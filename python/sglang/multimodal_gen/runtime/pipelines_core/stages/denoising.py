@@ -52,11 +52,14 @@ from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
 )
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
+    cache_dit_overrides_key,
+    disable_cache_on_transformer,
     enable_cache_on_dual_transformer,
     enable_cache_on_transformer,
     get_scm_mask,
     refresh_context_on_dual_transformer,
     refresh_context_on_transformer,
+    resolve_cache_dit_request_overrides,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
@@ -272,6 +275,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
+        # Per-request Cache-DiT overrides for the batch being executed
+        # (stashed by _maybe_enable_cache_dit; read by the config builders).
+        self._cache_dit_request_overrides: dict[str, Any] = {}
+        # Overrides key the mounted hooks were built from; None when unmounted.
+        self._cache_dit_active_key: tuple | None = None
         # Whether request-scoped quality="high" fusions are currently mounted.
         self._quality_fusions_mounted = False
         self._torch_compile_registry = CompiledModuleRegistry()
@@ -530,7 +538,23 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         return "wan2.2"
 
     def _cache_dit_requested(self) -> bool:
+        """Request-independent server default (init-time decisions only)."""
         return envs.SGLANG_CACHE_DIT_ENABLED
+
+    def _cache_dit_requested_for_batch(self, batch: Req) -> bool:
+        """Per-request Cache-DiT switch; the server default applies when unset."""
+        enable = batch.sampling_params.enable_cache_dit
+        if enable is None:
+            return self._cache_dit_requested()
+        return enable
+
+    def _unmount_cache_dit(self) -> None:
+        """Remove Cache-DiT hooks so subsequent batches run the native forward."""
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            disable_cache_on_transformer(transformer)
+        self._cache_dit_enabled = False
+        self._cached_num_steps = None
+        self._cache_dit_active_key = None
 
     def _cache_dit_secondary_uses_primary_config(self) -> bool:
         return False
@@ -554,9 +578,22 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return steps, steps
         raise ValueError("Boundary-expert dual transformers require split step counts.")
 
-    @staticmethod
-    def _parse_cache_dit_scm_bins() -> tuple[list[int] | None, list[int] | None, str]:
-        scm_preset = envs.SGLANG_CACHE_DIT_SCM_PRESET
+    def _parse_cache_dit_scm_bins(
+        self,
+    ) -> tuple[list[int] | None, list[int] | None, str]:
+        overrides = self._cache_dit_request_overrides
+        scm_preset = overrides.get("scm_preset", envs.SGLANG_CACHE_DIT_SCM_PRESET)
+        request_compute_bins = overrides.get("scm_compute_bins")
+        request_cache_bins = overrides.get("scm_cache_bins")
+        if request_compute_bins is not None or request_cache_bins is not None:
+            if request_compute_bins is None or request_cache_bins is None:
+                raise ValueError(
+                    "cache_dit_params SCM custom bins require both "
+                    "scm_compute_bins and scm_cache_bins."
+                )
+            compute_bins = [int(x) for x in request_compute_bins]
+            cache_bins = [int(x) for x in request_cache_bins]
+            return compute_bins, cache_bins, scm_preset
         compute_bins_str = envs.SGLANG_CACHE_DIT_SCM_COMPUTE_BINS
         cache_bins_str = envs.SGLANG_CACHE_DIT_SCM_CACHE_BINS
         compute_bins = None
@@ -582,7 +619,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, primary_num_steps: int, secondary_num_steps: int | None = None
     ) -> tuple[str, str, list[int] | None, list[int] | None]:
         scm_compute_bins, scm_cache_bins, scm_preset = self._parse_cache_dit_scm_bins()
-        scm_policy = envs.SGLANG_CACHE_DIT_SCM_POLICY
+        scm_policy = self._cache_dit_request_overrides.get(
+            "scm_policy", envs.SGLANG_CACHE_DIT_SCM_POLICY
+        )
         steps_computation_mask = get_scm_mask(
             preset=scm_preset,
             num_inference_steps=primary_num_steps,
@@ -606,50 +645,75 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 )
         return scm_preset, scm_policy, steps_computation_mask, steps_computation_mask_2
 
-    @staticmethod
+    def _cache_dit_knob(
+        self, key: str, env_value: Any, env_secondary_value: Any, *, secondary: bool
+    ) -> Any:
+        """Resolve one DBCache knob: request overrides win over env defaults.
+
+        The secondary transformer inherits the request's primary override for
+        keys its own ``secondary`` dict leaves unset, mirroring how the
+        SGLANG_CACHE_DIT_SECONDARY_* env values inherit the primary ones.
+        """
+        overrides = self._cache_dit_request_overrides
+        if not secondary:
+            return overrides.get(key, env_value)
+        secondary_overrides = overrides.get("secondary") or {}
+        if key in secondary_overrides:
+            return secondary_overrides[key]
+        return overrides.get(key, env_secondary_value)
+
     def _build_cache_dit_config(
+        self,
         num_inference_steps: int,
         steps_computation_mask: list[int] | None,
         scm_policy: str,
         *,
         secondary: bool = False,
     ) -> CacheDitConfig:
+        knob = self._cache_dit_knob
         return CacheDitConfig(
             enabled=True,
-            Fn_compute_blocks=(
-                envs.SGLANG_CACHE_DIT_SECONDARY_FN
-                if secondary
-                else envs.SGLANG_CACHE_DIT_FN
+            Fn_compute_blocks=knob(
+                "Fn_compute_blocks",
+                envs.SGLANG_CACHE_DIT_FN,
+                envs.SGLANG_CACHE_DIT_SECONDARY_FN,
+                secondary=secondary,
             ),
-            Bn_compute_blocks=(
-                envs.SGLANG_CACHE_DIT_SECONDARY_BN
-                if secondary
-                else envs.SGLANG_CACHE_DIT_BN
+            Bn_compute_blocks=knob(
+                "Bn_compute_blocks",
+                envs.SGLANG_CACHE_DIT_BN,
+                envs.SGLANG_CACHE_DIT_SECONDARY_BN,
+                secondary=secondary,
             ),
-            max_warmup_steps=(
-                envs.SGLANG_CACHE_DIT_SECONDARY_WARMUP
-                if secondary
-                else envs.SGLANG_CACHE_DIT_WARMUP
+            max_warmup_steps=knob(
+                "max_warmup_steps",
+                envs.SGLANG_CACHE_DIT_WARMUP,
+                envs.SGLANG_CACHE_DIT_SECONDARY_WARMUP,
+                secondary=secondary,
             ),
-            residual_diff_threshold=(
-                envs.SGLANG_CACHE_DIT_SECONDARY_RDT
-                if secondary
-                else envs.SGLANG_CACHE_DIT_RDT
+            residual_diff_threshold=knob(
+                "residual_diff_threshold",
+                envs.SGLANG_CACHE_DIT_RDT,
+                envs.SGLANG_CACHE_DIT_SECONDARY_RDT,
+                secondary=secondary,
             ),
-            max_continuous_cached_steps=(
-                envs.SGLANG_CACHE_DIT_SECONDARY_MC
-                if secondary
-                else envs.SGLANG_CACHE_DIT_MC
+            max_continuous_cached_steps=knob(
+                "max_continuous_cached_steps",
+                envs.SGLANG_CACHE_DIT_MC,
+                envs.SGLANG_CACHE_DIT_SECONDARY_MC,
+                secondary=secondary,
             ),
-            enable_taylorseer=(
-                envs.SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER
-                if secondary
-                else envs.SGLANG_CACHE_DIT_TAYLORSEER
+            enable_taylorseer=knob(
+                "enable_taylorseer",
+                envs.SGLANG_CACHE_DIT_TAYLORSEER,
+                envs.SGLANG_CACHE_DIT_SECONDARY_TAYLORSEER,
+                secondary=secondary,
             ),
-            taylorseer_order=(
-                envs.SGLANG_CACHE_DIT_SECONDARY_TS_ORDER
-                if secondary
-                else envs.SGLANG_CACHE_DIT_TS_ORDER
+            taylorseer_order=knob(
+                "taylorseer_order",
+                envs.SGLANG_CACHE_DIT_TS_ORDER,
+                envs.SGLANG_CACHE_DIT_SECONDARY_TS_ORDER,
+                secondary=secondary,
             ),
             num_inference_steps=num_inference_steps,
             steps_computation_mask=steps_computation_mask,
@@ -659,24 +723,43 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
-        """Enable cache-dit on the transformers if configured (idempotent).
+        """Enable cache-dit on the transformers for this batch (idempotent).
 
         This method should be called after the transformer is fully loaded
         and before torch.compile is applied.
+
+        The switch and knobs are per-request (``enable_cache_dit`` /
+        ``cache_dit_params`` in SamplingParams); the SGLANG_CACHE_DIT_*
+        environment values act as server-wide defaults for requests that leave
+        them unset. Both fields participate in the dynamic-batch signature, so
+        mount/unmount/remount transitions are safe at this batch boundary.
 
         For dual-transformer models (e.g., Wan2.2), this enables cache-dit on both
         transformers with (potentially) different configurations.
 
         """
+        requested = self._cache_dit_requested_for_batch(batch)
         if self.server_args.enable_breakable_cuda_graph:
             # Cache-DiT wraps transformer.forward with step-skipping control
             # flow that must not be baked into a captured CUDA graph.
-            if self._cache_dit_requested():
+            if requested:
                 logger.warning_once(
                     "Cache-DiT was requested but is disabled because breakable "
                     "CUDA graphs are enabled."
                 )
             return
+        self._cache_dit_request_overrides = resolve_cache_dit_request_overrides(
+            batch.sampling_params.cache_dit_params
+        )
+        desired_key = (
+            cache_dit_overrides_key(self._cache_dit_request_overrides)
+            if requested
+            else None
+        )
+        # This request opts out or changes knobs: unmount first, then fall
+        # through to the mount path (or the opt-out return below).
+        if self._cache_dit_enabled and desired_key != self._cache_dit_active_key:
+            self._unmount_cache_dit()
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
             primary_num_steps, secondary_num_steps = self._cache_dit_step_counts(
@@ -705,10 +788,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 )
             return
 
+        if not requested:
+            return
         # Keep cache-dit disabled for ordinary warmup, but allow torch.compile
         # warmup to mount cache-dit before Dynamo traces the transformer.
-        if not self._cache_dit_requested():
-            return
         if batch.is_warmup and not getattr(
             self.server_args, "enable_torch_compile", False
         ):
@@ -802,6 +885,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         self._cache_dit_enabled = True
         self._cached_num_steps = num_inference_steps
+        self._cache_dit_active_key = desired_key
 
     @lru_cache(maxsize=8)
     def _build_guidance(self, batch_size, target_dtype, device, guidance_val):

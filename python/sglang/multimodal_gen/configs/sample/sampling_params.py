@@ -222,6 +222,20 @@ class SamplingParams:
         None  # TeaCacheParams or WanTeaCacheParams, set by model-specific subclass
     )
 
+    # Cache-DiT parameters (block-level residual caching; see
+    # runtime/cache/cache_dit_integration.py). ``None`` falls back to the
+    # process-wide SGLANG_CACHE_DIT_ENABLED default; True/False opts this
+    # request in/out explicitly. Both fields intentionally participate in the
+    # dynamic-batch signature, so requests with different Cache-DiT settings
+    # never share a batch and mount/unmount transitions stay safe at batch
+    # boundaries.
+    enable_cache_dit: bool | None = None
+    # Per-request knob overrides applied on top of the SGLANG_CACHE_DIT_*
+    # defaults, e.g. {"residual_diff_threshold": 0.12, "scm_preset": "fast",
+    # "secondary": {"max_warmup_steps": 2}}. Valid keys:
+    # CACHE_DIT_REQUEST_PARAM_KEYS in runtime/cache/cache_dit_integration.py.
+    cache_dit_params: dict[str, Any] | None = None
+
     # Spectrum parameters
     enable_spectrum: bool = False
     spectrum_params: Any = None  # SpectrumParams
@@ -907,6 +921,14 @@ class SamplingParams:
         add_argument(
             "--enable-teacache",
             action="store_true",
+        )
+        add_argument(
+            "--enable-cache-dit",
+            action=StoreBoolean,
+        )
+        add_argument(
+            "--cache-dit-params",
+            type=json.loads,
         )
         add_argument(
             "--enable-spectrum",

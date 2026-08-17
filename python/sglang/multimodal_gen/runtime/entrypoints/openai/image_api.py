@@ -314,6 +314,8 @@ async def generations(
             use_system_prompt=_get_extra_field(request, "use_system_prompt"),
             use_guardrails=_get_extra_field(request, "use_guardrails"),
             enable_teacache=request.enable_teacache,
+            enable_cache_dit=_get_extra_field(request, "enable_cache_dit"),
+            cache_dit_params=_get_extra_field(request, "cache_dit_params"),
             quality=_runtime_sampling_quality(request.quality),
             output_compression=request.output_compression,
             output_quality=request.output_quality,
