@@ -2331,6 +2331,25 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
+def _freeze_gc_after_server_warmup(server_args: ServerArgs):
+    # Freeze GC after server warmup so static objects skip future GC gen2 collection.
+    # Use /freeze_gc to freeze scheduler and detokenizer as well.
+    freeze_key = server_args.admin_api_key or server_args.api_key
+    freeze_headers = {}
+    if freeze_key:
+        freeze_headers["Authorization"] = f"Bearer {freeze_key}"
+    try:
+        res = requests.post(
+            server_args.url() + "/freeze_gc",
+            headers=freeze_headers,
+            timeout=10,
+            verify=server_args.ssl_verify(),
+        )
+        res.raise_for_status()
+    except requests.exceptions.RequestException:
+        logger.warning("post-warmup freeze_gc failed", exc_info=True)
+
+
 def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
@@ -2353,6 +2372,8 @@ def _wait_and_warmup(
             return
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
+
+    _freeze_gc_after_server_warmup(server_args)
 
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
@@ -2687,16 +2708,10 @@ def _start_native_grpc_server_for_runtime(
     template_manager,
     scheduler_info,
 ):
-    try:
-        from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
-        from sglang.srt.grpc import _core as grpc_native
-    except ImportError as e:
-        raise RuntimeError(
-            "Native gRPC extension (sglang.srt.grpc._core) not found in this wheel, "
-            "but --grpc-port was set. The extension is built from "
-            "rust/sglang-grpc/ via setuptools-rust during wheel build. Either "
-            "install a wheel that includes the extension or unset --grpc-port."
-        ) from e
+    from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+    from sglang.srt.rust_extensions import load_rust_extension
+
+    grpc_native = load_rust_extension("sglang.srt.rust_extensions._grpc")
 
     runtime_handle = RuntimeHandle(
         tokenizer_manager=tokenizer_manager,
