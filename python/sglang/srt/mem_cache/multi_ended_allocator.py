@@ -138,6 +138,111 @@ class _CapacityField(Generic[_T]):
         obj._capacity_epoch += 1
 
 
+def _float_open_short_side(flt, demand) -> None:
+    """THE float-relocate policy, driven by a DEMAND VECTOR — one entry per
+    band, in PAGES of that band, zero for bands the operation does not touch
+    (e.g. mamba during a decode-token alloc). Any allocation event — a
+    band's own pages, a coupled token spanning several bands, or a future
+    combined admission vector — expresses itself the same way; nothing here
+    names a member or an operation.
+
+    Each END band's unpayable remainder (demand − its drainable holes) lands
+    on the float band on ITS side (a grow-down end faces the float's HIGH
+    side, a grow-up end its LOW side); the float's own remainder F can
+    extend into either band. With surplus = band − end-demand per side:
+
+      any demanded band's INDEX space too small -> skip (bytes cannot fix);
+      both sides short -> skip: relocation is ZERO-SUM between the bands
+          (opening one side closes the other) — the ladder falls through to
+          evict/retract;
+      one side short   -> open exactly that side, folding F in after
+          crediting the far side's surplus;
+      only F short     -> open the LARGER-surplus side by the remainder;
+      nothing short    -> no relocation.
+
+    `make_room`'s ``min_bytes`` is a TARGET for that side's whole band, so
+    the ask is demand + remainder + one page of slack (largest demanded
+    page) — never a delta, which under-asks whenever the band is partially
+    free. Best-effort: one relocation per ladder round, re-checked by the
+    caller; `make_room` leaves state untouched on an impossible ask.
+    """
+    if flt is None or flt._is_frontier_transparent():
+        return  # no float involved / empty float never blocks
+    if not any(pages > 0 for pages in demand.values()):
+        return  # nothing demanded — nothing to open (also keeps slack's max() total)
+    for band_alloc, pages in demand.items():
+        if pages <= 0:
+            continue
+        index_room = (
+            band_alloc.num_pages
+            - band_alloc.min_page_index
+            - band_alloc._allocated_pages()
+        )
+        if pages > index_room:
+            return  # index space binds; bytes cannot fix this
+    sides = {"low": 0, "high": 0}
+    for band_alloc, pages in demand.items():
+        if band_alloc is flt or pages <= 0:
+            continue
+        holes = len(band_alloc._free_phys_pages) if band_alloc.lazy_compaction else 0
+        ext = max(0, pages - holes)
+        side = "high" if band_alloc.grow_direction == "down" else "low"
+        sides[side] += ext * band_alloc.entry_bytes_per_page
+    band = {
+        "low": max(
+            0, flt._byte_low_frontier() - flt._chain_high_frontier_below_bytes()
+        ),
+        "high": max(
+            0, flt._chain_low_frontier_above_bytes() - flt._byte_high_frontier()
+        ),
+    }
+    surplus = {side: band[side] - sides[side] for side in ("low", "high")}
+    f_pages = demand.get(flt, 0)
+    f_bytes = max(0, f_pages - flt._hole_pages()) * flt.entry_bytes_per_page
+    slack = max(b.entry_bytes_per_page for b, pages in demand.items() if pages > 0)
+    if surplus["low"] < 0 and surplus["high"] < 0:
+        return  # zero-sum: opening one side closes the other
+    if surplus["low"] < 0 or surplus["high"] < 0:
+        short, far = ("low", "high") if surplus["low"] < 0 else ("high", "low")
+        target = sides[short] + max(0, f_bytes - max(0, surplus[far])) + slack
+        if target > band[short]:
+            flt.make_room(side=short, min_bytes=target)
+        return
+    if f_bytes > max(surplus.values()):
+        short = "low" if surplus["low"] >= surplus["high"] else "high"
+        flt.make_room(side=short, min_bytes=sides[short] + f_bytes + slack)
+
+
+def _relieve_for_alloc(short_pool, need_tokens: int) -> bool:
+    """THE shortfall ladder. Every allocation shortfall in the unified pool —
+    a single band's own alloc, or a composite's coupled multi-band alloc —
+    runs exactly this, cheapest remedy first:
+
+        1. flush targets flush        (absorb; ENDS also compact)
+        2. enough? -> done
+        3. the float, if one can help, slides   (relocate)
+        4. enough? -> done, else the caller evicts / retracts
+
+    ``short_pool`` is the allocator that FAILED — a band when its own pages
+    ran out (e.g. mamba state slots), the composite when a coupled alloc
+    (one token = a page on EVERY member) missed its joint gate. It supplies
+    the two policies as methods, each documented where it is defined:
+
+        _flush_targets()          who can raise MY availability by flushing
+        _ask_float_for_room(N)    how MY deficit maps to a float relocation
+
+    `_flush` is called unconditionally: an eager END no-ops (it compacted at
+    free time) and a FLOAT always has boundary absorption to do — so the
+    ladder itself never branches on lazy mode, member kind, or layout.
+    """
+    for m in short_pool._flush_targets():
+        m._flush(urgent=True)
+    if need_tokens <= short_pool.available_size():
+        return True
+    short_pool._ask_float_for_room(need_tokens)
+    return need_tokens <= short_pool.available_size()
+
+
 class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
     """Allocator for one sub-pool over a `UnifiedKVPool`."""
 
@@ -618,19 +723,26 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self._sched_avail_memo_epoch = epoch
         return self._sched_avail_memo_tokens
 
-    def _flush_chain_for_alloc(self, need_tokens: int) -> bool:
-        """One urgent flush of the growth-side chain neighbor on alloc
-        shortfall; returns whether THIS side now has enough. Only a NEIGHBOR's
-        compaction releases gap bytes (own compaction is net 0: each move
-        trades one hole for one gap byte on our own side).
+    def _flush_targets(self):
+        """A band short on its OWN alloc asks only its growth-side neighbour
+        to flush. Never itself: for its own allocation, holes and gap are
+        interchangeable (`take_physical_pages` drains holes first), so own
+        compaction trades one hole for one gap byte — net zero for self; only
+        a NEIGHBOUR's compaction releases bytes into the shared gap that own
+        extension consumes.
         """
-        if not self.lazy_compaction:
-            return False
         neighbor = self._growth_side_neighbor()
-        if neighbor is None:
-            return False
-        neighbor._flush(urgent=True)
-        return need_tokens <= self.available_size()
+        return () if neighbor is None else (neighbor,)
+
+    def _ask_float_for_room(self, need_tokens: int) -> None:
+        """A band short on its OWN pages: demand vector = {me: pages}; the
+        float, if the nearest non-transparent growth-side member is one,
+        opens the side facing me. Everything else — side derivation, index
+        guard, total-target ask — is the shared policy."""
+        blocker = self._growth_side_neighbor()
+        if not isinstance(blocker, FloatMultiEndedAllocator):
+            return
+        _float_open_short_side(blocker, {self: -(-need_tokens // self.page_size)})
 
     # -- physical-slot / physical-page primitives --
 
@@ -1004,7 +1116,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
                 # Shortfall: flush the PEER, not own. Own compaction is net 0
                 # (each move trades 1 hole for +1 gap byte); only peer compaction
                 # releases bytes into the shared gap that own extension consumes.
-                if not self._flush_chain_for_alloc(need_size):
+                if not _relieve_for_alloc(self, need_size):
                     return None
             num_pages = need_size // self.page_size
             v_pages = self.free_virtual_ids[:num_pages]
@@ -1075,7 +1187,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # compaction is internal — see `alloc`).
             need_tokens = num_new_pages * self.page_size
             if need_tokens > self.available_size():
-                if not self._flush_chain_for_alloc(need_tokens):
+                if not _relieve_for_alloc(self, need_tokens):
                     return None
             bs = len(prefix_lens)
             if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
@@ -1143,7 +1255,7 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # Lazy: physical-capacity pre-check; on shortfall flush PEER.
             need_tokens = num_new_pages * self.page_size
             if need_tokens > self.available_size():
-                if not self._flush_chain_for_alloc(need_tokens):
+                if not _relieve_for_alloc(self, need_tokens):
                     return None
             if self.need_sort and bs > len(self.free_virtual_ids):
                 self.merge_and_sort_free()
@@ -3178,16 +3290,19 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def schedulable_swa_available_size(self) -> int:
         return self.swa_attn_allocator.schedulable_available_size()
 
-    def _flush_both_for_alloc(self, need_tokens: int) -> bool:
-        """SWA analogue of `_flush_chain_for_alloc`. Each composite alloc consumes a
-        full AND a swa page and either side's compaction opens gap for the other,
-        so flush BOTH (one urgent pass each).
+    def _flush_targets(self):
+        """A coupled alloc consumes a page on EVERY member under one virtual
+        id, so a hole on ONE side is unusable once the gap is dry — there is
+        nothing on the other side to pair it with. Each member's compaction
+        converts such dead one-sided holes into SHARED gap, which serves the
+        joint gate: flush ALL members, including ones that are themselves
+        short.
         """
-        if not self.lazy_compaction:
-            return need_tokens <= self.available_size()
-        self.full_attn_allocator._flush(urgent=True)
-        self.swa_attn_allocator._flush(urgent=True)
-        return need_tokens <= self.available_size()
+        return (self.full_attn_allocator, self.swa_attn_allocator)
+
+    def _ask_float_for_room(self, need_tokens: int) -> None:
+        """No float in a two-END chain — nothing can slide."""
+        return None
 
     # `size_full` / `size_swa` are inherited; they read `_size_full`/`_size_swa`
     # (set to the static caps). We do NOT report `max_slots - 1`: under unified
@@ -3268,7 +3383,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             # Joint pre-check. Both sides are mutual peers (each side's compaction
             # opens gap for the other), so flush BOTH on shortfall.
             if need_size > self.available_size():
-                if not self._flush_both_for_alloc(need_size):
+                if not _relieve_for_alloc(self, need_size):
                     return None
             # Snapshot the virtual PAGES full will consume, to bind them on swa too.
             num_pages = need_size // self.page_size
@@ -3306,7 +3421,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             )
             need_tokens = num_new_pages * self.page_size
             if need_tokens > self.available_size():
-                if not self._flush_both_for_alloc(need_tokens):
+                if not _relieve_for_alloc(self, need_tokens):
                     return None
 
             # Snapshot the virtual PAGES the kernel will consume; clone so swa keeps
@@ -3345,7 +3460,7 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             )
             need_tokens = num_new_pages * self.page_size
             if need_tokens > self.available_size():
-                if not self._flush_both_for_alloc(need_tokens):
+                if not _relieve_for_alloc(self, need_tokens):
                     return None
 
             fa = self.full_attn_allocator
@@ -3730,14 +3845,47 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
                 hi_n = mid - 1
         return lo_n * self.page_size
 
-    def _flush_both_for_alloc(self, need_tokens: int) -> bool:
-        """Urgent-flush the two END pools (their hole-closing compaction opens
-        band bytes); the float's holes are assets, never flushed."""
-        if not self.lazy_compaction:
-            return need_tokens <= self.available_size()
-        self.full_attn_allocator._flush(urgent=True)
-        self.mamba_allocator._flush(urgent=True)
-        return need_tokens <= self.available_size()
+    def _flush_targets(self):
+        """All three members, same reasoning as the 2-pool pair with one
+        addition each way: the FLOAT's `_flush` is zero-copy boundary
+        absorption, and running it before `_ask_float_for_room` keeps the
+        deficit math from pricing a span that still claims absorbed holes
+        (which would buy a relocation the free shrink already covered); the
+        MAMBA end's compaction feeds the low band, which the float's own
+        extension for the same tokens can draw on.
+        """
+        return (
+            self.swa_attn_allocator,
+            self.full_attn_allocator,
+            self.mamba_allocator,
+        )
+
+    def _alloc_demand(self, need_tokens: int):
+        """Demand VECTOR for one composite allocation, in pages per band —
+        zero for bands the operation does not touch. A composite token
+        (prefill extend and decode alike) needs a full page AND a swa page;
+        it never draws a state slot — those are per-REQUEST allocations that
+        run the band-level ladder with their own {mamba: k} vector, so mamba
+        is an explicit 0 here, not an omission. A future 3-pool composite
+        (e.g. C128 | swa-float | C4) overrides just this vector and inherits
+        the whole relocation policy.
+        """
+        need_n = -(-need_tokens // self.page_size)
+        return {
+            self.full_attn_allocator: need_n,
+            self.swa_attn_allocator: need_n,
+            self.mamba_allocator: 0,
+        }
+
+    def _ask_float_for_room(self, need_tokens: int) -> None:
+        """Composite shortfall: hand the demand vector to the shared policy;
+        the float is whichever demanded band floats."""
+        demand = self._alloc_demand(need_tokens)
+        flt = None
+        for b in demand:
+            if isinstance(b, FloatMultiEndedAllocator):
+                flt = b
+        _float_open_short_side(flt, demand)
 
     def mamba_slot_full_token_cost(self) -> int:
         """Full-token-equivalents one mamba/conv slot removes from the shared
@@ -3785,18 +3933,6 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         # (the 2-pool mamba composite's convention).
         super().set_inflight_forward(forward_done, out_cache_loc_virtual)
         self.mamba_allocator.set_inflight_forward(forward_done, None)
-
-    def verify_byte_accounting(self) -> List[str]:
-        return (
-            _chain_byte_accounting_violations(
-                [
-                    self.mamba_allocator,
-                    self.swa_attn_allocator,
-                    self.full_attn_allocator,
-                ]
-            )
-            + self._joint_capacity_memo_violations()
-        )
 
     def verify_byte_accounting(self) -> List[str]:
         return (
