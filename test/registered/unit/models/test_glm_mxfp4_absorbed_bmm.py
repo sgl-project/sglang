@@ -320,6 +320,7 @@ class TestTunedMxfp4Bmm(CustomTestCase):
                     forward_mla,
                     "batched_gemm_a16wfp4",
                     return_value=wrapper_result,
+                    create=True,
                 ) as batched_gemm:
                     result = forward_mla._run_tuned_mxfp4_bmm(
                         x,
