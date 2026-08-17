@@ -1,12 +1,22 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, TypeAlias, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    TypeAlias,
+    Union,
+)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.jit_kernel.dsv4 import (
+from sglang.kernels.ops.attention.dsv4 import (
     fused_q_indexer_rope_hadamard_fp4_quant,
     fused_q_indexer_rope_hadamard_quant,
     topk_transform_512,
@@ -15,6 +25,8 @@ from sglang.jit_kernel.dsv4 import (
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.metadata import (
     NonPagedIndexerPlan,
@@ -28,7 +40,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
@@ -87,14 +99,14 @@ def fp8_paged_mqa_logits_torch(
 
     kv_values_raw = kvcache_gathered[..., :SCALE_OFFSET].contiguous()
     kv_values_fp8 = kv_values_raw.view(dtype=FP8_DTYPE)
-    kv_values = kv_values_fp8.to(torch.float32)
+    kv_values = kv_values_fp8.to(torch.bfloat16)
     kv_values = kv_values.reshape(batch_size, max_num_pages * block_size, head_dim)
 
     kv_scales_raw = kvcache_gathered[..., SCALE_OFFSET:].contiguous()
     kv_scales = kv_scales_raw.view(dtype=torch.float32)
     kv_scales = kv_scales.reshape(batch_size, max_num_pages * block_size)
 
-    q_float = q_fp8[:, 0].to(torch.float32)
+    q_float = q_fp8[:, 0].to(torch.bfloat16)
     scores = torch.bmm(kv_values, q_float.transpose(1, 2))
     scores = F.relu(scores)
     scores = scores * weight.unsqueeze(1)
@@ -153,7 +165,7 @@ def _aiter_fp8_paged_mqa_logits(
         page_table.to(torch.int32),
         max_seq_len,
         KVBlockSize=kv_block_size,
-        Preshuffle=True,
+        Preshuffle=aiter_can_use_preshuffle_paged_mqa(),
     )
     return logits
 
@@ -173,6 +185,25 @@ def fp8_paged_mqa_logits_torch_sm120(
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
     device = q_fp8.device
+
+    _QUERY_CHUNK = 1024
+    if batch_size > _QUERY_CHUNK:
+        return torch.cat(
+            [
+                fp8_paged_mqa_logits_torch_sm120(
+                    q_fp8[start : start + _QUERY_CHUNK],
+                    kvcache_fp8,
+                    weight[start : start + _QUERY_CHUNK],
+                    seq_lens[start : start + _QUERY_CHUNK],
+                    page_table[start : start + _QUERY_CHUNK],
+                    deep_gemm_metadata,
+                    max_seq_len,
+                    clean_logits=clean_logits,
+                )
+                for start in range(0, batch_size, _QUERY_CHUNK)
+            ],
+            dim=0,
+        )
 
     assert head_dim == 128, "Vectorized torch impl hardcodes DSV4 indexer head_dim=128"
     assert (
@@ -199,13 +230,13 @@ def fp8_paged_mqa_logits_torch_sm120(
     kv_value_raw = kvcache_gathered[..., :SCALE_OFFSET]
     kv_scale_raw = kvcache_gathered[..., SCALE_OFFSET:]
 
-    kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.float32)
+    kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.bfloat16)
     kv_value = kv_value.view(batch_size, max_padded_seq, head_dim)
 
     kv_scale = kv_scale_raw.contiguous().view(dtype=torch.float32)
     kv_scale = kv_scale.view(batch_size, max_padded_seq)
 
-    q = q_fp8[:, 0].to(torch.float32)
+    q = q_fp8[:, 0].to(torch.bfloat16)
 
     score = torch.bmm(kv_value, q.transpose(1, 2))
 
@@ -226,18 +257,17 @@ def fp8_paged_mqa_logits_torch_sm120(
     return logits
 
 
-def topk_transform_512_pytorch_vectorized(
+def _topk_transform_512_vectorized(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
     page_tables: torch.Tensor,
     out_page_indices: torch.Tensor,
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
+    topk_op: Callable[..., Tuple[torch.Tensor, torch.Tensor]] = torch.topk,
+    topk_op_kwargs: Optional[Dict[str, object]] = None,
+    contiguous_topk_input: bool = False,
 ) -> None:
-    """Vectorized PyTorch fallback for topk_transform_512.
-    All helper tensors (arange, zeros) are cached to avoid device-tensor
-    creation during HIP/CUDA graph capture."""
-
     TOPK = out_page_indices.shape[1]
     batch_size = scores.shape[0]
     max_seq_len = scores.shape[1]
@@ -264,9 +294,13 @@ def topk_transform_512_pytorch_vectorized(
     masked_scores.masked_fill_(~valid_mask, float("-inf"))
 
     actual_k = min(TOPK, max_seq_len)
-    _, raw_indices = torch.topk(
-        masked_scores, k=actual_k, dim=1, largest=True, sorted=False
+    topk_kwargs = (
+        {"dim": 1, "largest": True, "sorted": False}
+        if topk_op_kwargs is None
+        else topk_op_kwargs
     )
+    topk_input = masked_scores.contiguous() if contiguous_topk_input else masked_scores
+    _, raw_indices = topk_op(topk_input, actual_k, **topk_kwargs)
     raw_indices = raw_indices.to(torch.int32)
 
     if actual_k < TOPK:
@@ -311,10 +345,67 @@ def topk_transform_512_pytorch_vectorized(
         out_raw_indices.copy_(raw_indices)
 
 
+def topk_transform_512_pytorch_vectorized(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """Vectorized PyTorch fallback for topk_transform_512.
+    All helper tensors (arange, zeros) are cached to avoid device-tensor
+    creation during HIP/CUDA graph capture."""
+
+    _topk_transform_512_vectorized(
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_raw_indices,
+        topk_op=torch.topk,
+        topk_op_kwargs={"dim": 1, "largest": True, "sorted": False},
+    )
+
+
+def topk_transform_512_flashinfer_unfused(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    out_raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    import flashinfer
+
+    from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+        _flashinfer_tie_break_value,
+    )
+
+    _topk_transform_512_vectorized(
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        out_raw_indices,
+        topk_op=flashinfer.top_k,
+        topk_op_kwargs={
+            "sorted": False,
+            "deterministic": envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+            "tie_break": _flashinfer_tie_break_value(),
+            "dsa_graph_safe": True,
+        },
+        contiguous_topk_input=True,
+    )
+
+
 class C4IndexerBackendMixin:
     def __init__(self):
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False
+        self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
 
     def _forward_prepare_multi_stream(
         self,
@@ -494,6 +585,13 @@ class C4IndexerBackendMixin:
         ke = c4_seq_lens[:query_rows].reshape(-1).to(torch.int32).contiguous()
         gather_seq_lens = ke[-1:]
         ks = torch.zeros_like(ke)
+        # SGL Top-K synthesizes sequential indices for trivial rows without
+        # reading logits, so DeepGEMM can receive an empty range for them.
+        if (
+            self.dsa_topk_backend.is_sgl_kernel()
+            and not envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+        ):
+            ke = torch.where(ke - ks > c4_indexer.index_topk, ke, ks)
         c4_page_size = indexer_metadata.c4_page_size
         max_seqlen_k = (final_c4_len + c4_page_size - 1) // c4_page_size * c4_page_size
         plan = NonPagedIndexerPlan(
@@ -713,8 +811,20 @@ class C4IndexerBackendMixin:
         elif core_metadata.c4_sparse_raw_indices is not None:
             raw_indices = core_metadata.c4_sparse_raw_indices
 
-        if envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get():
+        if (
+            envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+            or self.dsa_topk_backend.is_torch()
+        ):
             topk_transform_512_pytorch_vectorized(
+                logits,
+                c4_seq_lens,
+                page_table,
+                c4_sparse_page_indices,
+                indexer_metadata.c4_page_size,
+                raw_indices,
+            )
+        elif self.dsa_topk_backend.is_flashinfer():
+            topk_transform_512_flashinfer_unfused(
                 logits,
                 c4_seq_lens,
                 page_table,
@@ -819,9 +929,8 @@ class C4Indexer(nn.Module):
         self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
-        from sglang.srt.runtime_context import get_server_args
 
-        self.use_fp4_indexer = get_server_args().enable_deepseek_v4_fp4_indexer
+        self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
         self.alt_streams = alt_streams
 
     def compute_q(

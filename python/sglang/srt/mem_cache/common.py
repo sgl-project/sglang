@@ -16,7 +16,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_serving, get_spec
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -53,6 +53,7 @@ def free_swa_out_of_window_slots(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     is_chunk_cache: bool = False,
+    retain_floor: int | None = None,
 ) -> None:
     if req.kv is None:
         return
@@ -76,6 +77,12 @@ def free_swa_out_of_window_slots(
         # boundary (page_floor(seq_len)) so the last leaf is never all-tombstone.
         # No extra page margin is needed.
         evict_threshold = pre_len - max(sliding_window_size, page_size)
+    if retain_floor is not None and not is_chunk_cache:
+        # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);
+        # this only promises not to free past it. Chunk cache has no tree, so a
+        # retained checkpoint could never be matched and holding it is pure cost.
+        evict_threshold = min(evict_threshold, retain_floor)
+
     new_swa_evicted_seqlen = max(
         req.kv.swa_evicted_seqlen,
         evict_threshold,
@@ -123,9 +130,10 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
                 EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
             )
     else:
-        # Standard allocator
-        if allocator.available_size() < num_tokens:
-            tree_cache.evict(EvictParams(num_tokens=num_tokens))
+        # Standard allocator: evict only the shortfall (mirrors the SWA arm)
+        available_size = allocator.available_size()
+        if available_size < num_tokens:
+            tree_cache.evict(EvictParams(num_tokens=num_tokens - available_size))
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
@@ -177,13 +185,13 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 def _release_overallocated_kv_indices(
     req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
 ) -> None:
-    global_server_args = get_server_args()
-    page_size = global_server_args.page_size
-    spec_algo = global_server_args.speculative_algorithm
+    allocator = tree_cache.token_to_kv_pool_allocator
+    page_size = allocator.page_size
+    spec_algo = get_spec().speculative_algorithm
 
     # strip_thinking_cache intentionally reports output tokens as overallocated
     # so they fall into the free path below (#22373).
-    if spec_algo is None and not global_server_args.strip_thinking_cache:
+    if spec_algo is None and not get_serving().strip_thinking_cache:
         assert (
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv.kv_allocated_len=}"
@@ -195,7 +203,9 @@ def _release_overallocated_kv_indices(
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
-        tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
+        # start_p is aligned to the allocator's physical page size above, so it
+        # never shares a page with cache_finished_req's tail free in this group.
+        allocator.free_segment(indices_to_free, start_pos=start_p)
 
 
 def available_and_evictable_str(tree_cache: BasePrefixCache) -> str:
