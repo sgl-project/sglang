@@ -236,6 +236,19 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     cd /sgl-workspace/mori
     git checkout '${MORI_COMMIT}'
     git submodule update --init --recursive
+    # Same rocm_sysdeps handling as docker/rocm.Dockerfile's MORI step: ROCm 10's
+    # pip SDK vendors NUMA and libdrm there, off every default search path. Kept
+    # scoped to the MORI build instead of exported image-wide because
+    # rocm_sysdeps/include also carries zlib.h/expat.h/elf.h, which would shadow
+    # the system headers for every other component.
+    ROCM_SYSDEPS=\"\${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps\"
+    if [ -d \"\${ROCM_SYSDEPS}\" ]; then
+      export CMAKE_PREFIX_PATH=\"\${ROCM_SYSDEPS}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}\"
+      export CPATH=\"\${ROCM_SYSDEPS}/include\${CPATH:+:\${CPATH}}\"
+      export LIBRARY_PATH=\"\${ROCM_SYSDEPS}/lib\${LIBRARY_PATH:+:\${LIBRARY_PATH}}\"
+      echo \"\${ROCM_SYSDEPS}/lib\" > /etc/ld.so.conf.d/rocm-sysdeps.conf
+      ldconfig
+    fi
     python3 setup.py develop
     python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))' > /etc/ld.so.conf.d/torch.conf
     ldconfig
