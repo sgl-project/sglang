@@ -1286,6 +1286,11 @@ class Envs:
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    # SM12x only. Run MLA prefill on n_local_heads query heads instead of the
+    # 64-head TP pad. Applies to prefill chunks wide enough to miss FlashMLA's
+    # fp8 sparse decode kernel, which is the kernel the pad exists for; every
+    # other batch keeps the pad.
+    SGLANG_OPT_DSV4_UNPAD_PREFILL_MLA_HEADS = EnvBool(True)
 
     # ===================================================================
     # DeepSeek V4 - cache, GEMM, and distributed

@@ -304,6 +304,41 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _SHARED_EXPERT_LOCAL = get_bool_env_var("SGLANG_DP_SHARED_EXPERT_LOCAL")
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx942_supported = is_gfx942_supported()
+_is_sm120 = is_sm120_supported()
+
+
+def _unpad_mla_prefill_heads(x: torch.Tensor, forward_batch: ForwardBatch) -> bool:
+    """True iff this forward may hand attention ``n_local_heads`` query heads
+    instead of the 64-head TP pad.
+
+    The pad exists only for FlashMLA's fp8 sparse *decode* kernel. On SM12x the
+    decode/prefill split is by ROW COUNT inside the flashinfer entry, not by
+    forward mode, so both the mode term and the row term are load-bearing.
+    """
+    if not _is_sm120 or not envs.SGLANG_OPT_DSV4_UNPAD_PREFILL_MLA_HEADS.get():
+        return False
+    # The gate reads forward_mode, which is not part of a captured graph's
+    # shape key, so capture and replay could disagree.
+    if is_in_breakable_cuda_graph():
+        return False
+    # Allowlist, NOT is_extend(): that returns True for TARGET_VERIFY.
+    if not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        return False
+    # DP padding can rewrite a verify batch into EXTEND; check the original.
+    orig = getattr(forward_batch, "_original_forward_mode", None)
+    if orig is not None and not orig.is_extend_or_draft_extend_or_mixed():
+        return False
+    # Deferred import: the model registry imports this module eagerly, and the
+    # threshold is only needed once the gate runs.
+    from sglang.kernels.ops.attention.flash_mla_sm120 import (
+        sm120_flashmla_decode_max_tokens,
+    )
+
+    # Below the row threshold the flashinfer entry takes the decode kernel.
+    if x.shape[0] <= sm120_flashmla_decode_max_tokens():
+        return False
+    return True
+
 
 if _use_aiter:
     if _is_gfx95_supported:
@@ -641,17 +676,29 @@ class MqaAttentionBase(nn.Module):
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
         self.freqs_cis: torch.Tensor
 
-    def _local_attn_sink(self) -> torch.Tensor:
+    def _local_attn_sink(self, num_heads: Optional[int] = None) -> torch.Tensor:
+        """Per-rank attention sink. ``num_heads`` defaults to the padded width,
+        which is what ``DSparkAttention`` (deepseek_v4_dspark.py) still asks for.
+        """
         if self.attn_tp_size == 1:
             return self.attn_sink
         if self._attn_sink_local is None:
             rank = self.attn_tp_rank
-            num_heads = self.n_local_heads
-            padded_num_heads = 64 if num_heads <= 64 else self.n_heads
+            local_heads = self.n_local_heads
+            padded_num_heads = 64 if local_heads <= 64 else self.n_heads
             sink = self.attn_sink.new_zeros(padded_num_heads)
-            sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
+            sink[:local_heads] = self.attn_sink[
+                rank * local_heads : (rank + 1) * local_heads
+            ]
             self._attn_sink_local = sink
-        return self._attn_sink_local
+        store = self._attn_sink_local
+        if num_heads is None or num_heads == store.shape[0]:
+            return store
+        # A prefix view, not a second allocation: this rank's real sinks live at
+        # [0:n_local_heads], so store[:num_heads] is bit-identical to a freshly
+        # built num_heads sink and shares storage with the padded tensor a
+        # captured decode graph may already hold a pointer to.
+        return store[:num_heads]
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
@@ -1308,12 +1355,15 @@ class MQALayer(MqaAttentionBase):
             and not (_is_hip and self.compressor is None)
         )
 
+        unpad_heads = _unpad_mla_prefill_heads(x, forward_batch)
         tp_slice, q_padded, q_out = slice(None), None, None
-        if self.attn_tp_size > 1:
+        attn_heads = self.n_local_heads
+        if self.attn_tp_size > 1 and not unpad_heads:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
-            # this rank and padded to match.
+            # this rank and padded to match. _unpad_mla_prefill_heads() drops
+            # the pad for the prefill chunks wide enough to miss that kernel.
             padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
             # heads inject NaN into attention on gfx942 (fnuz), so zero-init
@@ -1325,7 +1375,8 @@ class MQALayer(MqaAttentionBase):
                 q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
-        attn_sink = self._local_attn_sink()
+            attn_heads = padded_num_heads
+        attn_sink = self._local_attn_sink(attn_heads)
 
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
