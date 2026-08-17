@@ -22,6 +22,7 @@ from openai.types.responses import (
     ResponseOutputText,
     ResponseReasoningItem,
 )
+from openai.types.responses.response_custom_tool_call import ResponseCustomToolCall
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai.types.responses.response_output_text import Logprob, LogprobTopLogprob
 from openai.types.responses.response_reasoning_item import (
@@ -80,6 +81,12 @@ if TYPE_CHECKING:
     from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
+
+# Custom (freeform) tools carry a raw string instead of JSON arguments. They
+# are exposed to the chat layer as a function with this single string
+# property, and the wrapper is stripped again when emitting
+# ``custom_tool_call`` output items.
+_CUSTOM_TOOL_ARG_KEY = "input"
 
 
 class _MediaInputValidationError(ValueError):
@@ -857,7 +864,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             output_items.append(reasoning_item)
 
         is_required = request.tool_choice == "required"
-        tool_call_items: list[ResponseFunctionToolCall] = []
+        custom_tool_names = self._custom_tool_names(request)
+        tool_call_items: list[ResponseFunctionToolCall | ResponseCustomToolCall] = []
         parsed_via_native = False
         if (
             content
@@ -878,13 +886,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                     content, call_info_list = parser.parse_non_stream(content)
                     for call_info in call_info_list:
                         tool_call_items.append(
-                            ResponseFunctionToolCall(
-                                arguments=call_info.parameters or "",
-                                call_id=f"call_{random_uuid()[:24]}",
-                                type="function_call",
-                                name=call_info.name,
-                                id=f"fc_{random_uuid()[:8]}",
-                                status="completed",
+                            self._build_tool_call_item(
+                                call_info.name,
+                                call_info.parameters or "",
+                                custom_tool_names,
                             )
                         )
                     parsed_via_native = bool(call_info_list)
@@ -904,13 +909,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                             tool.get("parameters", {}), ensure_ascii=False
                         )
                         tool_call_items.append(
-                            ResponseFunctionToolCall(
-                                arguments=arguments,
-                                call_id=f"call_{random_uuid()[:24]}",
-                                type="function_call",
-                                name=tool["name"],
-                                id=f"fc_{random_uuid()[:8]}",
-                                status="completed",
+                            self._build_tool_call_item(
+                                tool["name"], arguments, custom_tool_names
                             )
                         )
                     content = ""
@@ -960,9 +960,36 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _response_tools_to_chat_tools(request: ResponsesRequest) -> list[Tool]:
-        # Only ``function`` tools flow to chat; built-ins go through harmony.
+        # ``function`` tools flow to chat as-is; built-ins go through harmony.
+        # ``custom`` (freeform) tools have no JSON schema, so expose each one
+        # as a function taking a single string argument: the model can then
+        # call it through the ordinary JSON tool-call path (parsers and
+        # constrained decoding keep working), and the raw string round-trips
+        # through the {"input": ...} wrapper (unwrapped again when emitting
+        # ``custom_tool_call`` output items).
         chat_tools = []
         for tool in request.tools:
+            if tool.type == "custom":
+                chat_tools.append(
+                    Tool(
+                        type="function",
+                        function=Function(
+                            name=tool.name,
+                            description=tool.description,
+                            parameters={
+                                "type": "object",
+                                "properties": {
+                                    _CUSTOM_TOOL_ARG_KEY: {
+                                        "type": "string",
+                                        "description": "Freeform tool input.",
+                                    }
+                                },
+                                "required": [_CUSTOM_TOOL_ARG_KEY],
+                            },
+                        ),
+                    )
+                )
+                continue
             if tool.type != "function":
                 continue
             chat_tools.append(
@@ -977,6 +1004,54 @@ class OpenAIServingResponses(OpenAIServingChat):
                 )
             )
         return chat_tools
+
+    @staticmethod
+    def _custom_tool_names(request: ResponsesRequest) -> set[str]:
+        return {
+            tool.name
+            for tool in (request.tools or [])
+            if tool.type == "custom" and tool.name
+        }
+
+    @staticmethod
+    def _custom_tool_input_from_arguments(arguments: str) -> str:
+        """Unwrap the {"input": ...} JSON produced by the synthetic custom-tool
+        schema back into the freeform string; fall back to the raw arguments
+        for malformed or unexpected shapes."""
+        try:
+            parsed = orjson.loads(arguments) if arguments else None
+        except orjson.JSONDecodeError:
+            return arguments or ""
+        if isinstance(parsed, dict):
+            value = parsed.get(_CUSTOM_TOOL_ARG_KEY)
+            if isinstance(value, str):
+                return value
+        return arguments or ""
+
+    @classmethod
+    def _build_tool_call_item(
+        cls, name: str, arguments: str, custom_tool_names: set[str]
+    ):
+        """Build the Responses output item for one parsed tool call: a
+        ``custom_tool_call`` when the tool was declared ``custom``, else a
+        ``function_call``."""
+        if name in custom_tool_names:
+            return ResponseCustomToolCall(
+                input=cls._custom_tool_input_from_arguments(arguments),
+                call_id=f"call_{random_uuid()[:24]}",
+                type="custom_tool_call",
+                name=name,
+                id=f"ctc_{random_uuid()[:8]}",
+                status="completed",
+            )
+        return ResponseFunctionToolCall(
+            arguments=arguments,
+            call_id=f"call_{random_uuid()[:24]}",
+            type="function_call",
+            name=name,
+            id=f"fc_{random_uuid()[:8]}",
+            status="completed",
+        )
 
     @staticmethod
     def _normalize_response_content_part_for_chat(content_part: Any) -> Any:
@@ -1036,6 +1111,25 @@ class OpenAIServingResponses(OpenAIServingChat):
             message = {**message, "role": "system"}
 
         msg_type = message.get("type")
+        if msg_type == "custom_tool_call":
+            # Freeform (``custom``) tool input is a raw string; wrap it in the
+            # same {"input": ...} object used when declaring the tool so chat
+            # templates that json-parse tool-call arguments survive.
+            return {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": message.get("call_id") or message.get("id"),
+                        "type": "function",
+                        "function": {
+                            "name": message.get("name"),
+                            "arguments": orjson.dumps(
+                                {_CUSTOM_TOOL_ARG_KEY: message.get("input") or ""}
+                            ).decode("utf-8"),
+                        },
+                    }
+                ],
+            }
         if msg_type == "function_call":
             # Coerce ``arguments`` to a valid JSON-object string so the chat
             # template's unconditional ``orjson.loads`` survives truncated or
@@ -1065,7 +1159,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     }
                 ],
             }
-        if msg_type == "function_call_output":
+        if msg_type in ("function_call_output", "custom_tool_call_output"):
             # ``output`` may be a string or an array of content parts (OpenAI
             # allows both); the chat tool message needs a string, so flatten.
             out = message.get("output", "")
@@ -1998,6 +2092,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             "text": "",
         }
         tool_call_states: dict[int, dict[str, Any]] = {}
+        custom_tool_names = self._custom_tool_names(request)
         # Items closed during the stream, in wire order. Feeds the final
         # ``response.completed`` snapshot and the stored response.
         emitted_items: list = []
@@ -2158,6 +2253,57 @@ class OpenAIServingResponses(OpenAIServingChat):
             if state is None or state.get("done"):
                 return []
             arguments = state["arguments"]
+            if state.get("is_custom"):
+                # Custom (freeform) tool: unwrap the buffered {"input": ...}
+                # JSON into the raw string. Arguments cannot be unwrapped
+                # incrementally (JSON string escaping), so the input streams
+                # as a single delta followed by done.
+                tool_input = self._custom_tool_input_from_arguments(arguments)
+                completed_item = ResponseCustomToolCall(
+                    input=tool_input,
+                    call_id=state["call_id"],
+                    name=state["name"] or "",
+                    type="custom_tool_call",
+                    id=state["item_id"],
+                    status="completed",
+                )
+                events = []
+                if tool_input:
+                    events.append(
+                        _send_event(
+                            openai_responses_types.ResponseCustomToolCallInputDeltaEvent(
+                                type="response.custom_tool_call_input.delta",
+                                sequence_number=-1,
+                                item_id=state["item_id"],
+                                output_index=state["output_index"],
+                                delta=tool_input,
+                            )
+                        )
+                    )
+                events.extend(
+                    [
+                        _send_event(
+                            openai_responses_types.ResponseCustomToolCallInputDoneEvent(
+                                type="response.custom_tool_call_input.done",
+                                sequence_number=-1,
+                                item_id=state["item_id"],
+                                output_index=state["output_index"],
+                                input=tool_input,
+                            )
+                        ),
+                        _send_event(
+                            openai_responses_types.ResponseOutputItemDoneEvent(
+                                type="response.output_item.done",
+                                sequence_number=-1,
+                                output_index=state["output_index"],
+                                item=completed_item,
+                            )
+                        ),
+                    ]
+                )
+                emitted_items.append(completed_item)
+                state["done"] = True
+                return events
             completed_item = ResponseFunctionToolCall(
                 arguments=arguments,
                 call_id=state["call_id"],
@@ -2335,7 +2481,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     for ev in _close_tool_call_state(other_index):
                                         yield ev
                             current_output_index += 1
-                            item_id = f"fc_{random_uuid()[:8]}"
+                            is_custom = (call.name or "") in custom_tool_names
+                            item_id = (
+                                f"ctc_{random_uuid()[:8]}"
+                                if is_custom
+                                else f"fc_{random_uuid()[:8]}"
+                            )
                             call_id = f"call_{random_uuid()[:24]}"
                             state = {
                                 "item_id": item_id,
@@ -2343,38 +2494,54 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 "output_index": current_output_index,
                                 "name": call.name or "",
                                 "arguments": "",
+                                "is_custom": is_custom,
                                 "added": False,
                                 "done": False,
                             }
                             tool_call_states[tool_index] = state
                         if not state["added"]:
                             state["added"] = True
+                            if state.get("is_custom"):
+                                added_item = ResponseCustomToolCall(
+                                    input="",
+                                    call_id=state["call_id"],
+                                    name=state["name"],
+                                    type="custom_tool_call",
+                                    id=state["item_id"],
+                                    status="in_progress",
+                                )
+                            else:
+                                added_item = ResponseFunctionToolCall(
+                                    arguments="",
+                                    call_id=state["call_id"],
+                                    name=state["name"],
+                                    type="function_call",
+                                    id=state["item_id"],
+                                    status="in_progress",
+                                )
                             yield _send_event(
                                 openai_responses_types.ResponseOutputItemAddedEvent(
                                     type="response.output_item.added",
                                     sequence_number=-1,
                                     output_index=state["output_index"],
-                                    item=ResponseFunctionToolCall(
-                                        arguments="",
-                                        call_id=state["call_id"],
-                                        name=state["name"],
-                                        type="function_call",
-                                        id=state["item_id"],
-                                        status="in_progress",
-                                    ),
+                                    item=added_item,
                                 )
                             )
                         if call.parameters:
+                            # Custom tools buffer the wrapped JSON and stream
+                            # the unwrapped input at close; the raw string
+                            # cannot be unwrapped incrementally.
                             state["arguments"] += call.parameters
-                            yield _send_event(
-                                openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
-                                    type="response.function_call_arguments.delta",
-                                    sequence_number=-1,
-                                    item_id=state["item_id"],
-                                    output_index=state["output_index"],
-                                    delta=call.parameters,
+                            if not state.get("is_custom"):
+                                yield _send_event(
+                                    openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
+                                        type="response.function_call_arguments.delta",
+                                        sequence_number=-1,
+                                        item_id=state["item_id"],
+                                        output_index=state["output_index"],
+                                        delta=call.parameters,
+                                    )
                                 )
-                            )
 
                 def _emit_normal_text():
                     if normal_text and _should_emit_normal_text_as_message(
