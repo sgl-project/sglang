@@ -501,7 +501,7 @@ class GPTQLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if not hasattr(layer, "scheme"):
+        if layer.scheme is None:
             layer.scheme = self.quant_config.get_linear_scheme(layer)
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.scheme.create_weights(
@@ -541,7 +541,7 @@ class GPTQMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if not hasattr(layer, "scheme"):
+        if layer.scheme is None:
             layer.scheme = self.quant_config.get_moe_scheme(layer)
         layer.scheme.create_weights(
             layer=layer,
@@ -593,7 +593,7 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ) -> None:
-        if not hasattr(layer, "scheme"):
+        if layer.scheme is None:
             layer.scheme = self.quant_config.get_linear_scheme(layer)
         weight_loader = extra_weight_attrs.get("weight_loader")
         layer.scheme.create_weights(
@@ -633,7 +633,7 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if not hasattr(layer, "scheme"):
+        if layer.scheme is None:
             layer.scheme = self.quant_config.get_moe_scheme(layer)
         layer.scheme.create_weights(
             layer=layer,
