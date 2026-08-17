@@ -465,6 +465,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
+    # Out-graph metadata init over the padded static buffers.
     def _init_out_graph_metadata(
         self,
         *,
@@ -477,7 +478,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         spec_info,
         out_cache_loc_dsv4,
     ):
-        """Run the out-graph metadata init over the padded static buffers."""
         buffers = self.buffers
         from types import SimpleNamespace
 
@@ -499,6 +499,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
+    # Pre-verify run of the out-graph metadata init (its pool gathers read
+    # req_to_token); execute(staged=True) then skips the init.
     def stage_shared_reads(
         self,
         *,
@@ -507,10 +509,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         req_pool_indices: torch.Tensor,
         out_cache_loc_dsv4=None,
     ):
-        """Run the out-graph metadata init (the pool gathers that read
-        req_to_token) before the verify launch, from pre-verify state only;
-        execute(staged=True) then skips the init and stays otherwise
-        unchanged."""
         buffers = self.buffers
         raw_bs = req_pool_indices.shape[0]
         num_tokens = raw_bs * self.captured_req_width
@@ -543,10 +541,9 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             out_cache_loc_dsv4=out_cache_loc_dsv4,
         )
 
+    # Shape-only stand-in for the not-yet-built spec_info: the init reads
+    # verify products only by shape, so stale buffer values are fine.
     def _make_spec_view(self, bs: int) -> EagleDraftExtendInput:
-        """Shape-only stand-in for the not-yet-built spec_info: the init reads
-        verify products only by shape (steady-state extend widths, stale
-        accept counts in the static buffers)."""
         buffers = self.buffers
         spec_view = EagleDraftExtendInput(
             hidden_states=None,

@@ -853,17 +853,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.dsa_extend_topk_buf = buf
         return buf[:num_tokens]
 
+    # Stage draft_extend's shared-buffer reads (the metadata init's
+    # req_to_token gathers) before verify; False keeps post-verify sequencing.
     def _draft_extend_plan_for_decode(self, batch: ScheduleBatch) -> bool:
-        """Stage draft_extend's shared-buffer reads (the out-graph metadata
-        init's req_to_token gathers) before the verify launch, from pre-verify
-        state only. Returns False to keep everything in the legacy post-verify
-        sequencing."""
         runner = self.cuda_graph_runner_for_draft_extend
         if runner is None or batch.forward_mode.is_idle():
             return False
-        # SWA metadata derives its prefix from num_accept_tokens (see
-        # flashinfer update_sliding_window), a verify product that does not
-        # exist yet at plan time.
+        # SWA metadata derives its prefix from num_accept_tokens (flashinfer
+        # update_sliding_window), a verify product that does not exist yet.
         if self.draft_runner.sliding_window_size is not None:
             return False
         # The DP-padded width would duplicate init_new's token-unit transform;
@@ -1211,8 +1208,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
-            # Stage draft_extend's shared-buffer reads before the verify
-            # launch; everything else stays post-verify.
+            # Stage draft_extend's shared-buffer reads before the verify launch.
             staged_draft_extend = self.draft_worker._draft_extend_plan_for_decode(batch)
             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
             # Publish before draft_extend so the fence is at verify-end.
