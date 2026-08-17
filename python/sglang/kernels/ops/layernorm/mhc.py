@@ -547,17 +547,7 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
 
     n_sms = get_device_core_count()
     if n_sms <= 0:
-        if torch.xpu.is_available():
-            props = torch.xpu.get_device_properties(0)
-            n_sms = getattr(props, "multi_processor_count", None)
-            if n_sms is None:
-                n_sms = getattr(
-                    props,
-                    "max_compute_units",
-                    getattr(props, "gpu_subslice_count", 1),
-                )
-        else:
-            n_sms = torch.cuda.get_device_properties(0).multi_processor_count
+        n_sms = 1
 
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
 
