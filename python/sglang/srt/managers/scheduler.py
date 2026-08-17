@@ -1301,7 +1301,6 @@ class Scheduler(
         self.transfer_backend = TransferBackend(
             get_disagg().disaggregation_transfer_backend
         )
-        self._sync_disaggregation_mode_to_subcomponents()
 
         # In rust-server mode the KV bootstrap registry is already serving on
         # the rust api listener (maybe_init_rust_server runs before this
