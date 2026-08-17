@@ -153,11 +153,20 @@ class MLPSyncBatchInfo:
             rank = torch.distributed.get_rank(group)
             if 0 <= rank < flat_info.shape[0]:
                 flat_info[rank] = local_info_tensor
-            torch.distributed.all_reduce(
+            # Retried: Mooncake can transiently reject this on the first
+            # post-shrink tick while its bitmap catches up to active_ranks.
+            from sglang.srt.elastic_ep.elastic_ep import (
+                mooncake_all_reduce_transient_retry,
+            )
+            mooncake_all_reduce_transient_retry(
                 global_info_tensor,
                 op=torch.distributed.ReduceOp.SUM,
                 group=group,
             )
+            # Cheap scalar sync so tick N+1's collective can't fire before
+            # Mooncake settles tick N; b3c02cbce7 dropped the .item() that
+            # used to provide this incidentally.
+            global_info_tensor.sum().item()
             missing = flat_info.abs().sum(dim=1) == 0
             flat_info[missing] = fallback_tensor
         else:
@@ -191,6 +200,12 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
+        # Sanitize retiree-slot garbage (Mooncake WORLD all-reduce mask-flip race).
+        _MAX = 1 << 30
+        self.global_num_tokens = [0 if (t < 0 or t > _MAX) else t for t in self.global_num_tokens]
+        self.global_num_tokens_for_logprob = [
+            0 if (t < 0 or t > _MAX) else t for t in self.global_num_tokens_for_logprob
+        ]
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())

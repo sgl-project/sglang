@@ -181,7 +181,9 @@ class SchedulerRequestReceiver:
             # all-ranks gloo sync.
             _local_ctrl = (
                 get_parallel().enable_dp_attention_local_control_broadcast
-                or is_ep_scale_joiner()
+                # ``is_ep_offset_joiner`` covers scale-mode + recover-with-offset;
+                # upstream's ``is_ep_scale_joiner`` is scale-only, too narrow here.
+                or self.server_args.is_ep_offset_joiner
             )
             if _local_ctrl:
                 if self.ps.attn_tp_size != 1:

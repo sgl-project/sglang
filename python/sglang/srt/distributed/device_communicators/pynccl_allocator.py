@@ -202,7 +202,9 @@ def get_nccl_mem_pool() -> torch.cuda.MemPool:
             os.remove(os.path.join(out_dir, "lock"))
         except FileNotFoundError:
             pass
-        torch.distributed.barrier()
+        # Solo-booting offset joiner has no peer to match this barrier.
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            torch.distributed.barrier()
 
         nccl_allocator_libname = "nccl_allocator"
         lib_path = torch.utils.cpp_extension.load_inline(

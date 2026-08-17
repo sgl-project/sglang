@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
+from dataclasses import dataclass, field
+from datetime import timedelta
+from typing import TYPE_CHECKING, Callable, Iterator, List, Optional, Union
 
 import torch
 
@@ -53,6 +54,10 @@ class ElasticEPState:
     original_ep_size: int = 0
     has_scaled: bool = False
     ep_join_rank_offset: int = 0
+    # Ranks a pending grow must reactivate (grow-into-retired-slot). Empty for append.
+    pending_recover_ranks: List[int] = field(default_factory=list)
+    # True once mask flips are committed; blocks reset() from clobbering Mooncake state.
+    mask_dirty: bool = False
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
@@ -72,6 +77,24 @@ class ElasticEPState:
             self.active_ranks[: self.effective_ep_size] = 1
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
+            self.mask_dirty = False
+
+    def _set_active_bits(self, global_ranks: List[int], value: int) -> None:
+        if self.active_ranks is None:
+            return
+        numel = self.active_ranks.numel()
+        for g in global_ranks:
+            if 0 <= g < numel:
+                self.active_ranks[g] = value
+        self.snapshot_active_to_last()
+        self.sync_active_to_cpu()
+        self.mask_dirty = True
+
+    def activate_ranks(self, global_ranks: List[int]) -> None:
+        self._set_active_bits(global_ranks, 1)
+
+    def deactivate_ranks(self, global_ranks: List[int]) -> None:
+        self._set_active_bits(global_ranks, 0)
 
 
 class ElasticEPStateManager:
@@ -95,6 +118,9 @@ class ElasticEPStateManager:
                 f"world_size ({world_size})."
             )
 
+            if server_args.elastic_ep_backend == "mooncake":
+                cls._shrink_mooncake_fault_reconciliation_window()
+
             inst = cls._build_state(ep_size=active_rank_capacity, device=None)
             inst.effective_ep_size = world_size
             inst.original_ep_size = world_size
@@ -113,6 +139,17 @@ class ElasticEPStateManager:
             cls._instance = inst
 
         return cls._instance
+
+    @classmethod
+    def _shrink_mooncake_fault_reconciliation_window(cls) -> None:
+        # Mooncake PR #2455 buffers positive link events for 30s after any
+        # negative event, stalling grow-into-retired-slot in ``_try_recover_world``.
+        # Retire/regrow is locally sequenced here, so shrink to 1s. Process-local.
+        try:
+            from mooncake.pg import set_fault_reconciliation_window_us
+        except ImportError:
+            return
+        set_fault_reconciliation_window_us(1_000_000)
 
     @classmethod
     def _init_joiner_state(cls, inst: ElasticEPState, server_args: ServerArgs) -> None:
@@ -174,6 +211,17 @@ class ElasticEPStateManager:
             or inst.scale_phase == "recovery_unsupported"
         ):
             return False
+        # Sync-reject invalid targets so admission gate can 4xx.
+        if n <= 0:
+            logger.warning("[Elastic EP] request_scale rejected: ep_size=%d must be > 0", n)
+            return False
+        if n == inst.effective_ep_size:
+            logger.info("[Elastic EP] request_scale rejected: ep_size=%d is no-op", n)
+            return False
+        max_cap = inst.active_ranks_cpu.numel() if inst.active_ranks_cpu is not None else None
+        if max_cap is not None and n > max_cap:
+            logger.warning("[Elastic EP] request_scale rejected: ep_size=%d > max=%d", n, max_cap)
+            return False
         inst.pending_ep_size = n
         inst.scale_phase = "waiting_for_cohort"
         inst.last_error = None
@@ -205,22 +253,54 @@ class ElasticEPStateManager:
         cls._mark_phase("syncing_new_world")
 
     @classmethod
+    def mark_draining(cls) -> None:
+        cls._mark_phase("draining")
+
+    @classmethod
+    def mark_retiring(cls) -> None:
+        cls._mark_phase("retiring")
+
+    @classmethod
+    def mark_reconfiguring(cls) -> None:
+        cls._mark_phase("reconfiguring")
+
+    @classmethod
     def _mark_phase(cls, phase: str) -> None:
         inst = cls._instance
         if inst is not None and inst.pending_ep_size is not None:
             inst.scale_phase = phase
 
     @classmethod
+    def get_shrink_direction(cls) -> Optional[str]:
+        inst = cls._instance
+        if inst is None or inst.pending_ep_size is None:
+            return None
+        if inst.pending_ep_size < inst.effective_ep_size:
+            return "shrink"
+        if inst.pending_ep_size > inst.effective_ep_size:
+            return "grow"
+        return None
+
+    @classmethod
+    def get_pending_shrink_ranks(cls) -> List[int]:
+        inst = cls._instance
+        if inst is None or inst.pending_ep_size is None or inst.pending_ep_size >= inst.effective_ep_size:
+            return []
+        return list(range(inst.pending_ep_size, inst.effective_ep_size))
+
+    @classmethod
     def commit_scale(cls) -> None:
         inst = cls._instance
         if inst is None or inst.pending_ep_size is None:
             return
+        direction = cls.get_shrink_direction()
         inst.effective_ep_size = inst.pending_ep_size
         inst.pending_ep_size = None
         inst.has_scaled = True
-        inst.scale_phase = "serving_expanded"
+        inst.scale_phase = "serving_shrunk" if direction == "shrink" else "serving_expanded"
         inst.last_error = None
         inst.pending_since = None
+        inst.pending_recover_ranks = []
         inst.reset()
 
     @classmethod
@@ -232,7 +312,10 @@ class ElasticEPStateManager:
         inst.scale_phase = "failed"
         inst.last_error = error
         inst.pending_since = None
-        inst.reset()
+        inst.pending_recover_ranks = []
+        # Skip reset() if mask has already been partially flipped (mirrors Mooncake ground truth).
+        if not inst.mask_dirty:
+            inst.reset()
 
     @classmethod
     def fail_recovery(cls, error: str) -> None:
@@ -241,6 +324,15 @@ class ElasticEPStateManager:
             return
         inst.scale_phase = "recovery_unsupported"
         inst.last_error = error
+
+    @classmethod
+    def set_pending_recover_ranks(cls, ranks: List[int]) -> None:
+        if cls._instance is not None:
+            cls._instance.pending_recover_ranks = list(ranks)
+
+    @classmethod
+    def get_pending_recover_ranks(cls) -> List[int]:
+        return list(cls._instance.pending_recover_ranks) if cls._instance is not None else []
 
     @classmethod
     def get_effective_ep_size(cls) -> int:
@@ -332,6 +424,248 @@ def _refresh_ep_members() -> None:
         buffer.update_ep_member()
 
 
+# Shared across all three store barriers (NIXL retire, WORLD retire, scale_ready).
+_BARRIER_STORE_POLL_S = 0.05
+_BARRIER_EPOCH_CATCH_UP_S = 5.0
+_NIXL_RETIRE_STORE_BARRIER_TIMEOUT_S = 300.0
+# Check windows: full catch-up on the same-tick fold, 200ms on FSM re-ticks.
+_NIXL_RETIRE_STORE_BARRIER_CATCH_UP_FALLBACK_S = 0.2
+_NIXL_RETIRE_ARRIVAL_COUNTER_KEY = "sglang_nixl_retire_arrival_counter"
+_NIXL_RETIRE_CYCLE_KEY = "sglang_nixl_retire_cycle_counter"
+
+# Per-namespace last-observed cycle id (NIXL retire barrier + WORLD retire barrier).
+_last_local_cycle_id: dict[str, int] = {"nixl": 0, "world": 0, "scale_ready": 0}
+
+
+class _BarrierSkip:
+    """Sentinel: no barrier needed. Distinct from None = post failed, so a
+    failed post can't fall through check()==True and flip the mask unsynced."""
+
+    __slots__ = ()
+
+
+BARRIER_SKIP = _BarrierSkip()
+
+
+def _barrier_target_from_effective_ep(rank: int, world_size: int, log_prefix: str) -> int:
+    """Retire barrier target = pre-shrink effective_ep_size (chained shrinks like 4->3->2)."""
+    try:
+        effective = ElasticEPStateManager.get_effective_ep_size()
+        if effective > 0:
+            return effective
+    except Exception as exc:
+        logger.debug("%s rank=%d get_effective_ep_size failed (%s)", log_prefix, rank, exc)
+    return world_size
+
+
+def _rollback_arrival_counter(store, rank: int, key: str) -> None:
+    """Undo this rank's arrival. Decrement, not reset: set(0) stomps peers'
+    arrivals, so the next one reads 1 and mints a second leader for the cycle."""
+    try:
+        store.add(key, -1)
+    except Exception as exc:
+        logger.debug("[Elastic EP][retire] rank=%d ARRIVAL rollback on %s failed (%s)", rank, key, exc)
+
+
+def _reset_arrival_counter(rank: int, key: str, epoch: int, log_prefix: str) -> None:
+    """Leader-only: zero ARRIVAL so the next cycle's first arrival reads 1."""
+    try:
+        store = get_global_tcp_store()
+        if store is not None:
+            store.set(key, "0")
+    except Exception as exc:
+        logger.debug("%s rank=%d ARRIVAL reset failed e=%d (%s)", log_prefix, rank, epoch, exc)
+
+
+def _derive_epoch_via_store(
+    store, rank: int, *,
+    arrival_key: str, cycle_key: str, catch_up_s: float,
+    cycle_ns: str, log_prefix: str,
+) -> tuple[Optional[int], int]:
+    """Elected-leader epoch derivation over the shared TCPStore. arrival 1 = leader,
+    >=2 = follower; epoch=None leaves fallback and arrival rollback to the caller."""
+    try:
+        arrival = int(store.add(arrival_key, 1))
+    except Exception as exc:
+        logger.debug("%s rank=%d arrival add failed (%s)", log_prefix, rank, exc)
+        return None, 0
+    if arrival == 1:
+        try:
+            epoch = int(store.add(cycle_key, 1))
+            _last_local_cycle_id[cycle_ns] = epoch
+            return epoch, arrival
+        except Exception as exc:
+            logger.debug("%s rank=%d cycle add failed (%s)", log_prefix, rank, exc)
+            return None, arrival
+    prev = _last_local_cycle_id[cycle_ns]
+    deadline = time.monotonic() + catch_up_s
+    while time.monotonic() < deadline:
+        try:
+            raw = store.get(cycle_key)
+            candidate = int(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            candidate = prev
+        if candidate > prev:
+            _last_local_cycle_id[cycle_ns] = candidate
+            return candidate, arrival
+        time.sleep(0.05)
+    logger.warning("%s rank=%d arrival=%d cycle id timeout %.1fs",
+                   log_prefix, rank, arrival, catch_up_s)
+    return None, arrival
+
+
+@dataclass
+class _NixlRetireBarrierState:
+    """NIXL retire barrier handle (store-counter only, no Work)."""
+    epoch: int
+    world_size: int
+    ready_key: str
+    rank: int
+    arrival: int
+    posted_at: float
+    first_check: bool = True
+
+
+def _pre_nixl_retire(
+    retiree_global_ranks: List[int],
+    my_elastic_global_rank: Optional[int] = None,
+) -> None:
+    """Survivor-side NIXL peer disconnect before retire barrier. No-op on retiree."""
+    from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+
+    if NixlEPBuffer._state().buffer is None or not torch.distributed.is_initialized():
+        return
+    my_rank = (my_elastic_global_rank if my_elastic_global_rank is not None
+               else torch.distributed.get_rank())
+    if my_rank in retiree_global_ranks:
+        return
+    t0 = time.monotonic()
+    NixlEPBuffer.on_retire(retiree_global_ranks)
+    logger.info("[Elastic EP][retire] rank=%d nixl on_retire took %.3fs",
+                my_rank, time.monotonic() - t0)
+
+
+def nixl_retire_barrier_post(
+    retiree_global_ranks: List[int],
+) -> Union[_NixlRetireBarrierState, _BarrierSkip, None]:
+    """Post async NIXL retire barrier over the global TCPStore (elected-leader epoch).
+
+    BARRIER_SKIP = nothing to synchronize; None = post failed, caller must retry.
+    """
+    from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+
+    if NixlEPBuffer._state().buffer is None or not torch.distributed.is_initialized():
+        return BARRIER_SKIP
+
+    my_rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    barrier_target = _barrier_target_from_effective_ep(my_rank, world_size, "[Elastic EP][retire]")
+
+    try:
+        store = get_global_tcp_store()
+    except Exception as exc:
+        logger.warning("[Elastic EP][retire] rank=%d TCPStore lookup failed (%s)", my_rank, exc)
+        return None
+    if store is None:
+        logger.warning("[Elastic EP][retire] rank=%d no TCPStore", my_rank)
+        return None
+
+    epoch, arrival = _derive_epoch_via_store(
+        store, my_rank,
+        arrival_key=_NIXL_RETIRE_ARRIVAL_COUNTER_KEY,
+        cycle_key=_NIXL_RETIRE_CYCLE_KEY,
+        catch_up_s=_BARRIER_EPOCH_CATCH_UP_S,
+        cycle_ns="nixl",
+        log_prefix="[Elastic EP][retire]",
+    )
+    if epoch is None:
+        if arrival > 0:
+            _rollback_arrival_counter(store, my_rank, _NIXL_RETIRE_ARRIVAL_COUNTER_KEY)
+        return None
+
+    ready_key = f"sglang_nixl_retire_barrier_e{epoch}_posted"
+    try:
+        posted = int(store.add(ready_key, 1))
+    except Exception as exc:
+        logger.warning("[Elastic EP][retire] rank=%d ready_key add failed e=%d (%s)", my_rank, epoch, exc)
+        if arrival == 1:
+            try:
+                store.add(_NIXL_RETIRE_CYCLE_KEY, -1)
+            except Exception:
+                pass
+            _rollback_arrival_counter(store, my_rank, _NIXL_RETIRE_ARRIVAL_COUNTER_KEY)
+            _last_local_cycle_id["nixl"] = epoch - 1
+        return None
+
+    logger.info("[Elastic EP][retire] rank=%d posted arr=%d e=%d %d/%d ws=%d",
+                my_rank, arrival, epoch, posted, barrier_target, world_size)
+    return _NixlRetireBarrierState(
+        epoch=epoch, world_size=barrier_target, ready_key=ready_key,
+        rank=my_rank, arrival=arrival, posted_at=time.monotonic(),
+    )
+
+
+def nixl_retire_barrier_check(
+    state: Union[_NixlRetireBarrierState, _BarrierSkip, None],
+) -> bool:
+    """Non-blocking probe: True when every cohort rank posted. TimeoutError at 300s."""
+    if isinstance(state, _BarrierSkip):
+        return True
+    if state is None:
+        return False  # post failed: fail closed so the FSM re-posts
+
+
+    try:
+        store = get_global_tcp_store()
+    except Exception:
+        store = None
+    if store is None:
+        if time.monotonic() - state.posted_at > _NIXL_RETIRE_STORE_BARRIER_TIMEOUT_S:
+            raise TimeoutError(
+                f"[Elastic EP][retire] rank={state.rank} store unavailable "
+                f"{_NIXL_RETIRE_STORE_BARRIER_TIMEOUT_S:.0f}s at e={state.epoch}"
+            )
+        return False
+
+    catch_up = (_BARRIER_EPOCH_CATCH_UP_S if state.first_check
+                else _NIXL_RETIRE_STORE_BARRIER_CATCH_UP_FALLBACK_S)
+    state.first_check = False
+    deadline = time.monotonic() + catch_up
+    last_seen: Optional[int] = None
+    while True:
+        try:
+            raw = store.get(state.ready_key)
+            count = int(raw.decode() if isinstance(raw, bytes) else raw)
+            last_seen = count
+            if count >= state.world_size:
+                return True
+        except Exception:
+            pass
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(_BARRIER_STORE_POLL_S)
+
+    if time.monotonic() - state.posted_at > _NIXL_RETIRE_STORE_BARRIER_TIMEOUT_S:
+        raise TimeoutError(
+            f"[Elastic EP][retire] rank={state.rank} e={state.epoch} timeout "
+            f"{last_seen}/{state.world_size} @ {_NIXL_RETIRE_STORE_BARRIER_TIMEOUT_S:.0f}s"
+        )
+    return False
+
+
+def nixl_retire_barrier_consume(
+    state: Union[_NixlRetireBarrierState, _BarrierSkip, None],
+) -> None:
+    """Finalize the barrier; only the leader resets ARRIVAL_KEY."""
+    if state is None or isinstance(state, _BarrierSkip):
+        return
+    if state.arrival == 1:
+        _reset_arrival_counter(state.rank, _NIXL_RETIRE_ARRIVAL_COUNTER_KEY,
+                               state.epoch, "[Elastic EP][retire]")
+    logger.info("[Elastic EP][retire] rank=%d consumed e=%d arr=%d wait=%.3fs",
+                state.rank, state.epoch, state.arrival, time.monotonic() - state.posted_at)
+
+
 _PEER_STATE_POLL_INTERVAL_SEC = 0.01
 
 
@@ -351,13 +685,6 @@ def _map_global_to_group_local_ranks(
     return [rank_to_local[rank] for rank in global_ranks if rank in rank_to_local]
 
 
-def _wait_for_peer_state(backend, ranks: List[int]) -> None:
-    from mooncake.pg import get_peer_state
-
-    while not all(get_peer_state(backend, ranks)):
-        time.sleep(_PEER_STATE_POLL_INTERVAL_SEC)
-
-
 def _maybe_create_message_queue(group) -> None:
     if not group.use_message_queue_broadcaster or group.world_size <= 1:
         return
@@ -369,7 +696,140 @@ def _maybe_create_message_queue(group) -> None:
     )
 
 
-def _try_recover_world(global_ranks: List[int]) -> bool:
+# Post-scale barrier keys. TCPStore replaces dist.barrier(WORLD) here because
+# Mooncake's bitmap is transiently inconsistent with our active_ranks flip while
+# it digests retirees' negative link events; TCPStore is torch-only.
+_SCALE_READY_ARRIVAL_KEY = "sglang_scale_ready_arrival_counter"
+_SCALE_READY_CYCLE_KEY = "sglang_scale_ready_cycle_counter"
+
+
+def _scale_ready_ready_key(epoch: int) -> str:
+    return f"sglang_scale_ready_e{epoch}_posted"
+
+
+def mooncake_all_reduce_transient_retry(tensor, *, op, group, total_budget_s: float = 30.0,
+                                         base_backoff_s: float = 0.05,
+                                         max_backoff_s: float = 2.0) -> None:
+    """WORLD all_reduce, retrying Mooncake's transient ``rank is not active in
+    this group``: its group-active bitmap can lag our ``active_ranks`` flip by
+    seconds after a scale. Any other error propagates unchanged.
+    """
+    deadline = time.monotonic() + total_budget_s
+    last = None
+    i = 0
+    while True:
+        try:
+            torch.distributed.all_reduce(tensor, op=op, group=group)
+            return
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "invalid state" not in msg or "rank is not active" not in msg:
+                raise
+            last = exc
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        sleep_s = min(base_backoff_s * (1 << i), max_backoff_s, remaining)
+        time.sleep(sleep_s)
+        i += 1
+    raise RuntimeError(
+        f"Mooncake WORLD all_reduce still transient after {total_budget_s:.1f}s: {last}"
+    )
+
+
+def mooncake_world_settle_probe(*, total_budget_s: float = 30.0) -> None:
+    """Drive a WORLD all_reduce off the hot path so Mooncake's bitmap converges
+    before the next scheduler tick. Warn-only: aborting the finalizer would
+    strand ``effective_ep_size`` pre-shrink while dp/mask read post-shrink. The
+    dp_attn call-site retry is the safety net.
+    """
+    if not torch.distributed.is_initialized():
+        return
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    probe = torch.zeros(1, dtype=torch.int64, device=device)
+    try:
+        mooncake_all_reduce_transient_retry(
+            probe,
+            op=torch.distributed.ReduceOp.SUM,
+            group=None,  # WORLD
+            total_budget_s=total_budget_s,
+        )
+    except RuntimeError as exc:
+        logger.warning("[Elastic EP] settle probe timed out after %.1fs; "
+                       "dp_attn retry will absorb: %s", total_budget_s, exc)
+
+
+def scale_ready_barrier_via_store(target_size: int, *, timeout_s: float = 60.0) -> None:
+    """Post-scale WORLD sync via TCPStore (Mooncake-free).
+
+    Leader-elected per-scale epoch (mirrors ``retire_barrier_post``).
+    ``target_size`` = post-scale live ranks (excludes retirees).
+    """
+    if not torch.distributed.is_initialized():
+        return
+
+    try:
+        store = get_global_tcp_store()
+    except Exception as exc:
+        logger.warning("[Elastic EP][scale_ready] no TCPStore (%s); skipping", exc)
+        return
+    if store is None:
+        return
+
+    rank = torch.distributed.get_rank()
+    epoch, arrival = _derive_epoch_via_store(
+        store, rank,
+        arrival_key=_SCALE_READY_ARRIVAL_KEY,
+        cycle_key=_SCALE_READY_CYCLE_KEY,
+        catch_up_s=_BARRIER_EPOCH_CATCH_UP_S,
+        cycle_ns="scale_ready",
+        log_prefix="[Elastic EP][scale_ready]",
+    )
+    if epoch is None:
+        if arrival > 0:
+            _rollback_arrival_counter(store, rank, _SCALE_READY_ARRIVAL_KEY)
+        logger.warning("[Elastic EP][scale_ready] rank=%d epoch derive failed; skipping", rank)
+        return
+
+    ready_key = _scale_ready_ready_key(epoch)
+    try:
+        store.add(ready_key, 1)
+    except Exception as exc:
+        logger.warning("[Elastic EP][scale_ready] rank=%d e=%d add failed (%s)",
+                       rank, epoch, exc)
+        return
+
+    deadline = time.monotonic() + timeout_s
+    last_count = 0
+    reached = False
+    while time.monotonic() < deadline:
+        try:
+            raw = store.get(ready_key)
+            last_count = int(raw.decode() if isinstance(raw, bytes) else raw)
+            if last_count >= target_size:
+                reached = True
+                break
+        except Exception:
+            pass
+        time.sleep(_BARRIER_STORE_POLL_S)
+
+    if arrival == 1:
+        _reset_arrival_counter(rank, _SCALE_READY_ARRIVAL_KEY, epoch, "[Elastic EP][scale_ready]")
+
+    if not reached:
+        raise RuntimeError(
+            f"[Elastic EP][scale_ready] rank={rank} e={epoch} timeout after "
+            f"{timeout_s}s (count={last_count} / target={target_size})"
+        )
+
+
+def _try_recover_world(
+    global_ranks: List[int],
+    *,
+    include_subgroups: bool = False,
+) -> bool:
+    """Recover WORLD-scope Mooncake peers. include_subgroups also recovers _WORLD sub-PGs
+    (recover-mode only; scale-up-v1 must pass False to avoid sub-PG ID mismatch)."""
     from mooncake.pg import get_peer_state, recover_ranks
 
     world_backend = torch.distributed.group.WORLD
@@ -378,64 +838,72 @@ def _try_recover_world(global_ranks: List[int]) -> bool:
 
     recover_ranks(world_backend, global_ranks)
     logger.debug("[Elastic EP][recover] WORLD recover_ranks(%s) done", global_ranks)
+
+    if not include_subgroups:
+        return True
+
+    _WORLD_RECOVER_WAIT_TIMEOUT_S = 60.0
+    world_group = parallel_state._WORLD
+    if world_group is not None:
+        for pg in (world_group.device_group, world_group.cpu_group):
+            if pg is None or pg is world_backend:
+                continue
+            wait_start = time.monotonic()
+            while not all(get_peer_state(pg, global_ranks)):
+                if time.monotonic() - wait_start > _WORLD_RECOVER_WAIT_TIMEOUT_S:
+                    return False
+                time.sleep(_PEER_STATE_POLL_INTERVAL_SEC)
+            recover_ranks(pg, global_ranks)
+    return True
+
+
+def _activate(global_ranks: List[int], include_subgroups: bool) -> bool:
+    if not _try_recover_world(global_ranks, include_subgroups=include_subgroups):
+        return False
+    inst = ElasticEPStateManager.instance()
+    if inst is not None:
+        inst.activate_ranks(global_ranks)
+    for group in _iter_live_parallel_groups():
+        _flip_active_rank_mask(group, global_ranks, value=1)
+        _maybe_create_message_queue(group)
+    _flip_world_backend_active_rank_mask(global_ranks, value=1)
+    _refresh_ep_members()
     return True
 
 
 def try_admit_scale_ranks(global_ranks: List[int]) -> bool:
-    """Admit append-only ranks into the expandable WORLD group."""
-    if not _try_recover_world(global_ranks):
-        return False
-
-    _refresh_ep_members()
-    return True
+    """Scale-up-v1 append (no sub-PG join)."""
+    return _activate(global_ranks, include_subgroups=False)
 
 
 def try_recover_ranks(global_ranks: List[int]) -> bool:
-    """Recover ranks in WORLD and every launch-time parallel group."""
-    if not _try_recover_world(global_ranks):
-        return False
-
-    from mooncake.pg import recover_ranks
-
-    for group in _iter_live_parallel_groups():
-        local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
-        if not local_ranks:
-            continue
-
-        _wait_for_peer_state(group.device_group, local_ranks)
-        recover_ranks(group.device_group, local_ranks)
-        _wait_for_peer_state(group.cpu_group, local_ranks)
-        recover_ranks(group.cpu_group, local_ranks)
-        _maybe_create_message_queue(group)
-
-    _refresh_ep_members()
-    return True
+    """Recover ranks in WORLD + sub-PGs."""
+    return _activate(global_ranks, include_subgroups=True)
 
 
-def _join_world_group() -> None:
+def _join_world_group(*, include_subgroups: bool = False) -> None:
     from mooncake.pg import join_group
-
-    join_group(torch.distributed.group.WORLD)
+    world_backend = torch.distributed.group.WORLD
+    join_group(world_backend)
+    if not include_subgroups:
+        return
+    world_group = parallel_state._WORLD
+    if world_group is not None:
+        for pg in (world_group.device_group, world_group.cpu_group):
+            if pg is None or pg is world_backend:
+                continue
+            join_group(pg)
 
 
 def join_scale_process_group() -> None:
-    """Join the expandable WORLD group for an append-only scale operation."""
-    _join_world_group()
+    """Scale-up-v1 append join (no sub-PG join)."""
+    _join_world_group(include_subgroups=False)
     _refresh_ep_members()
 
 
 def join_process_groups() -> None:
-    """Rejoin WORLD and every launch-time parallel group after recovery."""
-    from mooncake.pg import join_group
-
-    _join_world_group()
-    for group in _iter_live_parallel_groups():
-        if group.world_size <= 1:
-            continue
-        join_group(group.device_group)
-        join_group(group.cpu_group)
-        _maybe_create_message_queue(group)
-
+    """Recover-mode grow join (includes sub-PGs)."""
+    _join_world_group(include_subgroups=True)
     _refresh_ep_members()
 
 
@@ -518,3 +986,197 @@ def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
         except StopIteration:
             break
     return True
+
+
+def _flip_mask(ranks: List[int], active_ranks, active_ranks_cpu, global_ranks, value: int) -> None:
+    """Flip active_ranks[local_r] = value for every global rank in this group."""
+    if active_ranks is None:
+        return
+    for lr in _map_global_to_group_local_ranks(ranks, global_ranks):
+        active_ranks[lr] = value
+        if active_ranks_cpu is not None:
+            active_ranks_cpu[lr] = value
+
+
+def _flip_world_backend_active_rank_mask(global_ranks: List[int], value: int) -> None:
+    _flip_mask(parallel_state.get_world_backend_ranks(),
+               parallel_state.get_world_backend_active_ranks(), None,
+               global_ranks, value)
+
+
+def _flip_active_rank_mask(group, global_ranks: List[int], value: int) -> None:
+    _flip_mask(group.ranks, getattr(group, "active_ranks", None),
+               getattr(group, "active_ranks_cpu", None), global_ranks, value)
+
+
+def try_retire_ranks(global_ranks: List[int]) -> bool:
+    """Retire ranks in WORLD + every sub-PG. Mooncake has no retire (direct in-place write)."""
+    if not global_ranks:
+        return True
+
+    # NIXL retire handshake is driven asynchronously by ScaleDownStateMachine.NIXL_RETIRE.
+
+    inst = ElasticEPStateManager.instance()
+    if inst is not None:
+        inst.deactivate_ranks(global_ranks)
+
+    for group in _iter_live_parallel_groups():
+        _flip_active_rank_mask(group, global_ranks, value=0)
+    _flip_world_backend_active_rank_mask(global_ranks, value=0)
+    _refresh_ep_members()
+    logger.debug("[Elastic EP][retire] retire_ranks(%s) done", global_ranks)
+    return True
+
+
+@dataclass
+class _RetireBarrierState:
+    """Async retire barrier handle: async Work + TCPStore counter (Work.is_completed flaky)."""
+
+    handle: Optional["torch.distributed.Work"]
+    epoch: int
+    world_size: int
+    ready_key: str
+    rank: int
+    arrival: int = 0
+    # False if ready_key increment failed; skip store fast-path (never reaches world_size).
+    store_confirmed: bool = True
+    # True when shared-store leader election failed; ARRIVAL_KEY needs a cleaner reset.
+    used_fallback_epoch: bool = False
+    # True when store fast-path observed count >= world_size (safe to swallow wait() errors).
+    check_confirmed_via_store: bool = False
+
+
+# Per-process fallback counter (only when shared TCPStore is unreachable).
+_RETIRE_BARRIER_EPOCH = 0
+
+# Shared TCPStore keys for elected-leader epoch derivation.
+_RETIRE_BARRIER_ARRIVAL_COUNTER_KEY = "sglang_retire_barrier_arrival_counter"
+_RETIRE_BARRIER_CYCLE_KEY = "sglang_retire_barrier_cycle_counter"
+
+
+def _retire_barrier_ready_key(epoch: int) -> str:
+    return f"sglang_retire_barrier_e{epoch}_posted"
+
+
+def retire_barrier_post() -> Union[_RetireBarrierState, _BarrierSkip]:
+    """Async WORLD barrier posted before mask flip; poll via retire_barrier_check.
+
+    Async so mlp_sync (separate PG) doesn't deadlock. Store-backed epoch is authoritative;
+    handle.wait() only if store unreachable.
+    """
+    global _RETIRE_BARRIER_EPOCH
+    if not torch.distributed.is_initialized():
+        return BARRIER_SKIP
+    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+    barrier_target = _barrier_target_from_effective_ep(rank, world_size, "[Elastic EP][retire_barrier]")
+
+    try:
+        store = get_global_tcp_store()
+    except Exception:
+        store = None
+
+    epoch, arrival, used_fallback_epoch = None, 0, False
+    if store is not None:
+        epoch, arrival = _derive_epoch_via_store(
+            store, rank,
+            arrival_key=_RETIRE_BARRIER_ARRIVAL_COUNTER_KEY,
+            cycle_key=_RETIRE_BARRIER_CYCLE_KEY,
+            catch_up_s=_BARRIER_EPOCH_CATCH_UP_S,
+            cycle_ns="world",
+            log_prefix="[Elastic EP][retire_barrier]",
+        )
+        if epoch is None and arrival > 0:
+            # Derivation failed: undo ARRIVAL so next cycle isn't stuck.
+            _rollback_arrival_counter(store, rank, _RETIRE_BARRIER_ARRIVAL_COUNTER_KEY)
+    if epoch is None:
+        used_fallback_epoch = True
+        _RETIRE_BARRIER_EPOCH += 1
+        epoch = _RETIRE_BARRIER_EPOCH
+
+    logger.info("[Elastic EP][retire_barrier] rank=%d post async e=%d arr=%d", rank, epoch, arrival)
+    handle = torch.distributed.barrier(group=torch.distributed.group.WORLD, async_op=True)
+
+    ready_key = _retire_barrier_ready_key(epoch)
+    store_confirmed = store is not None
+    if store is not None:
+        try:
+            store.add(ready_key, 1)
+        except Exception as exc:
+            logger.warning("[Elastic EP][retire_barrier] rank=%d ready_key add fail e=%d (%s)",
+                           rank, epoch, exc)
+            store_confirmed = False
+
+    return _RetireBarrierState(
+        handle=handle, epoch=epoch, world_size=barrier_target,
+        ready_key=ready_key, rank=rank, arrival=arrival,
+        store_confirmed=store_confirmed, used_fallback_epoch=used_fallback_epoch,
+    )
+
+
+def retire_barrier_check(
+    state: Union[_RetireBarrierState, _BarrierSkip, None],
+) -> bool:
+    """Non-blocking probe: True when every rank posted (TCPStore fast-path)."""
+    if isinstance(state, _BarrierSkip):
+        return True
+    if state is None:
+        return False
+    if state.store_confirmed:
+        try:
+            store = get_global_tcp_store()
+            if store is not None:
+                raw = store.get(state.ready_key)
+                if int(raw.decode() if isinstance(raw, bytes) else raw) >= state.world_size:
+                    state.check_confirmed_via_store = True
+                    return True
+        except Exception:
+            pass
+    if state.handle is None:
+        return True
+    return state.handle.is_completed()
+
+
+_RETIRE_BARRIER_CONSUME_TIMEOUT_S = 30.0
+
+
+def retire_barrier_consume(
+    state: Union[_RetireBarrierState, _BarrierSkip, None],
+) -> None:
+    """Finalize the barrier after check()=True. Bounded wait() (Mooncake WORLD hang guard)."""
+    if state is None or isinstance(state, _BarrierSkip):
+        return
+    t0 = time.monotonic()
+    if state.handle is not None:
+        try:
+            state.handle.wait(timeout=timedelta(seconds=_RETIRE_BARRIER_CONSUME_TIMEOUT_S))
+        except TypeError:
+            state.handle.wait()
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            if state.check_confirmed_via_store:
+                logger.warning("[Elastic EP][retire_barrier] rank=%d wait(e=%d) %.1fs (%s); store OK",
+                               state.rank, state.epoch, elapsed, exc)
+            else:
+                raise RuntimeError(
+                    f"[Elastic EP][retire_barrier] rank={state.rank} wait(e={state.epoch}) "
+                    f"failed after {elapsed:.1f}s ({exc}); store NOT confirmed"
+                ) from exc
+
+    # Leader (arr==1) or fallback second-follower (arr==2) resets ARRIVAL_KEY; safe (lockstep).
+    if state.arrival == 1 or (state.used_fallback_epoch and state.arrival == 2):
+        _reset_arrival_counter(state.rank, _RETIRE_BARRIER_ARRIVAL_COUNTER_KEY,
+                               state.epoch, "[Elastic EP][retire_barrier]")
+    logger.info("[Elastic EP][retire_barrier] rank=%d consumed e=%d wait=%.3fs",
+                state.rank, state.epoch, time.monotonic() - t0)
+
+
+def retiree_local_cleanup() -> None:
+    """CUDA quiesce before sys.exit(0) (no destroy_process_group; peers still live)."""
+    if torch.cuda.is_available():
+        t0 = time.monotonic()
+        torch.cuda.synchronize()
+        t_sync = time.monotonic() - t0
+        torch.cuda.empty_cache()
+        logger.info("[Elastic EP] retiree_local_cleanup sync=%.3fs empty=%.3fs",
+                    t_sync, time.monotonic() - t0 - t_sync)
