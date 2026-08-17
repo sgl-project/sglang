@@ -190,6 +190,43 @@ def _molmo2_rope_init_compat(config: PretrainedConfig):
             ROPE_INIT_FUNCTIONS.pop("default", None)
 
 
+def _patch_molmo2_forward_compat(config: PretrainedConfig) -> None:
+    """Rewrite Molmo2's `trust_remote_code` module bindings so its forward
+    pass works under transformers 5.x.
+
+    `modeling_molmo2.py` calls `create_causal_mask(**mask_kwargs)` with
+    `mask_kwargs["input_embeds"]` (singular). transformers 5.x's
+    `create_causal_mask` takes `inputs_embeds` (plural) — the singular form
+    was never accepted upstream. Molmo2 captured `create_causal_mask` at
+    module import via `from transformers.masking_utils import ...`, so a
+    global monkey-patch on `transformers.masking_utils` does not reach the
+    module's local binding. Rebind that local reference to a wrapper that
+    renames the offending kwarg.
+
+    Self-gates on `config.model_type == "molmo2"`; a no-op for every other
+    model, and idempotent if invoked multiple times.
+    """
+    if getattr(config, "model_type", None) != _MOLMO2_MODEL_TYPE:
+        return
+
+    import sys
+
+    for module_name, module in list(sys.modules.items()):
+        if not module_name.endswith(".modeling_molmo2"):
+            continue
+        original = getattr(module, "create_causal_mask", None)
+        if original is None or getattr(original, "_molmo2_kwargs_shim", False):
+            continue
+
+        def _renaming_wrapper(*args, __original=original, **kwargs):
+            if "input_embeds" in kwargs and "inputs_embeds" not in kwargs:
+                kwargs["inputs_embeds"] = kwargs.pop("input_embeds")
+            return __original(*args, **kwargs)
+
+        _renaming_wrapper._molmo2_kwargs_shim = True
+        module.create_causal_mask = _renaming_wrapper
+
+
 def _hf_auto_model_class_for_config(config: PretrainedConfig):
     """Return the HF `AutoModel*` class best matching the config's auto_map.
 
@@ -722,6 +759,7 @@ class TransformersBase(nn.Module):
                         torch_dtype=torch.get_default_dtype(),
                         trust_remote_code=True,
                     )
+            _patch_molmo2_forward_compat(self.config)
         else:
             raise ValueError(
                 f"Model {model_cls} does not support custom attention backends "
