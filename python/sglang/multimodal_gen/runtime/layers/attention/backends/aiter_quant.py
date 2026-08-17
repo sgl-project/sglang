@@ -3,7 +3,7 @@
 # Quantized AITER attention family backend (ROCm / gfx950).
 #
 # One backend, several quant formats selected via --attention-backend-config
-# (e.g. `format=mxfp4`). 
+# (e.g. `format=mxfp4`).
 
 import inspect
 from collections.abc import Callable
@@ -43,22 +43,22 @@ _DEFAULT_FORMAT = "fp8"
 # error.
 # ---------------------------------------------------------------------------
 try:
+    from aiter.ops.mha_v4 import AttentionFormat as _AiterAttentionFormat
+    from aiter.ops.mha_v4 import mha_v4_packed as _aiter_mha_v4_packed
+    from aiter.ops.mha_v4 import mha_v4_q_multiplier as _aiter_mha_v4_q_multiplier
+    from aiter.ops.mha_v4 import mxfp4_k_view as _aiter_mxfp4_k_view
+    from aiter.ops.mha_v4 import mxfp4_v_view as _aiter_mxfp4_v_view
+    from aiter.ops.mha_v4 import mxfp6_k_view as _aiter_mxfp6_k_view
+    from aiter.ops.mha_v4 import native_fp8_format as _aiter_native_fp8_format
+    from aiter.ops.mha_v4 import quantize_fp8 as _aiter_mha_v4_quantize_fp8
+    from aiter.ops.mha_v4 import quantize_int8 as _aiter_mha_v4_quantize_int8
+    from aiter.ops.mha_v4 import quantize_mxfp4_k as _aiter_quantize_mxfp4_k
+    from aiter.ops.mha_v4 import quantize_mxfp4_q as _aiter_quantize_mxfp4_q
+    from aiter.ops.mha_v4 import quantize_mxfp6_k as _aiter_quantize_mxfp6_k
+    from aiter.ops.mha_v4 import quantize_mxfp6_q as _aiter_quantize_mxfp6_q
+    from aiter.ops.mha_v4 import quantize_v_fp8 as _aiter_quantize_v_fp8
+    from aiter.ops.mha_v4 import quantize_v_mxfp4 as _aiter_quantize_v_mxfp4
     from aiter.ops.mha_v4 import (
-        AttentionFormat as _AiterAttentionFormat,
-        mha_v4_packed as _aiter_mha_v4_packed,
-        mha_v4_q_multiplier as _aiter_mha_v4_q_multiplier,
-        mxfp4_k_view as _aiter_mxfp4_k_view,
-        mxfp4_v_view as _aiter_mxfp4_v_view,
-        mxfp6_k_view as _aiter_mxfp6_k_view,
-        native_fp8_format as _aiter_native_fp8_format,
-        quantize_fp8 as _aiter_mha_v4_quantize_fp8,
-        quantize_int8 as _aiter_mha_v4_quantize_int8,
-        quantize_mxfp4_k as _aiter_quantize_mxfp4_k,
-        quantize_mxfp4_q as _aiter_quantize_mxfp4_q,
-        quantize_mxfp6_k as _aiter_quantize_mxfp6_k,
-        quantize_mxfp6_q as _aiter_quantize_mxfp6_q,
-        quantize_v_fp8 as _aiter_quantize_v_fp8,
-        quantize_v_mxfp4 as _aiter_quantize_v_mxfp4,
         scale_modes_for_formats as _aiter_scale_modes_for_formats,
     )
 
@@ -117,9 +117,7 @@ def _build_hadamard_matrix(
         ), "Hadamard block_r must be a positive power of 2"
         H = torch.ones((1, 1), dtype=torch.float32)
         while H.shape[0] < block_r:
-            H = torch.cat(
-                [torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)], dim=0
-            )
+            H = torch.cat([torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)], dim=0)
         return (H / (block_r**0.5)).to(dtype)
 
 
@@ -130,9 +128,7 @@ def _replicate_hadamard_per_device(
     torch.device (all GPUs if CUDA is available, else CPU). A None matrix maps
     to None on every device."""
     if torch.cuda.is_available():
-        devices = [
-            torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())
-        ]
+        devices = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
     else:
         devices = [torch.device("cpu")]
     return {
@@ -191,13 +187,14 @@ AITER_FP8_HAS_DESCALE = _aiter_fp8_has_descale()
 
 
 # ---------------------------------------------------------------------------
-# Quant ops + kernel launches, one torch.library.custom_op each. 
-# Separate Q/K/V quant ops let Ulysses overlap each preprocessing path with 
-# its independent all-to-all; the kernel launch stays a custom op so 
-# torch.compile observes the native mutation/aliasing contract. 
-# Quant-op fakes call the real aiter op since the packed shapes are 
+# Quant ops + kernel launches, one torch.library.custom_op each.
+# Separate Q/K/V quant ops let Ulysses overlap each preprocessing path with
+# its independent all-to-all; the kernel launch stays a custom op so
+# torch.compile observes the native mutation/aliasing contract.
+# Quant-op fakes call the real aiter op since the packed shapes are
 # format-specific and cheap to derive.
 # ---------------------------------------------------------------------------
+
 
 # --- fp8 -------------------------------------------------------------------
 @torch.library.custom_op("sgl_diffusion::aiter_fp8_attention", mutates_args=())
@@ -387,9 +384,7 @@ def _aiter_mxfp4_quantize_q_fake(query, softmax_scale):
     return _aiter_quantize_mxfp4_q(query, _aiter_mha_v4_q_multiplier(softmax_scale))
 
 
-@torch.library.custom_op(
-    "sgl_diffusion::aiter_mxfp4_quantize_k_raw", mutates_args=()
-)
+@torch.library.custom_op("sgl_diffusion::aiter_mxfp4_quantize_k_raw", mutates_args=())
 def _aiter_mxfp4_quantize_k_raw(
     key: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -577,9 +572,7 @@ def _aiter_mxfp6_quantize_q_fake(query, softmax_scale):
     return _aiter_quantize_mxfp6_q(query, _aiter_mha_v4_q_multiplier(softmax_scale))
 
 
-@torch.library.custom_op(
-    "sgl_diffusion::aiter_mxfp6_quantize_k_raw", mutates_args=()
-)
+@torch.library.custom_op("sgl_diffusion::aiter_mxfp6_quantize_k_raw", mutates_args=())
 def _aiter_mxfp6_quantize_k_raw(
     key: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -722,7 +715,14 @@ def _forward_f6f4(
     k_buf, k_scale_buf = _aiter_mxfp6_quantize_k_raw(key)
     v_buf, v_scale = _aiter_f4_quantize_v_raw(value)
     return _aiter_f6f4_kernel_raw(
-        k_buf, k_scale_buf, q_fp6, q_scale, v_buf, v_scale, softmax_scale, value.shape[1]
+        k_buf,
+        k_scale_buf,
+        q_fp6,
+        q_scale,
+        v_buf,
+        v_scale,
+        softmax_scale,
+        value.shape[1],
     )
 
 
@@ -802,9 +802,7 @@ class AITERQuantImpl(AttentionImpl):
                 f"got {head_size}."
             )
         if not is_gfx95_supported():
-            raise RuntimeError(
-                "AITER quant backend requires a gfx950-class arch."
-            )
+            raise RuntimeError("AITER quant backend requires a gfx950-class arch.")
         if not _AITER_MHA_V4_AVAILABLE:
             raise RuntimeError(
                 "AITER quant backend requires aiter.ops.mha_v4, which is not "
