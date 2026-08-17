@@ -2439,9 +2439,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
-        if self.quant_config.use_per_token_activation:
+        use_cutedsl_w4a16 = (
+            self._is_cutedsl_v2_standard
+            and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+        )
+        if self.quant_config.use_per_token_activation or use_cutedsl_w4a16:
             # FlashInfer computes activation scales dynamically per token, so
             # the static checkpoint activation scale is intentionally neutral.
+            # CuTe DSL W4A16 keeps activations in BF16, so its GEMM alphas must
+            # likewise contain only the NVFP4 weight decode scales.
             w13_input_scale = torch.ones_like(w13_input_scale, dtype=torch.float32)
             w2_input_scale = torch.ones_like(w2_input_scale, dtype=torch.float32)
 
@@ -2499,8 +2505,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 )
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
-        use_dispatch_fp4 = not self.quant_config.use_per_token_activation and (
-            MOE_NVFP4_DISPATCH or should_use_flashinfer_cutlass_moe_fp4_allgather()
+        use_dispatch_fp4 = (
+            not self.quant_config.use_per_token_activation
+            and not use_cutedsl_w4a16
+            and (
+                MOE_NVFP4_DISPATCH or should_use_flashinfer_cutlass_moe_fp4_allgather()
+            )
         )
 
         layer.dispatcher.set_quant_config(
@@ -2815,6 +2825,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             )
 
             if self._is_cutedsl_v1_deepep:
+                if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
+                    raise ValueError(
+                        "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 does not support "
+                        "the CuTe DSL v1 DeepEP masked MoE path."
+                    )
                 # v1 path: DeepEP low-latency + flashinfer_cutedsl_moe_masked.
                 # Weights are [Gate, Up] (non-interleaved) with swizzled blockscales.
                 quant_info = CuteDslFp4MoeQuantInfo(
@@ -2837,6 +2852,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # with [Up, Gate] interleaved weights and MMA blockscales.
             ensure_cutedsl_wrapper(layer)
             w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
+            use_w4a16 = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
             quant_info = CuteDslFp4MoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -2851,7 +2867,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 a1_scale=layer._cutedsl_input_scale,
                 a2_scale=fc2_input_scale,
                 wrapper=layer._cutedsl_wrapper,
-                use_per_token_activation=self.quant_config.use_per_token_activation,
+                use_per_token_activation=(
+                    self.quant_config.use_per_token_activation and not use_w4a16
+                ),
+                use_w4a16=use_w4a16,
             )
             return self.runner.run(dispatch_output, quant_info)
 

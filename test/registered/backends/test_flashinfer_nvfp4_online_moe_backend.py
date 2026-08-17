@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=800, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=2400, stage="nightly", runner_config="4-gpu-b200")
 
 
 class FlashinferNvFp4OnlineMoeBackendBase:
@@ -24,10 +24,14 @@ class FlashinferNvFp4OnlineMoeBackendBase:
     extra_env = {}
     eval_args = {}
     spec_accept_length_threshold = None
+    quantization = "nvfp4_online"
 
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
+        quantization_args = (
+            ["--quantization", cls.quantization] if cls.quantization is not None else []
+        )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -43,8 +47,7 @@ class FlashinferNvFp4OnlineMoeBackendBase:
                 "4",
                 "--ep-size",
                 "4",
-                "--quantization",
-                "nvfp4_online",
+                *quantization_args,
                 "--mem-fraction-static",
                 "0.7",
             ],
@@ -130,6 +133,28 @@ class TestFlashinferCuteDSLMoeBackendNvFp4Online(
         "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
         "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "1",
     }
+
+
+class TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16(
+    TestFlashinferCuteDSLMoeBackendNvFp4Online
+):
+    extra_env = {
+        **TestFlashinferCuteDSLMoeBackendNvFp4Online.extra_env,
+        "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16": "1",
+    }
+
+
+class TestFlashinferCuteDSLMoeBackendNvFp4W4A16(
+    TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16
+):
+    model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+    quantization = None
+    extra_env = {"SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16": "1"}
+    extra_args = [
+        *TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16.extra_args,
+        "--model-loader-extra-config",
+        '{"enable_multithread_load": true, "num_threads": 17}',
+    ]
 
 
 if __name__ == "__main__":

@@ -3724,6 +3724,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+        self._validate_cutedsl_nvfp4_w4a16()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -6789,6 +6790,70 @@ class ServerArgs:
                 resolved_view(self).ep_size == 1
             ), "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
 
+    def _validate_cutedsl_nvfp4_w4a16(self):
+        """Validate W4A16 after target and speculative backend resolution."""
+        if not envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
+            return
+
+        import torch
+
+        view = resolved_view(self)
+        model_dtype = self.get_model_config().dtype
+        if model_dtype != torch.bfloat16:
+            raise ValueError(
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1 requires BF16 "
+                "model activations; leave --dtype auto for a BF16 checkpoint "
+                f"or pass --dtype bfloat16, got {model_dtype}."
+            )
+        if view.moe_runner_backend != "flashinfer_cutedsl":
+            raise ValueError(
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1 requires "
+                "--moe-runner-backend flashinfer_cutedsl after backend "
+                f"resolution; got {view.moe_runner_backend!r}."
+            )
+        device_sm = get_device_sm()
+        if device_sm not in (100, 103):
+            raise ValueError(
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1 currently supports "
+                "only NVIDIA SM100-family GPUs (SM100/SM103), "
+                f"got sm{device_sm}."
+            )
+        if envs.SGLANG_MOE_NVFP4_DISPATCH.get():
+            raise ValueError(
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1 requires BF16 MoE "
+                "dispatch; unset SGLANG_MOE_NVFP4_DISPATCH."
+            )
+        if envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get():
+            raise ValueError(
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 and "
+                "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION are mutually "
+                "exclusive."
+            )
+
+        supported_a2a_backends = ("none", "flashinfer")
+        if view.moe_a2a_backend not in supported_a2a_backends:
+            raise ValueError(
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1 requires "
+                "moe_a2a_backend='none' or 'flashinfer'; got "
+                f"{view.moe_a2a_backend!r}."
+            )
+
+        speculative_runner_backend = (
+            view.speculative_moe_runner_backend or view.moe_runner_backend
+        )
+        speculative_a2a_backend = (
+            view.speculative_moe_a2a_backend or view.moe_a2a_backend
+        )
+        if (
+            speculative_runner_backend == "flashinfer_cutedsl"
+            and speculative_a2a_backend not in supported_a2a_backends
+        ):
+            raise ValueError(
+                "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1 does not support "
+                f"speculative MoE A2A backend {speculative_a2a_backend!r} with "
+                "a flashinfer_cutedsl runner; use none or flashinfer."
+            )
+
     def cutedsl_moe_max_num_tokens(self) -> int:
         """Largest number of tokens a single forward routes through a CuteDSL
         MoE layer on one (DP) rank. Single source of truth for both the
@@ -6924,9 +6989,13 @@ class ServerArgs:
             ), "Flashinfer MoE A2A is only supported with dp_size == tp_size and --enable-dp-attention"
             if self.deepep_mode != "auto":
                 logger.warning("--deepep-mode is ignored for Flashinfer MoE A2A")
-            if not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set() and (
-                resolved_view(self).quantization == "modelopt_fp4"
-                or self.get_model_config().nvfp4_moe_meta is not None
+            if (
+                not envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+                and not envs.SGLANG_MOE_NVFP4_DISPATCH.is_set()
+                and (
+                    resolved_view(self).quantization == "modelopt_fp4"
+                    or self.get_model_config().nvfp4_moe_meta is not None
+                )
             ):
                 envs.SGLANG_MOE_NVFP4_DISPATCH.set(True)
                 logger.warning(
