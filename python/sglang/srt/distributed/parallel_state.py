@@ -1928,6 +1928,7 @@ def init_model_parallel_group(
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
+_ATTN_DP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
@@ -1963,6 +1964,11 @@ def get_attn_cp_group() -> GroupCoordinator:
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
     return _ATTN_CP
+
+
+def get_attn_dp_group() -> GroupCoordinator:
+    assert _ATTN_DP is not None, "attention data parallel group is not initialized"
+    return _ATTN_DP
 
 
 def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
@@ -2452,6 +2458,32 @@ def initialize_model_parallel(
     attn_cp_size = attention_context_model_parallel_size
     attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
 
+    global _ATTN_DP
+    assert _ATTN_DP is None, "attention data parallel group is already initialized"
+    if attn_dp_size > 1:
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            tp_group_base = tp_group_idx * tensor_model_parallel_size
+            for cp_idx in range(attn_cp_size):
+                for attn_tp_idx in range(attn_tp_size):
+                    ranks = [
+                        tp_group_base
+                        + dp_idx * attn_cp_size * attn_tp_size
+                        + cp_idx * attn_tp_size
+                        + attn_tp_idx
+                        for dp_idx in range(attn_dp_size)
+                    ]
+                    group_ranks.append(ranks)
+        _ATTN_DP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="attention_dp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
     global _ATTN_CP
     assert (
         _ATTN_CP is None
@@ -2901,6 +2933,11 @@ def destroy_model_parallel():
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None
+
+    global _ATTN_DP
+    if _ATTN_DP:
+        _ATTN_DP.destroy()
+    _ATTN_DP = None
 
     global _PDMUX_PREFILL_TP_GROUP
     if _PDMUX_PREFILL_TP_GROUP:  # type: ignore[union-attr]
