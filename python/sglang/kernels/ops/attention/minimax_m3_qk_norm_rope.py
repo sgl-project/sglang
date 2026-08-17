@@ -623,9 +623,7 @@ def sparse_qk_index_gemma_rmsnorm_rope_cache(
     _n_head_programs = (
         q_heads + k_heads if skip_index else q_heads + k_heads + idx_q_heads + 1
     )
-    _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel[
-        (q.shape[0], _n_head_programs)
-    ](
+    _sparse_qk_index_gemma_rmsnorm_rope_cache_kernel[(q.shape[0], _n_head_programs)](
         q,
         k,
         v,

@@ -46,9 +46,7 @@ def create_flashinfer_kv_indices_triton(
         if span_start < seq_len:
             for j in range(SPAN // BLOCK_SIZE):
                 offset = (
-                    tl.arange(0, BLOCK_SIZE).to(tl.int64)
-                    + span_start
-                    + j * BLOCK_SIZE
+                    tl.arange(0, BLOCK_SIZE).to(tl.int64) + span_start + j * BLOCK_SIZE
                 )
                 mask = offset < seq_len
                 data = tl.load(
@@ -58,9 +56,7 @@ def create_flashinfer_kv_indices_triton(
                     + offset,
                     mask=mask,
                 )
-                tl.store(
-                    kv_indices_ptr + kv_indices_offset + offset, data, mask=mask
-                )
+                tl.store(kv_indices_ptr + kv_indices_offset + offset, data, mask=mask)
     else:
         num_loop = tl.cdiv(kv_end - kv_start, BLOCK_SIZE)
         for i in range(num_loop):
