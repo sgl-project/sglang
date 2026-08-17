@@ -34,6 +34,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
     PI05_ACTION_CI_sampling_params,
     REALTIME_MODEL_sampling_params,
+    SANA_VIDEO_T2V_CI_sampling_params,
     SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
@@ -53,6 +54,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+    DEFAULT_SANA_VIDEO_MODEL_NAME_FOR_TEST,
     DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_I2V_14B_480P_MODEL_NAME_FOR_TEST,
@@ -235,6 +237,17 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
             modality="video",
         ),
+    ),
+    DiffusionTestCase(
+        "sana_video_2b_t2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SANA_VIDEO_MODEL_NAME_FOR_TEST,
+            modality="video",
+        ),
+        SANA_VIDEO_T2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
         "cosmos3_nano_t2v",
@@ -687,7 +700,9 @@ TWO_GPU_CASES = [
                 "--performance-mode",
                 "memory",
                 "--layerwise-offload-components",
-                "dit,text_encoder,vae",
+                "dit,text_encoder",
+                "--component-residency",
+                "vae=resident",
                 "--dit-offload-prefetch-size",
                 "1",
                 "--dit-layerwise-resident-layers",
@@ -1162,6 +1177,7 @@ STANDALONE_FILES = {
         "../single_test_file/test_disagg_server.py",
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
+        "../single_test_file/test_encoder_fold_srt_2_gpu.py",
         "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py",
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
@@ -1200,6 +1216,7 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_ar_models.py": 600.0,
         # no model load; the cost is the one-time JIT build of the sync kernels
         "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
+        "../single_test_file/test_encoder_fold_srt_2_gpu.py": 240.0,
         # ~60 s locally with a warm HF cache (load + one capture + 4 steps);
         # padded for cold-cache CI.
         "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py": 180.0,

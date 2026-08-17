@@ -510,7 +510,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             per_rank_kv_heads = getattr(kv_pool_for_heads, "head_num", 0)
             if per_rank_kv_heads > 0:
                 kv_args.kv_head_num = per_rank_kv_heads
-                kv_args.total_kv_head_num = per_rank_kv_heads * attn_tp_size
+                kv_args.total_kv_head_num = (
+                    self.scheduler.model_config.get_total_num_kv_heads()
+                )
             if hasattr(kv_manager, "set_kv_buffer_tensors"):
                 kv_pool = kv_pool_for_heads
                 if hasattr(kv_pool, "k_buffer") and hasattr(kv_pool, "v_buffer"):
@@ -1100,17 +1102,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
-            if total_prefix_len != 0 and hasattr(
-                self.token_to_kv_pool_allocator, "c4_attn_allocator"
-            ):
-                if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
-                raise RuntimeError(
-                    "DSV4 NPU PD disaggregation does not support decode-side "
-                    "prefix cache yet; disable disaggregation decode radix/HiCache "
-                    "for PD + chunked prefill."
-                )
-
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
@@ -1174,7 +1165,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             def _swa_payload():
                 window_size = self.scheduler.sliding_window_size
-                window_start = max(0, seq_len - window_size)
+                window_start = max(total_prefix_len, seq_len - window_size)
                 window_start = page_align_floor(window_start, page_size)
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, window_start:seq_len
@@ -1232,15 +1223,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
             }
-            if hasattr(self.req_to_token_pool, "req_to_token_c4"):
-                # DSV4 on NPU: per-pool dst page indices, produced by the same
-                # shared builder prefill uses so src/dst line up positionally.
-                if total_prefix_len != 0:
-                    raise RuntimeError(
-                        "DSV4 NPU PD disaggregation does not support decode-side "
-                        "prefix cache yet; disable disaggregation decode radix/HiCache "
-                        "for PD + chunked prefill."
-                    )
             if _is_npu and isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
                 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
                     dsv4_state_payloads,
@@ -1252,7 +1234,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         decode_req.req.req_pool_idx,
                         seq_len,
                         self.token_to_kv_pool_allocator.page_size,
-                        self.scheduler.sliding_window_size,
                         prefix_len=total_prefix_len,
                     )
                 )
@@ -1741,7 +1722,7 @@ def alloc_for_decode_prealloc(
         )
         extra_kwargs = {}
         dsv4_unwrap_prealloc = None
-        if hasattr(allocator, "c4_attn_allocator"):
+        if hasattr(allocator, "c128_attn_allocator"):
             assert req_to_token_pool is not None
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
                 dsv4_prealloc_kwargs,

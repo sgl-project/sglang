@@ -58,10 +58,12 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_precompile_model_kernels_after_loading,
 )
 from sglang.srt.model_loader import get_model
+from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderPreprocessOutput,
     get_encoder_preprocessed_items,
     invoke_encoder_preprocessor,
+    resolve_encoder_media_processor_config,
 )
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
@@ -85,6 +87,7 @@ from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     add_prometheus_middleware,
     configure_logger,
+    configure_media_url_security,
     load_audio,
     load_image,
     load_video,
@@ -92,6 +95,7 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
 )
 from sglang.srt.utils.common import configure_logger, maybe_reindex_device_id
+from sglang.srt.utils.hf_transformers_utils import resolve_image_processor_backend
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
@@ -307,6 +311,10 @@ class MMEncoder:
         argument."""
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
+        configure_media_url_security(
+            server_args.allowed_media_domains,
+            server_args.media_url_max_file_size_mb,
+        )
         publish(server_args, role="encoder")
         self.rank = rank
         # DP rank for metric labels; overridden by run_dp_worker in DP mode.
@@ -341,7 +349,8 @@ class MMEncoder:
         torch.get_device_module(self.device).set_device(self.gpu_id)
 
         self.use_image_processor_gpu = (
-            use_image_processor_gpu and not server_args.disable_fast_image_processor
+            use_image_processor_gpu
+            and resolve_image_processor_backend(server_args) != "pil"
         )
         self._build_vision_config(server_args.mm_process_config)
         self.model_audio_sr = self._resolve_audio_sr()
@@ -361,6 +370,9 @@ class MMEncoder:
             model_config=self.model_config,
             load_config=self.load_config,
             device_config=self.device_config,
+        )
+        self.encoder_media_processor_config = resolve_encoder_media_processor_config(
+            self.model
         )
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
@@ -606,12 +618,18 @@ class MMEncoder:
         """
         from transformers import AutoImageProcessor, AutoVideoProcessor
 
+        image_processor_backend = resolve_image_processor_backend(server_args)
+        image_processor_kwargs = (
+            {}
+            if image_processor_backend == "auto"
+            else {"backend": image_processor_backend}
+        )
         try:
             self.image_processor = AutoImageProcessor.from_pretrained(
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
+                **image_processor_kwargs,
             )
         except Exception as e:
             logger.warning(f"Failed to load image processor: {e}")
@@ -622,7 +640,6 @@ class MMEncoder:
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
             )
         except Exception as e:
             logger.warning(f"Failed to load video processor: {e}")
@@ -634,7 +651,6 @@ class MMEncoder:
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
             )
             if not hasattr(_audio_proc, "feature_extractor"):
                 logger.warning(
@@ -659,13 +675,27 @@ class MMEncoder:
         Load a single multimodal data.
         If data is precomputed, returns directly.
         Static method that can be pickled for multiprocessing"""
+        media_metadata = {}
+        content_hash = None
         if isinstance(data, dict):
-            return data
+            if "url" not in data:
+                return data
+            media_metadata = {key: value for key, value in data.items() if key != "url"}
+            content_hash = parse_content_hash(data.get("content_hash"))
+            data = data["url"]
         try:
             if modality == Modality.IMAGE:
+                if content_hash is not None:
+                    snapshot = snapshot_media(data)
+                    if snapshot.content_digest != content_hash:
+                        raise BadRequestError(
+                            "Encoder media content hash mismatch: "
+                            f"expected {content_hash}, got {snapshot.content_digest}"
+                        )
+                    data = snapshot.data
                 gpu_image_decode = (
-                    "nvjpeg_fancy"
-                    if self.use_image_processor_gpu and self.model_type == "kimi_k3"
+                    self.encoder_media_processor_config.image_decode_mode
+                    if self.use_image_processor_gpu
                     else False
                 )
                 img, _ = load_image(data, gpu_image_decode)
@@ -676,12 +706,23 @@ class MMEncoder:
                 ):
                     # Needed only when `img` is a PIL image
                     img = img.convert("RGB")
+                if (
+                    media_metadata
+                    and self.encoder_media_processor_config.preserve_media_metadata
+                ):
+                    return {
+                        "type": "image",
+                        "image": img,
+                        **media_metadata,
+                    }
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
                 return load_audio(data, self.model_audio_sr)
 
+        except MMError:
+            raise
         except CLIENT_MEDIA_EXCEPTIONS as e:
             # Not ValueError: the DP envelope classifies by `.code`, which only MMError carries.
             raise BadRequestError(f"Error while loading data {data}: {e}") from e
