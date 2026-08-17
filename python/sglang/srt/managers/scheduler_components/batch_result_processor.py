@@ -853,12 +853,10 @@ class SchedulerBatchResultProcessor:
         if isinstance(batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)):
             pp_raw = batch.spec_info
             if isinstance(pp_raw, DSparkPPVerifyInputRaw):
-                # Linear verify relays plain-python fields across PP ranks;
-                # accept_index stays None so no target KV token-move is needed.
-                accept_lens_cpu = torch.tensor(
-                    pp_raw.accept_lens, dtype=torch.int64
-                )
-                accept_lens = accept_lens_cpu.to(batch.seq_lens.device)
+                # Linear verify relays tensors across PP ranks; accept_index
+                # stays None so no target KV token-move is needed.
+                accept_lens = pp_raw.accept_lens.to(torch.int64)
+                accept_lens_cpu = accept_lens.cpu()
                 # Kimi-K3 hybrid mamba: commit mamba states after the verify.
                 self.model_worker.commit_pp_mamba_states_after_verify(
                     batch=batch,

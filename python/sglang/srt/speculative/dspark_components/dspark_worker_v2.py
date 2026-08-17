@@ -620,8 +620,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         # target-only for this iteration.
         device = batch.seq_lens.device
         bs = len(batch.seq_lens)
-        bonus = torch.tensor(pp_raw.bonus_tokens, device=device, dtype=torch.int64)
-        drafts = torch.tensor(pp_raw.draft_tokens, device=device, dtype=torch.int64)
+        bonus = pp_raw.bonus_tokens.to(torch.int64)
+        drafts = pp_raw.draft_tokens.to(torch.int64)
         draft_block_ids = bonus.unsqueeze(1)
         if sampling_info is not None:
             temperatures = (
@@ -653,7 +653,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             corrected_logits_ready=corrected_logits_ready,
         )
         confidence = (
-            torch.tensor(pp_raw.confidence, device=device, dtype=torch.float32)
+            pp_raw.confidence.to(torch.float32)
             if pp_raw.confidence is not None
             else None
         )
@@ -969,14 +969,20 @@ class DSparkWorkerV2(BaseSpecWorker):
                     ),
                 )
             pp_raw_out = DSparkPPVerifyInputRaw(
-                bonus_tokens=accept.bonus.tolist(),
-                draft_tokens=proposal_next.draft_block.draft_tokens.tolist(),
+                bonus_tokens=accept.bonus.to(self.device, torch.int64),
+                draft_tokens=proposal_next.draft_block.draft_tokens.to(
+                    self.device, torch.int64
+                ),
                 new_seq_lens=next_seq_lens,
-                confidence=(con.tolist() if con is not None else None),
-                accept_lens=accept.commit_lens.tolist(),
-                cap_trim_lens=accept.cap_trim_lens.tolist(),
+                confidence=(
+                    con.to(self.device, torch.float32) if con is not None else None
+                ),
+                accept_lens=accept.commit_lens.to(self.device, torch.int64),
+                cap_trim_lens=accept.cap_trim_lens.to(self.device, torch.int32),
                 verify_lens=(
-                    layout.verify_lens.tolist() if layout is not None else None
+                    layout.verify_lens.to(self.device, torch.int64)
+                    if layout is not None
+                    else None
                 ),
                 accept_index=None,
             )

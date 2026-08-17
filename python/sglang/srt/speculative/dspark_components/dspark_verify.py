@@ -180,14 +180,17 @@ class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
     the token-move step automatically.
     """
 
-    # Draft info for rebuilding the next iter's verify candidates on every rank.
-    bonus_tokens: List[int]
-    draft_tokens: List[List[int]]
+    # Draft info for rebuilding the next iter's verify candidates on every
+    # rank. GPU tensors so the PP ring relays them over the GPU channel.
+    bonus_tokens: torch.Tensor  # [bs]
+    draft_tokens: torch.Tensor  # [bs, gamma]
+    # Kept as a CPU list: consumed only by the last rank's sampling cache,
+    # whose keys are Python ints; GPU-izing it would add a second D2H copy.
     new_seq_lens: List[int]
 
     # Result / accounting for batch_result_processor and stats. Required: always
     # populated by the last rank (even build_dummy_for_decode sets [1]*bs).
-    accept_lens: List[int]
+    accept_lens: torch.Tensor  # [bs]
 
     # Optional placeholders mirroring DFlashDraftInputV2 so that run_non_compact's
     # elif branch (reading reserved_seq_lens_cpu when batch.seq_lens_cpu is None)
@@ -197,10 +200,10 @@ class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
 
     # Confidence produced by last rank's propose; all ranks recompute an
     # identical verify budget from the same source each iter.
-    confidence: Optional[List[float]] = None
+    confidence: Optional[torch.Tensor] = None  # [bs] float32
 
-    cap_trim_lens: Optional[List[int]] = None
-    verify_lens: Optional[List[int]] = None
+    cap_trim_lens: Optional[torch.Tensor] = None  # [bs] int32
+    verify_lens: Optional[torch.Tensor] = None  # [bs] int64
 
     # Linear verify: always None so batch_result_processor skips the token move.
     accept_index: Optional[List] = None
@@ -220,6 +223,8 @@ class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
         )
 
     def to_tensor_dict(self) -> dict:
+        # Nested tensors are flattened by _split_tensor_dict, so the whole
+        # dataclass dict still travels over the GPU channel.
         return {"pp_spec_output": asdict(self)}
 
     @classmethod
@@ -227,50 +232,56 @@ class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
         return cls(**pp_outputs["pp_spec_output"])
 
     @classmethod
-    def build_dummy_for_decode(cls, batch, num_draft: int) -> "DSparkPPVerifyInputRaw":
+    def build_dummy_for_decode(cls, batch, num_draft: int) -> DSparkPPVerifyInputRaw:
         # First decode step: the last PP rank has not proposed real drafts yet.
         bs = len(batch.reqs)
         gamma = max(num_draft - 1, 0)
-        bonus = batch.input_ids.tolist()
+        device = batch.input_ids.device
+        bonus = batch.input_ids.to(torch.int64)
         return cls(
             bonus_tokens=bonus,
-            draft_tokens=[bonus[i : i + 1] * gamma for i in range(bs)],
+            draft_tokens=bonus.unsqueeze(1).repeat(1, gamma),
             new_seq_lens=batch.seq_lens.tolist(),
-            confidence=[0.0] * bs,
-            accept_lens=[1] * bs,
-            cap_trim_lens=[0] * bs,
-            verify_lens=[num_draft] * bs,
+            confidence=torch.zeros(bs, dtype=torch.float32, device=device),
+            accept_lens=torch.ones(bs, dtype=torch.int64, device=device),
+            cap_trim_lens=torch.zeros(bs, dtype=torch.int32, device=device),
+            verify_lens=torch.full((bs,), num_draft, dtype=torch.int64, device=device),
             accept_index=None,
         )
 
     def filter_batch(
         self, new_indices, new_indices_cpu: Optional[List[int]] = None
     ):
-        idx = new_indices.tolist() if torch.is_tensor(new_indices) else list(new_indices)
-
-        def pick(lst):
-            return [lst[i] for i in idx]
-
-        self.bonus_tokens = pick(self.bonus_tokens)
+        self.bonus_tokens = self.bonus_tokens[new_indices]
         if self.draft_tokens is not None:
-            self.draft_tokens = pick(self.draft_tokens)
+            self.draft_tokens = self.draft_tokens[new_indices]
         if self.new_seq_lens is not None:
-            self.new_seq_lens = pick(self.new_seq_lens)
+            idx = (
+                new_indices.tolist()
+                if torch.is_tensor(new_indices)
+                else list(new_indices)
+            )
+            self.new_seq_lens = [self.new_seq_lens[i] for i in idx]
         if self.confidence is not None:
-            self.confidence = pick(self.confidence)
+            self.confidence = self.confidence[new_indices]
         if self.accept_lens is not None:
-            self.accept_lens = pick(self.accept_lens)
+            self.accept_lens = self.accept_lens[new_indices]
         if self.cap_trim_lens is not None:
-            self.cap_trim_lens = pick(self.cap_trim_lens)
+            self.cap_trim_lens = self.cap_trim_lens[new_indices]
         if self.verify_lens is not None:
-            self.verify_lens = pick(self.verify_lens)
+            self.verify_lens = self.verify_lens[new_indices]
         if self.accept_index is not None:
+            idx = (
+                new_indices.tolist()
+                if torch.is_tensor(new_indices)
+                else list(new_indices)
+            )
             self.accept_index = [self.accept_index[i] for i in idx]
 
-    def merge_batch(self, other: "DSparkPPVerifyInputRaw"):
-        if not other.bonus_tokens:
+    def merge_batch(self, other: DSparkPPVerifyInputRaw):
+        if other.bonus_tokens.numel() == 0:
             return
-        if not self.bonus_tokens:
+        if self.bonus_tokens.numel() == 0:
             self.bonus_tokens = other.bonus_tokens
             self.draft_tokens = other.draft_tokens
             self.new_seq_lens = other.new_seq_lens
@@ -280,19 +291,19 @@ class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
             self.verify_lens = other.verify_lens
             self.accept_index = other.accept_index
             return
-        self.bonus_tokens = self.bonus_tokens + other.bonus_tokens
+        self.bonus_tokens = torch.cat([self.bonus_tokens, other.bonus_tokens])
         if other.draft_tokens is not None:
-            self.draft_tokens = self.draft_tokens + other.draft_tokens
+            self.draft_tokens = torch.cat([self.draft_tokens, other.draft_tokens])
         if other.new_seq_lens is not None:
             self.new_seq_lens = self.new_seq_lens + other.new_seq_lens
         if self.confidence is not None and other.confidence is not None:
-            self.confidence = self.confidence + other.confidence
+            self.confidence = torch.cat([self.confidence, other.confidence])
         if self.accept_lens is not None and other.accept_lens is not None:
-            self.accept_lens = self.accept_lens + other.accept_lens
+            self.accept_lens = torch.cat([self.accept_lens, other.accept_lens])
         if self.cap_trim_lens is not None and other.cap_trim_lens is not None:
-            self.cap_trim_lens = self.cap_trim_lens + other.cap_trim_lens
+            self.cap_trim_lens = torch.cat([self.cap_trim_lens, other.cap_trim_lens])
         if self.verify_lens is not None and other.verify_lens is not None:
-            self.verify_lens = self.verify_lens + other.verify_lens
+            self.verify_lens = torch.cat([self.verify_lens, other.verify_lens])
         if self.accept_index is not None and other.accept_index is not None:
             self.accept_index = self.accept_index + other.accept_index
 

@@ -1209,13 +1209,7 @@ class SchedulerPPMixin:
         if isinstance(
             batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)
         ):
-            if isinstance(batch.spec_info, DSparkPPVerifyInputRaw):
-                # DSpark relays plain-python accept_lens across PP ranks.
-                output_result.accept_lens = torch.tensor(
-                    batch.spec_info.accept_lens, dtype=torch.int64
-                )
-            else:
-                output_result.accept_lens = batch.spec_info.accept_lens.to(torch.int64)
+            output_result.accept_lens = batch.spec_info.accept_lens.to(torch.int64)
             output_result.speculative_num_draft_tokens = (
                 self.server_args.speculative_num_draft_tokens
             )
