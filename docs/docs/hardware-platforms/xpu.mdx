@@ -105,16 +105,16 @@ docker run \
 Example command to launch SGLang serving:
 
 ```bash
-sglang serve                         \
+SGLANG_USE_SGL_XPU=1 sglang serve    \
     --model-path <MODEL_ID_OR_PATH>  \
-    --trust-remote-code              \
-    --disable-overlap-schedule       \
     --device xpu                     \
     --host 0.0.0.0                   \
     --tp 2                           \   # using multi GPUs
     --attention-backend intel_xpu    \   # using intel optimized XPU attention backend
     --page-size                      \   # intel_xpu attention backend supports [32, 64, 128]
 ```
+
+Note: Models using fp8 w8a8 precision like DeepSeek-V3* and DeepSeek-R1 are not supported with SGLANG_USE_SGL_XPU=1 instead set it to 0 for functionality.
 
 ## Benchmarking with Requests
 

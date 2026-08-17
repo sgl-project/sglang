@@ -1,5 +1,7 @@
 # docker build -t sglang:xpu -f xpu.Dockerfile --build-arg http_proxy=${http_proxy} --build-arg https_proxy=${https_proxy} --build-arg no_proxy=${no_proxy} --no-cache .
 
+# Models using fp8 w8a8 precision like DeepSeek-V3* and DeepSeek-R1 are not supported with SGLANG_USE_SGL_XPU=1 instead set it to 0 for functionality.
+
 # Use Intel deep learning essentials base image with Ubuntu 24.04
 FROM intel/deep-learning-essentials:2025.3.2-0-devel-ubuntu24.04
 
