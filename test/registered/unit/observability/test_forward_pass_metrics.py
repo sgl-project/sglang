@@ -426,14 +426,24 @@ class TestEstimatedPrefillPerf(CustomTestCase):
     def test_chunk_is_charged_for_its_cached_prefix(self):
         self.assertEqual(self._pair_count([4], [3]), 4 * 3 + 4 * 5 / 2)
 
-    def test_chunk_is_charged_for_prefix_kv_reads(self):
+    def test_prefix_kv_is_read_once_per_chunk(self):
+        # One pass over the prefix per chunk, not one read per query-key pair:
+        # the chunk's queries share the same KV stream.
         self.reporter._kv_cache_bytes_per_token = 1.0
         batch = types.SimpleNamespace(extend_lens=[4], prefix_lens=[3])
         _, read_bytes, _ = self.reporter._estimate_prefill_perf(batch)
-        self.assertEqual(read_bytes, 4 * 3)
+        self.assertEqual(read_bytes, 3)
 
     def test_requests_in_one_batch_do_not_attend_to_each_other(self):
         self.assertEqual(self._pair_count([100, 100], [0, 0]), 2 * (100 * 101 / 2))
+
+    def test_mixed_prefill_and_decode_rows_use_their_own_context(self):
+        # mix_with_running appends running requests as extend_len 1 with their
+        # full context as prefix_len.
+        self.assertEqual(
+            self._pair_count([8, 1, 1], [0, 100, 200]),
+            8 * 9 / 2 + (100 + 1) + (200 + 1),
+        )
 
 
 if __name__ == "__main__":
