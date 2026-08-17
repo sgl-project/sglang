@@ -49,6 +49,14 @@ _DRAFT_PROBS = Invariant(
 )
 
 
+def _make_num_token_non_padded(
+    num_tokens: int, device: str | torch.device
+) -> Optional[torch.Tensor]:
+    if not enable_num_token_non_padded():
+        return None
+    return torch.tensor(num_tokens, dtype=torch.int32).to(device, non_blocking=True)
+
+
 class DraftBlockResult(msgspec.Struct, frozen=True):
     draft_tokens: torch.Tensor
     corrected_logits: Optional[torch.Tensor]
@@ -212,7 +220,8 @@ class DraftBlockProposer:
         confidence_tap = None
         folded = False
         if (
-            draft_sampler is not None
+            envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
+            and draft_sampler is not None
             and fwd.can_run_graph
             and (all_greedy or draft_sampler.folded_sampling)
         ):
@@ -322,7 +331,9 @@ class DraftBlockProposer:
         draft_positions = positions_2d[:, :gamma].reshape(-1)
         draft_cache_loc = verify_cache_loc_2d[:, :gamma].reshape(-1)
 
-        draft_owns_embed = hasattr(self.draft_model, "forward_embed")
+        draft_owns_embed = envs.SGLANG_DSPARK_EMBED_IN_GRAPH.get() and hasattr(
+            self.draft_model, "forward_embed"
+        )
         draft_input_embeds: Optional[torch.Tensor] = None
         if not draft_owns_embed:
             noise_embedding = embed_module(draft_block_ids)
@@ -337,6 +348,7 @@ class DraftBlockProposer:
         else:
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
+        draft_num_tokens = bs * gamma
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
@@ -351,6 +363,8 @@ class DraftBlockProposer:
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_token_non_padded=_make_num_token_non_padded(draft_num_tokens, device),
+            num_token_non_padded_cpu=draft_num_tokens,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
@@ -377,6 +391,9 @@ class DraftBlockProposer:
     def _fill_dp_moe_sync_metadata(
         self, forward_batch: ForwardBatch, batch: ScheduleBatch
     ) -> None:
+        # The dense DSpark draft still reuses the target batch's graph tier.
+        # Set graph eligibility before the DP-MoE-only metadata early return.
+        forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
         gnt, gnt_logprob = spec_scale_global_num_tokens(
@@ -400,4 +417,3 @@ class DraftBlockProposer:
         forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
             gnt_logprob, dtype=torch.int64
         ).to(device, non_blocking=True)
-        forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
