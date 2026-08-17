@@ -75,9 +75,12 @@ def update_trtllm_mha_graph_metadata_kernel(
         row_out = page_table_ptr + pid.to(tl.int64) * page_table_stride
         if HAS_SWA:
             swa_row_out = swa_page_table_ptr + pid.to(tl.int64) * swa_page_table_stride
-        for i in range(tl.cdiv(max_seq_pages, PAGE_BLOCK)):
+        # Self-guard on the device-side seqlen: pages past cdiv(cache_seqlen,
+        # PAGE_SIZE) keep stale values the attention kernels never read.
+        num_live_pages = tl.minimum(tl.cdiv(seqlen, PAGE_SIZE), max_seq_pages)
+        for i in range(tl.cdiv(num_live_pages, PAGE_BLOCK)):
             page_idx = i * PAGE_BLOCK + tl.arange(0, PAGE_BLOCK)
-            mask = page_idx < max_seq_pages
+            mask = page_idx < num_live_pages
             token = tl.load(
                 row_in + page_idx.to(tl.int64) * PAGE_SIZE, mask=mask, other=0
             )
@@ -143,7 +146,12 @@ def update_trtllm_mha_graph_metadata(
     q_stride: int = 0,
     q_mode: int = Q_MODE_NONE,
 ):
-    """Launch the fused metadata update (one kernel for the whole replay init)."""
+    """Launch the fused metadata update (one kernel for the whole replay init).
+
+    Contract: only the live prefix (cdiv(cache_seqlens, page_size) pages) of each
+    page_table / swa_page_table row is (re)written; the tail keeps stale values
+    across replays, so consumers must bound reads by cache_seqlens.
+    """
     if bs == 0:
         return
 

@@ -16,12 +16,13 @@ from sglang.kernels.spec import (
 if TYPE_CHECKING:
     import torch
 
-_CUDA = CapabilityRequirement(requires_cuda=True)
+_CUDA = frozenset({CapabilityRequirement.CUDA})
+_HIP = frozenset({CapabilityRequirement.HIP})
 
 register_kernel(
     KernelSpec(
         op="moe.moe_align_block_size",
-        backend=KernelBackend.CUDA_AOT,
+        backend=KernelBackend.AOT,
         target="sgl_kernel:moe_align_block_size",
         format_signature=FormatSignature(
             in_place=True,
@@ -33,26 +34,40 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="moe.moe_align_block_size",
-        backend=KernelBackend.CUDA_JIT,
-        target="sglang.jit_kernel.moe_align:moe_align_block_size",
-        capability=_CUDA,
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.moe_align:moe_align_block_size",
+        capabilities=_CUDA,
         format_signature=FormatSignature(
             in_place=True,
             description="MoE align-block-size (JIT variant, AOT signature)",
         ),
-        description="MoE align-block-size (sglang.jit_kernel).",
+        description="MoE align-block-size (sglang.kernels.jit).",
     )
 )
 register_kernel(
     KernelSpec(
         op="moe.topk_softmax",
-        backend=KernelBackend.CUDA_AOT,
+        backend=KernelBackend.AOT,
         target="sgl_kernel:topk_softmax",
+        capabilities=_HIP,
         format_signature=FormatSignature(
             in_place=True,
             description="top-k softmax routing weights/ids",
         ),
-        description="MoE top-k softmax (sgl_kernel wheel).",
+        description="MoE top-k softmax (sgl_kernel ROCm wheel).",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="moe.topk_softmax",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.moe_topk_softmax:topk_softmax",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            in_place=True,
+            description="top-k softmax routing weights/ids",
+        ),
+        description="MoE top-k softmax (sglang.kernels.jit).",
     )
 )
 
@@ -69,7 +84,7 @@ def moe_align_block_size(
     ignore_invalid_expert: bool = False,
 ) -> None:
     """Align and sort expert token ids into block-padded output buffers."""
-    kernel = get_kernel("moe.moe_align_block_size", KernelBackend.CUDA_AOT)
+    kernel = get_kernel("moe.moe_align_block_size", KernelBackend.AOT)
     if ignore_invalid_expert:
         return kernel(
             topk_ids,
@@ -103,7 +118,7 @@ def topk_softmax(
     correction_bias: Optional[torch.Tensor] = None,
 ) -> None:
     """Compute top-k softmax routing weights/ids for MoE."""
-    return get_kernel("moe.topk_softmax", KernelBackend.CUDA_AOT)(
+    return get_kernel("moe.topk_softmax")(
         topk_weights,
         topk_ids,
         gating_output,
@@ -148,6 +163,7 @@ _PHASE25_TRITON_KERNELS = [
     ("router", "fused_moe_router_shim"),
     ("deepep_waterfill_kernels", "materialize_waterfill_dispatch_fused"),
     ("fill_padded_rows", "_fill_padded_rows"),
+    ("moe_fused_mul_sum", "moe_fused_mul_sum"),
 ]
 for _mod, _fn in _PHASE25_TRITON_KERNELS:
     register_kernel(
@@ -166,5 +182,22 @@ register_kernel(
         op="moe.pack_topk_ids",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.pack_topk_ids:PackTopkIds.triton",
+    )
+)
+
+# Single-CTA align for tiny batches: covers the corner the AOT/JIT
+# moe_align_block_size small-batch path leaves out (num_experts > 64), and is
+# selected by the moe_runner call site on numel <= SMALL_NUMEL_LIMIT.
+register_kernel(
+    KernelSpec(
+        op="moe.moe_align_small_numel",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.moe_align_small_numel:moe_align_small_numel",
+        capabilities=_CUDA,
+        format_signature=FormatSignature(
+            in_place=True,
+            description="align/sort expert token ids into block-padded buffers",
+        ),
+        description="MoE align-block-size, single-launch triton variant.",
     )
 )

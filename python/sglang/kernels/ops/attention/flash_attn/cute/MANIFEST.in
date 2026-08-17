@@ -1,0 +1,5 @@
+global-exclude *.egg-info/*
+prune flash_attn_4.egg-info
+prune flash_attn.egg-info
+prune build
+prune dist

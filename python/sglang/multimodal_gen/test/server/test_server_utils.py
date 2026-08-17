@@ -65,6 +65,17 @@ FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 80.0
 DECODING_STAGE_MIN_ABS_TOLERANCE_MS = 450.0
 VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 160.0
 
+
+def is_missing_diffusers_pipeline_error(message: str) -> bool:
+    """Return whether a server startup error is caused by a missing diffusers pipeline."""
+    normalized_message = message.lower()
+    return (
+        "not found in diffusers" in normalized_message
+        or "module 'diffusers' has no attribute" in normalized_message
+        or 'module "diffusers" has no attribute' in normalized_message
+    )
+
+
 # Tracks mesh output file paths from generate_mesh for later correctness validation.
 # Keyed by case_id, cleaned up after use.
 MESH_OUTPUT_PATHS: dict[str, str] = {}
@@ -734,7 +745,9 @@ class MeshValidator(PerformanceValidator):
 
 # Pinned to a ci-data commit (not main): invalidates the per-URL download cache
 # whenever the reference is regenerated, and keeps the mesh GT reproducible.
-# Bump this SHA when pushing a new hunyuan3d.glb to ci-data.
+# New GT now publishes to sgl-project/ci-data-diffusion, so when you push a new
+# hunyuan3d.glb, switch the repo in the URL below to it and bump the SHA together
+# (this frozen SHA stays readable on sgl-project/ci-data).
 HUNYUAN3D_REFERENCE_URL = (
     "https://raw.githubusercontent.com/sgl-project/ci-data/"
     "395f6e49c37d22a57d79fbcd3653d43984099ae2"

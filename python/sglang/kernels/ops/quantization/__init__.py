@@ -16,19 +16,20 @@ from sglang.kernels.spec import (
 if TYPE_CHECKING:
     import torch
 
-_CUDA = CapabilityRequirement(requires_cuda=True)
+_CUDA = frozenset({CapabilityRequirement.CUDA})
 
 register_kernel(
     KernelSpec(
         op="quantization.sgl_per_token_quant_fp8",
-        backend=KernelBackend.CUDA_AOT,
-        target="sgl_kernel:sgl_per_token_quant_fp8",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.per_token_quant_fp8:per_token_quant_fp8",
+        capabilities=_CUDA,
         format_signature=FormatSignature(
             supported_dtypes=("float8_e4m3fn",),
             in_place=True,
             description="per-token FP8 quantization into output_q/output_s",
         ),
-        description="Per-token FP8 quantization (sgl_kernel wheel).",
+        description="Per-token FP8 quantization (sglang.kernels.jit).",
     )
 )
 # fp8 / int8 are legacy aliases of the same 8bit kernel in the wheel; register
@@ -41,7 +42,7 @@ for _name in (
     register_kernel(
         KernelSpec(
             op=f"quantization.{_name}",
-            backend=KernelBackend.CUDA_AOT,
+            backend=KernelBackend.AOT,
             target=f"sgl_kernel:{_name}",
             format_signature=FormatSignature(
                 in_place=True,
@@ -54,15 +55,20 @@ del _name
 
 register_kernel(
     KernelSpec(
-        op="quantization.sgl_per_token_group_quant_8bit",
-        backend=KernelBackend.CUDA_JIT,
-        target="sglang.jit_kernel.per_token_group_quant_8bit:per_token_group_quant_8bit",
-        capability=_CUDA,
+        op="quantization.per_token_group_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.per_token_group_quant:per_token_group_quant",
+        capabilities=_CUDA,
         format_signature=FormatSignature(
+            supported_dtypes=("float8_e4m3fn", "int8"),
             in_place=True,
-            description="per-token-group 8-bit quantization (JIT variant)",
+            description=(
+                "trait-driven per-token-group quantization: bf16/fp16 input, "
+                "group size 16..256, fp32 or packed-UE8M0 scales in row/col-major "
+                "layouts, optional fused silu_and_mul and masked EP-MoE schedule"
+            ),
         ),
-        description="Per-token-group 8-bit quantization (sglang.jit_kernel).",
+        description="Unified per-token-group quantization (sglang.kernels.jit).",
     )
 )
 
@@ -73,7 +79,7 @@ def sgl_per_token_quant_fp8(
     output_s: torch.Tensor,
 ) -> None:
     """Per-token FP8 quantization, writing into ``output_q`` / ``output_s``."""
-    return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.CUDA_AOT)(
+    return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.JIT)(
         input, output_q, output_s
     )
 
@@ -92,9 +98,7 @@ def sgl_per_token_group_quant_8bit(
     enable_v2: Optional[bool] = None,
 ) -> None:
     """Per-token-group 8-bit quantization, writing into ``output_q`` / ``output_s``."""
-    return get_kernel(
-        "quantization.sgl_per_token_group_quant_8bit", KernelBackend.CUDA_AOT
-    )(
+    return get_kernel("quantization.sgl_per_token_group_quant_8bit", KernelBackend.AOT)(
         input,
         output_q,
         output_s,
@@ -114,11 +118,48 @@ sgl_per_token_group_quant_fp8 = sgl_per_token_group_quant_8bit
 sgl_per_token_group_quant_int8 = sgl_per_token_group_quant_8bit
 
 
+def per_token_group_quant(
+    input: torch.Tensor,
+    output_q: Optional[torch.Tensor] = None,
+    output_s: Optional[torch.Tensor] = None,
+    group_size: int = 128,
+    scale_ue8m0: bool = False,
+    fuse_silu_and_mul: bool = False,
+    masked_m: Optional[torch.Tensor] = None,
+    expected_m: Optional[int] = None,
+    *,
+    out_dtype: Optional[torch.dtype] = None,
+    column_major_scales: bool = False,
+):
+    """Unified per-token-group quantization (JIT). Returns ``(x_q, x_s)``.
+
+    bf16/fp16 input, fp8_e4m3/int8 output, group size 16..256, fp32 or
+    packed-UE8M0 scales in row-/col-major layouts, optional fused
+    ``silu_and_mul`` and masked EP-MoE schedule (``masked_m`` +
+    ``expected_m`` grid hint). Pass ``output_q``/``output_s`` to quantize into
+    caller-owned buffers (layout inferred from their dtype/strides), or omit
+    both to have them allocated.
+    """
+    return get_kernel("quantization.per_token_group_quant", KernelBackend.JIT)(
+        input,
+        output_q,
+        output_s,
+        group_size,
+        scale_ue8m0,
+        fuse_silu_and_mul,
+        masked_m,
+        expected_m,
+        out_dtype=out_dtype,
+        column_major_scales=column_major_scales,
+    )
+
+
 __all__ = [
     "sgl_per_token_quant_fp8",
     "sgl_per_token_group_quant_8bit",
     "sgl_per_token_group_quant_fp8",
     "sgl_per_token_group_quant_int8",
+    "per_token_group_quant",
 ]
 
 
@@ -132,7 +173,6 @@ _TRITON_KERNELS = [
     ("fp8_kernel", "sglang_per_token_quant_fp8"),
     ("fp8_kernel", "static_quant_fp8"),
     ("fp8_kernel", "w8a8_block_fp8_matmul"),
-    ("fp8_kernel", "mxfp8_block_scaled_matmul_triton"),
     ("fp8_kernel", "per_tensor_quant_mla_fp8"),
     ("fp8_kernel", "per_token_group_quant_mla_deep_gemm_masked_fp8"),
     ("fp8_kernel", "per_token_group_quant_fp8_hopper_moe_mn_major"),
@@ -163,7 +203,7 @@ register_kernel(
             "sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant"
             ":nvfp4_gemm_swiglu_nvfp4_quant"
         ),
-        capability=CapabilityRequirement(requires_cuda=True, min_cuda_arch=(10, 0)),
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
         description="Fused NVFP4 GEMM + SwiGLU + NVFP4 quant (CuTe DSL, SM100).",
     )
 )

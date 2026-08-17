@@ -36,6 +36,7 @@ from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerContext,
     ServerManager,
     get_generate_fn,
+    is_missing_diffusers_pipeline_error,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
@@ -64,6 +65,7 @@ from sglang.multimodal_gen.test.test_utils import (
     load_action_consistency_gt,
     load_consistency_gt,
     save_consistency_failure_artifact,
+    save_missing_consistency_gt_artifact,
     wait_for_req_perf_record,
 )
 
@@ -156,22 +158,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     # picking another one (which causes the test client to connect to the wrong server).
     extra_args += " --strict-ports"
 
-    # Shape-only mesh cases (e.g. hunyuan3d_shape_gen) validate geometry via
-    # mesh-correctness and must NOT run the paint/texture stages, whose
-    # verification checks texture artifacts (paint_mesh/normal_maps/renderer)
-    # that the shape-only path never produces. Inject a pipeline-config override
-    # disabling paint for these cases.
-    if server_args.custom_validator == "mesh":
-        import json as _json
-        import tempfile as _tempfile
-
-        _paint_off_cfg = os.path.join(
-            _tempfile.gettempdir(), f"{case.id}_paint_off.json"
-        )
-        with open(_paint_off_cfg, "w") as _f:
-            _json.dump({"paint_enable": False}, _f)
-        extra_args += f" --config {_paint_off_cfg}"
-
     for arg in server_args.extras:
         extra_args += f" {arg}"
 
@@ -212,9 +198,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         # pipeline class.  This avoids hard failures when a model needs a
         # newer diffusers release than what is currently installed in CI.
         msg = str(exc)
-        if "not found in diffusers" in msg or (
-            "has no attribute" in msg and "diffusers" in msg.lower()
-        ):
+        if is_missing_diffusers_pipeline_error(msg):
             pytest.skip(
                 f"Skipping {case.id}: required diffusers pipeline class "
                 f"is not available in the installed version. "
@@ -610,6 +594,24 @@ class DiffusionServerBase:
         if not gt_exists(
             case.id, num_gpus, is_video=is_video, output_format=output_format
         ):
+            if is_video:
+                output_frames = pop_realtime_key_frames(case.id)
+                if output_frames is None:
+                    output_frames = extract_key_frames_from_video(content)
+            else:
+                output_frames = [image_bytes_to_numpy(content)]
+            artifact_path = save_missing_consistency_gt_artifact(
+                artifact_dir=os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR"),
+                case_id=case.id,
+                num_gpus=num_gpus,
+                output_frames=output_frames,
+                is_video=is_video,
+                output_format=output_format,
+            )
+            if artifact_path is not None:
+                logger.info(
+                    "[Artifact] Saved missing consistency GT: %s", artifact_path
+                )
             if _get_consistency_gt_dir() is not None:
                 names = ", ".join(
                     get_consistency_gt_candidates(
@@ -626,13 +628,13 @@ class DiffusionServerBase:
 --- MISSING GROUND TRUTH DETECTED ---
 GT image(s) not found for '{case.id}'.
 
-Add the expected file(s) to sgl-project/ci-data in diffusion-ci/consistency_gt/sglang_generated/ with naming (n=num_gpus).
+Add the expected file(s) to sgl-project/ci-data-diffusion in diffusion-ci/consistency_gt/sglang_generated/ with naming (n=num_gpus).
   Image: {case.id}_{{n}}gpu.<ext> (ext from output_format: png, jpg, webp)
   Video: {case.id}_{{n}}gpu_frame_0.png, {case.id}_{{n}}gpu_frame_mid.png, {case.id}_{{n}}gpu_frame_last.png
 
 For this case, expected file(s): {names}
 
-Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
+Repository: https://github.com/sgl-project/ci-data-diffusion (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
 Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
 (Optional) Per-case override in {get_consistency_threshold_path()}:
@@ -768,12 +770,12 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 --- MISSING ACTION GROUND TRUTH DETECTED ---
 GT action JSON not found for '{case.id}'.
 
-Add the expected file to sgl-project/ci-data in diffusion-ci/consistency_gt/sglang_generated/ with naming:
+Add the expected file to sgl-project/ci-data-diffusion in diffusion-ci/consistency_gt/sglang_generated/ with naming:
   Action: {case.id}_{{n}}gpu.json
 
 For this case, expected file(s): {names}
 
-Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
+Repository: https://github.com/sgl-project/ci-data-diffusion (path: diffusion-ci/consistency_gt/sglang_generated/, with optional platform subdirectories such as 5090/)
 Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 """)
             pytest.fail(
@@ -840,6 +842,10 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         num_gpus = case.server_args.num_gpus
         is_video = case.server_args.modality == "video"
+
+        if case.server_args.modality == "3d":
+            logger.info("Skipping GT save for mesh (3d) case: %s", case.id)
+            return
 
         if case.server_args.modality == "action":
             output_path = out_dir / f"{case.id}_{num_gpus}gpu.json"

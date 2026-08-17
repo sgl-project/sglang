@@ -2,20 +2,16 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import tempfile
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import (
-    TYPE_CHECKING,
-    List,
-    Optional,
-    Tuple,
-    Union,
-)
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability.metrics_collector import (
@@ -26,6 +22,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
+from sglang.srt.runtime_context import get_context, get_observability, get_spec
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -62,6 +59,9 @@ class PrefillStats:
     num_new_seqs: int  # len(can_run_list)
     reprocessed_log_input_tokens: int = 0
     reprocessed_log_hit_tokens: int = 0
+    log_device_hit_tokens: int = 0
+    log_host_hit_tokens: int = 0
+    log_storage_hit_tokens: int = 0
     num_pending_tokens: int = 0
 
     @classmethod
@@ -77,6 +77,9 @@ class PrefillStats:
             log_hit_tokens=adder.log_hit_tokens,
             reprocessed_log_input_tokens=adder.reprocessed_log_input_tokens,
             reprocessed_log_hit_tokens=adder.reprocessed_log_hit_tokens,
+            log_device_hit_tokens=adder.log_device_hit_tokens,
+            log_host_hit_tokens=adder.log_host_hit_tokens,
+            log_storage_hit_tokens=adder.log_storage_hit_tokens,
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -110,6 +113,11 @@ class SchedulerMetricsReporter:
         )
         self._init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
         self._install_device_timer_on_runners()
+        # Keep log history after the existing async result copy so reporting does
+        # not synchronize the model stream once per generated token.
+        self._eplb_balancedness_history = [
+            deque(maxlen=window_size) for window_size in EPLB_BALANCEDNESS_WINDOW_SIZES
+        ]
 
     def _init_metrics(
         self,
@@ -214,11 +222,11 @@ class SchedulerMetricsReporter:
             self.scheduler._fpm_worker_id = (
                 self.scheduler.server_args.forward_pass_metrics_worker_id
             )
-            base_endpoint = self.scheduler.server_args.forward_pass_metrics_ipc_name
+            base_endpoint = get_observability().forward_pass_metrics_ipc_name
             if base_endpoint is None:
                 ipc_path = tempfile.NamedTemporaryFile(delete=False).name
                 base_endpoint = f"ipc://{ipc_path}"
-                self.scheduler.server_args.override(
+                get_context().override(
                     "metrics_reporter.ipc_endpoint",
                     forward_pass_metrics_ipc_name=base_endpoint,
                 )
@@ -304,6 +312,8 @@ class SchedulerMetricsReporter:
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in self.scheduler.disagg_prefill_bootstrap_queue.queue:
                 prefill_q.add(len(req.origin_input_ids))
+            for req in self.scheduler.waiting_queue:
+                prefill_q.add(len(req.origin_input_ids))
         elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             for req in self.scheduler.disagg_decode_prealloc_queue.queue:
                 decode_q.add(req.seqlen)
@@ -334,15 +344,15 @@ class SchedulerMetricsReporter:
                 "num_draft_tokens": 0,
             }
 
-        # Fallback to server_args if draft_worker does not have the attributes.
-        server_args = self.scheduler.server_args
+        # Fallback to the published `spec` bag if draft_worker does not have
+        # the attributes.
         num_steps = getattr(
-            draft_worker, "speculative_num_steps", server_args.speculative_num_steps
+            draft_worker, "speculative_num_steps", get_spec().speculative_num_steps
         )
         num_draft_tokens = getattr(
             draft_worker,
             "speculative_num_draft_tokens",
-            server_args.speculative_num_draft_tokens,
+            get_spec().speculative_num_draft_tokens,
         )
 
         return {
@@ -633,9 +643,25 @@ class SchedulerMetricsReporter:
             cache_hit_rate = (
                 effective_hit_tokens / total_tokens if total_tokens > 0 else 0.0
             )
+            self.metrics_collector.increment_effective_prefill_tokens(
+                input_tokens=effective_input_tokens,
+                device_hit_tokens=prefill_stats.log_device_hit_tokens,
+                host_hit_tokens=prefill_stats.log_host_hit_tokens,
+                storage_hit_tokens=prefill_stats.log_storage_hit_tokens,
+            )
 
             # Basics
-            self.stats.num_running_reqs = prefill_stats.num_running_reqs
+            if (
+                self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL
+                and batch is not None
+            ):
+                # running_batch is never populated in PD prefill, so count the
+                # current forward batch instead.
+                self.stats.num_running_reqs = QueueCount.from_reqs(
+                    batch.reqs, priority_enabled
+                )
+            else:
+                self.stats.num_running_reqs = prefill_stats.num_running_reqs
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.waiting_queue, priority_enabled
             )
@@ -752,12 +778,10 @@ class SchedulerMetricsReporter:
         else:
             spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
             num_correct_drafts = self.spec_num_accept_tokens - self.spec_num_forward_ct
-            if self.scheduler.server_args.speculative_num_draft_tokens:
-                draft_per_round = (
-                    self.scheduler.server_args.speculative_num_draft_tokens - 1
-                )
+            if get_spec().speculative_num_draft_tokens:
+                draft_per_round = get_spec().speculative_num_draft_tokens - 1
             else:
-                draft_per_round = self.scheduler.server_args.speculative_num_steps or 0
+                draft_per_round = get_spec().speculative_num_steps or 0
             total_draft_tokens = self.spec_num_forward_ct * draft_per_round
             spec_accept_rate = (
                 num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
@@ -933,16 +957,45 @@ class SchedulerMetricsReporter:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        if not self.enable_metrics:
-            return
         if not isinstance(result, GenerationBatchResult):
             return
 
         if (m := result.expert_distribution_metrics) is not None:
-            self.metrics_collector.increment_eplb_balancedness(
-                forward_mode=batch.forward_mode.name.lower(),
-                balancedness=m.eplb_balancedness.item(),
-            )
+            balancedness = m.eplb_balancedness.item()
+
+            if (
+                self.scheduler.server_args.should_log_expert_balancedness_to_server_log()
+            ):
+                if m.reset_server_log_history:
+                    for history in self._eplb_balancedness_history:
+                        history.clear()
+                for history in self._eplb_balancedness_history:
+                    history.append(balancedness)
+                balancedness_history_means = {
+                    history.maxlen: sum(history) / len(history)
+                    for history in self._eplb_balancedness_history
+                    if len(history) > 0
+                }
+                assert m.gpu_physical_count_sum is not None
+                gpu_physical_count_sum = m.gpu_physical_count_sum.item()
+
+                logger.info(
+                    f"[Expert Balancedness] "
+                    f"forward_pass_id={m.forward_pass_id} "
+                    f"current_pass_balancedness={balancedness:.03f} "
+                    f"{''.join(f'last_{size}_average_balancedness={value:.03f} ' for size, value in balancedness_history_means.items())} "
+                    f"gpu_physical_count_sum={gpu_physical_count_sum}"
+                )
+
+            if (
+                self.enable_metrics
+                and self.scheduler.server_args.should_export_expert_balancedness_to_prometheus()
+            ):
+                assert self.metrics_collector is not None
+                self.metrics_collector.increment_eplb_balancedness(
+                    forward_mode=batch.forward_mode.name.lower(),
+                    balancedness=balancedness,
+                )
 
     def _emit_forward_pass_metrics(
         self,
@@ -958,9 +1011,7 @@ class SchedulerMetricsReporter:
         if not self.scheduler.enable_fpm:
             return
 
-        from sglang.srt.observability.forward_pass_metrics import (
-            ForwardPassMetrics,
-        )
+        from sglang.srt.observability.forward_pass_metrics import ForwardPassMetrics
 
         if self.scheduler._fpm_uses_device_timer:
             self.forward_pass_device_timer._report()
@@ -997,10 +1048,9 @@ class SchedulerMetricsReporter:
             self.scheduler.tree_cache, "token_to_kv_pool_host", None
         ) or getattr(self.scheduler.tree_cache, "full_kv_pool_host", None)
         assert host_pool is not None, "Host pool not found"
-        self.stats.hicache_host_used_tokens = (
-            host_pool.size - host_pool.available_size()
-        )
-        self.stats.hicache_host_total_tokens = host_pool.size
+        host_total = host_pool.logical_size
+        self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
+        self.stats.hicache_host_total_tokens = host_total
 
     def _update_lora_metrics(self):
         """Update LoRA pool metrics for monitoring and autoscaling."""
@@ -1070,7 +1120,7 @@ class SchedulerMetricsReporter:
             # the gauge. Readers sample it asynchronously, and the window
             # boundary can phase-lock with the decode-log cadence, turning a
             # one-tick NaN into NaN on every log line. NaN is published only
-            # when truly stale (reset_device_timer_window after idle).
+            # when truly stale (_reset_device_timer_window after idle).
             self._device_timer_window_start = now
             self._device_timer_window_gpu_time = 0.0
         else:
@@ -1083,16 +1133,33 @@ class SchedulerMetricsReporter:
         if self._device_timer_window_batch_count >= self.decode_log_interval:
             self._device_timer_window_batch_count = 0
 
-    def reset_device_timer_window(self):
+    def _reset_device_timer_window(self):
+        """Exclude idle time and invalidate the last forward-occupancy sample."""
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
             self.fwd_occupancy = float("nan")
+            self.stats.fwd_occupancy = float("nan")
 
     def _maybe_log_idle_metrics(self):
-        """Collect and log metrics every 30 seconds during idle."""
+        """Reset forward timing and publish idle metrics when needed."""
+        # Preserve the transition so the rate limit cannot leave a finite idle gauge.
+        is_fwd_occupancy_stale = ENABLE_METRICS_DEVICE_TIMER and not math.isnan(
+            self.stats.fwd_occupancy
+        )
+        self._reset_device_timer_window()
+        if not self.current_scheduler_metrics_enabled:
+            return
+        # The running-reqs gauge holds the last batch report until the next
+        # one (on PD prefill that is the last forward-batch snapshot, which
+        # no later report zeroes). If it disagrees with running_batch -- the
+        # true idle value -- publish now instead of waiting out the window.
+        gauge_stale = self.stats.num_running_reqs.total != len(
+            self.scheduler.running_batch.reqs
+        )
         if (
-            not self.current_scheduler_metrics_enabled
-            or time.perf_counter() <= self.metrics_collector.last_log_time + 30
+            not gauge_stale
+            and not is_fwd_occupancy_stale
+            and time.perf_counter() <= self.metrics_collector.last_log_time + 30
         ):
             return
 

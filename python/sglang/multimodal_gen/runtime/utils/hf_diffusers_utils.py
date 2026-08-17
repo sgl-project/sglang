@@ -32,6 +32,7 @@ from diffusers.loaders.lora_base import (
     _best_guess_weight_name,  # watch out for potetential removal from diffusers
 )
 from huggingface_hub.errors import (
+    EntryNotFoundError,
     LocalEntryNotFoundError,
     RepositoryNotFoundError,
     RevisionNotFoundError,
@@ -70,6 +71,59 @@ _WEIGHT_FILE_PATTERNS = (
     "*.pth",
     "*.ckpt",
 )
+
+
+def _model_hub_name() -> str:
+    return "ModelScope" if envs.SGLANG_USE_MODELSCOPE.get() else "Hugging Face Hub"
+
+
+def _is_revisionless_snapshot_root(local_path: str) -> bool:
+    """Detect a resolved "snapshot" that is really the ``snapshots/`` parent.
+
+    An empty ``refs/<revision>`` makes the offline resolver join ``""`` onto
+    ``snapshots/`` and return the parent, which holds only revision subdirectories.
+    The ``models--*`` folder above is required too, since a ``local_dir`` may
+    legitimately be named ``snapshots``.
+    """
+    head, tail = os.path.split(os.path.normpath(local_path))
+    return tail == "snapshots" and os.path.basename(head).split("--")[0] in (
+        "models",
+        "datasets",
+        "spaces",
+    )
+
+
+def _snapshot_has_files(
+    local_path: str,
+    allow_patterns: Optional[Union[list[str], str]],
+) -> bool:
+    patterns = (
+        [allow_patterns]
+        if isinstance(allow_patterns, str)
+        else allow_patterns or ["**/*"]
+    )
+    return any(
+        os.path.isfile(candidate)
+        for pattern in patterns
+        for candidate in glob.iglob(
+            os.path.join(local_path, pattern),
+            recursive=True,
+        )
+    )
+
+
+def _is_modelscope_not_found_error(error: BaseException) -> bool:
+    if not envs.SGLANG_USE_MODELSCOPE.get():
+        return False
+
+    from modelscope.hub.errors import NotExistError
+
+    current: Optional[BaseException] = error
+    while current is not None:
+        if isinstance(current, NotExistError):
+            return True
+        current = current.__cause__
+    return False
 
 
 def _is_diffusers_component_entry(value: Any) -> bool:
@@ -129,6 +183,24 @@ def _get_missing_declared_weight_components(model_path: str) -> list[str]:
         elif not _has_local_weight_files(component_path):
             missing_files.append(f"{component_dir}/<weights>")
     return missing_files
+
+
+def _is_metadata_only_pipeline_snapshot(model_path: str) -> bool:
+    """Detect a snapshot holding only pipeline metadata, with no component weights.
+
+    ``maybe_download_model_index`` probes a repo by fetching just ``model_index.json``;
+    that single-file fetch materializes a full cache entry, so a later
+    ``local_files_only`` snapshot resolves it as a hit — offline there is no remote file
+    list to tell "cached" from "fully cached", so completeness must be read off disk.
+
+    Requires *all* declared components missing, not any: a partially populated snapshot
+    is legitimate (``allow_patterns``-filtered fetch), so only total absence is
+    unambiguously the probe stub. No declarations means no evidence to act on.
+    """
+    declared = _get_declared_weight_component_dirs(model_path)
+    if not declared:
+        return False
+    return len(_get_missing_declared_weight_components(model_path)) == len(declared)
 
 
 def _check_index_files_for_missing_shards(
@@ -402,13 +474,31 @@ def load_dict(file_path):
         ) from e
 
 
+def _split_hf_subfolder(path: str) -> tuple[str, str | None]:
+    """Split 'namespace/repo/subfolder' into (repo_id, subfolder), or return (path, None)."""
+    if os.path.isabs(path):
+        return path, None
+    parts = path.split("/")
+    if len(parts) > 2:
+        return "/".join(parts[:2]), "/".join(parts[2:])
+    return path, None
+
+
 def prepare_diffusers_component_path_for_loading(component_path: str) -> str:
     """Download component repos if needed and patch legacy flat ModelOpt configs."""
-    local_component_path = (
-        maybe_download_model(component_path)
-        if not os.path.exists(component_path)
-        else component_path
-    )
+    if os.path.exists(component_path):
+        local_component_path = component_path
+    else:
+        repo_id, subfolder = _split_hf_subfolder(component_path)
+        if subfolder is not None:
+            # component_path is 'namespace/repo/subfolder' — download only that subfolder
+            local_repo = maybe_download_model(
+                repo_id,
+                allow_patterns=[f"{subfolder}/**", f"{subfolder}/*"],
+            )
+            local_component_path = os.path.join(local_repo, subfolder)
+        else:
+            local_component_path = maybe_download_model(component_path)
     config_path = os.path.join(local_component_path, "config.json")
     if not os.path.exists(config_path):
         return local_component_path
@@ -538,7 +628,14 @@ def maybe_download_lora(
     Returns:
         Local path to the model
     """
-    allow_patterns = ["*.json", "*.safetensors", "*.bin"]
+    # Repositories often publish several adapter revisions side by side.  If a
+    # filename is pinned, do not download every weight before selecting it.
+    # Keep JSON metadata so PEFT's lora_alpha remains available.
+    allow_patterns = (
+        ["*.json", weight_name, f"**/{weight_name}"]
+        if weight_name is not None
+        else ["*.json", "*.safetensors", "*.bin"]
+    )
 
     local_path = maybe_download_model(
         model_name_or_path,
@@ -633,11 +730,9 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
 
 def _resolve_remote_repo_model_index_path(model_name_or_path: str) -> str:
     """Return a local path to a remote repo's ``model_index.json``"""
-    from huggingface_hub.errors import EntryNotFoundError
-
     try:
-        # Cache-aware: no local_dir, so HF reuses the cache and revalidates the
-        # ETag against the Hub, re-downloading only when the remote changed.
+        # Cache-aware: no local_dir, so the selected Hub reuses its cache and
+        # revalidates the remote file when online.
         return hf_hub_download(repo_id=model_name_or_path, filename="model_index.json")
     except EntryNotFoundError:
         # Repo exists but has no model_index.json (single-model repo); let the
@@ -677,8 +772,6 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
     Returns:
         The parsed model_index.json as a dictionary
     """
-    from huggingface_hub.errors import EntryNotFoundError
-
     overlay_config = maybe_load_overlay_model_index(
         model_name_or_path,
         snapshot_download_fn=snapshot_download,
@@ -825,7 +918,9 @@ def maybe_download_model(
     # Try to read from HF cache without network access
     try:
         logger.info(
-            "Checking for cached model in HF Hub cache for %s...", model_name_or_path
+            "Checking for cached model in %s cache for %s...",
+            _model_hub_name(),
+            model_name_or_path,
         )
         local_path = snapshot_download(
             repo_id=model_name_or_path,
@@ -834,9 +929,31 @@ def maybe_download_model(
             local_files_only=True,
             max_workers=8,
         )
+        if _is_revisionless_snapshot_root(local_path):
+            # A cache miss, so the download below re-resolves and rewrites the ref.
+            raise LocalEntryNotFoundError(
+                f"Cached ref for {model_name_or_path} is corrupt: resolved to the "
+                f"snapshots parent {local_path!r} instead of a revision directory."
+            )
         if not force_diffusers_model:
-            return str(local_path)
-        if is_lora or _verify_diffusers_model_complete(local_path):
+            # maybe_download_model_index's model_index.json fetch materializes a full
+            # cache entry, so this resolve reports that stub as a hit; returning it
+            # would skip the download. LoRA repos declare no components.
+            if not is_lora and _is_metadata_only_pipeline_snapshot(local_path):
+                if not download:
+                    raise ValueError(
+                        f"Model {model_name_or_path} found in cache but only contains "
+                        "pipeline metadata (no component weights) and download=False."
+                    )
+                logger.info(
+                    "Cached snapshot for %s only contains pipeline metadata, "
+                    "will download component weights from %s",
+                    model_name_or_path,
+                    _model_hub_name(),
+                )
+            else:
+                return str(local_path)
+        elif is_lora or _verify_diffusers_model_complete(local_path):
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(local_path)
                 if not is_valid:
@@ -863,14 +980,17 @@ def maybe_download_model(
                     f"Model {model_name_or_path} found in cache but is incomplete and download=False."
                 )
             logger.info(
-                "Model found in cache but incomplete, will download from HF Hub"
+                "Model found in cache but incomplete, will download from %s",
+                _model_hub_name(),
             )
     except LocalEntryNotFoundError:
         if not download:
             raise ValueError(
                 f"Model {model_name_or_path} not found in local cache and download=False."
             )
-        logger.info("Model not found in cache, will download from HF Hub")
+        logger.info(
+            "Model not found in cache, will download from %s", _model_hub_name()
+        )
     except Exception as e:
         logger.warning(
             "Unexpected error while checking cache for %s: %s, will attempt download",
@@ -887,7 +1007,8 @@ def maybe_download_model(
     for attempt in range(MAX_RETRIES):
         try:
             logger.info(
-                "Downloading model snapshot from HF Hub for %s (attempt %d/%d)...",
+                "Downloading model snapshot from %s for %s (attempt %d/%d)...",
+                _model_hub_name(),
                 model_name_or_path,
                 attempt + 1,
                 MAX_RETRIES,
@@ -942,10 +1063,15 @@ def maybe_download_model(
                 f"Model or revision not found at {model_name_or_path}. "
                 f"Please check the model ID or ensure you have access to the repository. Error: {e}"
             ) from e
-        except (RequestException, RequestsConnectionError) as e:
+        except (RequestException, RequestsConnectionError, ConnectionError) as e:
+            if _is_modelscope_not_found_error(e):
+                raise ValueError(
+                    f"Model or revision not found at {model_name_or_path}. "
+                    "Please check the model ID or ensure you have access to the repository."
+                ) from e
             if attempt == MAX_RETRIES - 1:
                 raise ValueError(
-                    f"Could not find model at {model_name_or_path} and failed to download from HF Hub "
+                    f"Could not find model at {model_name_or_path} and failed to download from {_model_hub_name()} "
                     f"after {MAX_RETRIES} attempts due to network error: {e}"
                 ) from e
             wait_time = 2**attempt
@@ -960,7 +1086,7 @@ def maybe_download_model(
             time.sleep(wait_time)
         except Exception as e:
             raise ValueError(
-                f"Could not find model at {model_name_or_path} and failed to download from HF Hub: {e}"
+                f"Could not find model at {model_name_or_path} and failed to download from {_model_hub_name()}: {e}"
             ) from e
 
 
@@ -974,13 +1100,19 @@ def hf_hub_download(
     """Unified hf_hub_download that supports both Hugging Face Hub and ModelScope."""
     if envs.SGLANG_USE_MODELSCOPE.get():
         from modelscope import model_file_download
+        from modelscope.hub.errors import NotExistError
 
-        return model_file_download(
-            model_id=repo_id,
-            file_path=filename,
-            cache_dir=local_dir,
-            **kwargs,
-        )
+        try:
+            return model_file_download(
+                model_id=repo_id,
+                file_path=filename,
+                local_dir=str(local_dir) if local_dir is not None else None,
+                **kwargs,
+            )
+        except NotExistError as exc:
+            # Keep the Hugging Face-compatible exception contract used by
+            # maybe_download_model_index for repositories without model_index.json.
+            raise EntryNotFoundError(str(exc)) from exc
     else:
         from huggingface_hub import hf_hub_download as _hf_hub_download
 
@@ -1005,16 +1137,25 @@ def snapshot_download(
     if envs.SGLANG_USE_MODELSCOPE.get():
         from modelscope import snapshot_download as _ms_snapshot_download
 
+        # ModelScope validates cached files on every online snapshot request and
+        # has no force_download argument. Dropping it preserves the caller's
+        # intended online revalidation without leaking Hub-specific kwargs.
+        kwargs.pop("force_download", None)
         ms_kwargs = {
             "model_id": repo_id,
-            "local_dir": local_dir,
+            "local_dir": str(local_dir) if local_dir is not None else None,
             "ignore_patterns": ignore_patterns,
             "allow_patterns": allow_patterns,
             "local_files_only": local_files_only,
             "max_workers": max_workers,
         }
         ms_kwargs.update(kwargs)
-        return _ms_snapshot_download(**ms_kwargs)
+        local_path = _ms_snapshot_download(**ms_kwargs)
+        if local_files_only and not _snapshot_has_files(local_path, allow_patterns):
+            raise LocalEntryNotFoundError(
+                f"No cached files for {repo_id} match {allow_patterns or '**/*'}"
+            )
+        return local_path
     else:
         from huggingface_hub import snapshot_download as _hf_snapshot_download
 

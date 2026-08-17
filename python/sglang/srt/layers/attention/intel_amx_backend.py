@@ -8,6 +8,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -59,7 +60,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         self.num_kv_splits = 8
 
         # speculative decoding params
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
 
     def _build_extend_metadata(self, forward_batch: ForwardBatch):
         """Resolve (seq_lens, extend_seq_lens, extend_start_loc, tree_mask) for
@@ -212,6 +213,9 @@ class IntelAMXAttnBackend(AttentionBackend):
         seq_lens, extend_seq_lens, extend_start_loc, tree_mask = self.extend_metadata
 
         _, max_extend_len = self.forward_metadata
+        seq_lens = forward_batch.seq_lens
+        if seq_lens.dtype != torch.int64:
+            seq_lens = seq_lens.to(torch.int64)
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
@@ -255,6 +259,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             seq_lens = forward_batch.seq_lens
 
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
+        seq_lens = forward_batch.seq_lens
+        if seq_lens.dtype != torch.int64:
+            seq_lens = seq_lens.to(torch.int64)
 
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
