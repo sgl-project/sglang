@@ -467,8 +467,8 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         """Clear the in-flight H->D marks on the anchor's root path at ack time."""
         ...
 
-    # Order-sensitive digest of write_back duplicate-reclaim victim ids,
-    # cross-checked across TP ranks; cores that never reclaim keep 0.
+    # Order-sensitive digest of write_back duplicate-reclaim node/component
+    # events, cross-checked across TP ranks; cores that never reclaim keep 0.
     write_back_duplicate_reclaim_digest: int = 0
 
     @abstractmethod

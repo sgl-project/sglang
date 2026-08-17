@@ -125,6 +125,36 @@ def _split_hicache_size(
     )
 
 
+def _split_swa_hicache_size(
+    hicache_size: int,
+    kv_pools: tuple[Any, Any],
+    host_bytes_per_token: tuple[int, int],
+    swa_full_tokens_ratio: Optional[float] = None,
+) -> tuple[float, float]:
+    """Split HiCache bytes while preserving the requested token capacities."""
+    full_pool, swa_pool = kv_pools
+    ratio = (
+        swa_full_tokens_ratio
+        if swa_full_tokens_ratio is not None
+        else swa_pool.size / full_pool.size
+    )
+    full_bytes_per_token, swa_bytes_per_token = host_bytes_per_token
+    weighted_bytes_per_token = full_bytes_per_token + ratio * swa_bytes_per_token
+    full_host_size = hicache_size * full_bytes_per_token / weighted_bytes_per_token
+    return (full_host_size, hicache_size - full_host_size)
+
+
+def _get_host_bytes_per_token(
+    kv_pool: Any,
+    use_mla: bool,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
+) -> int:
+    host_pool_cls = MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
+    return host_pool_cls.get_size_per_token_for_device_pool(
+        kv_pool, mtp_draft_device_pools=mtp_draft_device_pools
+    )
+
+
 def build_pool_entry(
     *,
     name: PoolName,
@@ -340,8 +370,14 @@ def build_hybrid_swa_stack(
 
     kv_host_size = swa_host_size = None
     if server_args.hicache_size > 0:
-        kv_host_size, swa_host_size = _split_hicache_size(
-            server_args.hicache_size, (full_kv_pool, swa_kv_pool)
+        kv_host_size, swa_host_size = _split_swa_hicache_size(
+            server_args.hicache_size,
+            (full_kv_pool, swa_kv_pool),
+            (
+                _get_host_bytes_per_token(full_kv_pool, use_mla),
+                _get_host_bytes_per_token(swa_kv_pool, use_mla, mtp_swa_device_pools),
+            ),
+            server_args.hicache_swa_full_tokens_ratio,
         )
 
     host_pool_group = build_hybrid_swa_group(
@@ -791,6 +827,11 @@ def build_hybrid_mamba_swa_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
+    if server_args.hicache_swa_full_tokens_ratio is not None:
+        raise ValueError(
+            "--hicache-swa-full-tokens-ratio is not supported by the Mamba+SWA "
+            "cache stack."
+        )
     transfer_layer_num = len(
         full_layer_mapping | swa_layer_mapping | mamba_layer_mapping
     )

@@ -2657,6 +2657,12 @@ class ServerArgs:
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
         NS("memory"),
     ] = 0
+    hicache_swa_full_tokens_ratio: A[
+        Optional[float],
+        "The ratio of SWA HiCache tokens to full HiCache tokens. If unset, "
+        "the ratio follows the device pools.",
+        NS("memory"),
+    ] = None
     hicache_write_policy: A[
         str,
         Arg(
@@ -8085,6 +8091,17 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
+        if self.hicache_swa_full_tokens_ratio is not None:
+            if not 0 < self.hicache_swa_full_tokens_ratio <= 1.0:
+                raise ValueError(
+                    "--hicache-swa-full-tokens-ratio should be in range (0, 1]."
+                )
+            if self.hicache_size <= 0:
+                raise ValueError(
+                    "--hicache-swa-full-tokens-ratio requires --hicache-size to be "
+                    "positive."
+                )
+
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "

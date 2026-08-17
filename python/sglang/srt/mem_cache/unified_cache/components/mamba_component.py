@@ -703,7 +703,7 @@ class MambaComponent(TreeComponent):
 
         if phase == CacheTransferPhase.BACKUP_HOST:
             cd = node.component_data[ct]
-            if cd.value is None:
+            if cd.value is None or cd.host_value is not None:
                 return None
             return [
                 PoolTransfer(

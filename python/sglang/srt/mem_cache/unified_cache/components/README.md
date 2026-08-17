@@ -290,6 +290,7 @@ Each component implements these hooks. See `tree_component.py` for the ABC and d
 | `evict_component(target=EvictLayer.DEVICE)` | Free this component's device, host, or both resources on a node being evicted. Internal device eviction tombstones (`value = None`); host eviction clears `host_value`. Returns `(device_freed, host_freed)`. | `_evict_component_and_detach_lru` | *abstract* |
 | `eviction_priority()` | Return cascade eviction priority (higher = evicted later). Leaf: all 0. Internal: Full(2) > SWA(1) > Mamba(0). When evicting, all components with ≤ priority on the same node are cascade-evicted. | `_cascade_evict` | `0` |
 | `evict_device_start()` / `evict_device_next_node()` / `evict_device_end()` | Step-wise device eviction walk the Controller drives: build the cursor/heap, return the next evictable leaf (freed values collected for the Controller to drain), clear the walk. Full: leaf-set heap. SWA/Mamba: component LRUs with internal tombstones and atomic leaf deletion. | `UnifiedRadixCache._evict_components` | *abstract* |
+| `reclaim_coexisting_host_values()` | Under write-back, reclaim host values whose device values remain resident before ordinary host eviction. Full walks its coexistence registry; SWA walks its device LRU. | `UnifiedTreeCore.drive_host_eviction` | no-op |
 | `drive_host_eviction()` | Drive host eviction for this component, collecting freed values for the Controller to drain. Full uses host leaves; SWA/Mamba use host LRUs. | `evict_host` | no-op |
 
 ### Lock Phase

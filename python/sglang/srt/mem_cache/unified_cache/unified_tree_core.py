@@ -1098,7 +1098,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
         # Only the new fragment needs qualifying; the child keeps its id.
-        self._update_duplicate_tracking(new_node)
+        self._update_full_host_duplicate_tracking(new_node)
         return new_node, action
 
     def _add_new_node(
@@ -1135,7 +1135,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.component_evictable_size_[ct] += n
         self._update_evictable_leaf_sets(node)
         # A backuped node restored from fresh KV is a duplicate right away.
-        self._update_duplicate_tracking(node)
+        self._update_full_host_duplicate_tracking(node)
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
         self._record_store_event(node, medium=StorageMedium.GPU)
@@ -1152,9 +1152,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         else:
             self.evictable_host_leaves.discard(node)
 
-    def _update_duplicate_tracking(self, node: UnifiedTreeNode) -> None:
-        """Register where duplicates are born (acks, split, unevict);
-        deregistration is lazy, so entries may be stale and re-checked live."""
+    def _update_full_host_duplicate_tracking(self, node: UnifiedTreeNode) -> None:
+        """Refresh Full's lazy host-duplicate registry."""
         if self._is_settled_full_host_duplicate(node):
             self.full_host_duplicates.setdefault(node.id, node)
         else:
@@ -1337,13 +1336,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def drive_host_eviction(
         self, component_type: ComponentType, num_tokens: int
     ) -> DriveHostEvictionResult:
-        """Evict a component's host-side resources; no-op if absent. Under
-        write_back, FULL pressure reclaims redundant Full host copies first."""
+        """Evict a component's host-side resources; no-op if absent."""
         result = DriveHostEvictionResult()
         comp = self.components_by_type.get(component_type)
         if comp is not None:
-            if self.is_write_back and component_type == BASE_COMPONENT_TYPE:
-                self._reclaim_full_host_duplicates(
+            if self.is_write_back:
+                comp.reclaim_coexisting_host_values(
                     num_tokens,
                     result.tracker,
                     result.device_frees,
@@ -1367,42 +1365,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.node_by_id(tail_node_id), device_frees, host_frees
         )
 
-    def _reclaim_full_host_duplicates(
-        self,
-        num_tokens: int,
-        tracker: dict[ComponentType, int],
-        device_frees: dict[ComponentType, list[torch.Tensor]],
-        host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> None:
-        """Reclaim Full host duplicates until num_tokens are freed; pass 1
-        spares evictable D-leaves (imminent free demotes), pass 2 takes them."""
-        swept_ids: list[NodeId] = []
-        for spare_imminent_demotes in (True, False):
-            if tracker[BASE_COMPONENT_TYPE] >= num_tokens:
-                break
-            for node in self.full_host_duplicates.values():
-                if tracker[BASE_COMPONENT_TYPE] >= num_tokens:
-                    break
-                cd = node.component_data[BASE_COMPONENT_TYPE]
-                if cd.value is None or cd.host_value is None:
-                    swept_ids.append(node.id)  # stale entry
-                    continue
-                if spare_imminent_demotes and node in self.evictable_device_leaves:
-                    continue
-                if not self._can_reclaim_full_host_duplicate(node):
-                    continue
-                self._release_full_host_duplicate(
-                    node, tracker, device_frees, host_frees
-                )
-                swept_ids.append(node.id)  # released -> no longer a duplicate
-        # Sweep after the walk: the dict must not be mutated mid-iteration.
-        for nid in swept_ids:
-            self.full_host_duplicates.pop(nid, None)
-
-    def _can_reclaim_full_host_duplicate(self, node: UnifiedTreeNode) -> bool:
-        """Full on both tiers, no in-flight DMA, no Full host lock; checked
-        live because tracking may be stale."""
-        cd = node.component_data[BASE_COMPONENT_TYPE]
+    def _can_reclaim_host_duplicate(
+        self, node: UnifiedTreeNode, component_type: ComponentType
+    ) -> bool:
+        cd = node.component_data[component_type]
         if node is self.root_node or cd.value is None or cd.host_value is None:
             return False
         if (
@@ -1412,27 +1378,30 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return False
         return cd.host_lock_ref == 0
 
-    def _release_full_host_duplicate(
+    def _release_host_duplicate(
         self,
         node: UnifiedTreeNode,
+        component_type: ComponentType,
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
     ) -> None:
-        """Free only the Full host layer; aux host slices stay under their own
-        pools' LRU (a host-only aux slice may be a sole copy)."""
-        assert self._can_reclaim_full_host_duplicate(node)
-        self._record_remove_event(node, medium=StorageMedium.CPU)
+        """Free one component's redundant host layer."""
+        assert self._can_reclaim_host_duplicate(node, component_type)
+        if component_type == BASE_COMPONENT_TYPE:
+            # BlockRemoved tracks Full host residency, not auxiliary slices.
+            self._record_remove_event(node, medium=StorageMedium.CPU)
         self._evict_component_and_detach_lru(
             node,
-            self.components_by_type[BASE_COMPONENT_TYPE],
+            self.components_by_type[component_type],
             target=EvictLayer.HOST,
             tracker=tracker,
             device_frees=device_frees,
             host_frees=host_frees,
         )
+        event = (node.id + 1) * len(ComponentType) + int(component_type)
         self.write_back_duplicate_reclaim_digest = (
-            self.write_back_duplicate_reclaim_digest * 1000003 + node.id + 1
+            self.write_back_duplicate_reclaim_digest * 1000003 + event
         ) & _RECLAIM_DIGEST_MASK
 
     def _evict_host_leaf(
@@ -1946,6 +1915,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 cache_actions=cache_actions,
             )
         assert not cache_actions  # BACKUP_HOST emits no actions
+        self._update_full_host_duplicate_tracking(node)
 
     def commit_load_back(
         self,
@@ -1998,7 +1968,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if node.load_back_pending_id == anchor_node_id:
                 node.load_back_pending_id = None
                 # The loaded copies become tracked duplicates only now.
-                self._update_duplicate_tracking(node)
+                self._update_full_host_duplicate_tracking(node)
             node = node.parent
 
     def mark_write_through_pending(self, node_id: NodeId) -> None:
@@ -2014,7 +1984,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if node.write_through_pending_id == ack_id:
                 node.write_through_pending_id = None
                 # The backed-up copy becomes a tracked duplicate only now.
-                self._update_duplicate_tracking(node)
+                self._update_full_host_duplicate_tracking(node)
             self._record_store_event(node, medium=StorageMedium.CPU)
 
     def set_component_device_value(

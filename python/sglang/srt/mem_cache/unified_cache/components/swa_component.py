@@ -803,7 +803,7 @@ class SWAComponent(TreeComponent):
 
         if phase == CacheTransferPhase.BACKUP_HOST:
             cd = node.component_data[ct]
-            if cd.value is None:
+            if cd.value is None or cd.host_value is not None:
                 return None
             # cd.value already holds SWA-pool indices (translated at insert time).
             # Host pool indexing wants int64.
@@ -1038,6 +1038,31 @@ class SWAComponent(TreeComponent):
         # Buffer prefix that fell outside the anchor→leaf path.
         if pos > loaded_start:
             self._release_swa_host(host_indices[: pos - loaded_start], cache_actions)
+
+    def reclaim_coexisting_host_values(
+        self,
+        num_tokens: int,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        """Reclaim SWA host values, preserving imminent demotes first."""
+        ct = self.component_type
+        lru = self.tree_core.lru_lists[ct]
+        for spare_imminent_demotes in (True, False):
+            if tracker[ct] >= num_tokens:
+                break
+            node = lru.get_lru_no_host_lock()
+            while tracker[ct] < num_tokens and node is not None:
+                next_node = lru.get_prev_no_host_lock(node)
+                if not (
+                    spare_imminent_demotes
+                    and node in self.tree_core.evictable_device_leaves
+                ) and self.tree_core._can_reclaim_host_duplicate(node, ct):
+                    self.tree_core._release_host_duplicate(
+                        node, ct, tracker, device_frees, host_frees
+                    )
+                node = next_node
 
     def drive_host_eviction(
         self,
