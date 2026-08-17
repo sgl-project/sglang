@@ -86,6 +86,7 @@ class EncoderConfig(ModelConfig):
 @dataclass
 class TextEncoderConfig(EncoderConfig):
     arch_config: ArchConfig = field(default_factory=TextEncoderArchConfig)
+    generation_config: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

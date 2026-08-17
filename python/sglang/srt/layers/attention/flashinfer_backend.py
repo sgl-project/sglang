@@ -281,6 +281,7 @@ def fast_prefill_plan(
         fixed_split_size if fixed_split_size is not None else -1,
         False,  # disable_split_kv
         0,  # num_colocated_ctas
+        0,  # uniform_q_len
     ]
     self._plan_info = self._cached_module.plan(*args)
 

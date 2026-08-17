@@ -5,12 +5,13 @@ import logging
 import math
 import tempfile
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability.metrics_collector import (
@@ -112,6 +113,11 @@ class SchedulerMetricsReporter:
         )
         self._init_metrics(self.tp_rank, self.pp_rank, self.dp_rank)
         self._install_device_timer_on_runners()
+        # Keep log history after the existing async result copy so reporting does
+        # not synchronize the model stream once per generated token.
+        self._eplb_balancedness_history = [
+            deque(maxlen=window_size) for window_size in EPLB_BALANCEDNESS_WINDOW_SIZES
+        ]
 
     def _init_metrics(
         self,
@@ -338,15 +344,15 @@ class SchedulerMetricsReporter:
                 "num_draft_tokens": 0,
             }
 
-        # Fallback to server_args if draft_worker does not have the attributes.
-        server_args = self.scheduler.server_args
+        # Fallback to the published `spec` bag if draft_worker does not have
+        # the attributes.
         num_steps = getattr(
-            draft_worker, "speculative_num_steps", server_args.speculative_num_steps
+            draft_worker, "speculative_num_steps", get_spec().speculative_num_steps
         )
         num_draft_tokens = getattr(
             draft_worker,
             "speculative_num_draft_tokens",
-            server_args.speculative_num_draft_tokens,
+            get_spec().speculative_num_draft_tokens,
         )
 
         return {
@@ -951,16 +957,45 @@ class SchedulerMetricsReporter:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        if not self.enable_metrics:
-            return
         if not isinstance(result, GenerationBatchResult):
             return
 
         if (m := result.expert_distribution_metrics) is not None:
-            self.metrics_collector.increment_eplb_balancedness(
-                forward_mode=batch.forward_mode.name.lower(),
-                balancedness=m.eplb_balancedness.item(),
-            )
+            balancedness = m.eplb_balancedness.item()
+
+            if (
+                self.scheduler.server_args.should_log_expert_balancedness_to_server_log()
+            ):
+                if m.reset_server_log_history:
+                    for history in self._eplb_balancedness_history:
+                        history.clear()
+                for history in self._eplb_balancedness_history:
+                    history.append(balancedness)
+                balancedness_history_means = {
+                    history.maxlen: sum(history) / len(history)
+                    for history in self._eplb_balancedness_history
+                    if len(history) > 0
+                }
+                assert m.gpu_physical_count_sum is not None
+                gpu_physical_count_sum = m.gpu_physical_count_sum.item()
+
+                logger.info(
+                    f"[Expert Balancedness] "
+                    f"forward_pass_id={m.forward_pass_id} "
+                    f"current_pass_balancedness={balancedness:.03f} "
+                    f"{''.join(f'last_{size}_average_balancedness={value:.03f} ' for size, value in balancedness_history_means.items())} "
+                    f"gpu_physical_count_sum={gpu_physical_count_sum}"
+                )
+
+            if (
+                self.enable_metrics
+                and self.scheduler.server_args.should_export_expert_balancedness_to_prometheus()
+            ):
+                assert self.metrics_collector is not None
+                self.metrics_collector.increment_eplb_balancedness(
+                    forward_mode=batch.forward_mode.name.lower(),
+                    balancedness=balancedness,
+                )
 
     def _emit_forward_pass_metrics(
         self,

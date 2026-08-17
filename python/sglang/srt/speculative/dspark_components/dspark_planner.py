@@ -1139,6 +1139,6 @@ def build_sps_cost_table(
         return load_sps_table_from_path(sps_table_path)
     max_batch_tokens = max(
         1,
-        int(server_args.max_running_requests or 1) * verify_num_draft_tokens,
+        int(get_schedule().max_running_requests or 1) * verify_num_draft_tokens,
     )
     return build_uninitialized_sps_table(max_batch_tokens=max_batch_tokens)

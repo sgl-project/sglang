@@ -46,6 +46,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
+from sglang.kernels.jit.utils import get_jit_cuda_arch
 from sglang.kernels.ops.diffusion.triton.numerics import (
     cuda_rsqrtf,
     div_rn_f32,
@@ -340,6 +341,15 @@ def _is_bf16_cuda(t: torch.Tensor) -> bool:
     return t.is_cuda and t.dtype is torch.bfloat16
 
 
+def _qk_head_launch_config() -> tuple[int, int]:
+    arch = get_jit_cuda_arch()
+    if arch.major == 10 and arch.minor == 3:
+        return 32, 1
+    if arch.major * 10 + arch.minor >= 120:
+        return 8, 4
+    return 64, 2
+
+
 def _mod_row_stride(t: torch.Tensor, batch: int, hidden: int) -> int | None:
     # (batch, hidden) modulation rows, possibly strided views of a chunked
     # adaLN projection; the last dim must be packed.
@@ -454,7 +464,10 @@ def fused_qk_head_layernorm(
     launch, bit-exact vs the eager aten kernel."""
     head_dim = q.shape[-1]
     n_rows = q.numel() // head_dim
-    rows = 64
+    # Architecture sweeps at the production GLM shape select 32 rows / 1 warp
+    # on B300 (SM103) and 8 rows / 4 warps on RTX 5090 (SM120). Preserve the
+    # independently tuned H100/H200 launch on all other architectures.
+    rows, num_warps = _qk_head_launch_config()
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
     with torch.cuda.device(q.device):
@@ -470,6 +483,6 @@ def fused_qk_head_layernorm(
             ROWS=rows,
             # H200-tuned: 62us at (1, 4360, 32, 128) vs the 301us of the two
             # aten launches (one 128-thread block per head_dim-element row).
-            num_warps=2,
+            num_warps=num_warps,
         )
     return q_out, k_out

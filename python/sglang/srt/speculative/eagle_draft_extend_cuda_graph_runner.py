@@ -591,10 +591,10 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Snapshot built -- the forward is done reading the shared pool. Publish
         # a read-done event the scheduler's WAR barrier waits on (draft extend
-        # is the EAGLE-family war-publish phase; last write wins the mailbox).
+        # is the EAGLE-family last shared-read phase; last write wins the mailbox).
         read_done = self.device_module.Event()
         read_done.record()
-        self.model_runner.war_fastpath_read_done_event = read_done
+        self.model_runner.shared_read_done_event = read_done
 
         self.raw_bs = raw_bs
         self.bs = bs

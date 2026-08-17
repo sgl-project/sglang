@@ -159,11 +159,15 @@ def _sync_srt_tp_group() -> None:
 
     if srt_parallel_state._TP is None:
         srt_parallel_state._TP = _TP
+    if srt_parallel_state._ATTN_TP is None:
+        srt_parallel_state._ATTN_TP = _TP
 
 
 def _clear_srt_tp_group() -> None:
     import sglang.srt.distributed.parallel_state as srt_parallel_state
 
+    if srt_parallel_state._ATTN_TP is _TP:
+        srt_parallel_state._ATTN_TP = None
     if srt_parallel_state._TP is _TP:
         srt_parallel_state._TP = None
 
@@ -607,14 +611,26 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
 
     _TP_STATE_PATCHED = True
     old_tp_group = get_tp_group()
+    import sglang.srt.distributed.parallel_state as srt_parallel_state
+
+    patch_srt_tp = srt_parallel_state._TP is old_tp_group
+    patch_srt_attention_tp = srt_parallel_state._ATTN_TP is old_tp_group
     global _TP
     _TP = tp_group
+    if patch_srt_tp:
+        srt_parallel_state._TP = tp_group
+    if patch_srt_attention_tp:
+        srt_parallel_state._ATTN_TP = tp_group
     try:
         yield
     finally:
         # restore the original state
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
+        if patch_srt_tp and srt_parallel_state._TP is tp_group:
+            srt_parallel_state._TP = old_tp_group
+        if patch_srt_attention_tp and srt_parallel_state._ATTN_TP is tp_group:
+            srt_parallel_state._ATTN_TP = old_tp_group
 
 
 def get_tp_world_size() -> int:

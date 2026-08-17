@@ -670,9 +670,29 @@ class LogicalHostPool:
     @synchronized
     def clear(self):
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        # Match HostKVCache's lazy release path: defer large free-list merges
+        # until an allocation needs the released slots.
+        self.release_slots = []
+        self.num_release_slots = 0
+
+    def destroy(self) -> None:
+        """Logical anchors own no backing buffers or registrations to release."""
+        return None
 
     def available_size(self):
-        return len(self.free_slots)
+        return len(self.free_slots) + self.num_release_slots
+
+    def _merge_release_slots(self):
+        if self.num_release_slots == 0:
+            return
+
+        if len(self.free_slots) == 0 and len(self.release_slots) == 1:
+            self.free_slots = self.release_slots[0]
+        else:
+            self.free_slots = torch.cat([self.free_slots, *self.release_slots])
+
+        self.release_slots = []
+        self.num_release_slots = 0
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
@@ -683,6 +703,10 @@ class LogicalHostPool:
             )
         if need_size > self.available_size():
             return None
+
+        if need_size > len(self.free_slots):
+            self._merge_release_slots()
+
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
         return select_index
@@ -694,9 +718,12 @@ class LogicalHostPool:
                 "LogicalHostPool free must be page-aligned, "
                 f"got len(indices)={len(indices)}, page_size={self.page_size}"
             )
-        self.free_slots = torch.cat(
-            [self.free_slots, indices.to(dtype=torch.int64, device="cpu").flatten()]
-        )
+        indices_cpu = indices.to(dtype=torch.int64, device="cpu").flatten()
+        if indices_cpu.numel() == 0:
+            return 0
+
+        self.release_slots.append(indices_cpu)
+        self.num_release_slots += len(indices_cpu)
         return len(indices)
 
     def backup_from_device_all_layer(
@@ -1634,120 +1661,6 @@ class HostPoolGroup:
 
     def set_from_flat_data_page(self, index: int, data_page) -> None:
         return self.anchor_entry.host_pool.set_from_flat_data_page(index, data_page)
-
-    def load_to_device_per_layer(
-        self,
-        device_pool,
-        host_indices,
-        device_indices,
-        layer_id,
-        io_backend,
-        pool_transfers: Optional[list] = None,
-        *,
-        is_draft: bool = False,
-    ) -> None:
-        # 1. Anchor (KV) transfer
-        anchor = self.anchor_entry
-        local_layer_id = anchor.layer_mapper(layer_id)
-        if local_layer_id is not None and host_indices.numel() > 0:
-            anchor.host_pool.load_to_device_per_layer(
-                device_pool if is_draft else anchor.device_pool,
-                host_indices,
-                device_indices,
-                local_layer_id,
-                io_backend,
-                is_draft=is_draft,
-            )
-
-        # 2. Extra pool transfers
-        for transfer in pool_transfers or []:
-            entry = self.entry_map.get(transfer.name)
-            if entry is None or transfer.host_indices is None:
-                continue
-            local_layer_id = entry.layer_mapper(layer_id)
-            if local_layer_id is None:
-                continue
-            entry.host_pool.load_to_device_per_layer(
-                device_pool if is_draft else entry.device_pool,
-                transfer.host_indices,
-                transfer.device_indices,
-                local_layer_id,
-                io_backend,
-                is_draft=is_draft,
-            )
-
-    def _backup_uses_cpu_host_indices(self, host_pool, io_backend) -> bool:
-        return (
-            io_backend == "kernel"
-            and getattr(host_pool, "layout", None) == "page_first"
-            and getattr(host_pool, "can_use_write_back_jit", False)
-        )
-
-    def _kernel_index_device(self, entry, device_indices):
-        if device_indices is not None and device_indices.is_cuda:
-            return device_indices.device
-        return getattr(entry.device_pool, "device", None)
-
-    def _normalize_backup_indices(
-        self, entry, host_indices, device_indices, io_backend
-    ):
-        if io_backend != "kernel":
-            return host_indices, device_indices
-
-        if self._backup_uses_cpu_host_indices(entry.host_pool, io_backend):
-            if host_indices.is_cuda:
-                host_indices = host_indices.cpu()
-            return host_indices, device_indices
-
-        if not host_indices.is_cuda:
-            target_device = self._kernel_index_device(entry, device_indices)
-            if target_device is not None:
-                host_indices = host_indices.to(target_device, non_blocking=True)
-                if host_indices.is_cuda:
-                    host_indices.record_stream(
-                        torch.cuda.current_stream(host_indices.device)
-                    )
-        return host_indices, device_indices
-
-    def backup_from_device_all_layer(
-        self,
-        device_pool,
-        host_indices,
-        device_indices,
-        io_backend,
-        pool_transfers: Optional[list] = None,
-    ) -> None:
-        # 1. Anchor (KV) backup
-        # A zero-length anchor denotes a component-only backup.
-        if host_indices.numel() > 0:
-            anchor_host_indices, anchor_device_indices = self._normalize_backup_indices(
-                self.anchor_entry, host_indices, device_indices, io_backend
-            )
-            self.anchor_entry.host_pool.backup_from_device_all_layer(
-                self.anchor_entry.device_pool,
-                anchor_host_indices,
-                anchor_device_indices,
-                io_backend,
-            )
-        # 2. Extra pool backup
-        for transfer in pool_transfers or []:
-            entry = self.entry_map.get(transfer.name)
-            if entry is None or transfer.host_indices is None:
-                continue
-            transfer_host_indices, transfer_device_indices = (
-                self._normalize_backup_indices(
-                    entry,
-                    transfer.host_indices,
-                    transfer.device_indices,
-                    io_backend,
-                )
-            )
-            entry.host_pool.backup_from_device_all_layer(
-                entry.device_pool,
-                transfer_host_indices,
-                transfer_device_indices,
-                io_backend,
-            )
 
 
 class DSAIndexerPoolHost(HostKVCache):

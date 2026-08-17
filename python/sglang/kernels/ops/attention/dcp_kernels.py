@@ -383,6 +383,104 @@ def _lse_pack_dim(output_dtype: torch.dtype) -> int:
 
 
 @triton.jit
+def _dcp_pack_a2a_send_kernel(
+    out_ptr,
+    lse_ptr,
+    dst_o_ptr,
+    dst_lse_ptr,
+    out_stride_B,
+    out_stride_H,
+    lse_stride_B,
+    lse_stride_H,
+    dst_o_stride_N,
+    dst_o_stride_B,
+    dst_o_stride_H,
+    dst_lse_stride_N,
+    dst_lse_stride_B,
+    dst_lse_stride_H,
+    H_PER_RANK: tl.constexpr,
+    WORDS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Scatter one (batch, head) partial into its peer's send slot."""
+    b = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1).to(tl.int64)
+    peer = h // H_PER_RANK
+    h_local = h % H_PER_RANK
+
+    src = out_ptr + b * out_stride_B + h * out_stride_H
+    dst = (
+        dst_o_ptr
+        + peer * dst_o_stride_N
+        + b * dst_o_stride_B
+        + h_local * dst_o_stride_H
+    )
+
+    for start in tl.range(0, WORDS, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < WORDS
+        tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
+
+    tl.store(
+        dst_lse_ptr
+        + peer * dst_lse_stride_N
+        + b * dst_lse_stride_B
+        + h_local * dst_lse_stride_H,
+        tl.load(lse_ptr + b * lse_stride_B + h * lse_stride_H),
+    )
+
+
+def dcp_pack_a2a_send(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    dst_o: torch.Tensor,
+    dst_lse: torch.Tensor,
+) -> None:
+    """Scatter ``[B, H, D]`` partials + ``[B, H]`` LSE into a transport's send slots.
+
+    ``dst_o`` is ``[N, B_max, H // N, D]`` and ``dst_lse`` ``[N, B_max, H // N]``,
+    in any stride order. Rows beyond ``B`` are left untouched.
+    """
+    B, H, D = cp_attn_out.shape
+    N, B_max, H_per_rank = dst_lse.shape
+    lpd = _lse_pack_dim(cp_attn_out.dtype)
+
+    if cp_attn_lse.dtype != torch.float32 or dst_lse.dtype != torch.float32:
+        raise ValueError("LSE tensors must be float32")
+    if D % lpd:
+        raise ValueError(f"head dim {D} must be a multiple of the LSE pack dim {lpd}")
+    if dst_o.shape != (N, B_max, H_per_rank, D) or H_per_rank * N != H or B > B_max:
+        raise ValueError(
+            f"destination {tuple(dst_o.shape)} / {tuple(dst_lse.shape)} does not "
+            f"match out {tuple(cp_attn_out.shape)}"
+        )
+
+    out_words = cp_attn_out.view(torch.float32)
+    dst_o_words = dst_o.view(torch.float32)
+    words = D // lpd
+
+    _dcp_pack_a2a_send_kernel[(B, H)](
+        out_words,
+        cp_attn_lse,
+        dst_o_words,
+        dst_lse,
+        out_words.stride(0),
+        out_words.stride(1),
+        cp_attn_lse.stride(0),
+        cp_attn_lse.stride(1),
+        dst_o_words.stride(0),
+        dst_o_words.stride(1),
+        dst_o_words.stride(2),
+        dst_lse.stride(0),
+        dst_lse.stride(1),
+        dst_lse.stride(2),
+        H_PER_RANK=H_per_rank,
+        WORDS=words,
+        BLOCK=min(1024, triton.next_power_of_2(words)),
+    )
+
+
+@triton.jit
 def _dcp_lse_combine_kernel(
     recv_output_ptr,
     recv_lse_ptr,

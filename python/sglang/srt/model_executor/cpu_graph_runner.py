@@ -39,7 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
-from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
 from sglang.srt.utils import (
     empty_context,
     log_info_on_rank0,
@@ -127,14 +127,13 @@ def set_torch_compile_config():
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
     # torch compile speeds up decoding by reducing python overhead on CPU
-    server_args = model_runner.server_args
     # Reuse cuda_graph_config[decode].bs here.
     # Users can customize the batch sizes supported by cpu_graph, such as:
     # --cuda-graph-bs-decode 1 2 4 8 16
-    capture_bs = server_args.cuda_graph_config.decode.bs
+    capture_bs = get_exec().graph.cuda_graph_config.decode.bs
     assert (
-        max(capture_bs) <= server_args.torch_compile_max_bs
-    ), f"{capture_bs=}, {server_args.torch_compile_max_bs=}"
+        max(capture_bs) <= get_exec().graph.torch_compile_max_bs
+    ), f"{capture_bs=}, {get_exec().graph.torch_compile_max_bs=}"
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
@@ -177,6 +176,8 @@ def register_fake_ops(tp_size: int):
         "gemma_fused_add_rmsnorm_cpu",
         "layernorm_cpu",
         "fused_add_layernorm_cpu",
+        "multimodal_rotary_embedding_cpu",
+        "apply_multidimensional_rope_cpu",
     ]
     for op in none_return_ops:
 
@@ -200,6 +201,18 @@ def register_fake_ops(tp_size: int):
         @register_cpu_compile_fake(op)
         def _(input, *args, **kwargs):
             return torch.empty_like(input)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_cpu")
+    def _(q, k, *args, **kwargs):
+        return torch.empty_like(q), torch.empty_like(k)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_sumsq_cpu")
+    def _(q, k):
+        return torch.empty((q.shape[0], 2), dtype=torch.float32, device=q.device)
+
+    @register_cpu_compile_fake("fused_qk_rmsnorm_apply_from_stats_cpu")
+    def _(q, k, *args, **kwargs):
+        return torch.empty_like(q), torch.empty_like(k)
 
     @register_cpu_compile_fake("shm_allgather")
     def _(data, dim):
@@ -248,26 +261,12 @@ def register_fake_ops(tp_size: int):
 
     @register_cpu_compile_fake("rotary_embedding_cpu")
     def _(positions, query, key, head_size, cos_sin_cache, is_neox):
-        if query.ndim == 2:
-            return query, key
-        else:
-            return torch.empty_like(query), torch.empty_like(key)
+        # TODO: the kernel aliases query/key for 2D and 4D but allocates for 3D,
+        # which no schema expresses; an accurate fake needs it to pick one
+        return torch.empty_like(query), torch.empty_like(key)
 
     @register_cpu_compile_fake("apply_rotary_pos_emb_cpu")
     def _(query, key, cos, sin):
-        return query, key
-
-    @register_cpu_compile_fake("multimodal_rotary_embedding_cpu")
-    def _(
-        positions,
-        query,
-        key,
-        head_size,
-        cos_sin_cache,
-        mrope_section,
-        mrope_interleaved,
-        is_neox,
-    ):
         return query, key
 
     @register_cpu_compile_fake("qkv_proj_with_rope_fused_weight")
@@ -385,7 +384,7 @@ def register_fake_ops(tp_size: int):
         return topk_weights, topk_ids
 
     @register_cpu_compile_fake("topk_sigmoid_cpu")
-    def _(hidden_states, gating_output, topk, renormalize):
+    def _(hidden_states, gating_output, topk, renormalize, correction_bias=None):
         num_tokens = hidden_states.shape[0]
         shape = (num_tokens, topk)
         return (
@@ -399,6 +398,7 @@ def register_fake_ops(tp_size: int):
         gating_output,
         topk,
         renormalize,
+        correction_bias=None,
     ):
         num_tokens = hidden_states.shape[0]
         shape = (num_tokens, topk)

@@ -75,6 +75,7 @@ from sglang.srt.runtime_context import (
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
     max_speculative_num_draft_tokens,
+    pre_capture_activation_reserve_mb,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -112,6 +113,26 @@ def _should_enable_lazy_compaction() -> bool:
     Centralized here so both unified-memory-pool factory call sites stay in sync.
     """
     return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
+
+
+def mm_runtime_reservation_gb(
+    *, is_multimodal: bool, mm_feature_transport: Optional[str]
+) -> float:
+    """Multimodal GPU memory allocated only after the KV pool is sized
+    (mm embedding cache + GPU feature-transport pools); reserve it out of
+    the KV budget so it doesn't have to fit in the runtime slack."""
+    if not is_multimodal:
+        return 0.0
+    reserved_mb = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
+    if mm_feature_transport in ("cuda_ipc", "cuda_vmm"):
+        reserved_mb += envs.SGLANG_MM_FEATURE_CACHE_MB.get()
+    if reserved_mb > 0:
+        logger.info(
+            "Reserving %.2f GB of the KV budget for post-sizing multimodal "
+            "allocations (feature-transport pools + embedding cache).",
+            reserved_mb / 1024,
+        )
+    return reserved_mb / 1024
 
 
 # base ratio of mamba pool size to max_running_requests. Under
@@ -973,6 +994,10 @@ class KVCacheConfigurator:
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
                     swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                 )
+            elif is_minimax_sparse(self.model_config.hf_config):
+                token_to_kv_pool = self._build_ascend_minimax_sparse_kv_pool(
+                    max_total_num_tokens=sizes.max_total_num_tokens,
+                )
             elif self.use_mla_backend:
                 token_to_kv_pool = self._build_ascend_mla_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
@@ -1215,6 +1240,37 @@ class KVCacheConfigurator:
             device=self.device,
             token_to_kv_pool_class=NPUMHATokenToKVPool,
             **kwargs,
+        )
+        return token_to_kv_pool
+
+    def _build_ascend_minimax_sparse_kv_pool(
+        self, *, max_total_num_tokens: int
+    ) -> KVCache:
+        _hf_config = self.model_config.hf_config
+        sparse_cfg = get_minimax_sparse_attention_config(_hf_config)
+        dense_layer_ids, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_cfg)
+        disable_value_sparse_layer_ids = get_minimax_sparse_disable_value_layer_ids(
+            sparse_cfg
+        )
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMiniMaxSparseKVPool,
+        )
+
+        token_to_kv_pool = NPUMiniMaxSparseKVPool(
+            size=max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            index_dtype=self.model_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
+            head_dim=self.model_config.head_dim,
+            idx_head_dim=sparse_cfg["sparse_index_dim"],
+            dense_layer_ids=dense_layer_ids,
+            sparse_layer_ids=sparse_layer_ids,
+            disable_value_sparse_layer_ids=disable_value_sparse_layer_ids,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
         )
         return token_to_kv_pool
 
@@ -1727,12 +1783,16 @@ class KVCacheConfigurator:
             # Mamba state is a fixed pre-capture allocation, so it can't ride the ~0 post-capture slack.
             slack_gb = max(
                 slack_gb,
-                self.server_args.pre_capture_activation_reserve_mb(
+                pre_capture_activation_reserve_mb(
                     get_device_memory_capacity(self.device)
                 )
                 / 1024,
             )
-        rest_memory = available_gpu_memory - slack_gb
+        mm_reservation_gb = mm_runtime_reservation_gb(
+            is_multimodal=self.model_config.is_multimodal,
+            mm_feature_transport=self.server_args.mm_feature_transport,
+        )
+        rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 

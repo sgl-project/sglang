@@ -128,7 +128,8 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
 
     def test_single_request_plan_contract(self):
         backend = SimpleNamespace(_can_use_nonpaged_indexer=lambda **_: True)
-        c4_indexer = SimpleNamespace(use_fp4_indexer=False)
+        backend.dsa_topk_backend = SimpleNamespace(is_sgl_kernel=lambda: True)
+        c4_indexer = SimpleNamespace(use_fp4_indexer=False, index_topk=64)
         query_rows = 4
         batch = SimpleNamespace(
             seq_lens=torch.tensor([262], dtype=torch.int32),
@@ -156,14 +157,19 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         threshold = envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS
         with threshold.override(threshold.default):
             self.assertIsNone(build_plan())
-        with threshold.override(query_rows):
+        with (
+            threshold.override(query_rows),
+            envs.SGLANG_TOPK_TRANSFORM_512_TORCH.override(False),
+        ):
             plan = build_plan()
         self.assertEqual(
             (plan.seq_len_sum, plan.max_seqlen_k, plan.query_rows),
             (65, 128, query_rows),
         )
         torch.testing.assert_close(plan.page_table, page_table[:1])
-        torch.testing.assert_close(plan.ke, c4_seq_lens)
+        torch.testing.assert_close(
+            plan.ke, torch.tensor([0, 0, 0, 65], dtype=torch.int32)
+        )
         torch.testing.assert_close(plan.gather_seq_lens, c4_seq_lens[-1:])
 
         metadata.nonpaged_plan = None
@@ -173,7 +179,8 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
 
     def test_extreme_plan_metadata_is_bounded_and_fail_closed(self):
         backend = SimpleNamespace(_can_use_nonpaged_indexer=lambda **_: True)
-        c4_indexer = SimpleNamespace(use_fp4_indexer=False)
+        backend.dsa_topk_backend = SimpleNamespace(is_sgl_kernel=lambda: True)
+        c4_indexer = SimpleNamespace(use_fp4_indexer=False, index_topk=512)
         query_rows = 4
         batch = SimpleNamespace(
             seq_lens=torch.tensor([500_000], dtype=torch.int32),
@@ -219,7 +226,8 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
     def test_query_threshold_boundary(self):
         can_use_nonpaged_indexer = MagicMock(return_value=True)
         backend = SimpleNamespace(_can_use_nonpaged_indexer=can_use_nonpaged_indexer)
-        c4_indexer = SimpleNamespace(use_fp4_indexer=False)
+        backend.dsa_topk_backend = SimpleNamespace(is_sgl_kernel=lambda: True)
+        c4_indexer = SimpleNamespace(use_fp4_indexer=False, index_topk=512)
         metadata = SimpleNamespace(nonpaged_plan=None, c4_page_size=64)
 
         def build_plan(query_rows):

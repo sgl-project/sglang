@@ -31,6 +31,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from sglang.kernels.jit.utils import get_jit_cuda_arch
 from sglang.kernels.ops.diffusion.quality_gate import QualityGatedFusion
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -130,6 +131,13 @@ def can_fuse_linear_gelu_static(linear: Any) -> bool:
 def can_fuse_linear_gelu(linear: Any, x: torch.Tensor) -> bool:
     """Whether ``gelu(linear(x))`` can use the fused cublasLt epilogue now."""
     if not (x.is_cuda and x.dtype in (torch.bfloat16, torch.float16)):
+        return False
+    arch = get_jit_cuda_arch()
+    if arch.major * 10 + arch.minor >= 120:
+        # The cublasLt GELU epilogue selected by current SM120 PyTorch/CUDA
+        # builds is slower than GEMM + the native GELU kernel for the FLUX
+        # production shape (1, 512, 3072 -> 12288).  Keep quality-gated sites
+        # on their existing eager path on RTX 5090; SM90 dispatch is unchanged.
         return False
     if getattr(linear, "weight", None) is None or x.dtype != linear.weight.dtype:
         return False

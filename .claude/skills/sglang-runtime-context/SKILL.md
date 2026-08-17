@@ -99,8 +99,10 @@ bag to override at all.
   instance: **constructor arguments** (`ModelRunner(draft_attention_backend=...)`,
   `MMEncoder(gpu_id=...)`) and **runner attributes holding the resolved value**
   (`model_runner.kv_cache_dtype_str`, `prefill_attention_backend_str`,
-  `num_fused_shared_experts`) — threaded to consumers as arguments, never
-  backfilled onto a shared object. The one sanctioned bend in that rule is
+  `num_fused_shared_experts`, `linear_attn_backends`) — threaded to consumers as
+  arguments, never backfilled onto a shared object. A per-runner choice also stays
+  *out* of the bags: recording it there is how a second runner inherits the first
+  one's answer, which is exactly the bug `linear_attn_backends` replaced. The one sanctioned bend in that rule is
   *scoped*: `ModelRunner._load_format_scope` exposes the draft's
   `--speculative-draft-load-format` through `get_model().override(load_format=...)`
   for exactly the duration of the draft build, because model construction
@@ -116,9 +118,28 @@ bag to override at all.
   encode-server DP workers used to specialize a config copy for the same reason;
   their device now travels as `MMEncoder(gpu_id=...)`.)
 - **Whole-object passes** (`f(server_args)` handing the instance along) keep the
-  supplied-instance contract; don't rewrite the parameter reads to bag reads unless the
+  supplied-instance contract; don't rewrite the parameter reads unless the
   field is runtime-mutated (see the elastic-EP `ep_size` case in
-  `eplb/expert_location.py`).
+  `eplb/expert_location.py`) — **or the field is one that resolution fills in
+  and the callee runs in a process that has published.** That second case is
+  step-12 debt, not a style question: the record is destined to carry the
+  user's raw input, so `server_args.page_size` inside a runner-owned
+  constructor will read the raw pre-resolution value instead of the effective
+  one. Debt means a decision, not automatically a bag read: pick where the
+  value should come from — usually the `get_*()` bag, sometimes a runner stamp
+  or a constructor argument (the per-mode attention pair and the encode-server
+  `gpu_id` above are dispositions of exactly this debt). And the per-instance
+  boundaries above stay exempt from this unless-clause: a multi-Engine site
+  must not become a process-global bag read even for a resolution-filled
+  field. `test_supplied_instance_exposure_ratchet.py`
+  pins the remaining set — three spellings of the read: `server_args.field`,
+  literal-name `getattr(server_args, "field", default)`, and the parked form
+  (`self.x = server_args` in a method that takes the parameter, read as
+  `self.x.field` anywhere in the class) — and fails on a new one, so the
+  disposition gets picked when the read is written. Two shapes stay parameter-form on purpose: a helper the
+  *resolution pipeline* calls with a `resolved_view` (its parameter happens to be
+  named `server_args`), and a factory whose contract is "build X from the record
+  you are handed" (`create_kt_config_from_server_args`, `DllmConfig.from_server_args`).
 
 ### `get_parallel()`: config leaves vs live topology
 

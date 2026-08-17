@@ -23,6 +23,7 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
     ModelSlimW4A8Int8MoE,
+    ModelSlimW4A8MXFP4MoE,
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
 )
@@ -90,6 +91,8 @@ class ModelSlimConfig(QuantizationConfig):
     Config class for ModelSlim Quantization, a NPU-specific quantization type.
     """
 
+    supports_kimi_k3_quantized_latent_projections = True
+
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
         keys = [k for k in quant_config if isinstance(k, str)]
@@ -102,6 +105,18 @@ class ModelSlimConfig(QuantizationConfig):
                 (remap(k) if isinstance(k, str) else k): v
                 for k, v in quant_config.items()
             }
+
+        # Add an mlp.* alias for each block_sparse_moe.* key but KEEP the original,
+        # so both module namings resolve
+        for k in list(quant_config.keys()):
+            if not isinstance(k, str):
+                continue
+            if "block_sparse_moe" in k:
+                quant_config[
+                    k.replace("block_sparse_moe.experts", "mlp.experts").replace(
+                        "block_sparse_moe.shared_experts", "mlp.shared_experts"
+                    )
+                ] = quant_config[k]
 
         self.quant_description = quant_config
         ignore = cast(List[str], quant_config.get("ignore", []))
@@ -126,6 +141,33 @@ class ModelSlimConfig(QuantizationConfig):
 
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)
+
+    def _quant_prefix_candidates(self, prefix: str) -> List[str]:
+        """Return checkpoint-name variants without copying the large config.
+
+        Kimi-K3's upstream model uses ``mlp`` internally while its ModelSlim
+        checkpoint retains the Hugging Face ``block_sparse_moe`` hierarchy.
+        Some multimodal checkpoints also keep the outer ``language_model``
+        prefix.  Resolve those layout-only differences at the quantization
+        boundary.
+        """
+        candidates = [prefix]
+        if ".mlp." in prefix:
+            candidates.append(prefix.replace(".mlp.", ".block_sparse_moe."))
+
+        for candidate in list(candidates):
+            if candidate.startswith("language_model."):
+                candidates.append(candidate.removeprefix("language_model."))
+            else:
+                candidates.append(f"language_model.{candidate}")
+
+        return list(dict.fromkeys(candidates))
+
+    def _resolve_quant_prefix(self, prefix: str) -> str:
+        for candidate in self._quant_prefix_candidates(prefix):
+            if candidate + ".weight" in self.quant_description:
+                return candidate
+        return prefix
 
     def get_linear_method(self) -> ModelSlimLinearMethod:
         return ModelSlimLinearMethod(self)
@@ -176,10 +218,7 @@ class ModelSlimConfig(QuantizationConfig):
                 prefix_in_quant_config = prefix.replace(
                     proj_name, packed_modules_mapping_subset[proj_name][0]
                 )
-                # Verify the remapped prefix exists in quant_description.
-                # If not (e.g. json uses fused name as-is), fall back to original.
-                if prefix_in_quant_config + ".weight" not in self.quant_description:
-                    prefix_in_quant_config = prefix
+            prefix_in_quant_config = self._resolve_quant_prefix(prefix_in_quant_config)
             if self.is_layer_skipped(
                 prefix, packed_modules_mapping_subset
             ) or self.is_layer_skipped(prefix, self.packed_modules_mapping):
@@ -217,6 +256,7 @@ class ModelSlimConfig(QuantizationConfig):
             ("W4A4_MXFP4", ModelSlimMXFP4Scheme),
         ]
 
+        prefix = self._resolve_quant_prefix(prefix)
         quant_schemes = [self.quant_description.get(prefix + ".weight", "")]
 
         for scheme_name, scheme_class in linear_quant_schemes:
@@ -236,6 +276,7 @@ class ModelSlimConfig(QuantizationConfig):
         prefix: str,
     ):
         moe_quant_schemes = [
+            ("W4A8_MXFP", ModelSlimW4A8MXFP4MoE),
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
@@ -252,46 +293,54 @@ class ModelSlimConfig(QuantizationConfig):
 
         w13_scheme_name = None
         w2_scheme_name = None
-        for gate_name, up_name, down_name in naming_conventions:
-            w13_keys = [
-                f"{prefix}.0.{gate_name}.weight",
-                f"{prefix}.0.{up_name}.weight",
-            ]
-            w2_key = f"{prefix}.0.{down_name}.weight"
-            w13_entries = {
-                key: self.quant_description[key]
-                for key in w13_keys
-                if key in self.quant_description
-            }
-            if w13_entries and w2_key in self.quant_description:
-                w13_names = list(w13_entries.values())
-                # For w13, both projections must agree on the scheme
-                unique_w13 = set(w13_names)
-                if len(unique_w13) > 1:
-                    raise ValueError(
-                        f"Mismatched ModelSlim quantization for W13 in layer {prefix}: "
-                        f"{w13_entries}"
-                    )
-                w13_scheme_name = w13_names[0]
-                w2_scheme_name = self.quant_description[w2_key]
+        resolved_prefix = prefix
+        for candidate in self._quant_prefix_candidates(prefix):
+            for gate_name, up_name, down_name in naming_conventions:
+                w13_keys = [
+                    f"{candidate}.0.{gate_name}.weight",
+                    f"{candidate}.0.{up_name}.weight",
+                ]
+                w2_key = f"{candidate}.0.{down_name}.weight"
+                w13_entries = {
+                    key: self.quant_description[key]
+                    for key in w13_keys
+                    if key in self.quant_description
+                }
+                if w13_entries and w2_key in self.quant_description:
+                    w13_names = list(w13_entries.values())
+                    # For w13, both projections must agree on the scheme
+                    unique_w13 = set(w13_names)
+                    if len(unique_w13) > 1:
+                        raise ValueError(
+                            "Mismatched ModelSlim quantization for W13 in layer "
+                            f"{prefix}: {w13_entries}"
+                        )
+                    w13_scheme_name = w13_names[0]
+                    w2_scheme_name = self.quant_description[w2_key]
+                    resolved_prefix = candidate
+                    break
+            if w13_scheme_name is not None:
                 break
 
         if w13_scheme_name is None:
             # Build a helpful error message listing all attempted key patterns
             all_attempted = []
-            for gate_name, up_name, down_name in naming_conventions:
-                w13_keys = [
-                    f"{prefix}.0.{gate_name}.weight",
-                    f"{prefix}.0.{up_name}.weight",
-                ]
-                w2_key = f"{prefix}.0.{down_name}.weight"
-                w13_found = any(k in self.quant_description for k in w13_keys)
-                w2_found = w2_key in self.quant_description
-                status = (
-                    f"({gate_name}/{up_name}={'found' if w13_found else 'missing'}, "
-                    f"{down_name}={'found' if w2_found else 'missing'})"
-                )
-                all_attempted.append(status)
+            for candidate in self._quant_prefix_candidates(prefix):
+                for gate_name, up_name, down_name in naming_conventions:
+                    w13_keys = [
+                        f"{candidate}.0.{gate_name}.weight",
+                        f"{candidate}.0.{up_name}.weight",
+                    ]
+                    w2_key = f"{candidate}.0.{down_name}.weight"
+                    w13_found = any(k in self.quant_description for k in w13_keys)
+                    w2_found = w2_key in self.quant_description
+                    status = (
+                        f"{candidate} "
+                        f"({gate_name}/{up_name}="
+                        f"{'found' if w13_found else 'missing'}, "
+                        f"{down_name}={'found' if w2_found else 'missing'})"
+                    )
+                    all_attempted.append(status)
             raise ValueError(
                 f"Missing ModelSlim MoE quantization description for layer {prefix}: "
                 + "; ".join(all_attempted)
@@ -306,7 +355,9 @@ class ModelSlimConfig(QuantizationConfig):
         def instantiate(name, weight_group):
             cls = scheme_map.get(name)
             if cls is None:
-                logger.warning(f"Unsupported scheme '{name}' for layer {prefix}")
+                logger.warning(
+                    f"Unsupported scheme '{name}' for layer {resolved_prefix}"
+                )
                 return None
             return cls(self, weight_group)
 
@@ -335,6 +386,7 @@ class ModelSlimConfig(QuantizationConfig):
 
             is_skipped = None
             for shard_prefix in shard_prefixes:
+                shard_prefix = self._resolve_quant_prefix(shard_prefix)
                 is_shard_skipped = (
                     self.quant_description.get(shard_prefix + ".weight", "") == "FLOAT"
                 )
@@ -348,6 +400,7 @@ class ModelSlimConfig(QuantizationConfig):
                         "to have the same precision."
                     )
         else:
+            prefix = self._resolve_quant_prefix(prefix)
             is_skipped = self.quant_description.get(prefix + ".weight", "") == "FLOAT"
 
         assert is_skipped is not None
@@ -481,8 +534,8 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale,
             w2_weight_scale=layer.w2_weight_scale,
-            w13_weight_offset=layer.w13_weight_offset,
-            w2_weight_offset=layer.w2_weight_offset,
+            w13_weight_offset=getattr(layer, "w13_weight_offset", None),
+            w2_weight_offset=getattr(layer, "w2_weight_offset", None),
             w13_scale_bias=getattr(layer, "w13_scale_bias", None),
             w2_scale_bias=getattr(layer, "w2_scale_bias", None),
             w13_weight_bias=getattr(layer, "w13_weight_bias", None),

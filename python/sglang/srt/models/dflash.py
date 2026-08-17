@@ -43,14 +43,13 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
-def _get_dflash_attention_type(config) -> AttentionType:
-    """Bidirectional over the draft block unless the checkpoint says causal."""
-    text_config = getattr(config, "text_config", None) or config
-    return (
-        AttentionType.DECODER
-        if getattr(text_config, "is_causal", False)
-        else AttentionType.ENCODER_ONLY
-    )
+def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
+    """Honor explicit causality while preserving legacy layer defaults."""
+    text_config = config.get_text_config()
+    is_causal = getattr(text_config, "is_causal", None)
+    if is_causal is None:
+        return default
+    return AttentionType.DECODER if is_causal else AttentionType.ENCODER_ONLY
 
 
 def _get_dflash_layer_attention_params(
@@ -67,12 +66,15 @@ def _get_dflash_layer_attention_params(
 
     layer_type = layer_types[layer_id]
     if layer_type == "full_attention":
-        return -1, _get_dflash_attention_type(config)
+        return -1, _get_dflash_attention_type(
+            config, default=AttentionType.ENCODER_ONLY
+        )
     if layer_type == "sliding_attention":
-        # Windowing is orthogonal to causality (mask is p1 - p0 >= window).
         sliding_window_size = get_dflash_attention_sliding_window_size(config)
         assert sliding_window_size is not None
-        return sliding_window_size, _get_dflash_attention_type(config)
+        return sliding_window_size, _get_dflash_attention_type(
+            config, default=AttentionType.DECODER
+        )
     raise ValueError(
         "Unsupported DFLASH draft layer type. "
         f"layer_types[{layer_id}]={layer_type!r}."

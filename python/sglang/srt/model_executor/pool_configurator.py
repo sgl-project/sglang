@@ -36,7 +36,14 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_write_pad,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_parallel,
+    get_schedule,
+    get_spec,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
@@ -533,10 +540,9 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         super().__init__(kvc)
         assert self._full_layers_num > 0
 
-        sa = kvc.server_args
         page_size = kvc.page_size
         window = kvc.sliding_window_size
-        draft_tokens = sa.speculative_num_draft_tokens or 1
+        draft_tokens = get_spec().speculative_num_draft_tokens or 1
         eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
 
         """
@@ -544,40 +550,47 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         Padding to make sure eviction point is page-aligned.
         """
         trailing_tokens = window + eviction_interval * draft_tokens + page_size
-        if sa.speculative_algorithm is None:
+        if get_spec().speculative_algorithm is None:
             decode_alloc = page_size
-        elif sa.disable_overlap_schedule:
+        elif get_schedule().disable_overlap_schedule:
             # spec-v1: new_tokens_required_next_decode per request.
-            decode_alloc = spec_decode_alloc_len_per_request(sa)
+            decode_alloc = spec_decode_alloc_len_per_request(
+                page_size=page_size,
+                speculative_num_steps=get_spec().speculative_num_steps,
+                speculative_eagle_topk=get_spec().speculative_eagle_topk,
+                speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
+            )
         else:
             # spec-v2: the overlap allocator keeps 2 * alloc_len outstanding
             # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + 2 * alloc_len).
-            decode_alloc = 2 * get_alloc_len_per_decode(sa)
+            decode_alloc = 2 * get_alloc_len_per_decode(
+                kvc.server_args,
+                max_draft_tokens=max_speculative_num_draft_tokens(),
+            )
         per_request = trailing_tokens + decode_alloc
 
-        num_reqs = sa.max_running_requests // kvc.ps.attn_dp_size
-        if sa.disaggregation_mode == "decode":
+        num_reqs = get_schedule().max_running_requests // kvc.ps.attn_dp_size
+        if get_disagg().disaggregation_mode == "decode":
             self._swa_cap = (
                 per_request * num_reqs
-                + (window + page_size) * sa.disaggregation_decode_extra_slots
+                + (window + page_size) * get_disagg().disaggregation_decode_extra_slots
             )
         else:
-            chunks_in_flight = 1 if sa.disable_overlap_schedule else 2
+            chunks_in_flight = 1 if get_schedule().disable_overlap_schedule else 2
             self._swa_cap = (
                 per_request * num_reqs
-                + chunks_in_flight * sa.chunked_prefill_size
+                + chunks_in_flight * get_schedule().chunked_prefill_size
                 + page_size
             )
 
     @staticmethod
     def is_applicable(kvc: KVCacheConfigurator) -> bool:
         """True when SWAChunkCache can be sized from explicit max requests."""
-        sa = kvc.server_args
-        if sa.max_running_requests is None:
+        if get_schedule().max_running_requests is None:
             return False
-        if not sa.disable_radix_cache:
+        if not get_memory().disable_radix_cache:
             return False
-        if sa.chunked_prefill_size is None:
+        if get_schedule().chunked_prefill_size is None:
             return False
         if kvc.sliding_window_size is None:
             return False

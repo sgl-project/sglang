@@ -2,14 +2,21 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import call, patch
 
+import torch
+from torch import nn
+
 from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     IPC_A2A,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_groups import PROCESS_GROUP
+from sglang.multimodal_gen.test.single_test_file.component_accuracy.engine import (
+    AccuracyEngine,
+)
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     initialize_parallel_runtime,
 )
+from sglang.srt.distributed import parallel_state as srt_parallel_state
 
 _UTILS = "sglang.multimodal_gen.test.single_test_file.component_accuracy.utils"
 
@@ -113,3 +120,87 @@ def test_destroy_releases_sequence_parallel_subgroups_after_partial_init():
         assert destroy_group.call_args_list == [call(ulysses_group), call(ring_group)]
         assert PROCESS_GROUP.ULYSSES_PG is None
         assert PROCESS_GROUP.RING_PG is None
+
+
+def test_srt_attention_tp_group_tracks_diffusion_tp_group():
+    tp_group = object()
+
+    with (
+        patch.object(parallel_state, "_TP", tp_group),
+        patch.object(srt_parallel_state, "_TP", None),
+        patch.object(srt_parallel_state, "_ATTN_TP", None),
+    ):
+        parallel_state._sync_srt_tp_group()
+
+        assert srt_parallel_state._TP is tp_group
+        assert srt_parallel_state._ATTN_TP is tp_group
+
+        parallel_state._clear_srt_tp_group()
+
+        assert srt_parallel_state._TP is None
+        assert srt_parallel_state._ATTN_TP is None
+
+
+def test_srt_owned_groups_are_not_overwritten_or_cleared():
+    diffusion_tp_group = object()
+    srt_tp_group = object()
+    srt_attention_tp_group = object()
+
+    with (
+        patch.object(parallel_state, "_TP", diffusion_tp_group),
+        patch.object(srt_parallel_state, "_TP", srt_tp_group),
+        patch.object(srt_parallel_state, "_ATTN_TP", srt_attention_tp_group),
+    ):
+        parallel_state._sync_srt_tp_group()
+        parallel_state._clear_srt_tp_group()
+
+        assert srt_parallel_state._TP is srt_tp_group
+        assert srt_parallel_state._ATTN_TP is srt_attention_tp_group
+
+
+def test_srt_tp_groups_follow_encoder_folding_context():
+    original_tp_group = object()
+    folding_tp_group = object()
+
+    with (
+        patch.object(parallel_state, "_TP", original_tp_group),
+        patch.object(parallel_state, "_TP_STATE_PATCHED", False),
+        patch.object(srt_parallel_state, "_TP", original_tp_group),
+        patch.object(srt_parallel_state, "_ATTN_TP", original_tp_group),
+    ):
+        with parallel_state.patch_tensor_parallel_group(folding_tp_group):
+            assert parallel_state._TP is folding_tp_group
+            assert srt_parallel_state._TP is folding_tp_group
+            assert srt_parallel_state._ATTN_TP is folding_tp_group
+
+        assert parallel_state._TP is original_tp_group
+        assert srt_parallel_state._TP is original_tp_group
+        assert srt_parallel_state._ATTN_TP is original_tp_group
+
+
+def test_weight_transfer_uses_loader_for_implicit_srt_shard():
+    source = nn.Module()
+    source.weight = nn.Parameter(torch.arange(8, dtype=torch.float32).reshape(4, 2))
+    target = nn.Module()
+    target.weight = nn.Parameter(torch.empty(2, 2))
+
+    def load_first_shard(param, loaded_weight):
+        param.data.copy_(loaded_weight[:2])
+
+    target.weight.weight_loader = load_first_shard
+
+    with patch(
+        "sglang.multimodal_gen.test.single_test_file.component_accuracy.engine.model_parallel_is_initialized",
+        return_value=False,
+    ):
+        AccuracyEngine.transfer_weights(
+            source,
+            target,
+            min_match_ratio=1.0,
+            target_device=torch.device("cpu"),
+        )
+
+    torch.testing.assert_close(
+        target.weight,
+        source.weight[:2].to(dtype=torch.bfloat16),
+    )

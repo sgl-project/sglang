@@ -32,6 +32,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
+from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
@@ -100,6 +101,7 @@ class _MockTokenizerManager:
                     "prompt_tokens": 10,
                     "completion_tokens": 5,
                     "cached_tokens": 0,
+                    "weight_version": "test-version",
                     "finish_reason": {"type": "stop", "matched": None},
                     "output_token_logprobs": [(0.1, 1, "Test"), (0.2, 2, "response")],
                     "output_top_logprobs": None,
@@ -109,6 +111,7 @@ class _MockTokenizerManager:
 
         self.generate_request = Mock(return_value=_mock_generate())
         self.create_abort_task = Mock()
+        self.request_logger = Mock(log_requests=False, log_requests_level=0)
 
     def config_value(self, name: str):
         """The manager's overlay accessor: no control-plane update recorded."""
@@ -278,11 +281,61 @@ class ServingChatTestCase(unittest.TestCase):
                 None,
             )
 
+            self.basic_req.return_sampling_mask = True
+            self.basic_req.return_meta_info = True
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
+            self.assertTrue(adapted.return_sampling_mask)
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
+
+    def test_chat_applies_pd_header_overrides(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            rid="body-rid",
+            routed_dp_rank=3,
+            disagg_prefill_dp_rank=4,
+            priority=5,
+        )
+        self.fastapi_request.headers = {
+            "x-override-rid": "header-rid",
+            "x-override-bootstrap-host": "header-host",
+            "x-override-bootstrap-port": "8998",
+            "x-override-bootstrap-room": "456",
+            "x-override-conversation-id": "conversation-1",
+            "x-override-routed-dp-rank": "6",
+            "x-override-disagg-prefill-dp-rank": "7",
+            "x-override-priority": "8",
+        }
+        body = request.model_dump()
+
+        processed_messages = MessageProcessingResult(
+            "Test prompt", [1, 2, 3], None, None, [], [], None
+        )
+        with (
+            envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.override(True),
+            patch.object(
+                self.chat, "_process_messages", return_value=processed_messages
+            ),
+        ):
+            response = get_or_create_event_loop().run_until_complete(
+                self.chat.handle_request(request, self.fastapi_request)
+            )
+
+        self.assertEqual(response.choices[0].message.content, "Test response")
+        adapted_request = self.tm.generate_request.call_args.args[0]
+        self.assertEqual(adapted_request.bootstrap_room, 456)
+        self.assertEqual(adapted_request.bootstrap_host, "header-host")
+        self.assertEqual(adapted_request.bootstrap_port, 8998)
+        self.assertEqual(adapted_request.rid, "header-rid")
+        self.assertEqual(adapted_request.conversation_id, "conversation-1")
+        self.assertEqual(adapted_request.routed_dp_rank, 6)
+        self.assertEqual(adapted_request.disagg_prefill_dp_rank, 7)
+        self.assertEqual(adapted_request.priority, 8)
+        self.assertEqual(request.model_dump(), body)
+        self.assertFalse(hasattr(request, "conversation_id"))
 
     def test_convert_to_internal_request_rejects_stream_token_ids(self):
         for field in ("return_prompt_token_ids", "return_token_ids"):
@@ -294,6 +347,18 @@ class ServingChatTestCase(unittest.TestCase):
             )
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
                 self.chat._convert_to_internal_request(req, self.fastapi_request)
+
+    def test_validate_request_rejects_sampling_mask_without_meta_info(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_sampling_mask=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_sampling_mask requires return_meta_info=true.",
+        )
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
@@ -316,6 +381,8 @@ class ServingChatTestCase(unittest.TestCase):
             input_ids=[101, 102, 103],
             stop=["STOP"],
             return_prompt_token_ids=True,
+            cache_salt="tenant-a",
+            extra_key="classification",
         )
 
         with patch(
@@ -329,6 +396,8 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(adapted.input_ids, [101, 102, 103])
         self.assertTrue(adapted.return_prompt_token_ids)
         self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
+        self.assertEqual(adapted.cache_salt, "tenant-a")
+        self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
 
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):

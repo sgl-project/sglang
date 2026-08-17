@@ -53,6 +53,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     field_serializer,
     field_validator,
     model_serializer,
@@ -219,7 +220,10 @@ class JsonSchemaResponseFormat(BaseModel):
     description: Optional[str] = None
     # use alias to workaround pydantic conflict
     schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    strict: Optional[bool] = None
+    # The OpenAI wire contract accepts JSON booleans only; StrictBool rejects
+    # the values lax pydantic would coerce ("yes", "on", 0, 1, ...), matching
+    # OpenAI's 422 behavior. Omitted (None) keeps its meaning.
+    strict: Optional[StrictBool] = None
 
 
 class ResponseFormat(BaseModel):
@@ -386,7 +390,7 @@ class CompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
-    # Extra key for classifying the request (e.g. cache_salt)
+    # Extra key for caller-defined request classification
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
@@ -529,6 +533,14 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    content_hash: Optional[str] = None
+
+    @field_validator("content_hash")
+    @classmethod
+    def validate_content_hash(cls, value: Optional[str]) -> Optional[str]:
+        from sglang.srt.multimodal.cache import parse_content_hash
+
+        return parse_content_hash(value)
 
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
@@ -787,6 +799,7 @@ class ChatCompletionRequest(BaseModel):
     return_prompt_token_ids: bool = False
     return_token_ids: bool = False
     return_meta_info: bool = False
+    return_sampling_mask: bool = False
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
@@ -848,7 +861,7 @@ class ChatCompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
-    # Extra key for classifying the request (e.g. cache_salt)
+    # Extra key for caller-defined request classification
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
@@ -1536,7 +1549,7 @@ class ResponsesRequest(BaseModel):
     priority: int = Field(default=0, description="Request priority")
     extra_key: Optional[str] = Field(
         default=None,
-        description="Extra key for classifying the request (e.g. cache_salt)",
+        description="Extra key for caller-defined request classification",
     )
     cache_salt: Optional[str] = Field(
         default=None, description="Cache salt for request caching"

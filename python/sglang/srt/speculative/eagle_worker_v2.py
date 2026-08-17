@@ -50,6 +50,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
+    get_schedule,
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
@@ -320,7 +321,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_extend_attn_backend = None
 
         draft_backend_factory = DraftBackendFactory(
-            self.server_args,
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
@@ -397,16 +397,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             "cuda": EAGLEDraftExtendCudaGraphRunner,
             "musa": EAGLEDraftCudaGraphRunner,
         }
-        supports_hip_aiter_draft_extend_graph = False
+        supports_hip_draft_extend_graph = False
         if _is_hip:
-            # Keep import local so non-HIP environments do not require aiter.
+            # Keep imports local so non-HIP environments do not require these.
+            # aiter packs draft-extend support into the decode (multi-step)
+            # backend; DSV4 exposes it on the draft-extend backend itself.
             from sglang.srt.layers.attention.aiter_backend import (
                 AiterMultiStepDraftBackend,
             )
-
-            supports_hip_aiter_draft_extend_graph = isinstance(
-                self.draft_attn_backend, AiterMultiStepDraftBackend
+            from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+                DeepseekV4HipRadixBackend,
             )
+
+            supports_hip_draft_extend_graph = isinstance(
+                self.draft_attn_backend, AiterMultiStepDraftBackend
+            ) or isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
 
         graph_supported_backend_types = [
             TritonAttnBackend,
@@ -451,7 +456,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 _is_npu
                 or _is_xpu
                 or supports_cuda_draft_extend_graph
-                or supports_hip_aiter_draft_extend_graph
+                or supports_hip_draft_extend_graph
             )
         ):
             tic = time.perf_counter()
@@ -1020,7 +1025,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -1050,7 +1055,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     @property
-    def war_fastpath_runner(self):
+    def last_shared_read_runner(self):
         # Per the base contract: the step's last shared-buffer-reading phase is
         # draft_extend, which runs on the draft runner.
         return self._draft_worker.draft_runner
@@ -1498,7 +1503,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             plan_stream=self.plan_stream,
             plan_stream_ctx=self.plan_stream_ctx,
             topk=self.topk,
-            num_steps=self.speculative_num_steps,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
             metadata_ready_pre_pad=False,

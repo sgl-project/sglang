@@ -62,6 +62,8 @@ class DFlashVerifyInput(SpecInput):
         metadata or eager attention metadata so the actual forward can run with
         `skip_attn_backend_init=True`.
         """
+        from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
+
         batch.input_ids = self.draft_token
         batch.spec_info = self
         batch.forward_mode = (
@@ -69,6 +71,12 @@ class DFlashVerifyInput(SpecInput):
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
+        if not batch.forward_mode.is_idle():
+            # Rebuild mamba track indices (lazy: gather the positions planned
+            # by mamba_lazy_spec_prepare) and clear the stale extend-time mask
+            # before init_new snapshots them into the verify ForwardBatch.
+            # Same hook eagle/ngram/dspark run before TARGET_VERIFY.
+            prepare_mamba_track_for_verify(batch)
         verify_forward_batch = ForwardBatch.init_new(
             batch,
             target_worker.model_runner,

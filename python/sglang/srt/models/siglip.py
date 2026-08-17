@@ -100,6 +100,7 @@ class SiglipEncoderLayer(nn.Module):
         norm_layer: Type[nn.Module] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        qkv_backend: Optional[str] = None,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -112,6 +113,7 @@ class SiglipEncoderLayer(nn.Module):
             projection_size=config.hidden_size,
             use_qkv_parallel=True,
             flatten_batch=True,
+            qkv_backend=qkv_backend,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
@@ -167,6 +169,7 @@ class SiglipEncoder(nn.Module):
         config: SiglipVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        qkv_backend: Optional[str] = None,
     ) -> None:
         super().__init__()
 
@@ -179,6 +182,7 @@ class SiglipEncoder(nn.Module):
                 SiglipEncoderLayer(
                     config=config,
                     norm_layer=norm_layer,
+                    qkv_backend=qkv_backend,
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_idx}", prefix),
                 )
@@ -215,6 +219,7 @@ class SiglipVisionTransformer(nn.Module):
         config: SiglipVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        qkv_backend: Optional[str] = None,
     ) -> None:
         super().__init__()
 
@@ -225,6 +230,7 @@ class SiglipVisionTransformer(nn.Module):
 
         self.encoder = SiglipEncoder(
             config=config,
+            qkv_backend=qkv_backend,
             quant_config=quant_config,
             prefix=add_prefix("encoder", prefix),
         )
@@ -268,10 +274,14 @@ class SiglipVisionModel(nn.Module):
         config: SiglipVisionConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        qkv_backend: Optional[str] = None,
     ):
         super().__init__()
         self.vision_model = SiglipVisionTransformer(
-            config, quant_config, prefix=add_prefix("vision_model", prefix)
+            config,
+            qkv_backend=qkv_backend,
+            quant_config=quant_config,
+            prefix=add_prefix("vision_model", prefix),
         )
 
     @property

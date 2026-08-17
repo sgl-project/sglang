@@ -458,10 +458,8 @@ export const config = {
           // Blackwell-only kernel-fusion path; selecting it reveals the Quantization sub-select.
           { id: "megamoe",          label: "MegaMoE",           flags: ["--moe-a2a-backend megamoe"],
             requiresHw: ["b200", "b300", "gb200", "gb300"] },
-          // Blackwell-only: runs the prebuilt trtllm-gen SiTU cubins; needs the
-          // downloadable SiTU cubin pool unpacked and pointed to by the env var.
+          // Blackwell-only: runs FlashInfer's official trtllm-gen SiTU kernels.
           { id: "flashinfer_mxfp4", label: "FlashInfer (MXFP4)", flags: ["--moe-runner-backend flashinfer_mxfp4"],
-            env: ["SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/path/to/trtllm_gen_moe_cubin_pool"],
             requiresHw: ["b200", "b300", "gb200", "gb300"] },
           { id: "marlin",           label: "Marlin (W4A16)",    flags: ["--moe-runner-backend marlin"] },
         ],
@@ -931,10 +929,8 @@ export const config = {
         "--pp-size 2",
         "--dcp-size 8",
         "--ep-size 8",
-        // Both pinned to the brought-up shape rather than left to the auto
-        // resolution the rest of Blackwell uses. The MXFP4 runner needs the SiTU
-        // cubin pool the published image ships; drop it to get the Marlin
-        // fallback on an install without one.
+        // Both backends are pinned to the validated recipe even though automatic
+        // resolution selects them on Blackwell.
         "--moe-runner-backend flashinfer_mxfp4",
         "--decode-attention-backend cutedsl_mla",
         "--mem-fraction-static 0.85",

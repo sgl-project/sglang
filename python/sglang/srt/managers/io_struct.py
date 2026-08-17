@@ -196,6 +196,12 @@ class GenerateReqInput:
     # sglang's prefix-cache key to align. When unset, behavior is unchanged
     # (sglang hashes the processor feature tensor).
     mm_hashes: Optional[Union[List[str], List[List[str]]]] = None
+    # Optional `sha256:<64-hex>` identities for the original media contents. Unlike
+    # mm_hashes, these identify processor inputs and never replace the
+    # processor-output feature hash used by the embedding/prefix cache.
+    mm_content_hashes: Optional[
+        Union[List[Optional[str]], List[List[Optional[str]]]]
+    ] = None
     # Whether to extract and process audio from video inputs.
     use_audio_in_video: bool = False
     # The sampling_params. See descriptions below.
@@ -287,7 +293,7 @@ class GenerateReqInput:
 
     # Priority for the request
     priority: Optional[int] = None
-    # Extra cache key for classifying the request (e.g. cache_salt)
+    # Extra cache key for caller-defined request classification.
     extra_key: Optional[Union[List[str], str]] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
@@ -326,6 +332,9 @@ class GenerateReqInput:
     # Pre-computed delimiter indices for multi-item scoring.
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
+
+    # Cache namespace used to isolate otherwise-identical prefixes.
+    cache_salt: Optional[Union[List[str], str]] = None
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -488,6 +497,14 @@ class GenerateReqInput:
             self.token_ids_logprob = None
         if self.return_sampling_mask is None:
             self.return_sampling_mask = False
+        for field_name in ("extra_key", "cache_salt"):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(
+                    f"{field_name} should be a string for a single request."
+                )
+            if value == "":
+                setattr(self, field_name, None)
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -503,6 +520,7 @@ class GenerateReqInput:
         self._normalize_rid(num)
         self._normalize_lora_paths(num)
         self._normalize_image_data(num)
+        self._normalize_mm_hashes(num)
         self._normalize_video_data(num)
         self._normalize_audio_data(num)
         self._normalize_sampling_params(num)
@@ -510,6 +528,7 @@ class GenerateReqInput:
         self._normalize_return_hidden_states(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
+        self._normalize_cache_salt(num)
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -582,6 +601,41 @@ class GenerateReqInput:
                 # Expand for parallel sampling
                 self.image_data = wrapped_images * self.parallel_sample_num
                 self.modalities = ["image"] * num
+
+    def _normalize_mm_hashes(self, num):
+        """Align per-media hashes with normalized batched image inputs."""
+        for field_name in ("mm_hashes", "mm_content_hashes"):
+            hashes = getattr(self, field_name)
+            if hashes is None:
+                setattr(self, field_name, [None] * num)
+                continue
+            if not isinstance(hashes, list):
+                raise ValueError(f"{field_name} must be a list")
+            if len(hashes) != self.batch_size:
+                raise ValueError(
+                    f"The length of {field_name} should equal the batch size"
+                )
+
+            normalized = []
+            for request_index, request_hashes in enumerate(hashes):
+                images = self.image_data[request_index]
+                image_count = len(images or [])
+                if isinstance(request_hashes, list):
+                    per_request = request_hashes
+                elif image_count == 1:
+                    per_request = [request_hashes]
+                else:
+                    raise ValueError(
+                        f"{field_name}[{request_index}] must be a list with one "
+                        "entry per image"
+                    )
+                if len(per_request) != image_count:
+                    raise ValueError(
+                        f"{field_name}[{request_index}] has {len(per_request)} "
+                        f"entries for {image_count} images"
+                    )
+                normalized.append(per_request)
+            setattr(self, field_name, normalized * self.parallel_sample_num)
 
     def _normalize_video_data(self, num):
         """Normalize video data for batch processing."""
@@ -703,15 +757,38 @@ class GenerateReqInput:
         if self.extra_key is None:
             return
         if isinstance(self.extra_key, str):
-            self.extra_key = [self.extra_key] * num
+            value = self.extra_key or None
+            self.extra_key = [value] * num
         elif isinstance(self.extra_key, list):
             if len(self.extra_key) != self.batch_size:
                 raise ValueError(
                     "The length of extra_key should be equal to the batch size."
                 )
+            if any(not isinstance(value, str) for value in self.extra_key):
+                raise ValueError("Every extra_key should be a string.")
+            self.extra_key = [value or None for value in self.extra_key]
             self.extra_key = self.extra_key * self.parallel_sample_num
         else:
             raise ValueError("extra_key should be a list or a string.")
+
+    def _normalize_cache_salt(self, num):
+        """Normalize cache_salt for batch processing."""
+        if self.cache_salt is None:
+            return
+        if isinstance(self.cache_salt, str):
+            value = self.cache_salt or None
+            self.cache_salt = [value] * num
+        elif isinstance(self.cache_salt, list):
+            if len(self.cache_salt) != self.batch_size:
+                raise ValueError(
+                    "The length of cache_salt should be equal to the batch size."
+                )
+            if any(not isinstance(value, str) for value in self.cache_salt):
+                raise ValueError("Every cache_salt should be a string.")
+            self.cache_salt = [value or None for value in self.cache_salt]
+            self.cache_salt = self.cache_salt * self.parallel_sample_num
+        else:
+            raise ValueError("cache_salt should be a list or a string.")
 
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
@@ -782,6 +859,12 @@ class GenerateReqInput:
             image_data=self.image_data[i],
             video_data=self.video_data[i],
             audio_data=self.audio_data[i],
+            mm_hashes=self.mm_hashes[i] if self.mm_hashes is not None else None,
+            mm_content_hashes=(
+                self.mm_content_hashes[i]
+                if self.mm_content_hashes is not None
+                else None
+            ),
             sampling_params=self.sampling_params[i],
             return_logprob=self.return_logprob[i],
             logprob_start_len=self.logprob_start_len[i],
@@ -837,6 +920,7 @@ class GenerateReqInput:
             max_thinking_tokens=self.max_thinking_tokens,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
+            cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -925,7 +1009,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Priority for the request
     priority: Optional[int] = None
 
-    # Extra cache key for classifying the request (e.g. cache_salt)
+    # Extra cache key for caller-defined request classification.
     extra_key: Optional[str] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
@@ -953,6 +1037,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # For observability
     # Pickled Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+
+    # Cache namespace used to isolate otherwise-identical prefixes.
+    cache_salt: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_as_pickle(self.mm_inputs)
