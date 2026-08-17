@@ -16,7 +16,6 @@ limitations under the License.
 import logging
 import threading
 import time
-from functools import cache
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -38,6 +37,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
@@ -45,26 +45,6 @@ from sglang.srt.utils import get_device_module
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
-
-
-@cache
-def _timing_events_supported() -> bool:
-    try:
-        device_module.Event(enable_timing=True)
-        return True
-    except (TypeError, NotImplementedError):
-        logger.warning(
-            "%s.Event does not support enable_timing=True; load-back "
-            "duration metric will be skipped on this backend.",
-            device_module.__name__,
-        )
-        return False
-
-
-def make_timing_event_pair():
-    timing_enabled = _timing_events_supported()
-    kwargs = {"enable_timing": True} if timing_enabled else {}
-    return device_module.Event(**kwargs), device_module.Event(**kwargs), timing_enabled
 
 
 class LayerLoadingEvent:
@@ -126,11 +106,13 @@ class CacheOperation:
         device_indices: torch.Tensor,
         node_id: int,
         priority: Optional[int] = None,
+        pool_transfers: Optional[List[PoolTransfer]] = None,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
         self.data = None
+        self.pool_transfers = pool_transfers
 
         self.id = CacheOperation.counter
         CacheOperation.counter += 1
@@ -138,18 +120,52 @@ class CacheOperation:
         self.priority = priority if priority is not None else self.id
 
     @staticmethod
+    def _merge_pool_transfers(
+        ops: List[CacheOperation],
+    ) -> Optional[List[PoolTransfer]]:
+        grouped: dict[tuple[PoolName, Optional[PoolName]], List[PoolTransfer]] = {}
+        for op in ops:
+            for transfer in op.pool_transfers or []:
+                grouped.setdefault(
+                    (transfer.name, transfer.indices_from_pool), []
+                ).append(transfer)
+        if not grouped:
+            return None
+
+        def cat_or_none(tensors):
+            parts = [tensor for tensor in tensors if tensor is not None]
+            return torch.cat(parts) if parts else None
+
+        return [
+            PoolTransfer(
+                name=transfers[0].name,
+                host_indices=cat_or_none(t.host_indices for t in transfers),
+                device_indices=cat_or_none(t.device_indices for t in transfers),
+                keys=[key for t in transfers if t.keys for key in t.keys] or None,
+                hit_policy=transfers[0].hit_policy,
+                indices_from_pool=transfers[0].indices_from_pool,
+            )
+            for transfers in grouped.values()
+        ]
+
+    @staticmethod
     def merge_ops(ops: List[CacheOperation]) -> CacheOperation:
-        assert len(ops) > 0
+        assert ops
         if len(ops) == 1:
             return ops[0]
-
         host_indices = torch.cat([op.host_indices for op in ops])
         device_indices = torch.cat([op.device_indices for op in ops])
         node_ids = []
         priority = min(op.priority for op in ops)
         for op in ops:
             node_ids.extend(op.node_ids)
-        merged_op = CacheOperation(host_indices, device_indices, -1, priority)
+        merged_op = CacheOperation(
+            host_indices,
+            device_indices,
+            -1,
+            priority,
+            pool_transfers=CacheOperation._merge_pool_transfers(ops),
+        )
         merged_op.node_ids = node_ids
         return merged_op
 
@@ -163,6 +179,11 @@ class HiCacheAck(NamedTuple):
     node_ids: List[int]
     num_tokens: int = 0
     timing_enabled: bool = False
+    # Tokens transferred per host pool (PoolName value -> count).
+    num_tokens_by_pool: Optional[dict[str, int]] = None
+    # Total bytes moved by the op across all pools, including draft piggyback
+    # and sidecar transfers that the per-pool token counts exclude.
+    num_bytes: int = 0
 
 
 class StorageOperation:
@@ -269,6 +290,8 @@ class HiCacheController:
         self.mem_pool_host_draft = None
         self.draft_page_get_func = None
         self.draft_page_set_func = None
+        self.has_mtp_draft = False
+        self.mtp_draft_device_pools = ()
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -295,8 +318,7 @@ class HiCacheController:
         self.ack_load_queue: List[HiCacheAck] = []
         self.ack_write_queue: List[HiCacheAck] = []
 
-        self.write_stream = device_module.Stream()
-        self.load_stream = device_module.Stream()
+        self.l2_transfer_engine = L2TransferEngine(io_backend)
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -375,7 +397,6 @@ class HiCacheController:
         self.backup_queue = Queue()
 
         self.prefetch_hit_queue: Queue[StorageOperation] = Queue()
-        self.prefetch_revoke_queue: Queue[str] = Queue()
         self.ack_backup_queue: Queue[StorageOperation] = Queue()
         self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
 
@@ -652,7 +673,6 @@ class HiCacheController:
             self.backup_thread.join()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
-            self.prefetch_revoke_queue.queue.clear()
             self.prefetch_hit_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
@@ -693,52 +713,35 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        # Kernel write-back keeps host indices on CPU only for page_first AND only
-        # when the staged JIT write-back kernel is available (it stages through
-        # device memory and accepts CPU destination indices). Otherwise we fall back
-        # to the plain transfer kernel, whose CUDA/HIP implementation requires
-        # device-resident destination indices -- so the indices must be moved to the
-        # device first. Without the can_use_write_back_jit check this crashes on
-        # backends where the JIT kernel is unavailable, with
-        # "Destination indices must be a CUDA tensor".
-        if (
-            self.io_backend == "kernel"
-            and self.mem_pool_host.layout == "page_first"
-            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
-        ):
-            host_indices, device_indices = op.host_indices, op.device_indices
-        else:
-            host_indices, device_indices = self.move_indices(
-                op.host_indices, op.device_indices
-            )
+        host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
 
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        completion = self.l2_transfer_engine.submit_device_to_host(
+            self._l2_transfers(host_indices, device_indices, pool_transfers)
+        )
 
-        start_event.record()
-        with device_module.stream(self.write_stream):
-            start_event.wait(self.write_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device, host_indices, device_indices, self.io_backend
+        self.ack_write_queue.append(
+            HiCacheAck(
+                start_event=completion.start_event,
+                finish_event=completion.finish_event,
+                node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
+                timing_enabled=completion.timing_enabled,
+                num_tokens_by_pool=self._num_tokens_by_pool(op),
+                num_bytes=self._transfer_num_bytes(op),
             )
-            if self.has_draft:
-                self.mem_pool_host_draft.backup_from_device_all_layer(
-                    self.mem_pool_device_draft,
-                    host_indices,
-                    device_indices,
-                    self.io_backend,
-                )
-            finish_event.record()
-            # NOTE: We must save the host indices and device indices here,
-            # this is because we need to guarantee that these tensors are
-            # still alive when the write stream is executing.
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.write_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.write_stream)
+        )
 
-        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+    def _transfer_num_bytes(self, op: CacheOperation) -> int:
+        """Total bytes moved by a merged transfer op (draft piggyback included)."""
+        num_tokens = len(op.device_indices)
+        num_bytes = num_tokens * self.mem_pool_host.size_per_token
+        if self.has_draft:
+            num_bytes += num_tokens * self.mem_pool_host_draft.size_per_token
+        return num_bytes
+
+    def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
+        return {PoolName.KV.value: len(op.device_indices)}
 
     def load(
         self,
@@ -757,7 +760,9 @@ class HiCacheController:
         )
         return device_indices
 
-    def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
+    def move_indices(
+        self, host_indices: torch.Tensor, device_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
@@ -779,57 +784,83 @@ class HiCacheController:
         else:
             raise ValueError(f"Unsupported io backend")
 
+    def _move_write_operation(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
+        """Keep CPU host indices only for page-first staged write-back."""
+        if (
+            self.io_backend == "kernel"
+            and self.mem_pool_host.layout == "page_first"
+            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+        ):
+            return op.host_indices, op.device_indices, op.pool_transfers
+        return self._move_op_indices(op)
+
+    def _move_op_indices(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
+        return (*self.move_indices(op.host_indices, op.device_indices), None)
+
+    def _l2_transfers(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+    ) -> list[L2Transfer]:
+        transfers = [
+            L2Transfer(
+                host_pool=self.mem_pool_host,
+                device_pool=self.mem_pool_device,
+                host_indices=host_indices,
+                device_indices=device_indices,
+            )
+        ]
+        if self.has_draft and host_indices.numel() > 0:
+            transfers.append(
+                L2Transfer(
+                    host_pool=self.mem_pool_host_draft,
+                    device_pool=self.mem_pool_device_draft,
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                )
+            )
+        return transfers
+
+    def _l2_load_transfers(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+    ) -> list[L2Transfer]:
+        return self._l2_transfers(host_indices, device_indices, pool_transfers)
+
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
             return -1
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
-        )
+        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
-        ack_start_event, ack_finish_event, timing_enabled = make_timing_event_pair()
-
-        with device_module.stream(self.load_stream):
-            producer_event.start_event.wait(self.load_stream)
-            ack_start_event.record()
-            for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
-                    host_indices,
-                    device_indices,
-                    i,
-                    self.io_backend,
-                )
-                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
-                        host_indices,
-                        device_indices,
-                        i,
-                        self.io_backend,
-                    )
-                producer_event.complete(i)
-            ack_finish_event.record()
-            # NOTE: We must save the host indices and device indices here,
-            # this is because we need to guarantee that these tensors are
-            # still alive when the load stream is executing.
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.load_stream)
+        completion = self.l2_transfer_engine.submit_host_to_device(
+            self._l2_load_transfers(host_indices, device_indices, pool_transfers),
+            start_event=producer_event.start_event,
+            on_layer_done=producer_event.complete,
+            layer_num=self.layer_num,
+        )
 
         self.ack_load_queue.append(
             HiCacheAck(
-                start_event=ack_start_event,
-                finish_event=ack_finish_event,
+                start_event=completion.start_event,
+                finish_event=completion.finish_event,
                 node_ids=op.node_ids,
                 num_tokens=len(op.device_indices),
-                timing_enabled=timing_enabled,
+                timing_enabled=completion.timing_enabled,
+                num_tokens_by_pool=self._num_tokens_by_pool(op),
+                num_bytes=self._transfer_num_bytes(op),
             )
         )
         return producer_id
@@ -859,6 +890,11 @@ class HiCacheController:
         # If storage is already attached, wire up the draft I/O path now.
         # Otherwise this will be deferred until attach_storage_backend().
         self._maybe_register_draft_with_storage()
+
+    def set_mtp_draft_pools(self, device_pools) -> None:
+        """Register MTP device pools used for L2 load-back."""
+        self.mtp_draft_device_pools = tuple(device_pools)
+        self.has_mtp_draft = bool(self.mtp_draft_device_pools)
 
     def _maybe_register_draft_with_storage(self) -> None:
         """Pick the draft L3 IO implementation."""
@@ -1070,19 +1106,13 @@ class HiCacheController:
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
 
-                if storage_hit_count < self.prefetch_threshold:
-                    # not to prefetch if not enough benefits
-                    self.prefetch_revoke_queue.put(operation.request_id)
-                    logger.debug(
-                        f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
-                    )
-                else:
-                    # Record hit count, so the scheduler thread will know the exact memory to allocate
-                    operation.hash_value = hash_value[
-                        : (storage_hit_count // self.page_size)
-                    ]
-                    operation.storage_hit_count = storage_hit_count
-                    self.prefetch_hit_queue.put(operation)
+                # Record the TP-synced hit count; the scheduler thread decides
+                # at drain time whether to revoke (below threshold) or allocate.
+                operation.hash_value = hash_value[
+                    : (storage_hit_count // self.page_size)
+                ]
+                operation.storage_hit_count = storage_hit_count
+                self.prefetch_hit_queue.put(operation)
 
             except Empty:
                 continue

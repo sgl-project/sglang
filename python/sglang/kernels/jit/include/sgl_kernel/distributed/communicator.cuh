@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+namespace sglang {
+
 namespace device::distributed {
 
 inline constexpr uint32_t kMaxWorldSize = 16;
@@ -118,3 +120,5 @@ struct CommunicatorRef : public tvm::ffi::ObjectRef {
 };
 
 }  // namespace host::distributed
+
+}  // namespace sglang
