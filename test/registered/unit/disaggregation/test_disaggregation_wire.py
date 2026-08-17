@@ -12,6 +12,8 @@ from sglang.srt.disaggregation.common.staging_handler import (
     handle_staging_req,
 )
 from sglang.srt.disaggregation.common.utils import (
+    build_dcp_staging_transfer_blocks,
+    dcp_staging_required_bytes,
     group_concurrent_contiguous,
     pack_int_lists,
     pack_list_of_buffers,
@@ -28,6 +30,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     get_dsv4_c128_state_indices,
+    is_mla_or_hybrid_mla_backend,
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
@@ -174,6 +177,237 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+
+class TestDCPStagingLayout(unittest.TestCase):
+    def test_required_bytes_uses_layer_major_layout(self):
+        self.assertEqual(dcp_staging_required_bytes(64, [576, 320]), 64 * 896)
+
+    def test_contiguous_destination_page_becomes_one_block_per_layer(self):
+        blocks = build_dcp_staging_transfer_blocks(
+            staging_ptr=0x1000,
+            dst_data_ptrs=[0x100000, 0x200000],
+            dst_token_indices=np.arange(640, 704, dtype=np.int64),
+            token_item_lens=[576, 320],
+        )
+
+        self.assertEqual(
+            blocks,
+            [
+                (0x1000, 0x100000 + 640 * 576, 64 * 576),
+                (0x1000 + 64 * 576, 0x200000 + 640 * 320, 64 * 320),
+            ],
+        )
+
+    def test_destination_page_gap_splits_blocks_but_source_stays_packed(self):
+        blocks = build_dcp_staging_transfer_blocks(
+            staging_ptr=0x8000,
+            dst_data_ptrs=[0x300000],
+            dst_token_indices=np.array([10, 11, 12, 64, 65], dtype=np.int64),
+            token_item_lens=[576],
+        )
+
+        self.assertEqual(
+            blocks,
+            [
+                (0x8000, 0x300000 + 10 * 576, 3 * 576),
+                (0x8000 + 3 * 576, 0x300000 + 64 * 576, 2 * 576),
+            ],
+        )
+
+    def test_invalid_layer_geometry_raises(self):
+        with self.assertRaises(ValueError):
+            build_dcp_staging_transfer_blocks(
+                staging_ptr=0,
+                dst_data_ptrs=[1, 2],
+                dst_token_indices=np.array([0], dtype=np.int64),
+                token_item_lens=[576],
+            )
+
+
+class TestMLACacheDetection(unittest.TestCase):
+    def test_direct_mla_pool_is_supported(self):
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+        pool = object.__new__(MLATokenToKVPool)
+        self.assertTrue(is_mla_or_hybrid_mla_backend(pool))
+
+    def test_hybrid_pool_with_mla_full_cache_is_supported(self):
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MLATokenToKVPool,
+        )
+
+        pool = object.__new__(HybridLinearKVPool)
+        pool.full_kv_pool = object.__new__(MLATokenToKVPool)
+        self.assertTrue(is_mla_or_hybrid_mla_backend(pool))
+
+    def test_hybrid_pool_without_mla_full_cache_is_rejected(self):
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        pool = object.__new__(HybridLinearKVPool)
+        pool.full_kv_pool = object()
+        self.assertFalse(is_mla_or_hybrid_mla_backend(pool))
+
+
+class TestMooncakeDCPStaging(unittest.TestCase):
+    @staticmethod
+    def _manager():
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            page_size=64,
+            kv_layer_ids=[0, 1],
+            kv_data_ptrs=[0x100000, 0x200000],
+            gpu_id=0,
+        )
+        manager._transfer_data = Mock(return_value=0)
+        return manager
+
+    @staticmethod
+    def _staging(num_tokens):
+        staging_size = num_tokens * (576 + 320)
+        return SimpleNamespace(
+            get_size=lambda: staging_size,
+            get_ptr=lambda: 0x9000,
+            fits=lambda required: required <= staging_size,
+        )
+
+    @patch(
+        "sglang.srt.disaggregation.common.staging_buffer."
+        "gather_dcp_tokens_to_staging"
+    )
+    def test_strided_source_is_gathered_into_page_sized_transfers(self, gather):
+        manager = self._manager()
+        staging = self._staging(64)
+
+        ret = manager.send_kvcache_dcp_staged(
+            "peer",
+            np.arange(100, 108, dtype=np.int32),
+            [0x300000, 0x400000],
+            np.array([200], dtype=np.int32),
+            dcp_token_item_lens=[576, 320],
+            dst_dcp_size=8,
+            dst_dcp_rank=3,
+            src_page_offset=0,
+            decode_prefix_len=0,
+            num_kv_tokens=512,
+            executor=Mock(),
+            dst_layer_ids=[0, 1],
+            staging_buffer=staging,
+        )
+
+        self.assertEqual(ret, 0)
+        gather.assert_called_once()
+        gathered_indices = gather.call_args.args[1]
+        np.testing.assert_array_equal(
+            gathered_indices[:4], np.array([6403, 6411, 6419, 6427])
+        )
+        manager._transfer_data.assert_called_once_with(
+            "peer",
+            [
+                (0x9000, 0x300000 + 200 * 64 * 576, 64 * 576),
+                (
+                    0x9000 + 64 * 576,
+                    0x400000 + 200 * 64 * 320,
+                    64 * 320,
+                ),
+            ],
+        )
+
+    @patch(
+        "sglang.srt.disaggregation.common.staging_buffer."
+        "gather_dcp_tokens_to_staging"
+    )
+    def test_large_relayout_is_split_at_staging_capacity(self, gather):
+        manager = self._manager()
+
+        ret = manager.send_kvcache_dcp_staged(
+            "peer",
+            np.arange(100, 116, dtype=np.int32),
+            [0x300000, 0x400000],
+            np.array([200, 400], dtype=np.int32),
+            dcp_token_item_lens=[576, 320],
+            dst_dcp_size=8,
+            dst_dcp_rank=3,
+            src_page_offset=0,
+            decode_prefix_len=0,
+            num_kv_tokens=1024,
+            executor=Mock(),
+            dst_layer_ids=[0, 1],
+            staging_buffer=self._staging(64),
+        )
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(gather.call_count, 2)
+        self.assertEqual(manager._transfer_data.call_count, 2)
+        self.assertEqual(
+            [len(call.args[1]) for call in manager._transfer_data.call_args_list],
+            [2, 2],
+        )
+
+    @patch(
+        "sglang.srt.disaggregation.common.staging_buffer."
+        "gather_dcp_tokens_to_staging",
+        side_effect=RuntimeError("Triton compilation failed"),
+    )
+    def test_gather_failure_disables_staging_and_falls_back(self, gather):
+        manager = self._manager()
+        manager.send_kvcache_dcp = Mock(return_value=0)
+        args = (
+            "peer",
+            np.arange(100, 108, dtype=np.int32),
+            [0x300000, 0x400000],
+            np.array([200], dtype=np.int32),
+        )
+        kwargs = dict(
+            dcp_token_item_lens=[576, 320],
+            dst_dcp_size=8,
+            dst_dcp_rank=3,
+            src_page_offset=0,
+            decode_prefix_len=0,
+            num_kv_tokens=512,
+            executor=Mock(),
+            dst_layer_ids=[0, 1],
+            staging_buffer=self._staging(64),
+        )
+
+        self.assertEqual(manager.send_kvcache_dcp_staged(*args, **kwargs), 0)
+        self.assertTrue(manager._dcp_staging_disabled)
+        self.assertEqual(manager.send_kvcache_dcp_staged(*args, **kwargs), 0)
+
+        gather.assert_called_once()
+        self.assertEqual(manager.send_kvcache_dcp.call_count, 2)
+        manager._transfer_data.assert_not_called()
+
+    @patch(
+        "sglang.srt.disaggregation.common.staging_buffer."
+        "gather_dcp_tokens_to_staging"
+    )
+    def test_transfer_failure_does_not_disable_staging(self, gather):
+        manager = self._manager()
+        manager.send_kvcache_dcp = Mock(return_value=0)
+        manager._transfer_data.side_effect = RuntimeError("RDMA transfer failed")
+
+        with self.assertRaisesRegex(RuntimeError, "RDMA transfer failed"):
+            manager.send_kvcache_dcp_staged(
+                "peer",
+                np.arange(100, 108, dtype=np.int32),
+                [0x300000, 0x400000],
+                np.array([200], dtype=np.int32),
+                dcp_token_item_lens=[576, 320],
+                dst_dcp_size=8,
+                dst_dcp_rank=3,
+                src_page_offset=0,
+                decode_prefix_len=0,
+                num_kv_tokens=512,
+                executor=Mock(),
+                dst_layer_ids=[0, 1],
+                staging_buffer=self._staging(64),
+            )
+
+        gather.assert_called_once()
+        self.assertFalse(getattr(manager, "_dcp_staging_disabled", False))
+        manager.send_kvcache_dcp.assert_not_called()
 
 
 class TestMooncakePPStaging(unittest.TestCase):

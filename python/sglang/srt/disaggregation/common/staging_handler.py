@@ -676,6 +676,30 @@ def init_staging_buffers(
     return buffers
 
 
+def init_dcp_staging_buffers(register_fn, kv_args, count: int) -> list:
+    """Create fixed-size prefill buffers for GPU-assisted DCP relayout."""
+    from sglang.srt.disaggregation.common.staging_buffer import StagingBuffer
+    from sglang.srt.environ import envs
+
+    size_mb = envs.SGLANG_DISAGG_DCP_STAGING_BUFFER_SIZE_MB.get()
+    if size_mb <= 0:
+        raise ValueError(
+            "SGLANG_DISAGG_DCP_STAGING_BUFFER_SIZE_MB must be positive, "
+            f"got {size_mb}"
+        )
+    size_bytes = size_mb * 1024 * 1024
+    gpu_id = kv_args.gpu_id
+    device = f"cuda:{gpu_id}"
+    custom_mem_pool, _ = _get_custom_mem_pool(device)
+
+    buffers = []
+    for _ in range(count):
+        buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
+        register_fn(buf.get_ptr(), buf.get_size())
+        buffers.append(buf)
+    return buffers
+
+
 def init_staging_allocator(register_fn, kv_args):
     """Create decode-side staging ring-buffer allocator and register with transport.
 

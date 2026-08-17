@@ -33,7 +33,9 @@ from sglang.srt.disaggregation.common.utils import (
     AuxDataCodec,
     FastQueue,
     TransferKVChunk,
+    build_dcp_staging_transfer_blocks,
     build_dcp_token_transfer_plan,
+    dcp_staging_required_bytes,
     group_concurrent_contiguous,
     pack_int_lists,
     unpack_int_lists,
@@ -206,6 +208,8 @@ class MooncakeKVManager(CommonKVManager):
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        self.enable_dcp_staging = envs.SGLANG_DISAGG_DCP_STAGING_BUFFER.get()
+        self._dcp_staging_disabled = False
         self.enable_trace = server_args.enable_trace
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.start_prefill_thread()
@@ -242,6 +246,9 @@ class MooncakeKVManager(CommonKVManager):
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
+            self._dcp_staging_buffers = []
+            if self.enable_dcp_staging:
+                self._init_dcp_staging_buffers(len(self.transfer_queues))
             for i, (queue, executor) in enumerate(
                 zip(self.transfer_queues, self.executors)
             ):
@@ -253,6 +260,11 @@ class MooncakeKVManager(CommonKVManager):
                         (
                             self._staging_ctx.buffers[i]
                             if self.enable_staging and self._staging_ctx.buffers
+                            else None
+                        ),
+                        (
+                            self._dcp_staging_buffers[i]
+                            if self.enable_dcp_staging and self._dcp_staging_buffers
                             else None
                         ),
                         i,
@@ -349,6 +361,17 @@ class MooncakeKVManager(CommonKVManager):
             get_schedule().chunked_prefill_size,
         )
         self.kv_buffer_tensors = None
+
+    def _init_dcp_staging_buffers(self, count: int):
+        from sglang.srt.disaggregation.common.staging_handler import (
+            init_dcp_staging_buffers,
+        )
+
+        self._dcp_staging_buffers = init_dcp_staging_buffers(
+            lambda ptr, size: self.engine.batch_register([ptr], [size]),
+            self.kv_args,
+            count,
+        )
 
     def _init_staging_allocator(self):
         from sglang.srt.disaggregation.common.staging_handler import (
@@ -893,6 +916,37 @@ class MooncakeKVManager(CommonKVManager):
             dst_device_data_ptrs=dst_device_kv_ptrs,
         )
 
+    def _resolve_dcp_transfer_layers(
+        self,
+        dst_kv_ptrs: List[int],
+        dcp_token_item_lens: List[int],
+        dst_layer_ids: List[int],
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Resolve PP-local source layers to their decode registrations."""
+        src_layer_ids = self.kv_args.kv_layer_ids
+        if src_layer_ids or dst_layer_ids:
+            dst_indices = resolve_dcp_dst_entry_indices(
+                src_layer_ids,
+                dst_layer_ids,
+                len(self.kv_args.kv_data_ptrs),
+                len(dst_kv_ptrs),
+            )
+            return (
+                self.kv_args.kv_data_ptrs,
+                [dst_kv_ptrs[j] for j in dst_indices],
+                dcp_token_item_lens[: len(self.kv_args.kv_data_ptrs)],
+            )
+
+        src_kv_ptrs, resolved_dst_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
+            self.kv_args.kv_data_ptrs,
+            dst_kv_ptrs,
+        )
+        return (
+            src_kv_ptrs,
+            resolved_dst_ptrs,
+            dcp_token_item_lens[: len(src_kv_ptrs)],
+        )
+
     def send_kvcache_dcp(
         self,
         mooncake_session_id: str,
@@ -925,21 +979,11 @@ class MooncakeKVManager(CommonKVManager):
         if plan.src_token_indices.size == 0:
             return 0
 
-        src_layer_ids = self.kv_args.kv_layer_ids
-        if src_layer_ids or dst_layer_ids:
-            dst_indices = resolve_dcp_dst_entry_indices(
-                src_layer_ids,
-                dst_layer_ids,
-                len(self.kv_args.kv_data_ptrs),
-                len(dst_kv_ptrs),
-            )
-            src_kv_ptrs = self.kv_args.kv_data_ptrs
-            dst_kv_ptrs = [dst_kv_ptrs[j] for j in dst_indices]
-        else:
-            src_kv_ptrs, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
-                self.kv_args.kv_data_ptrs,
-                dst_kv_ptrs,
-            )
+        src_kv_ptrs, dst_kv_ptrs, token_item_lens = self._resolve_dcp_transfer_layers(
+            dst_kv_ptrs,
+            dcp_token_item_lens,
+            dst_layer_ids,
+        )
         layers_current_pp_stage = len(src_kv_ptrs)
         src_groups, dst_groups = group_concurrent_contiguous(
             plan.src_token_indices,
@@ -950,7 +994,7 @@ class MooncakeKVManager(CommonKVManager):
             (
                 src_kv_ptrs[layer_id],
                 dst_kv_ptrs[layer_id],
-                dcp_token_item_lens[layer_id],
+                token_item_lens[layer_id],
             )
             for layer_id in range(layers_current_pp_stage)
         ]
@@ -992,6 +1036,136 @@ class MooncakeKVManager(CommonKVManager):
                 set_transfer_blocks(src_ptr, dst_ptr, token_item_len)
             )
         return self._transfer_data(mooncake_session_id, transfer_blocks)
+
+    def send_kvcache_dcp_staged(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: List[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        *,
+        dcp_token_item_lens: List[int],
+        dst_dcp_size: int,
+        dst_dcp_rank: int,
+        src_page_offset: int,
+        decode_prefix_len: int,
+        num_kv_tokens: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: List[int],
+        staging_buffer,
+    ) -> int:
+        """Relayout DCP tokens with a GPU gather, then issue page-sized RDMA writes."""
+        if num_kv_tokens is None:
+            raise ValueError("PD DCP transfer requires num_kv_tokens")
+        if staging_buffer is None:
+            raise ValueError("PD DCP staging is enabled but no staging buffer is set")
+
+        def fallback_to_direct_transfer() -> int:
+            return self.send_kvcache_dcp(
+                mooncake_session_id,
+                prefill_kv_indices,
+                dst_kv_ptrs,
+                dst_kv_indices,
+                dcp_token_item_lens=dcp_token_item_lens,
+                dst_dcp_size=dst_dcp_size,
+                dst_dcp_rank=dst_dcp_rank,
+                src_page_offset=src_page_offset,
+                decode_prefix_len=decode_prefix_len,
+                num_kv_tokens=num_kv_tokens,
+                executor=executor,
+                dst_layer_ids=dst_layer_ids,
+            )
+
+        if getattr(self, "_dcp_staging_disabled", False):
+            return fallback_to_direct_transfer()
+
+        physical_page_size = self.kv_args.page_size
+        plan = build_dcp_token_transfer_plan(
+            prefill_kv_indices,
+            dst_kv_indices,
+            physical_page_size=physical_page_size,
+            dcp_size=dst_dcp_size,
+            dcp_rank=dst_dcp_rank,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            num_kv_tokens=num_kv_tokens,
+        )
+        if plan.src_token_indices.size == 0:
+            return 0
+
+        src_kv_ptrs, resolved_dst_ptrs, token_item_lens = (
+            self._resolve_dcp_transfer_layers(
+                dst_kv_ptrs,
+                dcp_token_item_lens,
+                dst_layer_ids,
+            )
+        )
+        if not src_kv_ptrs:
+            return 0
+        bytes_per_packed_token = sum(token_item_lens)
+        max_tokens = staging_buffer.get_size() // bytes_per_packed_token
+        if max_tokens == 0:
+            logger.warning_once(
+                "DCP staging buffer cannot fit one token across all local layers; "
+                "falling back to direct strided transfer. Increase "
+                "SGLANG_DISAGG_DCP_STAGING_BUFFER_SIZE_MB."
+            )
+            return fallback_to_direct_transfer()
+
+        # Keep intermediate batches page-aligned so destination-contiguous
+        # tokens normally become one RDMA write per layer and physical page.
+        if max_tokens >= physical_page_size:
+            max_tokens = (max_tokens // physical_page_size) * physical_page_size
+
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            gather_dcp_tokens_to_staging,
+        )
+
+        total_tokens = int(plan.src_token_indices.size)
+        for start in range(0, total_tokens, max_tokens):
+            if getattr(self, "_dcp_staging_disabled", False):
+                # Replaying the whole chunk is safe after an earlier staged batch:
+                # the direct path writes the same KV bytes to the same destinations.
+                return fallback_to_direct_transfer()
+
+            end = min(start + max_tokens, total_tokens)
+            src_token_indices = plan.src_token_indices[start:end]
+            dst_token_indices = plan.dst_token_indices[start:end]
+            required_bytes = dcp_staging_required_bytes(
+                len(src_token_indices), token_item_lens
+            )
+            if not staging_buffer.fits(required_bytes):
+                raise RuntimeError(
+                    "DCP staging batch sizing exceeded the registered buffer: "
+                    f"need={required_bytes}, have={staging_buffer.get_size()}"
+                )
+
+            try:
+                gather_dcp_tokens_to_staging(
+                    src_kv_ptrs,
+                    src_token_indices,
+                    token_item_lens,
+                    staging_buffer,
+                    self.kv_args.gpu_id,
+                )
+            except Exception:
+                self._dcp_staging_disabled = True
+                logger.exception(
+                    "DCP staging gather failed; disabling staged DCP relayout "
+                    "for this process and falling back to direct transfer"
+                )
+                return fallback_to_direct_transfer()
+            transfer_blocks = build_dcp_staging_transfer_blocks(
+                staging_buffer.get_ptr(),
+                resolved_dst_ptrs,
+                dst_token_indices,
+                token_item_lens,
+            )
+            ret = self._transfer_data(mooncake_session_id, transfer_blocks)
+            if ret != 0:
+                return ret
+
+        return 0
 
     def send_kvcache_slice(
         self,
@@ -1617,6 +1791,7 @@ class MooncakeKVManager(CommonKVManager):
         queue: FastQueue,
         executor: concurrent.futures.ThreadPoolExecutor,
         staging_buffer=None,
+        dcp_staging_buffer=None,
         worker_index=0,
     ):
         staging_strategy = None
@@ -1757,22 +1932,36 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dcp_token_item_lens
                             )
                             assert dcp_token_item_lens is not None
-                            ret = self.send_kvcache_dcp(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
+                            dcp_kwargs = dict(
                                 dcp_token_item_lens=dcp_token_item_lens,
                                 dst_dcp_size=target_rank_registration_info.dst_dcp_size,
                                 dst_dcp_rank=target_rank_registration_info.dst_dcp_rank,
                                 src_page_offset=kv_chunk.index_slice.start or 0,
                                 decode_prefix_len=req.decode_prefix_len or 0,
                                 num_kv_tokens=kv_chunk.num_kv_tokens,
-                                executor=executor,
                                 dst_layer_ids=(
                                     target_rank_registration_info.dst_kv_layer_ids
                                 ),
                             )
+                            if self.enable_dcp_staging:
+                                ret = self.send_kvcache_dcp_staged(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    executor=executor,
+                                    staging_buffer=dcp_staging_buffer,
+                                    **dcp_kwargs,
+                                )
+                            else:
+                                ret = self.send_kvcache_dcp(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    executor=executor,
+                                    **dcp_kwargs,
+                                )
                         elif (
                             self.is_mla_backend
                             or self.is_hybrid_mla_backend

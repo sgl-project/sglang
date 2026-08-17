@@ -820,6 +820,18 @@ def is_mla_backend(target_kv_pool) -> bool:
     return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
 
+def is_mla_or_hybrid_mla_backend(target_kv_pool) -> bool:
+    """Return whether a KV pool exposes an MLA full-attention cache."""
+    if is_mla_backend(target_kv_pool):
+        return True
+
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    return isinstance(target_kv_pool, HybridLinearKVPool) and is_mla_backend(
+        target_kv_pool.full_kv_pool
+    )
+
+
 def compute_mamba_state_slice_blocks(
     src_dim: int,
     dst_dim: int,

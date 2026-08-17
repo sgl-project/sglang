@@ -317,6 +317,7 @@ class TestKimiLinearPDDCP4(GSM8KMixin, PDDisaggregationServerBase):
             cls.prefill_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 5,
             other_args=args,
+            env={"SGLANG_DISAGG_DCP_STAGING_BUFFER": "1"},
         )
 
     @classmethod

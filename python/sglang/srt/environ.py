@@ -678,6 +678,10 @@ class Envs:
     # Staging buffer for heterogeneous TP KV transfer
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
+    # Prefill-side staging buffer for MLA and hybrid-MLA DCP token relayout. The
+    # buffer is registered with the transfer engine and reused by one worker.
+    SGLANG_DISAGG_DCP_STAGING_BUFFER = EnvBool(False)
+    SGLANG_DISAGG_DCP_STAGING_BUFFER_SIZE_MB = EnvInt(64)
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)

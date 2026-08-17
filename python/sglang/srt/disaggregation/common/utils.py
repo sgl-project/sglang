@@ -133,6 +133,70 @@ def group_concurrent_contiguous(
     return src_groups, dst_groups
 
 
+def dcp_staging_required_bytes(num_tokens: int, token_item_lens: List[int]) -> int:
+    """Return bytes needed for the layer-major DCP staging layout."""
+    if num_tokens < 0:
+        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
+    if any(item_len <= 0 for item_len in token_item_lens):
+        raise ValueError(
+            f"token_item_lens must contain only positive values, got {token_item_lens}"
+        )
+    return num_tokens * sum(token_item_lens)
+
+
+def build_dcp_staging_transfer_blocks(
+    staging_ptr: int,
+    dst_data_ptrs: List[int],
+    dst_token_indices: npt.NDArray[np.int64],
+    token_item_lens: List[int],
+) -> List[Tuple[int, int, int]]:
+    """Build page-sized transfers from packed DCP staging data.
+
+    The staging layout is layer-major: each layer contains all selected tokens
+    densely in transfer order. Therefore only destination discontinuities split
+    a transfer block; the strided source indices have already been eliminated by
+    the GPU gather.
+    """
+    if len(dst_data_ptrs) != len(token_item_lens):
+        raise ValueError(
+            "dst_data_ptrs and token_item_lens must have equal lengths, "
+            f"got {len(dst_data_ptrs)} and {len(token_item_lens)}"
+        )
+    dst_indices = np.asarray(dst_token_indices, dtype=np.int64)
+    if dst_indices.ndim != 1:
+        raise ValueError(
+            f"dst_token_indices must be one-dimensional, got shape {dst_indices.shape}"
+        )
+    if not dst_data_ptrs or dst_indices.size == 0:
+        return []
+    if any(item_len <= 0 for item_len in token_item_lens):
+        raise ValueError(
+            f"token_item_lens must contain only positive values, got {token_item_lens}"
+        )
+
+    breaks = np.where(np.diff(dst_indices) != 1)[0] + 1
+    group_starts = np.concatenate(([0], breaks))
+    group_ends = np.concatenate((breaks, [dst_indices.size]))
+
+    blocks: List[Tuple[int, int, int]] = []
+    layer_offset = 0
+    num_tokens = int(dst_indices.size)
+    for dst_ptr, item_len in zip(dst_data_ptrs, token_item_lens):
+        src_layer_ptr = staging_ptr + layer_offset
+        for start, end in zip(group_starts, group_ends):
+            start = int(start)
+            end = int(end)
+            blocks.append(
+                (
+                    src_layer_ptr + start * item_len,
+                    dst_ptr + int(dst_indices[start]) * item_len,
+                    (end - start) * item_len,
+                )
+            )
+        layer_offset += num_tokens * item_len
+    return blocks
+
+
 @dataclasses.dataclass(frozen=True)
 class DCPTokenTransferPlan:
     src_token_indices: npt.NDArray[np.int64]
