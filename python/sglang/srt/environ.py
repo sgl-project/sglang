@@ -1113,6 +1113,9 @@ class Envs:
     # Blackwell MegaMoE uses a whole-grid software barrier. Keep a small
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
+    # Opt-in SM100+ CUDA Graph path: stage activations on a side stream while
+    # the JIT router writes final TopK outputs directly into the symm buffer.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_DIRECT_OUT = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels

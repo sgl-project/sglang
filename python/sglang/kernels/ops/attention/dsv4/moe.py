@@ -48,6 +48,23 @@ def _jit_mega_moe_pre_dispatch_module(quant_group_size: int):
 
 
 @cache_once
+def _jit_mega_moe_direct_out_module(quant_group_size: int):
+    args = make_cpp_args(quant_group_size)
+    return load_jit(
+        make_name("mega_moe_direct_out"),
+        *args,
+        cuda_files=["deepseek_v4/mega_moe_pre_dispatch.cuh"],
+        cuda_wrappers=[
+            (
+                "stage_activation",
+                f"MegaMoEActivationStagingKernel<{args}>::run",
+            ),
+            ("pad_route", "MegaMoERoutePaddingKernel::run"),
+        ],
+    )
+
+
+@cache_once
 def _jit_silu_mul_quant_varlen_module(
     quant_group_size: int,
     scale_ue8m0: bool,
@@ -171,6 +188,33 @@ def mega_moe_pre_dispatch(
         buf_topk_idx,
         buf_topk_weights,
     )
+
+
+def mega_moe_stage_activation(
+    x: torch.Tensor,
+    buf_x: torch.Tensor,
+    buf_x_sf: torch.Tensor,
+    quant_group_size: int = 32,
+) -> None:
+    """Stage only MegaMoE activations.
+
+    This kernel has no implicit PDL dependency. A caller that uses a side
+    stream must first make that stream wait for ``x``'s producer, and must join
+    it before launching a consumer of ``buf_x`` or ``buf_x_sf``.
+    """
+    module = _jit_mega_moe_direct_out_module(quant_group_size)
+    module.stage_activation(x, buf_x, buf_x_sf)
+
+
+def mega_moe_pad_route(
+    routed_topk_idx: torch.Tensor,
+    buf_topk_idx: torch.Tensor,
+    buf_topk_weights: torch.Tensor,
+    quant_group_size: int = 32,
+) -> None:
+    """Initialize only the padded rows after an out-variant router."""
+    module = _jit_mega_moe_direct_out_module(quant_group_size)
+    module.pad_route(routed_topk_idx, buf_topk_idx, buf_topk_weights)
 
 
 def silu_and_mul_clamp(
