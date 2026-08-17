@@ -13,10 +13,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
-use crate::message::{
-    ChunkEvent, DetokMsg, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, for_each_chunk,
-    ids::Rid,
+use crate::message::detok::DetokMsg;
+use crate::message::egress::{
+    ChunkEvent, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, for_each_chunk,
 };
+use crate::message::ids::Rid;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::EgressConsumer;
 use crate::tokenizer_manager::{Senders, recv};
@@ -193,8 +194,8 @@ fn decode_error(body: &[u8]) -> Option<(Rid, DetokMsg)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::DetokMsg;
-    use crate::message::frame_egress_error;
+    use crate::message::detok::DetokMsg;
+    use crate::message::egress::frame_egress_error;
 
     /// A framed error round-trips: `frame_egress_error` → tag stripped →
     /// `decode_error` yields the rid + a `Fail` carrying the message.

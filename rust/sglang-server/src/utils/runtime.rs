@@ -17,7 +17,8 @@
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crate::message::{DetokMsg, config::RuntimeConfig};
+use crate::message::config::RuntimeConfig;
+use crate::message::detok::DetokMsg;
 
 use super::threads::{plan_cores, spawn_pool};
 use crate::tokenizer_manager::channel::{
@@ -43,7 +44,7 @@ pub struct Runtime {
     /// Requests parked in `Encoding`, drained by the MM worker pool
     /// (`Server.start_mm_workers`). Stays empty for non-multimodal models —
     /// ingress never routes to it.
-    pub mm: flume::Receiver<crate::message::MmRequest>,
+    pub mm: flume::Receiver<crate::message::request::MmRequest>,
     /// Back-channel for the MM workers' `MmEncoded` / `MmFailed` into tm-ingress.
     pub tm: flume::Sender<TmEvent>,
     /// The loaded tokenizer, shared with the MM worker path (`None` under
@@ -135,11 +136,11 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     // --- inter-stage channels ---
     let (tm_tx, tm_rx) = flume::bounded::<TmEvent>(cfg.rust_server_args.channel_cap);
     let (tok_tx, tok_rx) =
-        flume::bounded::<crate::message::Request>(cfg.rust_server_args.channel_cap);
+        flume::bounded::<crate::message::request::Request>(cfg.rust_server_args.channel_cap);
     // Encoding → MM worker pool. Bounded like the other stage edges so a slow
     // pool back-pressures instead of buffering unboundedly.
     let (mm_tx, mm_rx) =
-        flume::bounded::<crate::message::MmRequest>(cfg.rust_server_args.channel_cap);
+        flume::bounded::<crate::message::request::MmRequest>(cfg.rust_server_args.channel_cap);
     let detokenizer_worker_num = cfg.server_args.detokenizer_worker_num;
     let mut detok_tx = Vec::with_capacity(detokenizer_worker_num);
     let mut detok_rx = Vec::with_capacity(detokenizer_worker_num);

@@ -26,10 +26,12 @@ use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_egress_stream,
     openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::message::{
-    ChunkEvent, ChunkExtras, EgressItem, GenerateRequest, Matched, OneOrMany, RequestKind,
-    SamplingParams, TokenIds, ids::Rid,
-};
+use crate::message::egress::{ChunkEvent, ChunkExtras, EgressItem};
+use crate::message::finish_reason::Matched;
+use crate::message::ids::Rid;
+use crate::message::request::{GenerateRequest, RequestKind};
+use crate::message::sampling::SamplingParams;
+use crate::message::types::{OneOrMany, TokenIds};
 use crate::utils::error::Error;
 
 pub(super) fn routes() -> Router<AppState> {
@@ -739,7 +741,7 @@ mod tests {
         completion_prompt_specs, completion_response_value, unary_completion,
     };
     use crate::api_server::guard::AbortGuard;
-    use crate::message::ChunkExtras;
+    use crate::message::egress::ChunkExtras;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{
         Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,

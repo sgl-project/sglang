@@ -14,7 +14,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::message::{Request, RequestKind, TokenIds};
+use crate::message::request::{Request, RequestKind};
+use crate::message::types::TokenIds;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::TmEvent;
 use crate::utils::{error::Error, fsm::Event};
@@ -229,7 +230,9 @@ impl Runnable for TokenizerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{EgressSink, GenerateRequest, RequestKind, SamplingParams};
+    use crate::message::egress::EgressSink;
+    use crate::message::request::{GenerateRequest, RequestKind};
+    use crate::message::sampling::SamplingParams;
     use crate::utils::fsm::RequestState;
     use tokio::sync::mpsc;
 

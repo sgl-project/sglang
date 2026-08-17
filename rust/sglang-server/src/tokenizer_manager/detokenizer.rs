@@ -23,8 +23,11 @@
 
 use std::collections::HashMap;
 
-use crate::message::DetokMsg;
-use crate::message::{ChunkEvent, EgressItem, EgressSink, Matched, SinkError, TokenIds, ids::Rid};
+use crate::message::detok::DetokMsg;
+use crate::message::egress::{ChunkEvent, EgressItem, EgressSink, SinkError};
+use crate::message::finish_reason::Matched;
+use crate::message::ids::Rid;
+use crate::message::types::TokenIds;
 use crate::tokenizer_manager::AbortSource;
 use crate::utils::runtime::Runnable;
 use crate::utils::{

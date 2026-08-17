@@ -33,7 +33,7 @@ use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::OneOrMany;
+use super::types::OneOrMany;
 use crate::utils::{error::Error, regex::RegexPattern};
 
 /// `_SAMPLING_EPS` — temperatures in `[0, eps)` mean greedy decoding.

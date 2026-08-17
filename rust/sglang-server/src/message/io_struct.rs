@@ -6,8 +6,10 @@
 use bytes::Bytes;
 use serde::Serialize;
 
+use super::request::GenerateRequest;
+use super::sampling::SamplingParams;
+use super::types::TokenIds;
 use super::types::{Tagged, control_messages, wire_struct};
-use super::{GenerateRequest, SamplingParams, TokenIds};
 use crate::utils::error::Error;
 
 wire_struct! {

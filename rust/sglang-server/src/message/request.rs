@@ -10,9 +10,12 @@ use bytes::Bytes;
 use itertools::izip;
 use serde::Deserialize;
 
+use super::egress::EgressSink;
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
-use super::{OneOrMany, OneOrManyItem, SamplingParams, SamplingParamsInput, TokenIds};
+use super::sampling::{SamplingParams, SamplingParamsInput};
+use super::types::{OneOrMany, OneOrManyItem, TokenIds};
 use crate::message::ids::Rid;
+use crate::utils::fsm::RequestState;
 use crate::utils::{environ::env_u64, error::Error};
 
 /// Hard cap on how many scheduler requests one `/generate` HTTP call may expand
@@ -544,6 +547,28 @@ fn mm_value_present(v: &Option<rmpv::Value>) -> bool {
         .is_some_and(crate::multi_modality::payload::value_present)
 }
 
+/// The owned request as it travels ingress stages (single owner, so `state` is
+/// mutated lock-free). Common fields here; variant data in [`RequestKind`].
+#[derive(Debug)]
+pub struct Request {
+    /// Client-visible request id (uuid hex) — what the scheduler wire and
+    /// `meta_info.id` carry.
+    pub rid: Rid,
+    pub state: RequestState,
+    /// Back-channel to the client connection for egress frames.
+    pub sink: EgressSink,
+    /// Discriminant + variant body (generate vs control).
+    pub kind: RequestKind,
+}
+
+/// One ingress-ring entry, split columnar: the scalar `header` (msgpack, `input_ids`
+/// omitted) + the raw int64 `ids` cell, so the big tensor never goes through msgpack.
+#[derive(Debug)]
+pub struct IngressMsg {
+    pub header: Bytes,
+    pub ids: Bytes,
+}
+
 /// Request variant — selects the ingress branch, scheduler wire message, and
 /// egress shape. Each owns its body, so generate/control fields stay type-separate.
 #[derive(Debug)]
@@ -639,6 +664,9 @@ pub struct GenerateRequest {
 }
 
 /// The opaque multimodal fields of one request (see [`GenerateRequest::mm`]).
+///
+/// Constructed directly only by tests: `api_server::prefetch` fills its
+/// `prefetched` field, everything else gets it packed inside a `GenerateRequest`.
 #[derive(Debug, Default)]
 pub struct MmData {
     pub image_data: Option<rmpv::Value>,

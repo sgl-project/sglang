@@ -22,7 +22,9 @@ use super::frame::OutputAccumulator;
 use super::guard::AbortGuard;
 use super::submit::submit;
 use crate::message::config::ServerArgs;
-use crate::message::{ChunkEvent, EgressItem, GenerateRequest, RequestKind, ids::Rid};
+use crate::message::egress::{ChunkEvent, EgressItem};
+use crate::message::ids::Rid;
+use crate::message::request::{GenerateRequest, RequestKind};
 use crate::tokenizer_manager::tokenizer;
 use crate::utils::response::error_response;
 

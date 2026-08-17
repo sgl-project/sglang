@@ -20,8 +20,8 @@ use tower::util::ServiceExt;
 
 use super::{openai_error, routes};
 use crate::message::config::ServerArgs;
+use crate::message::egress::{ChunkEvent, EgressItem};
 use crate::message::ids::Rid;
-use crate::message::{ChunkEvent, EgressItem};
 use crate::tokenizer_manager::Senders;
 
 pub(super) fn senders() -> Senders {

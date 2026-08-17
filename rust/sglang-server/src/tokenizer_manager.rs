@@ -19,7 +19,9 @@ pub mod tokenizer;
 pub use egress::{ActivityCounter, Egress};
 pub use ingress::{Ingress, Limits, Mm};
 
-use crate::message::{DetokMsg, Request, ids::Rid};
+use crate::message::detok::DetokMsg;
+use crate::message::ids::Rid;
+use crate::message::request::Request;
 
 /// Blocking receive that also wakes on shutdown: returns `None` when `rx` closes
 /// *or* the `shutdown` sender is dropped.

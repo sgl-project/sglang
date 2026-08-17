@@ -190,19 +190,25 @@ impl Server {
     /// committed to. It essentially never fires — measured headroom is ~100×.
     fn push_batch(&self, py: Python<'_>, header: &[u8], data_cols: Vec<PyBackedBytes>) -> bool {
         let cols: Vec<&[u8]> = data_cols.iter().map(|d| d.as_ref()).collect();
-        self.push_frame(py, crate::message::frame_egress_batch_cols(header, &cols))
+        self.push_frame(
+            py,
+            crate::message::egress::frame_egress_batch_cols(header, &cols),
+        )
     }
 
     /// Push a control-request result. Blocks for backpressure; `False` only on
     /// shutdown.
     fn push_result(&self, py: Python<'_>, rid: &str, payload: &[u8]) -> bool {
-        self.push_frame(py, crate::message::frame_egress_result(rid, payload))
+        self.push_frame(
+            py,
+            crate::message::egress::frame_egress_result(rid, payload),
+        )
     }
 
     /// Route a terminal failure back to request `rid`. Blocks for backpressure;
     /// `False` only on shutdown.
     fn push_error(&self, py: Python<'_>, rid: &str, message: &str) -> bool {
-        self.push_frame(py, crate::message::frame_egress_error(rid, message))
+        self.push_frame(py, crate::message::egress::frame_egress_error(rid, message))
     }
 
     /// Spawn the MM worker pool for the pipeline in `spec_json` (built from the

@@ -22,10 +22,11 @@ use std::collections::HashMap;
 use bytes::Bytes;
 
 use crate::message::config::ServerArgs;
-use crate::message::{
-    AbortReq, ControlRequest, DetokMsg, EgressItem, GenerateRequest, IngressMsg, MmRequest,
-    Request, RequestKind, ids::Rid,
-};
+use crate::message::detok::DetokMsg;
+use crate::message::egress::EgressItem;
+use crate::message::ids::Rid;
+use crate::message::io_struct::{AbortReq, ControlRequest};
+use crate::message::request::{GenerateRequest, IngressMsg, MmRequest, Request, RequestKind};
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::IngressProducer;
 use crate::tokenizer_manager::{AbortSource, Senders, TmEvent};
@@ -723,7 +724,9 @@ fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Er
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{EgressSink, GenerateRequest, SamplingParams};
+    use crate::message::egress::EgressSink;
+    use crate::message::request::GenerateRequest;
+    use crate::message::sampling::SamplingParams;
     use crate::tokenizer_manager::channel::{IngressConsumer, ingress_ring};
     use crate::utils::fsm::RequestState;
     use tokio::sync::mpsc;
@@ -1468,7 +1471,7 @@ mod tests {
             kind: RequestKind::Generate(Box::new(GenerateRequest {
                 rid: rid.to_string().into(),
                 text: Some("<image> hi".into()),
-                mm: Some(Box::new(crate::message::MmData {
+                mm: Some(Box::new(crate::message::request::MmData {
                     image_data: Some(rmpv::Value::from("data:image/jpeg;base64,xxxx")),
                     ..Default::default()
                 })),

@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::message::IngressMsg;
+use crate::message::request::IngressMsg;
 
 /// Ingress: TokenizerManager → scheduler `recv_requests`.
 /// Producers are Rust TM workers; the single consumer is the Python thread.

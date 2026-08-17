@@ -17,8 +17,10 @@ use super::AppState;
 use super::guard::AbortGuard;
 use super::submit::submit;
 use crate::message::config::ServerArgs;
+use crate::message::egress::EgressItem;
 use crate::message::ids::Rid;
-use crate::message::{ControlRequest, EgressItem, GetInternalStateReq, RequestKind};
+use crate::message::io_struct::{ControlRequest, GetInternalStateReq};
+use crate::message::request::RequestKind;
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {

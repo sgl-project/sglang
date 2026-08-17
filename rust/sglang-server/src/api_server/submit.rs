@@ -6,7 +6,9 @@ use axum::{http::StatusCode, response::Response};
 use tokio::sync::mpsc;
 
 use super::{AppState, native_api::native_error};
-use crate::message::{EgressItem, EgressSink, Request, RequestKind, ids::Rid};
+use crate::message::egress::{EgressItem, EgressSink};
+use crate::message::ids::Rid;
+use crate::message::request::{Request, RequestKind};
 use crate::tokenizer_manager::TmEvent;
 use crate::utils::fsm::RequestState;
 

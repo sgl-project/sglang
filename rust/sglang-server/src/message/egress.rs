@@ -7,8 +7,8 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use super::TokenIds;
 use super::finish_reason::FinishReason;
+use super::types::TokenIds;
 use crate::message::ids::Rid;
 use crate::utils::error::Error;
 

@@ -37,8 +37,11 @@ use super::{
     openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
+use crate::message::egress::{ChunkExtras, EgressItem};
 use crate::message::ids::Rid;
-use crate::message::{ChunkExtras, EgressItem, GenerateRequest, OneOrMany, SamplingParams};
+use crate::message::request::GenerateRequest;
+use crate::message::sampling::SamplingParams;
+use crate::message::types::OneOrMany;
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -852,8 +855,8 @@ mod tests {
         merge_template_stops, unary_chat,
     };
     use crate::api_server::guard::AbortGuard;
-    use crate::message::ChunkExtras;
     use crate::message::config::DefaultSamplingParams;
+    use crate::message::egress::ChunkExtras;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
     use futures::StreamExt;
@@ -921,7 +924,7 @@ mod tests {
         ));
         assert_eq!(
             formatter.stop_strs(),
-            Some(crate::message::OneOrMany::Many(vec![
+            Some(crate::message::types::OneOrMany::Many(vec![
                 "<|endoftext|>".into(),
                 "<|im_end|>".into()
             ]))
