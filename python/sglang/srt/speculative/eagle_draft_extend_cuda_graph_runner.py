@@ -532,9 +532,22 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.seq_lens_cpu[:raw_bs].copy_(seq_lens_cpu)
             seq_lens_sum = int(seq_lens_cpu.sum())
 
-        # The init reads verify products only by shape; a view over the static
-        # buffers (steady-state extend widths, stale accept counts) stands in
-        # for the not-yet-built spec_info.
+        self._init_out_graph_metadata(
+            bs=bs,
+            raw_bs=raw_bs,
+            num_tokens=num_tokens,
+            input_ids=buffers.input_ids[:num_tokens],
+            seq_lens_sum=seq_lens_sum,
+            has_seq_lens_cpu=seq_lens_cpu is not None,
+            spec_info=self._make_spec_view(bs),
+            out_cache_loc_dsv4=out_cache_loc_dsv4,
+        )
+
+    def _make_spec_view(self, bs: int) -> EagleDraftExtendInput:
+        """Shape-only stand-in for the not-yet-built spec_info: the init reads
+        verify products only by shape (steady-state extend widths, stale
+        accept counts in the static buffers)."""
+        buffers = self.buffers
         spec_view = EagleDraftExtendInput(
             hidden_states=None,
             num_correct_drafts=buffers.num_correct_drafts[:bs],
@@ -544,17 +557,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         spec_view.extend_seq_lens_cpu = [self.captured_req_width] * bs
         spec_view.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
-
-        self._init_out_graph_metadata(
-            bs=bs,
-            raw_bs=raw_bs,
-            num_tokens=num_tokens,
-            input_ids=buffers.input_ids[:num_tokens],
-            seq_lens_sum=seq_lens_sum,
-            has_seq_lens_cpu=seq_lens_cpu is not None,
-            spec_info=spec_view,
-            out_cache_loc_dsv4=out_cache_loc_dsv4,
-        )
+        return spec_view
 
     def execute(self, forward_batch: ForwardBatch, staged: bool = False):
         assert forward_batch.out_cache_loc is not None
