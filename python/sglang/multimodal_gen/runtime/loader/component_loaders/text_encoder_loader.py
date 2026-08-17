@@ -3,6 +3,7 @@ import glob
 import os
 import re
 from collections.abc import Callable, Generator, Iterable
+from itertools import chain
 from typing import cast
 
 import torch
@@ -65,6 +66,12 @@ def _configure_text_encoder_quantization(
     component_config: dict,
     component_model_path: str,
 ) -> None:
+    if getattr(model_cls, "manages_checkpoint_quantization", False):
+        # Preserve model-owned formats such as Ideogram's bitsandbytes state.
+        # Those models parse metadata, construct layers, and attach quant states
+        # themselves; running the generic lifecycle as well would process twice.
+        return
+
     quant_config = get_quant_config(
         component_config,
         component_model_path,
@@ -88,7 +95,32 @@ def _configure_text_encoder_quantization(
         )
 
 
-def _process_quantized_text_encoder_weights(model: nn.Module) -> int:
+def _module_tensor_device(module: nn.Module) -> torch.device | None:
+    """Return the device of a module's own tensors.
+
+    Quantized linear layers are expected to keep their parameters and buffers
+    together.  Failing explicitly is safer than staging only part of a layer.
+    """
+
+    devices = {
+        tensor.device
+        for tensor in chain(
+            module.parameters(recurse=False),
+            module.buffers(recurse=False),
+        )
+    }
+    if len(devices) > 1:
+        raise ValueError(
+            f"Cannot stage {type(module).__name__} with tensors on multiple "
+            f"devices: {sorted(map(str, devices))}"
+        )
+    return next(iter(devices), None)
+
+
+def _process_quantized_text_encoder_weights(
+    model: nn.Module,
+    process_device: torch.device,
+) -> int:
     processed_layers = 0
     for module in model.modules():
         if not isinstance(module, LinearBase):
@@ -96,8 +128,19 @@ def _process_quantized_text_encoder_weights(model: nn.Module) -> int:
         quant_method = module.quant_method
         if quant_method is None or isinstance(quant_method, UnquantizedLinearMethod):
             continue
-        quant_method.process_weights_after_loading(module)
-        processed_layers += 1
+
+        origin_device = _module_tensor_device(module)
+        should_stage = origin_device is not None and origin_device != process_device
+        if should_stage:
+            module.to(process_device)
+        try:
+            quant_method.process_weights_after_loading(module)
+            processed_layers += 1
+        finally:
+            # Post-load methods may replace parameters or register buffers. Move
+            # the complete layer back so component residency remains authoritative.
+            if should_stage:
+                module.to(origin_device)
     if processed_layers == 0:
         raise ValueError(
             "The text-encoder checkpoint declares quantization, but the model "
@@ -523,8 +566,10 @@ class TextEncoderLoader(ComponentLoader):
             )
 
             if quant_config is not None:
-                model = model.to(local_torch_device)
-                processed_layers = _process_quantized_text_encoder_weights(model)
+                processed_layers = _process_quantized_text_encoder_weights(
+                    model,
+                    local_torch_device,
+                )
                 logger.info(
                     "Processed %d %s text-encoder linear layers",
                     processed_layers,

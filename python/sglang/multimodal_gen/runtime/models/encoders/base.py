@@ -177,6 +177,9 @@ class TextEncoder(
     # Quantized checkpoints are opt-in because an encoder must construct
     # quantized linears and load the checkpoint's auxiliary scale parameters.
     supported_checkpoint_quantization_methods: frozenset[str] = frozenset()
+    # Some encoders own checkpoint quantization end to end because their weight
+    # states or sharding contract cannot use the generic loader lifecycle.
+    manages_checkpoint_quantization = False
     layerwise_offload_dit_group_enabled = False
     layer_names = [
         "layers",
