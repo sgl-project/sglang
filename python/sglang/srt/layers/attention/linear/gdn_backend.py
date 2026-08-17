@@ -558,6 +558,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
+            # TODO: add sgl_kernel variants on each platform to support the
+            # intermediate_* / retrieve_* args used here; once they are supported,
+            # drop this Triton fallback.
             # sgl_kernel variants don't support intermediate_* / retrieve_* args; fallback to Triton.
             mixed_qkv_processed = causal_conv1d_update_triton(
                 mixed_qkv_reshaped,
