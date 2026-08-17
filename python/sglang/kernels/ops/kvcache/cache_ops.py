@@ -9,7 +9,6 @@ def concat_and_cast_mha_k_kernel(
     k_nope_ptr,
     k_rope_ptr,
     head_cnt: tl.constexpr,
-    head_pad: tl.constexpr,
     k_stride0: tl.constexpr,
     k_stride1: tl.constexpr,
     nope_stride0: tl.constexpr,
@@ -19,10 +18,7 @@ def concat_and_cast_mha_k_kernel(
     rope_dim: tl.constexpr,
 ):
     pid_loc = tl.program_id(0)
-    # tl.arange needs a power-of-2 range; head_cnt may be non-pow2 (e.g. 12 =
-    # Kimi-K3 96 heads at TP8), so iterate the padded range and mask the tail.
-    head_range = tl.arange(0, head_pad)
-    head_mask = head_range < head_cnt
+    head_range = tl.arange(0, head_cnt)
 
     k_head_ptr = k_ptr + pid_loc * k_stride0 + head_range[:, None] * k_stride1
 
@@ -36,14 +32,14 @@ def concat_and_cast_mha_k_kernel(
     )
     dst_nope_ptr = k_head_ptr + nope_offs[None, :]
 
-    src_nope = tl.load(src_nope_ptr, mask=head_mask[:, None], other=0)
-    tl.store(dst_nope_ptr, src_nope, mask=head_mask[:, None])
+    src_nope = tl.load(src_nope_ptr)
+    tl.store(dst_nope_ptr, src_nope)
 
     rope_offs = tl.arange(0, rope_dim)
     src_rope_ptr = k_rope_ptr + pid_loc * rope_stride0 + rope_offs[None, :]
     dst_rope_ptr = k_head_ptr + nope_dim + rope_offs[None, :]
     src_rope = tl.load(src_rope_ptr)
-    tl.store(dst_rope_ptr, src_rope, mask=head_mask[:, None])
+    tl.store(dst_rope_ptr, src_rope)
 
 
 @triton.jit
@@ -146,7 +142,6 @@ def concat_and_cast_mha_k_triton(
         k_nope,
         k_rope,
         k.shape[1],
-        triton.next_power_of_2(k.shape[1]),
         k.stride(0),
         k.stride(1),
         k_nope.stride(0),
