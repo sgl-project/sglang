@@ -38,7 +38,9 @@ class IndexKeyCache:
         )
 
     def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
-        return num_pages
+        # Layers that reuse the previous layer's top-k never write index-K, so
+        # they get a 0-row placeholder that keeps ``buffer`` layer-aligned.
+        return 0 if self.pool.skip_topk_layers[layer_idx] else num_pages
 
     def clear(self) -> None:
         del self.buffer
@@ -47,7 +49,6 @@ class IndexKeyCache:
         buffers = [buf for buf in self.buffer if buf.shape[0] > 0]
         if not buffers or tgt_loc.numel() == 0:
             return
-
         scratch = torch.empty(
             (tgt_loc.numel(), self.pool.index_head_dim + 4),
             dtype=torch.uint8,
@@ -129,6 +130,8 @@ class IndexKeyCache:
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
         for layer_id in range(self.pool.layer_num):
             index_k_cpu.append([])
+            if self.buffer[layer_id].shape[0] == 0:
+                continue
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
                 idx_cpu = self.buffer[layer_id][chunk_page_indices].to(
@@ -144,17 +147,24 @@ class IndexKeyCache:
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
         for layer_id in range(self.pool.layer_num):
+            if self.buffer[layer_id].shape[0] == 0:
+                continue
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
                 idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
                 assert idx_cpu.shape[0] == len(chunk_page_indices)
-                idx_chunk = idx_cpu.to(self.buffer[0].device, non_blocking=True)
+                idx_chunk = idx_cpu.to(self.buffer[layer_id].device, non_blocking=True)
                 self.buffer[layer_id][chunk_page_indices] = idx_chunk
         torch.cuda.synchronize()
+
+    def _item_len(self, layer_idx: int) -> int:
+        # 0-row layers (skip-topk, or non-owned under CP layer split) have no item.
+        buf = self.buffer[layer_idx]
+        return 0 if buf.shape[0] == 0 else buf[0].nbytes
 
     def state_buf_infos(self):
         layer_num = self.pool.layer_num
         data_ptrs = [self.buffer[i].data_ptr() for i in range(layer_num)]
         data_lens = [self.buffer[i].nbytes for i in range(layer_num)]
-        item_lens = [self.buffer[i][0].nbytes for i in range(layer_num)]
+        item_lens = [self._item_len(i) for i in range(layer_num)]
         return data_ptrs, data_lens, item_lens
