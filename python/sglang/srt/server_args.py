@@ -4040,6 +4040,7 @@ class ServerArgs:
             handle_a2a_moe,
             handle_moe_kernel_config,
             validate_cutedsl_a2a_token_budget,
+            validate_cutedsl_nvfp4_w4a16,
             validate_deepep_v2_dispatch_token_budget,
             validate_deepep_v2_speculative_draft,
         )
@@ -4059,6 +4060,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+        validate_cutedsl_nvfp4_w4a16(self)
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_req is final.
         validate_cutedsl_a2a_token_budget(self)
