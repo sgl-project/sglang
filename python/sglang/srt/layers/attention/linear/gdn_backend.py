@@ -13,16 +13,16 @@ from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
-    get_linear_attn_decode_backend,
-    get_linear_attn_prefill_backend,
-    get_linear_attn_verify_backend,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 from sglang.srt.utils.common import rank0_log
+
+_is_hip = is_hip()
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
@@ -67,23 +67,22 @@ elif is_cpu():
 
 def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
     """FlashInfer for the narrow SM100 GDN prefill domain we validated, else None."""
-    args = model_runner.server_args
     if (
-        args.linear_attn_prefill_backend is not None
-        or args.linear_attn_backend != "triton"
-        or args.enable_page_major_kv_layout
+        get_exec().mamba.linear_attn_prefill_backend is not None
+        or get_exec().mamba.linear_attn_backend != "triton"
+        or get_memory().enable_page_major_kv_layout
         or not is_cuda()
         or torch.cuda.get_device_capability()[0] != 10
     ):
         return None
 
     cuda_version = torch.version.cuda
-    chunk_size = args.chunked_prefill_size
+    chunk_size = get_schedule().chunked_prefill_size
     config = hybrid_gdn_config(model_runner.model_config)
     if (
         cuda_version is None
         or int(cuda_version.split(".", 1)[0]) < 13
-        or args.enable_dynamic_chunking
+        or get_schedule().enable_dynamic_chunking
         or chunk_size is None
         or not 1 <= chunk_size <= 8192
         or getattr(config, "linear_key_head_dim", None) != 128
@@ -137,6 +136,10 @@ class GDNKernelDispatcher:
 
             flashinfer_kernel = FlashInferGDNKernel()
             self.decode_kernel = flashinfer_kernel
+        elif decode_backend.is_helion():
+            raise ValueError(
+                "The Helion linear-attention backend supports KDA only, not GDN."
+            )
         else:
             raise ValueError(f"Unsupported GDN decode backend: {decode_backend}")
 
@@ -176,6 +179,10 @@ class GDNKernelDispatcher:
 
                 flashinfer_kernel = FlashInferGDNKernel()
                 self.extend_kernel = flashinfer_kernel
+        elif prefill_backend.is_helion():
+            raise ValueError(
+                "The Helion linear-attention backend supports KDA only, not GDN."
+            )
         else:
             raise ValueError(f"Unsupported GDN prefill backend: {prefill_backend}")
 
@@ -351,11 +358,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 self.conv_states_shape[-1] < FLA_CHUNK_SIZE
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
-        decode_backend = get_linear_attn_decode_backend()
-        prefill_backend = get_linear_attn_prefill_backend()
-        verify_backend = get_linear_attn_verify_backend()
+        backends = model_runner.linear_attn_backends
         self.kernel_dispatcher = GDNKernelDispatcher(
-            decode_backend, prefill_backend, verify_backend
+            backends.decode, backends.prefill, backends.verify
         )
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
@@ -395,6 +400,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        if _is_hip and isinstance(mixed_qkv, torch.Tensor) and mixed_qkv.shape[0] == 0:
+            return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
+
         layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -488,6 +496,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
     ):
         assert isinstance(mixed_qkv, torch.Tensor)
         seq_len = mixed_qkv.shape[0]
+
+        if _is_hip and seq_len == 0:
+            return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
         is_target_verify = forward_batch.forward_mode.is_target_verify()
         forward_metadata = self.forward_metadata
