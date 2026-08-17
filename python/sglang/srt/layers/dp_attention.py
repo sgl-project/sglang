@@ -13,6 +13,7 @@ import triton.language as tl
 from sglang.srt.distributed import (
     GroupCoordinator,
     get_attn_cp_group,
+    get_attn_cp_overlap_group,
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
@@ -967,6 +968,14 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attn_cp_group().all_gather_into_tensor(output, input)
+
+
+def attn_cp_overlap_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
+    return get_attn_cp_overlap_group().all_gather_into_tensor(output, input)
+
+
+def attn_cp_overlap_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+    return get_attn_cp_overlap_group().reduce_scatter_tensor(output, input)
 
 
 def get_moe_cp_group() -> GroupCoordinator:

@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     EvictLayer,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
     DemoteResult,
@@ -252,6 +253,82 @@ class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
         n4.parent = n3
         n4.hash_value = ["h4"]
         self.assertEqual(n4.get_prefix_hash_values(n3), ["h1", "h2", "h3"])
+
+
+class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
+    def _build_core(self, *, is_write_back: bool):
+        component_types = (ComponentType.FULL,)
+        root = UnifiedTreeNode(component_types)
+        shared = UnifiedTreeNode(component_types)
+        anchor_a = UnifiedTreeNode(component_types)
+        anchor_b = UnifiedTreeNode(component_types)
+        shared.parent = root
+        anchor_a.parent = shared
+        anchor_b.parent = shared
+
+        nodes = {node.id: node for node in (root, shared, anchor_a, anchor_b)}
+        core = mock.Mock()
+        core.is_write_back = is_write_back
+        core.root_node = root
+        core.node_by_id.side_effect = nodes.__getitem__
+        core.components_by_type = {ComponentType.FULL: mock.Mock()}
+        core.full_host_duplicates = {}
+        core._is_settled_full_host_duplicate.side_effect = (
+            lambda node: UnifiedTreeCore._is_settled_full_host_duplicate(core, node)
+        )
+        core._update_duplicate_tracking.side_effect = (
+            lambda node: UnifiedTreeCore._update_duplicate_tracking(core, node)
+        )
+        return core, shared, anchor_a, anchor_b
+
+    def _commit_load_back(self, core, anchor, source):
+        transfer = PoolTransfer(
+            name=PoolName.KV,
+            host_indices=torch.tensor([1], dtype=torch.int64),
+            nodes_to_load=[source.id],
+        )
+        return UnifiedTreeCore.commit_load_back(
+            core,
+            anchor.id,
+            torch.tensor([2], dtype=torch.int64),
+            transfer,
+            {},
+        )
+
+    def test_write_through_different_anchors_track_duplicate_without_pending(self):
+        core, shared, anchor_a, anchor_b = self._build_core(is_write_back=False)
+        full = shared.component_data[ComponentType.FULL]
+        full.value = torch.tensor([1], dtype=torch.int64)
+        full.host_value = torch.tensor([2], dtype=torch.int64)
+
+        self._commit_load_back(core, anchor_a, shared)
+        self._commit_load_back(core, anchor_b, shared)
+        UnifiedTreeCore.finish_load_back(core, anchor_a.id)
+
+        self.assertIsNone(shared.load_back_pending_id)
+        self.assertIn(shared.id, core.full_host_duplicates)
+        core._update_duplicate_tracking.assert_has_calls(
+            [mock.call(anchor_a), mock.call(shared)]
+        )
+
+    def test_write_back_pending_blocks_reclaim_until_ack(self):
+        core, shared, anchor_a, anchor_b = self._build_core(is_write_back=True)
+        full = shared.component_data[ComponentType.FULL]
+        full.value = torch.tensor([1], dtype=torch.int64)
+        full.host_value = torch.tensor([2], dtype=torch.int64)
+
+        self._commit_load_back(core, anchor_a, shared)
+
+        self.assertEqual(shared.load_back_pending_id, anchor_a.id)
+        self.assertFalse(UnifiedTreeCore._can_reclaim_full_host_duplicate(core, shared))
+        with self.assertRaisesRegex(AssertionError, "new anchor"):
+            self._commit_load_back(core, anchor_b, shared)
+
+        UnifiedTreeCore.finish_load_back(core, anchor_a.id)
+
+        self.assertIsNone(shared.load_back_pending_id)
+        self.assertTrue(UnifiedTreeCore._can_reclaim_full_host_duplicate(core, shared))
+        core._update_duplicate_tracking.assert_called_once_with(shared)
 
 
 def _write_backup(cache, node, write_back: bool = False) -> int:
