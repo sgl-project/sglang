@@ -501,7 +501,7 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori"]
+                in ["hf3fs", "mooncake", "ascend_memcache", "eic", "nixl", "simm", "mori"]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
@@ -1246,6 +1246,10 @@ class HiCacheController:
 
                 if not self.backup_skip:
                     self._page_backup(operation)
+                    logger.debug(
+                        f"[L3-BACKUP] Backed up {len(operation.hash_value) if operation.hash_value else 0} "
+                        f"pages to storage for op {operation.id}."
+                    )
                 self.ack_backup_queue.put(operation)
 
             except Empty:

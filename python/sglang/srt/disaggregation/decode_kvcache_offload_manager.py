@@ -14,6 +14,8 @@ from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
@@ -55,6 +57,12 @@ class DecodeKVCacheOffloadManager:
                 self.page_size, (env_stride // self.page_size) * self.page_size
             )
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        if isinstance(kv_cache, HybridLinearKVPool):
+            # Hybrid model (e.g. K3 with MLA + KDA): offload only the full
+            # attention KV pool. Mamba/SSM state is ephemeral and does not
+            # require L3 offload on the decode side.
+            kv_cache = kv_cache.full_kv_pool
+
         allocator_type = get_allocator_type(server_args)
 
         if isinstance(kv_cache, MHATokenToKVPool):
@@ -270,12 +278,23 @@ class DecodeKVCacheOffloadManager:
         # concurrent admission. Now consolidated here at request
         # finish, where the request is guaranteed to no longer attend
         # to those slots.
+        #
+        # Skip the prefix tokens [0, cache_protected_len) which are
+        # managed by the tree cache via lock_ref.  These include:
+        #   - L1 device-hit tokens (shared tree cache slots, locked by
+        #     inc_lock_ref at admission)
+        #   - L2/L3 restored tokens (allocated by init_load_back, locked
+        #     by inc_lock_ref in the HiCache restore flow)
+        # Only free the delta prefill tokens that were allocated by
+        # _pre_alloc and are owned by this request.
         state = self.offloaded_state.get(req.rid)
         if state is not None and state.prefill_len > 0:
-            prefill_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : state.prefill_len
-            ]
-            self.token_to_kv_pool_allocator.free(prefill_indices)
+            free_start = max(req.cache_protected_len, 0)
+            if free_start < state.prefill_len:
+                prefill_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, free_start : state.prefill_len
+                ]
+                self.token_to_kv_pool_allocator.free(prefill_indices)
         start = start_offset
         end = kv_committed_len
         # Free the incremental part of the request (DSA-aware)
@@ -293,9 +312,33 @@ class DecodeKVCacheOffloadManager:
             ]
             self.token_to_kv_pool_allocator.free(overalloc_indices)
 
+        # Free mamba cache slots for hybrid models (e.g. K3 with KDA).
+        # The offload path skips release_kv_cache, so free_mamba_cache
+        # must be called here to avoid leaking mamba slots.
+        # NOTE: must be called before req_to_token_pool.free(req) because
+        # free_mamba_cache uses req.req_pool_idx to index the ping-pong
+        # track buffer mapping, and free(req) sets req_pool_idx = None.
+        if isinstance(self.req_to_token_pool, HybridReqToTokenPool) and (
+            not self.tree_cache.supports_mamba()
+        ):
+            if req.mamba_pool_idx is not None:
+                self.req_to_token_pool.free_mamba_cache(req)
         self.req_to_token_pool.free(req)
         req.kv = None
-        self.tree_cache.protected_size_ -= len(req.prefix_indices)
+        # Release the tree cache lock acquired at admission via
+        # _match_prefix_and_lock (inc_lock_ref).  dec_lock_ref properly
+        # updates lock_ref, protected_size_, and evictable_size_ together,
+        # keeping the invariant checker consistent.
+        #
+        # req.last_node tracks the currently-locked node:
+        #   - L1-only: last_node is the L1 prefix node (set at admission,
+        #     unchanged since needs_local_restore is False).
+        #   - L2/L3:   last_node is the restored node (updated by
+        #     _commit_hicache_local_restore_to_req, which already released
+        #     the L1 prefix node's lock via dec_lock_ref).  So this call
+        #     releases only the restored node's lock — no double-decrement.
+        if req.cache_protected_len > 0 and req.last_node is not None:
+            self.tree_cache.dec_lock_ref(req.last_node)
         if req.rid in self.offloaded_state:
             del self.offloaded_state[req.rid]
 

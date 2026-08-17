@@ -165,6 +165,9 @@ class StorageBackendFactory:
         elif backend_name == "mooncake":
             backend = backend_class(storage_config, mem_pool_host)
             return backend
+        elif backend_name == "ascend_memcache":
+            backend = backend_class(storage_config, mem_pool_host)
+            return backend
         elif backend_name == "aibrix":
             backend = backend_class(storage_config, mem_pool_host)
             return backend
@@ -208,6 +211,12 @@ StorageBackendFactory.register_backend(
     "mooncake",
     "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
     "MooncakeStore",
+)
+
+StorageBackendFactory.register_backend(
+    "ascend_memcache",
+    "sglang.srt.mem_cache.storage.ascend_memcache.ascend_memcache_store",
+    "AscendMemcacheStore",
 )
 
 StorageBackendFactory.register_backend(

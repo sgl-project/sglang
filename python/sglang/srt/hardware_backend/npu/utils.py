@@ -92,8 +92,14 @@ def set_default_server_args(args: "ServerArgs"):
     args.disable_custom_all_reduce = True
 
     # handles hierarchical cache configs
-    if args.enable_hierarchical_cache:
-        args.hicache_io_backend = "kernel_ascend"
+    if (
+        args.enable_hierarchical_cache
+        or args.disaggregation_decode_enable_offload_kvcache
+    ):
+        # Respect user override; only patch default values
+        if args.hicache_io_backend == "kernel":
+            args.hicache_io_backend = "kernel_ascend"
+
         if args.use_mla_backend():
             args.hicache_mem_layout = "page_first_kv_split"
         else:

@@ -1014,6 +1014,36 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
+            # Check mamba pool capacity for hybrid models (e.g. K3 with KDA).
+            # Without this guard, prealloc drains the mamba pool before the KV
+            # pool is full, causing "Not enough space for mamba cache" asserts.
+            # When the pool is full, try evicting cached mamba slots from the
+            # radix tree before giving up 鈥?but only if the tree_cache actually
+            # manages mamba states (ChunkCache.evict is a no-op).
+            mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+            if mamba_allocator is not None and mamba_allocator.available_size() <= 0:
+                supports_mamba = self.tree_cache.supports_mamba()
+                if supports_mamba and hasattr(self.tree_cache, "evict"):
+                    logger.debug(
+                        f"[PreallocMamba] MambaPool full, attempting eviction. "
+                        f"avail={mamba_allocator.available_size()} "
+                        f"pool_size={getattr(self.req_to_token_pool, 'mamba_pool', None) and self.req_to_token_pool.mamba_pool.size} "
+                        f"tree_cache={type(self.tree_cache).__name__}"
+                    )
+                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                    logger.debug(
+                        f"[PreallocMamba] Post-eviction avail={mamba_allocator.available_size()}"
+                    )
+                else:
+                    logger.debug(
+                        f"[PreallocMamba] MambaPool full, tree_cache={type(self.tree_cache).__name__} "
+                        f"does not manage mamba, skipping eviction. "
+                        f"avail={mamba_allocator.available_size()} "
+                        f"pool_size={getattr(self.req_to_token_pool, 'mamba_pool', None) and self.req_to_token_pool.mamba_pool.size}"
+                    )
+                if mamba_allocator.available_size() <= 0:
+                    break
+
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
 
@@ -2348,6 +2378,25 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        # Mamba slot leak detection: compare actual pool usage vs expected
+        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        if mamba_allocator is not None:
+            mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+            pool_size = mamba_pool.size if mamba_pool else 0
+            avail = mamba_allocator.available_size()
+            used = pool_size - avail
+            running = len(self.running_batch.reqs) if self.running_batch else 0
+            prealloc = len(self.disagg_decode_prealloc_queue.queue) if hasattr(self, "disagg_decode_prealloc_queue") else 0
+            transfer = len(self.disagg_decode_transfer_queue.queue) if hasattr(self, "disagg_decode_transfer_queue") else 0
+            retracted = len(self.disagg_decode_prealloc_queue.retracted_queue) if hasattr(self, "disagg_decode_prealloc_queue") else 0
+            expected = running + prealloc + transfer + retracted
+            if used > expected + 5:  # allow small accounting slack
+                logger.warning(
+                    f"[MambaLeak] MambaPool used={used}/{pool_size} but expected={expected} "
+                    f"(running={running} prealloc={prealloc} transfer={transfer} retracted={retracted}). "
+                    f"Possible leak of {used - expected} slots."
+                )
+
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 

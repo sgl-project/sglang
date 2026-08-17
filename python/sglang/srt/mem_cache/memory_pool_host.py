@@ -44,7 +44,14 @@ if _is_cuda or _is_hip:
         transfer_kv_mamba_pf_lf,
     )
 if _is_npu:
-    pass
+    from sgl_kernel_npu.kvcacheio import (
+        TransferDirection,
+        transfer_kv_dim_exchange,
+    )
+    try:
+        from sgl_kernel_npu.kvcacheio import transfer_mamba_state
+    except ImportError:
+        transfer_mamba_state = None
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +117,16 @@ class MambaPoolHost(HostKVCache):
 
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
+        logger.info(
+            "[MambaPoolHost][INIT] host_size=%d device_size=%d "
+            "num_layers=%d layout=%s temporal_shape=%s conv_shapes=%s",
+            self.size,
+            device_pool.size,
+            self.num_mamba_layers,
+            self.layout,
+            tuple(device_pool.mamba_cache.temporal.shape),
+            [tuple(c.shape) for c in device_pool.mamba_cache.conv],
+        )
 
         if self.size <= device_pool.size:
             logger.warning(
@@ -338,6 +355,23 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            if transfer_mamba_state is not None:
+                # NPU: use dedicated transfer_mamba_state kernel (aclrtMemcpy2dAsync)
+                transfer_mamba_state(
+                    device_buf=src_layers,
+                    host_buf=dst,
+                    device_indices=src_indices,
+                    host_indices=dst_indices,
+                    direction=TransferDirection.D2H,
+                )
+            else:
+                # Fallback: per-layer torch indexing when kernel is not available
+                for layer_id in range(num_layers):
+                    src_layer = src_layers[layer_id]
+                    dst[dst_indices.to(dst.device), layer_id, 0] = src_layer[
+                        src_indices.to(src_layer.device)
+                    ].to(dst.device)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -378,6 +412,13 @@ class MambaPoolHost(HostKVCache):
                 layer_id=layer_id,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            # NPU fallback: page-first host buffer -> per-layer device buffer.
+            # host buffer layout is (size, num_layers, 1, *shape); the trailing 1
+            # is the page placeholder dim, so index it out explicitly.
+            dst[dst_indices.to(dst.device)] = src[
+                src_indices.to(src.device), layer_id, 0
+            ].to(dst.device)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -421,6 +462,24 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 page_size=1,
             )
+        elif io_backend == "kernel_ascend":
+            # NPU: mirror the load path — the dedicated kernel transfers all
+            # layers at once via a single 2D strided copy
+            # (device layer-first -> host page-first).
+            if transfer_mamba_state is not None:
+                transfer_mamba_state(
+                    device_buf=src_layers,
+                    host_buf=dst,
+                    device_indices=src_indices,
+                    host_indices=dst_indices,
+                    direction=TransferDirection.D2H,
+                )
+            else:
+                # Per-layer fallback when the dedicated kernel is unavailable.
+                for lid in range(num_layers):
+                    dst[dst_indices.to(dst.device), lid, 0] = src_layers[
+                        lid
+                    ][src_indices.to(dst.device)].to(dst.device)
         else:
             raise ValueError(f"Unsupported io_backend: {io_backend}")
 
@@ -434,28 +493,59 @@ class MambaPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
+        if layer_id == 0 and torch.distributed.get_rank() == 0:
+            logger.debug(
+                "[%s][L2-LOAD] slots=%d host_idx_dev=%s dev_idx_dev=%s "
+                "io_backend=%s num_layers=%d",
+                self.__class__.__name__,
+                host_indices.numel(),
+                host_indices.device,
+                device_indices.device,
+                io_backend,
+                self.num_mamba_layers,
+            )
         if self.layout in ["page_first", "page_first_direct"]:
-            # no ssm state on conv-only models: nothing to transfer
-            if self.temporal_state_elem_size > 0:
-                self._copy_tensor_pf_lf(
-                    src=self.temporal_buffer,
-                    dst=device_pool.mamba_cache.temporal[layer_id],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    layer_id=layer_id,
-                    num_layers=self.num_mamba_layers,
-                    io_backend=io_backend,
-                )
-            for conv_idx in range(len(self.conv_state_shapes)):
-                self._copy_tensor_pf_lf(
-                    src=self.conv_buffer[conv_idx],
-                    dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
-                    src_indices=host_indices,
-                    dst_indices=device_indices,
-                    layer_id=layer_id,
-                    num_layers=self.num_mamba_layers,
-                    io_backend=io_backend,
-                )
+            if io_backend == "kernel_ascend" and transfer_mamba_state is not None:
+                # NPU: transfer all layers at once via dedicated kernel.
+                # layer_id == 0 covers every layer, so later calls must skip.
+                if layer_id == 0:
+                    transfer_mamba_state(
+                        device_buf=device_pool.mamba_cache.temporal,
+                        host_buf=self.temporal_buffer,
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        direction=TransferDirection.H2D,
+                    )
+                    for conv_idx in range(len(self.conv_state_shapes)):
+                        transfer_mamba_state(
+                            device_buf=device_pool.mamba_cache.conv[conv_idx],
+                            host_buf=self.conv_buffer[conv_idx],
+                            device_indices=device_indices,
+                            host_indices=host_indices,
+                            direction=TransferDirection.H2D,
+                        )
+            else:
+                # no ssm state on conv-only models: nothing to transfer
+                if self.temporal_state_elem_size > 0:
+                    self._copy_tensor_pf_lf(
+                        src=self.temporal_buffer,
+                        dst=device_pool.mamba_cache.temporal[layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        num_layers=self.num_mamba_layers,
+                        io_backend=io_backend,
+                    )
+                for conv_idx in range(len(self.conv_state_shapes)):
+                    self._copy_tensor_pf_lf(
+                        src=self.conv_buffer[conv_idx],
+                        dst=device_pool.mamba_cache.conv[conv_idx][layer_id],
+                        src_indices=host_indices,
+                        dst_indices=device_indices,
+                        layer_id=layer_id,
+                        num_layers=self.num_mamba_layers,
+                        io_backend=io_backend,
+                    )
         else:
             self._copy_tensor(
                 self.temporal_buffer[layer_id],
@@ -476,6 +566,17 @@ class MambaPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
+        if torch.distributed.get_rank() == 0:
+            logger.debug(
+                "[%s][L2-BACKUP] slots=%d host_idx_dev=%s dev_idx_dev=%s "
+                "io_backend=%s num_layers=%d",
+                self.__class__.__name__,
+                device_indices.numel(),
+                host_indices.device,
+                device_indices.device,
+                io_backend,
+                self.num_mamba_layers,
+            )
         if self.layout in ["page_first", "page_first_direct"]:
             # no ssm state on conv-only models: a 0-size batched memcpy errors
             if self.temporal_state_elem_size > 0:
@@ -1580,6 +1681,14 @@ class HostPoolGroup:
     @property
     def kv_buffer(self):
         return self.anchor_entry.host_pool.kv_buffer
+
+    @property
+    def v_buffer(self):
+        return getattr(self.anchor_entry.host_pool, "v_buffer", None)
+
+    @property
+    def index_k_buffer(self):
+        return getattr(self.anchor_entry.host_pool, "index_k_buffer", None)
 
     @property
     def size_per_token(self):

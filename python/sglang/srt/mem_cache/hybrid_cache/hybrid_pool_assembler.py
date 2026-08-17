@@ -651,12 +651,21 @@ def build_hybrid_mamba_stack(
             target_device_layer_num=kv_pool.layer_num,
             draft_layer_num=len(mtp_draft_device_pools),
         )
+    # MambaPoolHost only supports page_first_direct; the global layout may be
+    # page_first_kv_split (e.g. MLA + KDA hybrid on NPU). The Mamba/KDA state
+    # pool has no separate K/V buffers, so kv_split does not apply; override
+    # to page_first_direct.
+    mamba_layout = (
+        "page_first_direct"
+        if server_args.hicache_mem_layout == "page_first_kv_split"
+        else server_args.hicache_mem_layout
+    )
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
         server_args.hicache_ratio,
         mamba_host_size,
         allocator_type=_get_allocator_type(server_args),
-        layout=server_args.hicache_mem_layout,
+        layout=mamba_layout,
     )
     entries = [
         build_pool_entry(
@@ -905,6 +914,12 @@ def _build_mha_mla_host_pool(
     pool_label: str,
 ):
     from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    # The global layout is page_first_kv_split only when the target model
+    # uses MLA; that layout is MLA-specific, so MHA draft pools must use
+    # the non-MLA layout (NPU default: page_first_direct).
+    if isinstance(pool, MHATokenToKVPool) and layout == "page_first_kv_split":
+        layout = "page_first_direct"
 
     kwargs = dict(
         host_to_device_ratio=host_to_device_ratio,
@@ -1610,6 +1625,8 @@ def _apply_stack_result(
 ) -> None:
     cache.host_pool_group = result.host_pool_group
     cache.cache_controller = result.cache_controller
+    if result.cache_controller is not None:
+        cache.tree_core.set_hicache_enabled()
 
     for ct, host_pool in result.component_host_pools.items():
         cache_attr, component_attr = _COMPONENT_HOST_ATTR[ct]
