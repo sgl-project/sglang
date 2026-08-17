@@ -1284,7 +1284,7 @@ class KVCacheConfigurator:
         )
 
         indexer_layer_ids = None
-        if is_dsa_model and can_use_compact_npu_dsa_indexer_cache(self.server_args):
+        if is_dsa_model:
             is_nextn = self.is_draft_worker and bool(
                 self.model_config.num_nextn_predict_layers
             )

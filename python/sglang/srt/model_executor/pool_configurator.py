@@ -116,8 +116,6 @@ def _get_npu_dsa_indexer_size_per_token(
 
 
 def _get_npu_dsa_indexer_layer_count(kvc: KVCacheConfigurator, num_layers: int) -> int:
-    if not can_use_compact_npu_dsa_indexer_cache(kvc.server_args):
-        return num_layers
     is_nextn = kvc.is_draft_worker and bool(kvc.model_config.num_nextn_predict_layers)
     return len(
         resolve_dsa_indexer_layer_ids(
