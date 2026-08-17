@@ -26,7 +26,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_MLA_GLUON_ENABLED = get_bool_env_var("SGLANG_AITER_MLA_GLUON", "True")
 _mla_gluon_fn = None
 _mla_gluon_import_failed = False
 _capability_cache: Optional["MlaGluonCapability"] = None
@@ -78,12 +77,16 @@ def _gluon_runtime_ok() -> bool:
     return mla_gluon_available() and _triton_cga_layout_ok()
 
 
+def _mla_gluon_enabled() -> bool:
+    return get_bool_env_var("SGLANG_AITER_MLA_GLUON", "True")
+
+
 def probe_mla_gluon_capability(*, force_refresh: bool = False) -> MlaGluonCapability:
     global _capability_cache
     if _capability_cache is not None and not force_refresh:
         return _capability_cache
 
-    enabled = _MLA_GLUON_ENABLED
+    enabled = _mla_gluon_enabled()
     triton_ver = _triton_version()
     import_ok = mla_gluon_available() if enabled else False
     cga_ok = _triton_cga_layout_ok()
@@ -134,7 +137,7 @@ def _in_cuda_graph_capture() -> bool:
 
 
 def mla_gluon_available() -> bool:
-    if not _MLA_GLUON_ENABLED:
+    if not _mla_gluon_enabled():
         return False
     global _mla_gluon_fn, _mla_gluon_import_failed
     if _mla_gluon_import_failed:
@@ -225,7 +228,7 @@ def mla_gluon_decode(
 
 def prefer_mla_gluon_decode(*, num_head: int, kv_cache_dtype: torch.dtype) -> bool:
     """Route h12 decode through Gluon when FP8 KV and runtime prerequisites hold."""
-    if not _MLA_GLUON_ENABLED:
+    if not _mla_gluon_enabled():
         return False
     if get_bool_env_var("SGLANG_AITER_MLA_GLUON_FORCE", "False"):
         if mla_gluon_available():
