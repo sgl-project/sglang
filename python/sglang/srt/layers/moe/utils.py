@@ -111,6 +111,7 @@ class MoeRunnerBackend(Enum):
     EXPERIMENTAL_SGL_MARLIN = "experimental_sgl_marlin"
     AITER = "aiter"
     HPC_OPS = "hpc_ops"
+    INTEL_XPU = "intel_xpu"
 
     def is_auto(self):
         return self == MoeRunnerBackend.AUTO
@@ -173,6 +174,9 @@ class MoeRunnerBackend(Enum):
 
     def is_aiter(self):
         return self == MoeRunnerBackend.AITER
+
+    def is_intel_xpu(self):
+        return self == MoeRunnerBackend.INTEL_XPU
 
 
 class DeepEPMode(Enum):

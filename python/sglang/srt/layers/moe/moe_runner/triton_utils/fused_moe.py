@@ -28,7 +28,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-from sglang.srt.layers.moe.utils import get_moe_padding_size
+from sglang.srt.layers.moe.utils import get_moe_padding_size, get_moe_runner_backend
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -38,7 +38,6 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_xpu,
-    use_intel_xpu_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -54,7 +53,6 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
-_use_sgl_xpu = use_intel_xpu_backend()
 _is_musa = is_musa()
 
 
@@ -1112,7 +1110,7 @@ def fused_moe(
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
     """
-    if _use_sgl_xpu:
+    if _is_xpu and not get_moe_runner_backend().is_triton():
         topk_weight, topk_ids, _ = topk_output
         from sgl_kernel import fused_experts as sgl_fused_experts
 

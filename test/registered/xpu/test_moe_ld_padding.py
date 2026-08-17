@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.layers.moe.utils import (
     XPU_MOE_LD_PADDING_BYTES,
+    MoeRunnerBackend,
     xpu_moe_ld_padding_elems,
 )
 from sglang.srt.layers.quantization.unquant import _empty_xpu_moe_expert_weight
@@ -60,7 +61,7 @@ class TestXpuMoeLdPadding(CustomTestCase):
         self.assertTrue(unpadded.is_contiguous())
 
     def test_only_pads_weights_that_land_on_xpu(self):
-        # SGLANG_USE_SGL_XPU only says an XPU exists on the machine; the weights
+        # is_xpu() only says an XPU exists on the machine; the weights
         # can still be built for CPU/CUDA. create_weights takes no device
         # argument, so the gate reads the ambient device context. Padding a
         # non-XPU weight would make it non-contiguous for no benefit.
@@ -88,10 +89,12 @@ class TestXpuMoeLdPadding(CustomTestCase):
             return layer.w13_weight, layer.w2_weight
 
         with unittest.mock.patch(
-            "sglang.srt.layers.quantization.unquant.use_intel_xpu_backend",
-            return_value=True,
+            "sglang.srt.layers.quantization.unquant.is_xpu", return_value=True
+        ), unittest.mock.patch(
+            "sglang.srt.layers.quantization.unquant.get_moe_runner_backend",
+            return_value=MoeRunnerBackend.AUTO,
         ):
-            # Env var on but building for CPU -> must stay contiguous.
+            # Backend on but building for CPU -> must stay contiguous.
             w13_cpu, w2_cpu = build("cpu")
             self.assertTrue(w13_cpu.is_contiguous())
             self.assertTrue(w2_cpu.is_contiguous())
@@ -103,10 +106,12 @@ class TestXpuMoeLdPadding(CustomTestCase):
                 w13_triton, _ = build("xpu", use_triton_kernels=True)
                 self.assertTrue(w13_triton.is_contiguous())
 
-        # Backend off entirely -> never padded, even on XPU.
+        # Backend forced to Triton -> never padded, even on XPU.
         with unittest.mock.patch(
-            "sglang.srt.layers.quantization.unquant.use_intel_xpu_backend",
-            return_value=False,
+            "sglang.srt.layers.quantization.unquant.is_xpu", return_value=True
+        ), unittest.mock.patch(
+            "sglang.srt.layers.quantization.unquant.get_moe_runner_backend",
+            return_value=MoeRunnerBackend.TRITON,
         ):
             device = "xpu" if torch.xpu.is_available() else "cpu"
             w13, w2 = build(device)

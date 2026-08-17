@@ -3,7 +3,6 @@ Usage:
 python3 -m unittest test_intel_xpu_backend.TestIntelXPUBackend.test_latency_qwen_model
 """
 
-import os
 import unittest
 from functools import wraps
 
@@ -76,11 +75,12 @@ class TestIntelXPUBackend(CustomTestCase):
             '{"num_hidden_layers": 4}',
             "--decode-attention-backend",
             "intel_xpu",
+            "--moe-runner-backend",
+            "triton",  # FP8 is not yet supported in sgl-kernel
         ],
         min_throughput=32,
     )
     def test_mla_decode_attention_backend(self):
-        os.environ["SGLANG_USE_SGL_XPU"] = "0"  # FP8 is not yet supported in sgl-kernel
         return DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE
 
 

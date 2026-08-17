@@ -269,6 +269,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "experimental_sgl_marlin",
     "hpc_ops",  # HPC-Ops (https://github.com/Tencent/hpc-ops), FP8 MoE on Hopper (SM90) only
     "megamoe",
+    "intel_xpu",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
