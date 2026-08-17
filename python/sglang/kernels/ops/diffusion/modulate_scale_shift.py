@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -72,7 +73,8 @@ def can_use_modulate_scale_shift_cuda(
     x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor
 ) -> bool:
     if (
-        x.dtype not in _SUPPORTED_DTYPES
+        not current_platform.is_cuda()
+        or x.dtype not in _SUPPORTED_DTYPES
         or scale.dtype != x.dtype
         or shift.dtype != x.dtype
         or not (x.is_cuda and scale.is_cuda and shift.is_cuda)

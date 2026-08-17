@@ -3,12 +3,15 @@
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.common import get_compiler_backend
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 
 
 def maybe_enable_inductor_compute_comm_overlap() -> None:
@@ -76,14 +79,14 @@ class CompiledModuleRegistry:
 
     def compile_once(
         self,
-        module: nn.Module,
+        module: "BaseDiT",
         *,
         compile_kwargs: dict[str, object],
     ) -> bool:
         module_id = id(module)
         if module_id in self.module_ids:
             return False
-        module.compile(**compile_kwargs)
+        module.apply_torch_compile(compile_kwargs=compile_kwargs)
         self.module_ids.add(module_id)
         return True
 
