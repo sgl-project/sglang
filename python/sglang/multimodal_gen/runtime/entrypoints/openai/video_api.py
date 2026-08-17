@@ -574,6 +574,8 @@ async def create_video(
     size: Optional[str] = Form(None),
     fps: Optional[int] = Form(None),
     num_frames: Optional[int] = Form(None),
+    width: Optional[int] = Form(None),
+    height: Optional[int] = Form(None),
     seed: Optional[int] = Form(None),
     generator_device: Optional[str] = Form("cuda"),
     negative_prompt: Optional[str] = Form(None),
@@ -700,6 +702,8 @@ async def create_video(
         }
         fps_val = form_value("fps", fps)
         num_frames_val = form_value("num_frames", num_frames)
+        width_val = form_value("width", width)
+        height_val = form_value("height", height)
 
         req = VideoGenerationsRequest(
             prompt=prompt,
@@ -715,6 +719,8 @@ async def create_video(
             size=form_value("size", size),
             fps=fps_val,
             num_frames=num_frames_val,
+            width=width_val,
+            height=height_val,
             seed=form_value("seed", seed),
             generator_device=form_value("generator_device", generator_device),
             negative_prompt=form_text_value("negative_prompt", negative_prompt),
