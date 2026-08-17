@@ -833,6 +833,7 @@ class Envs:
     )
     # Quantize x to int8 in the dispatch operator
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
+    SGLANG_NPU_ENABLE_PIECEWISE_CUDA_GRAPH = EnvBool(False)  # prefill cuda graph on NPU
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
