@@ -18,8 +18,8 @@ from sglang.test.kits.attention_unittest.attention_methods.dense_attention impor
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(

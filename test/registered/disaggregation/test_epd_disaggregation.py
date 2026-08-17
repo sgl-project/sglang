@@ -37,7 +37,7 @@ QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 KIMI_VL_MODEL = "moonshotai/Kimi-VL-A3B-Instruct"
 
 
-register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=211, stage="base-c", runner_config="4-gpu-h100")
 
 
 @unittest.skipIf(

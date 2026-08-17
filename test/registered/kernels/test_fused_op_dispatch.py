@@ -28,7 +28,7 @@ from sglang.kernels.spec import CapabilityRequirement as Cap
 from sglang.kernels.spec import KernelBackend, PlatformInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=60, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
 _CUDA = PlatformInfo(device_type="cuda", cuda_arch_major=9, cuda_arch_minor=0)
 _HIP = PlatformInfo(device_type="hip")

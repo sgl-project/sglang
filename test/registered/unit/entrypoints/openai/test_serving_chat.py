@@ -39,7 +39,7 @@ from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 _DSV4_PREVIEW_ENCODER = 'REASONING_EFFORT_MAX = "preview"\n'
 _DSV4_OFFICIAL_ENCODER = (

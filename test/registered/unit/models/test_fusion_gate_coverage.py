@@ -25,7 +25,7 @@ from sglang.srt.models.registry import ModelRegistry
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=90, suite="base-a-test-cpu")
+register_cpu_ci(est_time=28, suite="base-a-test-cpu")
 
 GATE = "shared_experts_fusion_disable_reason"
 FLAG_READERS = (

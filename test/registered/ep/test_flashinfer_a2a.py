@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=500, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=628, stage="base-c", runner_config="4-gpu-gb300")
 
 # Keep rendezvous ports below the ephemeral range on the 4-GPU GB300 runner.
 NCCL_PORT_BASE = DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 110
