@@ -56,6 +56,10 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
 
 <Deployment config={config} />
 
+<Note>
+  The cells above were validated at ISL 8192 / OSL 1024, concurrency 1.
+</Note>
+
 ### Mamba ratio calculator
 
 <Qwen38MambaRatioCalculator />
@@ -193,10 +197,9 @@ checkpoint's calibration scales automatically.
   with no speculation, 97,280 KV tokens at bf16 against 68,588 at fp32. On 32GB
   cards it also decides whether a config fits at all: EAGLE needs
   `--mem-fraction-static 0.94` at fp32 but 0.92 at bf16. Speed is **not** a
-  one-way trade — the narrower state costs a little draft acceptance, so with
-  speculative decoding fp32 sometimes wins (NVFP4 + EAGLE: 152.9 vs 144.5
-  tok/s/user, accept 2.93 vs 2.92) and sometimes loses (FP8 + EAGLE: 106.3 vs
-  116.1, accept 3.24 vs 3.50); measure both for your quantization. Treat
+  one-way trade — with speculative decoding fp32 sometimes wins (NVFP4 + EAGLE:
+  152.9 vs 144.5 tok/s/user) and sometimes loses (FP8 + EAGLE: 106.3 vs 116.1);
+  measure both for your quantization. Treat
   `bfloat16` as an accuracy gate and validate it for your workload. bf16 state
   requires the Triton linear-attn prefill path (the FlashInfer GDN prefill
   kernels require an fp32 `initial_state`), which is already the SM120 default.
