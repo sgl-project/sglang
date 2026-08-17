@@ -64,6 +64,7 @@ def test_gemma3_uses_srt_siglip_with_stable_backend():
         prefix="vision_tower",
     )
     assert isinstance(model, EncoderTensorParallelMixin)
+    assert not hasattr(model, "_vision_tensor_parallel_group")
 
 
 def test_gemma3_maps_hf_siglip_projection_name():
