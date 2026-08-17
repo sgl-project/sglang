@@ -37,7 +37,7 @@ enum MemberIndex {
 }
 
 /// Measured crossover: SipHash costs more than a few short string comparisons.
-const MEMBER_SCAN_MAX: usize = 8;
+const MEMBER_SCAN_MAX: usize = 4;
 
 impl MemberIndex {
     fn new(worker_ids: &[String]) -> Self {
@@ -264,11 +264,18 @@ fn members(
     worker_ids: &[String],
     member_ids: &MemberIndex,
 ) -> Vec<Arc<Worker>> {
-    workers
-        .iter()
-        .filter(|worker| member_ids.contains(worker_ids, &worker.id.0))
-        .cloned()
-        .collect()
+    match member_ids {
+        MemberIndex::Scan => workers
+            .iter()
+            .filter(|worker| worker_ids.iter().any(|id| id == &worker.id.0))
+            .cloned()
+            .collect(),
+        MemberIndex::Set(ids) => workers
+            .iter()
+            .filter(|worker| ids.contains(&worker.id.0))
+            .cloned()
+            .collect(),
+    }
 }
 
 fn prefill_compatible(spec: &BucketSpec, input_tokens: u64) -> bool {

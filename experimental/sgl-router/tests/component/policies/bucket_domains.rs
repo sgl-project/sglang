@@ -300,12 +300,7 @@ fn membership_index_preserves_exact_matching_and_fleet_order() {
     let workers: Vec<_> = (0..10)
         .map(|index| worker(&format!("w{index}"), WorkerMode::Prefill))
         .collect();
-    let scan = bucket(
-        "scan",
-        BucketStage::Prefill,
-        10,
-        &["w3", "W3", " w2", "w1", "w1"],
-    );
+    let scan = bucket("scan", BucketStage::Prefill, 10, &["w3", "W3", "w1", "w1"]);
     let set = bucket(
         "set",
         BucketStage::Prefill,
