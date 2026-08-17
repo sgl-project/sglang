@@ -1,4 +1,4 @@
-"""WAR read-done event utilities for CUDA graph runners."""
+"""Shared-read-done event utilities for CUDA graph runners."""
 
 import logging
 from typing import Optional
@@ -6,15 +6,15 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
 
 
-def make_war_read_done_event(device_module) -> Optional[torch.cuda.Event]:
-    """Create a persistent external event for CUDA graph capture."""
+def make_external_event(device_module) -> Optional[torch.cuda.Event]:
+    """Create a persistent external event, e.g., for CUDA graph capture."""
     if not is_cuda():
         return None
     try:
@@ -23,7 +23,7 @@ def make_war_read_done_event(device_module) -> Optional[torch.cuda.Event]:
         return None
 
 
-def maybe_publish_prefill_war_read_done(
+def maybe_publish_prefill_shared_read_done(
     model_runner, forward_batch, device_module
 ) -> None:
     """Publish prefill read-done after compliant metadata initialization."""
@@ -36,15 +36,13 @@ def maybe_publish_prefill_war_read_done(
     if not model_runner.spec_algorithm.is_none():
         return
     # The record lands right after replay prep, so PRE_REPLAY only.
-    boundary = model_runner.attn_backend.shared_read_boundary(
-        forward_batch.forward_mode
-    )
-    if boundary is not SharedReadBoundary.PRE_REPLAY:
+    declared = model_runner.attn_backend.shared_read_ends(forward_batch.forward_mode)
+    if declared is not SharedReadEnds.PRE_REPLAY:
         return
     logger.info_once(
-        "Prefill WAR read-done fastpath active (%s)",
+        "Prefill shared-read-done fastpath active (%s)",
         type(model_runner.attn_backend).__name__,
     )
     read_done = device_module.Event()
     read_done.record()
-    model_runner.war_fastpath_read_done_event = read_done
+    model_runner.shared_read_done_event = read_done

@@ -857,6 +857,11 @@ class RuntimeContext:
             self._check_role_namespace(name)
         return bags[name]
 
+    def is_config_namespace_published(self, name: str) -> bool:
+        """Return whether a config namespace exists in the current context."""
+        bags = self._config_bags
+        return bags is not None and name in bags
+
     def _check_role_namespace(self, name: str) -> None:
         # Out of line so the mode gate above stays one dead-branch-prunable
         # check under dynamo in the default "off" mode (config_bag runs inside
