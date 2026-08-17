@@ -1291,12 +1291,20 @@ async fn chat_completions_inner(
     let at_post_dispatch = start.elapsed();
     // The router/engine boundary: unlike every phase above it, this span is not
     // router CPU — it carries the network hop and whatever the engine does
-    // before flushing headers. Recorded for streaming and buffered alike, and
-    // for non-2xx too, so an error-only regression stays visible.
-    ctx.metrics.observe_dispatch(
-        &metrics_model,
-        at_post_dispatch.saturating_sub(at_post_build).as_secs_f64(),
-    );
+    // before flushing headers.
+    //
+    // Only on `Ok`, which is precisely "headers came back". An upstream 4xx/5xx
+    // IS an Ok here and is recorded — a slow error is still a real
+    // header-receipt time. A dispatch that never produced headers (connect
+    // refused, retries exhausted, stale-request expiry) is NOT: its elapsed time
+    // is a give-up latency, and mixing that in would make a fleet outage read as
+    // enormous engine latency in the same histogram.
+    if result.is_ok() {
+        ctx.metrics.observe_dispatch(
+            &metrics_model,
+            at_post_dispatch.saturating_sub(at_post_build).as_secs_f64(),
+        );
+    }
     if PHASE_LOG_COUNTER
         .fetch_add(1, Ordering::Relaxed)
         .is_multiple_of(PHASE_LOG_SAMPLE)

@@ -190,6 +190,43 @@ async fn request_records_every_phase_histogram() {
     }
 }
 
+/// A dispatch that never yields upstream headers records NO
+/// `sgl_router_dispatch_seconds` sample. Its elapsed time is a give-up latency,
+/// not a header-receipt time, and folding the two together would make a fleet
+/// outage read as enormous engine latency in the histogram operators use to
+/// judge the engine. The earlier phases still record — they really did happen.
+#[tokio::test]
+async fn failed_dispatch_records_no_dispatch_sample() {
+    // Port 1 on loopback: nothing listens, so the connect is refused.
+    let ctx = build_ctx("http://127.0.0.1:1".to_string());
+    let status = send(
+        Arc::clone(&ctx),
+        json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hello there friend"}],
+        }),
+    )
+    .await;
+    assert!(
+        !status.is_success(),
+        "a refused upstream must not produce a success status; got {status}"
+    );
+
+    let m = ctx.metrics.render();
+    assert!(
+        !m.contains(&format!(
+            r#"sgl_router_dispatch_seconds_count{{model_id="{MODEL}"}}"#
+        )),
+        "a dispatch that never received headers must not be sampled; got:\n{m}"
+    );
+    assert!(
+        m.contains(&format!(
+            r#"sgl_router_tokenize_seconds_count{{model_id="{MODEL}"}} 1"#
+        )),
+        "phases that did complete must still record; got:\n{m}"
+    );
+}
+
 #[tokio::test]
 async fn tool_request_forwards_input_ids() {
     let mock = MockWorker::start(vec![]).await;

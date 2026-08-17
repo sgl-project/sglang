@@ -1118,11 +1118,24 @@ impl MetricsRegistry {
     /// engine-side queueing, which is what an unexplained TTFT gap between an
     /// external observer and the engine usually turns out to be.
     ///
-    /// Recorded for every request that receives upstream headers, streaming or
-    /// buffered, 2xx or not — deliberately wider than `ttft_overhead_seconds`,
-    /// which is streaming-2xx only, so an error-only regression is still
-    /// visible. Uses [`TTFT_OVERHEAD_BUCKETS`], not [`ROUTER_PHASE_BUCKETS`]:
-    /// under engine saturation this parks for seconds and needs the tall grid.
+    /// Recorded only when headers actually came back, streaming or buffered, and
+    /// for an upstream 4xx/5xx as readily as a 2xx — a slow error is still a real
+    /// header-receipt time. Deliberately wider than `ttft_overhead_seconds`
+    /// (streaming-2xx only), so an error-only regression stays visible. A
+    /// dispatch that never yielded headers — connect refused, retries exhausted,
+    /// stale-request expiry — records nothing: its elapsed time is a give-up
+    /// latency, and mixing it in would make a fleet outage read as enormous
+    /// engine latency. Those failures are counted by
+    /// `sgl_router_retries_exhausted_total` and the response counters.
+    ///
+    /// SPANS RETRIES. The marker sits after the retry loop, so one sample covers
+    /// every attempt plus backoff, not a single connect. That is the honest
+    /// number for TTFT attribution — the client waited for all of it — but it
+    /// means a retried request inflates this histogram's tail. Read it against
+    /// `sgl_router_retries_total` before concluding the engine got slower.
+    ///
+    /// Uses [`TTFT_OVERHEAD_BUCKETS`], not [`ROUTER_PHASE_BUCKETS`]: under engine
+    /// saturation this parks for seconds and needs the tall grid.
     pub fn observe_dispatch(&self, model_id: &str, seconds: f64) {
         // See `observe_request_duration` — drop non-finite before the map.
         if !seconds.is_finite() {
@@ -1660,7 +1673,7 @@ impl MetricsRegistry {
 
         // dispatch histogram
         out.push_str(
-            "# HELP sgl_router_dispatch_seconds Dispatch to upstream response headers (connect, send body, wait), in seconds. NOT router-attributable - contains the network hop and the engine's own queueing before it flushes headers. Recorded for streaming and buffered responses alike.\n",
+            "# HELP sgl_router_dispatch_seconds Dispatch to upstream response headers (connect, send body, wait), in seconds. NOT router-attributable - contains the network hop and the engine's own queueing before it flushes headers. Spans all retry attempts, so read it against sgl_router_retries_total. Recorded only when headers came back (an upstream 4xx/5xx counts; a dispatch that never yielded headers does not).\n",
         );
         out.push_str("# TYPE sgl_router_dispatch_seconds histogram\n");
         let guard = self.dispatch_seconds.lock();
