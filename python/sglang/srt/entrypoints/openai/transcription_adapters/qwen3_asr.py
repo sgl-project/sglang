@@ -72,6 +72,13 @@ class Qwen3ASRAdapter(TranscriptionAdapter):
             return text.split(self.ASR_TEXT_TAG, 1)[-1]
         return text
 
+    def postprocess_streaming_text(self, text: str) -> str | None:
+        # The forced prefix may span several decoder updates. Do not expose it
+        # as transcript text while its <asr_text> delimiter is still incomplete.
+        if self.ASR_TEXT_TAG not in text:
+            return None
+        return self.postprocess_text(text)
+
     def build_verbose_response(
         self,
         request: TranscriptionRequest,

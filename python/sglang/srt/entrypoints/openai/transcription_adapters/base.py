@@ -169,6 +169,13 @@ class TranscriptionAdapter(ABC):
         """
         return text
 
+    def postprocess_streaming_text(self, text: str) -> Optional[str]:
+        """Return the visible text for a partial decoder snapshot.
+
+        ``None`` keeps buffering when a model-specific prefix is incomplete.
+        """
+        return self.postprocess_text(text)
+
     @abstractmethod
     def build_verbose_response(
         self,

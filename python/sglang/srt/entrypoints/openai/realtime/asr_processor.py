@@ -27,7 +27,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from typing import Any, Dict, Optional
+from copy import copy
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 import msgspec
 import numpy as np
@@ -41,6 +42,7 @@ from sglang.srt.entrypoints.openai.realtime.decoder_suffix import (
     MIN_PREFIX_ECHO_WORDS,
     DecoderSuffixState,
     DecoderSuffixUpdate,
+    could_be_decoder_prefix_replay,
     cumulative_handoff_text,
     cumulative_is_suffix_compatible,
     has_no_word_boundaries,
@@ -64,6 +66,8 @@ from sglang.srt.server_args import ServerArgs
 logger = logging.getLogger(__name__)
 
 _MAX_PREFIX_ECHO_WORDS_PER_SECOND = 16
+
+_TranscriptDeltaCallback = Callable[[str], Awaitable[None]]
 
 
 class RealtimeASRState(msgspec.Struct):
@@ -270,6 +274,7 @@ class RealtimeASRProcessor:
         is_last: bool,
         language: Optional[str],
         sampling_params: Dict[str, Any],
+        on_transcript_delta: Optional[_TranscriptDeltaCallback] = None,
     ) -> str:
         """Run one transcription step and return its publishable delta.
 
@@ -294,16 +299,47 @@ class RealtimeASRProcessor:
             state.encoder_window_disabled = True
             step = self._build_transcription_step(state, is_last, language)
 
-        outcome = await self._execute_step(state, step, sampling_params)
+        streamed_delta = ""
+
+        async def publish_delta(candidate: str) -> None:
+            nonlocal streamed_delta
+            candidate = candidate.strip()
+            if not candidate or candidate == streamed_delta:
+                return
+            # Decoder output grows monotonically within one request. If
+            # reconciliation revises an already-published prefix, do not append
+            # conflicting text; the completed request will fail closed below.
+            if not candidate.startswith(streamed_delta):
+                return
+            delta = candidate[len(streamed_delta) :].strip()
+            if not delta:
+                return
+            assert on_transcript_delta is not None
+            await on_transcript_delta(delta)
+            streamed_delta = candidate
+
+        stream_callback = publish_delta if on_transcript_delta is not None else None
+        outcome = await self._execute_step(
+            state, step, sampling_params, stream_callback
+        )
 
         if self._requires_cumulative_retry(state, step, outcome):
             # Nothing was emitted yet; redo this request on the cumulative path.
             state.encoder_window_disabled = True
             step = self._build_transcription_step(state, is_last, language)
-            outcome = await self._execute_step(state, step, sampling_params)
+            outcome = await self._execute_step(
+                state, step, sampling_params, stream_callback
+            )
 
+        remaining_delta = outcome.delta
+        if streamed_delta:
+            if not remaining_delta.startswith(streamed_delta):
+                raise RuntimeError(
+                    "realtime ASR revised an append-only streamed prefix"
+                )
+            remaining_delta = remaining_delta[len(streamed_delta) :].strip()
         self._commit_outcome(state, step, outcome)
-        return outcome.delta
+        return remaining_delta
 
     def flush_pending_transcript(self, state: RealtimeASRState) -> str:
         """Emit text still held back when the item commits without new audio."""
@@ -417,6 +453,7 @@ class RealtimeASRProcessor:
         state: RealtimeASRState,
         step: _TranscriptionStep,
         sampling_params: Dict[str, Any],
+        on_transcript_delta: Optional[_TranscriptDeltaCallback],
     ) -> _TranscriptionOutcome:
         """Execute one step.
 
@@ -425,25 +462,42 @@ class RealtimeASRProcessor:
         can be discarded and retried cumulatively when text boundaries are unsafe.
         """
         if step.uses_encoder_windows:
-            return await self._execute_encoder_window_step(state, step, sampling_params)
-        return await self._execute_cumulative_step(state, step, sampling_params)
+            return await self._execute_encoder_window_step(
+                state, step, sampling_params, on_transcript_delta
+            )
+        return await self._execute_cumulative_step(
+            state, step, sampling_params, on_transcript_delta
+        )
 
     async def _execute_cumulative_step(
         self,
         state: RealtimeASRState,
         step: _TranscriptionStep,
         sampling_params: Dict[str, Any],
+        on_transcript_delta: Optional[_TranscriptDeltaCallback],
     ) -> _TranscriptionOutcome:
         """Re-transcribe accumulated audio and reconcile its cumulative text."""
         samples = await self._snapshot_samples(
             state.audio, step.start_offset_bytes, step.end_offset_bytes
         )
+
+        async def publish_delta(text: str) -> None:
+            assert on_transcript_delta is not None
+            preview_state = copy(state.transcript)
+            delta = apply_cumulative_transcript(preview_state, text, is_last=False)
+            await on_transcript_delta(delta)
+
         generation = await generate_cumulative_transcript(
             tokenizer_manager=self.tokenizer_manager,
             adapter=self.adapter,
             state=state.transcript,
             audio_data=samples,
             sampling_params=sampling_params,
+            on_update=(
+                publish_delta
+                if on_transcript_delta is not None and not step.is_last
+                else None
+            ),
         )
         if generation is None:
             if step.is_last:
@@ -476,6 +530,7 @@ class RealtimeASRProcessor:
         state: RealtimeASRState,
         step: _TranscriptionStep,
         sampling_params: Dict[str, Any],
+        on_transcript_delta: Optional[_TranscriptDeltaCallback],
     ) -> _TranscriptionOutcome:
         """Generate continuation text from encoder-aligned rolling context."""
         policy = self._encoder_window_policy
@@ -486,12 +541,45 @@ class RealtimeASRProcessor:
             state.audio, step.start_offset_bytes, step.end_offset_bytes
         )
 
+        async def publish_delta(text: str) -> None:
+            assert on_transcript_delta is not None
+            if not text:
+                return
+            if could_be_decoder_prefix_replay(text, step.decoder_prefix):
+                return
+            try:
+                preview = self._reconcile_encoder_window_text(state, step, text)
+            except RuntimeError:
+                # A partial token sequence can temporarily be impossible to
+                # reconcile; the completed generation still fails closed.
+                return
+            await on_transcript_delta(preview.delta)
+
         generation = await self._generate_windowed_transcript(
             samples=samples,
             sampling_params=sampling_params,
             prompt=self.adapter.prompt_template + step.decoder_prefix,
             encoder_window_config=policy.geometry,
+            on_update=(
+                publish_delta
+                if on_transcript_delta is not None
+                and not step.is_last
+                and state.encoder_window_active
+                else None
+            ),
         )
+
+        return self._reconcile_encoder_window_text(state, step, generation.text)
+
+    def _reconcile_encoder_window_text(
+        self,
+        state: RealtimeASRState,
+        step: _TranscriptionStep,
+        text: str,
+    ) -> _TranscriptionOutcome:
+        """Reconcile one complete or provisional windowed decoder snapshot."""
+        policy = self._encoder_window_policy
+        assert policy is not None
 
         suffix_state = state.decoder_suffix or DecoderSuffixState(
             emitted_text=state.transcript.emitted_text
@@ -501,7 +589,7 @@ class RealtimeASRProcessor:
         # then the first-window handoff. Reordering these trims can delete a
         # phrase the speaker genuinely repeated.
         text, decoder_prefix_replayed = suffix_state.trim_prefix_echo(
-            generation.text,
+            text,
             step.decoder_prefix,
             # Without pending text there is no anchor to confirm a short replay
             # against, so the request's own prefix is the only evidence — the
@@ -584,6 +672,7 @@ class RealtimeASRProcessor:
         prompt: str,
         *,
         encoder_window_config: AudioEncoderWindowConfig,
+        on_update: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> GeneratedTranscript:
         result = await generate_asr_transcript(
             tokenizer_manager=self.tokenizer_manager,
@@ -592,6 +681,7 @@ class RealtimeASRProcessor:
             sampling_params=sampling_params,
             prompt=prompt,
             audio_encoder_window_config=encoder_window_config,
+            on_update=on_update,
         )
         if result is None:
             raise RuntimeError("realtime ASR request returned no response")

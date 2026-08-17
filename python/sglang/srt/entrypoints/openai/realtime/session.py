@@ -603,6 +603,7 @@ class RealtimeConnection:
                 is_last=is_last,
                 language=self.config.language,
                 sampling_params=self.config.sampling_params,
+                on_transcript_delta=self._emit_transcription_delta,
             )
         except Exception:
             return await self._handle_inference_failure(is_last)
