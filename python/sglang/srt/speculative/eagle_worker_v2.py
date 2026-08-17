@@ -553,7 +553,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"avail mem={after_mem:.2f} GB.",
             )
 
-    def draft(self, batch: ScheduleBatch):
+    def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
             draft_input,
@@ -601,7 +601,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_forward(forward_batch)
                 )
 
-        return build_eagle_verify_input(
+        verify_input = build_eagle_verify_input(
             batch,
             draft_input,
             parent_list,
@@ -615,6 +615,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             tree_mask_mode=self.tree_mask_mode,
             device=self.device,
         )
+        if with_topology:
+            # PP+spec relays the tree so every stage rebuilds the same verify
+            # input; the mask build needs the topology this one was built from.
+            # Returned rather than stashed on self so the caller owns lifetime.
+            return verify_input, parent_list, top_scores_index
+        return verify_input
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -1304,8 +1310,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft"),
                 ):
-                    next_verify_input = self.draft_worker.draft(batch)
+                    next_verify_input, parent_list, top_scores_index = (
+                        self.draft_worker.draft(batch, with_topology=True)
+                    )
                 batch_output.next_verify_chain = next_verify_input.draft_token
+                # The tree shape is data-dependent once topk > 1, so the other
+                # stages cannot re-derive it; relay it alongside the tokens.
+                # clone(): both come out of cuda-graph-owned buffers under
+                # decode replay and would be overwritten before the relay.
+                batch_output.next_verify_parent_list = parent_list.clone()
+                batch_output.next_verify_top_scores_index = top_scores_index.clone()
 
             return batch_output
 

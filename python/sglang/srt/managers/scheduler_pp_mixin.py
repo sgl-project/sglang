@@ -8,6 +8,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import msgspec
 import numpy as np
 import torch
 import torch.distributed
@@ -57,6 +58,19 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
+
+
+class _PPSpecTreeRow(msgspec.Struct):
+    """One request's relayed draft tree: the tokens plus the topology they
+    were arranged by. Held per rid between PP+spec rounds."""
+
+    tokens: torch.Tensor  # [num_draft_tokens], index 0 is the bonus token
+    # parent_list / top_scores_index rows. None until the request has been
+    # drafted for (its first decode after prefill carries zero drafts, which
+    # are rejected whatever tree shape they are hung on); the rebuild then
+    # substitutes chain constants at the width the drafted rows use.
+    parents: Optional[torch.Tensor]
+    top_scores: Optional[torch.Tensor]
 
 
 @dataclass
@@ -1046,8 +1060,13 @@ class SchedulerPPMixin:
             tensor_dict["spec_new_seq_lens"] = result.new_seq_lens
             tensor_dict["spec_bonus_tokens"] = result.next_draft_input.bonus_tokens
             if result.next_verify_chain is not None:
-                # Tail-drafted chain for the next verify round (root = bonus).
+                # Tail-drafted tree for the next verify round (root = bonus),
+                # with the topology its tokens were arranged by.
                 tensor_dict["spec_next_chain"] = result.next_verify_chain
+                tensor_dict["spec_next_parents"] = result.next_verify_parent_list
+                tensor_dict["spec_next_top_scores"] = (
+                    result.next_verify_top_scores_index
+                )
 
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
@@ -1222,6 +1241,16 @@ class SchedulerPPMixin:
                     if "spec_next_chain" in pp_outputs.tensors
                     else None
                 ),
+                parent_list=(
+                    pp_outputs["spec_next_parents"]
+                    if "spec_next_parents" in pp_outputs.tensors
+                    else None
+                ),
+                top_scores_index=(
+                    pp_outputs["spec_next_top_scores"]
+                    if "spec_next_top_scores" in pp_outputs.tensors
+                    else None
+                ),
             )
             output_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -1286,23 +1315,25 @@ class SchedulerPPMixin:
         batch: ScheduleBatch,
         bonus_tokens: torch.Tensor,
         chain_tokens: Optional[torch.Tensor] = None,
+        parent_list: Optional[torch.Tensor] = None,
+        top_scores_index: Optional[torch.Tensor] = None,
     ) -> None:
-        """Stash the per-request chain row (root = bonus token) that seeds the
-        next verify round.
+        """Stash the per-request tree row (root = bonus token) that seeds the
+        next verify round, together with the topology it was arranged by.
 
-        chain_tokens is the last stage's tail-drafted chain (flat bs*dtn);
-        without it (prefill rounds) a degenerate row [bonus, 0, ...] is stored
-        — the zero drafts just get rejected, costing acceptance not
-        correctness. Keyed by rid (not batch position): the microbatch
-        composition can change between rounds (finish / retract / merge)."""
+        chain_tokens is the last stage's tail-drafted tree (flat bs*dtn) and
+        parent_list / top_scores_index its shape; without them (prefill rounds)
+        a degenerate row [bonus, 0, ...] over a chain topology is stored — the
+        zero drafts just get rejected, costing acceptance not correctness.
+        Keyed by rid (not batch position): the microbatch composition can
+        change between rounds (finish / retract / merge)."""
         num_draft_tokens = self.server_args.speculative_num_draft_tokens
+        bs = len(batch.reqs)
         if chain_tokens is not None:
-            rows = chain_tokens.to(torch.int64).reshape(
-                len(batch.reqs), num_draft_tokens
-            )
+            rows = chain_tokens.to(torch.int64).reshape(bs, num_draft_tokens)
         else:
             rows = torch.zeros(
-                (len(batch.reqs), num_draft_tokens),
+                (bs, num_draft_tokens),
                 dtype=torch.int64,
                 device=bonus_tokens.device,
             )
@@ -1315,18 +1346,43 @@ class SchedulerPPMixin:
                 # the entry's lifetime, and when chain_tokens is already
                 # int64 the .to() above is a no-op view of the relay buffer
                 # — a later relay reusing that buffer would corrupt stored
-                # chains (the row root is force-accepted by verify).
-                self._pp_spec_chain_by_rid[req.rid] = rows[i].clone()
+                # rows (the row root is force-accepted by verify).
+                self._pp_spec_chain_by_rid[req.rid] = _PPSpecTreeRow(
+                    tokens=rows[i].clone(),
+                    parents=None if parent_list is None else parent_list[i].clone(),
+                    top_scores=(
+                        None
+                        if top_scores_index is None
+                        else top_scores_index[i].clone()
+                    ),
+                )
+
+    def _pp_spec_chain_topology(
+        self: Scheduler, bs: int, device: str
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """topk=1 chain constants, the shape a prefill round's degenerate row
+        implies. Mirrors _rebuild_topk1_chain_buffers: a single-step chain has
+        no parent entries, and both widths key off num_steps."""
+        num_steps = self.server_args.speculative_num_steps
+        parent_width = num_steps if num_steps > 1 else 0
+        parent_list = torch.arange(
+            -1, parent_width - 1, dtype=torch.long, device=device
+        ).repeat(bs, 1)
+        top_scores_index = torch.arange(
+            num_steps, dtype=torch.long, device=device
+        ).repeat(bs, 1)
+        return parent_list, top_scores_index
 
     def _pp_spec_rebuild_verify_input(self: Scheduler, batch: ScheduleBatch) -> None:
         """Rebuild batch.spec_info (EagleVerifyInput) from relayed per-request
         state, without a draft model.
 
-        Phase 1 (correctness bring-up): degenerate topk=1 chains — the root is
-        the relayed bonus token (always accepted by the verify kernel), padded
-        with zero draft tokens that simply get rejected. Verify is sound for
-        arbitrary proposals, so this costs acceptance rate, not correctness.
-        Phase 2 relays the last stage's tail-drafted real chains instead."""
+        Runs on every stage, including the last one, so all stages verify the
+        exact same tree. The tokens and the topology both come from the last
+        stage's tail draft; a request that has not been drafted for yet (its
+        first decode after prefill) carries a degenerate row -- bonus token
+        plus zero drafts over a chain topology -- whose drafts simply get
+        rejected, costing acceptance rate, not correctness."""
         from sglang.srt.speculative.eagle_info import EagleVerifyInput
         from sglang.srt.speculative.eagle_utils import (
             TreeMaskMode,
@@ -1349,19 +1405,33 @@ class SchedulerPPMixin:
             )
             return
 
-        chain_rows = torch.stack(
-            [self._pp_spec_chain_by_rid[req.rid] for req in batch.reqs]
-        ).to(device=device, dtype=torch.int64)
-        bonus_tokens = chain_rows[:, 0].contiguous()
-        draft_tokens = chain_rows[:, 1:].contiguous()
-        # topk=1 chain constants (mirrors EagleDraftWorker._rebuild_topk1_chain_buffers)
-        parent_width = steps if steps > 1 else 0
-        parent_list = torch.arange(
-            -1, parent_width - 1, dtype=torch.long, device=device
-        ).repeat(bs, 1)
-        top_scores_index = torch.arange(steps, dtype=torch.long, device=device).repeat(
-            bs, 1
+        rows = [self._pp_spec_chain_by_rid[req.rid] for req in batch.reqs]
+        tree_rows = torch.stack([r.tokens for r in rows]).to(
+            device=device, dtype=torch.int64
         )
+        bonus_tokens = tree_rows[:, 0].contiguous()
+        draft_tokens = tree_rows[:, 1:].contiguous()
+        # Topology as drafted on the last stage. It is data-dependent once
+        # topk > 1, so it rides the relay rather than being re-derived here.
+        # Not-yet-drafted rows borrow the drafted rows' widths so the stack is
+        # rectangular; their drafts are zeros and get rejected regardless of
+        # the shape they hang on.
+        drafted = next((r for r in rows if r.parents is not None), None)
+        if drafted is None:
+            parent_list, top_scores_index = self._pp_spec_chain_topology(bs, device)
+        else:
+            chain_parents = torch.arange(
+                -1, drafted.parents.shape[0] - 1, dtype=torch.long, device=device
+            )
+            chain_scores = torch.arange(
+                drafted.top_scores.shape[0], dtype=torch.long, device=device
+            )
+            parent_list = torch.stack(
+                [chain_parents if r.parents is None else r.parents for r in rows]
+            ).to(device=device, dtype=torch.long)
+            top_scores_index = torch.stack(
+                [chain_scores if r.top_scores is None else r.top_scores for r in rows]
+            ).to(device=device, dtype=torch.long)
 
         # Mask selection mirrors the last stage's draft() tail
         # (build_eagle_verify_input) so every stage builds the same mask.
