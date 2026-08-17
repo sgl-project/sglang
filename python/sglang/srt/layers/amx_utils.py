@@ -15,6 +15,7 @@ class CPUQuantMethod(IntEnum):
     INT8_W8A8 = 1
     FP8_W8A16 = 2
     INT4_W4A8 = 3
+    MXFP4 = 4
 
 
 class CPUQuantAlgo(IntEnum):
@@ -96,6 +97,7 @@ def dtype_is_supported(weight):
     return weight.dtype in [
         torch.float16,
         torch.bfloat16,
+        torch.uint8,
         torch.int8,
         torch.float8_e4m3fn,
     ]
@@ -139,6 +141,7 @@ def _amx_process_weight_after_loading(
         device == torch.device("cpu") and cpu_has_amx_support()
     )
 
+    is_conv_weight = False
     if qweight_packed_method is None:
         for i, weight_name in enumerate(weight_names):
             weight_tensor = getattr(module, weight_name)

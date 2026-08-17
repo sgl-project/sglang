@@ -1,3 +1,4 @@
+from dataclasses import replace
 from typing import Literal
 
 import torch
@@ -259,6 +260,50 @@ def _make_custom_masks(
     return masks_by_req, torch.cat(flattened_masks, dim=0)
 
 
+def _make_flashinfer_dflash_swa_builtin_masks(
+    case,
+    *,
+    device: str,
+) -> list[torch.Tensor]:
+    """Mirror FlashInfer DFLASH verify's production no-custom-mask path."""
+    draft_token_num = _check_target_verify_case(case)
+    window = int(case.sliding_window_size)
+    masks_by_req = []
+    q_idx = torch.arange(
+        draft_token_num,
+        dtype=torch.int32,
+        device=device,
+    ).unsqueeze(1)
+    for prefix_len in case.prefix_lens:
+        seq_len = prefix_len + draft_token_num
+        prefix_start = max(0, int(prefix_len) - window)
+        k_idx = torch.arange(seq_len, dtype=torch.int32, device=device).unsqueeze(0)
+        masks_by_req.append((k_idx >= prefix_start) & (k_idx <= prefix_len + q_idx))
+
+    return masks_by_req
+
+
+def _expected_case_and_masks_for_spec_verify(
+    case,
+    *,
+    topk: int,
+    spec_kind: SpecVerifyKind,
+    device: str,
+):
+    if (
+        spec_kind == "dflash"
+        and case.backend == "flashinfer"
+        and getattr(case, "sliding_window_size", None) is not None
+    ):
+        reference_case = replace(case, sliding_window_size=None)
+        return reference_case, _make_flashinfer_dflash_swa_builtin_masks(
+            case, device=device
+        )
+
+    masks_by_req, _ = _make_custom_masks(case, topk=topk, device=device)
+    return case, masks_by_req
+
+
 def _make_retrieve_tensors(
     case,
     *,
@@ -299,6 +344,14 @@ def _make_spec_verify_input(
     if spec_kind == "dflash":
         if topk != 1:
             raise ValueError("DFlash verify is linear and expects topk=1.")
+        if (
+            case.backend == "flashinfer"
+            and getattr(case, "sliding_window_size", None) is not None
+        ):
+            # Production DFLASH disables custom verify masks for FlashInfer
+            # backends. SWA metadata clips the cached prefix; the backend causal
+            # path handles the draft block.
+            custom_mask = None
         return DFlashVerifyInput(
             draft_token=batch.input_ids,
             positions=batch.positions,
@@ -311,7 +364,7 @@ def _make_spec_verify_input(
     if spec_kind == "ngram":
         return NgramVerifyInput(
             draft_token=batch.input_ids,
-            tree_mask=custom_mask,
+            custom_mask=custom_mask,
             positions=batch.positions,
             retrieve_index=retrieve_index,
             retrieve_next_token=retrieve_next_token,
@@ -375,12 +428,18 @@ def _target_verify_expected_output(
     case,
     inputs,
     topk: int,
+    spec_kind: SpecVerifyKind,
     device: str,
 ):
-    masks_by_req, _ = _make_custom_masks(case, topk=topk, device=device)
+    reference_case, masks_by_req = _expected_case_and_masks_for_spec_verify(
+        case,
+        topk=topk,
+        spec_kind=spec_kind,
+        device=device,
+    )
     return reference_fn(
         fixture.reference_module,
-        case,
+        reference_case,
         inputs["prefix_hidden"],
         inputs["input_hidden"],
         masks_by_req,
@@ -457,6 +516,7 @@ def _run_spec_verify_cuda_graph_case(
                 case=spec_case,
                 inputs=inputs,
                 topk=topk,
+                spec_kind=spec_kind,
                 device=device,
             )
         ),
@@ -498,7 +558,12 @@ def run_dense_spec_verify_case(
         device=device,
     )
     _prepare_target_verify_batch(fixture.forward_batch, case, device)
-    masks_by_req, _ = _make_custom_masks(case, topk=topk, device=device)
+    reference_case, masks_by_req = _expected_case_and_masks_for_spec_verify(
+        case,
+        topk=topk,
+        spec_kind=spec_kind,
+        device=device,
+    )
     fixture.forward_batch.spec_info = _make_spec_verify_input(
         case,
         fixture.forward_batch,
@@ -509,7 +574,7 @@ def run_dense_spec_verify_case(
     inputs = dense_fixture_inputs(fixture)
     expected = dense_attention_reference_with_custom_mask(
         fixture.reference_module,
-        case,
+        reference_case,
         inputs["prefix_hidden"],
         inputs["input_hidden"],
         masks_by_req,
@@ -825,6 +890,7 @@ def run_dsv4_eagle_verify_cuda_graph_case(
     dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
     cuda_graph_capture_batch_size: int = 2,
+    force_gpu_only_seq_lens: bool = False,
 ):
     """DSV4 EAGLE target_verify CUDA-graph capture/replay. Chain only —
     `DeepseekV4AttnBackend.__init__` asserts `self.topk in [0, 1]` at
@@ -871,6 +937,11 @@ def run_dsv4_eagle_verify_cuda_graph_case(
         batch.spec_info = _make_eagle_verify_input(
             spec_case, batch, topk=topk, device=device
         )
+        if force_gpu_only_seq_lens:
+            batch.seq_lens_cpu = None
+            batch.seq_lens_sum = None
+            batch.spec_info.seq_lens_cpu = None
+            batch.spec_info.seq_lens_sum = None
 
     def _make_capture_case(base, name, capture_prefix_len: int, bs: int):
         # Capture uses uniform prefixes per request; each request still
@@ -1196,19 +1267,18 @@ def run_mamba2_eagle_verify_case(
     atol: float = MAMBA2_ATOL,
     rtol: float = MAMBA2_RTOL,
 ):
-    """Mamba2 chain verify (eager). Mamba2's SSM kernel processes draft
-    tokens linearly regardless of the spec_info tree mask, so only
-    `topk == 1` is supported here. The EXTEND-style recurrence reference
-    (`_pure_torch_mamba2_reference`) doubles as the chain verify
-    reference across all chain spec kinds (eagle / frozen_kv_mtp /
-    dflash / ngram). Tree verify (topk > 1) is structurally blocked
-    (the kernel doesn't consume the parent-indices plumbing); see
-    `expected_mamba2_verify_output_from_inputs`."""
+    """Mamba2 chain verify (eager). This test's reference
+    (`_pure_torch_mamba2_reference`) is a chain recurrence, so it can only
+    validate `topk == 1`; it doubles as the chain verify reference across
+    all chain spec kinds (eagle / frozen_kv_mtp / dflash / ngram). Tree
+    verify (topk > 1) is skipped only for lack of a tree-aware reference --
+    the production SSM kernel does consume the parent-indices plumbing and
+    supports tree verify. See `expected_mamba2_verify_output_from_inputs`."""
     if topk != 1:
         testcase.skipTest(
-            "Mamba2 tree verify (topk>1) is structurally unsupported — "
-            "the SSM kernel ignores tree masks; only chain (topk=1) is "
-            "exercised. See `expected_mamba2_verify_output_from_inputs`."
+            "Mamba2 tree verify (topk>1) skipped: this test has no tree-aware "
+            "reference. The production kernel supports tree verify. See "
+            "`expected_mamba2_verify_output_from_inputs`."
         )
     fixture = build_mamba2_attention_fixture(
         testcase,

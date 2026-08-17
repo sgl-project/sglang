@@ -21,7 +21,6 @@ from transformers.models.mllama.modeling_mllama import (
 )
 
 import sglang.srt.distributed.parallel_state as ps
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
@@ -43,6 +42,7 @@ from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
 
 
@@ -198,9 +198,16 @@ class MllamaVisionEncoderLayer(nn.Module):
         super().__init__()
 
         self.hidden_size = config.hidden_size
-        self.num_attention_heads = config.attention_heads
+        self.num_attention_heads = (
+            config.original_attention_heads
+            if hasattr(config, "original_attention_heads")
+            else config.attention_heads
+        )
         self.is_gated = is_gated
         self.intermediate_size = config.intermediate_size
+        num_dummy_heads = 0
+        if hasattr(config, "original_attention_heads"):
+            num_dummy_heads = config.attention_heads - config.original_attention_heads
 
         self.self_attn = VisionAttention(
             self.hidden_size,
@@ -210,6 +217,7 @@ class MllamaVisionEncoderLayer(nn.Module):
             quant_config=quant_config,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),
+            num_dummy_heads=num_dummy_heads,
         )
         self.mlp = MllamaVisionMLP(
             config, quant_config, prefix=add_prefix("mlp", prefix)
@@ -310,10 +318,17 @@ class MllamaVisionModel(nn.Module):
 
         self.num_patches = (self.image_size // self.patch_size) ** 2 + 1
         self.scale = config.hidden_size**-0.5
+        out_channels = (
+            config.hidden_size
+            // config.original_attention_heads
+            * config.attention_heads
+            if hasattr(config, "original_attention_heads")
+            else config.hidden_size
+        )
 
         self.patch_embedding = ColumnParallelConv2dPatch(
             in_channels=config.num_channels,
-            out_channels=self.hidden_size,
+            out_channels=out_channels,
             kernel_size=self.patch_size,
             stride=self.patch_size,
             bias=False,
@@ -382,6 +397,10 @@ class MllamaVisionModel(nn.Module):
 
         # tile embeddings
         _, num_patches, dim = hidden_state.shape
+        # slice off the padded part
+        if dim > self.hidden_size:
+            hidden_state = hidden_state[:, :, : self.hidden_size]
+            dim = self.hidden_size
         hidden_state = hidden_state.reshape(
             batch_size * num_concurrent_media, num_tiles, -1, dim
         )
@@ -491,7 +510,7 @@ class MllamaTextCrossAttention(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.model_parallel_size = get_tensor_model_parallel_world_size()
+        self.model_parallel_size = get_parallel().tp_size
         self.num_heads = self.config.num_attention_heads
         self.num_local_heads = self.num_heads // self.model_parallel_size
         self.num_key_value_heads = self.config.num_key_value_heads
@@ -501,6 +520,9 @@ class MllamaTextCrossAttention(nn.Module):
         self.dropout = config.dropout
         self.hidden_size = config.hidden_size
         self.head_dim = config.hidden_size // self.num_heads
+        # Use original head_dim since num_heads might be changed for TP num divisibility
+        if hasattr(config, "head_dim"):
+            self.head_dim = config.head_dim
         self.layer_id = layer_id
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.q_local_size = self.num_local_heads * self.head_dim
@@ -957,7 +979,7 @@ class MllamaForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.runner import get_is_capture_mode
 
         batched_images, batched_ar_ids, batched_ar_mask, encoder_lens_need = (
             self._batch_image_inputs(forward_batch)
@@ -968,9 +990,18 @@ class MllamaForConditionalGeneration(nn.Module):
         cross_attention_states = None
 
         if get_is_capture_mode():
-            # NOTE: when doing cuda graph capture, we do not want to skip cross attention
-            # Make is a constant value to avoid cuda graph capture issue
-            skip_cross_attention = False
+            # NOTE: during graph capture/replay skip_cross_attention must be a
+            # compile-time constant to avoid graph breaks from data-dependent
+            # branching.  CPUGraphRunner captures two graphs per batch size (one
+            # with skip=True, one with skip=False) and sets the override via
+            # capture_with_skip_cross_attention(); fall back to False for CUDA
+            # graph capture which only captures the no-skip variant.
+            from sglang.srt.model_executor.cpu_graph_runner import (
+                get_capture_skip_cross_attention,
+            )
+
+            _override = get_capture_skip_cross_attention()
+            skip_cross_attention = _override if _override is not None else False
         else:
             # NOTE: we do not need image_inputs when prefill
             assert len(forward_batch.encoder_lens) == len(forward_batch.seq_lens)

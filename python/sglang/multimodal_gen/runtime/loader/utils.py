@@ -5,6 +5,7 @@
 
 import contextlib
 import glob
+import json
 import os
 import re
 from collections import defaultdict
@@ -12,6 +13,7 @@ from collections.abc import Callable, Iterator
 from typing import Any, Dict, Type
 
 import torch
+from safetensors.torch import load_file as safetensors_load_file
 from torch import nn
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -179,14 +181,20 @@ class skip_init_modules:
     def __enter__(self):
         # Save originals
         self._orig_reset = {}
-        for cls in (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d):
+        for cls in (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.Embedding):
             self._orig_reset[cls] = cls.reset_parameters
             cls.reset_parameters = lambda self: None  # skip init
+        from transformers.modeling_utils import PreTrainedModel
+
+        self._pretrained_model_cls = PreTrainedModel
+        self._orig_post_init = PreTrainedModel.post_init
+        PreTrainedModel.post_init = lambda self: None
 
     def __exit__(self, exc_type, exc_value, traceback):
         # restore originals
         for cls, orig in self._orig_reset.items():
             cls.reset_parameters = orig
+        self._pretrained_model_cls.post_init = self._orig_post_init
 
 
 def _normalize_component_type(module_type: str) -> str:
@@ -254,8 +262,6 @@ def _list_safetensors_files(model_path: str) -> list[str]:
         str(model_path), "diffusion_pytorch_model.safetensors.index.json"
     )
     if os.path.exists(index_path):
-        import json
-
         with open(index_path) as f:
             index = json.load(f)
         expected_shards = sorted(set(index.get("weight_map", {}).values()))
@@ -276,6 +282,33 @@ def _list_safetensors_files(model_path: str) -> list[str]:
                 )
 
     return found
+
+
+def load_safetensors_state_dict(model_path: str) -> dict[str, torch.Tensor]:
+    """Load one safetensors checkpoint, including an indexed sharded set."""
+    index_path = os.path.join(
+        str(model_path), "diffusion_pytorch_model.safetensors.index.json"
+    )
+    safetensors_files = _list_safetensors_files(model_path)
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            index = json.load(f)
+        shard_names = sorted(set(index.get("weight_map", {}).values()))
+        state_dict: dict[str, torch.Tensor] = {}
+        for shard_name in shard_names:
+            state_dict.update(
+                safetensors_load_file(os.path.join(str(model_path), shard_name))
+            )
+        return state_dict
+
+    if not safetensors_files:
+        raise ValueError(f"No safetensors files found in {model_path}")
+    if len(safetensors_files) != 1:
+        raise ValueError(
+            f"Found {len(safetensors_files)} safetensors files in {model_path} "
+            "and no index to disambiguate them."
+        )
+    return safetensors_load_file(safetensors_files[0])
 
 
 BYTES_PER_GB = 1024**3

@@ -5,9 +5,14 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
+from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionBackend,
+    AttentionImpl,
+    AttentionMetadata,
+    AttentionMetadataBuilder,
+)
 from sglang.multimodal_gen.runtime.layers.utils import register_custom_op
-from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
 )
@@ -286,13 +291,6 @@ def flash_attn_varlen_func_op_lse(
     )
 
 
-from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
-    AttentionBackend,
-    AttentionImpl,
-    AttentionMetadata,
-    AttentionMetadataBuilder,
-)
-
 fa_ver = 3
 
 
@@ -331,6 +329,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder):
 
 
 class FlashAttentionBackend(AttentionBackend):
+
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        return True
+
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -381,10 +384,11 @@ class FlashAttentionImpl(AttentionImpl):
         *,
         return_softmax_lse: bool = False,
     ):
-        attn_metadata: FlashAttentionMetadata = get_forward_context().attn_metadata
-        if attn_metadata is not None and attn_metadata.max_seqlen_q is None:
-            attn_metadata.max_seqlen_q = query.shape[1]
-            attn_metadata.max_seqlen_k = key.shape[1]
+        if attn_metadata is not None:
+            if attn_metadata.max_seqlen_q is None:
+                attn_metadata.max_seqlen_q = query.shape[1]
+            if attn_metadata.max_seqlen_k is None:
+                attn_metadata.max_seqlen_k = key.shape[1]
             max_seqlen_q = attn_metadata.max_seqlen_q
             max_seqlen_k = attn_metadata.max_seqlen_k
         else:
@@ -443,3 +447,28 @@ class FlashAttentionImpl(AttentionImpl):
             return out_tensor
 
         raise ValueError(f"flash attention version {fa_ver} is not supported.")
+
+    def forward_varlen(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        cu_seqlens_host: tuple[int, ...] | None = None,
+    ) -> torch.Tensor:
+        del cu_seqlens_host
+        output = flash_attn_varlen_func(
+            query,
+            key,
+            value,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=self.softmax_scale,
+            causal=self.causal,
+            ver=fa_ver,
+        )
+        return output[0] if isinstance(output, tuple) else output

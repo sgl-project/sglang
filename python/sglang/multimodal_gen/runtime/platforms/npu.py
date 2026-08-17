@@ -84,13 +84,16 @@ class NPUPlatformBase(Platform):
     @classmethod
     def get_available_gpu_memory(
         cls,
-        device_id: int = 0,
+        device_id: int | None = None,
         distributed: bool = False,
         empty_cache: bool = True,
         cpu_group: Any = None,
     ) -> float:
         if empty_cache:
             torch.npu.empty_cache()
+
+        if device_id is None:
+            device_id = torch.npu.current_device()
 
         free_gpu_memory, _ = torch.npu.mem_get_info(device_id)
 
@@ -186,6 +189,6 @@ class NPUPlatformBase(Platform):
         return "sglang.multimodal_gen.runtime.distributed.device_communicators.cuda_communicator.CudaCommunicator"  # noqa
 
     @classmethod
-    def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:
-        """The performance of the layerwise_offload feature depends on the device's memory size and the memory size occupied by the model. Use --dit-layerwise-offload True if it suitable for your case."""
+    def enable_dit_layerwise_offload_by_default(cls) -> bool:
+        """Whether automatic DiT layerwise offload is enabled on this platform."""
         return False

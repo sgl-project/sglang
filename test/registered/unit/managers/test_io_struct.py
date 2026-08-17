@@ -1,7 +1,7 @@
 import copy
 import unittest
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
-register_cpu_ci(est_time=8, suite="base-b-test-cpu")
+register_cpu_ci(est_time=8, suite="base-c-test-cpu")
 
 
 class TestGenerateReqInputNormalization(CustomTestCase):
@@ -164,6 +164,48 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Check text expansion
         self.assertEqual(req.text, expected_text)
 
+    def test_return_hidden_states_expands_with_parallel_sampling(self):
+        req = GenerateReqInput(
+            text=["Prompt 1", "Prompt 2"],
+            sampling_params={"n": 2},
+            return_hidden_states=[False, "last"],
+        )
+
+        req.normalize_batch_and_arguments()
+
+        self.assertEqual(
+            req.return_hidden_states,
+            [False, "last", False, "last"],
+        )
+        self.assertEqual(
+            [req[i].return_hidden_states for i in range(4)],
+            [False, "last", False, "last"],
+        )
+
+    def test_return_hidden_states_batch_length_is_validated(self):
+        req = GenerateReqInput(
+            text=["Prompt 1", "Prompt 2"],
+            return_hidden_states=["last"],
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "return_hidden_states should be equal to the batch size",
+        ):
+            req.normalize_batch_and_arguments()
+
+    def test_return_hidden_states_batch_modes_are_validated(self):
+        req = GenerateReqInput(
+            text=["Prompt 1", "Prompt 2"],
+            return_hidden_states=[False, "invalid"],
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "return_hidden_states must be a boolean or the string literal 'last'",
+        ):
+            req.normalize_batch_and_arguments()
+
     def test_mixed_none_and_images_with_parallel_samples(self):
         """Test that when some batch items have images and others None, parallel expansion works correctly."""
         req = copy.deepcopy(self.base_req)
@@ -263,6 +305,40 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Modalities should be set for all 3 examples
         self.assertEqual(req.modalities, ["image", "image", "image"])
 
+    def test_parallel_sampling_preserves_reasoning_controls(self):
+        single = GenerateReqInput(
+            text="Hello",
+            rid="single",
+            sampling_params={"n": 3},
+            require_reasoning=True,
+            max_thinking_tokens=128,
+        )
+        single.normalize_batch_and_arguments()
+
+        self.assertEqual(single.rid, ["single_0", "single_1", "single_2"])
+        self.assertEqual(
+            [single[i].rid for i in range(3)],
+            ["single_0", "single_1", "single_2"],
+        )
+        self.assertTrue(all(single[i].require_reasoning for i in range(3)))
+        self.assertEqual(
+            [single[i].max_thinking_tokens for i in range(3)],
+            [128] * 3,
+        )
+
+        batch = GenerateReqInput(
+            text=["Hello", "World"],
+            rid="batch",
+            sampling_params={"n": 2},
+        )
+        batch.normalize_batch_and_arguments()
+
+        self.assertEqual(batch.rid, ["batch_0", "batch_1", "batch_2", "batch_3"])
+        self.assertEqual(
+            [batch[i].rid for i in range(4)],
+            ["batch_0", "batch_1", "batch_2", "batch_3"],
+        )
+
     def test_audio_data_handling(self):
         """Test handling of audio_data."""
         req = copy.deepcopy(self.base_req)
@@ -359,33 +435,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         with self.assertRaises(ValueError):
             req.normalize_batch_and_arguments()
 
-    def test_input_embeds_single_to_batch_conversion(self):
-        """Test that single input_embeds are properly converted to batch when using parallel sampling."""
-        # Test the specific case that was fixed: single input_embeds with n > 1
-        req = GenerateReqInput(
-            input_embeds=[[0.1, 0.2, 0.3]], sampling_params={"n": 2}  # Single embedding
-        )
-        req.normalize_batch_and_arguments()
-
-        # Should convert single to batch and then expand
-        self.assertFalse(req.is_single)
-        self.assertEqual(len(req.input_embeds), 2)
-
-        # Both should be the same single embedding
-        self.assertEqual(req.input_embeds[0], [[0.1, 0.2, 0.3]])
-        self.assertEqual(req.input_embeds[1], [[0.1, 0.2, 0.3]])
-
-        # Test with higher n value
-        req = GenerateReqInput(input_embeds=[[0.1, 0.2, 0.3]], sampling_params={"n": 5})
-        req.normalize_batch_and_arguments()
-
-        self.assertFalse(req.is_single)
-        self.assertEqual(len(req.input_embeds), 5)
-
-        # All should be the same
-        for i in range(5):
-            self.assertEqual(req.input_embeds[i], [[0.1, 0.2, 0.3]])
-
     def test_lora_path_normalization(self):
         """Test normalization of lora_path."""
         # Test single lora_path with batch input
@@ -418,6 +467,104 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         req.normalize_batch_and_arguments()
         self.assertEqual(req.lora_path, expected_lora_paths)
+
+    def test_extra_key_normalization(self):
+        """Test normalization of extra_key."""
+        # Per-request list
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            extra_key=["tenant-A", "tenant-B"],
+            sampling_params=[{}, {}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, ["tenant-A", "tenant-B"])
+        self.assertEqual(req[0].extra_key, "tenant-A")
+        self.assertEqual(req[1].extra_key, "tenant-B")
+
+        # Scalar broadcast
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            extra_key="shared",
+            sampling_params=[{}, {}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, ["shared", "shared"])
+
+        # None stays None
+        req = GenerateReqInput(text=["Hello", "World"], sampling_params=[{}, {}])
+        req.normalize_batch_and_arguments()
+        self.assertIsNone(req.extra_key)
+        self.assertIsNone(req[0].extra_key)
+
+        # Parallel sampling expansion
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            extra_key=["tenant-A", "tenant-B"],
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, ["tenant-A", "tenant-B"] * 2)
+
+        # Wrong-length list
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            extra_key=["only-one"],
+            sampling_params=[{}, {}],
+        )
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            req.normalize_batch_and_arguments()
+
+        # Non-batched scalar unchanged
+        req = GenerateReqInput(text="Hello", extra_key="solo")
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.extra_key, "solo")
+
+    def test_cache_salt_normalization(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_salt=["tenant-A", ""],
+            sampling_params=[{}, {}],
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.cache_salt, ["tenant-A", None])
+        self.assertEqual(req[0].cache_salt, "tenant-A")
+        self.assertIsNone(req[1].cache_salt)
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_salt="shared",
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.cache_salt, ["shared", "shared"] * 2)
+
+        req = GenerateReqInput(text="Hello", cache_salt="")
+        req.normalize_batch_and_arguments()
+        self.assertIsNone(req.cache_salt)
+
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            cache_salt=["only-one"],
+            sampling_params=[{}, {}],
+        )
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            req.normalize_batch_and_arguments()
+
+    def test_cache_key_normalization_rejects_invalid_types(self):
+        for field_name in ("extra_key", "cache_salt"):
+            with self.subTest(field_name=field_name, mode="single"):
+                req = GenerateReqInput(text="Hello", **{field_name: ["value"]})
+                with self.assertRaisesRegex(ValueError, "single request"):
+                    req.normalize_batch_and_arguments()
+
+            with self.subTest(field_name=field_name, mode="batch"):
+                req = GenerateReqInput(
+                    text=["Hello", "World"],
+                    sampling_params=[{}, {}],
+                    **{field_name: ["value", 1]},
+                )
+                with self.assertRaisesRegex(ValueError, "should be a string"):
+                    req.normalize_batch_and_arguments()
 
     def test_logprob_parameters_normalization(self):
         """Test normalization of logprob-related parameters."""
@@ -456,14 +603,14 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             logprob_start_len=[10, 5],
             top_logprobs_num=[5, 3],
             token_ids_logprob=[[7, 8, 9], [4, 5, 6]],
-            return_hidden_states=[False, False, True],
+            return_hidden_states=[False, True],
         )
         req.normalize_batch_and_arguments()
         self.assertEqual(req.return_logprob, [True, False])
         self.assertEqual(req.logprob_start_len, [10, 5])
         self.assertEqual(req.top_logprobs_num, [5, 3])
         self.assertEqual(req.token_ids_logprob, [[7, 8, 9], [4, 5, 6]])
-        self.assertEqual(req.return_hidden_states, [False, False, True])
+        self.assertEqual(req.return_hidden_states, [False, True])
 
     def test_custom_logit_processor_normalization(self):
         """Test normalization of custom_logit_processor."""
@@ -500,6 +647,24 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req.normalize_batch_and_arguments()
         self.assertEqual(req.session_params, [{"id": "session1"}, {"id": "session2"}])
 
+    def test_session_id_handling(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            session_id="session1",
+            sampling_params={"n": 2},
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.session_id, "session1")
+        self.assertIsNone(req.session_params)
+        self.assertEqual(req[2].session_id, "session1")
+
+        with self.assertRaisesRegex(ValueError, "cannot both be set"):
+            GenerateReqInput(
+                text="Hello",
+                session_id="explicit",
+                session_params={"id": "legacy"},
+            ).normalize_batch_and_arguments()
+
     def test_getitem_method(self):
         """Test the __getitem__ method."""
         req = GenerateReqInput(
@@ -517,7 +682,7 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             modalities=["image", "image"],
             lora_path=["path1", "path2"],
             custom_logit_processor=["processor1", "processor2"],
-            return_hidden_states=True,
+            return_hidden_states=[True, "last"],
         )
         req.normalize_batch_and_arguments()
 
@@ -538,6 +703,20 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(item0.lora_path, "path1")
         self.assertEqual(item0.custom_logit_processor, "processor1")
         self.assertEqual(item0.return_hidden_states, True)
+        self.assertEqual(req[1].return_hidden_states, "last")
+
+    def test_getitem_preserves_return_prompt_token_ids(self):
+        """Batch subrequests must keep the prompt-token-id return flag."""
+        req = GenerateReqInput(
+            input_ids=[[1, 2, 3], [4, 5, 6]],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            return_prompt_token_ids=True,
+        )
+        req.normalize_batch_and_arguments()
+
+        self.assertTrue(req[0].return_prompt_token_ids)
+        self.assertTrue(req[1].return_prompt_token_ids)
 
     def test_regenerate_rid(self):
         """Test the regenerate_rid method."""
@@ -564,22 +743,82 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             )
             req.normalize_batch_and_arguments()
 
-    def test_multiple_input_formats(self):
-        """Test different combinations of input formats."""
-        # Test with text only
-        req = GenerateReqInput(text="Hello")
+    def test_data_parallel_rank_alias_maps_to_routed_dp_rank(self):
+        req = GenerateReqInput(text="Hello", sampling_params={}, data_parallel_rank=2)
         req.normalize_batch_and_arguments()
-        self.assertTrue(req.is_single)
+        self.assertEqual(req.routed_dp_rank, 2)
+        self.assertIsNone(req.data_parallel_rank)
 
-        # Test with input_ids only
-        req = GenerateReqInput(input_ids=[1, 2, 3])
+    def test_data_parallel_rank_alias_does_not_override_routed_dp_rank(self):
+        req = GenerateReqInput(
+            text="Hello", sampling_params={}, data_parallel_rank=2, routed_dp_rank=1
+        )
         req.normalize_batch_and_arguments()
-        self.assertTrue(req.is_single)
+        self.assertEqual(req.routed_dp_rank, 1)
 
-        # Test with input_embeds only
-        req = GenerateReqInput(input_embeds=[[0.1, 0.2]])
+    def test_data_parallel_rank_alias_propagates_to_batch_items(self):
+        req = GenerateReqInput(
+            text=["Hello", "World"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            data_parallel_rank=3,
+        )
         req.normalize_batch_and_arguments()
-        self.assertTrue(req.is_single)
+        self.assertEqual(req[0].routed_dp_rank, 3)
+        self.assertEqual(req[1].routed_dp_rank, 3)
+
+
+class TestEmbeddingReqInputGetItem(CustomTestCase):
+    """Test EmbeddingReqInput.__getitem__."""
+
+    def test_priority_is_preserved(self):
+        """Priority must survive the batch split, in both __getitem__ branches."""
+        req = EmbeddingReqInput(text=["Hello", "World"], priority=7)
+        req.normalize_batch_and_arguments()
+        self.assertEqual([req[0].priority, req[1].priority], [7, 7])
+
+        cross_encoder_req = EmbeddingReqInput(
+            text=[["query 1", "doc 1"], ["query 2", "doc 2"]],
+            is_cross_encoder_request=True,
+            priority=3,
+        )
+        cross_encoder_req.normalize_batch_and_arguments()
+        self.assertEqual(
+            [cross_encoder_req[0].priority, cross_encoder_req[1].priority], [3, 3]
+        )
+
+    def test_lora_identity_survives_batch_split(self):
+        """Each embedding subrequest must retain its adapter path and resolved ID."""
+        cases = (
+            (["Hello", "World"], False),
+            (
+                [["query 1", "document 1"], ["query 2", "document 2"]],
+                True,
+            ),
+        )
+        for text, is_cross_encoder_request in cases:
+            with self.subTest(cross_encoder=is_cross_encoder_request):
+                req = EmbeddingReqInput(
+                    text=text,
+                    is_cross_encoder_request=is_cross_encoder_request,
+                    lora_path="adapter",
+                    lora_id=["id-0", "id-1"],
+                )
+                req.normalize_batch_and_arguments()
+
+                self.assertEqual(req.lora_path, ["adapter", "adapter"])
+                self.assertEqual(
+                    [(req[i].lora_path, req[i].lora_id) for i in range(2)],
+                    [("adapter", "id-0"), ("adapter", "id-1")],
+                )
+
+    def test_lora_path_count_must_match_embedding_batch(self):
+        """A partial adapter list must not silently route remaining items to base."""
+        req = EmbeddingReqInput(
+            text=["first", "second"], lora_path=["only-one-adapter"]
+        )
+        with self.assertRaisesRegex(ValueError, "must match batch size"):
+            req.normalize_batch_and_arguments()
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
@@ -21,6 +21,20 @@ logger = logging.get_logger(__name__)
 def _first_not_none(*candidates: Any) -> Any:
     """First non-None candidate. Unlike `a or b`, preserves falsy values."""
     return next((c for c in candidates if c is not None), None)
+
+
+def normalize_gating(value: Any) -> Literal["per-head", "per-element", "disabled"]:
+    if value in (True, "per-head"):
+        return "per-head"
+    if value == "per-element":
+        return "per-element"
+    if value in (False, None, "disabled"):
+        return "disabled"
+    raise ValueError(
+        "gating must be one of True, False, None, "
+        '"per-head", "per-element", or "disabled"; '
+        f"got {value!r}."
+    )
 
 
 def _to_sglang_rope_scaling(rope_params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -52,8 +66,18 @@ def _to_sglang_rope_scaling(rope_params: Dict[str, Any]) -> Optional[Dict[str, A
         if key in rope_params:
             out[key] = rope_params[key]
     if "attention_factor" in rope_params:
-        # HF spells it attention_factor; SGLang's factory reads attn_factor.
-        out["attn_factor"] = rope_params["attention_factor"]
+        # attention_factor is the final YaRN mscale; SGLang multiplies attn_factor
+        # onto its own default, so divide that out to avoid squaring the scale.
+        # Drop mscale/mscale_all_dim so the embedding uses that simple default as
+        # its base (yarn.py picks the mscale/mscale_all_dim ratio when both are set).
+        from sglang.srt.layers.rotary_embedding.yarn import yarn_get_mscale_simple
+
+        out.pop("mscale", None)
+        out.pop("mscale_all_dim", None)
+        factor = float(rope_params.get("factor", 1.0) or 1.0)
+        out["attn_factor"] = rope_params["attention_factor"] / yarn_get_mscale_simple(
+            factor
+        )
     return out
 
 
@@ -78,6 +102,7 @@ class LagunaConfig(PretrainedConfig):
         tie_word_embeddings: bool = False,
         attention_bias: bool = False,
         attention_dropout: float = 0.0,
+        gating: bool | str = True,
         sliding_window: int = 512,
         layer_types: Optional[List[str]] = None,
         mlp_layer_types: Optional[List[str]] = None,
@@ -120,6 +145,7 @@ class LagunaConfig(PretrainedConfig):
         self.use_cache = use_cache
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
+        self.gating = normalize_gating(gating)
         self.sliding_window = sliding_window
 
         self.num_experts = num_experts
@@ -135,10 +161,7 @@ class LagunaConfig(PretrainedConfig):
         self.layer_types = (
             list(layer_types)
             if layer_types
-            else [
-                "full_attention" if i % 4 == 0 else "sliding_attention"
-                for i in range(num_hidden_layers)
-            ]
+            else ["full_attention" for _ in range(num_hidden_layers)]
         )
         self.mlp_layer_types = (
             list(mlp_layer_types)
@@ -150,14 +173,23 @@ class LagunaConfig(PretrainedConfig):
             if (num_attention_heads_per_layer)
             else [num_attention_heads] * num_hidden_layers
         )
+        if len(self.num_attention_heads_per_layer) != num_hidden_layers:
+            raise ValueError(
+                "num_attention_heads_per_layer must have one entry per layer: "
+                f"expected num_hidden_layers={num_hidden_layers}, "
+                f"got {len(self.num_attention_heads_per_layer)}."
+            )
 
         # SGLang's hybrid-SWA core reads `swa_*` KV/head_dim from hf_text_config.
         # Per-layer Q-head count is read directly from num_attention_heads_per_layer.
-        # Pure-SWA models would have no full_attention layer, but the synthesized
-        # default above always plants one at index 0; let .index() raise if a
-        # caller passes an all-sliding layer_types — silent fallback would wire
-        # the SWA head count into a "full" attribute and corrupt downstream sizes.
-        full_idx = self.layer_types.index("full_attention")
+        # DFlash draft configs can be all-SWA. In that case there is no full
+        # layer geometry to expose, so use layer 0 for the default attention
+        # fields and keep per-layer Q-head geometry explicit.
+        full_idx = (
+            self.layer_types.index("full_attention")
+            if "full_attention" in self.layer_types
+            else 0
+        )
         self.num_attention_heads = self.num_attention_heads_per_layer[full_idx]
         self.swa_num_key_value_heads = num_key_value_heads
         self.swa_head_dim = head_dim
@@ -165,8 +197,9 @@ class LagunaConfig(PretrainedConfig):
 
         # Released checkpoint nests rope_parameters under layer-type keys.
         rp = rope_parameters if isinstance(rope_parameters, dict) else {}
-        full_rp = rp.get("full_attention") or {}
+        has_full_attention = "full_attention" in self.layer_types
         swa_rp = rp.get("sliding_attention") or {}
+        full_rp = rp.get("full_attention") or (swa_rp if not has_full_attention else {})
 
         # transformers v5 aliases `rope_scaling` ↔ `rope_parameters` on
         # PretrainedConfig — writing one clobbers the other. Keep the nested

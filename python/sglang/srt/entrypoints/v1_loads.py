@@ -18,33 +18,37 @@ This module provides the /v1/loads endpoint which returns detailed scheduler
 metrics for load balancing, monitoring, and capacity planning.
 """
 
-import dataclasses
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
-from sglang.srt.managers.io_struct import (
-    DisaggregationMetrics,
-    GetLoadsReqOutput,
-    LoRAMetrics,
-    MemoryMetrics,
-    QueueMetrics,
-    SpeculativeMetrics,
-)
+from sglang.srt.utils import get_device_name
 from sglang.version import __version__
 
 router = APIRouter()
 
-_OPTIONAL_METRIC_SECTIONS = {
-    "memory": ("memory", MemoryMetrics),
-    "speculative": ("spec", SpeculativeMetrics),
-    "lora": ("lora", LoRAMetrics),
-    "disaggregation": ("disagg", DisaggregationMetrics),
-    "queues": ("queues", QueueMetrics),
-}
+
+@lru_cache(maxsize=1)
+def _accelerator_name() -> Optional[str]:
+    """Accelerator marketing name (e.g. "NVIDIA GB300"), None if unavailable."""
+    return get_device_name()
+
+
+@lru_cache(maxsize=1)
+def _num_accelerators_per_dp_rank(
+    tp_size: int,
+    pp_size: int,
+    dp_size: int,
+    enable_dp_attention: bool,
+) -> int:
+    num_accelerators = tp_size * pp_size
+    if enable_dp_attention:
+        num_accelerators //= dp_size
+    return num_accelerators
 
 
 def _get_tokenizer_manager():
@@ -54,77 +58,31 @@ def _get_tokenizer_manager():
     return get_global_state().tokenizer_manager
 
 
-def _loads_dict_factory(items):
-    """Factory for dataclasses.asdict() that excludes None values and timestamp."""
-    return {k: v for k, v in items if v is not None and k != "timestamp"}
+def _format_loads_prometheus(load_results, include=None) -> Response:
+    """Format load metrics in Prometheus text exposition format."""
+    section_prefixes = {"speculative": "spec", "disaggregation": "disagg"}
+    metric_samples = {}
 
+    for load in load_results:
+        load_dict = load.to_dict(include)
+        dp_rank = load_dict.pop("dp_rank")
 
-def _compute_aggregate(load_dicts: list) -> dict:
-    """Compute aggregate metrics from load dicts."""
-    if not load_dicts:
-        return {
-            "total_running_reqs": 0,
-            "total_waiting_reqs": 0,
-            "total_reqs": 0,
-            "total_used_tokens": 0,
-            "total_tokens": 0,
-            "avg_token_usage": 0.0,
-            "avg_throughput": 0.0,
-            "avg_utilization": 0.0,
-        }
+        for key, value in load_dict.items():
+            if isinstance(value, dict):
+                prefix = section_prefixes.get(key, key)
+                for sub_key, sub_value in value.items():
+                    if isinstance(sub_value, (int, float)):
+                        metric_samples.setdefault(
+                            f"sglang_{prefix}_{sub_key}", []
+                        ).append((dp_rank, sub_value))
+            elif isinstance(value, (int, float)):
+                metric_samples.setdefault(f"sglang_{key}", []).append((dp_rank, value))
 
-    n = len(load_dicts)
-    return {
-        "total_running_reqs": sum(d["num_running_reqs"] for d in load_dicts),
-        "total_waiting_reqs": sum(d["num_waiting_reqs"] for d in load_dicts),
-        "total_reqs": sum(
-            d["num_running_reqs"] + d["num_waiting_reqs"] for d in load_dicts
-        ),
-        "total_used_tokens": sum(d["num_used_tokens"] for d in load_dicts),
-        "total_tokens": sum(d["num_total_tokens"] for d in load_dicts),
-        "avg_token_usage": round(sum(d["token_usage"] for d in load_dicts) / n, 4),
-        "avg_throughput": round(sum(d["gen_throughput"] for d in load_dicts) / n, 2),
-        "avg_utilization": round(sum(d["utilization"] for d in load_dicts) / n, 4),
-    }
-
-
-def _format_loads_prometheus(load_results) -> Response:
-    """Format load metrics in Prometheus text exposition format.
-
-    Metrics are derived from dataclass field metadata, providing a single source of truth.
-    """
     lines = []
-
-    for f in dataclasses.fields(GetLoadsReqOutput):
-        if "metric" not in f.metadata:
-            continue
-        metric_type, description = f.metadata["metric"]
-        metric_name = f"sglang_{f.name}"
-        lines.append(f"# HELP {metric_name} {description}")
-        lines.append(f"# TYPE {metric_name} {metric_type}")
-        for load in load_results:
-            value = getattr(load, f.name, None)
-            if value is not None:
-                lines.append(f'{metric_name}{{dp_rank="{load.dp_rank}"}} {value}')
-
-    for attr_name, (prefix, dataclass_type) in _OPTIONAL_METRIC_SECTIONS.items():
-        if not any(getattr(load, attr_name, None) for load in load_results):
-            continue
-        for f in dataclasses.fields(dataclass_type):
-            if "metric" not in f.metadata:
-                continue
-            metric_type, description = f.metadata["metric"]
-            metric_name = f"sglang_{prefix}_{f.name}"
-            lines.append(f"# HELP {metric_name} {description}")
-            lines.append(f"# TYPE {metric_name} {metric_type}")
-            for load in load_results:
-                section = getattr(load, attr_name, None)
-                if section:
-                    value = getattr(section, f.name, None)
-                    if value is not None:
-                        lines.append(
-                            f'{metric_name}{{dp_rank="{load.dp_rank}"}} {value}'
-                        )
+    for metric_name, samples in metric_samples.items():
+        lines.append(f"# TYPE {metric_name} gauge")
+        for dp_rank, value in samples:
+            lines.append(f'{metric_name}{{dp_rank="{dp_rank}"}} {value}')
 
     return Response(
         content="\n".join(lines) + "\n",
@@ -150,7 +108,8 @@ async def get_loads(
         format: Response format - 'json' (default) or 'prometheus'
 
     Returns:
-        JSON response with timestamp, version, dp_rank_count, per-DP-rank loads, and aggregates
+        JSON response with timestamp, version, accelerator metadata, and
+        per-DP-rank loads
     """
     include_list = [s.strip() for s in include.split(",")] if include else None
 
@@ -169,19 +128,25 @@ async def get_loads(
                 time.perf_counter() - start
             )
 
+    include_set = set(include_list) if include_list else None
+
     if format == "prometheus":
-        return _format_loads_prometheus(load_results)
+        return _format_loads_prometheus(load_results, include_set)
 
     loads = []
     for load in load_results:
-        d = dataclasses.asdict(load, dict_factory=_loads_dict_factory)
-        d["num_total_reqs"] = d["num_running_reqs"] + d["num_waiting_reqs"]
+        d = load.to_dict(include_set)
         loads.append(d)
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "version": __version__,
-        "dp_rank_count": len(loads),
+        "accelerator": _accelerator_name(),
+        "num_accelerators": _num_accelerators_per_dp_rank(
+            tokenizer_manager.server_args.tp_size,
+            tokenizer_manager.server_args.pp_size,
+            tokenizer_manager.server_args.dp_size,
+            tokenizer_manager.server_args.enable_dp_attention,
+        ),
         "loads": loads,
-        "aggregate": _compute_aggregate(loads),
     }

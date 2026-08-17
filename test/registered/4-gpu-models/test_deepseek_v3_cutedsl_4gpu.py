@@ -7,6 +7,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST,
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -14,7 +15,10 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb200")
+register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb300")
+
+# Keep rendezvous ports below the ephemeral range on the 4-GPU GB300 runner.
+NCCL_PORT_BASE = DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 100
 
 
 class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
@@ -42,6 +46,8 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
             "--moe-dense-tp-size",
             "1",
             "--enable-dp-attention",
+            "--nccl-port",
+            str(NCCL_PORT_BASE),
             "--quantization",
             "modelopt_fp4",
             "--attention-backend",
@@ -114,6 +120,8 @@ class TestDummyWithSBO(CustomTestCase):
             "--moe-dense-tp-size",
             "1",
             "--enable-dp-attention",
+            "--nccl-port",
+            str(NCCL_PORT_BASE + 1),
             "--quantization",
             "modelopt_fp4",
             "--attention-backend",
@@ -141,6 +149,17 @@ class TestDummyWithSBO(CustomTestCase):
                 **os.environ,
                 "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
                 "SGLANG_MOE_NVFP4_DISPATCH": "0",
+                # Dummy random weights legitimately produce NaN logits; turn
+                # off the CI crash machinery (async assert, coredump on GPU
+                # exception, crash-time coredump) so NaN is sanitized with a
+                # warning instead of killing the scheduler.
+                "SGLANG_ENABLE_ASYNC_ASSERT": "0",
+                "SGLANG_SANITIZE_NAN_LOGITS": "1",
+                "SGLANG_CUDA_COREDUMP": "0",
+                # Already injected into os.environ by the test process when
+                # SGLANG_CUDA_COREDUMP=1, so it must be overridden explicitly.
+                "CUDA_ENABLE_COREDUMP_ON_EXCEPTION": "0",
+                "SGLANG_CUDA_COREDUMP_BEFORE_CRASH": "0",
             },
         )
 

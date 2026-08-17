@@ -1,14 +1,8 @@
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
@@ -32,6 +26,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_mla_split_op_extend_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
@@ -336,8 +331,24 @@ class TestTritonMLAAttentionBackendCorrectness(CustomTestCase):
 
     def test_runner_mode_eagle_draft_extend_v2_cuda_graph_cases(self):
         for case in self.DRAFT_EXTEND_V2_CUDA_GRAPH_CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                run_mla_draft_extend_v2_cuda_graph_case(self, case)
+            for pad_style in ("small_real", "prod_fill"):
+                for capture_bs in (
+                    case.batch_size,
+                    case.batch_size * 2,
+                    case.batch_size * 4,
+                ):
+                    with self.subTest(
+                        case=case.name,
+                        backend=case.backend,
+                        pad_style=pad_style,
+                        capture_bs=capture_bs,
+                    ):
+                        run_mla_draft_extend_v2_cuda_graph_case(
+                            self,
+                            case,
+                            cuda_graph_capture_batch_size=capture_bs,
+                            pad_style=pad_style,
+                        )
 
     def test_runner_mode_eagle_draft_extend_v2_cuda_graph_runner_cases(self):
         for case in self.EAGLE_DRAFT_EXTEND_V2_RUNNER_CASES:

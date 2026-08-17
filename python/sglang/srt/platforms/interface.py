@@ -10,7 +10,14 @@ Out-of-tree platforms register via setuptools entry_points under the
 "sglang.srt.platforms" group and should subclass SRTPlatform.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional, Type
+
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 # Re-export for convenience
 __all__ = ["SRTPlatform", "PlatformEnum"]
@@ -80,6 +87,14 @@ class SRTPlatform(DeviceMixin):
         """Return the piecewise compilation backend class for this platform."""
         raise NotImplementedError
 
+    def get_quantization_config(
+        self, quantization: str
+    ) -> Optional[Type[QuantizationConfig]]:
+        """Return hardware-specific quantization config for the specific
+        quantization scheme, raise an error if not supported or return None
+        to use the default config."""
+        return None
+
     # ------------------------------------------------------------------
     # Capability flags (safe conservative defaults)
     # ------------------------------------------------------------------
@@ -87,10 +102,6 @@ class SRTPlatform(DeviceMixin):
     def supports_fp8(self) -> bool:
         """Whether this platform supports FP8 quantization."""
         return False
-
-    def is_pin_memory_available(self) -> bool:
-        """Whether pinned memory is available on this platform."""
-        return True
 
     def support_cuda_graph(self) -> bool:
         """Whether this platform supports device graph capture and replay.
@@ -116,13 +127,16 @@ class SRTPlatform(DeviceMixin):
         pass
 
     # ------------------------------------------------------------------
-    # MultiPlatformOp integration
+    # BaseFusedOp integration
     # ------------------------------------------------------------------
 
     def get_dispatch_key_name(self) -> str:
-        """Return the dispatch key name for MultiPlatformOp.
+        """Return the dispatch key name for BaseFusedOp
+        (``sglang.kernels.fused_op``).
 
-        Determines which ``forward_<key>()`` method is selected.
-        E.g. "cuda", "npu", "hip", "xpu", "cpu".
+        Determines which ``forward_<key>()`` method is selected on an
+        out-of-tree platform. E.g. "cuda", "npu", "hip", "xpu", "cpu".
+        Forwards registered via ``BaseFusedOp.register_oot_forward`` with
+        this key take precedence over the method lookup.
         """
         return "native"

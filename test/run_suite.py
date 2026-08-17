@@ -21,8 +21,10 @@ HW_MAPPING = {
     "cpu": HWBackend.CPU,
     "cuda": HWBackend.CUDA,
     "amd": HWBackend.AMD,
+    "musa": HWBackend.MUSA,
     "npu": HWBackend.NPU,
     "xpu": HWBackend.XPU,
+    "mlx": HWBackend.MLX,
 }
 
 # Per-commit test suites (run on every PR).
@@ -30,7 +32,12 @@ HW_MAPPING = {
 # (label-gated; pr-test-extra.yml). Tests are tagged per-commit regardless;
 # pr-test-extra.yml's `run-ci-extra` PR label decides whether extra-* dispatches.
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["base-a-test-cpu", "base-b-test-cpu"],
+    HWBackend.CPU: [
+        "base-a-test-cpu",
+        "base-b-test-cpu",
+        "base-c-test-cpu",
+        "base-b-test-cpu-arm64",
+    ],
     HWBackend.AMD: [
         "stage-a-test-1-gpu-small-amd",
         "stage-b-test-1-gpu-small-amd",
@@ -40,29 +47,44 @@ PER_COMMIT_SUITES = {
         "stage-b-test-1-gpu-large-amd",
         "stage-b-test-2-gpu-large-amd",
         "jit-kernel-unit-test-amd",
+        "jit-kernel-benchmark-test-amd",
+        "sgl-kernel-unit-test-2-gpu-amd",
         "stage-c-test-4-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
+        # extra-a: label-gated PR opt-in suites in pr-test-amd-extra.yml
+        # (mirror of CUDA extra-a; tests stay tagged per-commit but only
+        # dispatch when the PR carries the `run-ci-extra` label). 1-gpu-small
+        # carries the mock-model / kv_canary unit + single-GPU canary e2e
+        # tests; 1-gpu-large carries the subset of model e2e tests validated
+        # to pass on mi325 (quant fp8kv-triton, sessions streaming-session
+        # EAGLE3, spec standalone triton-backend variant); 2-gpu-large carries
+        # the multi-GPU (TP/PP/PD) mock-model + kv_canary e2e tests. The rest
+        # of CUDA extra-a tests fail on ROCm (missing flash_attn.cute/flash_ops
+        # kernels, OOM, or accuracy regressions — e.g. gemma4-mtp-31b dips
+        # below the gsm8k floor on the topk=3 leg) and stay CUDA-only for now.
+        "extra-a-test-1-gpu-small-amd",
+        "extra-a-test-1-gpu-large-amd",
+        "extra-a-test-2-gpu-large-amd",
     ],
+    HWBackend.MUSA: [],
     HWBackend.CUDA: [
         "base-a-test-1-gpu-small",
         "base-b-test-1-gpu-small",
         "base-b-test-1-gpu-large",
         "base-b-test-2-gpu-large",
         "base-b-test-4-gpu-b200",
-        "base-b-kernel-unit-1-gpu-large",
-        "base-b-kernel-unit-1-gpu-b200",
-        "base-b-kernel-unit-8-gpu-h200",
-        "base-b-kernel-benchmark-1-gpu-large",
+        "base-b-kernel-unit-test-1-gpu-large",
+        "base-b-kernel-unit-test-4-gpu-b200",
+        "base-b-kernel-unit-test-8-gpu-h200",
+        "base-b-kernel-benchmark-test-1-gpu-large",
         "base-c-test-4-gpu-h100",
         "base-c-test-4-gpu-b200",
-        "base-c-test-4-gpu-gb200",
+        "base-c-test-4-gpu-gb300",
         "base-c-test-8-gpu-h20",
         "base-c-test-8-gpu-h200",
         "base-c-test-8-gpu-b200",
-        "base-c-test-deepep-4-gpu-h100",
-        "base-c-test-deepep-4-gpu-b200",
-        "base-c-test-deepep-8-gpu-h200",
+        "base-c-test-8-gpu-b300",
         # extra-a / extra-b: label-gated PR opt-in suites in pr-test-extra.yml
         # (tests still tagged per-commit but skipped on default PR runs).
         "extra-a-test-1-gpu-small",
@@ -71,56 +93,65 @@ PER_COMMIT_SUITES = {
         "extra-b-test-4-gpu-h100",
         "extra-b-test-4-gpu-b200",
         "extra-b-test-8-gpu-h200",
-        "extra-b-test-deepep-4-gpu-b200",
-        "extra-b-test-deepep-8-gpu-h200",
     ],
     HWBackend.NPU: [
-        "base-a-test-1-gpu-small",
-        "stage-b-test-1-npu-a2",
-        "stage-b-test-2-npu-a2",
-        "stage-b-test-4-npu-a3",
-        "stage-b-test-16-npu-a3",
+        "base-a-test-1-npu-a2",
+        "base-b-test-1-npu-a3",
+        "base-b-test-2-npu-a3",
+        "base-b-test-4-npu-a3",
+        "base-b-test-8-npu-a3",
+        "base-b-test-16-npu-a3",
+        "base-c-test-acc-2-npu-a3",
+        "base-c-test-acc-4-npu-a3",
+        "base-c-test-acc-8-npu-a3",
+        "base-c-test-acc-16-npu-a3",
+        "base-c-test-perf-2-npu-a3",
+        "base-c-test-perf-4-npu-a3",
+        "base-c-test-perf-8-npu-a3",
+        "base-c-test-perf-16-npu-a3",
     ],
     HWBackend.XPU: [
         "stage-a-test-1-gpu-xpu",
         "stage-b-test-1-gpu-xpu",
+    ],
+    HWBackend.MLX: [
+        "stage-a-unit-test-mlx",
+        "stage-b-e2e-mlx",
     ],
 }
 
 # Nightly test suites (run nightly, organized by GPU configuration)
 NIGHTLY_SUITES = {
     HWBackend.CUDA: [
-        "nightly-1-gpu",
-        "nightly-2-gpu",
-        "nightly-4-gpu",
-        "nightly-4-gpu-b200",
-        "nightly-8-gpu",
-        "nightly-8-gpu-h200",
-        "nightly-8-gpu-h20",
-        "nightly-8-gpu-b200",
-        "nightly-8-gpu-h200-basic",  # Basic tests for large models on H200
-        "nightly-8-gpu-b200-basic",  # Basic tests for large models on B200
-        "nightly-8-gpu-common",  # Common tests that run on both H200 and B200
-        "nightly-kernel-1-gpu",
-        "nightly-kernel-8-gpu-h200",
-        # Eval and perf suites (2-gpu)
-        "nightly-eval-text-2-gpu",
-        "nightly-eval-vlm-2-gpu",
-        "nightly-perf-text-2-gpu",
-        "nightly-perf-vlm-2-gpu",
-        # GB300 (4x B200 NVL4) nightly suite
-        "nightly-4-gpu-gb300",
+        # `stage="nightly"` + a runner_config, same `{stage}-test-{runner_config}`
+        # shape as the per-commit suites. No `nightly=True`: the stage name
+        # carries the cadence; only the legacy suites below still need the flag.
+        "nightly-test-1-gpu-large",
+        "nightly-test-2-gpu-large",
+        "nightly-test-4-gpu-h100",
+        "nightly-test-4-gpu-b200",
+        "nightly-test-4-gpu-gb300",
+        "nightly-test-8-gpu-h200",
+        "nightly-test-8-gpu-b200",
     ],
     HWBackend.AMD: [
         "nightly-amd",
         "nightly-amd-1-gpu",
+        "nightly-amd-kernel-1-gpu",
         "nightly-amd-1-gpu-mi35x",
         "nightly-amd-1-gpu-zimage-turbo",
+        "nightly-amd-2-gpu-mi35x-deepseek-r1-mxfp4-tp2",
+        "nightly-amd-8-gpu-mi35x-deepseek-r1-mxfp4-tp4",
+        "nightly-amd-accuracy-8-gpu-mi35x-kimi-k3",
         "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
+        "nightly-amd-8-gpu-mi35x-deepseek-v4-flash",
         # MI35x 8-GPU suite (different model configs)
         "nightly-amd-8-gpu-mi35x",
+    ],
+    HWBackend.MUSA: [
+        "nightly-musa-1-gpu",
     ],
     HWBackend.CPU: [],
     HWBackend.NPU: [
@@ -135,7 +166,11 @@ NIGHTLY_SUITES = {
         "full-8-npu-a3",
         "full-16-npu-a3",
     ],
-    HWBackend.XPU: [],
+    HWBackend.XPU: [
+        "nightly-xpu-1-gpu",
+        "nightly-xpu-2-gpu",
+        "nightly-xpu-4-gpu",
+    ],
 }
 
 
@@ -145,12 +180,20 @@ OTHER_SUITES = {
     ],
     HWBackend.CUDA: [
         "stress",
-        "weekly-8-gpu-h200",
+        # `stage="weekly"` -- same shape. The three dicts group names for
+        # readability only; validation reads their union.
+        "weekly-test-8-gpu-h200",
     ],
 }
 
 
-_SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU, HWBackend.XPU}
+_SUITE_CHECKED_BACKENDS = {
+    HWBackend.CUDA,
+    HWBackend.CPU,
+    HWBackend.MUSA,
+    HWBackend.XPU,
+    HWBackend.MLX,
+}
 
 
 def _valid_suites_by_backend() -> dict:
@@ -189,14 +232,10 @@ def filter_tests(
         if t.backend == hw and t.effective_suite == suite and t.nightly == nightly
     ]
 
-    valid_suites = (
-        NIGHTLY_SUITES.get(hw, []) if nightly else PER_COMMIT_SUITES.get(hw, [])
-    )
-
-    if suite not in valid_suites:
-        print(
-            f"Warning: Unknown suite {suite} for backend {hw.name}, nightly={nightly}"
-        )
+    # Union of all three dicts, not just the per-commit or nightly half:
+    # CUDA nightly suites are selected by name alone, without --nightly.
+    if suite not in _valid_suites_by_backend().get(hw, set()):
+        print(f"Warning: Unknown suite {suite} for backend {hw.name}")
 
     enabled_tests = [t for t in ci_tests if t.disabled is None]
     skipped_tests = [t for t in ci_tests if t.disabled is not None]
@@ -302,19 +341,10 @@ def run_a_suite(args):
         for f in glob.glob(
             os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
         )
-        if not f.endswith("/conftest.py")
-        and not f.endswith("/__init__.py")
-        and not f.endswith("/cpu/utils.py")
+        # conftest.py / __init__.py are pytest+package structure, never
+        # registered tests, and must not be executed as one.
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
     ]
-
-    # JIT kernel tests and benchmarks (live alongside kernel source)
-    jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
-    files += glob.glob(
-        os.path.join(jit_kernel_dir, "tests", "**", "test_*.py"), recursive=True
-    )
-    files += glob.glob(
-        os.path.join(jit_kernel_dir, "benchmark", "**", "bench_*.py"), recursive=True
-    )
 
     # Strict: all discovered files must have proper registration
     sanity_check = True
@@ -350,9 +380,11 @@ def run_a_suite(args):
 
     pretty_print_tests(args, ci_tests, skipped_tests)
 
+    # None hands the per-file budget over to est_time (see run_unittest_files).
+    timeout = None if args.timeout_from_est_time else args.timeout_per_file
+
     # Add extra timeout when retry is enabled
-    timeout = args.timeout_per_file
-    if args.enable_retry:
+    if timeout is not None and args.enable_retry:
         timeout += args.retry_timeout_increase
 
     return run_unittest_files(
@@ -380,13 +412,24 @@ def main():
     parser.add_argument(
         "--nightly",
         action="store_true",
-        help="Run nightly tests instead of per-commit tests.",
+        help=(
+            "Include tests registered with nightly=True (AMD/CPU/NPU). CUDA "
+            "scheduled suites are selected by name and take no flag."
+        ),
     )
     parser.add_argument(
         "--timeout-per-file",
         type=int,
         default=1200,
         help="The time limit for running one file in seconds (default: 1200).",
+    )
+    parser.add_argument(
+        "--timeout-from-est-time",
+        action="store_true",
+        help=(
+            "Derive each file's time limit from its own est_time instead of "
+            "the flat --timeout-per-file, for suites mixing fast and slow tests."
+        ),
     )
     parser.add_argument(
         "--continue-on-error",

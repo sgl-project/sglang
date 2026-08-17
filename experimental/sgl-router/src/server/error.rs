@@ -144,6 +144,13 @@ impl ApiError {
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         }
     }
+
+    /// The HTTP status this error maps to — same value the client receives via
+    /// `into_response`. Exposed so the access log records the real status
+    /// (e.g. 502/503/504) instead of a sentinel.
+    pub fn status_code(&self) -> StatusCode {
+        self.status_and_code().0
+    }
 }
 
 #[derive(Serialize)]

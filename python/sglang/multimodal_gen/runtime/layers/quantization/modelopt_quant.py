@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
@@ -20,11 +21,12 @@ from sglang.multimodal_gen.runtime.models.parameter import (
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
+    normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
     pad_nvfp4_activation_for_cutlass,
@@ -187,7 +189,11 @@ class ModelOptFp8Config(ModelOptQuantConfig):
         return 89
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "ModelOptFp8Config":
+    def from_config(
+        cls,
+        config: Dict[str, Any],
+        ignore_remap: Optional[Dict[str, str]] = None,
+    ) -> ModelOptFp8Config:
         quant_method = config.get("quant_algo")
         exclude_modules = config.get("ignore")
         if quant_method is None:
@@ -204,6 +210,9 @@ class ModelOptFp8Config(ModelOptQuantConfig):
             raise ValueError(
                 "ModelOptFp8Config only supports static FP8 quantization in SGLang diffusion."
             )
+
+        if ignore_remap and exclude_modules:
+            exclude_modules = [ignore_remap.get(p, p) for p in exclude_modules]
 
         return cls(
             is_checkpoint_fp8_serialized=True,
@@ -404,8 +413,25 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # ROCm gfx942 (MI300X/MI325X) uses e4m3fnuz as its native fp8 dtype, so
+        # scaled_fp8_quant() produces e4m3fnuz activations. ModelOpt checkpoints
+        # ship e4m3fn weights. hipBLASLt rejects the resulting e4m3fn x e4m3fnuz
+        # torch._scaled_mm with HIPBLAS_STATUS_NOT_SUPPORTED. Reinterpreting the
+        # weights as e4m3fnuz and doubling the static scales is numerically
+        # identical and keeps the GEMM on the native fp8 path.
+        weight = layer.weight
+        if is_fp8_fnuz():
+            weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+            )
+            copy_or_rebind_param(layer, "weight_scale", weight_scale)
+            if input_scale is not None:
+                copy_or_rebind_param(layer, "input_scale", input_scale)
+
         max_w_scale, quantized_weight = requantize_with_max_scale(
-            layer.weight, layer.weight_scale, layer.logical_widths
+            weight, layer.weight_scale, layer.logical_widths
         )
         # Preserve the parameter subclass metadata while rebinding to the
         # transposed FP8 view expected by the runtime.
@@ -630,7 +656,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         fp4_quantize = _get_fp4_quantize_op()
         if fp4_quantize is None:
             raise RuntimeError(
-                "No FP4 quantization kernel available. Install flashinfer or sgl_kernel."
+                "No FP4 quantization kernel available. Install flashinfer."
             )
 
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
@@ -645,29 +671,17 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if w_scale_interleaved.dtype == torch.uint8:
             w_scale_interleaved = w_scale_interleaved.view(torch.float8_e4m3fn)
         fp4_gemm, flashinfer_backend = _get_fp4_gemm_op()
-        if flashinfer_backend is not None:
-            out = fp4_gemm(
-                x_fp4,
-                w.T,
-                x_scale_interleaved,
-                w_scale_interleaved.T,
-                layer.alpha,
-                output_dtype,
-                backend=flashinfer_backend,
-            )
-        elif fp4_gemm is not None:
-            out = fp4_gemm(
-                x_fp4,
-                w,
-                x_scale_interleaved,
-                w_scale_interleaved,
-                layer.alpha,
-                output_dtype,
-            )
-        else:
-            raise RuntimeError(
-                "No FP4 GEMM kernel available. Install flashinfer or sgl_kernel."
-            )
+        if fp4_gemm is None:
+            raise RuntimeError("No FP4 GEMM kernel available. Install flashinfer.")
+        out = fp4_gemm(
+            x_fp4,
+            w.T,
+            x_scale_interleaved,
+            w_scale_interleaved.T,
+            layer.alpha,
+            output_dtype,
+            backend=flashinfer_backend,
+        )
 
         out = slice_nvfp4_output(out, output_size)
 

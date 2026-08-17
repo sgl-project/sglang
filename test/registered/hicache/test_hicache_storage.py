@@ -3,6 +3,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=99, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
 
+import subprocess
 import time
 import unittest
 
@@ -20,8 +21,8 @@ _is_hip = is_hip()
 
 
 class TestHiCache(CustomTestCase, MMLUMixin):
-    mmlu_score_threshold = 0.65
-    mmlu_num_examples = 64
+    mmlu_score_threshold = 0.64
+    mmlu_num_examples = 256
     mmlu_num_threads = 32
 
     @classmethod
@@ -47,6 +48,14 @@ class TestHiCache(CustomTestCase, MMLUMixin):
 
     @classmethod
     def tearDownClass(cls):
+        # Graceful stop first so the server unregisters its large pinned host KV
+        # pool in userspace; a bare SIGKILL leaves the kernel to unpin it during
+        # reclaim, holding GPU memory long enough to fail the next test.
+        cls.process.terminate()
+        try:
+            cls.process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
         kill_process_tree(cls.process.pid)
         time.sleep(5)
 

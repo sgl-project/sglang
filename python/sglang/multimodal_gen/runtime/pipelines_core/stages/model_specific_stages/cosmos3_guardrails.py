@@ -4,10 +4,14 @@
 Text and video safety checks via the ``cosmos_guardrail`` package.
 Install with: pip install cosmos-guardrail==0.3.1
 
-Enabled by default; opt out with ``SGLANG_DISABLE_COSMOS3_GUARDRAILS=1``.
+Enabled by default when available; opt out with
+``SGLANG_DISABLE_COSMOS3_GUARDRAILS=1``.
 """
 
 from __future__ import annotations
+
+import importlib.util
+from functools import lru_cache
 
 import numpy as np
 import torch
@@ -23,6 +27,11 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 _checker = None
+
+
+@lru_cache(maxsize=1)
+def is_cosmos_guardrail_available() -> bool:
+    return importlib.util.find_spec("cosmos_guardrail") is not None
 
 
 def _init_guardrails(offload_to_cpu: bool = False) -> None:
@@ -91,6 +100,8 @@ class Cosmos3TextGuardrailStage(PipelineStage):
         _init_guardrails(offload_to_cpu)
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        if batch.use_guardrails is False:
+            return batch
         prompt = batch.prompt
         if prompt is None:
             return batch

@@ -163,6 +163,11 @@ impl Proxy {
     /// `active_requests` counter and the per-request active-load entry alive
     /// for the full streaming lifetime — without which a long-running SSE
     /// response would under-report load.
+    // Each parameter is a distinct, required input to a single upstream
+    // forward (target, breaker, path, headers, body, plus the two
+    // streaming-lifetime callbacks). Bundling them into a struct purely to
+    // satisfy the arg-count heuristic would add indirection without clarity.
+    #[allow(clippy::too_many_arguments)]
     pub async fn forward_streaming_to(
         &self,
         worker_url: &str,
@@ -171,6 +176,7 @@ impl Proxy {
         headers: &HeaderMap,
         body: Bytes,
         stream_guards: Option<Box<dyn Send + 'static>>,
+        on_first_byte: Option<Box<dyn FnOnce() + Send + 'static>>,
     ) -> Result<Response<Body>, ApiError> {
         if !breaker.allow() {
             return Err(ApiError::BreakerOpen {
@@ -225,7 +231,20 @@ impl Proxy {
                     }
                 }))
             };
-        let body = sse::bytes_stream_to_body(resp.bytes_stream(), stream_guards, on_complete);
+        // Only record TTFT for successful streams — a 4xx/5xx error body
+        // streaming back is not a generated token, so drop the hook for
+        // non-2xx responses.
+        let first_byte_hook = if status.is_success() {
+            on_first_byte
+        } else {
+            None
+        };
+        let body = sse::bytes_stream_to_body(
+            resp.bytes_stream(),
+            stream_guards,
+            on_complete,
+            first_byte_hook,
+        );
         let mut out = Response::new(body);
         *out.status_mut() = status;
         out.headers_mut().insert(

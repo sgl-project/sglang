@@ -1,17 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 import uuid
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Dict,
-    List,
-    Optional,
-    Tuple,
-)
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
 
@@ -21,6 +15,7 @@ from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
+    ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     ClearHiCacheReqInput,
@@ -39,8 +34,6 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadsReqInput,
-    GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -64,6 +57,7 @@ from sglang.srt.managers.io_struct import (
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
@@ -79,8 +73,13 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.server_args import LoRARef, ServerArgs
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import (
+    get_bool_env_var,
+    normalize_serialized_named_tensor_payloads,
+)
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
@@ -119,9 +118,30 @@ _COMMUNICATOR_SPECS = [
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
-    ("get_loads", GetLoadsReqOutput, "watching"),
     ("dumper_control", DumperControlReqOutput),
+    ("scale_elastic_ep", ScaleElasticEPReqOutput),
 ]
+
+
+def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOutput:
+    """Merge the per-rank replies of a LoRA load/unload fan-out into one result.
+
+    The operation succeeded only if every rank succeeded. Reporting a partial
+    failure as success would let the tokenizer-side LoRA registry drift from
+    the ranks that failed, so failures win: their deduplicated error messages
+    are joined, and loaded_adapters reflects the first failed rank.
+    """
+    failed = [r for r in results if not r.success]
+    if not failed:
+        return results[0]
+    error_messages = list(
+        dict.fromkeys(r.error_message for r in failed if r.error_message)
+    )
+    return LoRAUpdateOutput(
+        success=False,
+        error_message=" | ".join(error_messages),
+        loaded_adapters=failed[0].loaded_adapters,
+    )
 
 
 class TokenizerControlMixin:
@@ -135,10 +155,31 @@ class TokenizerControlMixin:
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
-            comm = FanOutCommunicator(self.send_to_scheduler, server_args.dp_size, mode)
+            comm = FanOutCommunicator(
+                self._dispatch_to_scheduler,
+                server_args.dp_size,
+                mode,
+            )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
+
+    def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
+        primary_group_control = (
+            self.server_args.enable_dp_attention
+            and not self.server_args.enable_dp_attention_local_control_broadcast
+        )
+        if primary_group_control:
+            control_fan_out = (
+                worker_count + self.server_args.tp_size - 1
+            ) // self.server_args.tp_size
+        else:
+            control_fan_out = worker_count
+
+        for spec in _COMMUNICATOR_SPECS:
+            getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
+
+        self.get_internal_state_communicator.set_fan_out(control_fan_out)
 
     async def add_external_corpus(
         self: TokenizerManager, obj: AddExternalCorpusReqInput
@@ -256,9 +297,12 @@ class TokenizerControlMixin:
         self: TokenizerManager, timeout_s: Optional[float] = None
     ) -> FlushCacheReqOutput:
         self.auto_create_handle_loop()
-        return (
+        result = (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+        if result.success and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
+        return result
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""
@@ -291,17 +335,18 @@ class TokenizerControlMixin:
         # TODO: partial rollback if failed
         if all_success:
             # Keep tokenizer side server_info consistent with scheduler side.
-            self.server_args.hicache_storage_backend = hicache_storage_backend
+            hicache_fields = {"hicache_storage_backend": hicache_storage_backend}
             if hicache_storage_backend_extra_config_json is not None:
-                self.server_args.hicache_storage_backend_extra_config = (
+                hicache_fields["hicache_storage_backend_extra_config"] = (
                     hicache_storage_backend_extra_config_json
                 )
             if hicache_storage_prefetch_policy is not None:
-                self.server_args.hicache_storage_prefetch_policy = (
+                hicache_fields["hicache_storage_prefetch_policy"] = (
                     hicache_storage_prefetch_policy
                 )
             if hicache_write_policy is not None:
-                self.server_args.hicache_write_policy = hicache_write_policy
+                hicache_fields["hicache_write_policy"] = hicache_write_policy
+            self.record_config_updates("tokenizer.attach_hicache", **hicache_fields)
         return out
 
     async def detach_hicache_storage(
@@ -317,49 +362,34 @@ class TokenizerControlMixin:
         out = DetachHiCacheStorageReqOutput(success=all_success, message=all_message)
         # TODO: partial rollback if failed
         if all_success:
-            self.server_args.hicache_storage_backend = None
-            self.server_args.hicache_storage_backend_extra_config = None
+            self.record_config_updates(
+                "tokenizer.detach_hicache",
+                hicache_storage_backend=None,
+                hicache_storage_backend_extra_config=None,
+            )
         return out
 
     async def start_profile(
         self: TokenizerManager,
-        output_dir: Optional[str] = None,
-        start_step: Optional[int] = None,
-        num_steps: Optional[int] = None,
-        activities: Optional[List[str]] = None,
-        with_stack: Optional[bool] = None,
-        record_shapes: Optional[bool] = None,
-        profile_by_stage: bool = False,
-        merge_profiles: bool = False,
-        profile_prefix: Optional[str] = None,
-        profile_stages: Optional[List[str]] = None,
+        req: Optional[ProfileReq] = None,
     ):
         self.auto_create_handle_loop()
+        req = req or ProfileReq()
+        req.req_type = ProfileReqType.START_PROFILE
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
-        with_stack = False if with_stack is False or env_with_stack is False else True
+        req.with_stack = (
+            False if req.with_stack is False or env_with_stack is False else True
+        )
         env_record_shapes: bool = get_bool_env_var(
             "SGLANG_PROFILE_RECORD_SHAPES", "true"
         )
-        record_shapes = (record_shapes is not False) and env_record_shapes
-        req = ProfileReq(
-            type=ProfileReqType.START_PROFILE,
-            output_dir=output_dir,
-            start_step=start_step,
-            num_steps=num_steps,
-            activities=activities,
-            with_stack=with_stack,
-            record_shapes=record_shapes,
-            profile_by_stage=profile_by_stage,
-            profile_id=str(time.time()),
-            merge_profiles=merge_profiles,
-            profile_prefix=profile_prefix,
-            profile_stages=profile_stages,
-        )
+        req.record_shapes = (req.record_shapes is not False) and env_record_shapes
+        req.profile_id = req.profile_id or str(time.time())
         return await self._execute_profile(req)
 
     async def stop_profile(self: TokenizerManager):
         self.auto_create_handle_loop()
-        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+        req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
         return await self._execute_profile(req)
 
     async def _execute_profile(self: TokenizerManager, req: ProfileReq):
@@ -433,6 +463,8 @@ class TokenizerControlMixin:
                 results = await self.update_weights_from_distributed_communicator(obj)
 
         success, message = FanOutCommunicator.merge_results(results)
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -480,6 +512,10 @@ class TokenizerControlMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
+        obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+            obj.serialized_named_tensors
+        )
+
         async with self.is_pause_cond:
             is_paused = self.is_pause
             if is_paused:
@@ -490,6 +526,8 @@ class TokenizerControlMixin:
                 results = await self.update_weights_from_tensor_communicator(obj)
 
         success, message = FanOutCommunicator.merge_results(results)
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -525,6 +563,8 @@ class TokenizerControlMixin:
             logger.error(error_msg)
             success, message = False, error_msg
 
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -547,7 +587,9 @@ class TokenizerControlMixin:
         # Initiate the actual unloading operation at the backend processes only after all
         # ongoing requests using this LoRA adapter are finished.
         await self.lora_registry.wait_for_unload(lora_id)
-        result = (await self.update_lora_adapter_communicator(obj))[0]
+        result = _merge_lora_update_results(
+            await self.update_lora_adapter_communicator(obj)
+        )
 
         return result
 
@@ -564,11 +606,9 @@ class TokenizerControlMixin:
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
-            # with dp_size > 1.
             assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
+                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             logger.info(
                 "Start load Lora adapter. Lora name=%s, path=%s",
                 obj.lora_name,
@@ -585,7 +625,9 @@ class TokenizerControlMixin:
 
                 # Trigger the actual loading operation at the backend processes.
                 obj.lora_id = new_adapter.lora_id
-                result = (await self.update_lora_adapter_communicator(obj))[0]
+                result = _merge_lora_update_results(
+                    await self.update_lora_adapter_communicator(obj)
+                )
 
                 # Register the LoRA adapter only after loading is successful.
                 if result.success:
@@ -643,11 +685,15 @@ class TokenizerControlMixin:
                 )
 
             assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
+                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             logger.info(
                 "Start load Lora adapter from tensors. Lora name=%s",
                 obj.lora_name,
+            )
+
+            obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+                obj.serialized_named_tensors
             )
 
             async with self.lora_update_lock:
@@ -657,7 +703,9 @@ class TokenizerControlMixin:
                     pinned=obj.pinned,
                 )
                 obj.lora_id = new_adapter.lora_id
-                result = (await self.update_lora_adapter_communicator(obj))[0]
+                result = _merge_lora_update_results(
+                    await self.update_lora_adapter_communicator(obj)
+                )
 
                 if result.success:
                     await self.lora_registry.register(new_adapter)
@@ -716,11 +764,9 @@ class TokenizerControlMixin:
                 obj.lora_name is not None
             ), "lora_name must be provided to unload LoRA adapter"
 
-            # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
-            # with dp_size > 1.
             assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
+                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             logger.info(
                 "Start unload Lora adapter. Lora name=%s",
                 obj.lora_name,
@@ -764,14 +810,23 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         obj: CheckWeightsReqInput,
         request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str, Optional[List[Dict]]]:
+    ) -> Tuple[bool, str, Optional[List[Dict]], Optional[str]]:
         self.auto_create_handle_loop()
         results = await self.check_weights_communicator(obj)
         success, message = FanOutCommunicator.merge_results(results)
         ranks: Optional[List[Dict]] = None
+        per_engine_checksum: Optional[str] = None
         if any(r.payload is not None for r in results):
-            ranks = [r.payload for r in results]
-        return success, message, ranks
+            rank_infos: List[ChecksumInfo] = []
+            for r in results:
+                if r.payload is not None:
+                    rank_infos.extend(r.payload)
+            h = hashlib.sha256()
+            for info in rank_infos:
+                h.update(info.per_gpu_checksum.encode())
+            per_engine_checksum = h.hexdigest()
+            ranks = [msgspec_to_builtins(info) for info in rank_infos]
+        return success, message, ranks, per_engine_checksum
 
     async def slow_down(
         self: TokenizerManager,
@@ -809,41 +864,29 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         include: Optional[List[str]] = None,
         dp_rank: Optional[int] = None,
-    ) -> List[GetLoadsReqOutput]:
+    ) -> List[LoadSnapshot]:
         """
-        Get comprehensive load metrics for /v1/loads endpoint.
+        Get load snapshots for /v1/loads endpoint.
 
         Args:
             include: List of sections to include. Options: core, memory, spec, lora, disagg, queues, all
             dp_rank: Optional filter for specific DP rank
 
         Returns:
-            List of GetLoadsReqOutput, one per scheduler (filtered by dp_rank if specified)
+            List of LoadSnapshot, one per scheduler (filtered by dp_rank if specified)
         """
         self.auto_create_handle_loop()
-        # Always request all sections from scheduler — watching mode shares
-        # results across concurrent callers, so we fetch full data and filter here.
-        req = GetLoadsReqInput(include=["all"], dp_rank=None)
-        results = await self.get_loads_communicator(req)
+        if dp_rank is not None and (
+            dp_rank < 0 or dp_rank >= self.elastic_worker_count
+        ):
+            return []
 
-        # Filter by dp_rank if specified
+        reader = self.load_snapshot_reader
         if dp_rank is not None:
-            results = [r for r in results if r.dp_rank == dp_rank]
-
-        # Filter optional sections client-side (scheduler always returns all)
-        if include and "all" not in include:
-            include_set = set(include)
-            _section_attrs = {
-                "memory": "memory",
-                "spec": "speculative",
-                "lora": "lora",
-                "disagg": "disaggregation",
-                "queues": "queues",
-            }
-            for r in results:
-                for key, attr in _section_attrs.items():
-                    if key not in include_set:
-                        setattr(r, attr, None)
+            load = reader.read(dp_rank)
+            results = [load] if load is not None else []
+        else:
+            results = reader.read_all()
 
         return results
 
@@ -867,7 +910,7 @@ class TokenizerControlMixin:
 
         future = asyncio.Future()
         self.session_futures[obj.session_id] = future
-        self.send_to_scheduler.send_pyobj(obj)
+        self._dispatch_to_scheduler(obj)
 
         try:
             return await future
@@ -879,11 +922,13 @@ class TokenizerControlMixin:
         obj: CloseSessionReqInput,
         request: Optional[fastapi.Request] = None,
     ):
-        await self.send_to_scheduler.send_pyobj(obj)
+        await self._async_dispatch_to_scheduler(obj)
 
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]
     ) -> None:
         """Update weight version if provided."""
         if weight_version is not None:
-            self.server_args.weight_version = weight_version
+            self.record_config_updates(
+                "tokenizer.weight_version", weight_version=weight_version
+            )

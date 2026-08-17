@@ -3,38 +3,27 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    FastWan2_2_TI2V_5B_Config,
+    Wan2_2_I2V_A14B_Config,
+    WanT2V480PConfig,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders import vae_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
     _backfill_ltx2_audio_vae_latent_stats,
     _should_use_channels_last_3d,
 )
-from sglang.multimodal_gen.runtime.models.vaes.parallel import wan_common_utils
+from sglang.multimodal_gen.runtime.models.vaes import wanvae
 
 
 class _FakeServerArgs:
     def __init__(self, pipeline_config, num_gpus=1):
         self.pipeline_config = pipeline_config
         self.num_gpus = num_gpus
-
-
-class QwenImagePipelineConfig:
-    pass
-
-
-class WanT2V480PConfig:
-    pass
-
-
-class FastWan2_2_TI2V_5B_Config:
-    pass
-
-
-class Wan2_2_I2V_A14B_Config:
-    pass
-
-
-class LTX2PipelineConfig:
-    pass
 
 
 class TestVAELoader(unittest.TestCase):
@@ -109,7 +98,16 @@ class TestVAELoader(unittest.TestCase):
             server_args = _FakeServerArgs(Wan2_2_I2V_A14B_Config(), num_gpus=2)
             self.assertFalse(_should_use_channels_last_3d(server_args, "video_vae"))
 
-    def test_channels_last_3d_defaults_false_for_ltx_on_cuda(self):
+    def test_channels_last_3d_defaults_true_for_single_gpu_ltx_on_cuda(self):
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
+            patch.object(vae_loader.current_platform, "is_rocm", return_value=False),
+        ):
+            server_args = _FakeServerArgs(LTX2PipelineConfig(), num_gpus=1)
+            self.assertTrue(_should_use_channels_last_3d(server_args, "video_vae"))
+
+    def test_channels_last_3d_defaults_false_for_multi_gpu_ltx_on_cuda(self):
         with (
             patch.dict("os.environ", {}, clear=True),
             patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
@@ -178,14 +176,10 @@ class TestVAELoader(unittest.TestCase):
         )
 
         with (
-            patch.object(
-                wan_common_utils.current_platform, "is_cuda", return_value=False
-            ),
-            patch.object(
-                wan_common_utils.current_platform, "is_rocm", return_value=False
-            ),
+            patch.object(wanvae.current_platform, "is_cuda", return_value=False),
+            patch.object(wanvae.current_platform, "is_rocm", return_value=False),
         ):
-            out = wan_common_utils.match_conv3d_input_format(x, weight)
+            out = wanvae.match_conv3d_input_format(x, weight)
 
         self.assertIs(out, x)
 
@@ -199,14 +193,10 @@ class TestVAELoader(unittest.TestCase):
         )
 
         with (
-            patch.object(
-                wan_common_utils.current_platform, "is_cuda", return_value=True
-            ),
-            patch.object(
-                wan_common_utils.current_platform, "is_rocm", return_value=False
-            ),
+            patch.object(wanvae.current_platform, "is_cuda", return_value=True),
+            patch.object(wanvae.current_platform, "is_rocm", return_value=False),
         ):
-            out = wan_common_utils.match_conv3d_input_format(x, weight)
+            out = wanvae.match_conv3d_input_format(x, weight)
 
         self.assertTrue(out.is_contiguous(memory_format=torch.channels_last_3d))
 

@@ -13,7 +13,7 @@ import multiprocessing as mp
 import os
 import time
 from contextlib import ExitStack
-from typing import Any, List, Union
+from typing import Any, List, Optional, Union
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -36,19 +36,25 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
+from sglang.multimodal_gen.runtime.server_warmup import (
+    run_sync_client_warmup,
+    should_run_explicit_client_warmup,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     GREEN,
     RESET,
+    globally_suppress_loggers,
     init_logger,
     log_batch_completion,
     log_generation_timer,
 )
-from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
-from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
+    init_diffusion_tracing,
+    trace_req,
+)
 
 logger = init_logger(__name__)
 
-# TODO: move to somewhere appropriate
 try:
     # Set the start method to 'spawn' to avoid CUDA errors in forked processes.
     # This must be done at the top level of the module, before any CUDA context
@@ -120,23 +126,22 @@ class DiffGenerator:
         Returns:
             The created DiffGenerator
         """
+        globally_suppress_loggers()
         instance = cls(
             server_args=server_args,
         )
-        if server_args.enable_trace:
-            process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
-            trace_set_thread_info("DiffGenerator")
+        init_diffusion_tracing(server_args, "DiffGenerator")
 
-        logger.info(f"Local mode: {local_mode}")
+        logger.info("Local mode: %s", local_mode)
         if local_mode:
             instance.local_scheduler_process = instance._start_local_server_if_needed()
+            instance.owns_scheduler_client = True
+            instance._run_client_warmup_if_needed()
         else:
             # In remote mode, we just need to connect and check.
             sync_scheduler_client.initialize(server_args)
             instance._check_remote_scheduler()
-
-        # In both modes, this DiffGenerator instance is responsible for the client's lifecycle.
-        instance.owns_scheduler_client = True
+            instance.owns_scheduler_client = True
         return instance
 
     def _start_local_server_if_needed(
@@ -149,6 +154,12 @@ class DiffGenerator:
         processes = launch_server(self.server_args, launch_http_server=False)
 
         return processes
+
+    def _run_client_warmup_if_needed(self) -> None:
+        if not should_run_explicit_client_warmup(self.server_args):
+            return
+
+        run_sync_client_warmup(self.server_args, sync_scheduler_client.forward)
 
     def _check_remote_scheduler(self):
         """Check if the remote scheduler is accessible."""
@@ -211,6 +222,7 @@ class DiffGenerator:
         )
 
         request_groups: list[list[Req]] = []
+        parent_requests: list[tuple[Req, int]] = []
         image_paths_per_prompt = self._resolve_image_paths_per_prompt(
             prompts, sampling_params_orig.image_path
         )
@@ -222,19 +234,44 @@ class DiffGenerator:
                 output_file_name=user_output_file_name,
                 image_path=image_paths_per_prompt[i],
             )
+            # `dataclasses.replace` drops non-field attrs; restore
+            # `_explicit_fields` so InputValidationStage honors user-supplied
+            # width/height, and mark the keys overridden above as explicit.
+            sampling_params._explicit_fields = getattr(
+                sampling_params_orig, "_explicit_fields", set()
+            ) | {"prompt", "output_file_name", "image_path"}
             sampling_params._set_output_file_name()
             req = prepare_request(
                 server_args=self.server_args,
                 sampling_params=sampling_params,
                 external_trace_header=external_trace_header,
             )
-            request_groups.append(
-                expand_request_outputs(
-                    req,
-                    num_prompts=len(prompts),
-                    prompt_index=i,
+            parent_requests.append((req, i))
+
+        for req, prompt_index in parent_requests:
+            sampling_params = req.sampling_params
+            try:
+                if sampling_params.data_type == DataType.VIDEO:
+                    sampling_params.prepare_video_request_for_queue(req)
+                request_groups.append(
+                    expand_request_outputs(
+                        req,
+                        num_prompts=len(prompts),
+                        prompt_index=prompt_index,
+                    )
                 )
-            )
+            except Exception:
+                if sampling_params.data_type == DataType.VIDEO:
+                    sampling_params.cleanup_video_request(req)
+                for prepared_requests in request_groups:
+                    if (
+                        prepared_requests
+                        and prepared_requests[0].data_type == DataType.VIDEO
+                    ):
+                        prepared_requests[0].sampling_params.cleanup_video_request(
+                            prepared_requests[0]
+                        )
+                raise
 
         results: list[GenerationResult] = []
         total_start_time = time.perf_counter()
@@ -270,6 +307,10 @@ class DiffGenerator:
                         )
                         for idx, path in enumerate(output_file_paths):
                             req = requests[idx]
+                            if req.data_type == DataType.VIDEO:
+                                req.sampling_params.validate_video_final_outputs(
+                                    [path], req
+                                )
                             results.append(
                                 GenerationResult(
                                     **self._result_common(
@@ -331,6 +372,11 @@ class DiffGenerator:
 
                         for idx in range(len(samples_out)):
                             req = requests[idx]
+                            output_file_path = req.output_file_path(1, 0)
+                            if req.data_type == DataType.VIDEO and req.save_output:
+                                req.sampling_params.validate_video_final_outputs(
+                                    [output_file_path], req
+                                )
                             results.append(
                                 GenerationResult(
                                     **self._result_common(
@@ -340,12 +386,23 @@ class DiffGenerator:
                                     frames=frames_out[idx],
                                     audio=audios_out[idx],
                                     prompt_index=global_output_index + idx,
-                                    output_file_path=req.output_file_path(1, 0),
+                                    output_file_path=output_file_path,
                                 )
                             )
             except Exception as e:
                 logger.error("Generation failed: %s", e, exc_info=True)
             finally:
+                if requests and requests[0].data_type == DataType.VIDEO:
+                    try:
+                        # Pre-queue resources are shared by the shallow
+                        # per-output Req copies, so one idempotent cleanup is
+                        # sufficient for the whole parent request.
+                        requests[0].sampling_params.cleanup_video_request(requests[0])
+                    except Exception:
+                        logger.warning(
+                            "Failed to clean up model-owned video request resources",
+                            exc_info=True,
+                        )
                 global_output_index += len(requests)
 
         total_gen_time = time.perf_counter() - total_start_time
@@ -360,6 +417,34 @@ class DiffGenerator:
         if not results:
             return None
         return results[0] if len(results) == 1 else results
+
+    def generate_action(
+        self,
+        sampling_params_kwargs: dict | None = None,
+        external_trace_header: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        sampling_params_kwargs = sampling_params_kwargs or {}
+        sampling_params = SamplingParams.from_user_sampling_params_args(
+            self.server_args.model_path,
+            server_args=self.server_args,
+            **sampling_params_kwargs,
+        )
+        if sampling_params.data_type != DataType.ACTION:
+            raise ValueError(
+                f"generate_action requires an ACTION pipeline, got {sampling_params.data_type}"
+            )
+
+        req = prepare_request(
+            server_args=self.server_args,
+            sampling_params=sampling_params,
+            external_trace_header=external_trace_header,
+        )
+        output_batch = self._send_to_scheduler_and_wait_for_response(req)
+        if output_batch.error:
+            raise RuntimeError(output_batch.error)
+        if output_batch.output is None:
+            raise RuntimeError("action policy returned no output")
+        return output_batch.output[0]
 
     def _resolve_prompts(
         self,
@@ -387,7 +472,7 @@ class DiffGenerator:
     def _log_summary(self, results: list[GenerationResult]) -> None:
         if not results:
             return
-        if self.server_args.warmup:
+        if self.server_args.warmup_mode != "off":
             total_duration_ms = results[0].metrics.get("total_duration_ms", 0)
             logger.info(
                 f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
@@ -415,12 +500,17 @@ class DiffGenerator:
             and output_index < len(output_batch.metrics_list)
         ):
             metrics = output_batch.metrics_list[output_index]
+        if req.data_type == DataType.ACTION:
+            size = ("action",)
+        else:
+            size = (req.height, req.width, req.num_frames)
         return dict(
             prompt=req.prompt,
-            size=(req.height, req.width, req.num_frames),
+            size=size,
             generation_time=generation_time,
             peak_memory_mb=output_batch.peak_memory_mb,
             metrics=metrics.to_dict() if metrics else {},
+            action=output_batch.action_pred,
             trajectory_latents=output_batch.trajectory_latents,
             trajectory_timesteps=output_batch.trajectory_timesteps,
             rollout_trajectory_data=output_batch.rollout_trajectory_data,
@@ -457,6 +547,7 @@ class DiffGenerator:
         target: Union[str, List[str]] = "all",
         strength: Union[float, List[float]] = 1.0,
         merge_mode: str | None = None,
+        lora_alpha: Optional[Union[int, List[Optional[int]]]] = None,
     ) -> None:
         """
         Set LoRA adapter(s) for the specified transformer(s).
@@ -473,6 +564,7 @@ class DiffGenerator:
                 - "critic": Apply only to the critic model
             strength: LoRA strength(s) for merge, default 1.0. Can be a float or a list of floats.
             merge_mode: Optional LoRA merge mode: "auto", "merge", or "dynamic".
+            lora_alpha: Training alpha override for adapters that omit it from metadata.
         """
         req = SetLoraReq(
             lora_nickname=lora_nickname,
@@ -480,6 +572,7 @@ class DiffGenerator:
             target=target,
             strength=strength,
             merge_mode=merge_mode,
+            lora_alpha=lora_alpha,
         )
         nickname_str, target_str, strength_str = format_lora_message(
             lora_nickname, target, strength
@@ -587,7 +680,7 @@ class DiffGenerator:
         # sends the shutdown command to the server
         if self.local_scheduler_process and self.owns_scheduler_client:
             try:
-                sync_scheduler_client.forward(ShutdownReq())
+                sync_scheduler_client.forward(ShutdownReq(), timeout_ms=5000)
             except Exception:
                 pass
 
@@ -599,11 +692,45 @@ class DiffGenerator:
                         f"Local worker {process.name} did not terminate gracefully, forcing."
                     )
                     process.terminate()
+                    process.join(timeout=1)
+                    if process.is_alive():
+                        process.kill()
+                        process.join(timeout=1)
             self.local_scheduler_process = None
 
         if self.owns_scheduler_client:
             sync_scheduler_client.close()
             self.owns_scheduler_client = False
+
+    def _force_shutdown_local_processes(self) -> None:
+        local_scheduler_process = getattr(self, "local_scheduler_process", None)
+        log = globals().get("logger")
+        if local_scheduler_process:
+            for process in local_scheduler_process:
+                if process.is_alive():
+                    if log is not None:
+                        log.warning(
+                            f"Local worker {process.name} did not terminate gracefully, forcing."
+                        )
+                    process.terminate()
+            for process in local_scheduler_process:
+                process.join(timeout=1)
+                if process.is_alive():
+                    if log is not None:
+                        log.warning(
+                            f"Local worker {process.name} did not terminate after terminate(), killing."
+                        )
+                    process.kill()
+                    process.join(timeout=1)
+            self.local_scheduler_process = None
+
+        if getattr(self, "owns_scheduler_client", False):
+            try:
+                client = globals().get("sync_scheduler_client")
+                if client is not None:
+                    client.close()
+            finally:
+                self.owns_scheduler_client = False
 
     def __enter__(self):
         return self
@@ -614,15 +741,18 @@ class DiffGenerator:
     def __del__(self):
         owns_scheduler_client = bool(getattr(self, "owns_scheduler_client", False))
         local_scheduler_process = getattr(self, "local_scheduler_process", None)
+        log = globals().get("logger")
         if owns_scheduler_client:
-            logger.warning(
-                "Generator was garbage collected without being shut down. "
-                "Attempting to shut down the local server and client."
-            )
-            self.shutdown()
+            if log is not None:
+                log.warning(
+                    "Generator was garbage collected without being shut down. "
+                    "Forcing local server and client cleanup."
+                )
+            self._force_shutdown_local_processes()
         elif local_scheduler_process:
-            logger.warning(
-                "Generator was garbage collected without being shut down. "
-                "Attempting to shut down the local server."
-            )
-            self.shutdown()
+            if log is not None:
+                log.warning(
+                    "Generator was garbage collected without being shut down. "
+                    "Forcing local server cleanup."
+                )
+            self._force_shutdown_local_processes()

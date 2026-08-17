@@ -13,123 +13,58 @@ import random
 import subprocess
 import sys
 import time
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
 import tabulate
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.partitioning import (
-    PartitionItem,
-    partition_items_by_lpt,
-)
-from sglang.multimodal_gen.test.server.gpu_cases import (
-    ONE_GPU_CASES,
-    TWO_GPU_CASES,
+from sglang.multimodal_gen.test.partitioning import PartitionItem, assign_partition
+from sglang.multimodal_gen.test.runner.pytest_runner import (
+    partition_items_by_index,
+    run_pytest,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
     DiffusionTestCase,
 )
 
-logger = init_logger(__name__)
-
-DEFAULT_EST_TIME_SECONDS = 300.0
-STARTUP_OVERHEAD_SECONDS = 120.0
-DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
-
-_UPDATE_WEIGHTS_FROM_DISK_TEST_FILE = "test_update_weights_from_disk.py"
-_UPDATE_WEIGHTS_MODEL_PAIR_ENV = "SGLANG_MMGEN_UPDATE_WEIGHTS_PAIR"
-_UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
-    "FLUX.2-klein-base-4B",
-    "Qwen-Image",
-)
-
-
-def _discover_unit_tests() -> list[str]:
-    unit_dir = Path(__file__).resolve().parent / "unit"
-    if not unit_dir.is_dir():
-        return []
-    return sorted(
-        f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()
+# TODO: remove duplicated code
+if current_platform.is_npu():
+    from sglang.multimodal_gen.test.server.ascend.testcase_configs_npu import (
+        _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE,
+        COMPONENT_ACCURACY_SUITES,
+        DEFAULT_EST_TIME_SECONDS,
+        DEFAULT_STANDALONE_EST_TIME_SECONDS,
+        FILE_SUITES,
+        PARAMETRIZED_CASE_GROUPS,
+        STANDALONE_FILES,
+        STARTUP_OVERHEAD_SECONDS,
+        SUITES,
+    )
+else:
+    from sglang.multimodal_gen.test.server.gpu_cases import (  # noqa: F401 It is used by ci scripts
+        _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE,
+        _UPDATE_WEIGHTS_MODEL_PAIR_ENV,
+        _UPDATE_WEIGHTS_MODEL_PAIR_IDS,
+        COMPONENT_ACCURACY_FILE_NUM_GPUS,
+        COMPONENT_ACCURACY_SUITES,
+        DEFAULT_EST_TIME_SECONDS,
+        DEFAULT_STANDALONE_EST_TIME_SECONDS,
+        FILE_SUITES,
+        ONE_GPU_CASES,
+        PARAMETRIZED_CASE_GROUPS,
+        STANDALONE_FILE_EST_TIMES,
+        STANDALONE_FILES,
+        STARTUP_OVERHEAD_SECONDS,
+        STRICT_SUITES,
+        SUITES,
+        TWO_GPU_CASES,
     )
 
 
-FILE_SUITES = {
-    "unit": _discover_unit_tests(),
-    "component-accuracy": [
-        "test_component_accuracy_1_gpu.py",
-        "test_component_accuracy_2_gpu.py",
-    ],
-    "component-accuracy-1-gpu": [
-        "test_component_accuracy_1_gpu.py",
-    ],
-    "component-accuracy-2-gpu": [
-        "test_component_accuracy_2_gpu.py",
-    ],
-    "1-gpu-b200": [
-        "test_server_b200.py",
-    ],
-}
-
-PARAMETRIZED_CASE_GROUPS = {
-    "1-gpu": [
-        ("test_server_1_gpu.py", ONE_GPU_CASES),
-    ],
-    "2-gpu": [
-        ("test_server_2_gpu.py", TWO_GPU_CASES),
-    ],
-}
-
-STANDALONE_FILES = {
-    "1-gpu": [
-        "../cli/test_generate_t2i_perf.py",
-        # Temporarily disabled: 24 timeout failures since 2026-04-09 across
-        # multimodal-gen-test-1-gpu. Re-enable after the flakiness is fixed.
-        # "test_update_weights_from_disk.py",
-    ],
-    "2-gpu": [
-        "test_disagg_server.py",
-    ],
-}
-
-# New standalone files may omit an estimate once to learn the real CI runtime.
-# CI will use a fallback estimate for sharding, run the test, then print a
-# measured value that must be copied into STANDALONE_FILE_EST_TIMES.
-STANDALONE_FILE_EST_TIMES = {
-    "1-gpu": {
-        "../cli/test_generate_t2i_perf.py": 240.0,
-        # See STANDALONE_FILES note above — temporarily disabled.
-        # "test_update_weights_from_disk.py": 480.0,
-    },
-    "2-gpu": {
-        # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
-        # Raise if CI reports a higher measured time.
-        "test_disagg_server.py": 600.0,
-    },
-}
-
-# Backward-compatible suite view for scripts that still operate on file lists.
-SUITES = {
-    **FILE_SUITES,
-    **{
-        suite: [filename for filename, _ in case_groups]
-        + STANDALONE_FILES.get(suite, [])
-        for suite, case_groups in PARAMETRIZED_CASE_GROUPS.items()
-    },
-}
-
-STRICT_SUITES = {"unit"}
-COMPONENT_ACCURACY_SUITES = {
-    "component-accuracy",
-    "component-accuracy-1-gpu",
-    "component-accuracy-2-gpu",
-}
-COMPONENT_ACCURACY_FILE_NUM_GPUS = {
-    "test_component_accuracy_1_gpu.py": 1,
-    "test_component_accuracy_2_gpu.py": 2,
-}
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -174,23 +109,6 @@ def validate_standalone_file_est_times() -> dict[str, list[str]]:
         if missing:
             missing_by_suite[suite] = missing
     return missing_by_suite
-
-
-def auto_partition(
-    cases: list[DiffusionTestCase], rank: int, size: int
-) -> list[DiffusionTestCase]:
-    if not cases or size <= 0:
-        return []
-
-    case_by_id = {case.id: case for case in cases}
-    items = [
-        PartitionItem(kind="case", item_id=case.id, est_time=get_case_est_time(case.id))
-        for case in cases
-    ]
-    partitions = partition_items_by_lpt(items, size)
-    if rank >= len(partitions):
-        return []
-    return [case_by_id[item.item_id] for item in partitions[rank]]
 
 
 def get_suite_files_rel(suite: str, parametrized_only: bool = False) -> list[str]:
@@ -242,6 +160,39 @@ def parse_partition_plan(
         missing_standalone_estimates=list(
             selected_partition.get("missing_standalone_estimates", [])
         ),
+    )
+
+
+def build_local_partition_assignment(
+    suite: str,
+    partition_id: int,
+    total_partitions: int,
+) -> PartitionAssignment:
+    """Assign this shard's work when CI did not precompute a partition plan.
+
+    Lanes with a hardcoded ``--total-partitions`` (the AMD ones) cannot give
+    every standalone file a shard of its own, so standalone files are LPT
+    balanced together with the parametrized cases instead.
+    """
+    items = [
+        PartitionItem(kind="case", item_id=case.id, est_time=get_case_est_time(case.id))
+        for case in _get_dynamic_suite_cases(suite)
+    ]
+    for standalone_file in STANDALONE_FILES.get(suite, []):
+        items.append(
+            PartitionItem(
+                kind="standalone",
+                item_id=standalone_file,
+                est_time=get_standalone_file_est_time(suite, standalone_file)[0],
+            )
+        )
+
+    my_items = assign_partition(items, partition_id, total_partitions)
+    return PartitionAssignment(
+        case_ids=[item.item_id for item in my_items if item.kind == "case"],
+        standalone_files=[
+            item.item_id for item in my_items if item.kind == "standalone"
+        ],
     )
 
 
@@ -381,93 +332,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def collect_test_items(files: list[str], filter_expr: str | None = None) -> list[str]:
-    """Collect test node IDs from the given files using pytest --collect-only."""
-    cmd = [sys.executable, "-m", "pytest", "--collect-only", "-q"]
-    if filter_expr:
-        cmd.extend(["-k", filter_expr])
-    cmd.extend(files)
-
-    filter_note = f" with filter: {filter_expr}" if filter_expr else ""
-    print(f"Collecting tests from {len(files)} file(s){filter_note}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    if result.returncode not in (0, 5):
-        error_msg = (
-            f"pytest --collect-only failed with exit code {result.returncode}\n"
-            f"Command: {' '.join(cmd)}\n"
-        )
-        if result.stderr:
-            error_msg += f"stderr:\n{result.stderr}\n"
-        if result.stdout:
-            error_msg += f"stdout:\n{result.stdout}\n"
-        logger.error(error_msg)
-        raise RuntimeError(error_msg)
-
-    if result.returncode == 5:
-        print(
-            "No tests were collected (exit code 5). This may be expected with filters."
-        )
-
-    test_items = []
-    for line in result.stdout.strip().split("\n"):
-        line = line.strip()
-        if line and "::" in line and not line.startswith(("=", "-", " ")):
-            test_id = line.split()[0] if " " in line else line
-            if "::" in test_id:
-                test_items.append(test_id)
-
-    print(f"Collected {len(test_items)} test items")
-    return test_items
-
-
-def parse_junit_xml_for_executed_cases(xml_path: str) -> list[str]:
-    if not Path(xml_path).exists():
-        return []
-
-    executed_cases = []
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-
-    for testcase in root.iter("testcase"):
-        if testcase.find("skipped") is not None:
-            continue
-
-        name = testcase.get("name", "")
-        if "[" in name and "]" in name:
-            case_id = name[name.index("[") + 1 : name.index("]")]
-            executed_cases.append(case_id)
-
-    return executed_cases
-
-
-def parse_junit_xml_for_case_results(xml_path: str) -> dict[str, str]:
-    if not Path(xml_path).exists():
-        return {}
-
-    case_results = {}
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-
-    for testcase in root.iter("testcase"):
-        if testcase.find("skipped") is not None:
-            continue
-
-        name = testcase.get("name", "")
-        if "[" not in name or "]" not in name:
-            continue
-
-        case_id = name[name.index("[") + 1 : name.index("]")]
-        if testcase.find("failure") is not None:
-            case_results[case_id] = "fail"
-        elif testcase.find("error") is not None:
-            case_results[case_id] = "error"
-        else:
-            case_results[case_id] = "pass"
-
-    return case_results
-
-
 def write_execution_report(
     suite: str,
     partition_id: int,
@@ -498,274 +362,6 @@ def write_execution_report(
 
     logger.info("Execution report written to: %s", report_path)
     return str(report_path)
-
-
-def _run_pytest_attempt(cmd: list[str]) -> tuple[int, str]:
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        bufsize=0,
-    )
-
-    output_bytes = bytearray()
-    while True:
-        chunk = process.stdout.read(4096)
-        if not chunk:
-            break
-        sys.stdout.buffer.write(chunk)
-        sys.stdout.buffer.flush()
-        output_bytes.extend(chunk)
-
-    process.wait()
-    return process.returncode, output_bytes.decode("utf-8", errors="replace")
-
-
-def _extract_collection_line(full_output: str) -> str | None:
-    for line in full_output.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("collected "):
-            return stripped
-    return None
-
-
-def _extract_short_test_summary(full_output: str) -> list[str]:
-    summary_lines = []
-    in_summary = False
-    for line in full_output.splitlines():
-        stripped = line.strip()
-        if "short test summary info" in stripped:
-            in_summary = True
-            continue
-        if not in_summary:
-            continue
-        if stripped.startswith("="):
-            break
-        if not stripped or stripped.startswith("!"):
-            continue
-        summary_lines.append(stripped)
-    return summary_lines
-
-
-def _extract_failure_tail(full_output: str, max_lines: int = 20) -> list[str]:
-    summary_lines = _extract_short_test_summary(full_output)
-    if summary_lines:
-        return summary_lines
-
-    lines = [line.rstrip() for line in full_output.splitlines() if line.strip()]
-    return lines[-max_lines:]
-
-
-def _summary_has_retryable_failure(summary_lines: list[str]) -> bool:
-    for line in summary_lines:
-        lowered = line.lower()
-        if (
-            "[performance]" in line
-            or "SafetensorError" in line
-            or "FileNotFoundError" in line
-            or "TimeoutError" in line
-            or "out of memory" in lowered
-            or "oom killer" in lowered
-        ):
-            return True
-    return False
-
-
-def _is_consistency_failure(full_output: str) -> bool:
-    summary_lines = _extract_short_test_summary(full_output)
-    for line in summary_lines:
-        if "Consistency check failed for" in line or "GT not found for" in line:
-            return True
-
-    return (
-        "Consistency check failed for " in full_output
-        or "GT not found for " in full_output
-        or "--- MISSING GROUND TRUTH DETECTED ---" in full_output
-    )
-
-
-def _is_retryable_failure(full_output: str) -> bool:
-    if _is_consistency_failure(full_output):
-        return False
-
-    summary_lines = _extract_short_test_summary(full_output)
-    is_perf_assertion = (
-        "multimodal_gen/test/server/test_server_utils.py" in full_output
-        and "AssertionError" in full_output
-    )
-    is_aggregated_retryable_failure = _summary_has_retryable_failure(summary_lines)
-
-    is_flaky_ci_assertion = (
-        "SafetensorError" in full_output
-        or "FileNotFoundError" in full_output
-        or "TimeoutError" in full_output
-    )
-
-    is_oom_error = (
-        "out of memory" in full_output.lower() or "oom killer" in full_output.lower()
-    )
-
-    return (
-        is_perf_assertion
-        or is_aggregated_retryable_failure
-        or is_flaky_ci_assertion
-        or is_oom_error
-    )
-
-
-def _print_attempt_tail_summary(
-    attempt_reports: list[dict], assigned_count: int
-) -> None:
-    if len(attempt_reports) == 1 and attempt_reports[0]["returncode"] in (0, 5):
-        return
-
-    rows = []
-    for report in attempt_reports:
-        if report["returncode"] in (0, 5):
-            result = "success"
-        elif report["retryable"]:
-            result = "retryable failure"
-        else:
-            result = "failure"
-        rows.append(
-            [
-                report["attempt"],
-                report["mode"],
-                result,
-                report["collection_line"] or "-",
-            ]
-        )
-
-    print("\n" + "=" * 32 + " Pytest Tail Summary " + "=" * 32, flush=True)
-    print(f"Assigned {assigned_count} test item(s)", flush=True)
-    print(
-        tabulate.tabulate(
-            rows,
-            headers=["Attempt", "Mode", "Result", "Collection"],
-            tablefmt="psql",
-        ),
-        flush=True,
-    )
-
-    for report in attempt_reports:
-        if not report["failure_tail"]:
-            continue
-        print(f"\nAttempt {report['attempt']} failure summary:", flush=True)
-        for line in report["failure_tail"]:
-            print(f"  {line}", flush=True)
-
-    print("=" * 84, flush=True)
-
-
-def run_pytest(
-    files: list[str],
-    filter_expr: str | None = None,
-    junit_xml_path: str | None = None,
-) -> tuple[int, list[str], dict[str, str]]:
-    if not files:
-        print("No files to run.")
-        return (0, [], {})
-
-    all_executed_cases: set[str] = set()
-    all_case_results: dict[str, str] = {}
-
-    base_cmd = [
-        sys.executable,
-        "-m",
-        "pytest",
-        "-s",
-        "-v",
-        "--tb=short",
-        "--no-header",
-    ]
-    if junit_xml_path:
-        base_cmd.extend(["--junit-xml", junit_xml_path])
-    if filter_expr:
-        base_cmd.extend(["-k", filter_expr])
-
-    max_retries = 6
-    attempt_reports = []
-    for i in range(max_retries + 1):
-        is_retry = i > 0
-        cmd = list(base_cmd)
-        if is_retry:
-            cmd.append("--last-failed")
-        cmd.extend(files)
-
-        mode = "retry failed items" if is_retry else "initial pass"
-        print(
-            f"Starting pytest attempt {i + 1}/{max_retries + 1}: {mode} "
-            f"for {len(files)} assigned item(s)"
-        )
-
-        returncode, full_output = _run_pytest_attempt(cmd)
-        retryable = returncode not in (0, 5) and _is_retryable_failure(full_output)
-        attempt_reports.append(
-            {
-                "attempt": i + 1,
-                "mode": mode,
-                "returncode": returncode,
-                "retryable": retryable,
-                "collection_line": _extract_collection_line(full_output),
-                "failure_tail": (
-                    _extract_failure_tail(full_output)
-                    if returncode not in (0, 5)
-                    else []
-                ),
-            }
-        )
-
-        if junit_xml_path:
-            all_executed_cases.update(
-                parse_junit_xml_for_executed_cases(junit_xml_path)
-            )
-            all_case_results.update(parse_junit_xml_for_case_results(junit_xml_path))
-
-        if returncode == 0:
-            if is_retry:
-                print(f"Recovered retryable failures on attempt {i + 1}.")
-            _print_attempt_tail_summary(attempt_reports, len(files))
-            return (0, list(all_executed_cases), all_case_results)
-        if returncode == 5:
-            print(
-                "No tests collected (exit code 5). This is expected when filters "
-                "deselect all tests in a partition. Treating as success."
-            )
-            _print_attempt_tail_summary(attempt_reports, len(files))
-            return (0, list(all_executed_cases), all_case_results)
-
-        if not retryable:
-            _print_attempt_tail_summary(attempt_reports, len(files))
-            return (returncode, list(all_executed_cases), all_case_results)
-
-        if i == max_retries:
-            print(f"Max retry exceeded ({max_retries})")
-            _print_attempt_tail_summary(attempt_reports, len(files))
-            return (returncode, list(all_executed_cases), all_case_results)
-
-        print(
-            f"Retryable failure detected on attempt {i + 1}. "
-            "Retrying only previously failed items."
-        )
-
-    _print_attempt_tail_summary(attempt_reports, len(files))
-    return (
-        attempt_reports[-1]["returncode"],
-        list(all_executed_cases),
-        all_case_results,
-    )
-
-
-def partition_items_by_index(
-    items: list[str], partition_id: int, total_partitions: int
-) -> list[str]:
-    return [
-        item for i, item in enumerate(items) if i % total_partitions == partition_id
-    ]
-
-
-def partition_test_files(files, partition_id, total_partitions):
-    return partition_items_by_index(files, partition_id, total_partitions)
 
 
 def run_component_accuracy_files(files, filter_expr=None, continue_on_error=False):
@@ -884,19 +480,6 @@ def _get_parametrized_files_for_case_ids(
     return files
 
 
-def _get_standalone_file(target_dir: Path, suite: str, index: int) -> str | None:
-    standalone_files = STANDALONE_FILES.get(suite, [])
-    if index < 0 or index >= len(standalone_files):
-        return None
-    file_path = target_dir / standalone_files[index]
-    if file_path.exists():
-        return str(file_path)
-    logger.warning(
-        "Standalone test file %s not found in %s", standalone_files[index], target_dir
-    )
-    return None
-
-
 def _run_dynamic_suite(args, target_dir: Path) -> int:
     if args.partition_plan_json:
         assignment = parse_partition_plan(
@@ -905,251 +488,139 @@ def _run_dynamic_suite(args, target_dir: Path) -> int:
             total_partitions=args.total_partitions,
             plan_json=args.partition_plan_json,
         )
-
-        rows = [[args.suite, f"{args.partition_id + 1}/{args.total_partitions}"]]
-        print(tabulate.tabulate(rows, headers=["Suite", "Partition"], tablefmt="psql"))
-
-        total_est_time = 0.0
-        executed_cases: list[str] = []
-        case_results: dict[str, str] = {}
-        missing_standalone_estimates: list[str] = []
-        standalone_measurements: list[dict] = []
-        overall_exit_code = 0
-
-        if assignment.case_ids:
-            case_id_set = set(assignment.case_ids)
-            total_est_time += sum(
-                get_case_est_time(case_id) for case_id in assignment.case_ids
-            )
-            suite_files = _get_parametrized_files_for_case_ids(
-                args.suite, case_id_set, target_dir
-            )
-            if not suite_files:
-                print(
-                    f"No valid parametrized test files found for suite '{args.suite}'."
-                )
-                return 0
-
-            partition_filter = " or ".join(
-                f"[{case_id}]" for case_id in assignment.case_ids
-            )
-            filter_expr = (
-                f"({partition_filter}) and ({args.filter})"
-                if args.filter
-                else partition_filter
-            )
-
-            print(
-                f"Running {len(assignment.case_ids)} parametrized cases with estimated total "
-                f"{sum(get_case_est_time(case_id) for case_id in assignment.case_ids):.1f}s:"
-            )
-            for case_id in assignment.case_ids:
-                print(f"  - case: {case_id} ({get_case_est_time(case_id):.1f}s)")
-            print(f"Test files: {[Path(f).name for f in suite_files]}")
-            print(f"Filter expression: {filter_expr}")
-
-            junit_xml_path = str(
-                target_dir / f"junit_results_{args.suite}_{args.partition_id}.xml"
-            )
-            exit_code, new_executed_cases, new_case_results = run_pytest(
-                suite_files,
-                filter_expr=filter_expr,
-                junit_xml_path=junit_xml_path,
-            )
-            _merge_execution_results(
-                executed_cases, case_results, new_executed_cases, new_case_results
-            )
-            if exit_code != 0 and overall_exit_code == 0:
-                overall_exit_code = exit_code
-            if exit_code != 0 and not args.continue_on_error:
-                write_execution_report(
-                    suite=args.suite,
-                    partition_id=args.partition_id,
-                    total_partitions=args.total_partitions,
-                    executed_cases=executed_cases,
-                    is_standalone=False,
-                    standalone_file=None,
-                    case_results=case_results,
-                    missing_standalone_estimates=missing_standalone_estimates,
-                    standalone_measurements=standalone_measurements,
-                )
-                return overall_exit_code
-
-        if assignment.standalone_files:
-            standalone_estimate = sum(
-                get_standalone_file_est_time(args.suite, standalone_file)[0]
-                for standalone_file in assignment.standalone_files
-            )
-            total_est_time += standalone_estimate
-            print(
-                f"Running {len(assignment.standalone_files)} standalone file(s) with estimated total "
-                f"{standalone_estimate:.1f}s:"
-            )
-            for standalone_file in assignment.standalone_files:
-                est_time, used_fallback_estimate = get_standalone_file_est_time(
-                    args.suite, standalone_file
-                )
-                fallback_suffix = (
-                    f", fallback estimate {DEFAULT_STANDALONE_EST_TIME_SECONDS:.1f}s"
-                    if used_fallback_estimate
-                    else ""
-                )
-                print(
-                    f"  - standalone: {standalone_file} "
-                    f"({est_time:.1f}s{fallback_suffix})"
-                )
-
-            for standalone_file in assignment.standalone_files:
-                exit_code, new_executed_cases, new_case_results, measurement = (
-                    _run_standalone_file(
-                        args.suite,
-                        standalone_file,
-                        target_dir,
-                        extra_filter=args.filter,
-                    )
-                )
-                if measurement["used_fallback_estimate"]:
-                    missing_standalone_estimates.append(standalone_file)
-                standalone_measurements.append(measurement)
-                _merge_execution_results(
-                    executed_cases,
-                    case_results,
-                    new_executed_cases,
-                    new_case_results,
-                )
-                if exit_code != 0 and overall_exit_code == 0:
-                    overall_exit_code = exit_code
-                if exit_code != 0 and not args.continue_on_error:
-                    break
-
-        print(f"Partition estimated total time: {total_est_time:.1f}s")
-        write_execution_report(
+    else:
+        assignment = build_local_partition_assignment(
             suite=args.suite,
             partition_id=args.partition_id,
             total_partitions=args.total_partitions,
-            executed_cases=executed_cases,
-            is_standalone=False,
-            standalone_file=None,
-            case_results=case_results,
-            missing_standalone_estimates=missing_standalone_estimates,
-            standalone_measurements=standalone_measurements,
         )
-        return overall_exit_code
+    return _run_partition_assignment(args, target_dir, assignment)
 
-    all_cases = _get_dynamic_suite_cases(args.suite)
-    standalone_files = STANDALONE_FILES.get(args.suite, [])
-    parametrized_partitions = args.total_partitions - len(standalone_files)
 
-    if parametrized_partitions < 0:
-        print(
-            f"Error: total_partitions ({args.total_partitions}) must be >= "
-            f"standalone files ({len(standalone_files)})"
+def _run_partition_assignment(
+    args, target_dir: Path, assignment: PartitionAssignment
+) -> int:
+    rows = [[args.suite, f"{args.partition_id + 1}/{args.total_partitions}"]]
+    print(tabulate.tabulate(rows, headers=["Suite", "Partition"], tablefmt="psql"))
+
+    total_est_time = 0.0
+    executed_cases: list[str] = []
+    case_results: dict[str, str] = {}
+    missing_standalone_estimates: list[str] = []
+    standalone_measurements: list[dict] = []
+    overall_exit_code = 0
+
+    if assignment.case_ids:
+        case_id_set = set(assignment.case_ids)
+        total_est_time += sum(
+            get_case_est_time(case_id) for case_id in assignment.case_ids
         )
-        return 1
-
-    if args.partition_id < parametrized_partitions:
-        if not all_cases:
-            print(f"No cases found for suite '{args.suite}'.")
-            return 0
-
-        my_cases = auto_partition(all_cases, args.partition_id, parametrized_partitions)
-        if not my_cases:
-            print(
-                f"No cases assigned to partition {args.partition_id}. Exiting success."
-            )
-            write_execution_report(
-                suite=args.suite,
-                partition_id=args.partition_id,
-                total_partitions=args.total_partitions,
-                executed_cases=[],
-                is_standalone=False,
-                missing_standalone_estimates=[],
-                standalone_measurements=[],
-            )
-            return 0
-
-        case_ids = [case.id for case in my_cases]
-        case_id_set = set(case_ids)
-        total_est_time = sum(get_case_est_time(case.id) for case in my_cases)
         suite_files = _get_parametrized_files_for_case_ids(
             args.suite, case_id_set, target_dir
         )
-
         if not suite_files:
             print(f"No valid parametrized test files found for suite '{args.suite}'.")
             return 0
 
-        partition_filter = " or ".join(f"[{case_id}]" for case_id in case_ids)
+        partition_filter = " or ".join(
+            f"[{case_id}]" for case_id in assignment.case_ids
+        )
         filter_expr = (
             f"({partition_filter}) and ({args.filter})"
             if args.filter
             else partition_filter
         )
 
-        rows = [[args.suite, f"{args.partition_id + 1}/{args.total_partitions}"]]
-        print(tabulate.tabulate(rows, headers=["Suite", "Partition"], tablefmt="psql"))
         print(
-            f"Running {len(my_cases)} cases with estimated total "
-            f"{total_est_time:.1f}s:"
+            f"Running {len(assignment.case_ids)} parametrized cases with estimated total "
+            f"{sum(get_case_est_time(case_id) for case_id in assignment.case_ids):.1f}s:"
         )
-        for case in my_cases:
-            print(f"  - {case.id} ({get_case_est_time(case.id):.1f}s)")
+        for case_id in assignment.case_ids:
+            print(f"  - case: {case_id} ({get_case_est_time(case_id):.1f}s)")
         print(f"Test files: {[Path(f).name for f in suite_files]}")
         print(f"Filter expression: {filter_expr}")
 
         junit_xml_path = str(
             target_dir / f"junit_results_{args.suite}_{args.partition_id}.xml"
         )
-        exit_code, executed_cases, case_results = run_pytest(
+        exit_code, new_executed_cases, new_case_results = run_pytest(
             suite_files,
             filter_expr=filter_expr,
             junit_xml_path=junit_xml_path,
         )
-        write_execution_report(
-            suite=args.suite,
-            partition_id=args.partition_id,
-            total_partitions=args.total_partitions,
-            executed_cases=executed_cases,
-            is_standalone=False,
-            case_results=case_results,
-            missing_standalone_estimates=[],
-            standalone_measurements=[],
+        _merge_execution_results(
+            executed_cases, case_results, new_executed_cases, new_case_results
         )
-        return exit_code
+        # A failing case must not swallow this shard's standalone files: they
+        # are separate pytest runs, and they only share a shard because the
+        # shard count is fixed. --continue-on-error still decides whether a
+        # failing standalone file stops the ones queued behind it.
+        if exit_code != 0 and overall_exit_code == 0:
+            overall_exit_code = exit_code
 
-    standalone_idx = args.partition_id - parametrized_partitions
-    if standalone_idx >= len(standalone_files):
+    if assignment.standalone_files:
+        standalone_estimate = sum(
+            get_standalone_file_est_time(args.suite, standalone_file)[0]
+            for standalone_file in assignment.standalone_files
+        )
+        total_est_time += standalone_estimate
         print(
-            f"ERROR: Standalone partition index {standalone_idx} exceeds available "
-            f"standalone files ({len(standalone_files)}) for suite '{args.suite}'."
+            f"Running {len(assignment.standalone_files)} standalone file(s) with estimated total "
+            f"{standalone_estimate:.1f}s:"
         )
-        return 1
+        for standalone_file in assignment.standalone_files:
+            est_time, used_fallback_estimate = get_standalone_file_est_time(
+                args.suite, standalone_file
+            )
+            fallback_suffix = (
+                f", fallback estimate {DEFAULT_STANDALONE_EST_TIME_SECONDS:.1f}s"
+                if used_fallback_estimate
+                else ""
+            )
+            print(
+                f"  - standalone: {standalone_file} "
+                f"({est_time:.1f}s{fallback_suffix})"
+            )
 
-    standalone_rel = standalone_files[standalone_idx]
-    print(
-        f"Suite: {args.suite} | Partition: {args.partition_id + 1}/{args.total_partitions} (standalone)"
-    )
-    print(f"Running standalone test file: {Path(standalone_rel).name}")
-    exit_code, executed_cases, case_results, measurement = _run_standalone_file(
-        args.suite,
-        standalone_rel,
-        target_dir,
-        extra_filter=args.filter,
-    )
+        for standalone_file in assignment.standalone_files:
+            exit_code, new_executed_cases, new_case_results, measurement = (
+                _run_standalone_file(
+                    args.suite,
+                    standalone_file,
+                    target_dir,
+                    extra_filter=args.filter,
+                )
+            )
+            if measurement["used_fallback_estimate"]:
+                missing_standalone_estimates.append(standalone_file)
+            standalone_measurements.append(measurement)
+            _merge_execution_results(
+                executed_cases,
+                case_results,
+                new_executed_cases,
+                new_case_results,
+            )
+            if exit_code != 0 and overall_exit_code == 0:
+                overall_exit_code = exit_code
+            if exit_code != 0 and not args.continue_on_error:
+                break
+
+    if not assignment.case_ids and not assignment.standalone_files:
+        print(f"No work assigned to partition {args.partition_id}. Exiting success.")
+
+    print(f"Partition estimated total time: {total_est_time:.1f}s")
     write_execution_report(
         suite=args.suite,
         partition_id=args.partition_id,
         total_partitions=args.total_partitions,
         executed_cases=executed_cases,
-        is_standalone=True,
-        standalone_file=standalone_rel,
+        is_standalone=False,
+        standalone_file=None,
         case_results=case_results,
-        missing_standalone_estimates=(
-            [standalone_rel] if measurement["used_fallback_estimate"] else []
-        ),
-        standalone_measurements=[measurement],
+        missing_standalone_estimates=missing_standalone_estimates,
+        standalone_measurements=standalone_measurements,
     )
-    return exit_code
+    return overall_exit_code
 
 
 def main():
@@ -1172,7 +643,7 @@ def main():
             print(f"No valid test files found for suite '{args.suite}'.")
             sys.exit(1 if args.suite in STRICT_SUITES else 0)
 
-        my_files = partition_test_files(
+        my_files = partition_items_by_index(
             suite_files_abs, args.partition_id, args.total_partitions
         )
         partition_info = (

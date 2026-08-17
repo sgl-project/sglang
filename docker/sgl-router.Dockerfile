@@ -49,6 +49,15 @@ RUN mkdir -p src && echo "fn main() {}" > src/main.rs \
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
 RUN cargo install cargo-chef --locked --version ^0.1
 WORKDIR /work
+
+# `dynamo-tokenizers` pulls in `pcre2-sys`, whose build.rs links the SYSTEM
+# libpcre2-8 whenever pkg-config finds it (it does here — the rust:bookworm
+# base ships libpcre2-dev). That dynamic dep is absent from the distroless
+# runtime, so the binary fails at startup with "libpcre2-8.so.0: cannot open
+# shared object file". Force pcre2-sys to compile its vendored PCRE2 and link
+# it statically, keeping the runtime self-contained.
+ENV PCRE2_SYS_STATIC=1
+
 COPY --from=chef /work/recipe.json ./recipe.json
 COPY --from=chef /work/Cargo.lock ./Cargo.lock
 COPY experimental/sgl-router/rust-toolchain.toml ./

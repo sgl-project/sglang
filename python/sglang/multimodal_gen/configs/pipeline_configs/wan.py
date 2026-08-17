@@ -21,6 +21,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.runtime.utils.condition_expansion import (
+    PromptToSampleBatchExpander,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -86,6 +89,7 @@ class WanT2V480PConfig(PipelineConfig):
     # Precision for each component
     precision: str = "bf16"
     vae_precision: str = "fp32"
+    vae_decode_precision: str = "bf16"
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
 
     def __post_init__(self):
@@ -94,8 +98,30 @@ class WanT2V480PConfig(PipelineConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_dit_layerwise_offload=True,
+            dit_layerwise_offload_modes=("memory",),
+            keep_resident_min_available_gb=60,
+            keep_resident_components=("dit",),
         )
+
+    def expand_conditioning_to_sample_batch(self, batch):
+        expander = PromptToSampleBatchExpander.from_batch(batch)
+        if expander is None:
+            return batch
+
+        for field_name in (
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "image_embeds",
+            "image_latent",
+        ):
+            expander.expand_field(batch, field_name)
+        return batch
+
+    def get_pos_prompt_embeds(self, batch):
+        return batch.prompt_embeds[0]
+
+    def get_neg_prompt_embeds(self, batch):
+        return batch.negative_prompt_embeds[0]
 
 
 @dataclass
@@ -106,6 +132,23 @@ class TurboWanT2V480PConfig(WanT2V480PConfig):
     dmd_denoising_steps: list[int] | None = field(
         default_factory=lambda: [988, 932, 852, 608]
     )
+
+
+@dataclass
+class TurboWanT2V1_3B480PConfig(TurboWanT2V480PConfig):
+    """Configuration for TurboWan T2V 1.3B DMD pipeline."""
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("memory",),
+            keep_resident_min_available_gb=60,
+            keep_resident_components=(
+                "dit",
+                "text_encoder",
+                "image_encoder",
+                "vae",
+            ),
+        )
 
 
 @dataclass
@@ -141,11 +184,6 @@ class WanI2V480PConfig(WanT2V480PConfig, WanI2VCommonConfig):
     def __post_init__(self) -> None:
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
-
-    def get_model_deployment_config(self) -> ModelDeploymentConfig:
-        return ModelDeploymentConfig(
-            auto_dit_layerwise_offload=True,
-        )
 
 
 @dataclass
@@ -183,12 +221,25 @@ class FastWan2_1_T2V_480P_Config(WanT2V480PConfig):
         default_factory=lambda: [1000, 757, 522]
     )
 
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("memory",),
+            keep_resident_min_available_gb=60,
+            keep_resident_components=(
+                "dit",
+                "text_encoder",
+                "image_encoder",
+                "vae",
+            ),
+        )
+
 
 @dataclass
 class Wan2_2_TI2V_5B_Config(WanT2V480PConfig, WanI2VCommonConfig):
     flow_shift: float | None = 5.0
     task_type: ModelTaskType = ModelTaskType.TI2V
     expand_timesteps: bool = True
+    vae_decode_precision: str = "fp32"
     # ti2v, 5B
     vae_stride = (4, 16, 16)
 
@@ -219,19 +270,34 @@ class FastWan2_2_TI2V_5B_Config(Wan2_2_TI2V_5B_Config):
 class Wan2_2_T2V_A14B_Config(WanT2V480PConfig):
     flow_shift: float | None = 12.0
     boundary_ratio: float | None = 0.875
+    vae_decode_precision: str = "fp32"
 
     def __post_init__(self) -> None:
         self.dit_config.boundary_ratio = self.boundary_ratio
+        self.dit_config.torch_compile_mode = "default"
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("auto", "memory"),
+            auto_dit_offload_prefetch_size=2,
+        )
 
 
 @dataclass
 class Wan2_2_I2V_A14B_Config(WanI2V720PConfig):
     flow_shift: float | None = 5.0
     boundary_ratio: float | None = 0.900
+    vae_decode_precision: str = "fp32"
 
     def __post_init__(self) -> None:
         super().__post_init__()
         self.dit_config.boundary_ratio = self.boundary_ratio
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            dit_layerwise_offload_modes=("auto", "memory"),
+            auto_dit_offload_prefetch_size=2,
+        )
 
 
 # =============================================

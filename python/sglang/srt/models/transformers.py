@@ -34,10 +34,8 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from sglang.srt.distributed import (
     divide,
-    get_moe_expert_parallel_world_size,
     get_pp_group,
     get_pp_indices,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -67,7 +65,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import AutoWeightsLoader, WeightsMapper
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import direct_register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_hf_text_config
@@ -119,7 +117,9 @@ def _getattr_first(obj, names, default=None):
 
 
 def _resolve_attention_backend_model_cls(config: PretrainedConfig):
-    model_cls = getattr(transformers, getattr(config, "architectures", [""])[0], None)
+    model_cls = getattr(
+        transformers, (getattr(config, "architectures", None) or [""])[0], None
+    )
     if model_cls is not None:
         return model_cls
 
@@ -352,7 +352,7 @@ class TransformersFusedMoE(nn.Module):
         expert_mapping: list,
     ) -> None:
         super().__init__()
-        num_redundant = get_global_server_args().ep_num_redundant_experts
+        num_redundant = get_exec().moe.ep_num_redundant_experts
         experts_cls = get_moe_impl_class(quant_config)
         self.experts = experts_cls(
             num_experts=num_experts + num_redundant,
@@ -642,7 +642,7 @@ class TransformersBase(nn.Module):
         # Pipeline parallel
         self.pipeline_parallel()
         # Module replacement (Linear → TP, RMSNorm → fused, MoE overridden by MoEMixin)
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.recursive_replace()
         # Attention instances
         self.attention_instances = self._create_attention_instances(tp_size)
@@ -755,7 +755,7 @@ class TransformersBase(nn.Module):
 
     # -- Recursive module replacement (Linear + RMSNorm) --------------------
     def recursive_replace(self):
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         tp_plan = self._normalize_tp_plan(self._get_model_tp_plan())
 
         if not tp_plan and tp_size > 1:
@@ -1231,8 +1231,8 @@ class MoEMixin:
         expert_mapping = self._get_expert_mapping(num_experts)
 
         # EPLB / EP tracking
-        num_redundant = get_global_server_args().ep_num_redundant_experts
-        ep_size = get_moe_expert_parallel_world_size()
+        num_redundant = get_exec().moe.ep_num_redundant_experts
+        ep_size = get_parallel().moe_ep_size
 
         self.mlp_moe_layers: list[nn.Module] = []
         self.moe_layers: list[TransformersFusedMoE] = []
@@ -1344,6 +1344,22 @@ class MultiModalMixin:
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._mm_padding_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+
+        # transformers v5 flattened SigLIP/CLIP (dropped the "vision_model"
+        # wrapper); older checkpoints still ship "vision_tower.vision_model.*"
+        # keys, so remap them when the live model lacks that sub-module.
+        vt = getattr(self.model, "vision_tower", None)
+        if vt is not None and not any(
+            name == "vision_model" for name, _ in vt.named_children()
+        ):
+            self.weight_mapper = (
+                WeightsMapper(
+                    orig_to_new_prefix={
+                        "vision_tower.vision_model.": "model.vision_tower.",
+                    }
+                )
+                | self.weight_mapper
+            )
 
     def _uses_mrope_positions(self) -> bool:
         rope_scaling = getattr(self.text_config, "rope_scaling", None)
@@ -1497,6 +1513,14 @@ class MultiModalMixin:
         ):
             mm_inputs = forward_batch.mm_inputs
             target_device = next(self.model.parameters()).device
+            # 5D features (num_images, num_patches, C, H, W) can't be flattened
+            # here: anyres models pad num_patches per HF processor call, so a
+            # flattened concat would leave stray padding rows once items with
+            # different tile counts are combined. Defer them and pad to the
+            # batch-wide max instead -- the model's own get_image_features
+            # re-derives each image's real patch count from image_sizes and
+            # slices the padding back out.
+            pending_5d_features: dict = {}
 
             for batch_idx in range(len(mm_inputs or [])):
                 mm_input = mm_inputs[batch_idx]
@@ -1519,6 +1543,11 @@ class MultiModalMixin:
                         feature = item.feature
                         if isinstance(feature, torch.Tensor):
                             feature = feature.to(device=target_device)
+                            if feature.dim() == 5:
+                                pending_5d_features.setdefault(feature_key, []).append(
+                                    feature
+                                )
+                                continue
                         if feature_key not in kwargs:
                             kwargs[feature_key] = feature
                         elif isinstance(feature, torch.Tensor) and isinstance(
@@ -1527,6 +1556,24 @@ class MultiModalMixin:
                             kwargs[feature_key] = torch.cat(
                                 [kwargs[feature_key], feature], dim=0
                             )
+
+            for feature_key, tensors in pending_5d_features.items():
+                max_patches = max(t.shape[1] for t in tensors)
+                padded = []
+                for t in tensors:
+                    if t.shape[1] < max_patches:
+                        pad = t.new_zeros(
+                            (t.shape[0], max_patches - t.shape[1], *t.shape[2:])
+                        )
+                        t = torch.cat([t, pad], dim=1)
+                    padded.append(t)
+                combined = torch.cat(padded, dim=0)
+                if feature_key in kwargs:
+                    kwargs[feature_key] = torch.cat(
+                        [kwargs[feature_key], combined], dim=0
+                    )
+                else:
+                    kwargs[feature_key] = combined
 
         return kwargs
 

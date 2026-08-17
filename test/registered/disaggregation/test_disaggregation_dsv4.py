@@ -2,6 +2,7 @@ import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
+from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -11,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=250, stage="base-c", runner_config="deepep-8-gpu-h200")
+register_cuda_ci(est_time=500, stage="base-c", runner_config="8-gpu-h200")
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 
@@ -34,9 +35,10 @@ _EAGLE_SPEC_ARGS = [
 ]
 
 
-class TestDisaggregationDSV4(PDDisaggregationServerBase, GSM8KMixin):
-
+class TestDisaggregationDSV4(SpecDecodingMixin, PDDisaggregationServerBase, GSM8KMixin):
     gsm8k_accuracy_thres = 0.93
+    accept_length_thres = 1.8
+    bs_1_speed_thres = 140
 
     @classmethod
     def setUpClass(cls):
@@ -60,6 +62,8 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase, GSM8KMixin):
             "prefill",
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
+            "--nccl-port",
+            cls.prefill_nccl_port,
             "--tp",
             4,
             "--dp",
@@ -69,7 +73,7 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase, GSM8KMixin):
             "deepep",
             "--deepep-config",
             DEEPEP_CONFIG,
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "128",
             "--max-running-requests",
             "128",
@@ -94,6 +98,8 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase, GSM8KMixin):
             "decode",
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
+            "--nccl-port",
+            cls.decode_nccl_port,
             "--tp",
             4,
             "--dp",
@@ -105,7 +111,7 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase, GSM8KMixin):
             "deepep",
             "--deepep-config",
             DEEPEP_CONFIG,
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "128",
             "--max-running-requests",
             "128",

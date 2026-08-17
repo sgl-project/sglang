@@ -22,15 +22,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.distributed import (
     divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -54,11 +57,53 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _is_cuda:
-    from sglang.jit_kernel.activation import (
-        gelu_and_mul,
-        gelu_tanh_and_mul,
-        silu_and_mul,
+    from sgl_kernel import gelu_and_mul as _sgl_gelu_and_mul
+    from sgl_kernel import gelu_tanh_and_mul as _sgl_gelu_tanh_and_mul
+    from sgl_kernel import silu_and_mul as _sgl_silu_and_mul
+
+    from sglang.kernels.ops.activation.activation import (
+        gelu_and_mul as _jit_gelu_and_mul,
     )
+    from sglang.kernels.ops.activation.activation import (
+        gelu_tanh_and_mul as _jit_gelu_tanh_and_mul,
+    )
+    from sglang.kernels.ops.activation.activation import (
+        relu2,
+    )
+    from sglang.kernels.ops.activation.activation import (
+        silu_and_mul as _jit_silu_and_mul,
+    )
+
+    # The jit act-and-mul kernel requires the per-rank hidden size to be a
+    # multiple of the vector width (kMaxVecBytes/dtype: 32B on SM100+, else 16B --
+    # RuntimeCheck "hidden size must be divisible by vector size" in
+    # kernels/jit/csrc/elementwise/activation.cuh). Route unaligned shapes to the
+    # sgl_kernel implementation (e.g. DeepSeek-V2-Lite dense 10944/8 = 1368 at
+    # tp8, 1368 % 16 != 0).
+    _jit_act_max_vec_bytes: Optional[int] = None
+
+    def _jit_act_supported(out: torch.Tensor) -> bool:
+        global _jit_act_max_vec_bytes
+        if _jit_act_max_vec_bytes is None:
+            major, _ = torch.cuda.get_device_capability()
+            _jit_act_max_vec_bytes = 32 if major >= 10 else 16
+        return out.shape[-1] % (_jit_act_max_vec_bytes // out.dtype.itemsize) == 0
+
+    def _act_and_mul(jit_fn, sgl_fn, input: torch.Tensor, out=None) -> torch.Tensor:
+        if out is None:
+            out = input.new_empty(*input.shape[:-1], input.shape[-1] // 2)
+        (jit_fn if _jit_act_supported(out) else sgl_fn)(input, out)
+        return out
+
+    def silu_and_mul(input: torch.Tensor, out=None) -> torch.Tensor:
+        return _act_and_mul(_jit_silu_and_mul, _sgl_silu_and_mul, input, out)
+
+    def gelu_and_mul(input: torch.Tensor, out=None) -> torch.Tensor:
+        return _act_and_mul(_jit_gelu_and_mul, _sgl_gelu_and_mul, input, out)
+
+    def gelu_tanh_and_mul(input: torch.Tensor, out=None) -> torch.Tensor:
+        return _act_and_mul(_jit_gelu_tanh_and_mul, _sgl_gelu_tanh_and_mul, input, out)
+
 elif _is_xpu:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:
@@ -82,10 +127,10 @@ if is_npu():
 logger = logging.getLogger(__name__)
 
 
-class SiluAndMul(MultiPlatformOp):
+class SiluAndMul(BaseFusedOp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_exec().deterministic.rl_on_policy_target is not None:
             self._forward_method = self.forward_native
         elif _use_aiter and envs.SGLANG_OPT_USE_AITER_SILU_MUL.get():
             self._forward_method = self.forward_aiter
@@ -127,13 +172,52 @@ class SiluAndMul(MultiPlatformOp):
         return out
 
     def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+            return self.forward_native(x)
+
         if not hasattr(self, "_musa_swish_glu"):
             # XXX (MUSA): nn.SwishGLU seems to have better performance than silu_and_mul on MUSA, we can switch to it for now. We can consider implementing a silu_and_mul kernel for MUSA in the future if needed.
             self._musa_swish_glu = nn.SwishGLU()
         return self._musa_swish_glu(x)
 
 
-class GeluAndMul(MultiPlatformOp):
+class SituAndMul(BaseFusedOp):
+    """SituGLU activation used by Kimi K3.
+
+    Computes beta * tanh(gate / beta) * sigmoid(gate) * up.
+    When linear_beta is set, up is softly clipped:
+        up = linear_beta * tanh(up / linear_beta).
+    """
+
+    def __init__(self, beta: float = 1.0, linear_beta: float | None = None):
+        super().__init__()
+        self.beta = float(beta)
+        self.linear_beta = None if linear_beta is None else float(linear_beta)
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        gate = x[..., :d].float()
+        up = x[..., d:].float()
+        gate = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
+        if self.linear_beta is not None:
+            up = self.linear_beta * torch.tanh(up / self.linear_beta)
+        return (gate * up).to(x.dtype)
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        from sglang.kernels.ops.kimi_k3.activation import situ_and_mul
+
+        return situ_and_mul(x, None, self.beta, self.linear_beta)
+
+    def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
+        from sgl_kernel_npu.activation.situ import situ_and_mul
+
+        return situ_and_mul(x)
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_native(x)
+
+
+class GeluAndMul(BaseFusedOp):
     def __init__(self, approximate="tanh"):
         super().__init__()
         self.approximate = approximate
@@ -180,7 +264,7 @@ class GeluAndMul(MultiPlatformOp):
         return y_npu
 
 
-class NewGELU(MultiPlatformOp):
+class NewGELU(BaseFusedOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         c = math.sqrt(2.0 / math.pi)
         return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * torch.pow(x, 3.0))))
@@ -190,18 +274,21 @@ class NewGELU(MultiPlatformOp):
         return self.forward_native(x)
 
 
-class ReLU2(nn.Module):
+class ReLU2(BaseFusedOp):
     """
     Applies the squared Rectified Linear Unit function.
     y = max(0, x)^2
     """
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         x = F.relu(x)
         return x * x
 
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return relu2(x)
 
-class QuickGELU(MultiPlatformOp):
+
+class QuickGELU(BaseFusedOp):
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(1.702 * x)
 
@@ -217,7 +304,7 @@ class QuickGELU(MultiPlatformOp):
         return torch_npu.npu_fast_gelu(x)
 
 
-class XIELU(MultiPlatformOp):
+class XIELU(BaseFusedOp):
     """
     Applies the xIELU activation function introduced in https://arxiv.org/abs/2411.13010
     If the user has installed the nickjbrowning/XIELU, we import xIELU CUDA
@@ -269,14 +356,8 @@ class XIELU(MultiPlatformOp):
                 )
                 self._xielu_cuda_fn = self._xielu_cuda
             logger.warning_once(msg)
-        except Exception as err:
+        except Exception:
             pass
-            # logger.warning_once(
-            #     "CUDA-fused xIELU not available (%s) –"
-            #     " falling back to a Python version.\n"
-            #     "For CUDA xIELU (experimental), `pip install git+https://github.com/nickjbrowning/XIELU`",
-            #     str(err),
-            # )
 
     def _xielu_python(self, x: torch.Tensor) -> torch.Tensor:
         alpha_p = nn.functional.softplus(self.alpha_p)
@@ -286,6 +367,9 @@ class XIELU(MultiPlatformOp):
             alpha_p * x * x + self.beta * x,
             (torch.expm1(torch.min(x, self.eps)) - x) * alpha_n + self.beta * x,
         )
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        return self._xielu_python(x)
 
     def _xielu_cuda(self, x: torch.Tensor) -> torch.Tensor:
         """Firewall function to prevent torch.compile from seeing .item()"""
@@ -344,7 +428,7 @@ class ScaledActivation(nn.Module):
         self.act = act_module
         self.input_is_parallel = input_is_parallel
         if input_is_parallel:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_parallel().tp_size
             intermediate_size_per_partition = divide(intermediate_size, tp_size)
         else:
             intermediate_size_per_partition = intermediate_size
@@ -361,7 +445,7 @@ class ScaledActivation(nn.Module):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         if self.input_is_parallel:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
             shard_size = param_data.shape[0]
             start_idx = tp_rank * shard_size
             loaded_weight = loaded_weight.narrow(0, start_idx, shard_size)

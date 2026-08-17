@@ -16,7 +16,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_memory, get_spec
+from sglang.srt.utils import create_device_stream, device_stream_context
 
 try:
     from lmcache.integration.sglang.multi_process_adapter import LMCacheMPConnector
@@ -46,7 +47,8 @@ class _LMCacheLoadBackMarker:
     ``match_prefix`` call in MP mode.
     """
 
-    key: RadixKey  # page-aligned key the scheduler matched on
+    key: RadixKey  # detached snapshot of the matched key (the live query key
+    # aliases the req's growing fill_ids and must not be retained)
     value_numel: int  # number of tokens already in radix at match time
 
 
@@ -60,13 +62,13 @@ class LayerTransferCounter:
 
     The KV pool calls `wait_until(layer_id)` after finishing a layer, which we
     translate into a `load_kv_layerwise(layer_id)` call on the LMCache connector
-    within the provided CUDA stream.
+    within the provided device stream.
     """
 
     def __init__(
         self,
         num_layers: int,
-        load_stream: torch.cuda.Stream,
+        load_stream: torch.Stream,
         lmc_connector: LMCacheLayerwiseConnector,
         printable: bool = False,
     ):
@@ -77,7 +79,7 @@ class LayerTransferCounter:
     def wait_until(self, layer_id: int):
         # Ensure ordering of the async loads wrt compute stream(s).
         self.load_stream.synchronize()
-        with self.load_stream:
+        with device_stream_context(self.load_stream):
             self.lmc_connector.load_kv_layerwise(layer_id)
 
 
@@ -100,14 +102,14 @@ class LMCRadixCache(RadixCache):
     def __init__(
         self,
         params: CacheInitParams,
-        model_config: Optional["ModelConfig"] = None,
+        model_config: Optional[ModelConfig] = None,
         tp_size: int = 1,
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(params)
 
-        cli_lmc_cfg = get_global_server_args().lmcache_config_file or ""
+        cli_lmc_cfg = get_memory().lmcache_config_file or ""
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         connector_kwargs = dict(
@@ -130,12 +132,13 @@ class LMCRadixCache(RadixCache):
             tp_group=tp_group.device_group if tp_group is not None else None,
         )
 
-        self.load_stream = torch.cuda.Stream()
-        self.store_stream = torch.cuda.Stream()
+        self.load_stream = create_device_stream(self.device)
+        self.store_stream = create_device_stream(self.device)
 
-        # MP is the default. To use the in-process layerwise connector,
-        # set ``self._mode = LMCacheMode.IP`` here.
-        self._mode = LMCacheMode.MP
+        # MP (multi-process) is the default. XPU defaults to IP (in-process
+        # layerwise) because the MP connector shares the KV cache via CUDA IPC
+        # (``Tensor._share_cuda_``), which is unavailable on XPU.
+        self._mode = LMCacheMode.IP if self.device.type == "xpu" else LMCacheMode.MP
         if self._mode is LMCacheMode.MP:
             if not cli_lmc_cfg:
                 raise ValueError(
@@ -216,14 +219,22 @@ class LMCRadixCache(RadixCache):
         LMCache has tokens beyond radix. Otherwise releases
         the held read locks and returns the radix-only result.
         """
-        matched = self.lmcache_connector.lookup_kv(key.token_ids, req.rid)
+        token_ids = key.raw_token_ids()
+        matched = self.lmcache_connector.lookup_kv(token_ids, req.rid)
         if matched <= value.numel():
             # Release the read locks; keep the pending session for end_session.
             self.lmcache_connector.release_pending(req.rid)
             return base_res
 
+        if token_ids is key.token_ids:
+            token_ids = token_ids[:]
         self._mp_load_back_markers[req.rid] = _LMCacheLoadBackMarker(
-            key=key,
+            key=RadixKey(
+                token_ids,
+                key.extra_key,
+                key.is_bigram,
+                cache_salt=key.cache_salt,
+            ),
             value_numel=int(value.numel()),
         )
         return MatchResult(
@@ -254,13 +265,14 @@ class LMCRadixCache(RadixCache):
         if uncached_len == 0:
             return base_res
 
+        token_ids = key.raw_token_ids()
         result = self._load_back(
             key=key,
             value_numel=int(value.numel()),
             uncached_len=uncached_len,
             last_node=last_node,
             load_fn=lambda sm, pp: self._ip_load_back(
-                token_ids=key.token_ids,
+                token_ids=token_ids,
                 value_numel=int(value.numel()),
                 slot_mapping=sm,
                 prefix_pad=pp,
@@ -346,6 +358,8 @@ class LMCRadixCache(RadixCache):
         slot_mapping[:value_numel].fill_(-1)
         slot_mapping[value_numel:].copy_(token_slots)
 
+        # Dispatch to the mode-specific loader (IP: start_load_kv, MP:
+        # retrieve_kv). Each loader manages its own load_stream context.
         num_retrieved = load_fn(slot_mapping, prefix_pad)
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
 
@@ -387,8 +401,9 @@ class LMCRadixCache(RadixCache):
         """MP non-layerwise loader: fire ``retrieve_kv`` and wait for the
         load_stream so the compute stream observes the writes.
         """
-        self.load_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.load_stream):
+        current_stream = torch.get_device_module(self.device).current_stream()
+        self.load_stream.wait_stream(current_stream)
+        with device_stream_context(self.load_stream):
             n = self.lmcache_connector.retrieve_kv(
                 LoadMetadata(
                     token_ids=marker.key.token_ids,
@@ -398,7 +413,7 @@ class LMCRadixCache(RadixCache):
                     request_id=request_id,
                 )
             )
-        torch.cuda.current_stream().wait_stream(self.load_stream)
+        current_stream.wait_stream(self.load_stream)
         return n
 
     def _ip_load_back(
@@ -414,7 +429,7 @@ class LMCRadixCache(RadixCache):
         ``start_load_kv`` enqueues the first layer's transfer; the
         ``LayerTransferCounter`` hook drives the rest during forward.
         """
-        with torch.cuda.stream(self.load_stream):
+        with device_stream_context(self.load_stream):
             return self.lmcache_connector.start_load_kv(
                 LoadMetadata(
                     token_ids=token_ids,
@@ -423,18 +438,21 @@ class LMCRadixCache(RadixCache):
                 )
             )
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ) -> None:
         """On request completion, insert device KV into radix and store to LMCache."""
 
-        super().cache_finished_req(req, is_insert=is_insert)
+        super().cache_finished_req(
+            req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
+        )
         if not is_insert:
             if self._mode is LMCacheMode.MP:
                 self._mp_load_back_markers.pop(req.rid, None)
                 self.lmcache_connector.end_session(req.rid)
             return
 
-        global_server_args = get_global_server_args()
-        topk = global_server_args.speculative_eagle_topk
+        topk = get_spec().speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
             kv_committed_len = req.kv_committed_len
@@ -450,7 +468,13 @@ class LMCRadixCache(RadixCache):
 
         # Use super() to avoid a redundant LOOKUP — we only need new_last_node from radix.
         match_result = super().match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids,
+                    req.extra_key,
+                    cache_salt=req.cache_salt,
+                )
+            )
         )
         new_last_node = match_result.last_device_node
         assert new_last_node is not None
@@ -463,14 +487,15 @@ class LMCRadixCache(RadixCache):
             offset=0,
             request_id=req.rid,
         )
-        with torch.cuda.stream(self.store_stream):
-            self.lmcache_connector.store_kv(store_md)
         if self._mode is LMCacheMode.MP:
+            self.lmcache_connector.store_kv(store_md)
             # MP store_kv blocks until the daemon's signal event fires, so the slots are safe to evict immediately.
             self._mp_load_back_markers.pop(req.rid, None)
             self.dec_lock_ref(new_last_node)
             self.lmcache_connector.end_session(req.rid)
         elif self._mode is LMCacheMode.IP:
+            with device_stream_context(self.store_stream):
+                self.lmcache_connector.store_kv(store_md)
             # Layerwise store is async on store_stream; defer the unlock to evict()'s store_stream.synchronize().
             with self._node_lock:
                 self._in_flight_nodes.append(new_last_node)

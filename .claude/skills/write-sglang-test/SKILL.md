@@ -11,15 +11,15 @@ This skill covers **how to write and register tests**. For CI pipeline internals
 
 1. **Always use `CustomTestCase`** — never raw `unittest.TestCase`. It ensures `tearDownClass` runs even when `setUpClass` fails, preventing resource leaks in CI.
 2. **`tearDownClass` must be defensive** — use `hasattr`/null checks before accessing resources (e.g. `cls.process`) that `setUpClass` may not have finished allocating.
-3. **Place tests in `test/registered/<category>/`** — except JIT kernel tests and benchmarks, which live in `python/sglang/jit_kernel/tests/` and `python/sglang/jit_kernel/benchmark/` (nested subfolders are allowed)
+3. **Place tests in `test/registered/<category>/`** — including JIT kernel tests and benchmarks, which live in `test/registered/jit/` and `test/registered/jit/benchmark/` (nested subfolders are allowed)
 4. **Reuse server fixtures** — inherit from `DefaultServerBase` or write `setUpClass`/`tearDownClass` with `popen_launch_server`
 5. **Prefer mock over real server** — when testing logic that doesn't need a server / engine launch (middleware, request routing, config validation, argument parsing), use `unittest.mock.patch` / `MagicMock` and place tests in `test/registered/unit/`. Only launch a real server when the test genuinely needs inference results or server lifecycle behavior.
 
-JIT kernel exception:
-- If the task is adding or updating code under `python/sglang/jit_kernel/`, prefer the `add-jit-kernel` skill first.
-- JIT kernel correctness tests use `python/sglang/jit_kernel/tests/**/test_*.py`.
-- JIT kernel benchmarks use `python/sglang/jit_kernel/benchmark/**/bench_*.py`.
-- Those files are still executed by `test/run_suite.py`, but through dedicated kernel suites rather than `test/registered/`.
+JIT kernel notes:
+- If the task is adding or updating code under `python/sglang/kernels/jit/`, prefer the `add-jit-kernel` skill first.
+- JIT kernel correctness tests use `test/registered/jit/**/test_*.py`.
+- JIT kernel benchmarks use `test/registered/jit/benchmark/**/bench_*.py`.
+- Those files are executed by `test/run_suite.py` through dedicated kernel suites (`base-b-kernel-*`); a `register_*_ci(...)` call placed under `python/sglang/` is rejected by the `check-no-registered-tests-in-package` pre-commit hook.
 
 ---
 
@@ -50,8 +50,13 @@ Defined in `python/sglang/test/test_utils.py`:
 
 ### Naming Conventions
 
-- **Suite**: `base-{a,b,c}-test-{gpu_count}-gpu-{hardware}` (e.g., `base-b-test-1-gpu-small`)
-- **CI runner**: `{gpu_count}-gpu-{hardware}` (e.g., `1-gpu-5090`, `4-gpu-h100`, `8-gpu-h200`)
+A per-commit suite name is **generated** from registration metadata as `{stage}-test-{runner_config}` — you don't hand-write it:
+
+- **`stage`** — the CI stage (e.g. `base-b`, `base-b-kernel-unit`, `base-c`).
+- **`runner_config`** — a runner-pool key from `scripts/ci/runner_configs.yml`, which maps it to the physical runner label (so `1-gpu-large` runs on `1-gpu-h100`). AMD/NPU use their own keys (e.g. `amd`).
+- **Suite** — `register_cuda_ci(stage="base-b", runner_config="1-gpu-small")` → `base-b-test-1-gpu-small`, the name you pass to `run_suite.py --suite`. The `-test-` is just the connector; never put it in `register_*_ci`.
+
+> CUDA nightly uses the same shape with `stage="nightly"` (e.g. `stage="nightly", runner_config="1-gpu-large"` → `nightly-test-1-gpu-large`) and **no** `nightly=True` — the stage name carries the cadence, and setting the flag makes the test silently never run. Legacy single-string `suite=` is left only for `stress` and some AMD/CPU/NPU pools.
 
 ### All CI Suites
 
@@ -65,10 +70,10 @@ Defined in `python/sglang/test/test_utils.py`:
 | `base-b-test-1-gpu-large` | `1-gpu-h100` | Tests that need H100-class memory or kernels (e.g. FA3) |
 | `base-b-test-2-gpu-large` | `2-gpu-h100` | Two-GPU correctness and parallelism (TP/PP) on H100 |
 | `base-b-test-4-gpu-b200` | `4-gpu-b200` | Early Blackwell coverage (SM100+ paths) on four GPUs |
-| `base-b-kernel-unit-1-gpu-large` | `1-gpu-h100` | JIT kernel correctness tests under `python/sglang/jit_kernel/tests/` |
-| `base-b-kernel-unit-1-gpu-b200` | `4-gpu-b200` | JIT kernel correctness tests for Blackwell / SM100-specific paths |
-| `base-b-kernel-unit-8-gpu-h200` | `8-gpu-h200` | Multi-GPU JIT kernel correctness tests under `python/sglang/jit_kernel/tests/` |
-| `base-b-kernel-benchmark-1-gpu-large` | `1-gpu-h100` | JIT kernel benchmark files under `python/sglang/jit_kernel/benchmark/` |
+| `base-b-kernel-unit-test-1-gpu-large` | `1-gpu-h100` | JIT kernel correctness tests under `test/registered/jit/` |
+| `base-b-kernel-unit-test-4-gpu-b200` | `4-gpu-b200` | JIT kernel correctness tests for Blackwell / SM100-specific paths |
+| `base-b-kernel-unit-test-8-gpu-h200` | `8-gpu-h200` | Multi-GPU JIT kernel correctness tests under `test/registered/jit/` |
+| `base-b-kernel-benchmark-test-1-gpu-large` | `1-gpu-h100` | JIT kernel benchmark files under `test/registered/jit/benchmark/` |
 | `base-c-test-4-gpu-h100` | `4-gpu-h100` | Large 4-GPU H100 integration and scaling tests |
 | `base-c-test-8-gpu-h200` | `8-gpu-h200` | Large 8-GPU H200 runs for big models and parallelism |
 | `base-c-test-8-gpu-h20` | `8-gpu-h20` | Large 8-GPU H20 runs for big models |
@@ -108,13 +113,14 @@ Defined in `python/sglang/test/test_utils.py`:
 
 #### Nightly
 
-Nightly suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](../../../test/run_suite.py). They run via `nightly-test-nvidia.yml`, `nightly-test-amd.yml`, and `nightly-test-npu.yml`, not `pr-test.yml`. Examples:
+Nightly suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](../../../test/run_suite.py). They run via `nightly-test-nvidia.yml`, `nightly-test-amd.yml`, and `nightly-test-npu.yml`, not `pr-test.yml`.
 
-- `nightly-1-gpu` (CUDA)
-- `nightly-kernel-1-gpu` (CUDA, JIT kernel full grids)
-- `nightly-kernel-8-gpu-h200` (CUDA, multi-GPU JIT kernel nightly)
-- `nightly-8-gpu-h200` (CUDA)
-- `nightly-eval-vlm-2-gpu` (CUDA)
+CUDA nightly suites are named `nightly-test-{runner_config}` — one per machine type, holding everything that runs nightly on it. There is no per-purpose split (kernel / eval / perf / precision all share their machine's suite); `auto_partition` splits the work. Examples:
+
+- `nightly-test-1-gpu-large` (CUDA)
+- `nightly-test-2-gpu-large` (CUDA)
+- `nightly-test-8-gpu-h200` (CUDA)
+- `nightly-test-4-gpu-gb300` (CUDA)
 - `nightly-amd` (AMD)
 - `nightly-amd-8-gpu-mi35x` (AMD)
 - `nightly-1-npu-a3` (NPU)
@@ -132,9 +138,9 @@ Use the lightest suite that meets your test's needs:
 - **No GPU required** → `base-a-test-cpu`
 - **Most small GPU tests** → `base-b-test-1-gpu-small` (default choice)
 - **Need H100 memory or Hopper features** → `base-b-test-1-gpu-large`
-- **JIT kernel correctness** → `base-b-kernel-unit-1-gpu-large`
-- **JIT kernel correctness for B200 / SM100 paths** → `base-b-kernel-unit-1-gpu-b200`
-- **JIT kernel benchmarks** → `base-b-kernel-benchmark-1-gpu-large`
+- **JIT kernel correctness** → `base-b-kernel-unit-test-1-gpu-large`
+- **JIT kernel correctness for B200 / SM100 paths** → `base-b-kernel-unit-test-4-gpu-b200`
+- **JIT kernel benchmarks** → `base-b-kernel-benchmark-test-1-gpu-large`
 - **Multi-GPU** → only when the test actually needs multiple GPUs
 
 ---
@@ -325,8 +331,8 @@ register_cuda_ci(est_time=80, suite="base-b-test-1-gpu-small")
 # Per-commit test (large 1-gpu, runs on H100)
 register_cuda_ci(est_time=120, suite="base-b-test-1-gpu-large")
 
-# Nightly-only test
-register_cuda_ci(est_time=200, suite="nightly-1-gpu", nightly=True)
+# Nightly-only test (same shape as per-commit, stage is just "nightly")
+register_cuda_ci(est_time=200, stage="nightly", runner_config="1-gpu-large")
 
 # Multi-backend test (only when testing backend-specific code paths)
 register_cuda_ci(est_time=80, suite="base-a-test-1-gpu-small")
@@ -340,7 +346,7 @@ register_cuda_ci(est_time=80, suite="base-b-test-1-gpu-small", disabled="flaky -
 Parameters:
 - `est_time`: estimated runtime in seconds (used for CI partitioning)
 - `suite`: which CI suite to run in (see suite tables above)
-- `nightly=True`: for nightly-only tests (default `False` = per-commit)
+- `nightly=True`: legacy cadence flag, for non-CUDA nightly suites only. CUDA nightly uses `stage="nightly"` and must leave this unset
 - `disabled="reason"`: temporarily disable with explanation
 
 **Key principle**: Only add `register_amd_ci` / `register_npu_ci` when the test exercises backend-specific code paths. Common E2E tests just need `register_cuda_ci` — duplicating across backends wastes CI time.
@@ -352,20 +358,20 @@ JIT kernel files live outside `test/registered/` but still use registration:
 ```python
 from sglang.test.ci.ci_register import register_cuda_ci
 
-# Correctness tests in python/sglang/jit_kernel/tests/
-register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-b200")
-register_cuda_ci(est_time=120, suite="base-b-kernel-unit-8-gpu-h200")
+# Correctness tests in test/registered/jit/
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="8-gpu-h200")
 
-# Benchmarks in python/sglang/jit_kernel/benchmark/
-register_cuda_ci(est_time=6, suite="base-b-kernel-benchmark-1-gpu-large")
+# Benchmarks in test/registered/jit/benchmark/
+register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
 
-# Optional nightly registration
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
-register_cuda_ci(est_time=120, suite="nightly-kernel-8-gpu-h200", nightly=True)
+# Optional nightly registration — same form, stage is just "nightly"
+register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="nightly", runner_config="8-gpu-h200")
 ```
 
-Keep `est_time` and `suite` as **literal values** — `run_suite.py` collects them by AST parsing
+Every call generates a suite named `{stage}-test-{runner_config}`, e.g. `base-b-kernel-unit-test-1-gpu-large` and `nightly-test-1-gpu-large`. Keep `est_time`, `stage`, `runner_config`, and `suite` as **literal values** — `run_suite.py` collects them by AST parsing.
 
 ---
 
@@ -386,14 +392,14 @@ test/
 ├── manual/              # Non-CI: debugging, one-off, manual verification
 └── run_suite.py         # CI runner (scans registered/ plus jit_kernel test/benchmark files)
 
-python/sglang/jit_kernel/
+python/sglang/kernels/jit/
 ├── tests/               # JIT kernel correctness tests (CI-discovered by test/run_suite.py)
 └── benchmark/           # JIT kernel benchmarks (CI-discovered by test/run_suite.py)
 ```
 
 **Decision rule** (see also `test/registered/README.md`):
 - Component logic, no server → `registered/unit/`
-- JIT kernel correctness / benchmarks → `python/sglang/jit_kernel/tests/` or `python/sglang/jit_kernel/benchmark/`
+- JIT kernel correctness / benchmarks → `test/registered/jit/` or `test/registered/jit/benchmark/`
 - Other kernel correctness → `registered/kernels/`
 - Server needed → `registered/<category>/`
 - Local debugging → `manual/`
@@ -437,8 +443,8 @@ Before submitting a test:
 
 - [ ] Inherits from `CustomTestCase` (not `unittest.TestCase`)
 - [ ] Has `register_*_ci(...)` call at module level
-- [ ] Placed in `test/registered/<category>/`, unless this is a JIT kernel test/benchmark
-- [ ] JIT kernel work: files live in `python/sglang/jit_kernel/tests/` or `python/sglang/jit_kernel/benchmark/`
+- [ ] Placed in `test/registered/<category>/` (JIT kernel test/benchmark → `test/registered/jit/` or `test/registered/jit/benchmark/`)
+- [ ] JIT kernel work: test files live in `test/registered/jit/`; only test-only helpers stay under `python/sglang/kernels/jit/`
 - [ ] Backend-independent tests: `register_cuda_ci` only + smallest model
 - [ ] Logic that doesn't need a server / engine launch → unit test in `registered/unit/` (see Unit Tests section)
 - [ ] `setUpClass` launches server, `tearDownClass` kills it (if server-based)
