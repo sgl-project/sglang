@@ -23,15 +23,17 @@ from sglang.srt.observability.metrics_collector import (
     RadixCacheMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.runtime_context import get_observability
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import HiCacheController
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+    from sglang.srt.mem_cache.unified_cache.components.tree_component import (
         ComponentType,
     )
 
@@ -83,6 +85,7 @@ class InsertResult:
     last_device_node: Any = None
     mamba_exist: bool = False
     inserted_host_node: Any = None
+    host_insert_dropped: bool = False
     # Controller-applied actions from the non-stepped channels (e.g. insert_host); the stepped insert emits via InsertStepResult.actions.
     cache_actions: list[CacheAction | ComponentAction] = dataclasses.field(
         default_factory=list
@@ -231,14 +234,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     metrics_collector: Optional[RadixCacheMetricsCollector] = (
         None  # metrics collector for the cache
     )
+    cache_controller: Optional[HiCacheController] = None
 
     def init_metrics_collector(self):
         from sglang.srt.runtime_context import get_server_args
 
         server_args = get_server_args()
         labels = {"cache_type": self.__class__.__name__}
-        if server_args.extra_metric_labels:
-            labels.update(server_args.extra_metric_labels)
+        if get_observability().extra_metric_labels:
+            labels.update(get_observability().extra_metric_labels)
         radix_cache_cls = resolve_collector_class(
             server_args,
             STAT_LOGGER_ROLE_RADIX_CACHE,
@@ -363,14 +367,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
-    def flush_write_through_acks(self) -> None:
-        """Release lock_ref on radix-tree nodes whose write-through has completed.
-
-        Lightweight operation that only processes finished write acks.
-        No-op for caches without hierarchical write-through support.
-        """
-        pass
-
     def check_hicache_events(self) -> Any:
         """
         Check HiCache related activities to update radix tree and synchronize across TP workers if needed
@@ -382,6 +378,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_swa(self) -> bool:
         return False
+
+    def swa_retain_floor(self, req) -> int | None:
+        # A match lands on a state checkpoint rather than on the tail, so a cache
+        # that pairs SWA with mamba/conv checkpoints has to keep the window behind
+        # the last checkpoint. Those caches override this. Everyone else has
+        # nothing deeper than the tail to protect.
+        return None
 
     def swa_reprefill_tail_tokens(self) -> int:
         # Only the unified_kv compress-only HiCache layout needs to hold back a

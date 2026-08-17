@@ -6,7 +6,6 @@ from typing import Dict, List, Optional, Tuple, Union
 from urllib.parse import unquote, urlparse
 
 import pybase64
-import requests
 import torch
 
 from sglang.srt.managers.schedule_batch import (
@@ -21,6 +20,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.utils.common import download_remote_media
 
 
 class MossVLImageProcessor(SGLangBaseProcessor):
@@ -234,7 +234,15 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             device=device,
         )
 
-        if len(flat_eff_h) == 0 or len(image_token_indices) == 0:
+        frame_count = len(flat_eff_h)
+        image_token_count = len(image_token_indices)
+        if frame_count != image_token_count:
+            raise ValueError(
+                "Moss-VL vision metadata must map one-to-one to image tokens: "
+                f"found {frame_count} frame(s) and {image_token_count} token(s)"
+            )
+
+        if frame_count == 0:
             rope_deltas = (
                 position_ids.max(dim=0).values.max(dim=-1).values
                 + 1
@@ -242,18 +250,11 @@ class MossVLImageProcessor(SGLangBaseProcessor):
             )
             return vision_pos_ids, position_ids, rope_deltas
 
-        num_matches = min(len(flat_eff_h), len(image_token_indices))
-        flat_eff_h = torch.tensor(
-            flat_eff_h[:num_matches], device=device, dtype=torch.long
-        )
-        flat_eff_w = torch.tensor(
-            flat_eff_w[:num_matches], device=device, dtype=torch.long
-        )
-        flat_vis_starts = torch.tensor(
-            flat_vis_starts[:num_matches], device=device, dtype=torch.long
-        )
+        flat_eff_h = torch.tensor(flat_eff_h, device=device, dtype=torch.long)
+        flat_eff_w = torch.tensor(flat_eff_w, device=device, dtype=torch.long)
+        flat_vis_starts = torch.tensor(flat_vis_starts, device=device, dtype=torch.long)
 
-        target_indices = image_token_indices[:num_matches]
+        target_indices = image_token_indices
         batch_rows = target_indices[:, 0]
         text_cols = target_indices[:, 1]
 
@@ -425,13 +426,10 @@ class MossVLImageProcessor(SGLangBaseProcessor):
 
         if value.startswith(("http://", "https://")):
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-            response = requests.get(value, stream=True, timeout=timeout)
-            response.raise_for_status()
+            content = download_remote_media(value, timeout=timeout)
             suffix = os.path.splitext(urlparse(value).path)[1] or ".mp4"
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
+                f.write(content)
                 return f.name, f.name
 
         if value.startswith("data:"):

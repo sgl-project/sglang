@@ -341,10 +341,14 @@ async def _save_url_image_to_path(image_url: str, target_path: str) -> str:
 async def process_generation_batch(
     scheduler_client: AsyncSchedulerClient,
     batch,
+    *,
+    scheduler_batches=None,
 ) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
     with trace_req(batch.trace_ctx), log_generation_timer(logger, batch.prompt):
-        result = await scheduler_client.forward([batch])
+        result = await scheduler_client.forward(
+            scheduler_batches if scheduler_batches is not None else [batch]
+        )
 
         if (
             result.output is None
@@ -429,6 +433,21 @@ def add_common_data_to_response(
 
     if result.metrics and result.metrics.total_duration_s > 0:
         response["inference_time_s"] = result.metrics.total_duration_s
+
+    if result.usage is not None:
+        usage = dict(result.usage)
+        cached_tokens = usage.pop("cached_tokens", None)
+        enable_cache_report = getattr(
+            get_global_server_args(), "enable_cache_report", False
+        )
+        if (
+            enable_cache_report
+            and cached_tokens is not None
+            and int(cached_tokens) > 0
+            and usage.get("prompt_tokens_details") is None
+        ):
+            usage["prompt_tokens_details"] = {"cached_tokens": int(cached_tokens)}
+        response["usage"] = usage
 
     response["id"] = request_id
 
