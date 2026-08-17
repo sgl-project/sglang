@@ -8,7 +8,6 @@ from sglang.kernels.ops.speculative.topk1 import (
     TargetVerifyTopk1Output,
     target_verify_topk1_is_supported,
     target_verify_topk1_postprocess,
-    target_verify_topk1_postprocess_packed,
 )
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import is_cuda
@@ -21,15 +20,6 @@ if TYPE_CHECKING:
 
 
 _is_cuda = is_cuda()
-
-
-def get_eagle_verify_tp_group():
-    """Return the group whose rank-0 verify decision is canonical."""
-    from sglang.srt.distributed import get_tp_group
-    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-    from sglang.srt.runtime_context import get_parallel
-
-    return get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
 
 
 def prepare_eagle_verify_logits(
@@ -81,7 +71,7 @@ def maybe_eagle_sample_target_verify_topk1(
     logits_output: LogitsProcessorOutput,
     grammar_mask: Optional[GrammarMask] = None,
 ) -> Optional[TargetVerifyTopk1Output]:
-    """Run the CUDA topk=1 verify fast path when its semantics apply."""
+    """Run the rank-local CUDA topk=1 fast path when its semantics apply."""
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_METHOD,
@@ -136,23 +126,6 @@ def maybe_eagle_sample_target_verify_topk1(
         )
         use_real_draft_tokens = SIMULATE_ACC_TOKEN_MODE == "real-draft-token"
 
-    tp_group = get_eagle_verify_tp_group()
-    if tp_group.world_size > 1:
-        output, packed_buffer = target_verify_topk1_postprocess_packed(
-            logits,
-            candidates,
-            verify_input.retrieve_index,
-            verify_input.retrieve_next_token,
-            batch.seq_lens,
-            num_simulated_accept_tokens=num_simulated_accept_tokens,
-            use_real_draft_tokens=use_real_draft_tokens,
-        )
-        # Every field is a typed view into packed_buffer. Synchronizing the
-        # backing allocation before returning makes all derived metadata, not
-        # only the core verify decision, canonical before downstream mutation.
-        tp_group.broadcast(packed_buffer, src=0)
-        return output
-
     return target_verify_topk1_postprocess(
         logits,
         candidates,
@@ -165,7 +138,6 @@ def maybe_eagle_sample_target_verify_topk1(
 
 
 __all__ = [
-    "get_eagle_verify_tp_group",
     "maybe_eagle_sample_target_verify_topk1",
     "prepare_eagle_verify_logits",
 ]

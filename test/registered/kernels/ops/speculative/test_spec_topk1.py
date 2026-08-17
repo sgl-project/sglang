@@ -11,7 +11,6 @@ from sglang.kernels.ops.speculative.topk1 import (
     TargetVerifyTopk1Output,
     draft_topk1_postprocess,
     target_verify_topk1_postprocess,
-    target_verify_topk1_postprocess_packed,
 )
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.test.test_utils import CustomTestCase
@@ -400,75 +399,6 @@ class TestSpecTopk1Triton(CustomTestCase):
                         )
 
                         _assert_target_verify_matches_eager(fused, eager)
-
-    def test_target_verify_packed_buffer_canonicalizes_every_output(self):
-        batch_size, num_tokens, vocab_size = 3, 4, 64
-        target_ids_rank0 = (
-            torch.arange(
-                batch_size * num_tokens, dtype=torch.long, device=self.device
-            ).view(batch_size, num_tokens)
-            + 5
-        )
-        target_ids_rank1 = (target_ids_rank0 + 17) % vocab_size
-
-        def make_logits(target_ids):
-            logits = torch.full(
-                (batch_size * num_tokens, vocab_size),
-                -100.0,
-                dtype=torch.float32,
-                device=self.device,
-            )
-            logits.scatter_(1, target_ids.reshape(-1, 1), 100.0)
-            return logits
-
-        candidates = torch.zeros(
-            (batch_size, num_tokens), dtype=torch.long, device=self.device
-        )
-        candidates[:, 1:] = target_ids_rank0[:, :-1]
-        retrieve_index, retrieve_next_token = _make_topk1_chain(
-            batch_size, num_tokens, self.device
-        )
-
-        for seq_lens_dtype in (torch.int32, torch.int64):
-            with self.subTest(seq_lens_dtype=seq_lens_dtype):
-                seq_lens = torch.arange(
-                    40,
-                    40 + batch_size,
-                    dtype=seq_lens_dtype,
-                    device=self.device,
-                )
-                rank0, rank0_buffer = target_verify_topk1_postprocess_packed(
-                    make_logits(target_ids_rank0),
-                    candidates,
-                    retrieve_index,
-                    retrieve_next_token,
-                    seq_lens,
-                )
-                rank1, rank1_buffer = target_verify_topk1_postprocess_packed(
-                    make_logits(target_ids_rank1),
-                    candidates,
-                    retrieve_index,
-                    retrieve_next_token,
-                    seq_lens,
-                )
-
-                self.assertFalse(
-                    torch.equal(rank0.num_correct_drafts, rank1.num_correct_drafts)
-                )
-                for output, packed_buffer in (
-                    (rank0, rank0_buffer),
-                    (rank1, rank1_buffer),
-                ):
-                    packed_storage = packed_buffer.untyped_storage().data_ptr()
-                    for field in output._fields:
-                        self.assertEqual(
-                            getattr(output, field).untyped_storage().data_ptr(),
-                            packed_storage,
-                        )
-
-                # This is the exact in-place effect of the TP rank-0 broadcast.
-                rank1_buffer.copy_(rank0_buffer)
-                _assert_target_verify_matches_eager(rank1, rank0)
 
     def test_target_verify_leftmost_ties_and_all_negative_infinity(self):
         batch_size, num_tokens, vocab_size = 1, 3, 8193

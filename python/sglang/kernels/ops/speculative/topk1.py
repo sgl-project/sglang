@@ -479,99 +479,28 @@ def target_verify_topk1_is_supported(
     )
 
 
-def _allocate_target_verify_topk1_output(
-    batch_size: int,
-    num_draft_tokens: int,
-    seq_lens: torch.Tensor,
-    *,
-    packed: bool,
-) -> tuple[TargetVerifyTopk1Output, torch.Tensor | None]:
-    total_rows = batch_size * num_draft_tokens
-    device = seq_lens.device
-    if not packed:
-        output = TargetVerifyTopk1Output(
-            predict=torch.empty((total_rows,), dtype=torch.int32, device=device),
-            num_correct_drafts=torch.empty(
-                (batch_size,), dtype=torch.int32, device=device
-            ),
-            accept_lens=torch.empty((batch_size,), dtype=torch.int32, device=device),
-            accept_index=torch.empty(
-                (batch_size, num_draft_tokens),
-                dtype=torch.int32,
-                device=device,
-            ),
-            bonus_tokens=torch.empty((batch_size,), dtype=torch.int32, device=device),
-            new_seq_lens=torch.empty_like(seq_lens),
-            select_index=torch.empty((batch_size,), dtype=torch.int64, device=device),
-            draft_tokens=torch.empty((total_rows,), dtype=torch.int64, device=device),
-        )
-        return output, None
-
-    # Store every semantic output in one aligned allocation so TP can make the
-    # complete rank-0 result canonical with one collective and no pack/unpack
-    # kernels. The int32 prefix is rounded up to an int64 boundary; at most one
-    # unused int32 slot separates the typed regions.
-    int32_sizes = [
-        total_rows,  # predict
-        batch_size,  # num_correct_drafts
-        batch_size,  # accept_lens
-        total_rows,  # accept_index
-        batch_size,  # bonus_tokens
-    ]
-    int64_sizes = [
-        batch_size,  # select_index
-        total_rows,  # draft_tokens
-    ]
-    seq_lens_is_int32 = seq_lens.dtype == torch.int32
-    if seq_lens_is_int32:
-        int32_sizes.append(batch_size)  # new_seq_lens
-    else:
-        int64_sizes.insert(0, batch_size)  # new_seq_lens
-
-    num_int32 = sum(int32_sizes)
-    num_int32_words = (num_int32 + 1) // 2
-    packed_buffer = torch.empty(
-        (num_int32_words + sum(int64_sizes),),
-        dtype=torch.int64,
-        device=device,
-    )
-    int32_storage = packed_buffer[:num_int32_words].view(torch.int32)[:num_int32]
-    int64_storage = packed_buffer[num_int32_words:]
-
-    int32_views = int32_storage.split(int32_sizes)
-    predict, num_correct_drafts, accept_lens, accept_index, bonus_tokens = int32_views[
-        :5
-    ]
-    if seq_lens_is_int32:
-        new_seq_lens = int32_views[5]
-        select_index, draft_tokens = int64_storage.split(int64_sizes)
-    else:
-        new_seq_lens, select_index, draft_tokens = int64_storage.split(int64_sizes)
-
-    output = TargetVerifyTopk1Output(
-        predict=predict,
-        num_correct_drafts=num_correct_drafts,
-        accept_lens=accept_lens,
-        accept_index=accept_index.view(batch_size, num_draft_tokens),
-        bonus_tokens=bonus_tokens,
-        new_seq_lens=new_seq_lens,
-        select_index=select_index,
-        draft_tokens=draft_tokens,
-    )
-    return output, packed_buffer
-
-
-def _target_verify_topk1_postprocess(
+def target_verify_topk1_postprocess(
     next_token_logits: torch.Tensor,
     candidates: torch.Tensor,
     retrieve_index: torch.Tensor,
     retrieve_next_token: torch.Tensor,
     seq_lens: torch.Tensor,
     *,
-    packed: bool,
-    num_simulated_accept_tokens: int,
-    use_real_draft_tokens: bool,
-) -> tuple[TargetVerifyTopk1Output, torch.Tensor | None]:
+    num_simulated_accept_tokens: int = 0,
+    use_real_draft_tokens: bool = False,
+) -> TargetVerifyTopk1Output:
+    """Reduce target logits and finalize greedy topk=1 verification.
+
+    This reuses the split argmax reduction used by draft decoding, then folds
+    chain verification and the small tensors consumed by draft-extend into one
+    finalizer launch. The caller is responsible for selecting this CUDA-only
+    fast path only after penalties, grammar masks, and NaN sanitization.
+
+    When ``num_simulated_accept_tokens`` is positive, the same finalizer also
+    overrides natural verification with that forced acceptance length.
+    ``use_real_draft_tokens`` selects real draft/target tokens instead of the
+    fixed simulation token.
+    """
     assert target_verify_topk1_is_supported(
         next_token_logits,
         candidates,
@@ -584,14 +513,22 @@ def _target_verify_topk1_postprocess(
     assert isinstance(num_simulated_accept_tokens, int)
     assert 0 <= num_simulated_accept_tokens <= num_draft_tokens
     assert num_simulated_accept_tokens > 0 or not use_real_draft_tokens
-    output, packed_buffer = _allocate_target_verify_topk1_output(
-        batch_size,
-        num_draft_tokens,
-        seq_lens,
-        packed=packed,
+    total_rows = next_token_logits.shape[0]
+    device = next_token_logits.device
+    output = TargetVerifyTopk1Output(
+        predict=torch.empty((total_rows,), dtype=torch.int32, device=device),
+        num_correct_drafts=torch.empty((batch_size,), dtype=torch.int32, device=device),
+        accept_lens=torch.empty((batch_size,), dtype=torch.int32, device=device),
+        accept_index=torch.empty(
+            (batch_size, num_draft_tokens), dtype=torch.int32, device=device
+        ),
+        bonus_tokens=torch.empty((batch_size,), dtype=torch.int32, device=device),
+        new_seq_lens=torch.empty_like(seq_lens),
+        select_index=torch.empty((batch_size,), dtype=torch.int64, device=device),
+        draft_tokens=torch.empty((total_rows,), dtype=torch.int64, device=device),
     )
     if batch_size == 0:
-        return output, packed_buffer
+        return output
 
     num_splits, partial_vals, partial_indices = _launch_draft_topk1_partials(
         next_token_logits
@@ -620,71 +557,7 @@ def _target_verify_topk1_postprocess(
         SPLIT_BLOCK=triton.next_power_of_2(num_splits),
         num_warps=4,
     )
-    return output, packed_buffer
-
-
-def target_verify_topk1_postprocess(
-    next_token_logits: torch.Tensor,
-    candidates: torch.Tensor,
-    retrieve_index: torch.Tensor,
-    retrieve_next_token: torch.Tensor,
-    seq_lens: torch.Tensor,
-    *,
-    num_simulated_accept_tokens: int = 0,
-    use_real_draft_tokens: bool = False,
-) -> TargetVerifyTopk1Output:
-    """Reduce target logits and finalize greedy topk=1 verification.
-
-    This reuses the split argmax reduction used by draft decoding, then folds
-    chain verification and the small tensors consumed by draft-extend into one
-    finalizer launch. The caller is responsible for selecting this CUDA-only
-    fast path only after penalties, grammar masks, and NaN sanitization.
-
-    When ``num_simulated_accept_tokens`` is positive, the same finalizer also
-    overrides natural verification with that forced acceptance length.
-    ``use_real_draft_tokens`` selects real draft/target tokens instead of the
-    fixed simulation token.
-    """
-    output, _ = _target_verify_topk1_postprocess(
-        next_token_logits,
-        candidates,
-        retrieve_index,
-        retrieve_next_token,
-        seq_lens,
-        packed=False,
-        num_simulated_accept_tokens=num_simulated_accept_tokens,
-        use_real_draft_tokens=use_real_draft_tokens,
-    )
     return output
-
-
-def target_verify_topk1_postprocess_packed(
-    next_token_logits: torch.Tensor,
-    candidates: torch.Tensor,
-    retrieve_index: torch.Tensor,
-    retrieve_next_token: torch.Tensor,
-    seq_lens: torch.Tensor,
-    *,
-    num_simulated_accept_tokens: int = 0,
-    use_real_draft_tokens: bool = False,
-) -> tuple[TargetVerifyTopk1Output, torch.Tensor]:
-    """Finalize into typed views backed by one TP-broadcastable allocation.
-
-    The simulation arguments have the same semantics as
-    :func:`target_verify_topk1_postprocess` and are applied before broadcast.
-    """
-    output, packed_buffer = _target_verify_topk1_postprocess(
-        next_token_logits,
-        candidates,
-        retrieve_index,
-        retrieve_next_token,
-        seq_lens,
-        packed=True,
-        num_simulated_accept_tokens=num_simulated_accept_tokens,
-        use_real_draft_tokens=use_real_draft_tokens,
-    )
-    assert packed_buffer is not None
-    return output, packed_buffer
 
 
 def draft_extend_topk1_postprocess(

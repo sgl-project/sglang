@@ -16,11 +16,8 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 )
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
-from sglang.srt.runtime_context import get_spec
-from sglang.srt.speculative.eagle_target_verify import (
-    get_eagle_verify_tp_group,
-    prepare_eagle_verify_logits,
-)
+from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.speculative.eagle_target_verify import prepare_eagle_verify_logits
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -662,6 +659,8 @@ def eagle_sample(
     """
     import torch.nn.functional as F
 
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
         SIMULATE_ACC_TOKEN_MODE,
@@ -797,7 +796,9 @@ def eagle_sample(
     # tensors feeding this point can make one rank accept a different number of
     # drafts, which desynchronizes the committed seq_lens and deadlocks the next
     # TP collective. Broadcast from rank 0 to ensure consistency.
-    tp_group = get_eagle_verify_tp_group()
+    tp_group = (
+        get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
+    )
     if tp_group.world_size > 1:
         tp_group.broadcast(predict, src=0)
         tp_group.broadcast(accept_index, src=0)

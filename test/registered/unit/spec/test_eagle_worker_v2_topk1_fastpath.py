@@ -17,7 +17,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_target_verify import (
-    get_eagle_verify_tp_group,
     maybe_eagle_sample_target_verify_topk1,
 )
 from sglang.srt.speculative.eagle_utils import organize_draft_results
@@ -232,42 +231,6 @@ class TestTargetVerifyFusionOwnership(CustomTestCase):
         )
 
 
-class TestEagleVerifyTpGroupSelection(CustomTestCase):
-    def test_uses_model_tp_group_without_dp_attention(self):
-        tp_group = object()
-        with (
-            patch(
-                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
-                return_value=False,
-            ),
-            patch(
-                "sglang.srt.distributed.get_tp_group", return_value=tp_group
-            ) as get_tp_group,
-        ):
-            actual = get_eagle_verify_tp_group()
-
-        self.assertIs(actual, tp_group)
-        get_tp_group.assert_called_once_with()
-
-    def test_uses_attention_tp_group_with_dp_attention(self):
-        attn_tp_group = object()
-        with (
-            patch(
-                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
-                return_value=True,
-            ),
-            patch("sglang.srt.distributed.get_tp_group") as get_tp_group,
-            patch(
-                "sglang.srt.runtime_context.get_parallel",
-                return_value=SimpleNamespace(attn_tp_group=attn_tp_group),
-            ),
-        ):
-            actual = get_eagle_verify_tp_group()
-
-        self.assertIs(actual, attn_tp_group)
-        get_tp_group.assert_not_called()
-
-
 @unittest.skipUnless(
     is_cuda() and torch.cuda.is_available(), "NVIDIA CUDA is required for this test."
 )
@@ -280,13 +243,9 @@ class TestTargetVerifyTopk1Selection(CustomTestCase):
             self.device
         )
 
-        with patch(
-            "sglang.srt.speculative.eagle_target_verify.get_eagle_verify_tp_group",
-            return_value=SimpleNamespace(world_size=1),
-        ):
-            result = maybe_eagle_sample_target_verify_topk1(
-                verify_input, batch, logits_output
-            )
+        result = maybe_eagle_sample_target_verify_topk1(
+            verify_input, batch, logits_output
+        )
 
         self.assertIsNotNone(result)
         torch.testing.assert_close(
@@ -302,32 +261,34 @@ class TestTargetVerifyTopk1Selection(CustomTestCase):
             atol=0,
         )
 
-    def test_tp_uses_one_packed_broadcast_for_all_outputs(self):
+    def test_fast_path_ignores_tp_broadcast(self):
         verify_input, batch, logits_output = _make_target_verify_selection_case(
             self.device
         )
         tp_group = SimpleNamespace(world_size=2, broadcast=MagicMock())
 
-        with patch(
-            "sglang.srt.speculative.eagle_target_verify.get_eagle_verify_tp_group",
-            return_value=tp_group,
+        with (
+            patch(
+                "sglang.srt.distributed.get_tp_group", return_value=tp_group
+            ) as get_tp_group,
+            patch(
+                "sglang.srt.speculative.eagle_utils.get_parallel",
+                return_value=SimpleNamespace(attn_tp_group=tp_group),
+            ) as get_parallel,
+            patch(
+                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                return_value=True,
+            ) as is_dp_attention_enabled,
         ):
             result = maybe_eagle_sample_target_verify_topk1(
                 verify_input, batch, logits_output
             )
 
-        tp_group.broadcast.assert_called_once()
-        packed_buffer = tp_group.broadcast.call_args.args[0]
-        self.assertEqual(tp_group.broadcast.call_args.kwargs, {"src": 0})
-        self.assertEqual(packed_buffer.dtype, torch.int64)
-        self.assertTrue(packed_buffer.is_contiguous())
-        packed_storage = packed_buffer.untyped_storage().data_ptr()
-        for field in result._fields:
-            with self.subTest(field=field):
-                self.assertEqual(
-                    getattr(result, field).untyped_storage().data_ptr(),
-                    packed_storage,
-                )
+        self.assertIsNotNone(result)
+        get_tp_group.assert_not_called()
+        get_parallel.assert_not_called()
+        is_dp_attention_enabled.assert_not_called()
+        tp_group.broadcast.assert_not_called()
 
     def test_simulated_acceptance_uses_fast_path(self):
         for token_mode in ("fixed", "real-draft-token"):
@@ -335,6 +296,7 @@ class TestTargetVerifyTopk1Selection(CustomTestCase):
                 verify_input, batch, logits_output = _make_target_verify_selection_case(
                     self.device
                 )
+                tp_group = SimpleNamespace(world_size=2, broadcast=MagicMock())
                 with (
                     patch("sglang.srt.speculative.spec_utils.SIMULATE_ACC_LEN", 1.5),
                     patch(
@@ -346,13 +308,20 @@ class TestTargetVerifyTopk1Selection(CustomTestCase):
                         token_mode,
                     ),
                     patch(
-                        "sglang.srt.speculative.eagle_target_verify.get_eagle_verify_tp_group",
-                        return_value=SimpleNamespace(world_size=1),
-                    ),
-                    patch(
                         "sglang.srt.speculative.spec_utils.sample_simulated_acc_len",
                         return_value=1,
                     ) as sample_simulated_acc_len,
+                    patch(
+                        "sglang.srt.distributed.get_tp_group", return_value=tp_group
+                    ) as get_tp_group,
+                    patch(
+                        "sglang.srt.speculative.eagle_utils.get_parallel",
+                        return_value=SimpleNamespace(attn_tp_group=tp_group),
+                    ) as get_parallel,
+                    patch(
+                        "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                        return_value=True,
+                    ) as is_dp_attention_enabled,
                 ):
                     result = maybe_eagle_sample_target_verify_topk1(
                         verify_input,
@@ -364,6 +333,10 @@ class TestTargetVerifyTopk1Selection(CustomTestCase):
                 sample_simulated_acc_len.assert_called_once_with(
                     1.5, "match-expected", 2
                 )
+                get_tp_group.assert_not_called()
+                get_parallel.assert_not_called()
+                is_dp_attention_enabled.assert_not_called()
+                tp_group.broadcast.assert_not_called()
                 simulated_token = 100 if token_mode == "fixed" else 3
                 torch.testing.assert_close(
                     result.accept_lens,
