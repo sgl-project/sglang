@@ -29,6 +29,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
+    Qwen2_5VLVisionTransformer,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.common import add_prefix
 
@@ -69,8 +72,6 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VisionRotaryEmbedding,
-    Qwen2_5_VisionTransformerPretrainedModel,
     Qwen2_5_VLCausalLMOutputWithPast,
     Qwen2_5_VLModelOutputWithPast,
     Qwen2_5_VLRotaryEmbedding,
@@ -78,6 +79,53 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _apply_repetition_penalty(
+    logits: torch.Tensor,
+    input_ids: torch.LongTensor,
+    penalty: float,
+) -> torch.Tensor:
+    if penalty == 1.0:
+        return logits
+    selected_logits = torch.gather(logits, 1, input_ids)
+    selected_logits = torch.where(
+        selected_logits < 0,
+        selected_logits * penalty,
+        selected_logits / penalty,
+    )
+    return logits.scatter(1, input_ids, selected_logits)
+
+
+def _select_next_token(
+    logits: torch.Tensor,
+    input_ids: torch.LongTensor,
+    *,
+    do_sample: bool,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    repetition_penalty: float,
+) -> torch.LongTensor:
+    scores = _apply_repetition_penalty(logits.float(), input_ids, repetition_penalty)
+    if not do_sample or top_k == 1:
+        return torch.argmax(scores, dim=-1)
+
+    scores = scores / temperature
+    if 0 < top_k < scores.shape[-1]:
+        top_k_threshold = torch.topk(scores, top_k, dim=-1).values[..., -1, None]
+        scores = scores.masked_fill(scores < top_k_threshold, -torch.inf)
+    if top_p < 1.0:
+        sorted_scores, sorted_indices = torch.sort(scores, descending=True)
+        cumulative_probs = torch.softmax(sorted_scores, dim=-1).cumsum(dim=-1)
+        sorted_remove = cumulative_probs > top_p
+        sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+        sorted_remove[..., 0] = False
+        remove = torch.zeros_like(sorted_remove).scatter(
+            1, sorted_indices, sorted_remove
+        )
+        scores = scores.masked_fill(remove, -torch.inf)
+    return torch.multinomial(torch.softmax(scores, dim=-1), num_samples=1).squeeze(1)
 
 
 def _tp_world_size() -> int:
@@ -261,7 +309,15 @@ class Qwen2_5_VLAttention(nn.Module):
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
-        attn_output = self.attn(query_states, key_states, value_states)
+        # Diffusion text encoding is cache-free and historically uses the native
+        # causal kernel; its trailing padding is removed during postprocessing.
+        # Cached generation still needs the explicit mask for padded batches.
+        attn_output = self.attn(
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attention_mask if use_cache else None,
+        )
 
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = _linear_output(self.o_proj, attn_output)
@@ -597,28 +653,14 @@ class Qwen2_5_VLModel(nn.Module):
     _checkpoint_conversion_mapping = {"^model": "language_model"}
     # Reference: fix gemma3 grad acc #37208
     accepts_loss_kwargs = False
-    _no_split_modules = ["Qwen2_5_VLDecoderLayer", "Qwen2_5_VLVisionBlock"]
+    _no_split_modules = ["Qwen2_5_VLDecoderLayer", "Qwen2_5VLVisionBlock"]
 
     def __init__(self, config, enable_image_understanding: bool = False):
         super().__init__()
         self.language_model = Qwen2_5_VLTextModel(config.text_config)
 
         if enable_image_understanding:
-            self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(
-                config.vision_config
-            )
-            self.visual.to(torch.get_default_dtype())
-            # keeps the vision rotary frequencies in fp32 even when weights are bf16 (as HF does)
-            head_dim = (
-                config.vision_config.hidden_size // config.vision_config.num_heads
-            )
-            rotary_dim = head_dim // 2
-            inv_freq = Qwen2_5_VisionRotaryEmbedding(rotary_dim).inv_freq
-            self.visual.rotary_pos_emb.register_buffer(
-                "inv_freq",
-                inv_freq,
-                persistent=False,
-            )
+            self.visual = Qwen2_5VLVisionTransformer(config.vision_config)
         self.rope_deltas = None  # cache rope_deltas here
         self.config = config
         # Initialize weights and apply final processing
@@ -902,11 +944,6 @@ class Qwen2_5_VLModel(nn.Module):
         """
         pixel_values = pixel_values.type(self.visual.dtype)
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
-        if not isinstance(image_embeds, torch.Tensor):
-            # In transformers v5, the visual encoder returns BaseModelOutputWithPooling.
-            # pooler_output contains the spatially merged embeddings (what we need),
-            # while last_hidden_state contains the raw unmerged output.
-            image_embeds = image_embeds.pooler_output
         split_sizes = (
             image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
         ).tolist()
@@ -1106,6 +1143,9 @@ class Qwen2_5_VLModel(nn.Module):
 
 
 class Qwen2_5_VLForConditionalGeneration(TextEncoder):
+    layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
+    _fsdp_forward_methods = ("generate",)
+
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_up_proj.",
@@ -1132,6 +1172,7 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
     ) -> None:
         super().__init__(config)
         enable_image_understanding = config.enable_image_understanding
+        generation_config = config.generation_config
         config = config.arch_config
         self.model = Qwen2_5_VLModel(
             config, enable_image_understanding=enable_image_understanding
@@ -1141,6 +1182,7 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
         )
 
         self.enable_image_understanding = enable_image_understanding
+        self.generation_config = generation_config
 
         self.config = config
 
@@ -1224,6 +1266,152 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
             attentions=outputs.attentions,
             rope_deltas=outputs.rope_deltas,
         )
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        *,
+        max_new_tokens: int,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
+        mm_token_type_ids: Optional[torch.IntTensor] = None,
+        do_sample: Optional[bool] = None,
+        temperature: Optional[float] = None,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: Optional[float] = None,
+        eos_token_id: Optional[Union[int, list[int]]] = None,
+        pad_token_id: Optional[int] = None,
+    ) -> torch.LongTensor:
+        """Generate tokens with Qwen2.5-VL's native decoder and KV cache."""
+        # Transformers 5 processors emit this field. The Qwen2.5-VL checkpoint
+        # derives modality positions from image/video placeholder token IDs.
+        del mm_token_type_ids
+
+        if input_ids.ndim != 2:
+            raise ValueError("input_ids must have shape [batch_size, sequence_length]")
+        if max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be non-negative")
+        if max_new_tokens == 0:
+            return input_ids
+
+        generation_config = self.generation_config
+        do_sample = (
+            generation_config.get("do_sample", False)
+            if do_sample is None
+            else do_sample
+        )
+        temperature = (
+            generation_config.get("temperature", 1.0)
+            if temperature is None
+            else temperature
+        )
+        top_k = generation_config.get("top_k", 0) if top_k is None else top_k
+        top_p = generation_config.get("top_p", 1.0) if top_p is None else top_p
+        repetition_penalty = (
+            generation_config.get("repetition_penalty", 1.0)
+            if repetition_penalty is None
+            else repetition_penalty
+        )
+        eos_token_id = (
+            generation_config.get("eos_token_id", self.config.eos_token_id)
+            if eos_token_id is None
+            else eos_token_id
+        )
+        pad_token_id = (
+            generation_config.get("pad_token_id", self.config.pad_token_id)
+            if pad_token_id is None
+            else pad_token_id
+        )
+
+        if do_sample and temperature <= 0:
+            raise ValueError("temperature must be positive when sampling")
+        if top_k < 0:
+            raise ValueError("top_k must be non-negative")
+        if not 0 < top_p <= 1:
+            raise ValueError("top_p must be in (0, 1]")
+        if repetition_penalty <= 0:
+            raise ValueError("repetition_penalty must be positive")
+
+        eos_token_ids = (
+            []
+            if eos_token_id is None
+            else [eos_token_id] if isinstance(eos_token_id, int) else list(eos_token_id)
+        )
+        if pad_token_id is None:
+            raise ValueError("pad_token_id must be set for generation")
+        eos_tokens = torch.tensor(
+            eos_token_ids, dtype=input_ids.dtype, device=input_ids.device
+        )
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+
+        generated_ids = input_ids
+        unfinished = torch.ones(
+            input_ids.shape[0], dtype=torch.bool, device=input_ids.device
+        )
+        past_key_values = None
+        model_input_ids = input_ids
+        cache_position = torch.arange(input_ids.shape[1], device=input_ids.device)
+        self.model.rope_deltas = None
+
+        for _ in range(max_new_tokens):
+            outputs = self(
+                input_ids=model_input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+                cache_position=cache_position,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                logits_to_keep=1,
+            )
+            next_tokens = _select_next_token(
+                outputs.logits[:, -1, :],
+                generated_ids,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+            )
+            next_tokens = torch.where(
+                unfinished,
+                next_tokens,
+                torch.full_like(next_tokens, pad_token_id),
+            )
+            generated_ids = torch.cat([generated_ids, next_tokens[:, None]], dim=-1)
+
+            if eos_tokens.numel() > 0:
+                reached_eos = (next_tokens[:, None] == eos_tokens[None, :]).any(dim=-1)
+                unfinished = unfinished & ~reached_eos
+                if not unfinished.any():
+                    break
+
+            past_key_values = outputs.past_key_values
+            model_input_ids = next_tokens[:, None]
+            attention_mask = torch.cat(
+                [attention_mask, attention_mask.new_ones((input_ids.shape[0], 1))],
+                dim=-1,
+            )
+            cache_position = torch.tensor(
+                [generated_ids.shape[1] - 1], device=input_ids.device
+            )
+            pixel_values = None
+            pixel_values_videos = None
+            image_grid_thw = None
+            video_grid_thw = None
+            second_per_grid_ts = None
+
+        return generated_ids
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         loaded_params: set[str] = set()

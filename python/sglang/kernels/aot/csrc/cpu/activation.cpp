@@ -167,7 +167,7 @@ at::Tensor gelu_and_mul_cpu(const at::Tensor& input) {
         num_tokens,
         d,
         [inv_sqrt2](float x) { return 0.5f * x * (1.f + std::erf(x * inv_sqrt2)); },
-        [inv_sqrt2](Vec x) { return Vec(0.5f) * x * (Vec(1.f) + (x * Vec(inv_sqrt2)).erf()); });
+        [](Vec x) { return fast_gelu(x); });
   });
 
   return out;

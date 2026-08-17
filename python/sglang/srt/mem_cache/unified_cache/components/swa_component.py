@@ -76,6 +76,9 @@ class SWAComponent(TreeComponent):
 
     component_type = ComponentType.SWA
 
+    def needs_incremental_backup(self, node: UnifiedTreeNode) -> bool:
+        return False
+
     def reset_session_state(self) -> None:
         super().reset_session_state()
         self._session_leaf_covered_len = {}
@@ -752,6 +755,7 @@ class SWAComponent(TreeComponent):
                 page_size=self.cache.page_size,
                 req_to_token_pool=self.cache.req_to_token_pool,
                 token_to_kv_pool_allocator=self.cache.token_to_kv_pool_allocator,
+                retain_floor=self.cache.swa_retain_floor(req),
             )
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 

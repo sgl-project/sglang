@@ -58,6 +58,13 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_precompile_model_kernels_after_loading,
 )
 from sglang.srt.model_loader import get_model
+from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
+from sglang.srt.multimodal.encoder_preprocessing import (
+    EncoderPreprocessOutput,
+    get_encoder_preprocessed_items,
+    invoke_encoder_preprocessor,
+    resolve_encoder_media_processor_config,
+)
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
 from sglang.srt.observability.req_time_stats import EncoderReqTimeStats
@@ -65,7 +72,13 @@ from sglang.srt.observability.trace import (
     process_tracing_init,
     trace_set_thread_info,
 )
-from sglang.srt.runtime_context import get_disagg, get_exec, get_mm, publish
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_mm,
+    get_parallel,
+    publish,
+)
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -74,6 +87,7 @@ from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     add_prometheus_middleware,
     configure_logger,
+    configure_media_url_security,
     load_audio,
     load_image,
     load_video,
@@ -81,6 +95,7 @@ from sglang.srt.utils import (
     set_prometheus_multiproc_dir,
 )
 from sglang.srt.utils.common import configure_logger, maybe_reindex_device_id
+from sglang.srt.utils.hf_transformers_utils import resolve_image_processor_backend
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
@@ -296,6 +311,10 @@ class MMEncoder:
         argument."""
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
+        configure_media_url_security(
+            server_args.allowed_media_domains,
+            server_args.media_url_max_file_size_mb,
+        )
         publish(server_args, role="encoder")
         self.rank = rank
         # DP rank for metric labels; overridden by run_dp_worker in DP mode.
@@ -330,7 +349,8 @@ class MMEncoder:
         torch.get_device_module(self.device).set_device(self.gpu_id)
 
         self.use_image_processor_gpu = (
-            use_image_processor_gpu and not server_args.disable_fast_image_processor
+            use_image_processor_gpu
+            and resolve_image_processor_backend(server_args) != "pil"
         )
         self._build_vision_config(server_args.mm_process_config)
         self.model_audio_sr = self._resolve_audio_sr()
@@ -350,6 +370,9 @@ class MMEncoder:
             model_config=self.model_config,
             load_config=self.load_config,
             device_config=self.device_config,
+        )
+        self.encoder_media_processor_config = resolve_encoder_media_processor_config(
+            self.model
         )
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
@@ -387,14 +410,19 @@ class MMEncoder:
         ).element_size()
 
         if get_mm().enable_mm_global_cache:
-            from sglang.srt.mem_cache.storage.mooncake_store.embedding_cache_controller import (
+            from sglang.srt.mem_cache.embedding_cache_controller import (
                 EmbeddingCacheController,
             )
+            from sglang.srt.mem_cache.embedding_store import EmbeddingStoreFactory
 
+            embedding_store = EmbeddingStoreFactory.create_backend(
+                get_mm().mm_global_cache_backend,
+            )
             hidden_dims = self._infer_embedding_dims()
             self.mm_global_cache = EmbeddingCacheController(
                 rank,
                 server_args.tp_size,
+                embedding_store=embedding_store,
                 hidden_dims=hidden_dims,
                 tp_group=get_tp_group().cpu_group,
                 all_rank_get=False,
@@ -590,12 +618,18 @@ class MMEncoder:
         """
         from transformers import AutoImageProcessor, AutoVideoProcessor
 
+        image_processor_backend = resolve_image_processor_backend(server_args)
+        image_processor_kwargs = (
+            {}
+            if image_processor_backend == "auto"
+            else {"backend": image_processor_backend}
+        )
         try:
             self.image_processor = AutoImageProcessor.from_pretrained(
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
+                **image_processor_kwargs,
             )
         except Exception as e:
             logger.warning(f"Failed to load image processor: {e}")
@@ -606,7 +640,6 @@ class MMEncoder:
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
             )
         except Exception as e:
             logger.warning(f"Failed to load video processor: {e}")
@@ -618,7 +651,6 @@ class MMEncoder:
                 server_args.tokenizer_path or server_args.model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
             )
             if not hasattr(_audio_proc, "feature_extractor"):
                 logger.warning(
@@ -643,13 +675,27 @@ class MMEncoder:
         Load a single multimodal data.
         If data is precomputed, returns directly.
         Static method that can be pickled for multiprocessing"""
+        media_metadata = {}
+        content_hash = None
         if isinstance(data, dict):
-            return data
+            if "url" not in data:
+                return data
+            media_metadata = {key: value for key, value in data.items() if key != "url"}
+            content_hash = parse_content_hash(data.get("content_hash"))
+            data = data["url"]
         try:
             if modality == Modality.IMAGE:
+                if content_hash is not None:
+                    snapshot = snapshot_media(data)
+                    if snapshot.content_digest != content_hash:
+                        raise BadRequestError(
+                            "Encoder media content hash mismatch: "
+                            f"expected {content_hash}, got {snapshot.content_digest}"
+                        )
+                    data = snapshot.data
                 gpu_image_decode = (
-                    "nvjpeg_fancy"
-                    if self.use_image_processor_gpu and self.model_type == "kimi_k3"
+                    self.encoder_media_processor_config.image_decode_mode
+                    if self.use_image_processor_gpu
                     else False
                 )
                 img, _ = load_image(data, gpu_image_decode)
@@ -660,12 +706,23 @@ class MMEncoder:
                 ):
                     # Needed only when `img` is a PIL image
                     img = img.convert("RGB")
+                if (
+                    media_metadata
+                    and self.encoder_media_processor_config.preserve_media_metadata
+                ):
+                    return {
+                        "type": "image",
+                        "image": img,
+                        **media_metadata,
+                    }
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
                 return load_audio(data, self.model_audio_sr)
 
+        except MMError:
+            raise
         except CLIENT_MEDIA_EXCEPTIONS as e:
             # Not ValueError: the DP envelope classifies by `.code`, which only MMError carries.
             raise BadRequestError(f"Error while loading data {data}: {e}") from e
@@ -857,9 +914,24 @@ class MMEncoder:
         return slices
 
     def _calculate_hashes_from_features(
-        self, mm_feature, grid_thw: List, modality: Modality
+        self, mm_feature, grid_thw: List, modality: Modality, mm_inputs=None
     ) -> List[int]:
         """CPU Task: Compute hashes based on processed feature patches."""
+        preprocessed_items = (
+            get_encoder_preprocessed_items(mm_inputs) if mm_inputs is not None else None
+        )
+        if preprocessed_items is not None:
+            if len(preprocessed_items) != len(grid_thw):
+                raise ValueError(
+                    "Encoder preprocess item/grid mismatch: "
+                    f"{len(preprocessed_items)} items != {len(grid_thw)} grids"
+                )
+            hashes = []
+            for item in preprocessed_items:
+                item.set_pad_value()
+                hashes.append(item.hash)
+            return hashes
+
         hashes = []
         if modality == Modality.AUDIO and isinstance(mm_feature, list):
             for feature in mm_feature:
@@ -879,21 +951,37 @@ class MMEncoder:
             offset += num_patches
         return hashes
 
-    def _encode_missing(
+    def _build_mm_data_items(
         self,
         mm_feature,
         mm_inputs: dict,
         indices: List[int],
-        modality: Modality = Modality.IMAGE,
-        get_feature_fn=None,
+        modality: Modality,
         grid_thw: Optional[List] = None,
-        keep_on_gpu: bool = False,
-    ) -> List[torch.Tensor]:
-        """
-        GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
+    ) -> List[MultimodalDataItem]:
+        """Build the model-facing items selected for one encoder forward.
+
+        A model preprocessor can preserve an item-wise representation with
+        ``EncoderPreprocessOutput``. This path avoids concatenating and then
+        re-slicing features before encoder-DP knows which rank owns each item.
+        Legacy Hugging Face processor outputs retain their existing aggregate
+        tensor behavior.
         """
         if grid_thw is None:
             grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+
+        preprocessed_items = get_encoder_preprocessed_items(mm_inputs)
+        if preprocessed_items is not None:
+            if len(preprocessed_items) != len(grid_thw):
+                raise ValueError(
+                    "Encoder preprocess item/grid mismatch: "
+                    f"{len(preprocessed_items)} items != {len(grid_thw)} grids"
+                )
+            selected = [preprocessed_items[index] for index in indices]
+            if any(item.modality != modality for item in selected):
+                raise ValueError("Encoder preprocess output contains wrong modality")
+            return selected
+
         split_kimi_k3_images = (
             self.model_type == "kimi_k3" and modality == Modality.IMAGE
         )
@@ -911,11 +999,11 @@ class MMEncoder:
             sub_feature_list = []
             offsets = [0]
             curr = 0
-            for g in grid_thw:
-                curr += self.get_num_patches(g, modality)
+            for grid in grid_thw:
+                curr += self.get_num_patches(grid, modality)
                 offsets.append(curr)
-            for idx in indices:
-                sub_feature_list.append(mm_feature[offsets[idx] : offsets[idx + 1]])
+            for index in indices:
+                sub_feature_list.append(mm_feature[offsets[index] : offsets[index + 1]])
             if not split_kimi_k3_images:
                 sub_feature = torch.cat(sub_feature_list, dim=0)
 
@@ -943,19 +1031,39 @@ class MMEncoder:
                 )
             ]
 
-        for k, v in mm_inputs.items():
-            if k in _mm_feature_attrs.get(modality, []):
+        for key, value in mm_inputs.items():
+            if key in _mm_feature_attrs.get(modality, []):
                 continue
-            val = _convert(v)
-            if k in _mm_grid_attrs.get(modality, []):
+            value = _convert(value)
+            if key in _mm_grid_attrs.get(modality, []):
                 if split_kimi_k3_images:
-                    for mm_item, idx in zip(mm_items, indices):
-                        mm_item.set(k, val[idx : idx + 1])
+                    for mm_item, index in zip(mm_items, indices):
+                        mm_item.set(key, value[index : index + 1])
                 else:
-                    mm_items[0].set(k, val[indices])
+                    mm_items[0].set(key, value[indices])
             else:
                 for mm_item in mm_items:
-                    mm_item.set(k, val)
+                    mm_item.set(key, value)
+        return mm_items
+
+    def _encode_missing(
+        self,
+        mm_feature,
+        mm_inputs: dict,
+        indices: List[int],
+        modality: Modality = Modality.IMAGE,
+        get_feature_fn=None,
+        grid_thw: Optional[List] = None,
+        keep_on_gpu: bool = False,
+    ) -> List[torch.Tensor]:
+        """
+        GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
+        """
+        if grid_thw is None:
+            grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+        mm_items = self._build_mm_data_items(
+            mm_feature, mm_inputs, indices, modality, grid_thw
+        )
 
         forward_start = time.perf_counter()
         with torch.inference_mode():
@@ -997,7 +1105,7 @@ class MMEncoder:
         if self.rank == 0:
             if hashes is None:
                 mm_hashes = self._calculate_hashes_from_features(
-                    mm_feature, grid_thw, modality
+                    mm_feature, grid_thw, modality, mm_inputs
                 )
             else:
                 mm_hashes = hashes
@@ -1646,12 +1754,31 @@ class MMEncoder:
         if not (self.image_processor or model_preprocessor):
             raise ValueError("No image processor available")
         images = await self._flatten_and_load_images(mm_items)
-        if model_preprocessor:
-            return model_preprocessor(images, Modality.IMAGE, self.vision_config)
-        image_config = self.vision_config.get("image", {})
-        original_image_sizes = [_get_original_image_size(item) for item in images]
         if self.model_type in ["kimi_k25", "kimi_k3", "kimi_vl"]:
             images = self._normalize_kimi_encoder_images(images)
+        original_image_sizes = [_get_original_image_size(item) for item in images]
+        if model_preprocessor:
+            processor_output = invoke_encoder_preprocessor(
+                model_preprocessor,
+                images,
+                Modality.IMAGE,
+                self.vision_config,
+                image_processor=self.image_processor,
+                use_gpu_preprocessing=self.use_image_processor_gpu,
+            )
+            if (
+                isinstance(processor_output, EncoderPreprocessOutput)
+                and processor_output.materialize_local_items is not None
+            ):
+                parallel = get_parallel()
+                await asyncio.get_running_loop().run_in_executor(
+                    self.preproc_executor,
+                    processor_output.materialize_for_rank,
+                    parallel.attn_tp_rank,
+                    parallel.attn_tp_size,
+                )
+            return processor_output
+        image_config = self.vision_config.get("image", {})
         processor_input = await asyncio.get_running_loop().run_in_executor(
             self.preproc_executor,
             functools.partial(self.image_processor, images=images, **image_config),
@@ -1770,25 +1897,25 @@ class MMEncoder:
             # support mm_cache
             mm_embedding = None
             mm_hash = None
-
-            mm_item = MultimodalDataItem.from_dict(
-                {
-                    "modality": modality,
-                    "feature": _convert(_get_mm_feature(mm_inputs, modality)),
-                }
+            mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+            grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+            model_mm_items = self._build_mm_data_items(
+                mm_feature,
+                mm_inputs,
+                list(range(len(grid_thw))),
+                modality,
+                grid_thw,
             )
-            for k, v in mm_inputs.items():
-                if k in _mm_feature_attrs[modality]:
-                    continue
-                mm_item.set(k, _convert(v))
 
             cache_hit = False
             use_mm_cache = get_mm().enable_prefix_mm_cache and log_metrics
             if use_mm_cache:
-                mm_item.set_pad_value()
-                mm_hash = MultiModalStaticCache.combine_hashes([mm_item.hash])
+                for item in model_mm_items:
+                    item.set_pad_value()
+                item_hashes = [item.hash for item in model_mm_items]
+                mm_hash = MultiModalStaticCache.combine_hashes(item_hashes)
                 async with self.mm_cache_lock:
-                    mm_cache = self.mm_cache.get([mm_item.hash])
+                    mm_cache = self.mm_cache.get(item_hashes)
                     if mm_cache is not None:
                         mm_embedding = mm_cache.embedding
                         cache_hit = True
@@ -1796,7 +1923,7 @@ class MMEncoder:
             if mm_embedding is None:
                 forward_start = time.perf_counter()
                 with torch.inference_mode():
-                    mm_embedding: torch.Tensor = get_feature_fn([mm_item])
+                    mm_embedding: torch.Tensor = get_feature_fn(model_mm_items)
                     mm_embedding = mm_embedding.cpu()
                 if len(mm_embedding.shape) != 2:
                     mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
@@ -1805,7 +1932,8 @@ class MMEncoder:
                         time.perf_counter() - forward_start, modality=modality_str
                     )
 
-            # Per-request cache hit metrics: tokens = embedding rows, files = 1 item.
+            # Per-request cache hit metrics: tokens = embedding rows, files =
+            # logical multimodal items (not the legacy aggregate tensor count).
             if use_mm_cache and encoder_metrics_collector is not None:
                 total_tokens = int(mm_embedding.shape[0])
                 hit_tokens = total_tokens if cache_hit else 0
@@ -1813,7 +1941,9 @@ class MMEncoder:
                     hit_tokens, total_tokens, modality=modality_str
                 )
                 encoder_metrics_collector.record_cache_files(
-                    1 if cache_hit else 0, 1, modality=modality_str
+                    len(model_mm_items) if cache_hit else 0,
+                    len(model_mm_items),
+                    modality=modality_str,
                 )
 
             if use_mm_cache:
@@ -1860,7 +1990,7 @@ class MMEncoder:
                     )
 
             return (
-                _get_mm_grid_dim(mm_inputs, modality, self.model_type),
+                grid_thw,
                 mm_embedding,
                 aux_data,
             )
@@ -2218,23 +2348,21 @@ class MMEncoder:
                 )
             )
 
-            # Build mm_item (all ranks)
-            mm_item = MultimodalDataItem.from_dict(
-                {
-                    "modality": modality,
-                    "feature": _convert(_get_mm_feature(mm_inputs, modality)),
-                }
+            # Build model-facing items on all ranks. Owner-deferred processor
+            # outputs stay per-item until encoder-DP assigns them.
+            mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+            model_mm_items = self._build_mm_data_items(
+                mm_feature,
+                mm_inputs,
+                list(range(len(grid_thw))),
+                modality,
+                grid_thw,
             )
-            for k, v in mm_inputs.items():
-                if k in _mm_feature_attrs.get(modality, []):
-                    continue
-                val = _convert(v)
-                mm_item.set(k, val)
 
             async def _run_forward():
                 try:
                     with torch.inference_mode():
-                        emb = get_feature_fn([mm_item])
+                        emb = get_feature_fn(model_mm_items)
                         if len(emb.shape) != 2:
                             emb = emb.reshape(-1, emb.shape[-1])
                         # mooncake's transfer_sync is a host-side

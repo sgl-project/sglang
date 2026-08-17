@@ -19,7 +19,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from functools import partial, wraps
+from functools import wraps
 from io import BytesIO
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -46,7 +46,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.network import is_port_available
 from sglang.test.run_eval import run_eval
-from sglang.utils import get_exception_traceback, normalize_base_url
+from sglang.utils import normalize_base_url
 
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
@@ -219,17 +219,10 @@ def is_rust_server_built():
     """Return whether the embedded Rust server extension (``SGLANG_RUST_SERVER``)
     is importable.
 
-    ``sglang/srt/server/`` is not in the source tree — it is produced by
-    ``setup.py build_rust --inplace``, so on a build without it ``find_spec``
-    raises ``ModuleNotFoundError`` for the missing *parent* package rather than
-    returning ``None`` for the missing leaf. Suites gate a rust-server subclass on
-    this at class-definition time, so letting that escape would fail the whole
-    module import instead of skipping the one class.
+    The ``sglang.srt.rust_extensions`` Python package is always present; the
+    private ``_server`` module exists only when the PyO3 extension was built.
     """
-    try:
-        return importlib.util.find_spec("sglang.srt.server._core") is not None
-    except ModuleNotFoundError:
-        return False
+    return importlib.util.find_spec("sglang.srt.rust_extensions._server") is not None
 
 
 def _use_cached_default_models(model_repo: str):
@@ -264,23 +257,6 @@ if is_in_ci() and is_xpu():
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 1800
 
 
-def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
-    assert url is not None
-
-    data = {
-        "inputs": prompt,
-        "parameters": {
-            "temperature": temperature,
-            "max_new_tokens": max_tokens,
-            "stop_sequences": stop,
-        },
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    pred = res.json()["generated_text"][0]
-    return pred
-
-
 def find_available_port(base_port: int):
     port = base_port + random.randint(100, 1000)
     while True:
@@ -290,174 +266,6 @@ def find_available_port(base_port: int):
             port += 42
         else:
             port -= 43
-
-
-def call_generate_vllm(prompt, temperature, max_tokens, stop=None, n=1, url=None):
-    assert url is not None
-
-    data = {
-        "prompt": prompt,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stop": stop,
-        "n": n,
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
-    else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
-    return pred
-
-
-def call_generate_outlines(
-    prompt, temperature, max_tokens, stop=None, regex=None, n=1, url=None
-):
-    assert url is not None
-
-    data = {
-        "prompt": prompt,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stop": stop,
-        "regex": regex,
-        "n": n,
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    if n == 1:
-        pred = res.json()["text"][0][len(prompt) :]
-    else:
-        pred = [x[len(prompt) :] for x in res.json()["text"]]
-    return pred
-
-
-def call_generate_srt_raw(prompt, temperature, max_tokens, stop=None, url=None):
-    assert url is not None
-
-    data = {
-        "text": prompt,
-        "sampling_params": {
-            "temperature": temperature,
-            "max_new_tokens": max_tokens,
-            "stop": stop,
-        },
-    }
-    res = requests.post(url, json=data)
-    assert res.status_code == 200
-    obj = res.json()
-    pred = obj["text"]
-    return pred
-
-
-def call_generate_guidance(
-    prompt, temperature, max_tokens, stop=None, n=1, regex=None, model=None
-):
-    assert model is not None
-    from guidance import gen
-
-    rets = []
-    for _ in range(n):
-        out = (
-            model
-            + prompt
-            + gen(
-                name="answer",
-                max_tokens=max_tokens,
-                temperature=temperature,
-                stop=stop,
-                regex=regex,
-            )
-        )
-        rets.append(out["answer"])
-    return rets if n > 1 else rets[0]
-
-
-def call_select_lightllm(context, choices, url=None):
-    assert url is not None
-
-    scores = []
-    for i in range(len(choices)):
-        data = {
-            "inputs": context + choices[i],
-            "parameters": {
-                "max_new_tokens": 1,
-            },
-        }
-        res = requests.post(url, json=data)
-        assert res.status_code == 200
-        scores.append(0)
-    return np.argmax(scores)
-
-
-def call_select_vllm(context, choices, url=None):
-    assert url is not None
-
-    scores = []
-    for i in range(len(choices)):
-        data = {
-            "prompt": context + choices[i],
-            "max_tokens": 1,
-            "prompt_logprobs": 1,
-        }
-        res = requests.post(url, json=data)
-        assert res.status_code == 200
-        scores.append(res.json().get("prompt_score", 0))
-    return np.argmax(scores)
-
-    """
-    Modify vllm/entrypoints/api_server.py
-
-    if final_output.prompt_logprobs is not None:
-        score = np.mean([prob[t_id] for t_id, prob in zip(final_output.prompt_token_ids[1:], final_output.prompt_logprobs[1:])])
-        ret["prompt_score"] = score
-    """
-
-
-def call_select_guidance(context, choices, model=None):
-    assert model is not None
-    from guidance import select
-
-    out = model + context + select(choices, name="answer")
-    return choices.index(out["answer"])
-
-
-def add_common_other_args_and_parse(parser: argparse.ArgumentParser):
-    parser.add_argument("--parallel", type=int, default=64)
-    parser.add_argument("--host", type=str, default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=None)
-    parser.add_argument(
-        "--backend",
-        type=str,
-        required=True,
-        choices=[
-            "vllm",
-            "outlines",
-            "lightllm",
-            "gserver",
-            "guidance",
-            "srt-raw",
-            "llama.cpp",
-        ],
-    )
-    parser.add_argument("--n-ctx", type=int, default=4096)
-    parser.add_argument(
-        "--model-path", type=str, default="meta-llama/Llama-2-7b-chat-hf"
-    )
-    parser.add_argument("--result-file", type=str, default="result.jsonl")
-    args = parser.parse_args()
-
-    if args.port is None:
-        default_port = {
-            "vllm": 21000,
-            "outlines": 21000,
-            "lightllm": 22000,
-            "srt-raw": 30000,
-            "gserver": 9988,
-        }
-        args.port = default_port.get(args.backend, None)
-    return args
 
 
 def auto_config_device() -> str:
@@ -504,71 +312,6 @@ def select_sglang_backend(args: argparse.Namespace):
     else:
         raise ValueError(f"Invalid backend: {args.backend}")
     return backend
-
-
-def _get_call_generate(args: argparse.Namespace):
-    base_url = normalize_base_url(args.host, args.port)
-    if args.backend == "lightllm":
-        return partial(call_generate_lightllm, url=f"{base_url}/generate")
-    elif args.backend == "vllm":
-        return partial(call_generate_vllm, url=f"{base_url}/generate")
-    elif args.backend == "srt-raw":
-        return partial(call_generate_srt_raw, url=f"{base_url}/generate")
-    elif args.backend == "outlines":
-        return partial(call_generate_outlines, url=f"{base_url}/generate")
-    elif args.backend == "guidance":
-        from guidance import models
-
-        model = models.LlamaCpp(args.model_path, n_gpu_layers=-1, n_ctx=args.n_ctx)
-        call_generate = partial(call_generate_guidance, model=model)
-        call_generate("Hello,", 1.0, 8, ".")
-        return call_generate
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
-
-
-def _get_call_select(args: argparse.Namespace):
-    base_url = normalize_base_url(args.host, args.port)
-    if args.backend == "lightllm":
-        return partial(call_select_lightllm, url=f"{base_url}/generate")
-    elif args.backend == "vllm":
-        return partial(call_select_vllm, url=f"{base_url}/generate")
-    elif args.backend == "guidance":
-        from guidance import models
-
-        model = models.LlamaCpp(args.model_path, n_gpu_layers=-1, n_ctx=args.n_ctx)
-        call_select = partial(call_select_guidance, model=model)
-
-        call_select("Hello,", ["world", "earth"])
-        return call_select
-    else:
-        raise ValueError(f"Invalid backend: {args.backend}")
-
-
-def get_call_generate(args: argparse.Namespace):
-    call_generate = _get_call_generate(args)
-
-    def func(*args, **kwargs):
-        try:
-            return call_generate(*args, **kwargs)
-        except Exception:
-            print("Exception in call_generate:\n" + get_exception_traceback())
-            raise
-
-    return func
-
-
-def get_call_select(args: argparse.Namespace):
-    call_select = _get_call_select(args)
-
-    def func(*args, **kwargs):
-        try:
-            return call_select(*args, **kwargs)
-        except Exception:
-            print("Exception in call_select:\n" + get_exception_traceback())
-            raise
-
-    return func
 
 
 def _get_default_models():
@@ -2471,12 +2214,6 @@ class ModelLaunchSettings:
         for fixed_arg in fixed_args:
             if fixed_arg not in self.extra_args:
                 self.extra_args.append(fixed_arg)
-
-
-class ModelEvalMetrics:
-    def __init__(self, accuracy: float, eval_time: float):
-        self.accuracy = accuracy
-        self.eval_time = eval_time
 
 
 def extract_trace_link_from_bench_one_batch_server_output(output: str) -> str:

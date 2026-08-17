@@ -40,6 +40,14 @@ Document orthogonal controls as feature overlays instead:
 | Cache-DiT and sampling controls | Request/sampling recipes | Quality level, incompatible placement modes, task-specific validation |
 | TP, Ulysses, Ring, FSDP, residency | Base picker only for verified cells | Exact GPU count, topology, memory, and latency evidence |
 
+For memory placement, prefer the unified
+[`--component-residency`](/docs/sglang-diffusion/api/cli#component-residency)
+selector. Each component resolves to exactly one of `resident`,
+`component-offload`, or `layerwise-offload`. Existing options such as
+`--dit-cpu-offload`, `--text-encoder-cpu-offload`,
+`--image-encoder-cpu-offload`, and `--vae-cpu-offload` remain supported by all
+recipes that already use them.
+
 ## Contributing a model
 
 Use the repo-local `cookbook-add-model` skill and its
