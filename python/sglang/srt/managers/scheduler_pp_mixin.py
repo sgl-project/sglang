@@ -109,7 +109,10 @@ class SchedulerPPMixin:
                     recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
                 if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
+                    if not is_npu():
+                        self._pp_commit_comm_work(self.send_req_work)
+                    else:
+                        self.pending_send_req_work = self.send_req_work
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
                             recv_reqs,
@@ -153,6 +156,13 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                # NPU: commit pending send_reqs AFTER output recv to avoid
+                # circular dependency: PP1 output_send blocks waiting for
+                # PP0 output_recv, but PP0 can't reach output_recv because
+                # commit send_reqs blocks waiting for PP1 recv_reqs.
+                if not self.pp_group.is_last_rank and is_npu():
+                    self._pp_commit_comm_work(self.pending_send_req_work)
+                    self.pending_send_req_work = []
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
@@ -596,6 +606,7 @@ class SchedulerPPMixin:
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
 
         self.send_req_work = []
+        self.pending_send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []
         self.launch_event = None
