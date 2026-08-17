@@ -302,5 +302,110 @@ class TestEveryUnifiedAllocatorOverridesFreeSegment(unittest.TestCase):
                 self.assertIn("free_page_reps_group", inspect.getsource(cls))
 
 
+class TestFreeSwaWindowRatchetNoHostSync(unittest.TestCase):
+    """The per-decode-step SWA window ratchet frees a CONTIGUOUS row slice
+    with host-int, page-aligned bounds — the same shape `free_segment` was
+    built for. `free_swa(..., start_pos=)` must therefore reach the swa side
+    with caller-derived page ids: no `torch.unique` (data-dependent shape =
+    host sync) and no stale-slot `.item()` on the per-step path.
+
+    Poisoning the ops is the decisive form (a textual guard can be fooled).
+    """
+
+    PS = 4
+
+    def _swa_composite(self, lazy=True):
+        from test_multi_ended_allocator import _FakeKVCache, _make_mha_spec
+
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedKVPool
+
+        full = _make_mha_spec("full", "up", layer_num=4)
+        swa = _make_mha_spec("swa", "down", layer_num=2)
+        total = 64 * full.entry_bytes() + 64 * swa.entry_bytes()
+        pool = UnifiedKVPool(
+            total_bytes=total,
+            sub_pool_specs=[full, swa],
+            device="cpu",
+            enable_memory_saver=False,
+            page_size=self.PS,
+        )
+
+        class _KV:
+            def __init__(self, p):
+                self.full_kv_pool = _FakeKVCache(p.max_slots("full"))
+                self.swa_kv_pool = _FakeKVCache(p.max_slots("swa"))
+
+            def attach_allocators(self, **kwargs):
+                pass
+
+        return mea.UnifiedSWATokenToKVPoolAllocator(
+            unified_buffer=pool,
+            kvcache=_KV(pool),
+            device="cpu",
+            full_max_total_num_tokens=64,
+            swa_max_total_num_tokens=64,
+            page_size=self.PS,
+            need_sort=False,
+            forward_stream=None,
+            lazy_compaction=lazy,
+        )
+
+    def test_ratchet_shape_free_swa_never_syncs(self):
+        """Aligned bounds (the ratchet guarantees them at ps>1): no unique,
+        no item — on the lazy production config."""
+        alloc = self._swa_composite(lazy=True)
+        v = alloc.alloc(8 * self.PS)
+        self.assertIsNotNone(v)
+        with mock.patch.object(
+            torch, "unique", side_effect=AssertionError("unique = host sync")
+        ), mock.patch.object(
+            torch.Tensor, "item", side_effect=AssertionError("item = host sync")
+        ):
+            alloc.free_swa(v[: 4 * self.PS], start_pos=0)
+            alloc.free_swa(v[4 * self.PS :], start_pos=4 * self.PS)
+
+    def test_unaligned_start_pos_still_no_sync(self):
+        """`_page_reps_pieces` covers a misaligned start with a second piece;
+        the sync-free property must not depend on alignment."""
+        alloc = self._swa_composite(lazy=True)
+        v = alloc.alloc(8 * self.PS)
+        with mock.patch.object(
+            torch, "unique", side_effect=AssertionError("unique = host sync")
+        ):
+            alloc.free_swa(v[1 : 5 * self.PS], start_pos=1)
+
+    def test_start_pos_path_matches_the_fallback_end_state(self):
+        """Derived property: the stride-rep path and the dedup fallback must
+        leave IDENTICAL allocator state (v2p tombstones, capacity)."""
+        for lazy in (True, False):
+            with self.subTest(lazy=lazy):
+                a1 = self._swa_composite(lazy=lazy)
+                a2 = self._swa_composite(lazy=lazy)
+                v1 = a1.alloc(6 * self.PS)
+                v2 = a2.alloc(6 * self.PS)
+                self.assertTrue(torch.equal(v1, v2))
+                a1.free_swa(v1[: 4 * self.PS], start_pos=0)
+                a2.free_swa(v2[: 4 * self.PS])  # fallback (radix shape)
+                self.assertTrue(
+                    torch.equal(
+                        a1.swa_attn_allocator.virtual_to_physical,
+                        a2.swa_attn_allocator.virtual_to_physical,
+                    )
+                )
+                self.assertEqual(a1.available_size(), a2.available_size())
+                self.assertEqual(
+                    a1.swa_attn_allocator.schedulable_available_size(),
+                    a2.swa_attn_allocator.schedulable_available_size(),
+                )
+
+    def test_double_ratchet_is_filtered_not_crashed(self):
+        """Freeing an already-tombstoned range again must no-op through the
+        liveness filter (radix eviction and the ratchet can overlap)."""
+        alloc = self._swa_composite(lazy=True)
+        v = alloc.alloc(4 * self.PS)
+        alloc.free_swa(v, start_pos=0)
+        alloc.free_swa(v, start_pos=0)  # all tombstoned -> filtered to empty
+
+
 if __name__ == "__main__":
     unittest.main()
