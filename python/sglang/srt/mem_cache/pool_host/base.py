@@ -108,7 +108,6 @@ class HostKVCache(abc.ABC):
             "paged allocator."
         )
         self.page_size = page_size // dcp_size
-        self._dcp_localized = None
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
@@ -341,7 +340,7 @@ class HostKVCache(abc.ABC):
         """Page size in that same logical space (the widened DCP page)."""
         return self.page_size * self.dcp_size
 
-    def dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
+    def maybe_dcp_kernel_indices(self, indices: torch.Tensor) -> torch.Tensor:
         """Transfer kernels index per-rank rows; callers hold widened logical slots.
 
         Keep this rank's slots (% dcp_size == dcp_rank), then collapse (// dcp_size).
@@ -353,22 +352,6 @@ class HostKVCache(abc.ABC):
             f"{indices.numel()} logical slots with dcp_size={self.dcp_size}."
         )
         return indices[self.dcp_rank :: self.dcp_size] // self.dcp_size
-
-    def maybe_localize_dcp_indices(
-        self, host_indices: torch.Tensor, device_indices: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.dcp_size == 1:
-            return host_indices, device_indices
-        key = (id(host_indices), id(device_indices))
-        cached = self._dcp_localized
-        if cached is not None and cached[0] == key:
-            return cached[1]
-        rows = (
-            self.dcp_kernel_indices(host_indices),
-            self.dcp_kernel_indices(device_indices),
-        )
-        self._dcp_localized = (key, rows, host_indices, device_indices)
-        return rows
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
@@ -402,7 +385,7 @@ class HostKVCache(abc.ABC):
             indices_cpu.numel() % self.logical_page_size == 0
         ), (
             "Host pool frees must cover whole widened pages under DCP "
-            f"(dcp_kernel_indices assumes residue == position); got "
+            f"(maybe_dcp_kernel_indices assumes residue == position); got "
             f"{indices_cpu.numel()} slots, logical_page_size="
             f"{self.logical_page_size}."
         )
