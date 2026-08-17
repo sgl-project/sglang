@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from array import array
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List
 
@@ -30,14 +29,16 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         self.forward_mode = ForwardMode.PREBUILT
         reqs = self.reqs
-        input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
+        # PREBUILT never enters a model forward. Keep the legacy scalar metadata,
+        # but do not flatten and copy every transferred prompt to the GPU only to
+        # discard it before the first decode step.
         seq_lens = []
         pre_lens = []
         req_pool_indices = []
 
         # Pre-calculate total size
         total_size = sum(req.extend_range.length for req in reqs)
+        extend_num_tokens = total_size
         out_cache_loc = torch.empty(total_size, dtype=torch.int64, device=self.device)
 
         # Fill the tensor in one pass
@@ -77,9 +78,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
             pre_lens.append(pre_len)
 
         # Set fields
-        self.input_ids = torch.tensor(
-            sum(input_ids, array("q")), dtype=torch.int32, device=self.device
-        )
+        # The first decode input and speculative extras are seeded by
+        # process_prebuilt through FutureMap, so merge/forward-entry rebuilds
+        # input_ids from the relay.
+        self.input_ids = None
         self.req_pool_indices = torch.tensor(
             req_pool_indices, dtype=torch.int64, device=self.device
         )

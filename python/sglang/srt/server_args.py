@@ -893,6 +893,11 @@ class ServerArgs:
         Arg(help="The number of tokens in a page.", resolvable=True),
         NS("schedule"),
     ] = None
+    c128_page_size: A[
+        int,
+        "The physical page size of the NPU DSV4 C128 KV cache. Must be a positive multiple of 16.",
+        NS("schedule"),
+    ] = 16
     swa_full_tokens_ratio: A[
         float,
         Arg(
@@ -6686,7 +6691,6 @@ class ServerArgs:
         # (arg_groups/overrides.py: _moe_runner_backend_quant_constraints);
         # the compatibility asserts and fusion writes stay below.
         from sglang.srt.arg_groups.overrides import (
-            _cutlass_moe_env_override,
             _moe_runner_backend_quant_constraints,
             _moe_runner_fusion_disable,
             run_post_process_pass,
@@ -6761,11 +6765,6 @@ class ServerArgs:
         # invoked here at the legacy write slots.
         run_post_process_pass(self, _moe_runner_fusion_disable)
 
-        # The deprecated SGLANG_CUTLASS_MOE override moved to the pipeline
-        # (arg_groups/overrides.py: _cutlass_moe_env_override). It sits after
-        # the fusion blocks above on purpose: they must observe the
-        # pre-override runner value, exactly as they did imperatively.
-        run_post_process_pass(self, _cutlass_moe_env_override)
         if resolved_view(self).moe_runner_backend == "cutlass" and resolved_view(
             self
         ).quantization in [
@@ -9690,32 +9689,6 @@ def get_global_server_args() -> ServerArgs:
     return get_context().server_args
 
 
-def _has_cli_arg(argv: List[str], flag: str) -> bool:
-    return any(arg == flag or arg.startswith(f"{flag}=") for arg in argv)
-
-
-def _apply_fuseep_mode_env_compat(
-    raw_args: argparse.Namespace, argv: List[str]
-) -> None:
-    if not envs.SGLANG_NPU_FUSED_MOE_MODE.is_set() or _has_cli_arg(
-        argv, "--fuseep-mode"
-    ):
-        return
-
-    fuseep_mode = envs.SGLANG_NPU_FUSED_MOE_MODE.get()
-    if fuseep_mode not in (1, 2):
-        raise ValueError(
-            f"Wrong value of SGLANG_NPU_FUSED_MOE_MODE={fuseep_mode}, "
-            "the NPU only supports 1 or 2."
-        )
-
-    logger.warning(
-        "The env variable SGLANG_NPU_FUSED_MOE_MODE is deprecated and will be "
-        "removed in a future release. Please use --fuseep-mode instead."
-    )
-    raw_args.fuseep_mode = fuseep_mode
-
-
 def prepare_server_args(argv: List[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -9749,8 +9722,6 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
         datefmt="%Y-%m-%d %H:%M:%S",
         force=True,
     )
-
-    _apply_fuseep_mode_env_compat(raw_args, argv)
 
     return ServerArgs.from_cli_args(raw_args)
 
