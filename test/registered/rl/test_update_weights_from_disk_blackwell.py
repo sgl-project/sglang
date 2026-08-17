@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=320, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=420, stage="extra-b", runner_config="4-gpu-b200")
 
 import time
 import unittest
@@ -252,6 +252,35 @@ class TestServerUpdateWeightsFromDiskNVFP4CuteDSL(
     backend_test_suites = (
         {
             "name": "flashinfer_cutedsl_nvfp4",
+            "other_args": (
+                "--tp-size",
+                "4",
+                "--ep-size",
+                "4",
+                "--fp4-gemm-backend",
+                "flashinfer_cutedsl",
+                "--moe-runner-backend",
+                "flashinfer_cutedsl",
+                "--moe-a2a-backend",
+                "none",
+                "--enable-deterministic-inference",
+            ),
+        },
+    )
+
+
+class TestServerUpdateWeightsFromDiskNVFP4W4A16CuteDSL(
+    UpdateWeightsFromDiskBase, CustomTestCase
+):
+    model = "nvidia/Qwen3-30B-A3B-NVFP4"
+    launch_env = {
+        "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16": "1",
+        "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0",
+        "SGLANG_MOE_NVFP4_DISPATCH": "0",
+    }
+    backend_test_suites = (
+        {
+            "name": "flashinfer_cutedsl_nvfp4_w4a16",
             "other_args": (
                 "--tp-size",
                 "4",
