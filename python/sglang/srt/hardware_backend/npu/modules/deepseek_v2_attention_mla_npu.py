@@ -203,8 +203,10 @@ def forward_mla_prepare_npu(
                 k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
                 k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
             else:
-                if qkv_latent.shape[0] < 65536 and not dsa_use_prefill_cp(
-                    forward_batch
+                if (
+                    qkv_latent.shape[0] < 65536
+                    and not dsa_use_prefill_cp(forward_batch)
+                    and not getattr(m, "_disable_npu_fused_split_qk_norm", False)
                 ):
                     q, k_nope, k_pe = fused_split_qk_norm(
                         qkv_latent,
@@ -216,6 +218,8 @@ def forward_mla_prepare_npu(
                         eps=m.q_a_layernorm.variance_epsilon,
                     )
                 else:
+                    # The fused split+RMSNorm kernel is not numerically equivalent
+                    # on Ascend. Keep the unfused path for models that opt out.
                     q, latent_cache = qkv_latent.split(
                         [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim],
                         dim=-1,
@@ -245,7 +249,8 @@ def forward_mla_prepare_npu(
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
-        q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+        if m.rotary_emb is not None:
+            q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
             # support allgather+rerrange
@@ -297,14 +302,16 @@ def forward_mla_core_npu(
 
     attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
-    attn_bmm_output = torch.empty(
-        (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-        dtype=attn_output.dtype,
-        device=attn_output.device,
-    )
-
     attn_output = attn_output.contiguous()
-    torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+    # torch.ops.npu.batch_matmul_transpose is not numerically equivalent for
+    # Kimi-K3, so use the numerically validated torch_npu implementation.
+    attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
+        attn_output,
+        m.w_vc,
+        perm_x1=(1, 0, 2),
+        perm_x2=(0, 1, 2),
+        perm_y=(1, 0, 2),
+    )
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     output, _ = m.o_proj(attn_bmm_output)
@@ -380,8 +387,10 @@ def forward_dsa_prepare_npu(
             if q_event is not None:
                 torch.npu.current_stream().wait_event(q_event)
         else:
-            if fused_qkv_a_proj_out.shape[0] < 65535 and not dsa_use_prefill_cp(
-                forward_batch
+            if (
+                fused_qkv_a_proj_out.shape[0] < 65535
+                and not dsa_use_prefill_cp(forward_batch)
+                and not getattr(m, "_disable_npu_fused_split_qk_norm", False)
             ):
                 q_lora, k_nope, k_pe = fused_split_qk_norm(
                     fused_qkv_a_proj_out,
@@ -393,6 +402,8 @@ def forward_dsa_prepare_npu(
                     eps=m.q_a_layernorm.variance_epsilon,
                 )
             else:
+                # Keep the numerically validated unfused path for models that
+                # explicitly opt out of the fused split and RMSNorm kernel.
                 q, latent_cache = fused_qkv_a_proj_out.split(
                     [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
                 )

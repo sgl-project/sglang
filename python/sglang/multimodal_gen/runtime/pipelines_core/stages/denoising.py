@@ -20,9 +20,25 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from sglang.kernels.ops.diffusion.fused_gate_rmsnorm import (
+    mount_fused_gate_rmsnorm,
+    unmount_fused_gate_rmsnorm,
+)
 from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     mount_fused_linear_gelu,
     unmount_fused_linear_gelu,
+)
+from sglang.kernels.ops.diffusion.fused_ln_modulate import (
+    mount_fused_ln_modulate,
+    unmount_fused_ln_modulate,
+)
+from sglang.kernels.ops.diffusion.hunyuan_qknorm import (
+    mount_hunyuan_qknorm,
+    unmount_hunyuan_qknorm,
+)
+from sglang.kernels.ops.diffusion.ltx2_rmsnorm_modulate import (
+    mount_ltx2_rms_norm_modulate,
+    unmount_ltx2_rms_norm_modulate,
 )
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
@@ -73,14 +89,11 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
     save_mask_search_results,
 )
-from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
-    TransformerLoader,
-)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -113,6 +126,10 @@ from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import 
     RolloutDenoisingMixin,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.component_load import (
+    load_transformer_if_needed,
+    register_loaded_transformer,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -132,9 +149,38 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
     maybe_enable_inductor_compute_comm_overlap,
     resolve_torch_compile_mode,
 )
-from sglang.multimodal_gen.utils import dict_to_3d_list
 
 logger = init_logger(__name__)
+
+_QUALITY_FUSION_HANDLERS: tuple[
+    tuple[str, Callable[[nn.Module], bool], Callable[[nn.Module], None]], ...
+] = (
+    (
+        "fused linear+GELU (cublasLt epilogue)",
+        mount_fused_linear_gelu,
+        unmount_fused_linear_gelu,
+    ),
+    (
+        "fused LN+modulate (affine folding)",
+        mount_fused_ln_modulate,
+        unmount_fused_ln_modulate,
+    ),
+    (
+        "LTX-2 fused RMSNorm+modulate",
+        mount_ltx2_rms_norm_modulate,
+        unmount_ltx2_rms_norm_modulate,
+    ),
+    (
+        "fused gate RMSNorm (BF16-native Triton)",
+        mount_fused_gate_rmsnorm,
+        unmount_fused_gate_rmsnorm,
+    ),
+    (
+        "HunyuanVideo strided QK RMSNorm",
+        mount_hunyuan_qknorm,
+        unmount_hunyuan_qknorm,
+    ),
+)
 
 
 def _ensure_tensor_model_output(model_output):
@@ -226,9 +272,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # cache-dit state (for delayed mounting and idempotent control)
         self._cache_dit_enabled = False
         self._cached_num_steps = None
-        # fused linear+GELU state: whether the cublasLt-epilogue fusion is
-        # currently mounted on the transformers (quality="high" batches only).
-        self._fused_gelu_mounted = False
+        # Whether request-scoped quality="high" fusions are currently mounted.
+        self._quality_fusions_mounted = False
         self._torch_compile_registry = CompiledModuleRegistry()
         # Breakable CUDA graph runners, one per transformer module (lazy).
         self._bcg_runners: dict[int, Any] = {}
@@ -354,7 +399,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if (
             not args.enable_torch_compile
             or not args.offload_during_compile
-            or not args.warmup
+            or args.warmup_mode == "off"
             or not self._owns_compile_warmup_lifecycle()
             or args.use_fsdp_inference
             or self._cache_dit_requested()
@@ -450,38 +495,36 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
         """Apply request-dependent transformer acceleration in trace-safe order."""
-        self._maybe_toggle_fused_gelu(batch)
+        self._maybe_toggle_quality_fusions(batch)
         self._maybe_enable_cache_dit(num_inference_steps, batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             self._maybe_torch_compile(transformer)
 
-    def _maybe_toggle_fused_gelu(self, batch: Req) -> None:
-        """Mount/unmount the cublasLt linear+GELU fusion for this batch.
+    def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
+        """Mount/unmount the ``quality="high"`` fusions for this batch.
 
-        The fused epilogue is numerically equivalent only at half-precision
-        rounding level (not bit-exact), so it is mounted for
-        ``quality="high"`` requests and unmounted otherwise -- the
-        ``"lossless"`` default runs the unmodified reference path bit-for-bit.
-        ``quality`` participates in the dynamic-batch signature, so a worker
-        batch is uniform in ``quality`` and this process-wide transition is
-        safe at the batch boundary. Mounting is all-or-nothing per
-        transformer (any ineligible marked site keeps the whole transformer
-        on the reference path); models without marked sites are no-ops.
+        These fusions are numerically equivalent only at half-precision
+        rounding level (not bit-exact), so they are mounted for
+        ``quality="high"`` requests and unmounted otherwise. The
+        ``"lossless"`` default runs the reference path bit-for-bit. ``quality``
+        participates in the dynamic-batch signature, making this transition
+        safe at the batch boundary. Mounting is all-or-nothing per transformer
+        and fusion family; models without marked sites are no-ops.
         """
         want = getattr(batch.sampling_params, "quality", "lossless") == "high"
-        if want == self._fused_gelu_mounted:
+        if want == self._quality_fusions_mounted:
             return
-        mounted = False
+        mounted_fusions: set[str] = set()
         for transformer in filter(None, [self.transformer, self.transformer_2]):
-            if want:
-                mounted |= mount_fused_linear_gelu(transformer)
-            else:
-                unmount_fused_linear_gelu(transformer)
-        self._fused_gelu_mounted = want
-        if want and mounted:
-            logger.info(
-                "Mounted fused linear+GELU (cublasLt epilogue) for quality=high"
-            )
+            for description, mount, unmount in _QUALITY_FUSION_HANDLERS:
+                if want:
+                    if mount(transformer):
+                        mounted_fusions.add(description)
+                else:
+                    unmount(transformer)
+        self._quality_fusions_mounted = want
+        for description in sorted(mounted_fusions):
+            logger.info("Mounted %s for quality=high", description)
 
     def _cache_dit_dual_model_name(self) -> str:
         return "wan2.2"
@@ -628,6 +671,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if self.server_args.enable_breakable_cuda_graph:
             # Cache-DiT wraps transformer.forward with step-skipping control
             # flow that must not be baked into a captured CUDA graph.
+            if self._cache_dit_requested():
+                logger.warning_once(
+                    "Cache-DiT was requested but is disabled because breakable "
+                    "CUDA graphs are enabled."
+                )
             return
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
         if self._cache_dit_enabled:
@@ -853,22 +901,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         else:
             cache_dit_num_inference_steps = num_inference_steps
 
-        transformer_was_loaded = server_args.model_loaded["transformer"]
-        if not transformer_was_loaded:
-            # FIXME: reuse more code
-            loader = TransformerLoader()
-            self.transformer = loader.load(
-                server_args.model_paths["transformer"], server_args, "transformer"
-            )
+        freshly_loaded = load_transformer_if_needed(self, server_args)
 
         self._maybe_enable_cache_dit_and_torch_compile(
             cache_dit_num_inference_steps, batch
         )
 
-        if not transformer_was_loaded:
-            if pipeline:
-                pipeline.add_module("transformer", self.transformer)
-            server_args.model_loaded["transformer"] = True
+        if freshly_loaded:
+            register_loaded_transformer(self, server_args, pipeline)
 
         if batch.rollout:
             self._maybe_prepare_rollout(batch)
@@ -965,7 +1005,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             {
                 # TODO: make sure on-device
                 "encoder_hidden_states_image": image_embeds,
-                "mask_strategy": dict_to_3d_list(None, t_max=50, l_max=60, h_max=24),
             },
         )
 
@@ -1408,10 +1447,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 torch.mps.current_allocated_memory(),
             )
             if self._component_residency_manager is not None:
-                self._component_residency_manager.remove_nvtx_hooks_for_module(
-                    self.transformer
-                )
-                self._component_residency_manager.strategy_for.cache_clear()
+                self._component_residency_manager.finish_active_use(prefetch_next=False)
+                self._component_residency_manager.forget_module(self.transformer)
             del self.transformer
             if pipeline is not None and "transformer" in pipeline.modules:
                 del pipeline.modules["transformer"]
@@ -1506,12 +1543,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         batch: Req,
     ) -> None:
         """
-        manage dit's residency by reporting the active sequential use
-
-        only applicable for dual-dit architecture like Wan
+        manage dit residency by reporting the active sequential use
 
         Args:
-            current_model: the next active dit, transformer_1 or transformer_2
+            current_model: the next active dit
         """
         manager = self._component_residency_manager
 

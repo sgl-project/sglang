@@ -17,6 +17,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_target_verify import (
+    get_eagle_verify_tp_group,
     maybe_eagle_sample_target_verify_topk1,
 )
 from sglang.srt.speculative.eagle_utils import organize_draft_results
@@ -231,6 +232,42 @@ class TestTargetVerifyFusionOwnership(CustomTestCase):
         )
 
 
+class TestEagleVerifyTpGroupSelection(CustomTestCase):
+    def test_uses_model_tp_group_without_dp_attention(self):
+        tp_group = object()
+        with (
+            patch(
+                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.distributed.get_tp_group", return_value=tp_group
+            ) as get_tp_group,
+        ):
+            actual = get_eagle_verify_tp_group()
+
+        self.assertIs(actual, tp_group)
+        get_tp_group.assert_called_once_with()
+
+    def test_uses_attention_tp_group_with_dp_attention(self):
+        attn_tp_group = object()
+        with (
+            patch(
+                "sglang.srt.layers.dp_attention.is_dp_attention_enabled",
+                return_value=True,
+            ),
+            patch("sglang.srt.distributed.get_tp_group") as get_tp_group,
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(attn_tp_group=attn_tp_group),
+            ),
+        ):
+            actual = get_eagle_verify_tp_group()
+
+        self.assertIs(actual, attn_tp_group)
+        get_tp_group.assert_not_called()
+
+
 @unittest.skipUnless(
     is_cuda() and torch.cuda.is_available(), "NVIDIA CUDA is required for this test."
 )
@@ -243,9 +280,13 @@ class TestTargetVerifyTopk1Selection(CustomTestCase):
             self.device
         )
 
-        result = maybe_eagle_sample_target_verify_topk1(
-            verify_input, batch, logits_output
-        )
+        with patch(
+            "sglang.srt.speculative.eagle_target_verify.get_eagle_verify_tp_group",
+            return_value=SimpleNamespace(world_size=1),
+        ):
+            result = maybe_eagle_sample_target_verify_topk1(
+                verify_input, batch, logits_output
+            )
 
         self.assertIsNotNone(result)
         torch.testing.assert_close(
@@ -260,6 +301,33 @@ class TestTargetVerifyTopk1Selection(CustomTestCase):
             rtol=0,
             atol=0,
         )
+
+    def test_tp_uses_one_packed_broadcast_for_all_outputs(self):
+        verify_input, batch, logits_output = _make_target_verify_selection_case(
+            self.device
+        )
+        tp_group = SimpleNamespace(world_size=2, broadcast=MagicMock())
+
+        with patch(
+            "sglang.srt.speculative.eagle_target_verify.get_eagle_verify_tp_group",
+            return_value=tp_group,
+        ):
+            result = maybe_eagle_sample_target_verify_topk1(
+                verify_input, batch, logits_output
+            )
+
+        tp_group.broadcast.assert_called_once()
+        packed_buffer = tp_group.broadcast.call_args.args[0]
+        self.assertEqual(tp_group.broadcast.call_args.kwargs, {"src": 0})
+        self.assertEqual(packed_buffer.dtype, torch.int64)
+        self.assertTrue(packed_buffer.is_contiguous())
+        packed_storage = packed_buffer.untyped_storage().data_ptr()
+        for field in result._fields:
+            with self.subTest(field=field):
+                self.assertEqual(
+                    getattr(result, field).untyped_storage().data_ptr(),
+                    packed_storage,
+                )
 
     def test_fallbacks(self):
         cases = (
@@ -382,12 +450,15 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                     seq_lens=torch.ones((1,), dtype=torch.int32, device=DEVICE),
                 )
 
-                with patch(
-                    "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
-                    return_value=tree_result,
-                ), patch(
-                    "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
-                    return_value=(forward_batch, True),
+                with (
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_common.build_tree_kernel_efficient",
+                        return_value=tree_result,
+                    ),
+                    patch(
+                        "sglang.srt.speculative.eagle_worker_v2.prepare_for_draft",
+                        return_value=(forward_batch, True),
+                    ),
                 ):
                     worker.draft(batch)
 

@@ -185,6 +185,22 @@ def outplace_all_reduce(
     return group._all_reduce_out_place(tensor, outplace_all_reduce_method)
 
 
+@register_custom_op(out_shape="tensor")
+def flashinfer_allreduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    """FlashInfer kAllReduce over ``group_name``.
+
+    Registered as a custom op so it stays opaque under Dynamo and can run inside
+    piecewise CUDA graphs. Applicability is decided by
+    ``GroupCoordinator._can_use_flashinfer_allreduce`` before the call -- this op
+    has no fallback of its own.
+    """
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._flashinfer_allreduce(tensor)
+
+
 @register_custom_op(mutates_args=["output"])
 def reg_all_gather_into_tensor(
     output: torch.Tensor, input: torch.Tensor, group_name: str
@@ -291,6 +307,10 @@ class GroupCoordinator:
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
+        # Which FlashInfer fusion workspace this group owns, or None when the
+        # group is not eligible for the allreduce-only kAllReduce path. Stamped
+        # by _tag_groups_for_flashinfer_allreduce_only() after group init.
+        self._fi_workspace_hint: Optional[str] = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
         if is_cuda_alike():
@@ -348,12 +368,14 @@ class GroupCoordinator:
                     backend="mooncake",
                     pg_options=dev_opts,
                     timeout=subgroup_timeout,
+                    group_desc=f"{group_name}:device",
                 )
                 cpu_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake-cpu",
                     pg_options=cpu_opts,
                     timeout=subgroup_timeout,
+                    group_desc=f"{group_name}:cpu",
                 )
             else:
                 active_ranks = torch.ones(
@@ -366,11 +388,15 @@ class GroupCoordinator:
                     backend=torch_distributed_backend,
                     pg_options=pg_options,
                     timeout=subgroup_timeout,
+                    group_desc=f"{group_name}:device",
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
                 cpu_group = torch.distributed.new_group(
-                    ranks, backend="gloo", timeout=gloo_timeout
+                    ranks,
+                    backend="gloo",
+                    timeout=gloo_timeout,
+                    group_desc=f"{group_name}:cpu",
                 )
             if self.rank in ranks:
                 self.ranks = ranks
@@ -666,6 +692,9 @@ class GroupCoordinator:
             return self.npu_communicator.all_reduce(input_)
 
         if torch.compiler.is_compiling():
+            if self._can_use_flashinfer_allreduce(input_):
+                return flashinfer_allreduce(input_, group_name=self.unique_name)
+
             # Byte-size thresholds in method selection (e.g. `_pick_algo` or
             # `should_mscclpp_allreduce`) would guard on the symbolic token dim
             # and recompile per shape; defer the selection to runtime inside
@@ -716,6 +745,9 @@ class GroupCoordinator:
             with self.pynccl_comm.change_state(enable=True):
                 self.pynccl_comm.all_reduce(input_)
                 return input_
+
+        if self._can_use_flashinfer_allreduce(input_):
+            return flashinfer_allreduce(input_, group_name=self.unique_name)
 
         outplace_all_reduce_method = self._resolve_outplace_all_reduce_method(
             input_=input_,
@@ -913,6 +945,29 @@ class GroupCoordinator:
             return "pynccl"
         return None
 
+    def _can_use_flashinfer_allreduce(self, input_: torch.Tensor) -> bool:
+        if self._fi_workspace_hint is None:
+            return False
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            can_use_flashinfer_allreduce,
+        )
+
+        return can_use_flashinfer_allreduce(
+            input_,
+            use_attn_tp_group=(self._fi_workspace_hint == "attn_tp"),
+            expected_world_size=self.world_size,
+            expected_group_key=(self.device_group, self.cpu_group),
+        )
+
+    def _flashinfer_allreduce(self, input_: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            flashinfer_allreduce as _flashinfer_allreduce_impl,
+        )
+
+        return _flashinfer_allreduce_impl(
+            input_, use_attn_tp_group=(self._fi_workspace_hint == "attn_tp")
+        )
+
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:
@@ -1074,7 +1129,10 @@ class GroupCoordinator:
             return False
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
-                ca_comm.reduce_scatter(input, output, registered=True)
+                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                    ca_comm.reduce_scatter(input, output, registered=False)
+                else:
+                    ca_comm.reduce_scatter(input, output, registered=True)
             elif is_in_tc_piecewise_cuda_graph():
                 ca_comm.reduce_scatter(input, output, registered=False)
             else:
@@ -1870,6 +1928,7 @@ def init_model_parallel_group(
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
+_ATTN_CP_OVERLAP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
 # duplicate GroupCoordinator for prefill in PD-Multiplexing
@@ -1905,6 +1964,55 @@ def get_attn_cp_group() -> GroupCoordinator:
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
     return _ATTN_CP
+
+
+def get_attn_cp_overlap_group() -> GroupCoordinator:
+    return _ATTN_CP_OVERLAP if _ATTN_CP_OVERLAP is not None else get_attn_cp_group()
+
+
+def _init_attn_cp_overlap_group(
+    *,
+    world_size: int,
+    attn_cp_size: int,
+    attn_tp_size: int,
+    backend: Optional[str],
+    recovered_rank: bool,
+    rank_offset: int,
+    max_world_size: Optional[int],
+) -> None:
+    """Second communicator over the attention CP ranks; RCCL deadlocks when one
+    communicator is driven from two streams at once."""
+    global _ATTN_CP_OVERLAP
+    assert (
+        _ATTN_CP_OVERLAP is None
+    ), "attention context parallel overlap group is already initialized"
+    if attn_cp_size <= 1:
+        return
+
+    span = attn_tp_size * attn_cp_size
+    group_ranks = [
+        list(range(base + i, base + i + span, attn_tp_size))
+        for base in range(0, world_size, span)
+        for i in range(attn_tp_size)
+    ]
+    rank = torch.distributed.get_rank()
+    mine = next(ranks for ranks in group_ranks if rank in ranks)
+    assert mine == get_attn_cp_group().ranks, (
+        f"attn_cp_overlap partition {mine} does not match attn_cp "
+        f"{get_attn_cp_group().ranks}; the two communicators must span the "
+        "same ranks or the overlapped collectives will not pair up"
+    )
+
+    _ATTN_CP_OVERLAP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_message_queue_broadcaster=False,
+        group_name="attn_cp_overlap",
+        recovered_rank=recovered_rank,
+        rank_offset=rank_offset,
+        max_world_size=max_world_size,
+    )
 
 
 def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
@@ -1999,6 +2107,7 @@ _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
 # Read once at import: whether CustomAllReduceV2 is opted in on a multi-node
 # (MNNVL) group. Used on the all_reduce hot path (see GroupCoordinator).
 _CA_V2_MULTINODE = envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get()
+_ENABLE_FLASHINFER_ALLREDUCE_ONLY = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -2014,6 +2123,41 @@ def set_mscclpp_all_reduce(enable: bool):
 def set_torch_symm_mem_all_reduce(enable: bool):
     global _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
+
+
+def set_flashinfer_allreduce_only(enable: bool):
+    global _ENABLE_FLASHINFER_ALLREDUCE_ONLY
+    _ENABLE_FLASHINFER_ALLREDUCE_ONLY = enable
+
+
+def _tag_groups_for_flashinfer_allreduce_only():
+    """Stamp _fi_workspace_hint on the group coordinators that own a FlashInfer
+    fusion workspace, so all_reduce() can dispatch to flashinfer_allreduce()
+    without touching the call sites.
+
+    Only two workspaces exist (see ``_get_workspace_manager``): one for
+    attention TP and one for MoE. A group may only be tagged for the workspace
+    that was rendezvoused on its own peers -- reducing over a workspace built
+    for a different set of peers silently returns wrong data.
+
+    - ``_TP`` is deliberately absent: it *is* ``_ATTN_TP`` when
+      ``attn_tp_size == tp_size``, and a strict superset of it otherwise (DP
+      attention), where the attention workspace addresses the wrong peers.
+    - The MoE workspace rendezvouses on the EP group when ``moe_ep_size > 1``
+      and on the MoE-TP group otherwise, so exactly one of ``_MOE_EP`` /
+      ``_MOE_TP`` is eligible. Tagging both makes a MoE-TP allreduce reduce
+      across the EP peers under hybrid EP+TP (e.g. tp=4, ep=2).
+    """
+    if not _ENABLE_FLASHINFER_ALLREDUCE_ONLY:
+        return
+
+    moe_group = _MOE_EP if (_MOE_EP is not None and _MOE_EP.world_size > 1) else _MOE_TP
+    # Attention is tagged last on purpose: when a coordinator backs both roles
+    # (e.g. _ATTN_TP is _MOE_EP is _TP at tp=4, ep=4) either workspace spans the
+    # same peers and is correct, so we just pick one deterministically.
+    for group, hint in ((moe_group, "moe"), (_ATTN_TP, "attn_tp")):
+        if group is not None:
+            group._fi_workspace_hint = hint
 
 
 # TODO: refactor in-tree platforms to get rid of this wrapper
@@ -2198,6 +2342,7 @@ def initialize_model_parallel(
     decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    duplicate_attn_cp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
     rank_offset: int = 0,
@@ -2387,6 +2532,17 @@ def initialize_model_parallel(
             backend,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attn_cp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
+    if duplicate_attn_cp_group and is_hip():
+        _init_attn_cp_overlap_group(
+            world_size=world_size,
+            attn_cp_size=attn_cp_size,
+            attn_tp_size=attn_tp_size,
+            backend=backend,
             recovered_rank=recovered_rank,
             rank_offset=rank_offset,
             max_world_size=max_world_size,
@@ -2793,12 +2949,16 @@ def destroy_model_parallel():
     _MOE_TP = None
 
     global _ATTN_CP
+    global _ATTN_CP_OVERLAP
     global _MOE_DP
     # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.
     # Only destroy if not aliasing another group.
     if _MOE_DP and _MOE_DP is not _ATTN_CP and _MOE_DP is not _TP:
         _MOE_DP.destroy()
     _MOE_DP = None
+    if _ATTN_CP_OVERLAP:
+        _ATTN_CP_OVERLAP.destroy()
+    _ATTN_CP_OVERLAP = None
     if _ATTN_CP:
         _ATTN_CP.destroy()
     _ATTN_CP = None
