@@ -828,13 +828,18 @@ def eagle_sample(
     # tensors feeding this point can make one rank accept a different number of
     # drafts, which desynchronizes the committed seq_lens and deadlocks the next
     # TP collective. Broadcast from rank 0 to ensure consistency.
-    tp_group = (
-        get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
-    )
-    if tp_group.world_size > 1:
-        tp_group.broadcast(predict, src=0)
-        tp_group.broadcast(accept_index, src=0)
-        tp_group.broadcast(num_correct_drafts, src=0)
+    # XPU opts out: always on the greedy path, it never ran this sync before, and
+    # the raw broadcast here hangs TP>1 EAGLE at warmup (#35144).
+    if not _is_xpu:
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(predict, src=0)
+            tp_group.broadcast(accept_index, src=0)
+            tp_group.broadcast(num_correct_drafts, src=0)
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
