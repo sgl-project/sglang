@@ -88,7 +88,8 @@ def discover_files(repo_root: str) -> list[str]:
         for f in glob.glob(
             os.path.join(test_dir, "registered", "**", "*.py"), recursive=True
         )
-        if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
+        # Same exclusion as run_suite.py: pytest+package structure files.
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
     ]
     jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
     files += glob.glob(
@@ -128,8 +129,11 @@ def compute_partitions(
     in-source `est_time` / `(1.0, 0.0)`.
     `full_parallel=True` lifts the matrix-fanout throttle.
     """
-    # Allowlist: stages pr-test.yml dispatches. Stress / weekly /
-    # nightly-* live in test/registered/ but pr-test doesn't run them.
+    # Allowlist of the stages this workflow dispatches -- what keeps stress /
+    # weekly / nightly out, since CUDA scheduled suites no longer carry
+    # `nightly=True`. The nightly filter still matters for CPU: some tests sit on
+    # a dispatched suite with the flag set, so run_suite.py skips them and their
+    # est_time must not inflate the shard count.
     dispatched_suites = set(run_timeouts) | set(_BASE_A_OVERRIDES)
     suite_tests = defaultdict(list)
     for t in tests:
