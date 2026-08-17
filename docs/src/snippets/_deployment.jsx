@@ -443,16 +443,8 @@ export const Deployment = ({ config, benchmarks }) => {
     typeof v === "string"
       ? (VERIFY_LABEL[v] ? v : "unverified")
       : (v ? "verified" : "unverified");
-  // Either field may also be a function of the full selection, so overlay
-  // picks — which never re-match the cell — can still move the badge: a
-  // recipe verified only at its default serving tier reports "unverified"
-  // the moment a non-default overlay option is selected.
-  const cellVerifyStatus = (c, selection) => {
-    if (!c) return "unverified";
-    let v = c.verificationStatus ?? c.verified;
-    if (typeof v === "function") v = v(selection);
-    return verifyStatusOf(v);
-  };
+  const cellVerifyStatus = (c) =>
+    c ? verifyStatusOf(c.verificationStatus ?? c.verified) : "unverified";
 
   // Two kinds of selector row:
   //   match dims    participate in cell lookup (cell.match[dim] === sel[dim])
@@ -1248,7 +1240,7 @@ export const Deployment = ({ config, benchmarks }) => {
   // ==== 5. Derived values ====
   const s = makeStyles(isDark);
   const cell = findCell(config.cells, sel);
-  const verifyStatus = cellVerifyStatus(cell, sel);
+  const verifyStatus = cellVerifyStatus(cell);
   // Pin the calculator-computed ratio into the rendered command (before the
   // host/port tail); cells themselves stay ratio-free.
   const cellWithRatio = (() => {
