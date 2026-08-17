@@ -480,10 +480,12 @@ export const config = {
     },
     // DGX Spark (GB10, SM121): single node, 128GB coherent unified memory
     // shared with the CPU — every checkpoint fits, so all three quants get a
-    // cell. FlashInfer attention comes from the SM120 pair; the platform gets
-    // its own operating point at 8192-token prefill chunks, 0.95 static
-    // fraction, and prefill CUDA graphs disabled. Unvalidated on SM121 /
-    // aarch64.
+    // cell. These cells reuse the RTX PRO 6000 recipe verbatim rather than a
+    // separate SM121 operating point: both cards are SM12x Blackwell, and
+    // GB10's 128GB unified pool is larger than the 6000's 96GB, so a recipe
+    // that fits the smaller card has headroom here. Still unvalidated on
+    // SM121 / aarch64 -- these cells carry no `verified`, and the shared
+    // recipe is an inheritance choice, not a measurement.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", nodes: "single" },
       env: [],
@@ -491,10 +493,9 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--kv-cache-dtype fp8_e4m3",
-        "--mem-fraction-static 0.95",
+        "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
-        "--chunked-prefill-size 8192",
-        "--disable-prefill-cuda-graph",
+        "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -508,10 +509,9 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--kv-cache-dtype fp8_e4m3",
-        "--mem-fraction-static 0.95",
+        "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
-        "--chunked-prefill-size 8192",
-        "--disable-prefill-cuda-graph",
+        "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -525,10 +525,9 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--kv-cache-dtype fp8_e4m3",
-        "--mem-fraction-static 0.95",
+        "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
-        "--chunked-prefill-size 8192",
-        "--disable-prefill-cuda-graph",
+        "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
