@@ -134,6 +134,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     from sglang.srt.arg_groups.overrides import (
         _deepseek_v4_attn_backend_auto,
         _deepseek_v4_kv_cache_dtype,
+        _deepseek_v4_uses_context_parallelism,
         run_post_process_pass,
     )
 
@@ -156,6 +157,10 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
         assert (
             not server_args.enable_hisparse
         ), "--dsv4-attn-backend trtllm does not support enable_hisparse."
+        assert not _deepseek_v4_uses_context_parallelism(server_args), (
+            "--dsv4-attn-backend trtllm does not support context parallelism "
+            "(prefill CP, attention CP, or decode CP)."
+        )
         logger.info(
             "DeepSeek V4 attention: trtllm backend enabled "
             "(uniform-FP8 KV pool, decode + sparse prefill)."

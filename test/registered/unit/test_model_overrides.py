@@ -85,6 +85,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "kv_cache_dtype",
                     "dsa_prefill_backend",
                     "dsa_decode_backend",
+                    "dsv4_attn_backend",
                     "prefill_attention_backend",
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",
@@ -1493,6 +1494,66 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _deepseek_v4_kv_cache_dtype(_view(kv_cache_dtype="fp8_e5m2"))
         self.assertEqual(
             _deepseek_v4_kv_cache_dtype(_view(arch="LlamaForCausalLM")), {}
+        )
+
+    def test_deepseek_v4_attn_backend_auto_pass(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _deepseek_v4_attn_backend_auto,
+        )
+
+        def _view(arch="DeepseekV4ForCausalLM", **kw):
+            hf = SimpleNamespace(architectures=[arch])
+            defaults = dict(
+                dsv4_attn_backend="auto",
+                device="cuda",
+                kv_cache_dtype="fp8_e4m3",
+                attn_cp_size=1,
+                dcp_size=1,
+                enable_prefill_cp=False,
+                enable_prefill_context_parallel=False,
+                enable_dsa_prefill_context_parallel=False,
+                enable_hisparse=False,
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(
+                    get_model_config=lambda: SimpleNamespace(hf_config=hf), **defaults
+                )
+            )
+
+        with patch("sglang.srt.utils.common.is_sm100_supported", return_value=True):
+            self.assertEqual(
+                _deepseek_v4_attn_backend_auto(_view()),
+                {"dsv4_attn_backend": "trtllm"},
+            )
+            self.assertEqual(
+                _deepseek_v4_attn_backend_auto(_view(dsv4_attn_backend="flashmla")),
+                {},
+            )
+            self.assertEqual(
+                _deepseek_v4_attn_backend_auto(_view(enable_hisparse=True)), {}
+            )
+            for field, value in (
+                ("attn_cp_size", 2),
+                ("dcp_size", 2),
+                ("enable_prefill_cp", True),
+                ("enable_prefill_context_parallel", True),
+                ("enable_dsa_prefill_context_parallel", True),
+            ):
+                with self.subTest(field=field):
+                    self.assertEqual(
+                        _deepseek_v4_attn_backend_auto(_view(**{field: value})), {}
+                    )
+
+        with patch("sglang.srt.utils.common.is_sm100_supported", return_value=False):
+            self.assertEqual(_deepseek_v4_attn_backend_auto(_view()), {})
+
+        self.assertEqual(
+            _deepseek_v4_attn_backend_auto(_view(kv_cache_dtype="bfloat16")), {}
+        )
+        self.assertEqual(
+            _deepseek_v4_attn_backend_auto(_view(arch="LlamaForCausalLM")), {}
         )
 
     def test_deepseek_spec_moe_resolution_pass(self):

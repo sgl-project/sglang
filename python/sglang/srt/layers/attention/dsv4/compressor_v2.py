@@ -49,6 +49,34 @@ def _extract_positions_from_plan(
     return positions
 
 
+def _mask_invalid_prefill_compress_rows(
+    kv_compressed: torch.Tensor,
+    plan_raw: torch.Tensor,
+    out_loc: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Make padded prefill-plan rows inert before the unfused store.
+
+    ``PlanC::invalid()`` uses ``seq_len == -1`` and a ``ragged_id`` of
+    ``0xffff``.  The fused epilogue checks ``is_invalid()`` before reading
+    ``out_loc``; the unfused uniform-FP8 path must provide the same guard
+    without introducing a dynamic-shape mask (it is also used by BCG).
+    """
+    valid = plan_raw[:, 0] != -1
+    kv_compressed = torch.where(
+        valid.unsqueeze(-1), kv_compressed, torch.zeros_like(kv_compressed)
+    )
+
+    ragged_ids = plan_raw[:, 1].to(torch.int32) & 0xFFFF
+    safe_ragged_ids = torch.where(valid, ragged_ids, torch.zeros_like(ragged_ids))
+    mapped_out_loc = out_loc[safe_ragged_ids.long()]
+    # Slot 0 is the allocator's reserved padding sink, so duplicate invalid
+    # writes cannot collide with a live cache entry.
+    out_loc_to_store = torch.where(
+        valid, mapped_out_loc, torch.zeros_like(mapped_out_loc)
+    )
+    return kv_compressed, out_loc_to_store
+
+
 def _compress_forward_c128_fallback(
     kv_score_buffer: torch.Tensor,
     kv_score_input: torch.Tensor,
@@ -343,8 +371,11 @@ class CompressorBackendMixin:
             )
             out_loc_to_store = out_loc
         else:
-            ragged_ids = plan_raw[:, 1].to(torch.int32) & 0xFFFF
-            out_loc_to_store = out_loc[ragged_ids.long()]
+            kv_compressed, out_loc_to_store = _mask_invalid_prefill_compress_rows(
+                kv_compressed,
+                plan_raw,
+                out_loc,
+            )
 
         positions = _extract_positions_from_plan(plan, compress_ratio).clamp(min=0)
         fused_norm_rope_inplace_triton(

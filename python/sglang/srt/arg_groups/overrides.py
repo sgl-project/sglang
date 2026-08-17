@@ -1921,6 +1921,16 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
     return {}
 
 
+def _deepseek_v4_uses_context_parallelism(view: Any) -> bool:
+    return (
+        view.attn_cp_size > 1
+        or view.dcp_size > 1
+        or view.enable_prefill_cp
+        or view.enable_prefill_context_parallel
+        or view.enable_dsa_prefill_context_parallel
+    )
+
+
 @register_post_process
 def _deepseek_v4_attn_backend_auto(view: Any) -> dict:
     """Slot pass in the DeepSeek V4 hook (after _deepseek_v4_kv_cache_dtype):
@@ -1937,18 +1947,11 @@ def _deepseek_v4_attn_backend_auto(view: Any) -> dict:
 
     from sglang.srt.utils.common import is_sm100_supported
 
-    uses_cp = (
-        view.attn_cp_size > 1
-        or view.dcp_size > 1
-        or view.enable_prefill_cp
-        or view.enable_prefill_context_parallel
-        or view.enable_dsa_prefill_context_parallel
-    )
     if (
         view.device == "cuda"
         and is_sm100_supported()
         and view.kv_cache_dtype == "fp8_e4m3"
-        and not uses_cp
+        and not _deepseek_v4_uses_context_parallelism(view)
         and not view.enable_hisparse
     ):
         logger.info(

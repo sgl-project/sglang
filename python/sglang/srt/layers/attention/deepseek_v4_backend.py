@@ -2667,7 +2667,9 @@ class DeepseekV4AttnBackend(
         if need_compress:
             core_attn_metadata.init_compression_metadata(num_tokens)
             core_attn_metadata.init_flashmla_related(is_prefill=is_prefill)
-            if self.trtllm_attn:
+            if self.trtllm_attn and not is_prefill:
+                # Eager prefill builds its varlen tables lazily in
+                # _forward_trtllm_prefill; these buffers are decode-only.
                 core_attn_metadata.init_trtllm_sparse_buffers()
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
