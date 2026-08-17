@@ -121,8 +121,11 @@ def _target_verify_topk1_finalize_kernel(
     new_seq_lens,
     select_index,
     draft_tokens,
+    num_simulated_accept_tokens,
     num_splits: tl.constexpr,
     NUM_DRAFT_TOKENS: tl.constexpr,
+    SIMULATE_ACCEPTANCE: tl.constexpr,
+    USE_REAL_DRAFT_TOKENS: tl.constexpr,
     ROW_BLOCK: tl.constexpr,
     SPLIT_BLOCK: tl.constexpr,
 ):
@@ -194,6 +197,45 @@ def _target_verify_topk1_finalize_kernel(
     last_local = last_global - request_base
     bonus_token = tl.sum(tl.where(rows == last_local, target_ids, 0), axis=0)
     predict_values = tl.where(rows == last_local, bonus_token, predict_values)
+
+    if SIMULATE_ACCEPTANCE:
+        first_global = tl.load(retrieve_index + request_base)
+        accept_values = tl.where(
+            rows < num_simulated_accept_tokens,
+            first_global + rows,
+            -1,
+        )
+        num_correct_drafts_value = num_simulated_accept_tokens - 1
+
+        if USE_REAL_DRAFT_TOKENS:
+            simulated_draft_mask = rows < num_simulated_accept_tokens - 1
+            simulated_draft_tokens = tl.load(
+                candidates + request_base + rows + 1,
+                mask=simulated_draft_mask,
+                other=0,
+            )
+            predict_values = tl.where(
+                simulated_draft_mask,
+                simulated_draft_tokens,
+                predict_values,
+            )
+            simulated_bonus_token = tl.sum(
+                tl.where(
+                    rows == num_simulated_accept_tokens - 1,
+                    target_ids,
+                    0,
+                ),
+                axis=0,
+            )
+            predict_values = tl.where(
+                rows == num_simulated_accept_tokens - 1,
+                simulated_bonus_token,
+                predict_values,
+            )
+            bonus_token = simulated_bonus_token
+        else:
+            predict_values = tl.full((ROW_BLOCK,), 100, tl.int32)
+            bonus_token = 100
 
     row_mask = rows < NUM_DRAFT_TOKENS
     tl.store(predict + request_base + rows, predict_values, mask=row_mask)
@@ -527,6 +569,8 @@ def _target_verify_topk1_postprocess(
     seq_lens: torch.Tensor,
     *,
     packed: bool,
+    num_simulated_accept_tokens: int,
+    use_real_draft_tokens: bool,
 ) -> tuple[TargetVerifyTopk1Output, torch.Tensor | None]:
     assert target_verify_topk1_is_supported(
         next_token_logits,
@@ -537,6 +581,9 @@ def _target_verify_topk1_postprocess(
     ), "Unsupported tensor shape, layout, dtype, or device"
 
     batch_size, num_draft_tokens = candidates.shape
+    assert isinstance(num_simulated_accept_tokens, int)
+    assert 0 <= num_simulated_accept_tokens <= num_draft_tokens
+    assert num_simulated_accept_tokens > 0 or not use_real_draft_tokens
     output, packed_buffer = _allocate_target_verify_topk1_output(
         batch_size,
         num_draft_tokens,
@@ -564,8 +611,11 @@ def _target_verify_topk1_postprocess(
         output.new_seq_lens,
         output.select_index,
         output.draft_tokens,
+        num_simulated_accept_tokens,
         num_splits,
         NUM_DRAFT_TOKENS=num_draft_tokens,
+        SIMULATE_ACCEPTANCE=num_simulated_accept_tokens > 0,
+        USE_REAL_DRAFT_TOKENS=use_real_draft_tokens,
         ROW_BLOCK=triton.next_power_of_2(num_draft_tokens),
         SPLIT_BLOCK=triton.next_power_of_2(num_splits),
         num_warps=4,
@@ -579,6 +629,9 @@ def target_verify_topk1_postprocess(
     retrieve_index: torch.Tensor,
     retrieve_next_token: torch.Tensor,
     seq_lens: torch.Tensor,
+    *,
+    num_simulated_accept_tokens: int = 0,
+    use_real_draft_tokens: bool = False,
 ) -> TargetVerifyTopk1Output:
     """Reduce target logits and finalize greedy topk=1 verification.
 
@@ -586,6 +639,11 @@ def target_verify_topk1_postprocess(
     chain verification and the small tensors consumed by draft-extend into one
     finalizer launch. The caller is responsible for selecting this CUDA-only
     fast path only after penalties, grammar masks, and NaN sanitization.
+
+    When ``num_simulated_accept_tokens`` is positive, the same finalizer also
+    overrides natural verification with that forced acceptance length.
+    ``use_real_draft_tokens`` selects real draft/target tokens instead of the
+    fixed simulation token.
     """
     output, _ = _target_verify_topk1_postprocess(
         next_token_logits,
@@ -594,6 +652,8 @@ def target_verify_topk1_postprocess(
         retrieve_next_token,
         seq_lens,
         packed=False,
+        num_simulated_accept_tokens=num_simulated_accept_tokens,
+        use_real_draft_tokens=use_real_draft_tokens,
     )
     return output
 
@@ -604,8 +664,15 @@ def target_verify_topk1_postprocess_packed(
     retrieve_index: torch.Tensor,
     retrieve_next_token: torch.Tensor,
     seq_lens: torch.Tensor,
+    *,
+    num_simulated_accept_tokens: int = 0,
+    use_real_draft_tokens: bool = False,
 ) -> tuple[TargetVerifyTopk1Output, torch.Tensor]:
-    """Finalize into typed views backed by one TP-broadcastable allocation."""
+    """Finalize into typed views backed by one TP-broadcastable allocation.
+
+    The simulation arguments have the same semantics as
+    :func:`target_verify_topk1_postprocess` and are applied before broadcast.
+    """
     output, packed_buffer = _target_verify_topk1_postprocess(
         next_token_logits,
         candidates,
@@ -613,6 +680,8 @@ def target_verify_topk1_postprocess_packed(
         retrieve_next_token,
         seq_lens,
         packed=True,
+        num_simulated_accept_tokens=num_simulated_accept_tokens,
+        use_real_draft_tokens=use_real_draft_tokens,
     )
     assert packed_buffer is not None
     return output, packed_buffer

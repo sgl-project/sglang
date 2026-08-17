@@ -82,7 +82,12 @@ def maybe_eagle_sample_target_verify_topk1(
     grammar_mask: Optional[GrammarMask] = None,
 ) -> Optional[TargetVerifyTopk1Output]:
     """Run the CUDA topk=1 verify fast path when its semantics apply."""
-    from sglang.srt.speculative.spec_utils import SIMULATE_ACC_LEN
+    from sglang.srt.speculative.spec_utils import (
+        SIMULATE_ACC_LEN,
+        SIMULATE_ACC_METHOD,
+        SIMULATE_ACC_TOKEN_MODE,
+        sample_simulated_acc_len,
+    )
 
     if (
         not _is_cuda
@@ -91,7 +96,6 @@ def maybe_eagle_sample_target_verify_topk1(
         or verify_input.spec_input_type != SpecInputType.EAGLE_VERIFY
         or verify_input.tree_topk != 1
         or verify_input.draft_token_num != verify_input.max_tree_depth
-        or SIMULATE_ACC_LEN > 0
     ):
         return None
 
@@ -116,6 +120,22 @@ def maybe_eagle_sample_target_verify_topk1(
     logits = prepare_eagle_verify_logits(
         verify_input, batch, logits_output, grammar_mask
     )
+    num_simulated_accept_tokens = 0
+    use_real_draft_tokens = False
+    if SIMULATE_ACC_LEN > 0:
+        if SIMULATE_ACC_TOKEN_MODE not in ("fixed", "real-draft-token"):
+            raise ValueError(
+                "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
+                f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or "
+                "'real-draft-token'."
+            )
+        num_simulated_accept_tokens = sample_simulated_acc_len(
+            SIMULATE_ACC_LEN,
+            SIMULATE_ACC_METHOD,
+            verify_input.max_tree_depth,
+        )
+        use_real_draft_tokens = SIMULATE_ACC_TOKEN_MODE == "real-draft-token"
+
     tp_group = get_eagle_verify_tp_group()
     if tp_group.world_size > 1:
         output, packed_buffer = target_verify_topk1_postprocess_packed(
@@ -124,6 +144,8 @@ def maybe_eagle_sample_target_verify_topk1(
             verify_input.retrieve_index,
             verify_input.retrieve_next_token,
             batch.seq_lens,
+            num_simulated_accept_tokens=num_simulated_accept_tokens,
+            use_real_draft_tokens=use_real_draft_tokens,
         )
         # Every field is a typed view into packed_buffer. Synchronizing the
         # backing allocation before returning makes all derived metadata, not
@@ -137,6 +159,8 @@ def maybe_eagle_sample_target_verify_topk1(
         verify_input.retrieve_index,
         verify_input.retrieve_next_token,
         batch.seq_lens,
+        num_simulated_accept_tokens=num_simulated_accept_tokens,
+        use_real_draft_tokens=use_real_draft_tokens,
     )
 
 

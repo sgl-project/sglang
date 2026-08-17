@@ -329,13 +329,83 @@ class TestTargetVerifyTopk1Selection(CustomTestCase):
                     packed_storage,
                 )
 
+    def test_simulated_acceptance_uses_fast_path(self):
+        for token_mode in ("fixed", "real-draft-token"):
+            with self.subTest(token_mode=token_mode):
+                verify_input, batch, logits_output = _make_target_verify_selection_case(
+                    self.device
+                )
+                with (
+                    patch("sglang.srt.speculative.spec_utils.SIMULATE_ACC_LEN", 1.5),
+                    patch(
+                        "sglang.srt.speculative.spec_utils.SIMULATE_ACC_METHOD",
+                        "match-expected",
+                    ),
+                    patch(
+                        "sglang.srt.speculative.spec_utils.SIMULATE_ACC_TOKEN_MODE",
+                        token_mode,
+                    ),
+                    patch(
+                        "sglang.srt.speculative.eagle_target_verify.get_eagle_verify_tp_group",
+                        return_value=SimpleNamespace(world_size=1),
+                    ),
+                    patch(
+                        "sglang.srt.speculative.spec_utils.sample_simulated_acc_len",
+                        return_value=1,
+                    ) as sample_simulated_acc_len,
+                ):
+                    result = maybe_eagle_sample_target_verify_topk1(
+                        verify_input,
+                        batch,
+                        logits_output,
+                    )
+
+                self.assertIsNotNone(result)
+                sample_simulated_acc_len.assert_called_once_with(
+                    1.5, "match-expected", 2
+                )
+                simulated_token = 100 if token_mode == "fixed" else 3
+                torch.testing.assert_close(
+                    result.accept_lens,
+                    torch.tensor([1], dtype=torch.int32, device=self.device),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    result.bonus_tokens,
+                    torch.tensor(
+                        [simulated_token], dtype=torch.int32, device=self.device
+                    ),
+                    rtol=0,
+                    atol=0,
+                )
+
+    def test_simulated_acceptance_rejects_unknown_token_mode(self):
+        verify_input, batch, logits_output = _make_target_verify_selection_case(
+            self.device
+        )
+        with (
+            patch("sglang.srt.speculative.spec_utils.SIMULATE_ACC_LEN", 1),
+            patch(
+                "sglang.srt.speculative.spec_utils.SIMULATE_ACC_TOKEN_MODE",
+                "unknown",
+            ),
+            self.assertRaisesRegex(
+                ValueError, "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE"
+            ),
+        ):
+            maybe_eagle_sample_target_verify_topk1(
+                verify_input,
+                batch,
+                logits_output,
+            )
+
     def test_fallbacks(self):
         cases = (
             "non_greedy",
             "input_type",
             "topk",
             "idle",
-            "simulation",
             "logits_stride",
             "draft_layout",
             "metadata_contract",
@@ -345,7 +415,6 @@ class TestTargetVerifyTopk1Selection(CustomTestCase):
                 verify_input, batch, logits_output = _make_target_verify_selection_case(
                     self.device
                 )
-                simulation = 0
                 if case == "non_greedy":
                     batch.sampling_info.is_all_greedy = False
                 elif case == "input_type":
@@ -354,8 +423,6 @@ class TestTargetVerifyTopk1Selection(CustomTestCase):
                     verify_input.tree_topk = 2
                 elif case == "idle":
                     batch.forward_mode = ForwardMode.IDLE
-                elif case == "simulation":
-                    simulation = 1
                 elif case == "logits_stride":
                     logits_output.next_token_logits = torch.empty(
                         (16, 2), device=self.device
@@ -369,9 +436,7 @@ class TestTargetVerifyTopk1Selection(CustomTestCase):
                         torch.int32
                     )
 
-                with patch(
-                    "sglang.srt.speculative.spec_utils.SIMULATE_ACC_LEN", simulation
-                ):
+                with patch("sglang.srt.speculative.spec_utils.SIMULATE_ACC_LEN", 0):
                     result = maybe_eagle_sample_target_verify_topk1(
                         verify_input,
                         batch,

@@ -19,7 +19,7 @@ from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, run_distributed_test
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=40, stage="base-b", runner_config="2-gpu-large")
 
 WORLD_SIZE = 2
 NUM_DRAFT_TOKENS = 4
@@ -93,59 +93,103 @@ def _make_verify_case(
 
 def _run_adversarial_rank(rank: int):
     for seq_lens_dtype in (torch.int32, torch.int64):
-        verify_input, batch, logits_output, candidates = _make_verify_case(
-            rank, rank, seq_lens_dtype
+        scenarios = (
+            ("natural", 0, 0, "fixed"),
+            ("simulated-fixed", 2, 2 + rank, "fixed"),
+            ("simulated-real", 2, 2 + rank, "real-draft-token"),
         )
-        local_output = target_verify_topk1_postprocess(
-            logits_output.next_token_logits,
-            candidates,
-            verify_input.retrieve_index,
-            verify_input.retrieve_next_token,
-            batch.seq_lens,
-        )
+        for scenario, rank0_num_accept, local_num_accept, token_mode in scenarios:
+            verify_input, batch, logits_output, candidates = _make_verify_case(
+                rank, rank, seq_lens_dtype
+            )
+            use_real_draft_tokens = token_mode == "real-draft-token"
+            local_output = target_verify_topk1_postprocess(
+                logits_output.next_token_logits,
+                candidates,
+                verify_input.retrieve_index,
+                verify_input.retrieve_next_token,
+                batch.seq_lens,
+                num_simulated_accept_tokens=local_num_accept,
+                use_real_draft_tokens=(local_num_accept > 0 and use_real_draft_tokens),
+            )
 
-        # Compute the rank-0 oracle independently on both ranks. This also
-        # proves that the adversarial setup differs in all eight fields before
-        # exercising the synchronization path.
-        ref_input, ref_batch, ref_logits_output, ref_candidates = _make_verify_case(
-            rank, 0, seq_lens_dtype
-        )
-        rank0_output = target_verify_topk1_postprocess(
-            ref_logits_output.next_token_logits,
-            ref_candidates,
-            ref_input.retrieve_index,
-            ref_input.retrieve_next_token,
-            ref_batch.seq_lens,
-        )
-        for field in TargetVerifyTopk1Output._fields:
-            local_value = getattr(local_output, field)
-            rank0_value = getattr(rank0_output, field)
-            if rank == 0:
-                torch.testing.assert_close(local_value, rank0_value, rtol=0, atol=0)
-            else:
-                assert not torch.equal(local_value, rank0_value), (
-                    f"adversarial precondition did not diverge for {field} "
-                    f"with seq_lens dtype {seq_lens_dtype}"
+            # Compute the rank-0 oracle independently on both ranks. Simulated
+            # cases deliberately sample different lengths on rank 1; the one
+            # packed broadcast must make rank 0's full result canonical.
+            ref_input, ref_batch, ref_logits_output, ref_candidates = _make_verify_case(
+                rank, 0, seq_lens_dtype
+            )
+            rank0_output = target_verify_topk1_postprocess(
+                ref_logits_output.next_token_logits,
+                ref_candidates,
+                ref_input.retrieve_index,
+                ref_input.retrieve_next_token,
+                ref_batch.seq_lens,
+                num_simulated_accept_tokens=rank0_num_accept,
+                use_real_draft_tokens=(rank0_num_accept > 0 and use_real_draft_tokens),
+            )
+            divergent_fields = {
+                field
+                for field in TargetVerifyTopk1Output._fields
+                if not torch.equal(
+                    getattr(local_output, field), getattr(rank0_output, field)
+                )
+            }
+
+            real_group = _RealBroadcastGroup()
+            with (
+                patch(
+                    "sglang.srt.speculative.eagle_target_verify.get_eagle_verify_tp_group",
+                    return_value=real_group,
+                ),
+                patch(
+                    "sglang.srt.speculative.spec_utils.SIMULATE_ACC_LEN",
+                    1 if local_num_accept > 0 else -1,
+                ),
+                patch(
+                    "sglang.srt.speculative.spec_utils.SIMULATE_ACC_TOKEN_MODE",
+                    token_mode,
+                ),
+                patch(
+                    "sglang.srt.speculative.spec_utils.sample_simulated_acc_len",
+                    return_value=local_num_accept,
+                ),
+            ):
+                synchronized = maybe_eagle_sample_target_verify_topk1(
+                    verify_input, batch, logits_output
                 )
 
-        real_group = _RealBroadcastGroup()
-        with patch(
-            "sglang.srt.speculative.eagle_target_verify.get_eagle_verify_tp_group",
-            return_value=real_group,
-        ):
-            synchronized = maybe_eagle_sample_target_verify_topk1(
-                verify_input, batch, logits_output
-            )
+            assert synchronized is not None
+            assert real_group.broadcast_calls == 1
 
-        assert synchronized is not None
-        assert real_group.broadcast_calls == 1
-        for field in TargetVerifyTopk1Output._fields:
-            torch.testing.assert_close(
-                getattr(synchronized, field),
-                getattr(rank0_output, field),
-                rtol=0,
-                atol=0,
-            )
+            # Check adversarial preconditions only after both ranks have
+            # completed the collective, so a fixture failure cannot strand the
+            # peer inside NCCL.
+            if rank == 0:
+                assert not divergent_fields
+            else:
+                expected_divergent_fields = (
+                    set(TargetVerifyTopk1Output._fields)
+                    if scenario != "simulated-fixed"
+                    else {
+                        "num_correct_drafts",
+                        "accept_lens",
+                        "accept_index",
+                        "new_seq_lens",
+                        "select_index",
+                    }
+                )
+                assert divergent_fields == expected_divergent_fields, (
+                    f"unexpected adversarial divergence for {scenario} with "
+                    f"seq_lens dtype {seq_lens_dtype}: {divergent_fields}"
+                )
+            for field in TargetVerifyTopk1Output._fields:
+                torch.testing.assert_close(
+                    getattr(synchronized, field),
+                    getattr(rank0_output, field),
+                    rtol=0,
+                    atol=0,
+                )
 
 
 class TestEagleTargetVerifyTpSync(CustomTestCase):

@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
 
@@ -53,6 +53,9 @@ def _eager_target_verify_topk1(
     retrieve_index: torch.Tensor,
     retrieve_next_token: torch.Tensor,
     seq_lens: torch.Tensor,
+    *,
+    num_simulated_accept_tokens: int = 0,
+    use_real_draft_tokens: bool = False,
 ) -> TargetVerifyTopk1Output:
     batch_size, num_tokens = candidates.shape
     predict = torch.zeros(
@@ -76,6 +79,35 @@ def _eager_target_verify_topk1(
         target_predict=target_predict,
         topk=1,
     )
+
+    # Keep this oracle independent of the production simulation helper so a
+    # kernel regression cannot be hidden by shared rewrite logic.
+    if num_simulated_accept_tokens > 0:
+        simulated_accept_index = torch.full_like(accept_index, -1)
+        simulated_accept_index[:, :num_simulated_accept_tokens] = accept_index[
+            :, :1
+        ] + torch.arange(
+            num_simulated_accept_tokens,
+            dtype=accept_index.dtype,
+            device=accept_index.device,
+        )
+        accept_index = simulated_accept_index
+        num_correct_drafts.fill_(num_simulated_accept_tokens - 1)
+
+        if use_real_draft_tokens:
+            if num_simulated_accept_tokens > 1:
+                draft_node_indices = accept_index[
+                    :, : num_simulated_accept_tokens - 1
+                ].long()
+                predict[draft_node_indices] = candidates[
+                    :, 1:num_simulated_accept_tokens
+                ].to(predict.dtype)
+            bonus_node_indices = accept_index[:, num_simulated_accept_tokens - 1].long()
+            predict[bonus_node_indices] = target_predict[
+                :, num_simulated_accept_tokens - 1
+            ].to(predict.dtype)
+        else:
+            predict.fill_(100)
 
     accept_lens = num_correct_drafts + 1
     new_seq_lens = seq_lens + accept_lens
@@ -311,6 +343,63 @@ class TestSpecTopk1Triton(CustomTestCase):
             rtol=0,
             atol=0,
         )
+
+    def test_target_verify_simulated_acceptance_matches_eager_exactly(self):
+        batch_size, num_tokens, vocab_size = 3, 6, 8193
+        logits, target_ids = _make_logits_with_unique_argmax(
+            batch_size * num_tokens,
+            vocab_size,
+            dtype=torch.float32,
+            device=self.device,
+            seed=31,
+        )
+        target_ids = target_ids.view(batch_size, num_tokens)
+        candidates = torch.zeros(
+            (batch_size, num_tokens), dtype=torch.long, device=self.device
+        )
+        candidates[:, 1:] = (target_ids[:, :-1] + 1) % vocab_size
+        for batch_idx, num_correct_drafts in enumerate((0, 2, num_tokens - 1)):
+            candidates[batch_idx, 1 : num_correct_drafts + 1] = target_ids[
+                batch_idx, :num_correct_drafts
+            ]
+        retrieve_index, retrieve_next_token = _make_topk1_chain(
+            batch_size, num_tokens, self.device
+        )
+
+        for seq_lens_dtype in (torch.int32, torch.int64):
+            for use_real_draft_tokens in (False, True):
+                for num_simulated_accept_tokens in (1, 3, num_tokens):
+                    with self.subTest(
+                        seq_lens_dtype=seq_lens_dtype,
+                        use_real_draft_tokens=use_real_draft_tokens,
+                        num_simulated_accept_tokens=num_simulated_accept_tokens,
+                    ):
+                        seq_lens = torch.arange(
+                            70,
+                            70 + batch_size,
+                            dtype=seq_lens_dtype,
+                            device=self.device,
+                        )
+                        fused = target_verify_topk1_postprocess(
+                            logits,
+                            candidates,
+                            retrieve_index,
+                            retrieve_next_token,
+                            seq_lens,
+                            num_simulated_accept_tokens=num_simulated_accept_tokens,
+                            use_real_draft_tokens=use_real_draft_tokens,
+                        )
+                        eager = _eager_target_verify_topk1(
+                            logits,
+                            candidates,
+                            retrieve_index,
+                            retrieve_next_token,
+                            seq_lens,
+                            num_simulated_accept_tokens=num_simulated_accept_tokens,
+                            use_real_draft_tokens=use_real_draft_tokens,
+                        )
+
+                        _assert_target_verify_matches_eager(fused, eager)
 
     def test_target_verify_packed_buffer_canonicalizes_every_output(self):
         batch_size, num_tokens, vocab_size = 3, 4, 64
