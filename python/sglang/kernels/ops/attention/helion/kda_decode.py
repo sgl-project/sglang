@@ -28,18 +28,18 @@ _KDA_BF16_CONFIG = helion.Config(
     block_sizes=[16],
     indexing="pointer",
     l2_groupings=[16],
-    # Policies are positional in the traced load order. Keep the labels in
-    # sync if the decode body changes.
+    # Policies are positional in the traced load order. Retune them if the
+    # decode body gains, loses, or reorders loads.
     load_eviction_policies=[
-        "",  # ssm_state_indices
-        "last",  # a
-        "first",  # dt_bias
-        "last",  # A_log
-        "first",  # b
-        "first",  # state
-        "last",  # mixed_qkv (k)
-        "",  # mixed_qkv (v)
-        "last",  # mixed_qkv (q)
+        "",
+        "last",
+        "first",
+        "last",
+        "first",
+        "first",
+        "last",
+        "",
+        "last",
     ],
     loop_orders=[[1, 2, 0]],
     num_stages=1,
