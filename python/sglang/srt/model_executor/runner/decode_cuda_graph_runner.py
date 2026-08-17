@@ -453,8 +453,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return self.attn_backend
 
     def _resolve_shared_read_ends(self, attn_backend, forward_mode) -> SharedReadEnds:
-        """The backend's declaration, demoted when this runner cannot record
-        there. UNKNOWN records nothing (scheduler keeps the coarse fence)."""
         declared = attn_backend.shared_read_ends(forward_mode)
         if (
             declared is SharedReadEnds.IN_REPLAY
