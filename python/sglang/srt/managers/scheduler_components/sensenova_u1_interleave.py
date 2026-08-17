@@ -165,9 +165,11 @@ class SenseNovaU1InterleaveController:
 
         namespace = f"sensenova_u1_interleave:{req.rid}"
         req.extra_key = f"{req.extra_key}|{namespace}" if req.extra_key else namespace
+        state_spec = copy.deepcopy(spec)
+        state_spec["turn_seeds"] = list(turn_seeds)
         state = U1InterleaveState(
             parent=req,
-            spec=spec,
+            spec=state_spec,
             original_max_new_tokens=int(req.sampling_params.max_new_tokens),
             turn_seeds=turn_seeds,
         )

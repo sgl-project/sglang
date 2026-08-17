@@ -450,6 +450,11 @@ def test_u1_interleave_repeated_images_use_deterministic_turn_seeds() -> None:
     mutable_spec = parent.sampling_params.custom_params[U1_INTERLEAVE_CUSTOM_PARAM]
     mutable_spec["seed"] = 100
     mutable_spec["turn_seeds"] = [100, 101]
+    mutable_spec["max_images"] = 1
+    state = controller._parents[parent.rid]
+    assert state.spec is not mutable_spec
+    assert state.spec["turn_seeds"] == [41, 42]
+    assert state.spec["max_images"] == 2
 
     parent.output_ids.extend([20, IMG_START])
     parent.req_pool_idx = 1
