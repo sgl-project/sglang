@@ -10,6 +10,22 @@ on:
         options:
           - 'all'
           - publish
+      publish_target:
+        description: 'Where to push the image. Keep "test" while the ROCm 7.15 image is still being brought up.'
+        required: false
+        type: choice
+        default: 'test'
+        options:
+          - test
+          - lmsys
+          - none
+      image_repo:
+        description: 'Docker Hub repo used when publish_target=test'
+        required: false
+        type: string
+        default: 'bingxche/sgl-test'
+  # No schedule: the ROCm 7.15 SDK pin is a nightly alpha and the gfx1250 image
+  # is still being brought up, so this stays dispatch-only.
   # schedule:
   #   - cron: '0 12 * * *'
 
@@ -46,6 +62,48 @@ jobs:
         run: |
           echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
 
+      # Resolve the destination before building: a missing secret or an
+      # unpushable target should fail in seconds, not after an hour of build.
+      - name: Resolve publish target
+        id: target
+        env:
+          PUBLISH_TARGET: ${{ inputs.publish_target || 'test' }}
+          TEST_IMAGE_REPO: ${{ inputs.image_repo || 'bingxche/sgl-test' }}
+          TEST_USERNAME: ${{ secrets.DOCKERHUB_AMD_TEST_USERNAME }}
+          TEST_TOKEN: ${{ secrets.DOCKERHUB_AMD_TEST_TOKEN }}
+          LMSYS_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          LMSYS_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          case "${PUBLISH_TARGET}" in
+            test)
+              if [ -z "${TEST_USERNAME}" ] || [ -z "${TEST_TOKEN}" ]; then
+                echo "::error::publish_target=test needs DOCKERHUB_AMD_TEST_USERNAME and DOCKERHUB_AMD_TEST_TOKEN"
+                exit 1
+              fi
+              echo "image_repo=${TEST_IMAGE_REPO}" >> $GITHUB_OUTPUT
+              echo "push=true" >> $GITHUB_OUTPUT
+              ;;
+            lmsys)
+              if [ -z "${LMSYS_USERNAME}" ] || [ -z "${LMSYS_TOKEN}" ]; then
+                echo "::error::publish_target=lmsys needs DOCKERHUB_USERNAME and DOCKERHUB_TOKEN"
+                exit 1
+              fi
+              echo "image_repo=lmsysorg/sglang-rocm" >> $GITHUB_OUTPUT
+              echo "push=true" >> $GITHUB_OUTPUT
+              ;;
+            none)
+              echo "image_repo=rocm/sgl-dev" >> $GITHUB_OUTPUT
+              echo "push=false" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "::error::Unknown publish_target '${PUBLISH_TARGET}'"
+              exit 1
+              ;;
+          esac
+          echo "target=${PUBLISH_TARGET}" >> $GITHUB_OUTPUT
+          echo "Publish target: ${PUBLISH_TARGET}"
+
       - name: Get version from latest tag
         id: version
         run: |
@@ -68,13 +126,23 @@ jobs:
           echo "Detected version: ${VERSION}"
           echo "Pretend version for pip: ${PRETEND_VERSION}"
 
-      # - name: Login to Docker Hub (AMD)
-      #   uses: docker/login-action@v2
-      #   with:
-      #     username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
-      #     password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+      # Pushing to rocm/sgl-dev is deliberately not wired up: an image built on
+      # an alpha ROCm SDK does not belong in the registry the AMD CI pulls from.
+      - name: Login to Docker Hub (AMD test registry)
+        if: steps.target.outputs.target == 'test'
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_TEST_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TEST_TOKEN }}
 
-      - name: Build and Push to rocm/sgl-dev
+      - name: Login to Docker Hub (lmsys)
+        if: steps.target.outputs.target == 'lmsys'
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build ROCm 7.15 image
         run: |
           version=${{ steps.version.outputs.version }}
           pretend_version=${{ steps.version.outputs.pretend_version }}
@@ -88,22 +156,21 @@ jobs:
             exit 1
           fi
 
-          tag=v${version}-${rocm_tag}
-          echo "IMAGE_TAG=${tag}-${{ env.DATE }}" >> $GITHUB_ENV
+          image="${{ steps.target.outputs.image_repo }}:v${version}-${rocm_tag}-${{ env.DATE }}"
+          echo "IMAGE=${image}" >> $GITHUB_ENV
+          echo "Building ${image}"
 
           # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
+          # UBUNTU_CODENAME=noble because this stage builds on ubuntu:24.04 while the
+          # Dockerfile defaults to jammy for the 22.04 bases; MORI's apt step
+          # interpolates it into the amdainic repo URL.
+          # ENABLE_NIXL=0 because Ubuntu 24.04's Abseil is too old for absl_log.
           # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
           # to Canonical's archive.ubuntu.com mirror IPs from the build runner.
-          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.sha }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg GPU_ARCH_LIST_ARG=gfx1250 --build-arg ENABLE_MORI=1 --build-arg SGLANG_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
-          # docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
+          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.sha }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg ENABLE_NIXL=0 --build-arg UBUNTU_CODENAME=noble --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t "${image}" --no-cache
 
-      - name: Login to Docker Hub (lmsys)
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Push to lmsysorg/sglang-rocm
+      - name: Push image
+        if: steps.target.outputs.push == 'true'
         run: |
-          docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
-          docker push lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
+          docker push "${{ env.IMAGE }}"
+          echo "Published ${{ env.IMAGE }}" >> $GITHUB_STEP_SUMMARY
