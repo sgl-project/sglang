@@ -98,8 +98,8 @@ class TestSm100PerExpert:
 
     def test_decode_tile_ladder_is_rank_then_token_bucketed(self):
         # gate_up_b BLOCK_SIZE_N names the tile set: 128 tiny, 512 mse,
-        # 256 large. Rank 16 pins tiny at every M; rank 32 holds mse to 32
-        # tokens; rank 64 drops to large above 16.
+        # 256 large. Rank 16 pins tiny at every M; rank 32 keeps mse above the
+        # small-M buckets at every batch; rank 64 drops to large above 16.
         def block_n(rank: int, tokens: int) -> int:
             table = resolve_tiles(
                 architecture_value="gb300",
@@ -110,7 +110,14 @@ class TestSm100PerExpert:
 
         assert block_n(16, 4) == 128
         assert block_n(16, 4096) == 128
-        assert [block_n(32, m) for m in (4, 16, 32, 33)] == [128, 512, 512, 256]
+        assert [block_n(32, m) for m in (4, 16, 32, 33, 128, 4096)] == [
+            128,
+            512,
+            512,
+            512,
+            512,
+            512,
+        ]
         assert [block_n(64, m) for m in (4, 16, 17)] == [128, 512, 256]
 
     def test_unknown_row_serves_the_default_launch_config(self):

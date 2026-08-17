@@ -169,7 +169,6 @@
    },
    {
     "max_rank": 32,
-    "max_tokens": 32,
     "sites": {
      "b_activation": {
       "BLOCK_SIZE_K": 32,

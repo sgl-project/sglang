@@ -109,12 +109,13 @@ Qwen3.5-397B, Inkling-Small on GB300/B200/H200).
   shared-outer at bs1), so the ladder earns its place on both dies, at every TP
   measured.
 - The one place both dies wanted something the table did not have: at rank 32
-  the M≤16 tiles keep winning up to 32 tokens, where the ladder used to fall
-  to the wildcard row. `{"max_rank": 32, "max_tokens": 32}` encodes exactly
-  that measured window — above 32 tokens at that rank nothing was measured,
-  so it still serves the wildcard row. Confirmed on two geometries: +4.4% at
-  bs32 on 35B (committed table vs old, GB300) and +2.0% on Inkling per-expert,
-  each with the cells the rule must not touch reading inside ±0.7%.
+  the M≤16 tiles keep winning above the small-M buckets, where the ladder used
+  to fall to the wildcard row. `{"max_rank": 32}` encodes that. Confirmed on
+  two geometries: +4.4% at bs32 on 35B (committed table vs old, GB300) and
+  +2.0% on Inkling per-expert, each with the cells the rule must not touch
+  reading inside ±0.7%; and measured out to the largest batch the decode graph
+  captures — +3.5% at 64 tokens, +3.3% at 128 — which is why the rule carries
+  no `max_tokens` bound.
 - NOT measured on B200: tile values for the ≤4-token bucket, whose sites are
   byte-identical to the rank rule's, so forcing them re-runs the incumbent
   rather than testing it. Those inherit GB300's numbers.
