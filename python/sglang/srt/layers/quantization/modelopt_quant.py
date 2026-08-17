@@ -2471,9 +2471,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         if layer.moe_runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
+            runner_config = layer.moe_runner_config
+            is_situ = runner_config.activation == "situ"
             gemm1_clamp_limit = (
-                layer.moe_runner_config.gemm1_clamp_limit
-                or layer.moe_runner_config.swiglu_limit
+                None
+                if is_situ
+                else (runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
             )
             if gemm1_clamp_limit is not None:
                 copy_or_rebind_param(
@@ -2482,21 +2485,26 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     (gemm1_clamp_limit / layer.g1_alphas).to(torch.float32),
                 )
 
-            if layer.moe_runner_config.gemm1_alpha is not None:
+            if runner_config.gemm1_alpha is not None:
                 copy_or_rebind_param(
                     layer,
                     "gemm1_alpha",
                     torch.full_like(
                         layer.g1_alphas,
-                        layer.moe_runner_config.gemm1_alpha,
+                        runner_config.gemm1_alpha,
                         dtype=torch.float32,
                     ),
                 )
-                copy_or_rebind_param(
-                    layer,
-                    "gemm1_beta",
-                    (1.0 / layer.g1_alphas).to(torch.float32),
+                gemm1_beta = (
+                    torch.full_like(
+                        layer.g1_alphas,
+                        runner_config.gemm1_clamp_limit,
+                        dtype=torch.float32,
+                    )
+                    if is_situ
+                    else (1.0 / layer.g1_alphas).to(torch.float32)
                 )
+                copy_or_rebind_param(layer, "gemm1_beta", gemm1_beta)
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         use_dispatch_fp4 = not self.quant_config.use_per_token_activation and (
