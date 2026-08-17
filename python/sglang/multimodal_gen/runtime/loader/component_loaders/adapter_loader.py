@@ -65,7 +65,7 @@ class AdapterLoader(ComponentLoader):
         # Not a fixed name: connectors follow DiT offload, while the duration
         # head stays resident unless selected explicitly.
         target_device = self.target_device(
-            server_args.should_cpu_offload_component(component_name)
+            server_args.should_start_component_on_cpu(component_name)
         )
         default_dtype = resolve_precision(
             server_args, component_name, precision_attr="dit_precision"
