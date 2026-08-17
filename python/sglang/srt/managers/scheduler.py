@@ -1701,12 +1701,8 @@ class Scheduler(
             dispatch_event_loop(self)
 
     def _apply_war_barrier(self):
-        # Called right after each launch: order later schedule_stream work
-        # (result processing, next iteration's writes) behind the forward's
-        # shared-buffer reads. Fast path: wait on the read-done event the
-        # forward published after its snapshot (non-spec: decode graph; spec:
-        # draft_extend), then clear it. Else whole-forward wait_stream
-        # (forceable via SGLANG_FORCE_COARSE_WAR_BARRIER).
+        # WAR: keep later schedule_stream writes behind this forward's shared reads.
+        # Clearing matters: a phase that skips the publish then falls back to coarse.
         if not self._war_barrier_enabled:
             return
         runner = self.model_worker.last_shared_read_runner
@@ -2510,11 +2506,7 @@ class Scheduler(
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
-            error_msg = (
-                "DSpark speculative decoding does not support return_logprob yet."
-                if self.spec_algorithm.is_dspark() and req.return_logprob
-                else validate_dflash_request(req, self.enable_overlap)
-            )
+            error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
