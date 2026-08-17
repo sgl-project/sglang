@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.flashattention_backend import (
     merge_state_v2_wrapper,
     prepare_swa_spec_page_table_triton,
 )
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -501,7 +502,11 @@ class XPUAttentionBackend(AttentionBackend):
         #     q = q.to(self.kv_cache_dtype)
         #     q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
         #     k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
-        causal = not layer.is_cross_attention
+        causal = not (
+            layer.is_cross_attention
+            or layer.attn_type
+            in (AttentionType.ENCODER_ONLY, AttentionType.DECODER_BIDIRECTIONAL)
+        )
 
         # Check if we should use local attention
         use_local_attn = (
@@ -824,7 +829,11 @@ class XPUAttentionBackend(AttentionBackend):
             if layer.sliding_window_size is not None and layer.sliding_window_size > -1
             else (-1, -1)
         )
-        causal = not layer.is_cross_attention
+        causal = not (
+            layer.is_cross_attention
+            or layer.attn_type
+            in (AttentionType.ENCODER_ONLY, AttentionType.DECODER_BIDIRECTIONAL)
+        )
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
         kwargs = {}
