@@ -155,8 +155,10 @@ class TestXPUDecoderRerank(CustomTestCase):
             prompts = self._preprocess_prompts(query_doc)
             self._assert_close_scores(prompts)
 
-# This cross-encoder test is from test/manual/prefill_only/test_cross_encoder_models.py, which uses float32 and triton backend. Now intel_xpu attention backend only supports bfloat16 backend, 
-# so we choose triton backend as well. 
+
+# This cross-encoder test is ported from `test/manual/prefill_only/test_cross_encoder_models.py`,
+# which uses float32 with the triton backend. The `intel_xpu` attention backend currently only
+# supports the bfloat16 dtype, so we keep the triton backend here to preserve float32 parity.
 CROSS_ENCODER_MODEL_PATH = "BAAI/bge-reranker-v2-m3"
 CROSS_ENCODER_TP_SIZE = 1
 CROSS_ENCODER_SCORE_TOLERANCE = 1e-2
@@ -164,7 +166,7 @@ CROSS_ENCODER_ATTENTION_BACKEND = "triton"
 CROSS_ENCODER_TORCH_DTYPE = torch.float32
 
 
-class TestXpuCrossEncoderReank(CustomTestCase):
+class TestXPUCrossEncoderRerank(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         mp.set_start_method("spawn", force=True)

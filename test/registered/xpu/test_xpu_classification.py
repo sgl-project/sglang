@@ -1,7 +1,7 @@
 """XPU classification parity test for Qwen2.5-1.5B-apeach via /v1/classify.
 
 Usage:
-python3 -m unittest test_xpu_classfication.TestXPUClassification
+python3 -m unittest test_xpu_classification.TestXPUClassification
 """
 
 import multiprocessing as mp
