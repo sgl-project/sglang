@@ -196,6 +196,35 @@ class AttentionBackend(ABC):
         """
         pass
 
+    def capture_swa_windows(
+        self, layer_id: int, kv: torch.Tensor, forward_batch: ForwardBatch
+    ) -> None:
+        """Prefill hook to snapshot the sliding window at page boundaries.
+
+        Called from the attention layer with the flat post-norm+rope KV, before
+        the device ring overwrites it. Only a backend whose ring is per-request
+        and recycled on completion has to copy the window somewhere durable; a
+        backend whose window stays addressable in the KV pool keeps nothing.
+        """
+        pass
+
+    def capture_swa_windows_decode(self, forward_batch: ForwardBatch) -> None:
+        """Decode counterpart of capture_swa_windows.
+
+        Called from ModelRunner outside the cuda graph, after the decode forward
+        wrote the ring and before the next step overwrites it.
+        """
+        pass
+
+    def capture_compress_state_windows_decode(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        """Decode hook for compressor state coupled to the sliding window.
+
+        Same call site and ordering contract as capture_swa_windows_decode.
+        """
+        pass
+
     @property
     def verify_mask(self) -> Optional[VerifyMask]:
         """The mask the draft stage fills in place, if this backend has one."""
