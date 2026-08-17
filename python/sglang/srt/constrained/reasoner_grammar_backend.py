@@ -41,7 +41,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         think_end_ids: List[int],
         channel_header_end_ids: Optional[List[int]] = None,
         channel_reasoning_header_ids: Optional[List[int]] = None,
-        max_channel_header_tokens: int = 16,
+        max_channel_header_tokens: int = -1,
         think_excluded_token_ids: Optional[List[int]] = None,
         max_think_tokens: int = -1,
         enable_token_filter: bool = False,
@@ -66,6 +66,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
             if self.channel_reasoning_header_ids
             else None
         )
+        self._channel_header_enabled = self._channel_header_end_matcher is not None
         self.max_channel_header_tokens = max_channel_header_tokens
         self.think_excluded_token_ids = think_excluded_token_ids
         self.max_think_tokens = max_think_tokens
@@ -83,6 +84,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self._matched_channel_header_end_tokens = 0
         self._matched_channel_reasoning_header_tokens = 0
         self._saw_channel_reasoning_header = False
+        self._thinking_match_history: List[int] = []
         self._state_history = []
         self._grammar_accept_history: List[bool] = []
 
@@ -93,6 +95,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
         self._matched_channel_header_end_tokens = 0
         self._matched_channel_reasoning_header_tokens = 0
         self._saw_channel_reasoning_header = False
+        self._thinking_match_history.clear()
         self._state_history.clear()
         self._grammar_accept_history.clear()
         if reasoning:
@@ -156,9 +159,12 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self.tokens_after_end = 0
 
     def transfer_state(self, token: int) -> None:
-        self._state_history.append(self._snapshot_state())
+        if self._channel_header_enabled:
+            self._state_history.append(self._snapshot_state())
         if self._is_thinking():
             previous_match = self._matched_think_end_tokens
+            if not self._channel_header_enabled:
+                self._thinking_match_history.append(previous_match)
             matched = self._think_end_matcher.advance(previous_match, token)
             if matched == len(self._think_end_matcher):
                 self._matched_think_end_tokens = 0
@@ -204,8 +210,24 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self.tokens_after_end += 1
 
     def rollback_state(self):
-        if self._state_history:
-            self._restore_state(self._state_history.pop())
+        if self._channel_header_enabled:
+            if self._state_history:
+                self._restore_state(self._state_history.pop())
+            return
+        if self._is_thinking():
+            if self._thinking_match_history:
+                previous_match = self._thinking_match_history.pop()
+                self.tokens_in_think -= (
+                    previous_match + 1 - self._matched_think_end_tokens
+                )
+                self._matched_think_end_tokens = previous_match
+        elif self._is_generation():
+            if self.tokens_after_end == 0:
+                if self._thinking_match_history:
+                    self.tokens_after_end = -1
+                    self._matched_think_end_tokens = self._thinking_match_history.pop()
+            elif self.tokens_after_end > 0:
+                self.tokens_after_end -= 1
 
     def accept_token(self, token: int):
         # Track the last accepted token on the wrapper itself (mirroring
@@ -217,7 +239,8 @@ class ReasonerGrammarObject(BaseGrammarObject):
         # the token is accepted twice -> "Tokens not accepted" -> FINISH_ABORT.
         self.current_token = token
         accepted_by_grammar = self._is_generation() and self.grammar is not None
-        self._grammar_accept_history.append(accepted_by_grammar)
+        if self._channel_header_enabled:
+            self._grammar_accept_history.append(accepted_by_grammar)
         if accepted_by_grammar:
             self.grammar.accept_token(token)
         self.transfer_state(token)
@@ -229,11 +252,14 @@ class ReasonerGrammarObject(BaseGrammarObject):
 
     def rollback(self, k):
         if self.grammar is not None:
-            steps_after = sum(self._grammar_accept_history[-k:]) if k > 0 else 0
+            if self._channel_header_enabled:
+                steps_after = sum(self._grammar_accept_history[-k:]) if k > 0 else 0
+            else:
+                steps_after = min(k, max(0, self.tokens_after_end))
             if steps_after > 0:
                 self.grammar.rollback(steps_after)
         for _ in range(k):
-            if self._grammar_accept_history:
+            if self._channel_header_enabled and self._grammar_accept_history:
                 self._grammar_accept_history.pop()
             self.rollback_state()
 
@@ -318,6 +344,7 @@ class ReasonerGrammarObject(BaseGrammarObject):
             self._matched_channel_reasoning_header_tokens
         )
         new_obj._saw_channel_reasoning_header = self._saw_channel_reasoning_header
+        new_obj._thinking_match_history = list(self._thinking_match_history)
         new_obj._state_history = list(self._state_history)
         new_obj._grammar_accept_history = list(self._grammar_accept_history)
         new_obj._finished = self._finished

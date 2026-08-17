@@ -145,6 +145,17 @@ class TestReasonerGrammarObject(unittest.TestCase):
         obj.fill_vocab_mask(second_mask, 0)
         self.assertEqual(_allowed_token_ids(second_mask, [7, 8, 10]), [8])
 
+    def test_non_channel_generation_does_not_record_per_token_history(self):
+        grammar = MagicMock()
+        obj = ReasonerGrammarObject(grammar=grammar, think_end_ids=[7])
+        obj.maybe_init_reasoning(False)
+
+        for token in range(1000):
+            obj.accept_token(token)
+
+        self.assertEqual(obj._state_history, [])
+        self.assertEqual(obj._grammar_accept_history, [])
+
 
 class TestReasonerGrammarChannelHeaders(unittest.TestCase):
     EOM = 7
@@ -212,6 +223,20 @@ class TestReasonerGrammarChannelHeaders(unittest.TestCase):
         obj, grammar = self._make_object(max_header_tokens=-1)
         self._accept(obj, [100, self.EOM] + list(range(20, 60)))
 
+        self.assertTrue(obj._is_waiting_for_channel_header())
+        grammar.accept_token.assert_not_called()
+
+    def test_default_header_limit_does_not_rearm_long_tool_headers(self):
+        grammar = MagicMock()
+        obj = ReasonerGrammarObject(
+            grammar=grammar,
+            think_end_ids=[self.EOM],
+            channel_header_end_ids=[self.MESSAGE],
+        )
+        obj.maybe_init_reasoning(True)
+        self._accept(obj, [100, self.EOM] + list(range(20, 120)))
+
+        self.assertEqual(obj.max_channel_header_tokens, -1)
         self.assertTrue(obj._is_waiting_for_channel_header())
         grammar.accept_token.assert_not_called()
 
