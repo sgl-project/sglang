@@ -122,6 +122,28 @@ class BaseReasoningFormatDetector:
             self._detect_and_parse_impl(text)
         )
 
+    def _split_at_think_start(self, text: str) -> Tuple[str, str]:
+        """Remove the opening think token wherever it first appears, and return
+        ``(text_from_the_block, leading_normal_text)``.
+
+        The block opens at the marker, not at index 0: everything the model wrote
+        before it is content, and matching only at index 0 leaves the literal
+        marker sitting inside ``reasoning_content`` after a single leading space
+        or newline. Under ``force_reasoning`` the block was already opened by the
+        chat template, so the leading text is reasoning and only an echoed marker
+        is dropped -- which is what the streaming path does in both cases.
+        """
+        think_start_text = self.think_start_token + self.think_start_self_label
+        start_idx = text.find(think_start_text)
+        if start_idx <= 0:
+            return text, ""
+
+        preceding = text[:start_idx]
+        rest = text[start_idx + len(think_start_text) :]
+        if self._in_reasoning:
+            return preceding + rest, ""
+        return rest, preceding
+
     def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
         in_reasoning = self._in_reasoning or self.think_start_token in text
 
@@ -130,7 +152,7 @@ class BaseReasoningFormatDetector:
 
         # The text is considered to be in a reasoning block.
         think_start_text = self.think_start_token + self.think_start_self_label
-        processed_text = text
+        processed_text, leading_normal_text = self._split_at_think_start(text)
         while processed_text.startswith(think_start_text):
             processed_text = processed_text[len(think_start_text) :]
 
@@ -148,25 +170,29 @@ class BaseReasoningFormatDetector:
                 tool_idx = processed_text.find(self.tool_start_token)
                 reasoning_text = processed_text[:tool_idx]
                 # Preserve tool_start_token in normal text
-                normal_text = processed_text[tool_idx:]
+                normal_text = leading_normal_text + processed_text[tool_idx:]
                 return StreamingParseResult(
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
             # Assume reasoning was truncated before end token
-            return StreamingParseResult(reasoning_text=processed_text)
+            return StreamingParseResult(
+                normal_text=leading_normal_text, reasoning_text=processed_text
+            )
 
         # Extract reasoning content
         if self.think_end_token in processed_text:
             splits = processed_text.split(self.think_end_token, maxsplit=1)
             reasoning_text = splits[0]
-            normal_text = splits[1]
+            normal_text = leading_normal_text + splits[1]
 
             return StreamingParseResult(
                 normal_text=normal_text, reasoning_text=reasoning_text
             )
         else:
             # think_end_token is in self.previous_content for continue_final_message=True case
-            return StreamingParseResult(normal_text=processed_text)
+            return StreamingParseResult(
+                normal_text=leading_normal_text + processed_text
+            )
 
     def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
         """
@@ -203,8 +229,17 @@ class BaseReasoningFormatDetector:
             return StreamingParseResult()
 
         # Strip `<think>` token if present
+        leading_normal_text = ""
         if not self.stripped_think_start and think_start_text in current_text:
-            current_text = current_text.replace(think_start_text, "", 1)
+            if self._in_reasoning:
+                # force_reasoning: the block was open before the marker, so the
+                # text in front of an echoed marker is reasoning, not content.
+                current_text = current_text.replace(think_start_text, "", 1)
+            else:
+                # The block opens at the marker; what came before it is content.
+                start_idx = current_text.find(think_start_text)
+                leading_normal_text = current_text[:start_idx]
+                current_text = current_text[start_idx + len(think_start_text) :]
             # Write back, or stream_reasoning=False carries the token into finish().
             self._buffer = current_text
             self.stripped_think_start = True
@@ -218,7 +253,10 @@ class BaseReasoningFormatDetector:
 
             self._buffer = ""
             self._in_reasoning = False
-            normal_text = current_text[end_idx + len(self.think_end_token) :]
+            normal_text = (
+                leading_normal_text
+                + current_text[end_idx + len(self.think_end_token) :]
+            )
 
             return StreamingParseResult(
                 normal_text=normal_text, reasoning_text=reasoning_text
@@ -232,7 +270,7 @@ class BaseReasoningFormatDetector:
                 tool_idx = current_text.find(self.tool_start_token)
                 reasoning_text = current_text[:tool_idx]
                 # Preserve tool_start_token in normal text
-                normal_text = current_text[tool_idx:]
+                normal_text = leading_normal_text + current_text[tool_idx:]
                 self._buffer = ""
                 self._in_reasoning = False
                 return StreamingParseResult(
@@ -252,15 +290,28 @@ class BaseReasoningFormatDetector:
                 )
                 self._buffer = current_text[len(current_text) - holdback :]
                 return StreamingParseResult(
-                    reasoning_text=current_text[: len(current_text) - holdback]
+                    normal_text=leading_normal_text,
+                    reasoning_text=current_text[: len(current_text) - holdback],
                 )
             else:
-                return StreamingParseResult()
+                return StreamingParseResult(normal_text=leading_normal_text)
 
         # If we're not in a reasoning block return as normal text
         if not self._in_reasoning:
-            self._buffer = ""
-            return StreamingParseResult(normal_text=current_text)
+            # The prefix check above only fires when the *whole* buffer is a
+            # prefix of the opening token. A chunk that carries content first
+            # ("Sure." + "<") clears the buffer, so the rest of the marker
+            # arrives with nothing to attach to and the whole reasoning block
+            # reaches the client as raw text. Hold the partial marker back the
+            # same way the reasoning branch holds back the closing one.
+            holdback = (
+                self._ends_with_partial_token(current_text, think_start_text)
+                if not self.stripped_think_start
+                else 0
+            )
+            cut = len(current_text) - holdback
+            self._buffer = current_text[cut:]
+            return StreamingParseResult(normal_text=current_text[:cut])
 
         return StreamingParseResult()
 
