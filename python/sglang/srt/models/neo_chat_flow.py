@@ -7,8 +7,9 @@ import math
 from typing import Any
 
 import torch
-from sglang.srt.models.neo_chat_vision import NEOVisionModel
 from torch import nn
+
+from sglang.srt.models.neo_chat_vision import NEOVisionModel
 
 
 class NEOChatTimestepEmbedder(nn.Module):

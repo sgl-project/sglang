@@ -1716,9 +1716,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # uses real request metadata instead of padded slots. BCG has no
         # request-slot padding, so static_forward_batch is already the serving batch.
         tail_batch = (
-            forward_batch
-            if full_path or flow_graph_replay
-            else static_forward_batch
+            forward_batch if full_path or flow_graph_replay else static_forward_batch
         )
         try:
             with self._prefill_forward_context(

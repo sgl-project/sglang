@@ -3,10 +3,14 @@
 from types import SimpleNamespace
 
 import torch
+
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     _copy_preplanned_decode_inputs,
     _refresh_decode_mrope_positions,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def test_preplanned_decode_refreshes_mrope_positions() -> None:

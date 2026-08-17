@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, patch
 import numpy as np
 import pytest
 from PIL import Image
+from starlette.datastructures import UploadFile
+
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
 )
@@ -31,7 +33,9 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
-from starlette.datastructures import UploadFile
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
 class _FakeTokenizer:
@@ -260,9 +264,9 @@ async def _asgi_request(
     )
 
 
-def _image_edit_route_dependant(http_server):
+def _image_edit_route_dependent(http_server):
     return next(
-        route.dependant
+        route.dependant  # codespell:ignore dependant
         for route in http_server.app.routes
         if getattr(route, "path", None) == "/v1/images/edits"
     )
@@ -614,10 +618,10 @@ def test_u1_image_edit_asgi_rejects_declared_limit_plus_one_before_read() -> Non
         manager = _FakeTokenizerManager(media_url_max_file_size_mb=1)
         global_state = SimpleNamespace(tokenizer_manager=manager)
         endpoint = AsyncMock(return_value={"unexpected": True})
-        route_dependant = _image_edit_route_dependant(http_server)
+        route_dependency = _image_edit_route_dependent(http_server)
         with (
             patch.object(http_server, "_global_state", global_state),
-            patch.object(route_dependant, "call", endpoint),
+            patch.object(route_dependency, "call", endpoint),
         ):
             body = _image_edit_multipart_at_request_limit(http_server) + b"x"
             response = await _asgi_request(
@@ -645,10 +649,10 @@ def test_u1_image_edit_asgi_rejects_receive_stream_overflow() -> None:
         manager = _FakeTokenizerManager(media_url_max_file_size_mb=1)
         global_state = SimpleNamespace(tokenizer_manager=manager)
         endpoint = AsyncMock(return_value={"unexpected": True})
-        route_dependant = _image_edit_route_dependant(http_server)
+        route_dependency = _image_edit_route_dependent(http_server)
         with (
             patch.object(http_server, "_global_state", global_state),
-            patch.object(route_dependant, "call", endpoint),
+            patch.object(route_dependency, "call", endpoint),
         ):
             request_limit = http_server._u1_image_edit_request_limit_bytes()
             body = _image_edit_multipart_at_request_limit(http_server)

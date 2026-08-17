@@ -2697,8 +2697,8 @@ class Scheduler(
                 return
 
         if self.sensenova_u1_interleave_controller is not None:
-            interleave_error = (
-                self.sensenova_u1_interleave_controller.register_parent(req)
+            interleave_error = self.sensenova_u1_interleave_controller.register_parent(
+                req
             )
             if interleave_error is not None:
                 req.set_finish_with_abort(interleave_error)
@@ -3393,8 +3393,7 @@ class Scheduler(
                 continue
             if (
                 adder.can_run_list
-                and req.batch_isolation_key
-                != adder.can_run_list[0].batch_isolation_key
+                and req.batch_isolation_key != adder.can_run_list[0].batch_isolation_key
             ):
                 continue
 

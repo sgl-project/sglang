@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from PIL import Image
+
 from sglang.kernels.ops.attention.extend_attention import (
     _custom_mask_dense_attention_fwd,
     extend_attention_fwd,
@@ -36,6 +37,9 @@ from sglang.srt.multimodal.processors.neo_chat import (
     build_u1_mrope_positions,
     load_image_native,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def test_neo_chat_mrope_positions_match_u1_layout() -> None:

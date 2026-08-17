@@ -97,15 +97,15 @@ from sglang.srt.entrypoints.openai.protocol import (
     TokenizeRequest,
     V1RerankReqInput,
 )
-from sglang.srt.entrypoints.openai.serving_sensenova_u1_images import (
-    serve_sensenova_u1_image_edit,
-    serve_sensenova_u1_image_generation,
-)
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
 from sglang.srt.entrypoints.openai.serving_rerank import OpenAIServingRerank
 from sglang.srt.entrypoints.openai.serving_score import OpenAIServingScore
+from sglang.srt.entrypoints.openai.serving_sensenova_u1_images import (
+    serve_sensenova_u1_image_edit,
+    serve_sensenova_u1_image_generation,
+)
 from sglang.srt.entrypoints.openai.serving_tokenize import (
     OpenAIServingDetokenize,
     OpenAIServingTokenize,

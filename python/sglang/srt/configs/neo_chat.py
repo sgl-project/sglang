@@ -5,15 +5,16 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from sglang.srt.multimodal.customized_mm_processor_utils import (
-    register_customized_processor,
-)
 from transformers import (
     AutoConfig,
     AutoTokenizer,
     PretrainedConfig,
     ProcessorMixin,
     Qwen3Config,
+)
+
+from sglang.srt.multimodal.customized_mm_processor_utils import (
+    register_customized_processor,
 )
 
 _U1_LLM_EXTRA_FIELDS = (

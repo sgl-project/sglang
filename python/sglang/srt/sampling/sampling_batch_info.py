@@ -405,9 +405,9 @@ class SamplingBatchInfo:
         self_len = len(self)
         other_len = len(other)
         if self.custom_params is not None or other.custom_params is not None:
-            self.custom_params = (
-                self.custom_params or [None] * self_len
-            ) + (other.custom_params or [None] * other_len)
+            self.custom_params = (self.custom_params or [None] * self_len) + (
+                other.custom_params or [None] * other_len
+            )
 
         # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
         # See note below on len(self) and len(other).

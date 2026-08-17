@@ -14,6 +14,8 @@ from contextvars import ContextVar
 
 import torch
 import torch.nn.functional as F
+from torch import nn
+
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -40,6 +42,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.neo_chat_exact_text import U1ExactTextRuntime
 from sglang.srt.models.neo_chat_flow import (
     NEOChatFlowModules,
     apply_u1_time_schedule,
@@ -58,10 +61,8 @@ from sglang.srt.models.neo_chat_mask import (
     build_u1_hybrid_allowed_matrix,
     build_u1_hybrid_backend_mask,
 )
-from sglang.srt.models.neo_chat_exact_text import U1ExactTextRuntime
 from sglang.srt.models.neo_chat_vision import NEOVisionModel
 from sglang.srt.utils import add_prefix
-from torch import nn
 
 logger = logging.getLogger(__name__)
 

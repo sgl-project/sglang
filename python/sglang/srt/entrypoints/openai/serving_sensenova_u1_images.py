@@ -15,6 +15,7 @@ from collections import OrderedDict
 import numpy as np
 from fastapi import Request
 from PIL import Image
+
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     ImageGenerationsRequest,
     ImagePromptTokensDetails,

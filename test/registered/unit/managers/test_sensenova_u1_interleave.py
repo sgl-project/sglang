@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
@@ -29,6 +30,9 @@ from sglang.srt.models.neo_chat_limits import (
     normalize_u1_interleave_request,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 IMG_START = 10
 IMG_CONTEXT = 11

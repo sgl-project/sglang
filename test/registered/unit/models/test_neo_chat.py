@@ -11,6 +11,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from transformers import AutoConfig
+
 from sglang.srt.configs.neo_chat import NEOChatConfig
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.models.neo_chat import (
@@ -19,7 +21,9 @@ from sglang.srt.models.neo_chat import (
     _stacked_weight_target,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from transformers import AutoConfig
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _MODEL_PATH_VALUE = os.environ.get("SENSENOVA_U1_MODEL_PATH")
 MODEL_PATH = Path(_MODEL_PATH_VALUE) if _MODEL_PATH_VALUE else None

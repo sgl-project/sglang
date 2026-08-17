@@ -8,6 +8,8 @@ from typing import ClassVar
 
 import torch
 from PIL import Image
+from torchvision import transforms
+
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -25,7 +27,6 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
-from torchvision import transforms
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)

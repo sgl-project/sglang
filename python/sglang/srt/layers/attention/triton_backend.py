@@ -958,8 +958,7 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask = forward_batch.cross_attention_custom_mask
             if custom_mask is not None:
                 seq_mask_len = forward_batch.extend_seq_lens * (
-                    forward_batch.extend_prefix_lens
-                    + forward_batch.extend_seq_lens
+                    forward_batch.extend_prefix_lens + forward_batch.extend_seq_lens
                 )
                 mask_indptr = self.mask_indptr
                 mask_indptr[1 : bs + 1] = torch.cumsum(
