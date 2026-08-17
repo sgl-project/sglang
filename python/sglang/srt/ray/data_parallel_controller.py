@@ -31,7 +31,11 @@ from sglang.srt.ray.engine import (
     _get_bundle_node_ip,
     _resolve_bundle_indices,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    configured_attn_cp_size,
+    configured_pp_size,
+    get_parallel,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils.network import bind_port, get_zmq_socket, get_zmq_socket_on_host
 
@@ -144,7 +148,10 @@ class RayDataParallelController(DataParallelController):
             for node_idx in range(nnodes):
                 bundle_idx = self.bundle_for_node[node_idx]
                 pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
-                    nnodes, server_args.pp_size, server_args.tp_size, node_rank=node_idx
+                    nnodes,
+                    configured_pp_size(),
+                    server_args.tp_size,
+                    node_rank=node_idx,
                 )
                 for pp_rank in pp_range:
                     for tp_rank in tp_range:
@@ -161,7 +168,7 @@ class RayDataParallelController(DataParallelController):
                                 tp_rank,
                                 server_args.tp_size,
                                 get_parallel().dp_size,
-                                server_args.attn_cp_size,
+                                configured_attn_cp_size(),
                             )
                             rank_port_args = PortArgs.init_new(
                                 server_args, actual_dp_rank, worker_ports
@@ -202,7 +209,7 @@ class RayDataParallelController(DataParallelController):
             world_size = _compute_world_size(server_args)
             bundle_indices = _resolve_bundle_indices(self.pg, world_size)
 
-            ranks_per_tp_group = server_args.tp_size * server_args.pp_size
+            ranks_per_tp_group = server_args.tp_size * configured_pp_size()
             if dp_rank is not None:
                 start_rank = dp_rank * ranks_per_tp_group
                 end_rank = start_rank + ranks_per_tp_group
@@ -232,7 +239,7 @@ class RayDataParallelController(DataParallelController):
                         tp_rank,
                         server_args.tp_size,
                         get_parallel().dp_size,
-                        server_args.attn_cp_size,
+                        configured_attn_cp_size(),
                     )
                     rank_port_args = PortArgs.init_new(
                         server_args, actual_dp_rank, worker_ports
