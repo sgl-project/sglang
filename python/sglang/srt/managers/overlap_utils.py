@@ -476,7 +476,13 @@ class FutureMap:
         indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
-        self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
+        # MLX backend: see stash() — keep device consistent with the buffer.
+        buf_device = self.new_seq_lens_buf.device
+        if indices.device != buf_device:
+            indices = indices.to(buf_device)
+        self.new_seq_lens_buf[indices] = new_seq_lens.to(
+            device=buf_device, dtype=self.new_seq_lens_buf.dtype
+        )
         publish_confidence = self.needs_confidence_relay and confidence is not None
         if publish_confidence:
             self.confidence_relay.scatter(indices, confidence)
@@ -509,8 +515,14 @@ class FutureMap:
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(payload)
         self._maybe_init_dsa_topk_indices_buf(payload)
+        # MLX backend: payload tensors arrive on CPU (converted from mlx arrays)
+        # while the bufs live on self.device (mps). `.to(dtype)` alone keeps the
+        # device mismatch — move indices and values to the buffer's device.
+        buf_device = self.output_tokens_buf.device
+        if indices.device != buf_device:
+            indices = indices.to(buf_device)
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(
-            self.output_tokens_buf.dtype
+            device=buf_device, dtype=self.output_tokens_buf.dtype
         )
 
         if self.need_topk:

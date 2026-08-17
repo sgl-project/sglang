@@ -317,6 +317,19 @@ class MlxAuxiliaryStateComponent(MambaComponent):
         TreeComponent.__init__(self, cache, params)
         self.enable_mamba_extra_buffer = False
         self._mamba_pool_host = None
+        # This __init__ bypasses MambaComponent.__init__ (its HybridReqToTokenPool
+        # assert does not hold for the MLX pool), but inherited MambaComponent
+        # methods still read these attributes (e.g. finalize_match_result_in_tree_core
+        # uses mamba_checkpoint_grid). Mirror the parent's initialization.
+        from sglang.srt.runtime_context import (
+            get_exec,
+            mamba_cache_chunk_size,
+            mamba_checkpoint_grid,
+        )
+
+        self.mamba_cache_chunk_size = mamba_cache_chunk_size()
+        self.mamba_checkpoint_grid = mamba_checkpoint_grid(params.page_size)
+        self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
 
     @staticmethod
     def _tracked_value(req) -> tuple[object | None, bool]:
