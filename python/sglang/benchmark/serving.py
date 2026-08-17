@@ -37,6 +37,7 @@ import aiohttp
 import numpy as np
 import orjson
 import requests
+import urllib3
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
@@ -68,6 +69,24 @@ def _get_bool_env_var(name: str, default: str = "false") -> bool:
     return value.lower() in ("true", "1")
 
 
+def insecure_ssl() -> bool:
+    """Whether to skip TLS certificate verification (--insecure)."""
+    return bool(getattr(args, "insecure", False))
+
+
+def _suppress_insecure_warnings() -> None:
+    """Silence urllib3's InsecureRequestWarning when --insecure is set.
+
+    ``requests`` emits one warning per request when ``verify=False``, which
+    spams the bench log for every health poll and benchmark request.
+    Must prepend: Python's default ``default`` rule for ``UserWarning`` (the
+    parent of ``InsecureRequestWarning``) matches first and wins over any
+    ``append=True`` filter, so only a front-of-list filter actually silences it.
+    """
+    if insecure_ssl():
+        warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+
+
 def _create_bench_client_session():
     # When the pressure is big, the read buffer could be full before aio thread read
     # the content. We increase the read_bufsize from 64K to 10M.
@@ -76,8 +95,11 @@ def _create_bench_client_session():
     BENCH_AIOHTTP_READ_BUFSIZE_BYTES = 10 * 1024**2  # 10 MB
 
     aiohttp_timeout = aiohttp.ClientTimeout(total=BENCH_AIOHTTP_TIMEOUT_SECONDS)
+    connector = aiohttp.TCPConnector(ssl=not insecure_ssl())
     return aiohttp.ClientSession(
-        timeout=aiohttp_timeout, read_bufsize=BENCH_AIOHTTP_READ_BUFSIZE_BYTES
+        timeout=aiohttp_timeout,
+        read_bufsize=BENCH_AIOHTTP_READ_BUFSIZE_BYTES,
+        connector=connector,
     )
 
 
@@ -153,18 +175,25 @@ def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
     print(f"Waiting up to {timeout_sec}s for {url} to become ready...")
     start_time = time.perf_counter()
     headers = get_auth_headers()
+    ssl_verify = not insecure_ssl()
+    last_error = None
     while True:
         try:
-            response = requests.get(url, headers=headers, timeout=5)
+            response = requests.get(url, headers=headers, timeout=5, verify=ssl_verify)
             if response.status_code == 200:
                 elapsed = time.perf_counter() - start_time
                 print(f"Server ready in {elapsed:.1f}s.")
                 return True
-        except requests.exceptions.RequestException:
-            pass
+        except requests.exceptions.RequestException as e:
+            last_error = e
         elapsed = time.perf_counter() - start_time
         if elapsed >= timeout_sec:
             print(f"Server did not become ready within {timeout_sec}s timeout.")
+            if last_error is not None:
+                print(
+                    f"[wait_for_endpoint] last error: "
+                    f"{type(last_error).__name__}: {last_error}"
+                )
             return False
         time.sleep(1)
 
@@ -977,7 +1006,11 @@ def flush_server_cache(base_url: str, backend: str) -> None:
     cache_endpoint = (
         "/reset_prefix_cache" if backend.startswith("vllm") else "/flush_cache"
     )
-    response = requests.post(base_url + cache_endpoint, headers=get_auth_headers())
+    response = requests.post(
+        base_url + cache_endpoint,
+        headers=get_auth_headers(),
+        verify=not insecure_ssl(),
+    )
     response.raise_for_status()
 
 
@@ -1565,7 +1598,9 @@ async def benchmark(
 
     if "sglang" in backend:
         server_info = requests.get(
-            base_url + "/server_info", headers=get_auth_headers()
+            base_url + "/server_info",
+            headers=get_auth_headers(),
+            verify=not insecure_ssl(),
         )
         if server_info.status_code == 200:
             server_info_json = server_info.json()
@@ -1761,7 +1796,11 @@ async def benchmark(
                 print("{:<40} {:.1f}%".format(label, storage_pct))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
+    resp = requests.get(
+        base_url + "/server_info",
+        headers=get_auth_headers(),
+        verify=not insecure_ssl(),
+    )
     server_info = resp.json() if resp.status_code == 200 else None
 
     if (
@@ -1900,6 +1939,7 @@ def set_global_args(args_: argparse.Namespace):
 def run_benchmark(args_: argparse.Namespace):
     global args
     args = args_
+    _suppress_insecure_warnings()
 
     # Set default value for max_concurrency if not present
     if not hasattr(args, "max_concurrency"):
@@ -2026,7 +2066,11 @@ def run_benchmark(args_: argparse.Namespace):
             )
             sys.exit(1)
         try:
-            response = requests.get(model_url, headers=get_auth_headers())
+            response = requests.get(
+                model_url,
+                headers=get_auth_headers(),
+                verify=not insecure_ssl(),
+            )
             model_list = response.json().get("data", [])
             args.model = model_list[0]["id"] if model_list else None
         except Exception as e:
@@ -2077,7 +2121,10 @@ def run_benchmark(args_: argparse.Namespace):
     if tokenizer_id is None:
         try:
             resp = requests.get(
-                base_url + "/model_info", headers=get_auth_headers(), timeout=5
+                base_url + "/model_info",
+                headers=get_auth_headers(),
+                timeout=5,
+                verify=not insecure_ssl(),
             )
             if resp.status_code == 200:
                 info = resp.json()
@@ -2718,6 +2765,13 @@ def cli_main():
         nargs="+",
         default=None,
         help="Custom HTTP headers in Key=Value format. Example: --header MyHeader=MY_VALUE MyAnotherHeader=myanothervalue",
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        default=False,
+        help="Disable SSL certificate verification. Use this option when "
+        "connecting to servers with self-signed certificates.",
     )
     args = parser.parse_args()
     _validate_parsed_gsp_args(parser, args)

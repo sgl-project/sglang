@@ -19,12 +19,14 @@ import json
 import random
 import re
 import time
+import warnings
 from functools import lru_cache
 from types import SimpleNamespace
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import requests
+import urllib3
 from pydantic import BaseModel
 from tabulate import tabulate
 from transformers import AutoProcessor, PreTrainedTokenizer
@@ -43,13 +45,13 @@ from sglang.test.test_utils import is_in_ci, write_github_step_summary
 DEFAULT_TIMEOUT = 600
 
 
-def get_cache_tokens_from_metrics(url: str) -> Optional[tuple]:
+def get_cache_tokens_from_metrics(url: str, verify: bool = True) -> Optional[tuple]:
     """
     Get cached_tokens_total and prompt_tokens_total from Prometheus /metrics endpoint.
     Returns (cached_tokens_total, prompt_tokens_total) or None if metrics are not available.
     """
     try:
-        response = requests.get(url + "/metrics", timeout=5)
+        response = requests.get(url + "/metrics", timeout=5, verify=verify)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError:
@@ -141,6 +143,7 @@ class BenchArgs:
     lora_request_distribution: str = "uniform"
     lora_zipf_alpha: float = 1.1
     enable_multi_batch: bool = False
+    insecure: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -357,6 +360,13 @@ class BenchArgs:
                 "batching and will be misleading."
             ),
         )
+        parser.add_argument(
+            "--insecure",
+            action="store_true",
+            default=BenchArgs.insecure,
+            help="Disable SSL certificate verification. Use this option when "
+            "connecting to servers with self-signed certificates.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -411,6 +421,7 @@ def _warmup_cache(
     image_data: Optional[List] = None,
     backend: str = "sglang",
     model_name: Optional[str] = None,
+    verify: bool = True,
 ):
     """Warm up the cache by sending prefix tokens to populate the radix/prefix cache.
 
@@ -463,16 +474,21 @@ def _warmup_cache(
         gen_url,
         json=cache_warmup_payload,
         timeout=DEFAULT_TIMEOUT,
+        verify=verify,
     )
     warmup_response.raise_for_status()
     print("Cache warmup completed")
 
 
-def _flush_cache_with_retry(url: str, endpoint: str, max_retries: int = 3):
+def _flush_cache_with_retry(
+    url: str, endpoint: str, max_retries: int = 3, verify: bool = True
+):
     """Post to a cache flush endpoint with retries on failure."""
     for attempt in range(max_retries):
         try:
-            response = requests.post(url + endpoint, timeout=DEFAULT_TIMEOUT)
+            response = requests.post(
+                url + endpoint, timeout=DEFAULT_TIMEOUT, verify=verify
+            )
             if response.status_code == 200:
                 return
             if attempt >= max_retries - 1:
@@ -559,12 +575,13 @@ def run_one_case(
     lora_zipf_alpha: float = BenchArgs.lora_zipf_alpha,
     fixed_prompt_file: str = "",
     apply_chat_template: bool = False,
+    verify: bool = True,
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
-        _flush_cache_with_retry(url, "/reset_prefix_cache")
+        _flush_cache_with_retry(url, "/reset_prefix_cache", verify=verify)
     else:
-        _flush_cache_with_retry(url, "/flush_cache")
+        _flush_cache_with_retry(url, "/flush_cache", verify=verify)
 
     if fixed_prompt_file:
         tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
@@ -705,6 +722,7 @@ def run_one_case(
             image_data=image_data,
             backend=backend,
             model_name=model_name,
+            verify=verify,
         )
 
     # Turn on profiler
@@ -718,10 +736,11 @@ def run_one_case(
             profile_by_stage=profile_by_stage,
             profile_prefix=profile_prefix,
             start_step=profile_start_step,
+            verify=verify,
         )
 
     # Get metrics before the request (for cache hit rate calculation)
-    metrics_before = get_cache_tokens_from_metrics(url)
+    metrics_before = get_cache_tokens_from_metrics(url, verify=verify)
 
     # Run the request
     tic = time.perf_counter()
@@ -730,6 +749,7 @@ def run_one_case(
         json=payload,
         stream=True,
         timeout=DEFAULT_TIMEOUT,
+        verify=verify,
     ) as response:
         response.raise_for_status()
 
@@ -781,7 +801,9 @@ def run_one_case(
         last_gen_throughput = -1
         acc_length = -1
     else:
-        response = requests.get(url + "/server_info", timeout=DEFAULT_TIMEOUT)
+        response = requests.get(
+            url + "/server_info", timeout=DEFAULT_TIMEOUT, verify=verify
+        )
         response.raise_for_status()
         server_info = response.json()
         internal_states = server_info.get("internal_states", [])
@@ -796,7 +818,7 @@ def run_one_case(
                 last_gen_throughput = val_thr
 
     # Calculate cache hit rate from before/after metrics delta
-    metrics_after = get_cache_tokens_from_metrics(url)
+    metrics_after = get_cache_tokens_from_metrics(url, verify=verify)
     metrics_cache_hit_rate = calculate_cache_hit_rate(metrics_before, metrics_after)
 
     # Print results
@@ -941,16 +963,29 @@ def run_benchmark_internal(
     # set random seed
     random.seed(bench_args.seed)
     np.random.seed(bench_args.seed)
+    if bench_args.insecure:
+        # Must prepend: the built-in 'default' rule for UserWarning (parent of
+        # InsecureRequestWarning) matches first and beats any append=True filter.
+        warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
 
     # Resolve the benchmark target: launch a server, or connect to --base-url.
-    endpoint = acquire_endpoint(server_args, bench_args.base_url, launch_server_func)
+    endpoint = acquire_endpoint(
+        server_args,
+        bench_args.base_url,
+        launch_server_func,
+        verify_ssl=not bench_args.insecure,
+    )
     base_url = endpoint.base_url
 
     # Get tokenizer and server info
     if bench_args.backend == "vllm":
         # For vLLM, get model name from /v1/models endpoint
         print(f"Connecting to vLLM server at {base_url}...")
-        response = requests.get(base_url + "/v1/models", timeout=DEFAULT_TIMEOUT)
+        response = requests.get(
+            base_url + "/v1/models",
+            timeout=DEFAULT_TIMEOUT,
+            verify=not bench_args.insecure,
+        )
         response.raise_for_status()
         model_list = response.json().get("data", [])
         if not model_list:
@@ -970,7 +1005,11 @@ def run_benchmark_internal(
         skip_max_running_requests_threshold = float("inf")
     else:
         model_name = None
-        response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
+        response = requests.get(
+            base_url + "/server_info",
+            timeout=DEFAULT_TIMEOUT,
+            verify=not bench_args.insecure,
+        )
         response.raise_for_status()
         server_info = response.json()
         if bench_args.local_tokenizer_path:
@@ -1107,6 +1146,7 @@ def run_benchmark_internal(
                 lora_zipf_alpha=bench_args.lora_zipf_alpha,
                 fixed_prompt_file=bench_args.fixed_prompt_file,
                 apply_chat_template=bench_args.apply_chat_template,
+                verify=not bench_args.insecure,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -1152,6 +1192,7 @@ def run_benchmark_internal(
                     lora_zipf_alpha=bench_args.lora_zipf_alpha,
                     fixed_prompt_file=bench_args.fixed_prompt_file,
                     apply_chat_template=bench_args.apply_chat_template,
+                    verify=not bench_args.insecure,
                     **gsp_kwargs,
                 )
             )
@@ -1206,6 +1247,7 @@ def run_benchmark_internal(
                             lora_name=bench_args.lora_name,
                             lora_request_distribution=bench_args.lora_request_distribution,
                             lora_zipf_alpha=bench_args.lora_zipf_alpha,
+                            verify=not bench_args.insecure,
                             **gsp_kwargs,
                         )
                     )
