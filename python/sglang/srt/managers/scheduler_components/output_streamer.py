@@ -387,6 +387,13 @@ class _GenerationStreamAccumulator:
                     len(req.output_ids) % self.default_force_stream_interval == 0
                 )
 
+                if should_output:
+                    # Hold the intermediate output when the tail may still grow
+                    # into a stop string. Otherwise the leaked stop-string prefix
+                    # is committed ahead of the final trim point and stays in the
+                    # returned text (same hold as the stream branch above).
+                    should_output &= not req.check_match_stop_str_prefix()
+
         if not should_output:
             return
 
