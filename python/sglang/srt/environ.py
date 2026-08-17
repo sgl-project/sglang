@@ -1027,6 +1027,9 @@ class Envs:
     # SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is also set; DeepGEMM asserts
     # this combination on the host side.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
+    # Opt-in SM100+ CUDA Graph path: stage activations on a side stream while
+    # the JIT router writes final TopK outputs directly into the symm buffer.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_DIRECT_OUT = EnvBool(False)
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
 
     # ===================================================================

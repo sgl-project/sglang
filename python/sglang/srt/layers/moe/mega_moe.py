@@ -21,7 +21,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4 import mega_moe_pre_dispatch
+from sglang.kernels.ops.attention.dsv4 import (
+    mega_moe_pad_route,
+    mega_moe_pre_dispatch,
+    mega_moe_stage_activation,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
@@ -42,6 +46,7 @@ if TYPE_CHECKING:
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+_MEGA_MOE_STAGING_STREAMS: dict[int, torch.cuda.Stream] = {}
 _MEGA_MOE_DG_ENV_APPLIED = False
 
 
@@ -98,6 +103,17 @@ def _get_mega_moe_symm_buffer(
         )
         _MEGA_MOE_SYMM_BUFFER[key] = buf
     return buf
+
+
+def _get_mega_moe_staging_stream(device: torch.device) -> torch.cuda.Stream:
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    stream = _MEGA_MOE_STAGING_STREAMS.get(device_index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=device_index)
+        _MEGA_MOE_STAGING_STREAMS[device_index] = stream
+    return stream
 
 
 def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool:
@@ -169,29 +185,6 @@ def _run_mega_routed(
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
 
     hidden_size = moe.config.hidden_size
-
-    if num_tokens > 0:
-        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
-        topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        topk_output = moe.topk(
-            hidden_states,
-            router_logits,
-            num_token_non_padded=(
-                forward_batch.num_token_non_padded
-                if forward_batch is not None
-                else None
-            ),
-            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                layer_id=moe.layer_id,
-            ),
-            **topk_kwargs,
-        )
-        topk_ids = topk_output.topk_ids
-        topk_weights = topk_output.topk_weights
-    else:
-        topk_ids = None
-        topk_weights = None
-
     ep_group = get_moe_ep_group().device_group
     num_experts = moe.experts.num_experts
     top_k = moe.config.num_experts_per_tok + moe.num_fused_shared_experts
@@ -215,9 +208,122 @@ def _run_mega_routed(
         intermediate_hidden=intermediate_size,
     )
 
+    use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
+    direct_out_enabled = (
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_DIRECT_OUT.get()
+        and envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get()
+        and get_is_capture_mode()
+        and _device_sm >= 100
+        and not use_fp4_acts
+    )
+    # Construct the persistent stream during eager warmup as soon as the
+    # feature is enabled; CUDA Graph capture then only records fork/join events.
+    staging_stream = (
+        _get_mega_moe_staging_stream(hidden_states.device)
+        if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_DIRECT_OUT.get()
+        and _device_sm >= 100
+        and not use_fp4_acts
+        else None
+    )
+
+    num_token_non_padded = (
+        forward_batch.num_token_non_padded if forward_batch is not None else None
+    )
+    dispatch_info = (
+        ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+        if num_tokens > 0
+        else None
+    )
+    use_direct_out = False
+    if direct_out_enabled and num_tokens > 0 and not moe.is_hash:
+        from sglang.srt.layers.moe.topk import (
+            precomputed_topk_postprocess_is_noop,
+        )
+
+        cfg = getattr(moe.topk, "topk_config", None)
+        use_direct_out = (
+            cfg is not None
+            and not cfg.use_grouped_topk
+            and cfg.custom_routing_function is None
+            and cfg.scoring_func == "sqrtsoftplus"
+            and cfg.correction_bias is not None
+            and precomputed_topk_postprocess_is_noop(
+                cfg,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+            )
+        )
+
     if num_tokens > 0:
+        if use_direct_out:
+            assert staging_stream is not None
+            current_stream = torch.cuda.current_stream(hidden_states.device)
+            staging_stream.wait_stream(current_stream)
+            with torch.cuda.stream(staging_stream):
+                mega_moe_stage_activation(
+                    hidden_states,
+                    buf.x,
+                    buf.x_sf,
+                    quant_group_size=32,
+                )
+                # TopK writes valid rows on the main stream; initialize only
+                # the disjoint capacity tail here while both streams run.
+                mega_moe_pad_route(
+                    buf.topk_idx[:num_tokens],
+                    buf.topk_idx,
+                    buf.topk_weights,
+                    quant_group_size=32,
+                )
+
+        router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
+        if use_direct_out:
+            from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
+            from sglang.srt.layers.moe.topk import build_precomputed_topk_output
+
+            cfg = moe.topk.topk_config
+            topk_weights, topk_ids = moe_fused_gate(
+                router_logits,
+                cfg.correction_bias,
+                cfg.top_k,
+                scoring_func=cfg.scoring_func,
+                num_fused_shared_experts=cfg.num_fused_shared_experts,
+                renormalize=cfg.renormalize,
+                routed_scaling_factor=cfg.routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=(
+                    cfg.apply_routed_scaling_factor_on_output
+                ),
+                out_weights=buf.topk_weights[:num_tokens],
+                out_indices=buf.topk_idx[:num_tokens],
+            )
+            topk_output = build_precomputed_topk_output(
+                topk_weights,
+                topk_ids,
+                cfg,
+                moe.layer_id,
+            )
+        else:
+            topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
+            topk_output = moe.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+                **topk_kwargs,
+            )
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+    else:
+        topk_ids = None
+        topk_weights = None
+
+    if num_tokens > 0 and not use_direct_out:
         topk_ids_in = topk_ids.to(torch.int32)
         topk_weights_in = topk_weights.to(torch.float32)
+    elif use_direct_out:
+        # The direct-output path has already written the final int64/float32
+        # route buffers. Avoid materializing temporary cast tensors.
+        topk_ids_in = topk_ids
+        topk_weights_in = topk_weights
     else:
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
@@ -232,7 +338,6 @@ def _run_mega_routed(
             num_tokens,
         )
 
-    use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
     if use_fp4_acts:
         # FP4 path goes through DeepGEMM's mega_moe_pre_dispatch which
         # handles the E2M1 packing variant. The jit implementation
@@ -249,6 +354,9 @@ def _run_mega_routed(
             group_size=32,
             use_fp4_acts=True,
         )
+    elif use_direct_out:
+        assert staging_stream is not None
+        torch.cuda.current_stream(hidden_states.device).wait_stream(staging_stream)
     else:
         mega_moe_pre_dispatch(
             hidden_states,
