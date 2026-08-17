@@ -73,6 +73,19 @@ whose `max_tokens` admits the batch (a rule without `max_tokens` terminates
 the ladder). `sites` holds `MoeLoraLaunchConfig` fields (per-site Triton
 tile dicts). A plan row with no rules serves the built-in heuristics.
 
+Some rules carry byte-identical `sites` ON PURPOSE, and nothing enforces the
+pairing — the format is deliberately raw values with no reference/alias
+mechanism. As shipped: `decode.per_expert` rules 0+1 share one config
+(rank rule and its M≤4 bucket), rules 2+3 share another (the M≤16 bucket and
+the rank-32 rule that extends the same tiles to 32 tokens), and the
+`fallback.*` rows repeat one config across all three arch files. If you
+retune one rule of such a pair, retune its twin in the same edit, or the
+"same tiles, wider window" intent silently splits. This is a fact about the
+current tuning, not an invariant — a future sweep may legitimately split a
+pair, which is why no test pins it. Editing by hand? Read
+`benchmark/kernels/lora_moe/README.md` first for the selection-cascade traps
+and the measurement protocol.
+
 Both loaders are pydantic models with `extra="forbid"`: a field this build
 does not understand aborts startup instead of silently widening a match.
 Two annotation fields are declared and ignored by selection, so tuned
