@@ -1319,6 +1319,7 @@ class SchedulerPPMixin:
         from sglang.srt.speculative.eagle_utils import (
             TreeMaskMode,
             build_tree_kernel_efficient,
+            default_tree_mask_mode,
         )
 
         sa = self.server_args
@@ -1332,6 +1333,7 @@ class SchedulerPPMixin:
                 topk=sa.speculative_eagle_topk,
                 spec_steps=steps,
                 num_verify_tokens=num_draft_tokens,
+                device=device,
             )
             return
 
@@ -1349,18 +1351,23 @@ class SchedulerPPMixin:
             bs, 1
         )
 
-        attn_backend = self.tp_worker.model_runner.attn_backend
-        tree_mask_buf, position_buf = (
-            attn_backend.get_verify_buffers_to_fill_after_draft()
-        )
+        # Mask selection mirrors the last stage's draft() tail
+        # (build_eagle_verify_input) so every stage builds the same mask.
+        verify_mask = self.tp_worker.model_runner.attn_backend.verify_mask
+        if verify_mask is None:
+            tree_mask_buf, mask_mode, fill_mask = None, default_tree_mask_mode(), True
+        else:
+            mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
+            tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
+
         seq_lens_sum = batch.seq_lens_sum
         if seq_lens_sum is None:
-            if tree_mask_buf is None:
+            if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
+                seq_lens_sum = 0  # preallocated / bs-sized -> kernel ignores it
+            else:
                 # Conservative upper bound; backend-agnostic (not every
                 # attention backend exposes max_context_len).
                 seq_lens_sum = bs * self.tp_worker.model_runner.model_config.context_len
-            else:
-                seq_lens_sum = 0  # preallocated buf -> kernel ignores it
 
         (
             tree_mask,
@@ -1379,9 +1386,9 @@ class SchedulerPPMixin:
             sa.speculative_eagle_topk,
             steps,
             num_draft_tokens,
-            TreeMaskMode.FULL_MASK,
+            mask_mode,
             tree_mask_buf,
-            position_buf,
+            fill_prefix_mask=fill_mask,
         )
         batch.spec_info = EagleVerifyInput(
             draft_token=flat_draft_tokens,
