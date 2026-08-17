@@ -112,7 +112,7 @@ export const Qwen35Deployment = () => {
     },
     hicache: {
       name: 'hicache',
-      title: 'HiCache DRAM Offload',
+      title: 'HiCache (L2)',
       condition: (values) => values.model === '397b' && values.hardware === 'h200' && values.quantization === 'fp8' && values.speculative === 'enabled',
       items: [
         { id: 'disabled', label: 'Disabled', default: true  },
