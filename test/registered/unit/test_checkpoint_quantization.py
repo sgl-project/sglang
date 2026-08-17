@@ -4,6 +4,7 @@ import unittest
 
 from sglang.checkpoint_quantization import (
     CheckpointQuantSpec,
+    canonicalize_modelopt_quant_algo,
     resolve_checkpoint_quant_spec,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -26,6 +27,21 @@ class _QuantConfigObject:
 
 
 class TestResolveCheckpointQuantSpec(CustomTestCase):
+    def test_modelopt_quant_algo_canonicalization(self):
+        cases = {
+            "FP8": "modelopt_fp8",
+            "mxfp8": "mxfp8",
+            "NVFP4": "modelopt_fp4",
+            "NVFP4_AWQ": "modelopt_fp4",
+            "W4A16_NVFP4": "modelopt_fp4",
+            "FP8_FAKE": None,
+            "MIXED_PRECISION": None,
+            None: None,
+        }
+        for quant_algo, expected in cases.items():
+            with self.subTest(quant_algo=quant_algo):
+                self.assertEqual(canonicalize_modelopt_quant_algo(quant_algo), expected)
+
     def test_top_level_quantization_config(self):
         config = {
             "quantization_config": {

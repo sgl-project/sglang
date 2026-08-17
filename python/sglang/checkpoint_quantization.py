@@ -10,7 +10,9 @@ from typing import Any, Literal, Mapping, TypeAlias
 
 __all__ = [
     "CheckpointQuantSpec",
+    "ModelOptQuantMethod",
     "QuantMetadataSource",
+    "canonicalize_modelopt_quant_algo",
     "resolve_checkpoint_quant_spec",
 ]
 
@@ -20,6 +22,36 @@ QuantMetadataSource: TypeAlias = Literal[
     "text_config.quantization_config",
     "compression_config",
 ]
+
+ModelOptQuantMethod: TypeAlias = Literal[
+    "modelopt_fp8",
+    "modelopt_fp4",
+    "mxfp8",
+]
+
+_MODELOPT_QUANT_ALGO_TO_METHOD: dict[str, ModelOptQuantMethod] = {
+    "FP8": "modelopt_fp8",
+    "MXFP8": "mxfp8",
+    "FP4": "modelopt_fp4",
+    "NVFP4": "modelopt_fp4",
+    "NVFP4_AWQ": "modelopt_fp4",
+    "W4A16_NVFP4": "modelopt_fp4",
+}
+
+
+def canonicalize_modelopt_quant_algo(
+    quant_algo: object,
+) -> ModelOptQuantMethod | None:
+    """Map a known ModelOpt algorithm name to its SGLang runtime family.
+
+    This is intentionally an exact allowlist. In particular, ``MXFP8`` must not
+    be mistaken for ordinary ``FP8`` merely because its name contains that
+    substring. Runtime-specific capability checks remain with each consumer.
+    """
+
+    if not isinstance(quant_algo, str):
+        return None
+    return _MODELOPT_QUANT_ALGO_TO_METHOD.get(quant_algo.upper())
 
 
 @dataclass(slots=True)
