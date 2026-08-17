@@ -116,6 +116,38 @@ def _getattr_first(obj, names, default=None):
     return default
 
 
+# Preference order for picking an HF `AutoModel*` factory when a config's
+# `auto_map` doesn't declare `AutoModel` directly. Newer VLMs like Molmo2 only
+# declare a task-specific auto class (`AutoModelForImageTextToText`); the
+# corresponding factory can still resolve the custom class via trust_remote_code.
+# Order is generation-focused: image-text families, then plain CausalLM, then
+# seq2seq, with plain `AutoModel` as the ultimate fallback.
+_HF_AUTO_MODEL_KEYS = (
+    "AutoModelForImageTextToText",
+    "AutoModelForVision2Seq",
+    "AutoModelForCausalLM",
+    "AutoModelForSeq2SeqLM",
+    "AutoModel",
+)
+
+
+def _hf_auto_model_class_for_config(config: PretrainedConfig):
+    """Return the HF `AutoModel*` class best matching the config's auto_map.
+
+    Prefers a task-specific class actually declared in `config.auto_map`
+    (`AutoModelForImageTextToText` for Molmo2, etc.) over the generic
+    `AutoModel`; falls back to `AutoModel` when the config makes no claim.
+    """
+    auto_map = getattr(config, "auto_map", {}) or {}
+    for key in _HF_AUTO_MODEL_KEYS:
+        if key not in auto_map:
+            continue
+        auto_cls = getattr(transformers, key, None)
+        if auto_cls is not None:
+            return auto_cls
+    return AutoModel
+
+
 def _resolve_attention_backend_model_cls(config: PretrainedConfig):
     model_cls = getattr(
         transformers, (getattr(config, "architectures", None) or [""])[0], None
@@ -124,7 +156,7 @@ def _resolve_attention_backend_model_cls(config: PretrainedConfig):
         return model_cls
 
     auto_map = getattr(config, "auto_map", {}) or {}
-    for key in ("AutoModel", "AutoModelForCausalLM"):
+    for key in _HF_AUTO_MODEL_KEYS:
         if key not in auto_map:
             continue
         try:
@@ -612,8 +644,9 @@ class TransformersBase(nn.Module):
         # Initialize on meta device to avoid premature GPU allocation
         self.text_config._attn_implementation = "sglang"
         if supports_backend:
+            auto_model_cls = _hf_auto_model_class_for_config(self.config)
             with _init_on_device_without_buffers(torch.device("meta")):
-                self.model: PreTrainedModel = AutoModel.from_config(
+                self.model: PreTrainedModel = auto_model_cls.from_config(
                     self.config,
                     torch_dtype=torch.get_default_dtype(),
                     trust_remote_code=True,
