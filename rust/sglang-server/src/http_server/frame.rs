@@ -4,7 +4,7 @@
 //! abort frames). No HTTP here — the sibling `native_api` module owns the handlers
 //! and streams; it calls these per frame.
 
-use crate::message::egress::{ChunkEvent, ChunkExtras};
+use crate::message::response::{ChunkEvent, ChunkExtras};
 
 /// The text slot of a `[logprob, token_id, text]` tuple: the decoded token when
 /// `return_text_in_logprobs` supplied a text buffer, else `null`.

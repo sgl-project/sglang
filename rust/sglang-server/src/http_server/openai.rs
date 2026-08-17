@@ -22,9 +22,9 @@ use super::frame::OutputAccumulator;
 use super::guard::AbortGuard;
 use super::submit::submit;
 use crate::message::config::ServerArgs;
-use crate::message::egress::{ChunkEvent, EgressItem};
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateRequest, RequestKind};
+use crate::message::response::{ChunkEvent, ResponseItem};
 use crate::tokenizer_manager::tokenizer;
 use crate::utils::response::error_response;
 
@@ -116,25 +116,25 @@ pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream:
 /// `guard` on a natural terminal, and map errors / validation aborts /
 /// truncation to `(status, message)` for the OpenAI error shape.
 async fn collect_output(
-    mut rx: mpsc::Receiver<EgressItem>,
+    mut rx: mpsc::Receiver<ResponseItem>,
     guard: &mut AbortGuard,
     rid: &Rid,
 ) -> Result<ChunkEvent, (StatusCode, String)> {
     let mut accumulator = OutputAccumulator::default();
     let output = loop {
         match rx.recv().await {
-            Some(EgressItem::Frame(output)) => accumulator.fold(&output),
-            Some(EgressItem::Done(output)) => {
+            Some(ResponseItem::Frame(output)) => accumulator.fold(&output),
+            Some(ResponseItem::Done(output)) => {
                 accumulator.fold(&output);
                 break accumulator.into_output();
             }
-            Some(EgressItem::Error(error)) => {
+            Some(ResponseItem::Error(error)) => {
                 guard.disarm(rid);
                 let status = StatusCode::from_u16(error.http_status())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return Err((status, error.to_string()));
             }
-            Some(EgressItem::Control(_)) | Some(EgressItem::Data(_)) => {}
+            Some(ResponseItem::Control(_)) | Some(ResponseItem::Data(_)) => {}
             None => {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -162,7 +162,7 @@ async fn submit_generation(
     request: GenerateRequest,
     stream: bool,
     guard: &mut AbortGuard,
-) -> Result<mpsc::Receiver<EgressItem>, Response> {
+) -> Result<mpsc::Receiver<ResponseItem>, Response> {
     match submit(state, RequestKind::Generate(Box::new(request)), stream).await {
         Ok((rid, rx)) => {
             guard.arm(rid);
@@ -181,15 +181,15 @@ async fn submit_generation(
 
 fn indexed_egress_stream(
     index: usize,
-    rx: mpsc::Receiver<EgressItem>,
-) -> futures::stream::BoxStream<'static, (usize, Option<EgressItem>)> {
+    rx: mpsc::Receiver<ResponseItem>,
+) -> futures::stream::BoxStream<'static, (usize, Option<ResponseItem>)> {
     futures::stream::unfold((rx, false), move |(mut rx, finished)| async move {
         if finished {
             return None;
         }
         match rx.recv().await {
             Some(item) => {
-                let finished = matches!(item, EgressItem::Done(_) | EgressItem::Error(_));
+                let finished = matches!(item, ResponseItem::Done(_) | ResponseItem::Error(_));
                 Some(((index, Some(item)), (rx, finished)))
             }
             None => Some(((index, None), (rx, true))),

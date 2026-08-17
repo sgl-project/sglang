@@ -9,7 +9,7 @@ use axum::Router;
 use super::disaggregation::bootstrap as pd_bootstrap;
 use super::{common, log, native_api, openai};
 use crate::message::config::ServerArgs;
-use crate::tokenizer_manager::egress::ActivityCounter;
+use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::Senders;
 
 /// Shared handler state: submission handles, immutable server configuration,

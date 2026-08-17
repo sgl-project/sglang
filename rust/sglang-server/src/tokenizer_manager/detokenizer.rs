@@ -24,9 +24,9 @@
 use std::collections::HashMap;
 
 use crate::message::detok::DetokMsg;
-use crate::message::egress::{ChunkEvent, EgressItem, EgressSink, SinkError};
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
+use crate::message::response::{ChunkEvent, ResponseItem, ResponseSink, SinkError};
 use crate::message::types::TokenIds;
 use crate::tokenizer_manager::wiring::AbortSource;
 use crate::utils::runtime::Runnable;
@@ -130,7 +130,7 @@ impl DetokenizerBackend {
 }
 
 struct DetokState {
-    sink: EgressSink,
+    sink: ResponseSink,
     /// `return_text_in_logprobs`: whether to decode this request's logprob token
     /// ids to text (in this shard) for the `[logprob, token_id, text]` tuples.
     decode_logprob_text: bool,
@@ -241,8 +241,8 @@ fn handle_decode(
 ) {
     if let Some(mut st) = table.remove(rid) {
         let item = match backend.decode_once(token_ids) {
-            Ok(text) => EgressItem::Data(text.into()),
-            Err(e) => EgressItem::Error(e),
+            Ok(text) => ResponseItem::Data(text.into()),
+            Err(e) => ResponseItem::Error(e),
         };
         let _ = st.sink.try_send(item);
         st.fsm = RequestState::Completed;
@@ -253,7 +253,7 @@ fn handle_decode(
 /// single `Done` frame — no detokenization, no streaming.
 fn handle_result(table: &mut HashMap<Rid, DetokState>, rid: &Rid, payload: bytes::Bytes) {
     if let Some(mut st) = table.remove(rid) {
-        let _ = st.sink.try_send(EgressItem::Control(payload));
+        let _ = st.sink.try_send(ResponseItem::Control(payload));
         // Egress FSM: a control request goes straight to Completed (no Streaming
         // / Finalizing states — single response, never streamed).
         st.fsm = RequestState::Completed;
@@ -278,7 +278,7 @@ fn handle_fail(
         let _ = abort.send(AbortSource::Detok(rid.clone()));
         let _ = st
             .sink
-            .try_send(EgressItem::Error(Error::Internal(message)));
+            .try_send(ResponseItem::Error(Error::Internal(message)));
         st.fsm = RequestState::Completed;
     }
 }
@@ -332,7 +332,7 @@ fn handle_chunk(
                 // — the other two terminal paths (disconnect, fail) both abort.
                 let _ = st.fsm.apply(Event::Error(e.clone()));
                 let _ = abort.send(AbortSource::Detok(rid.clone()));
-                let _ = st.sink.try_send(EgressItem::Error(e));
+                let _ = st.sink.try_send(ResponseItem::Error(e));
                 table.remove(&rid);
                 return;
             }
@@ -369,7 +369,7 @@ fn handle_chunk(
 
     if finished {
         // The Done frame *is* the final frame: Finalizing → Completed.
-        let sent = st.sink.try_send(EgressItem::Done(ev)).is_ok();
+        let sent = st.sink.try_send(ResponseItem::Done(ev)).is_ok();
         let _ = st.fsm.apply(if sent {
             Event::FinalFrameSent
         } else {
@@ -383,7 +383,7 @@ fn handle_chunk(
         // silently dropping the frame would truncate the response and still look
         // like success at EOS. So treat both as terminal: drop the request AND
         // abort scheduler work for it.
-        if let Err(e) = st.sink.try_send(EgressItem::Frame(ev)) {
+        if let Err(e) = st.sink.try_send(ResponseItem::Frame(ev)) {
             match e {
                 SinkError::Full => {
                     tracing::warn!(
@@ -445,15 +445,15 @@ mod tests {
     #[test]
     fn full_sink_drops_request_and_aborts_scheduler() {
         // Capacity-1 sink, pre-filled so the next send hits `Full`.
-        let (tx, _rx) = mpsc::channel::<EgressItem>(1);
-        tx.try_send(EgressItem::Frame(ChunkEvent::default()))
+        let (tx, _rx) = mpsc::channel::<ResponseItem>(1);
+        tx.try_send(ResponseItem::Frame(ChunkEvent::default()))
             .unwrap();
 
         let mut table = HashMap::new();
         table.insert(
             Rid::from("1"),
             DetokState {
-                sink: EgressSink::Local(tx),
+                sink: ResponseSink::Local(tx),
                 decode_logprob_text: false,
                 no_stop_trim: false,
                 decoder: None,
@@ -521,12 +521,12 @@ mod tests {
     /// this kind never reached the ring, so there is no scheduler work to stop.)
     #[test]
     fn decode_answers_via_registered_sink_and_consumes_the_entry() {
-        let (tx, mut rx) = mpsc::channel::<EgressItem>(4);
+        let (tx, mut rx) = mpsc::channel::<ResponseItem>(4);
         let mut table = HashMap::new();
         table.insert(
             Rid::from("d1"),
             DetokState {
-                sink: EgressSink::Local(tx),
+                sink: ResponseSink::Local(tx),
                 decode_logprob_text: false,
                 no_stop_trim: false,
                 decoder: None,
@@ -541,7 +541,7 @@ mod tests {
             &DetokenizerBackend::Skip,
         );
 
-        let Ok(EgressItem::Error(err)) = rx.try_recv() else {
+        let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
             panic!("the decode error must reach the sink, not vanish");
         };
         assert!(matches!(err, Error::Validation(_)));
@@ -566,11 +566,11 @@ mod tests {
     /// deterministically, without needing to find a real 64-bit collision.
     #[test]
     fn co_located_requests_keep_their_own_sinks() {
-        let (tx_a, mut rx_a) = mpsc::channel::<EgressItem>(4);
-        let (tx_b, mut rx_b) = mpsc::channel::<EgressItem>(4);
+        let (tx_a, mut rx_a) = mpsc::channel::<ResponseItem>(4);
+        let (tx_b, mut rx_b) = mpsc::channel::<ResponseItem>(4);
         let mut table = HashMap::new();
         let state = |tx| DetokState {
-            sink: EgressSink::Local(tx),
+            sink: ResponseSink::Local(tx),
             decode_logprob_text: false,
             no_stop_trim: false,
             decoder: None,
@@ -598,8 +598,8 @@ mod tests {
             &tm_tx,
         );
 
-        let ids = |rx: &mut mpsc::Receiver<EgressItem>| match rx.try_recv() {
-            Ok(EgressItem::Frame(ev)) => ev.token_ids,
+        let ids = |rx: &mut mpsc::Receiver<ResponseItem>| match rx.try_recv() {
+            Ok(ResponseItem::Frame(ev)) => ev.token_ids,
             other => panic!("expected a frame, got {other:?}"),
         };
         assert_eq!(
@@ -622,12 +622,12 @@ mod tests {
         finish_reason: serde_json::Value,
         ids: Vec<i32>,
     ) -> ChunkEvent {
-        let (tx, mut rx) = mpsc::channel::<EgressItem>(4);
+        let (tx, mut rx) = mpsc::channel::<ResponseItem>(4);
         let mut table = HashMap::new();
         table.insert(
             Rid::from("1"),
             DetokState {
-                sink: EgressSink::Local(tx),
+                sink: ResponseSink::Local(tx),
                 decode_logprob_text: false,
                 no_stop_trim,
                 decoder: None, // skip mode → output_ids passthrough
@@ -647,7 +647,7 @@ mod tests {
         };
         handle_chunk(&mut table, ev, &DetokenizerBackend::Skip, &tm_tx);
         match rx.try_recv() {
-            Ok(EgressItem::Done(out)) => out,
+            Ok(ResponseItem::Done(out)) => out,
             other => panic!("expected Done, got {other:?}"),
         }
     }

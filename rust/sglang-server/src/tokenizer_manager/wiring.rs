@@ -19,7 +19,7 @@ pub fn recv<T>(rx: &flume::Receiver<T>, shutdown: &flume::Receiver<()>) -> Optio
 /// share this one inbox, keeping the loop a single consumer (no `select`).
 pub enum TmEvent {
     /// A freshly received request from the API server.
-    Ingress(Request),
+    Intake(Request),
     /// A request back from the tokenizer pool: `PreSendValidating` (ids filled) on success,
     /// or `Failed` on a tokenize error. `drive` handles both.
     Tokenized(Request),

@@ -37,9 +37,9 @@ use super::{
     openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
-use crate::message::egress::{ChunkExtras, EgressItem};
 use crate::message::ids::Rid;
 use crate::message::request::GenerateRequest;
+use crate::message::response::{ChunkExtras, ResponseItem};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
 
@@ -422,7 +422,7 @@ pub(super) fn chat_sampling_params(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn unary_chat(
-    submitted: Vec<(usize, Rid, mpsc::Receiver<EgressItem>)>,
+    submitted: Vec<(usize, Rid, mpsc::Receiver<ResponseItem>)>,
     mut guard: AbortGuard,
     response_id: String,
     model: String,
@@ -506,7 +506,7 @@ pub(super) async fn unary_chat(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn chat_event_stream(
-    submitted: Vec<(usize, Rid, mpsc::Receiver<EgressItem>)>,
+    submitted: Vec<(usize, Rid, mpsc::Receiver<ResponseItem>)>,
     mut guard: AbortGuard,
     response_id: String,
     model: String,
@@ -579,12 +579,12 @@ pub(super) fn chat_event_stream(
                 continue;
             };
             let output = match item {
-                EgressItem::Frame(output) => output,
-                EgressItem::Done(output) => {
+                ResponseItem::Frame(output) => output,
+                ResponseItem::Done(output) => {
                     guard.disarm(&rids[index]);
                     output
                 }
-                EgressItem::Error(error) => {
+                ResponseItem::Error(error) => {
                     guard.disarm(&rids[index]);
                     yield Annotated {
                         data: None,
@@ -595,7 +595,7 @@ pub(super) fn chat_event_stream(
                     };
                     continue;
                 }
-                EgressItem::Control(_) | EgressItem::Data(_) => continue,
+                ResponseItem::Control(_) | ResponseItem::Data(_) => continue,
             };
             if let Some((code, message)) = output
                 .finish_reason
@@ -856,7 +856,7 @@ mod tests {
     };
     use crate::http_server::guard::AbortGuard;
     use crate::message::config::DefaultSamplingParams;
-    use crate::message::egress::ChunkExtras;
+    use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
     use futures::StreamExt;

@@ -20,8 +20,8 @@ use tower::util::ServiceExt;
 
 use super::{openai_error, routes};
 use crate::message::config::ServerArgs;
-use crate::message::egress::{ChunkEvent, EgressItem};
 use crate::message::ids::Rid;
+use crate::message::response::{ChunkEvent, ResponseItem};
 use crate::tokenizer_manager::wiring::Senders;
 
 pub(super) fn senders() -> Senders {
@@ -33,7 +33,7 @@ pub(super) fn senders() -> Senders {
     }
 }
 
-pub(super) fn chunk(rid: &str, text: &str, done: bool) -> EgressItem {
+pub(super) fn chunk(rid: &str, text: &str, done: bool) -> ResponseItem {
     let output = ChunkEvent {
         rid: rid.into(),
         text: text.into(),
@@ -50,9 +50,9 @@ pub(super) fn chunk(rid: &str, text: &str, done: bool) -> EgressItem {
         ..Default::default()
     };
     if done {
-        EgressItem::Done(output)
+        ResponseItem::Done(output)
     } else {
-        EgressItem::Frame(output)
+        ResponseItem::Frame(output)
     }
 }
 
@@ -63,7 +63,7 @@ pub(super) fn submitted(
     rid: &str,
 ) -> (
     super::completions::SubmittedChoice,
-    tokio::sync::mpsc::Sender<EgressItem>,
+    tokio::sync::mpsc::Sender<ResponseItem>,
 ) {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     (
@@ -84,8 +84,8 @@ pub(super) fn chat_submitted(
     index: usize,
     rid: &str,
 ) -> (
-    (usize, Rid, tokio::sync::mpsc::Receiver<EgressItem>),
-    tokio::sync::mpsc::Sender<EgressItem>,
+    (usize, Rid, tokio::sync::mpsc::Receiver<ResponseItem>),
+    tokio::sync::mpsc::Sender<ResponseItem>,
 ) {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     ((index, rid.into(), rx), tx)

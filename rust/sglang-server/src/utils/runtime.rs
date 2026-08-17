@@ -22,7 +22,7 @@ use crate::message::detok::DetokMsg;
 
 use super::threads::{plan_cores, spawn_pool};
 use crate::tokenizer_manager::channel::{
-    EgressConsumer, EgressProducer, IngressConsumer, IngressProducer, egress_ring, ingress_ring,
+    FromSchedulerRx, FromSchedulerTx, ToSchedulerRx, ToSchedulerTx, from_scheduler, to_scheduler,
 };
 use crate::tokenizer_manager::wiring::{Senders, TmEvent};
 use crate::utils::sock::bind_tcp_listener;
@@ -39,8 +39,8 @@ pub trait Runnable: Send + 'static {
 /// Live runtime. Held by the pyo3 bridge; the Python boundary reads `ingress`
 /// and `egress`. `request_shutdown` (also run on `Drop`) stops every stage.
 pub struct Runtime {
-    pub ingress: IngressConsumer,
-    pub egress: EgressProducer,
+    pub ingress: ToSchedulerRx,
+    pub egress: FromSchedulerTx,
     /// Requests parked in `Encoding`, drained by the MM worker pool
     /// (`Server.start_mm_workers`). Stays empty for non-multimodal models —
     /// ingress never routes to it.
@@ -132,10 +132,10 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     let plan = plan_cores(&cfg);
 
     // --- rings (Rust ↔ Python) ---
-    let (ingress_tx, ingress_rx): (IngressProducer, IngressConsumer) =
-        ingress_ring(cfg.rust_server_args.ingress_ring_cap);
-    let (egress_tx, egress_rx): (EgressProducer, EgressConsumer) =
-        egress_ring(cfg.rust_server_args.egress_ring_cap);
+    let (ingress_tx, ingress_rx): (ToSchedulerTx, ToSchedulerRx) =
+        to_scheduler(cfg.rust_server_args.to_scheduler_cap);
+    let (egress_tx, egress_rx): (FromSchedulerTx, FromSchedulerRx) =
+        from_scheduler(cfg.rust_server_args.from_scheduler_cap);
 
     // --- inter-stage channels ---
     let (tm_tx, tm_rx) = flume::bounded::<TmEvent>(cfg.rust_server_args.channel_cap);
@@ -230,7 +230,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     }
 
     // Egress heartbeat: bumped per drained frame, watched by `/health_generate`.
-    let egress_activity: tokenizer_manager::egress::ActivityCounter =
+    let egress_activity: tokenizer_manager::from_scheduler::ActivityCounter =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // --- Egress dispatcher: drains egress ring → routes chunks to shards ---
@@ -246,7 +246,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let activity = egress_activity.clone();
         let shutdown_rx = shutdown_rx.clone();
         spawn_pool("tm-egress", cores, 1, &mut threads, |_| {
-            tokenizer_manager::egress::Egress::new(
+            tokenizer_manager::from_scheduler::Dispatcher::new(
                 egress_rx.take().unwrap(),
                 senders.clone(),
                 activity.clone(),
@@ -263,9 +263,9 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .as_ref()
             .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied())
             .map(|c| vec![c]);
-        let limits = tokenizer_manager::ingress::Limits::try_from(&*cfg.server_args)
+        let limits = tokenizer_manager::to_scheduler::Limits::try_from(&*cfg.server_args)
             .map_err(|e| format!("ingress limits: {e}"))?;
-        let mm = tokenizer_manager::ingress::Mm {
+        let mm = tokenizer_manager::to_scheduler::Mm {
             enabled: cfg.server_args.model_is_multimodal(),
             tx: mm_tx,
             sidecar: mm_sidecar.clone(),
@@ -274,7 +274,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let shutdown_rx = shutdown_rx.clone();
         spawn_pool("tm-ingress", cores, 1, &mut threads, |_| {
             let (tm_rx, ingress_tx) = parts.take().unwrap();
-            tokenizer_manager::ingress::Ingress::new(
+            tokenizer_manager::to_scheduler::Intake::new(
                 tm_rx,
                 abort_rx.clone(),
                 senders.clone(),

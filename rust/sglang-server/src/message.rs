@@ -11,10 +11,10 @@
 
 pub mod config;
 pub mod detok;
-pub mod egress;
 pub mod finish_reason;
 pub mod ids;
 pub mod io_struct;
 pub mod request;
+pub mod response;
 pub mod sampling;
 pub mod types;

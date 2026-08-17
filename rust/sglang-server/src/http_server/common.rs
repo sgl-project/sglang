@@ -17,10 +17,10 @@ use super::app::AppState;
 use super::guard::AbortGuard;
 use super::submit::submit;
 use crate::message::config::ServerArgs;
-use crate::message::egress::EgressItem;
 use crate::message::ids::Rid;
 use crate::message::io_struct::{ControlRequest, GetInternalStateReq};
 use crate::message::request::RequestKind;
+use crate::message::response::ResponseItem;
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
@@ -53,20 +53,20 @@ async fn await_control_result(
         guard.disarm(&rid); // completed normally — nothing to abort
     }
     match received {
-        Some(EgressItem::Control(bytes)) => Ok(bytes),
-        Some(EgressItem::Error(e)) => {
+        Some(ResponseItem::Control(bytes)) => Ok(bytes),
+        Some(ResponseItem::Error(e)) => {
             let code =
                 StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             Err((code, e.to_string()).into_response())
         }
         // A control request never receives generation frames or service-call data.
-        Some(EgressItem::Frame(_)) | Some(EgressItem::Done(_)) | Some(EgressItem::Data(_)) => {
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "unexpected generation output for control request",
-            )
-                .into_response())
-        }
+        Some(ResponseItem::Frame(_))
+        | Some(ResponseItem::Done(_))
+        | Some(ResponseItem::Data(_)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected generation output for control request",
+        )
+            .into_response()),
         None => Err((StatusCode::from_u16(499).unwrap(), "request aborted").into_response()),
     }
 }

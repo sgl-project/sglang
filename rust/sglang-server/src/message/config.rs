@@ -13,8 +13,8 @@ use std::sync::Arc;
 pub struct RustServerServerArgs {
     pub http_addr: SocketAddr,
     pub api_worker_num: usize,
-    pub ingress_ring_cap: usize,
-    pub egress_ring_cap: usize,
+    pub to_scheduler_cap: usize,
+    pub from_scheduler_cap: usize,
     pub channel_cap: usize,
     /// CPU core ids the pools pin to (e.g. this rank's NUMA-local cores minus
     /// the scheduler's reserved launch cores). `None` → run unpinned.
@@ -26,8 +26,8 @@ impl Default for RustServerServerArgs {
         Self {
             http_addr: "127.0.0.1:30000".parse().unwrap(),
             api_worker_num: 2,
-            ingress_ring_cap: 8192,
-            egress_ring_cap: 8192,
+            to_scheduler_cap: 8192,
+            from_scheduler_cap: 8192,
             channel_cap: 8192,
             cores: None,
         }

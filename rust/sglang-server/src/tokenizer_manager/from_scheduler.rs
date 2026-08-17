@@ -1,12 +1,5 @@
-//! TokenizerManager egress thread — drains the egress ring (scheduler output
-//! pushed from Python) and routes each message to the detok shard that owns its
-//! `Rid::shard`. Routing is a pure function of the rid, so it matches the shard
-//! the request registered with on ingress — no shared map, no lock.
-//!
-//! The ring carries a 1-byte frame tag: `BATCH` (a whole decode batch, fanned
-//! out here into per-request chunks), `RESULT` (a single control-request JSON
-//! payload, e.g. `/server_info`), or `ERROR` (a terminal per-request failure the
-//! scheduler ingress couldn't decode, routed back as a 400).
+//! TokenizerManager dispatcher thread — drains the from_scheduler channel and
+//! routes each message to the detok shard that owns its `Rid::shard`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,38 +7,38 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 
 use crate::message::detok::DetokMsg;
-use crate::message::egress::{
+use crate::message::ids::Rid;
+use crate::message::response::{
     ChunkEvent, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, for_each_chunk,
 };
-use crate::message::ids::Rid;
 use crate::runtime::Runnable;
-use crate::tokenizer_manager::channel::EgressConsumer;
+use crate::tokenizer_manager::channel::FromSchedulerRx;
 use crate::tokenizer_manager::wiring::{Senders, recv};
 
-/// A monotonic counter bumped once per egress-ring frame the dispatcher drains.
+/// A monotonic counter bumped once per from_scheduler frame the dispatcher drains.
 /// It's the rust-native equivalent of the Python `TokenizerManager`'s
 /// `last_receive_tstamp`: `/health_generate` watches it advance to confirm the
 /// scheduler → detok path is alive (the value itself is meaningless).
 pub type ActivityCounter = Arc<AtomicU64>;
 
-/// Egress dispatcher stage. Owns the egress-ring consumer + the detok-shard
+/// Dispatcher dispatcher stage. Owns the from_scheduler consumer + the detok-shard
 /// senders, so the runtime spawns it as a [`Runnable`].
-pub struct Egress {
-    egress: EgressConsumer,
+pub struct Dispatcher {
+    from_scheduler_rx: FromSchedulerRx,
     senders: Senders,
     activity: ActivityCounter,
     shutdown: flume::Receiver<()>,
 }
 
-impl Egress {
+impl Dispatcher {
     pub fn new(
-        egress: EgressConsumer,
+        from_scheduler_rx: FromSchedulerRx,
         senders: Senders,
         activity: ActivityCounter,
         shutdown: flume::Receiver<()>,
     ) -> Self {
         Self {
-            egress,
+            from_scheduler_rx,
             senders,
             activity,
             shutdown,
@@ -53,13 +46,13 @@ impl Egress {
     }
 }
 
-impl Runnable for Egress {
+impl Runnable for Dispatcher {
     fn run(self) {
         // Reused across frames (`clear` keeps capacity) — steady state allocates nothing.
         let shards = self.senders.detok.len();
         let mut buckets: Vec<Vec<ChunkEvent>> = (0..shards).map(|_| Vec::new()).collect();
 
-        while let Some(bytes) = recv(self.egress.receiver(), &self.shutdown) {
+        while let Some(bytes) = recv(self.from_scheduler_rx.receiver(), &self.shutdown) {
             let Some((&tag, body)) = bytes.split_first() else {
                 continue;
             };
@@ -148,7 +141,7 @@ impl Runnable for Egress {
     }
 }
 
-impl Egress {
+impl Dispatcher {
     /// Route one message to the shard owning `rid`. HOL ceiling: a slow shard stalls
     /// this thread; the fix is a per-shard egress ring (see `threads::TM_CORES`).
     #[inline]
@@ -195,7 +188,7 @@ fn decode_error(body: &[u8]) -> Option<(Rid, DetokMsg)> {
 mod tests {
     use super::*;
     use crate::message::detok::DetokMsg;
-    use crate::message::egress::frame_egress_error;
+    use crate::message::response::frame_egress_error;
 
     /// A framed error round-trips: `frame_egress_error` → tag stripped →
     /// `decode_error` yields the rid + a `Fail` carrying the message.

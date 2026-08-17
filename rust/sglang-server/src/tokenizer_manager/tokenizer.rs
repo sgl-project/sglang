@@ -230,8 +230,8 @@ impl Runnable for TokenizerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::egress::EgressSink;
     use crate::message::request::{GenerateRequest, RequestKind};
+    use crate::message::response::ResponseSink;
     use crate::message::sampling::SamplingParams;
     use crate::utils::fsm::RequestState;
     use tokio::sync::mpsc;
@@ -268,7 +268,7 @@ mod tests {
             .send(Request {
                 rid: "1".into(),
                 state: RequestState::Tokenizing,
-                sink: EgressSink::Local(sink_tx),
+                sink: ResponseSink::Local(sink_tx),
                 kind: RequestKind::Generate(Box::new(GenerateRequest {
                     rid: "1".into(),
                     text: Some("hello world".into()),
@@ -328,7 +328,7 @@ mod tests {
                 .send(Request {
                     rid: "1".into(),
                     state: RequestState::Tokenizing,
-                    sink: EgressSink::Local(tokio::sync::mpsc::channel(4).0),
+                    sink: ResponseSink::Local(tokio::sync::mpsc::channel(4).0),
                     kind: RequestKind::Generate(Box::new(GenerateRequest {
                         rid: "1".into(),
                         text: Some("hi".into()),

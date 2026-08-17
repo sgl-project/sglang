@@ -1,7 +1,7 @@
 //! The `/generate` request path: the HTTP body and its per-request fan-out
 //! ([`GenerateBody`] → [`GenerateRequest`]s), the variant bodies, and the
 //! scheduler ingress encodings (`TokenizedGenerateReqInput` header,
-//! control/abort, `IngressMsg`).
+//! control/abort, `SchedulerRequest`).
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -10,8 +10,8 @@ use bytes::Bytes;
 use itertools::izip;
 use serde::Deserialize;
 
-use super::egress::EgressSink;
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
+use super::response::ResponseSink;
 use super::sampling::{SamplingParams, SamplingParamsInput};
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
 use crate::message::ids::Rid;
@@ -556,7 +556,7 @@ pub struct Request {
     pub rid: Rid,
     pub state: RequestState,
     /// Back-channel to the client connection for egress frames.
-    pub sink: EgressSink,
+    pub sink: ResponseSink,
     /// Discriminant + variant body (generate vs control).
     pub kind: RequestKind,
 }
@@ -564,7 +564,7 @@ pub struct Request {
 /// One ingress-ring entry, split columnar: the scalar `header` (msgpack, `input_ids`
 /// omitted) + the raw int64 `ids` cell, so the big tensor never goes through msgpack.
 #[derive(Debug)]
-pub struct IngressMsg {
+pub struct SchedulerRequest {
     pub header: Bytes,
     pub ids: Bytes,
 }

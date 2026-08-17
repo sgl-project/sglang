@@ -1,14 +1,13 @@
-//! sglang-server: a multi-threaded Rust frontend (API server → TokenizerManager
+//! sglang-server: a multi-threaded Rust frontend (HTTP server → TokenizerManager
 //! → Tokenizer/Detokenizer) embedded in the Python scheduler process.
 //!
-//! Pipeline stages 1–5 are pure Rust and never touch a `PyObject`, so they run
-//! concurrently with the Python scheduler without contending for the GIL. The
-//! only GIL crossings are the boundary methods on [`Server`]:
-//!   * `recv_requests` — Python scheduler thread drains the ingress ring.
-//!   * `push_batch`    — Python scheduler thread pushes one output batch.
-//!   * `push_result`   — Python scheduler thread pushes one control result.
-//!
-//! All are non-blocking, so the GIL is never held across a wait.
+//! This file is the Python↔Rust boundary: it registers the pyo3 module
+//! (`_server`) and the classes exposed to the scheduler — [`Server`] (boot,
+//! `recv_requests`/`wait_ingress`, `push_*`, MM handoff, shutdown),
+//! [`RequestBatch`] and [`MmHandoff`]. Everything behind that boundary — receiving
+//! requests, encoding multimodal inputs, tokenizing, detokenizing, SSE streaming,
+//! and so on — is implemented purely in Rust and never touches a `PyObject`; the
+//! only Python-facing code lives in this file.
 
 mod http_server;
 mod message;
@@ -25,25 +24,42 @@ use pyo3::types::PyBytes;
 use crate::message::config::{RuntimeConfig, RustServerServerArgs, ServerArgs};
 use crate::utils::runtime;
 
-/// One drained MM result (see [`Server::take_mm`]). Exactly one of
+/// One drained MM result (see [`Server::take_mm`]), consumed by
+/// `RustServer.build_native_mm` to build the scheduler's
+/// `MultimodalProcessorOutput`. Every per-item `Vec` below has one entry per
+/// image, in prompt order, and they line up index-for-index. Exactly one of
 /// `features`/`shm_names` is `Some`: inline features for single-rank serving
 /// (zero-copy into numpy), or one POSIX segment name per item when the scheduler
 /// broadcasts across TP ranks and Python wraps each in a `ShmPointerMMData`.
 #[pyclass(frozen, get_all)]
 struct MmHandoff {
+    /// *Generic.* All items' `pixel_values` concatenated, flat `f32` of logical
+    /// shape `[sum(t*h*w), feature_dim]`; `Some` on the inline (single-rank) path.
     features: Option<Py<numpy::PyArray1<f32>>>,
+    /// *Generic.* Per-item POSIX shm segment name holding that item's features
+    /// (`[t*h*w, feature_dim]` f32); `Some` on the TP-broadcast path.
     shm_names: Option<Vec<String>>,
-    grids: Vec<(u32, u32, u32)>,
+    /// *Generic.* Per-item content hash of the raw source bytes (or the caller's
+    /// `mm_hashes` override), precomputed so the drain never re-hashes.
     hashes: Vec<u64>,
+    /// *Generic.* Per-item inclusive `(start, end)` placeholder-token span in the
+    /// expanded `input_ids`.
     offsets: Vec<(u32, u32)>,
+    /// *Qwen-VL specific.* Per-item `image_grid_thw` `(t, h, w)` in patch units;
+    /// `t*h*w` is also the item's row count in `features`.
+    grids: Vec<(u32, u32, u32)>,
+    /// *Qwen-VL specific.* M-RoPE position ids, flat `i64` of row-major shape
+    /// `[3, seq_len]` (temporal, height, width rows).
     mrope: Py<numpy::PyArray1<i64>>,
+    /// *Qwen-VL specific.* M-RoPE delta, `max(mrope) + 1 - seq_len`, that decode
+    /// adds to the plain sequence position.
     mrope_delta: i64,
 }
 
 /// Columnar ingress batch handed to Python by [`Server::recv_requests`].
 /// `frozen`: immutable snapshot, so field access never contends on a borrow.
 #[pyclass(frozen, get_all)]
-struct IngressBatch {
+struct RequestBatch {
     /// One msgpack scalar header per request (`input_ids` omitted).
     headers: Vec<Py<PyBytes>>,
     /// The raw-data plane today just all requests' raw little-endian int64
@@ -66,8 +82,8 @@ impl Server {
     #[new]
     #[pyo3(signature = (
         http_addr = None,
-        ingress_ring_cap = 8192,
-        egress_ring_cap = 8192,
+        to_scheduler_cap = 8192,
+        from_scheduler_cap = 8192,
         channel_cap = 8192,
         cores = None,
         server_args_json = "{}",
@@ -77,8 +93,8 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     fn start(
         http_addr: Option<String>,
-        ingress_ring_cap: usize,
-        egress_ring_cap: usize,
+        to_scheduler_cap: usize,
+        from_scheduler_cap: usize,
         channel_cap: usize,
         cores: Option<Vec<usize>>,
         server_args_json: &str,
@@ -108,8 +124,8 @@ impl Server {
             rust_server_args: RustServerServerArgs {
                 http_addr,
                 api_worker_num: server_args.api_worker_num(),
-                ingress_ring_cap,
-                egress_ring_cap,
+                to_scheduler_cap,
+                from_scheduler_cap,
                 channel_cap,
                 cores,
             },
@@ -121,20 +137,12 @@ impl Server {
         Ok(Server { rt })
     }
 
-    /// Non-blocking drain of the ingress ring, returned **columnar** as an
-    /// [`IngressBatch`] so the large `input_ids` tensor never goes through
+    /// Non-blocking drain of the to_scheduler channel, returned **columnar** as an
+    /// [`RequestBatch`] so the large `input_ids` tensor never goes through
     /// msgpack (see the field docs for the layout). The `ids` cells are copied
     /// **directly into the result `bytes`** (one copy, no intermediate buffer).
-    ///
-    /// Runs entirely GIL-held, deliberately. `drain` is a `try_recv` loop plus an
-    /// uncontended stash lock (the Python thread is the only consumer), so it
-    /// cannot block — there is nothing for a detach to overlap with. And detaching
-    /// is far from free: reacquiring the GIL waits out the interpreter's switch
-    /// interval, so a `py.detach` here cost up to 5 ms whenever another Python
-    /// thread was runnable, to cover ~0.2 µs of work. Held, the whole call is a
-    /// fraction of a microsecond on an empty ring.
     #[pyo3(signature = (max = 256))]
-    fn recv_requests(&self, py: Python<'_>, max: usize) -> PyResult<IngressBatch> {
+    fn recv_requests(&self, py: Python<'_>, max: usize) -> PyResult<RequestBatch> {
         let cols = self.rt.ingress.drain(max);
         let headers = cols
             .headers
@@ -152,7 +160,7 @@ impl Server {
             Ok(())
         })?
         .unbind();
-        Ok(IngressBatch {
+        Ok(RequestBatch {
             headers,
             data,
             lengths: cols.lengths,
@@ -176,23 +184,11 @@ impl Server {
     /// Push a whole decode batch as ONE frame: a columnar msgpack `header` plus
     /// the raw `data_cols` (per-column `bytes`), concatenated here. Blocks for
     /// backpressure; `False` only on shutdown.
-    ///
-    /// Framed and pushed with the GIL HELD, detaching only if the ring is full.
-    /// This runs on the scheduler's CUDA-launch thread every decode step, where the
-    /// unconditional detach was the single worst boundary cost: framing is
-    /// ~0.1–0.2 µs, but reacquiring the GIL waits out the interpreter's switch
-    /// interval (5 ms by default) whenever another Python thread is runnable —
-    /// 17–50% of a 10–30 ms decode step, landing nondeterministically. Held, the
-    /// whole boundary is ~1.3 µs per step.
-    ///
-    /// The slow path keeps its detach because a full ring genuinely parks: the
-    /// scheduler must feel backpressure rather than drop output it has already
-    /// committed to. It essentially never fires — measured headroom is ~100×.
     fn push_batch(&self, py: Python<'_>, header: &[u8], data_cols: Vec<PyBackedBytes>) -> bool {
         let cols: Vec<&[u8]> = data_cols.iter().map(|d| d.as_ref()).collect();
         self.push_frame(
             py,
-            crate::message::egress::frame_egress_batch_cols(header, &cols),
+            crate::message::response::frame_egress_batch_cols(header, &cols),
         )
     }
 
@@ -201,14 +197,17 @@ impl Server {
     fn push_result(&self, py: Python<'_>, rid: &str, payload: &[u8]) -> bool {
         self.push_frame(
             py,
-            crate::message::egress::frame_egress_result(rid, payload),
+            crate::message::response::frame_egress_result(rid, payload),
         )
     }
 
     /// Route a terminal failure back to request `rid`. Blocks for backpressure;
     /// `False` only on shutdown.
     fn push_error(&self, py: Python<'_>, rid: &str, message: &str) -> bool {
-        self.push_frame(py, crate::message::egress::frame_egress_error(rid, message))
+        self.push_frame(
+            py,
+            crate::message::response::frame_egress_error(rid, message),
+        )
     }
 
     /// Spawn the MM worker pool for the pipeline in `spec_json` (built from the
@@ -306,7 +305,7 @@ fn _server(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .with_writer(writer)
         .try_init();
     m.add_class::<Server>()?;
-    m.add_class::<IngressBatch>()?;
+    m.add_class::<RequestBatch>()?;
     m.add_class::<MmHandoff>()?;
     Ok(())
 }

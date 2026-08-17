@@ -1,5 +1,5 @@
 //! The egress (response) direction: the per-request back-channel the API
-//! handler drains ([`EgressSink`] / [`EgressItem`]), the egress-ring frame
+//! handler drains ([`ResponseSink`] / [`ResponseItem`]), the egress-ring frame
 //! encodings (batch / control result / error), and the columnar batch decode
 //! into per-request [`ChunkEvent`]s.
 
@@ -15,11 +15,11 @@ use crate::utils::error::Error;
 /// Per-request back-channel the detok shard writes egress frames to and the API
 /// handler drains for SSE; bounded, and receiver-drop (disconnect) = stream end.
 #[derive(Clone, Debug)]
-pub enum EgressSink {
-    Local(mpsc::Sender<EgressItem>),
+pub enum ResponseSink {
+    Local(mpsc::Sender<ResponseItem>),
 }
 
-/// Why an [`EgressSink::try_send`] failed: `Full` = client backpressure, `Closed`
+/// Why an [`ResponseSink::try_send`] failed: `Full` = client backpressure, `Closed`
 /// = client gone. Both terminal for a stream; the caller distinguishes for logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkError {
@@ -27,11 +27,11 @@ pub enum SinkError {
     Closed,
 }
 
-impl EgressSink {
+impl ResponseSink {
     /// Non-blocking send. `Err(Full)` = backpressure, `Err(Closed)` = client gone.
-    pub fn try_send(&self, item: EgressItem) -> Result<(), SinkError> {
+    pub fn try_send(&self, item: ResponseItem) -> Result<(), SinkError> {
         match self {
-            EgressSink::Local(tx) => tx.try_send(item).map_err(|e| match e {
+            ResponseSink::Local(tx) => tx.try_send(item).map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => SinkError::Full,
                 mpsc::error::TrySendError::Closed(_) => SinkError::Closed,
             }),
@@ -40,12 +40,12 @@ impl EgressSink {
 }
 
 #[allow(dead_code)] // the receiver half is created inline in api_server::submit.
-pub type EgressSource = mpsc::Receiver<EgressItem>;
+pub type ResponseSource = mpsc::Receiver<ResponseItem>;
 
 /// What the connection handler receives on the egress stream: a detok-decoded
 /// [`ChunkEvent`] (handler formats it), a verbatim control payload, or an error.
 #[derive(Debug)]
-pub enum EgressItem {
+pub enum ResponseItem {
     /// An intermediate streamed generation step (only sent for streaming reqs).
     Frame(ChunkEvent),
     /// The final generation step.

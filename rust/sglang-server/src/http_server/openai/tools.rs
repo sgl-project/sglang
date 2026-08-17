@@ -36,7 +36,7 @@ use dynamo_protocols::types::{
     Role,
 };
 
-use crate::message::egress::ChunkEvent;
+use crate::message::response::ChunkEvent;
 use crate::message::sampling::SamplingParams;
 
 /// Canonicalize a tool-call parser name onto the dynamo-parsers registry keys.
@@ -264,7 +264,7 @@ mod tests {
         apply_tool_constraint, chat_delta, chat_finish_reason, dynamo_parser_name,
         dynamo_tool_choice, parse_chat_tool_calls,
     };
-    use crate::message::egress::ChunkEvent;
+    use crate::message::response::ChunkEvent;
     use crate::message::sampling::SamplingParams;
     use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
     use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};

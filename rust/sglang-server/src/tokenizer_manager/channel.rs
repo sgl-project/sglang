@@ -15,28 +15,28 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::message::request::IngressMsg;
+use crate::message::request::SchedulerRequest;
 
 /// Ingress: TokenizerManager → scheduler `recv_requests`.
 /// Producers are Rust TM workers; the single consumer is the Python thread.
-/// Carries [`IngressMsg`] (columnar: scalar header + raw int64 ids cell), not a
+/// Carries [`SchedulerRequest`] (columnar: scalar header + raw int64 ids cell), not a
 /// single msgpack blob, so the large `input_ids` tensor bypasses msgpack.
 #[derive(Clone)]
-pub struct IngressProducer {
-    tx: flume::Sender<IngressMsg>,
+pub struct ToSchedulerTx {
+    tx: flume::Sender<SchedulerRequest>,
 }
 
-pub struct IngressConsumer {
-    rx: flume::Receiver<IngressMsg>,
+pub struct ToSchedulerRx {
+    rx: flume::Receiver<SchedulerRequest>,
     /// One-slot buffer holding a message consumed by a blocking [`wait`] so the
     /// scheduler can park on idle without losing it — the next [`drain`] returns
     /// it first. Only ever touched by the single consumer (the Python thread),
     /// so contention is nil; the `Mutex` is just for interior mutability across
     /// the `&self` methods.
     ///
-    /// [`wait`]: IngressConsumer::wait
-    /// [`drain`]: IngressConsumer::drain
-    stash: Mutex<Option<IngressMsg>>,
+    /// [`wait`]: ToSchedulerRx::wait
+    /// [`drain`]: ToSchedulerRx::drain
+    stash: Mutex<Option<SchedulerRequest>>,
 }
 
 /// A drained ingress batch in **columnar** (struct-of-arrays) form. The `ids`
@@ -44,7 +44,7 @@ pub struct IngressConsumer {
 /// into one `PyBytes` (no intermediate buffer); `ids_total` is their summed
 /// length, precomputed for that single allocation.
 #[derive(Default)]
-pub struct IngressColumns {
+pub struct RequestColumns {
     /// Per-request scalar msgpack header (`input_ids` omitted).
     pub headers: Vec<Bytes>,
     /// Per-request raw little-endian int64 ids cell (empty for control reqs).
@@ -55,17 +55,17 @@ pub struct IngressColumns {
     pub ids_total: usize,
 }
 
-impl IngressProducer {
+impl ToSchedulerTx {
     /// Non-blocking push. Returns `false` on a full ring (backpressure) so the
     /// caller can fail the request rather than block a worker thread.
     #[inline]
-    pub fn try_push(&self, msg: IngressMsg) -> bool {
+    pub fn try_push(&self, msg: SchedulerRequest) -> bool {
         self.tx.try_send(msg).is_ok()
     }
 }
 
-impl IngressConsumer {
-    /// Drain up to `max` messages into a columnar [`IngressColumns`], returning
+impl ToSchedulerRx {
+    /// Drain up to `max` messages into a columnar [`RequestColumns`], returning
     /// immediately when the ring runs dry — mirrors the scheduler's existing
     /// `zmq.NOBLOCK` loop in `request_receiver._pull_raw_reqs`. Splitting headers
     /// from ids here (off the GIL) leaves `recv_requests` a thin marshaling shim.
@@ -73,8 +73,8 @@ impl IngressConsumer {
     /// Non-blocking by construction: `try_recv` returns `Err(TryRecvError::Empty)`
     /// instantly when the ring is empty, and `Err(_) => break` exits the loop
     /// right away.
-    pub fn drain(&self, max: usize) -> IngressColumns {
-        let mut batch = IngressColumns::default();
+    pub fn drain(&self, max: usize) -> RequestColumns {
+        let mut batch = RequestColumns::default();
         // A message parked by a prior blocking `wait` is delivered first.
         if let Some(m) = self.stash.lock().unwrap().take() {
             push_msg(&mut batch, m);
@@ -110,7 +110,7 @@ impl IngressConsumer {
 
 /// Append one drained message's columnar cells to the batch.
 #[inline]
-fn push_msg(batch: &mut IngressColumns, m: IngressMsg) {
+fn push_msg(batch: &mut RequestColumns, m: SchedulerRequest) {
     batch.ids_total += m.ids.len();
     batch.lengths.push((m.ids.len() / 8) as u32); // int64 cell → tokens
     batch.headers.push(m.header);
@@ -120,15 +120,15 @@ fn push_msg(batch: &mut IngressColumns, m: IngressMsg) {
 /// Egress: scheduler output (`push_chunk`) → Rust egress dispatcher.
 /// The single producer is the Python thread; the consumer is the dispatcher.
 #[derive(Clone)]
-pub struct EgressProducer {
+pub struct FromSchedulerTx {
     tx: flume::Sender<Bytes>,
 }
 
-pub struct EgressConsumer {
+pub struct FromSchedulerRx {
     rx: flume::Receiver<Bytes>,
 }
 
-impl EgressProducer {
+impl FromSchedulerTx {
     /// Blocking push: parks until the ring has space, so a full ring applies
     /// backpressure to the scheduler instead of dropping output the scheduler has
     /// already committed (advanced `send_token_offset` for). The GIL is released
@@ -158,7 +158,7 @@ impl EgressProducer {
     }
 }
 
-impl EgressConsumer {
+impl FromSchedulerRx {
     /// The underlying receiver, so the dispatcher can drain it via
     /// [`wiring::recv`](crate::tokenizer_manager::wiring::recv) (data + shutdown select).
     pub fn receiver(&self) -> &flume::Receiver<Bytes> {
@@ -167,28 +167,28 @@ impl EgressConsumer {
 }
 
 /// Build both halves of a bounded ring.
-pub fn ingress_ring(cap: usize) -> (IngressProducer, IngressConsumer) {
+pub fn to_scheduler(cap: usize) -> (ToSchedulerTx, ToSchedulerRx) {
     let (tx, rx) = flume::bounded(cap);
     (
-        IngressProducer { tx },
-        IngressConsumer {
+        ToSchedulerTx { tx },
+        ToSchedulerRx {
             rx,
             stash: Mutex::new(None),
         },
     )
 }
 
-pub fn egress_ring(cap: usize) -> (EgressProducer, EgressConsumer) {
+pub fn from_scheduler(cap: usize) -> (FromSchedulerTx, FromSchedulerRx) {
     let (tx, rx) = flume::bounded(cap);
-    (EgressProducer { tx }, EgressConsumer { rx })
+    (FromSchedulerTx { tx }, FromSchedulerRx { rx })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn msg(h: &'static [u8]) -> IngressMsg {
-        IngressMsg {
+    fn msg(h: &'static [u8]) -> SchedulerRequest {
+        SchedulerRequest {
             header: Bytes::from_static(h),
             ids: Bytes::new(),
         }
@@ -198,7 +198,7 @@ mod tests {
     /// non-destructively, and the next `drain` returns it.
     #[test]
     fn wait_stashes_then_drain_returns_it() {
-        let (tx, rx) = ingress_ring(8);
+        let (tx, rx) = to_scheduler(8);
         // Empty ring → times out, nothing stashed.
         assert!(!rx.wait(Duration::from_millis(1)));
         // Push one, then wait stashes it (returns true).
@@ -214,7 +214,7 @@ mod tests {
     /// A blocked `wait` is woken the instant a producer pushes (no polling).
     #[test]
     fn wait_wakes_on_push() {
-        let (tx, rx) = ingress_ring(8);
+        let (tx, rx) = to_scheduler(8);
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             let _ = tx.try_push(msg(b"a"));
@@ -229,7 +229,7 @@ mod tests {
     /// committed frame is delivered in order, never dropped.
     #[test]
     fn egress_push_blocks_until_drained() {
-        let (tx, rx) = egress_ring(1);
+        let (tx, rx) = from_scheduler(1);
         assert!(tx.push(Bytes::from_static(b"a"))); // fits; ring now full
         let t = std::thread::spawn(move || tx.push(Bytes::from_static(b"b")));
         // The parked push can't have completed while the ring is full.
@@ -244,7 +244,7 @@ mod tests {
     /// parking forever, so a scheduler blocked in `push` unblocks on teardown.
     #[test]
     fn egress_push_returns_false_when_closed() {
-        let (tx, rx) = egress_ring(1);
+        let (tx, rx) = from_scheduler(1);
         drop(rx);
         assert!(!tx.push(Bytes::from_static(b"x")));
     }
