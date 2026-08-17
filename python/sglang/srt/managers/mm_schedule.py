@@ -10,6 +10,7 @@ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalSta
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils.async_probe import maybe_assert_sum
 from sglang.utils import logger
 
 _is_hip = is_hip()
@@ -573,13 +574,31 @@ def _get_multimodal_mask(
     return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
 
 
+def _count_mm_tokens_in_extend(
+    prefix_length: List[int],
+    extend_length: List[int],
+    items_offset_list: List[List[Tuple[int, int]]],
+) -> int:
+    """Count MM placeholders from host offsets without reading back the GPU mask."""
+    num_mm_tokens = 0
+    for i, (extend_start, items_offset) in enumerate(
+        zip(prefix_length, items_offset_list)
+    ):
+        extend_end = extend_start + (extend_length[i] if i < len(extend_length) else 0)
+        for item_start, item_end in items_offset:
+            overlap_start = max(item_start, extend_start)
+            overlap_end = min(item_end + 1, extend_end)
+            num_mm_tokens += max(overlap_end - overlap_start, 0)
+
+    return num_mm_tokens
+
+
 def _adjust_embedding_length(
     embedding: torch.Tensor,
-    mask: torch.Tensor,
+    num_mm_tokens_in_input_ids: int,
     logger,
 ) -> torch.Tensor:
     num_mm_tokens_in_embedding = embedding.shape[0]
-    num_mm_tokens_in_input_ids = mask.sum().item()
     if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
         logger.warning(
             f"Number of tokens in multimodal embedding does not match those in the input text. "
@@ -634,6 +653,13 @@ def get_embedding_and_mask(
         - A boolean mask tensor indicating where these embeddings should be placed
         - If EVS is used, the pruned input ids tensor; otherwise, the original input ids tensor
     """
+    original_input_ids = input_ids
+    num_mm_tokens_in_input_ids = _count_mm_tokens_in_extend(
+        prefix_length,
+        extend_length,
+        items_offset_list,
+    )
+
     # 1. Get embedding
     embedding = _get_precomputed_embedding(
         embedding_items, items_size, prefix_length, extend_length, items_offset_list
@@ -655,5 +681,14 @@ def get_embedding_and_mask(
         torch.npu.current_stream().synchronize()
     special_multimodal_mask = _get_multimodal_mask(input_ids, placeholder_tensor)
     # 3. Adjust embedding length if needed
-    embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger)
+    if input_ids is not original_input_ids:
+        # EVS rewrites placeholder spans after pruning, making the original offsets stale.
+        num_mm_tokens_in_input_ids = special_multimodal_mask.sum().item()
+    else:
+        maybe_assert_sum(
+            special_multimodal_mask,
+            num_mm_tokens_in_input_ids,
+            "MM placeholder count derived from offsets does not match input_ids",
+        )
+    embedding = _adjust_embedding_length(embedding, num_mm_tokens_in_input_ids, logger)
     return embedding, special_multimodal_mask, input_ids
