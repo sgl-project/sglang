@@ -22,8 +22,8 @@ from sglang.srt.utils import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=80, suite="nightly-4-gpu-b200", nightly=True)
-register_cuda_ci(est_time=40, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=80, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=40, stage="nightly", runner_config="kernel-1-gpu")
 
 BLOCK_KV = 64
 HEAD_DIM = 128
