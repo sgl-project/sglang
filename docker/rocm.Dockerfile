@@ -285,8 +285,8 @@ RUN pip install IPython \
     && pip install pybind11
 
 # Rust toolchain — needed by setuptools-rust to build the sglang-mm extension
-# (sglang.srt.multimodal._core) during the sglang pip install below, and later by
-# sgl-model-gateway. Must precede the sglang install.
+# (sglang.srt.rust_extensions._multimodal) during the sglang pip install below
+# and later by sgl-model-gateway. Must precede the sglang install.
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && rustc --version && cargo --version

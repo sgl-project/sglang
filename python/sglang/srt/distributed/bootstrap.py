@@ -32,6 +32,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_available_gpu_memory,
+    is_hip,
     is_host_cpu_arm64,
     is_npu,
     monkey_patch_p2p_access_check,
@@ -235,6 +236,11 @@ def _init_parallel_groups(
         moe_data_model_parallel_size=moe_dp_size,
         decode_context_parallel_size=dcp_size,
         duplicate_tp_group=server_args.enable_pdmux,
+        duplicate_attn_cp_group=(
+            is_hip()
+            and server_args.enable_two_batch_overlap
+            and get_parallel().enable_dsa_prefill_context_parallel
+        ),
         enable_symm_mem=server_args.enable_symm_mem,
         recovered_rank=is_ep_joiner,
         rank_offset=rank_offset,
