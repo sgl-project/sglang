@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 _ACT_DTYPES = ("float16", "bfloat16")
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 _HIP = frozenset({CapabilityRequirement.HIP})
+_NPU = frozenset({CapabilityRequirement.NPU})
 # sgl_kernel's gated-activation ops build for CUDA *and* ROCm (production
 # imports them from sgl_kernel on both), so the AOT backend spans both devices
 # — the canonical OR-semantics case that a device-baked backend name couldn't.
@@ -110,17 +111,20 @@ class SiluAndMulOp(_GatedActivationOp):
         KernelBackend.JIT,
         KernelBackend.AOT,
         KernelBackend.AITER,
+        KernelBackend.TORCH_NPU,
         KernelBackend.TORCH,
     )
     capabilities = {
         KernelBackend.AOT: _CUDA_HIP,
         KernelBackend.JIT: _CUDA,
         KernelBackend.AITER: _HIP,
+        KernelBackend.TORCH_NPU: _NPU,
     }
     descriptions = {
         KernelBackend.AOT: "silu_and_mul (sgl_kernel wheel).",
         KernelBackend.JIT: "silu_and_mul (sglang.kernels.jit).",
         KernelBackend.AITER: "silu_and_mul (aiter, ROCm).",
+        KernelBackend.TORCH_NPU: "SwiGLU (torch_npu, Ascend).",
         KernelBackend.TORCH: "silu_and_mul (pure-torch reference).",
     }
 
@@ -143,6 +147,17 @@ class SiluAndMulOp(_GatedActivationOp):
         # aiter's ROCm silu_and_mul: (out, input, limit); limit=0.0 = no clamp,
         # matching the standard (unclamped) gated-SiLU used elsewhere.
         _aiter_silu_and_mul(out, input, 0.0)
+        return out
+
+    def forward_torch_npu(
+        self, input: torch.Tensor, out: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        import torch_npu
+
+        result = torch_npu.npu_swiglu(input)
+        if out is None:
+            return result
+        out.copy_(result)
         return out
 
 

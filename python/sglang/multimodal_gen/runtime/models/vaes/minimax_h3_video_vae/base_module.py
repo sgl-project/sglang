@@ -8,12 +8,14 @@ import torch.nn as nn
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 
+from sglang.kernels.ops.activation import silu_and_mul
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
 from sglang.kernels.ops.diffusion.triton.scale_shift import (
     try_fused_scaled_residual_add_exact,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from .attention import Attention
 from .vit_utils import _env_flag, _vit_torch_compile_kwargs
@@ -78,12 +80,21 @@ class FeedForward(nn.Module):
         if self.use_gated:
             if (
                 isinstance(self.act_fn, nn.SiLU)
-                and hidden_states.is_cuda
+                and (
+                    current_platform.is_cuda()
+                    or current_platform.is_rocm()
+                    or current_platform.is_npu()
+                )
                 and hidden_states.dtype in (torch.float16, torch.bfloat16)
                 and hidden_states.is_contiguous()
                 and hidden_states.shape[-1] % 32 == 0
             ):
-                hidden_states = silu_and_mul_with_activation_rounding(hidden_states)
+                if current_platform.is_npu():
+                    hidden_states = silu_and_mul(hidden_states)
+                else:
+                    hidden_states = silu_and_mul_with_activation_rounding(
+                        hidden_states
+                    )
             else:
                 gate, hidden_states = hidden_states.chunk(2, dim=-1)
                 hidden_states = self.act_fn(gate).mul_(hidden_states)
