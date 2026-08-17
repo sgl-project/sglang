@@ -45,6 +45,13 @@ class TestGracefulDrainSignals(CustomTestCase):
         self.assertTrue(tokenizer_manager.gracefully_exit)
         self.assertFalse(tokenizer_manager.drain_force_exit)
 
+        # Orchestrators deliver one stop event as a bundle of DISTINCT signals
+        # (e.g. Modal sends SIGTERM and SIGINT together); a signal not yet
+        # seen joins the active drain instead of escalating.
+        handler.sigterm_handler(signal.SIGINT, None)
+        self.assertFalse(tokenizer_manager.drain_force_exit)
+
+        # The SAME signal arriving again is the operator insisting: force exit.
         handler.sigterm_handler(signal.SIGINT, None)
         self.assertTrue(tokenizer_manager.drain_force_exit)
 

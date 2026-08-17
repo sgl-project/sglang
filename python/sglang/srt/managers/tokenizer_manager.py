@@ -2193,12 +2193,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # due to the CPython limitation.
         if threading.current_thread() is threading.main_thread():
             signal_handler = self.signal_handler_class(self)
-            loop.add_signal_handler(signal.SIGTERM, signal_handler.sigterm_handler)
+            loop.add_signal_handler(
+                signal.SIGTERM, signal_handler.sigterm_handler, signal.SIGTERM
+            )
             # SIGINT must take the same graceful-drain path. Left unhandled, it
             # reaches the HTTP server's default handler (uvicorn installs one),
             # which begins shutting the server down at signal time and severs
             # every in-flight streaming response before the drain can run.
-            loop.add_signal_handler(signal.SIGINT, signal_handler.sigterm_handler)
+            loop.add_signal_handler(
+                signal.SIGINT, signal_handler.sigterm_handler, signal.SIGINT
+            )
             # Update the signal handler for the process. It overrides the sigquit handler in the launch phase.
             loop.add_signal_handler(
                 signal.SIGQUIT, signal_handler.running_phase_sigquit_handler
@@ -3657,17 +3661,31 @@ def determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportM
 class SignalHandler:
     def __init__(self, tokenizer_manager: TokenizerManager):
         self.tokenizer_manager = tokenizer_manager
+        self._stop_signums_seen: set = set()
 
     def sigterm_handler(self, signum=None, frame=None):
         if self.tokenizer_manager.gracefully_exit:
-            # Second stop signal during drain: the operator insists. Stop
-            # waiting for in-flight requests and exit now.
-            logger.error(
-                f"Repeated stop signal received during graceful drain. {signum=}. "
-                "Force exiting."
-            )
-            self.tokenizer_manager.drain_force_exit = True
+            if signum is not None and signum in self._stop_signums_seen:
+                # The SAME signal arriving again is the operator insisting
+                # (e.g. Ctrl-C pressed twice). Stop waiting for in-flight
+                # requests and exit now.
+                logger.error(
+                    f"Repeated stop signal received during graceful drain. "
+                    f"{signum=}. Force exiting."
+                )
+                self.tokenizer_manager.drain_force_exit = True
+            else:
+                # Orchestrators deliver one stop event as a bundle of DISTINCT
+                # signals (e.g. Modal sends SIGTERM and SIGINT together); a
+                # signal not seen yet joins the stop event already draining.
+                if signum is not None:
+                    self._stop_signums_seen.add(signum)
+                logger.info(
+                    f"Additional stop signal {signum=} joined the active drain."
+                )
             return
+        if signum is not None:
+            self._stop_signums_seen.add(signum)
         logger.warning(
             f"Stop signal received. {signum=} {frame=}. Draining requests and shutting down..."
         )
