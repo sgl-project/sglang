@@ -28,6 +28,8 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.runtime_context import (
+    attention_backends,
+    configured_pp_size,
     get_device,
     get_disagg,
     get_exec,
@@ -188,6 +190,7 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
+    RecentPrefillBatchSizeTracker,
 )
 from sglang.srt.managers.rust_server import RustServer
 from sglang.srt.managers.schedule_batch import (
@@ -315,6 +318,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
     get_tokenizer_from_processor,
+    resolve_image_processor_backend,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
@@ -432,7 +436,7 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_session_radix_cache = server_args.enable_session_radix_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
@@ -812,7 +816,7 @@ class Scheduler(
                     tokenizer_mode=get_serving().tokenizer_mode,
                     trust_remote_code=get_model().trust_remote_code,
                     revision=get_model().revision,
-                    use_fast=not get_mm().disable_fast_image_processor,
+                    image_processor_backend=resolve_image_processor_backend(get_mm()),
                     tokenizer_backend=get_serving().tokenizer_backend,
                     model_name=get_model().model_path,
                 )
@@ -828,7 +832,11 @@ class Scheduler(
 
         # Load multimodal processor for M-RoPE fallback computation.
         self._mm_processor = None
-        if self.model_config.is_multimodal and self.processor is not None:
+        if (
+            self.model_config.is_multimodal
+            and self.processor is not None
+            and not server_args.language_model_only
+        ):
             try:
                 import_processors("sglang.srt.multimodal.processors")
                 self._mm_processor = get_mm_processor(
@@ -981,6 +989,8 @@ class Scheduler(
     def init_model_worker(self):
         # Load model weights.
         self.init_tp_model_worker()
+        if self.server_args.is_startup_weight_load_overlap:
+            self.tp_worker.start_startup_weight_load()
         self.maybe_init_draft_worker()
 
         # Prepare KV cache pools for all workers
@@ -996,6 +1006,9 @@ class Scheduler(
             tic = time.perf_counter()
             model_runner.post_capture_resize_kv_pool()
             self.kv_cache_allocation_time += time.perf_counter() - tic
+
+        if self.server_args.is_startup_weight_load_overlap:
+            self.tp_worker.finalize_startup_weight_load()
 
         if (
             get_exec().moe.elastic_ep_backend is not None
@@ -1201,7 +1214,10 @@ class Scheduler(
             self.schedule_low_priority_values_first,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
-        self.max_prefill_bs: float = 0.0
+        self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
+            window_size=envs.SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE.get()
+        )
+        self.max_prefill_bs: int = 0
         if get_schedule().enable_prefill_delayer:
             if get_disagg().disaggregation_mode == "decode":
                 logger.info(
@@ -1503,9 +1519,10 @@ class Scheduler(
             "flashinfer": ("SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE", 4096),
             "triton": ("SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE", 4096),
         }
-        env_var, default_size = backend_sizes.get(
-            get_exec().kernel.attention_backend, (None, None)
-        )
+        # Both entries are prefill knobs (SPLIT_TILE / PREFILL_TRUNCATION):
+        # the prefill half decides.
+        prefill_backend, _ = attention_backends()
+        env_var, default_size = backend_sizes.get(prefill_backend, (None, None))
         self.truncation_align_size = (
             get_int_env_var(env_var, default_size) if env_var else None
         )
@@ -1692,9 +1709,9 @@ class Scheduler(
         # (forceable via SGLANG_FORCE_COARSE_WAR_BARRIER).
         if not self._war_barrier_enabled:
             return
-        runner = self.model_worker.war_fastpath_runner
-        ev = runner.war_fastpath_read_done_event
-        runner.war_fastpath_read_done_event = None
+        runner = self.model_worker.last_shared_read_runner
+        ev = runner.shared_read_done_event
+        runner.shared_read_done_event = None
         if ev is not None and not envs.SGLANG_FORCE_COARSE_WAR_BARRIER.get():
             self.schedule_stream.wait_event(ev)
         else:
@@ -1862,7 +1879,7 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
-        if self.server_args.mm_feature_transport == "cuda_vmm":
+        if get_mm().mm_feature_transport == "cuda_vmm":
             for recv_req in recv_reqs:
                 self._materialize_cuda_vmm_inputs(recv_req)
 
@@ -2412,6 +2429,7 @@ class Scheduler(
                 ),
                 routing_key=recv_req.routing_key,
                 extra_key=recv_req.extra_key,
+                cache_salt=recv_req.cache_salt,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -2492,11 +2510,7 @@ class Scheduler(
         self._maybe_namespace_elastic_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
-            error_msg = (
-                "DSpark speculative decoding does not support return_logprob yet."
-                if self.spec_algorithm.is_dspark() and req.return_logprob
-                else validate_dflash_request(req, self.enable_overlap)
-            )
+            error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
@@ -2517,11 +2531,13 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if req.return_sampling_mask and req.sampling_params.top_k == TOP_K_ALL:
+        uses_top_k_or_top_p_truncation = (
+            req.sampling_params.top_k != TOP_K_ALL or req.sampling_params.top_p < 1.0
+        )
+        if req.return_sampling_mask and not uses_top_k_or_top_p_truncation:
             error_msg = (
-                "return_sampling_mask requires finite top_k; top_p-only sampling "
-                "is valid but can return huge masks in the tail, blowing up "
-                "metadata, so we need a safety cap."
+                "return_sampling_mask cannot return the full vocabulary; set "
+                "top_p < 1 or a finite top_k."
             )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
@@ -3143,11 +3159,6 @@ class Scheduler(
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
-            # Decay the max-prefill-bs high-watermark once per pass so one
-            # unusually large admission burst does not permanently raise the
-            # slot_condition bar in the delayer (0.998/pass ~= half-life of
-            # ~350 forward passes).
-            self.max_prefill_bs *= 0.998
             # Get max usage across all pools for prefill delay decision
             max_pool_usage = (
                 self.pool_stats_observer.get_pool_stats().get_max_pool_usage()
@@ -3162,7 +3173,13 @@ class Scheduler(
         )
 
         if self.prefill_delayer:
-            prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
+            observed_prefill_bs = prefill_delayer_single_pass.finalize(
+                actual_prefill_bs=ret.batch_size() if ret is not None else 0
+            )
+            if observed_prefill_bs > 0:
+                self.max_prefill_bs = self.prefill_bs_tracker.observe_attempt(
+                    observed_prefill_bs
+                )
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
@@ -3387,7 +3404,6 @@ class Scheduler(
             self.chunked_req is None or len(can_run_list) != 1
         )
 
-        self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
@@ -3881,6 +3897,12 @@ class Scheduler(
             assert _batch_result is batch_result
             # Delay-sample is non-spec only; relays the sampled bonus tokens.
             self._relay_forward_payload(batch_result.future_indices, batch_result)
+
+        # Run device-to-host copy on a separate stream to avoid blocking the
+        # forward stream. The copy waits for the sampled result and can overlap
+        # with subsequent forward computation.
+        self.copy_stream.wait_stream(self.forward_stream)
+        with self.copy_stream_ctx:
             batch_result.copy_to_cpu(
                 return_logprob=cur_batch.return_logprob,
                 return_hidden_states=cur_batch.return_hidden_states,
@@ -4875,13 +4897,12 @@ class Scheduler(
 
 
 def dispatch_event_loop(scheduler: Scheduler):
-    # Dispatch to the appropriate event loop based on the disaggregation mode
-    server_args = scheduler.server_args
+    # The live PP property asserts before torch.distributed init (MLX stub).
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
-        elif server_args.pp_size > 1:
+        elif configured_pp_size() > 1:
             scheduler.event_loop_pp()
         elif scheduler.enable_overlap_mlx:
             scheduler.event_loop_overlap_mlx()
@@ -4890,14 +4911,14 @@ def dispatch_event_loop(scheduler: Scheduler):
         else:
             scheduler.event_loop_normal()
     elif disaggregation_mode == DisaggregationMode.PREFILL:
-        if server_args.pp_size > 1:
+        if configured_pp_size() > 1:
             scheduler.event_loop_pp_disagg_prefill()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_prefill()
         else:
             scheduler.event_loop_normal_disagg_prefill()
     elif disaggregation_mode == DisaggregationMode.DECODE:
-        if server_args.pp_size > 1:
+        if configured_pp_size() > 1:
             scheduler.event_loop_pp_disagg_decode()
         elif scheduler.enable_overlap:
             scheduler.event_loop_overlap_disagg_decode()

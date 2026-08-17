@@ -705,9 +705,25 @@ class LogitsProcessor(nn.Module):
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
             if self.use_fp32_lm_head:
-                logits = torch.matmul(
-                    hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
+                # Avoid materializing FP32 copies for same-dtype CUDA FP16/BF16
+                # inputs. Retain explicit FP32 casts for unsupported devices or
+                # dtype combinations.
+                use_mm_out_dtype = (
+                    hidden_states.is_cuda
+                    and hidden_states.dtype == lm_head.weight.dtype
+                    and hidden_states.dtype in (torch.float16, torch.bfloat16)
                 )
+                if use_mm_out_dtype:
+                    logits = torch.mm(
+                        hidden_states,
+                        lm_head.weight.T,
+                        out_dtype=torch.float32,
+                    )
+                else:
+                    logits = torch.matmul(
+                        hidden_states.to(torch.float32),
+                        lm_head.weight.to(torch.float32).T,
+                    )
             elif use_intel_amx_backend(lm_head):
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),

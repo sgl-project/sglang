@@ -8,6 +8,7 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
     mamba_cache_chunk_size,
+    mamba_checkpoint_grid,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
 )
@@ -377,21 +378,13 @@ class MultimodalDataItem:
         if self.pad_value is not None:
             return
 
-        from sglang.srt.managers.mm_utils import hash_feature
+        from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 
-        if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
-            import uuid
-
-            self.hash = uuid.uuid4().int
-            self.pad_value = _compute_pad_value(self.hash)
-            return
-        if self.hash is None:
-            if self.feature is not None:
-                hashed_feature = self.feature
-            else:
-                hashed_feature = self.precomputed_embeddings
-            self.hash = hash_feature(hashed_feature)
-        assert self.hash is not None
+        self.hash = resolve_multimodal_item_hash(
+            existing_hash=self.hash,
+            feature=self.feature,
+            precomputed_embeddings=self.precomputed_embeddings,
+        )
         self.pad_value = _compute_pad_value(self.hash)
 
     def is_modality(self, modality: Modality) -> bool:
@@ -855,6 +848,7 @@ class Req(ReqDllmMixin):
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -924,13 +918,14 @@ class Req(ReqDllmMixin):
             return_hidden_states
         )
 
-        # extra key for classifying the request (e.g. cache_salt)
+        # Extra key for caller-defined request classification.
         if lora_id is not None:
             extra_key = (
                 extra_key or ""
             ) + lora_id  # lora_id is concatenated to the extra key
 
         self.extra_key = extra_key
+        self.cache_salt = cache_salt or None
         self.lora_id = lora_id
         self.routing_key = routing_key
 
@@ -939,6 +934,7 @@ class Req(ReqDllmMixin):
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
         self.mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
         self.mamba_next_track_idx: Optional[int] = None  # 0 or 1
+        self.mamba_last_track_idx: Optional[int] = None  # 0 or 1
         self.mamba_last_track_seqlen: Optional[int] = (
             None  # seq len of the last cached mamba state
         )
@@ -1358,6 +1354,7 @@ class Req(ReqDllmMixin):
                         token_ids=token_ids_to_match,
                         extra_key=self.extra_key,
                         limit=key_limit,
+                        cache_salt=self.cache_salt,
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
@@ -1693,6 +1690,7 @@ class Req(ReqDllmMixin):
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
+        self.mamba_last_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.mamba_cow_src_index = None
@@ -1774,6 +1772,7 @@ class Req(ReqDllmMixin):
             "bootstrap_room": self.bootstrap_room,
             "priority": self.priority,
             "extra_key": self.extra_key,
+            "cache_salt": self.cache_salt,
             "routing_key": self.routing_key,
             "disagg_prefill_dp_rank": self.disagg_prefill_dp_rank,
         }
@@ -1883,6 +1882,7 @@ def set_mamba_track_indices_from_reqs(
             req.mamba_next_track_idx if req.mamba_next_track_idx is not None else 0
             for req in batch.reqs
         ]
+    batch.mamba_track_buffer_indices = list(track_positions)
     idx = (
         torch.tensor(
             track_positions,
@@ -2079,6 +2079,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
+    # Per-batch snapshot of the logical ping-pong positions selected for this
+    # forward (normally req.mamba_next_track_idx; spec may override it). Result
+    # processing uses it to update req.mamba_last_track_idx, since both req-level
+    # indices may advance under overlap.
+    mamba_track_buffer_indices: Optional[List[int]] = None  # shape: [b], 0 or 1
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask_cpu: Optional[List[bool]] = None  # shape: [b]
@@ -2618,6 +2623,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
         chunk_size = mamba_cache_chunk_size()
+        # The donated depth has to be a radix node boundary. Read the tree's own
+        # page rather than re-deriving how DCP widens it; the kernel still
+        # snapshots on the chunk_size grid.
+        checkpoint_grid = mamba_checkpoint_grid(self.tree_cache.page_size)
 
         def _force_track_h(i: int) -> int:
             assert i % chunk_size == 0
@@ -2630,7 +2639,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        mask = req.extend_range.length >= chunk_size
+        mask = req.extend_range.length >= checkpoint_grid
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
         if mask:
@@ -2647,13 +2656,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # mamba radix cache to track which seqlen this mamba state should store at.
             mamba_track_seqlen_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_range.length // chunk_size) * chunk_size
+                + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
             )
 
             # mamba_track_fla_chunk_aligned is the aligned seqlen based on chunk_size
-            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
-            # page_size > chunk_size, we need to force the math calculation to retrieve the correct mamba state from h
-            # by _force_track_h()
+            # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which is true when
+            # checkpoint_grid is coarser than chunk_size, we need to force the math calculation to
+            # retrieve the correct mamba state from h by _force_track_h()
             mamba_track_fla_chunk_aligned = (
                 len(req.prefix_indices)
                 + (req.extend_range.length // chunk_size) * chunk_size
@@ -2666,6 +2675,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # In lazy mode, skip the swap — the second ping-pong slot is not
             # allocated yet; it will be allocated on demand at the track boundary
             # in mamba_lazy_prealloc_at_boundary during prepare_for_decode.
+            req.mamba_last_track_idx = req.mamba_next_track_idx
             if not mamba_extra_buffer_lazy_enabled():
                 req.mamba_next_track_idx = (
                     self.req_to_token_pool.get_mamba_ping_pong_other_idx(
@@ -3067,6 +3077,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 )
+                self.mamba_track_buffer_indices = []
             else:
                 if mamba_extra_buffer_lazy_enabled():
                     self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
@@ -3148,6 +3159,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
 
         self.mamba_track_indices = None
+        self.mamba_track_buffer_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
         self.mamba_track_mask_cpu = None
@@ -3211,6 +3223,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.mamba_track_indices = None
+        self.mamba_track_buffer_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
         self.mamba_track_mask_cpu = None
@@ -3272,6 +3285,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
             mamba_track_indices=self.mamba_track_indices,
+            mamba_track_buffer_indices=self.mamba_track_buffer_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
             mamba_track_mask_cpu=self.mamba_track_mask_cpu,
@@ -3364,6 +3378,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             is_chunk_cache=self.tree_cache.is_chunk_cache(),
+            retain_floor=self.tree_cache.swa_retain_floor(req),
         )
 
     def __str__(self):
