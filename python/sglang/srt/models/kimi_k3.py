@@ -457,17 +457,17 @@ class KimiK3MoE(nn.Module):
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
-            # flashinfer_mxfp4 + situ consumes precomputed routing
-            # (PackedPrecomputed): keep the radix router in the TopK layer
-            # and hand its ids/weights to the MoE op. Other quantized paths
-            # keep the runner-resolved format (marlin -> standard anyway,
-            # bypassed only for the public logits-routing path).
+            # TRT-LLM cannot consume fused-front's row-strided router logits;
+            # keep K3's FP32 router and pass precomputed top-k instead.
             output_format=(
                 TopKOutputFormat.STANDARD
                 if quant_config is None
                 or (
                     config.hidden_act == "situ"
-                    and get_moe_runner_backend().is_flashinfer_mxfp4()
+                    and (
+                        get_moe_runner_backend().is_flashinfer_mxfp4()
+                        or get_moe_runner_backend().is_flashinfer_trtllm()
+                    )
                 )
                 # mega pre-dispatch consumes raw topk_ids/topk_weights
                 or get_moe_a2a_backend().is_megamoe()
