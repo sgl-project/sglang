@@ -173,6 +173,11 @@ def _ipc_input_a2a_qkv(q, k, v):
     None when unavailable."""
     if get_ulysses_parallel_world_size() != 2:
         return None
+    # One staging slot is sized from `q` and reused for all three, so unequal
+    # k/v lengths would copy mismatched extents into it. The general exchange
+    # guards the same way and handles them.
+    if q.shape != k.shape or q.shape != v.shape:
+        return None
     group = _ipc_ready_group()
     if group is None:
         return None

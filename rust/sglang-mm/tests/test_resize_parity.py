@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from sglang.srt.multimodal._core import common as _rs_common
-from sglang.srt.multimodal._core import inkling as _rs_inkling
+from sglang.srt.rust_extensions._multimodal import common as _rs_common
+from sglang.srt.rust_extensions._multimodal import inkling as _rs_inkling
 
 
 def py_scaled_dims(

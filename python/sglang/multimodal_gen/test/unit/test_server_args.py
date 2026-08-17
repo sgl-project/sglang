@@ -20,6 +20,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanCo
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
+    LongCatImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
@@ -32,6 +35,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
 )
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
@@ -53,6 +57,14 @@ from sglang.multimodal_gen.registry import (
     _get_config_info,
     get_non_diffusers_pipeline_name,
     is_known_non_diffusers_multimodal_model,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    COMPONENT_OFFLOAD,
+    LAYERWISE_OFFLOAD,
+    RESIDENT,
+    normalize_component_residency,
+    resolve_component_residency_mode,
+    resolve_diffusers_pipeline_offload,
 )
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
@@ -409,10 +421,8 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                 server_args = ServerArgs.from_cli_args(args, unknown_args)
 
         self.assertEqual(server_args.cpu_offload_components, ["transformer", "vae"])
-        self.assertTrue(server_args.dit_cpu_offload)
-        self.assertTrue(server_args.vae_cpu_offload)
-        self.assertFalse(server_args.text_encoder_cpu_offload)
-        self.assertFalse(server_args.image_encoder_cpu_offload)
+        self.assertEqual(server_args.residency_mode("transformer"), COMPONENT_OFFLOAD)
+        self.assertEqual(server_args.residency_mode("vae"), COMPONENT_OFFLOAD)
 
     def test_serve_cli_preserves_config_and_dynamic_unknown_args(self):
         from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
@@ -863,8 +873,8 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.should_cpu_offload_component("transformer_2"))
         self.assertTrue(args.should_cpu_offload_component("audio_vae"))
         self.assertTrue(args.should_cpu_offload_component("connectors"))
-        self.assertFalse(args.dit_cpu_offload)
-        self.assertFalse(args.vae_cpu_offload)
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+        self.assertEqual(args.residency_mode("vae"), RESIDENT)
 
     def test_cpu_offload_components_all_matches_dynamic_components(self):
         args = self._from_dict_with_task_type(
@@ -889,10 +899,10 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertEqual(args.cpu_offload_components, [])
-        self.assertFalse(args.dit_cpu_offload)
-        self.assertFalse(args.text_encoder_cpu_offload)
-        self.assertFalse(args.image_encoder_cpu_offload)
-        self.assertFalse(args.vae_cpu_offload)
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+        self.assertEqual(args.residency_mode("text_encoder"), RESIDENT)
+        self.assertEqual(args.residency_mode("image_encoder"), RESIDENT)
+        self.assertEqual(args.residency_mode("vae"), RESIDENT)
 
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
             self._from_dict_with_task_type(
@@ -900,18 +910,251 @@ class TestOffloadDefaults(unittest.TestCase):
                 kwargs={"cpu_offload_components": ["none", "vae"]},
             )
 
-    def test_cpu_offload_components_rejects_legacy_flag_conflict(self):
-        with self.assertRaisesRegex(ValueError, "cannot be combined"):
-            self._from_dict_with_task_type(
-                ModelTaskType.T2V,
-                kwargs={
-                    "performance_mode": "manual",
-                    "cpu_offload_components": ["dit"],
+    def test_cpu_offload_components_can_mix_with_legacy_flags(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={
+                "performance_mode": "manual",
+                "cpu_offload_components": ["vae"],
+                "dit_cpu_offload": True,
+                "text_encoder_cpu_offload": False,
+            },
+        )
+
+        self.assertEqual(args.residency_mode("vae"), COMPONENT_OFFLOAD)
+        self.assertEqual(args.residency_mode("transformer"), COMPONENT_OFFLOAD)
+        self.assertEqual(args.residency_mode("text_encoder"), RESIDENT)
+
+    def test_legacy_component_cpu_offload_flags_remain_supported(self):
+        cases = (
+            ("dit_cpu_offload", "transformer_2"),
+            ("text_encoder_cpu_offload", "text_encoder_3"),
+            ("image_encoder_cpu_offload", "image_encoder"),
+            ("vae_cpu_offload", "audio_vae"),
+        )
+        for flag_name, component_name in cases:
+            with self.subTest(flag_name=flag_name, enabled=True):
+                args = self._from_dict_with_task_type(
+                    ModelTaskType.T2V,
+                    kwargs={"performance_mode": "manual", flag_name: True},
+                )
+                self.assertEqual(args.residency_mode(component_name), COMPONENT_OFFLOAD)
+            with self.subTest(flag_name=flag_name, enabled=False):
+                args = self._from_dict_with_task_type(
+                    ModelTaskType.T2V,
+                    kwargs={"performance_mode": "manual", flag_name: False},
+                )
+                self.assertEqual(args.residency_mode(component_name), RESIDENT)
+
+    def test_component_residency_normalizes_assignments(self):
+        self.assertEqual(
+            normalize_component_residency(
+                [
+                    "all=resident,dit=layerwise_offload",
+                    "transformer_2=component-offload",
+                ]
+            ),
+            {
+                "all": RESIDENT,
+                "dit": LAYERWISE_OFFLOAD,
+                "transformer_2": COMPONENT_OFFLOAD,
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "COMPONENT=MODE"):
+            normalize_component_residency(["dit"])
+        with self.assertRaisesRegex(ValueError, "Invalid component residency mode"):
+            normalize_component_residency(["dit=cpu"])
+
+    def test_component_residency_resolves_exact_group_and_all_precedence(self):
+        assignments = normalize_component_residency(
+            [
+                "all=component-offload",
+                "dit=layerwise-offload",
+                "transformer_2=resident",
+                "connectors=resident",
+            ]
+        )
+
+        self.assertEqual(
+            resolve_component_residency_mode("transformer", assignments),
+            LAYERWISE_OFFLOAD,
+        )
+        self.assertEqual(
+            resolve_component_residency_mode("transformer_2", assignments),
+            RESIDENT,
+        )
+        self.assertEqual(
+            resolve_component_residency_mode("text_encoder_2", assignments),
+            COMPONENT_OFFLOAD,
+        )
+        self.assertEqual(
+            resolve_component_residency_mode("connectors", assignments), RESIDENT
+        )
+
+    def test_component_residency_groups_exclude_legacy_helpers(self):
+        assignments = normalize_component_residency(
+            ["dit=component-offload", "vae=component-offload"]
+        )
+
+        for component_name in (
+            "connectors",
+            "dual_tower_bridge",
+            "vision_language_encoder",
+            "condition_image_encoder",
+            "sound_tokenizer",
+            "spatial_upsampler",
+            "vocoder",
+        ):
+            with self.subTest(component_name=component_name):
+                self.assertIsNone(
+                    resolve_component_residency_mode(component_name, assignments)
+                )
+
+    def test_component_residency_groups_include_native_texture_models(self):
+        assignments = normalize_component_residency(
+            ["dit=layerwise-offload", "vae=component-offload"]
+        )
+
+        for component_name in ("paint_transformer", "delight_transformer"):
+            with self.subTest(component_name=component_name):
+                self.assertEqual(
+                    resolve_component_residency_mode(component_name, assignments),
+                    LAYERWISE_OFFLOAD,
+                )
+        for component_name in ("paint_vae", "delight_vae"):
+            with self.subTest(component_name=component_name):
+                self.assertEqual(
+                    resolve_component_residency_mode(component_name, assignments),
+                    COMPONENT_OFFLOAD,
+                )
+
+    def test_component_residency_overrides_matching_legacy_flags_only(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={
+                "performance_mode": "manual",
+                "component_residency": ["dit=resident"],
+                "dit_cpu_offload": True,
+                "text_encoder_cpu_offload": True,
+            },
+        )
+
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+        self.assertEqual(args.residency_mode("text_encoder"), COMPONENT_OFFLOAD)
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+
+    def test_explicit_false_layerwise_keeps_dit_resident(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "dit_layerwise_offload": False,
+            },
+        )
+
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+
+    def test_explicit_false_layerwise_preserves_other_explicit_dit_mode(self):
+        for kwargs, expected_mode in (
+            (
+                {
+                    "dit_layerwise_offload": False,
                     "dit_cpu_offload": True,
                 },
-            )
+                COMPONENT_OFFLOAD,
+            ),
+            (
+                {
+                    "dit_layerwise_offload": False,
+                    "layerwise_offload_components": ["dit"],
+                },
+                LAYERWISE_OFFLOAD,
+            ),
+        ):
+            with self.subTest(expected_mode=expected_mode):
+                args = self._from_dict_with_pipeline_config(
+                    QwenImagePipelineConfig(),
+                    kwargs={"model_path": "Qwen/Qwen-Image", **kwargs},
+                )
+                self.assertEqual(args.residency_mode("transformer"), expected_mode)
 
-    def test_vae_cpu_offload_defaults_false_on_low_memory_gpu(self):
+    def test_exact_canonical_residency_preserves_unmatched_legacy_dit_scope(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "component_residency": ["transformer=resident"],
+                "dit_layerwise_offload": False,
+                "dit_cpu_offload": True,
+            },
+        )
+
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+        self.assertEqual(args.residency_mode("transformer_2"), COMPONENT_OFFLOAD)
+        self.assertEqual(args.residency_mode("connectors"), COMPONENT_OFFLOAD)
+
+    def test_explicit_layerwise_takes_precedence_over_legacy_cpu_offload(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "model_path": "Qwen/Qwen-Image",
+                "performance_mode": "manual",
+                "dit_cpu_offload": True,
+                "dit_layerwise_offload": True,
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(args.residency_mode("transformer"), LAYERWISE_OFFLOAD)
+        self.assertEqual(args.residency_mode("connectors"), COMPONENT_OFFLOAD)
+
+    def test_component_residency_overrides_only_matching_legacy_components(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={
+                "performance_mode": "manual",
+                "component_residency": ["text_encoder=resident"],
+                "dit_cpu_offload": True,
+                "text_encoder_cpu_offload": True,
+                "image_encoder_cpu_offload": True,
+                "vae_cpu_offload": True,
+            },
+        )
+
+        self.assertEqual(args.residency_mode("text_encoder"), RESIDENT)
+        self.assertEqual(args.residency_mode("transformer"), COMPONENT_OFFLOAD)
+        self.assertEqual(args.residency_mode("image_encoder"), COMPONENT_OFFLOAD)
+        self.assertEqual(args.residency_mode("vae"), COMPONENT_OFFLOAD)
+
+    def test_component_residency_fsdp_decision_is_component_scoped(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={
+                "performance_mode": "manual",
+                "use_fsdp_inference": True,
+                "component_residency": [
+                    "transformer=layerwise-offload",
+                    "text_encoder=resident",
+                ],
+            },
+        )
+
+        self.assertFalse(args.should_use_fsdp_for_component("transformer"))
+        self.assertTrue(args.should_use_fsdp_for_component("text_encoder"))
+
+        args.disable_fsdp_for_component("text_encoder")
+        self.assertFalse(args.should_use_fsdp_for_component("text_encoder"))
+
+    def test_diffusers_component_residency_is_pipeline_wide(self):
+        self.assertFalse(resolve_diffusers_pipeline_offload({"all": RESIDENT}))
+        self.assertTrue(resolve_diffusers_pipeline_offload({"all": COMPONENT_OFFLOAD}))
+        with self.assertRaisesRegex(ValueError, "pipeline-wide"):
+            resolve_diffusers_pipeline_offload({"dit": COMPONENT_OFFLOAD})
+        with self.assertRaisesRegex(ValueError, "native SGLang backend"):
+            resolve_diffusers_pipeline_offload({"all": LAYERWISE_OFFLOAD})
+
+    def test_memory_mode_layerwise_offloads_vae_on_low_memory_gpu(self):
         args = self._from_dict_with_task_type(
             ModelTaskType.T2V,
             memory_gb=16,
@@ -926,6 +1169,22 @@ class TestOffloadDefaults(unittest.TestCase):
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder", "vae"],
         )
+        self.assertEqual(args.residency_mode("vae"), LAYERWISE_OFFLOAD)
+
+    def test_memory_mode_preserves_explicit_vae_residency(self):
+        for kwargs, expected_mode in (
+            ({"component_residency": ["vae=resident"]}, RESIDENT),
+            ({"vae_cpu_offload": True}, COMPONENT_OFFLOAD),
+        ):
+            with self.subTest(expected_mode=expected_mode):
+                args = self._from_dict_with_task_type(
+                    ModelTaskType.T2V,
+                    memory_gb=16,
+                    kwargs={"performance_mode": "memory", **kwargs},
+                )
+
+                self.assertNotIn("vae", args.layerwise_offload_components or [])
+                self.assertEqual(args.residency_mode("vae"), expected_mode)
 
     def test_explicit_vae_cpu_offload_true_is_preserved_by_default_layerwise(
         self,
@@ -949,7 +1208,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertEqual(args.layerwise_offload_components, ["image_encoder", "vae"])
 
-    def test_layerwise_components_disable_matching_non_dit_cpu_offloads(self):
+    def test_layerwise_components_override_matching_cpu_offload_modes(self):
         args = self._from_dict_with_task_type(
             ModelTaskType.T2V,
             memory_gb=16,
@@ -959,32 +1218,30 @@ class TestOffloadDefaults(unittest.TestCase):
                 "text_encoder_cpu_offload": True,
                 "image_encoder_cpu_offload": True,
                 "vae_cpu_offload": True,
+                "layerwise_offload_components": [
+                    "text_encoder",
+                    "image_encoder",
+                    "video_dit",
+                    "vae",
+                ],
             },
         )
-        args.layerwise_offload_components = [
-            "text_encoder",
-            "image_encoder",
-            "video_dit",
-            "vae",
-        ]
-        args._adjust_layerwise_offload_components()
 
         self.assertTrue(args.layerwise_offload_components)
-        # dit_cpu_offload is complementary to DiT layerwise offload (keeps
-        # weights off-device during load), so it must be preserved here.
         self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
+        for component_name in (
+            "text_encoder",
+            "image_encoder",
+            "video_dit",
+            "vae",
+        ):
+            self.assertEqual(args.residency_mode(component_name), LAYERWISE_OFFLOAD)
 
-    def test_dit_layerwise_offload_preserves_dit_cpu_offload(self):
-        """Combining --dit-cpu-offload with --dit-layerwise-offload must keep both on.
-
-        dit_cpu_offload controls initial residency (host memory), while
-        dit_layerwise_offload only swaps layers on/off device at inference.
-        Force-disabling dit_cpu_offload here would push the full DiT to GPU at
-        load time and OOM low-VRAM cards.
-        """
+    def test_legacy_layerwise_wins_over_component_offload(self):
+        """Each component resolves to one mode under mixed legacy flags."""
         args = self._from_dict_with_task_type(
             ModelTaskType.T2I,
             memory_gb=32,
@@ -997,6 +1254,99 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.dit_cpu_offload)
         self.assertTrue(args.dit_layerwise_offload)
         self.assertEqual(args.layerwise_offload_components, ["dit"])
+        self.assertEqual(args.residency_mode("transformer"), LAYERWISE_OFFLOAD)
+        self.assertEqual(args.residency_mode("connectors"), COMPONENT_OFFLOAD)
+
+    def test_explicit_layerwise_false_keeps_independent_auto_residency(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "performance_mode": "auto",
+                "dit_layerwise_offload": False,
+            },
+        )
+
+        self.assertFalse(args.dit_layerwise_offload)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+
+    def test_explicit_dit_cpu_offload_is_preserved_by_auto_residency(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "performance_mode": "auto",
+                "dit_layerwise_offload": False,
+                "dit_cpu_offload": True,
+            },
+        )
+
+        self.assertFalse(args.dit_layerwise_offload)
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(args.residency_mode("transformer"), COMPONENT_OFFLOAD)
+
+    def test_explicit_layerwise_true_wins_over_auto_component_offload(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "performance_mode": "auto",
+                "dit_layerwise_offload": True,
+            },
+        )
+
+        self.assertTrue(args.dit_layerwise_offload)
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(args.residency_mode("transformer"), LAYERWISE_OFFLOAD)
+
+    def test_explicit_vae_cpu_offload_is_preserved_by_auto_residency(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "performance_mode": "auto",
+                "dit_layerwise_offload": False,
+                "vae_cpu_offload": True,
+            },
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.vae_cpu_offload)
+
+    def test_explicit_cpu_offload_components_are_preserved_by_auto_residency(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "performance_mode": "auto",
+                "cpu_offload_components": ["dit", "vae"],
+            },
+        )
+
+        self.assertEqual(args.residency_mode("transformer"), COMPONENT_OFFLOAD)
+        self.assertEqual(args.residency_mode("vae"), COMPONENT_OFFLOAD)
+
+    def test_cpu_offload_component_selector_keeps_unmatched_auto_defaults(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "performance_mode": "auto",
+                "cpu_offload_components": ["vae"],
+            },
+        )
+
+        self.assertEqual(args.residency_mode("vae"), COMPONENT_OFFLOAD)
+        self.assertEqual(args.residency_mode("transformer"), RESIDENT)
+        self.assertEqual(args.residency_mode("text_encoder"), LAYERWISE_OFFLOAD)
+
+    def test_explicit_dit_layerwise_component_wins_over_auto_residency(self):
+        args = self._from_dict_with_pipeline_config(
+            QwenImagePipelineConfig(),
+            kwargs={
+                "performance_mode": "auto",
+                "layerwise_offload_components": ["dit"],
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(args.layerwise_offload_components, ["dit"])
+        self.assertEqual(args.residency_mode("transformer"), LAYERWISE_OFFLOAD)
 
     def test_pipeline_configs_declare_auto_tune_hints(self):
         qwen_deployment = QwenImagePipelineConfig().get_model_deployment_config()
@@ -1071,6 +1421,32 @@ class TestOffloadDefaults(unittest.TestCase):
         # default keeps only vae resident (encoders are large, dit owned by FSDP)
         self.assertEqual(qwen_deployment.keep_resident_components, ("vae",))
         self.assertIsNone(qwen_deployment.keep_resident_min_available_gb)
+
+    def test_qwen_ar_generation_residency_scales_with_available_memory(self):
+        pipeline_configs = (
+            QwenImageLayeredPipelineConfig(),
+            LongCatImagePipelineConfig(),
+        )
+
+        for pipeline_config in pipeline_configs:
+            high_memory_args = self._from_dict_with_pipeline_config(
+                pipeline_config,
+                memory_gb=80,
+                kwargs={"performance_mode": "auto"},
+            )
+            self.assertNotIn(
+                "text_encoder", high_memory_args.layerwise_offload_components or []
+            )
+            self.assertFalse(high_memory_args.text_encoder_cpu_offload)
+
+            constrained_args = self._from_dict_with_pipeline_config(
+                pipeline_config,
+                memory_gb=60,
+                kwargs={"performance_mode": "auto"},
+            )
+            self.assertIn(
+                "text_encoder", constrained_args.layerwise_offload_components or []
+            )
 
     def test_auto_multi_gpu_sana_wm_prefers_fsdp_and_cfg_parallel(self):
         args = self._from_dict_with_pipeline_config(
@@ -1308,10 +1684,8 @@ class TestOffloadDefaults(unittest.TestCase):
 
                 self.assertTrue(args.layerwise_offload_components)
                 self.assertFalse(args.use_fsdp_inference)
-                # dit_cpu_offload is complementary to DiT layerwise offload:
-                # layerwise only moves layers on/off device at runtime, while
-                # dit_cpu_offload keeps the initial weights on host memory.
                 self.assertTrue(args.dit_cpu_offload)
+                self.assertEqual(args.residency_mode("transformer"), LAYERWISE_OFFLOAD)
                 self.assertFalse(args.text_encoder_cpu_offload)
                 self.assertFalse(args.image_encoder_cpu_offload)
                 self.assertEqual(args.dit_offload_prefetch_size, 2)
@@ -1526,8 +1900,6 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        # dit_cpu_offload defaults to True from _adjust_offload and is now
-        # preserved alongside DiT layerwise offload (the two are complementary).
         self.assertTrue(args.dit_cpu_offload)
         self.assertEqual(args.layerwise_offload_components, ["dit"])
 
@@ -1629,24 +2001,19 @@ class TestOffloadDefaults(unittest.TestCase):
             ["text_encoder", "image_encoder", "vae"],
         )
 
-    def test_ltx23_snapshot_device_mode_is_deprecated_alias_for_original(self):
-        args = self._from_dict_with_pipeline_config(
-            LTX2PipelineConfig(),
-            memory_gb=140,
-            available_memory_gb=134,
-            kwargs={
-                "model_path": "Lightricks/LTX-2.3",
-                "num_gpus": 2,
-                "pipeline_class_name": "LTX2TwoStagePipeline",
-                "ltx2_two_stage_device_mode": "snapshot",
-            },
-        )
-
-        self.assertEqual(args.ltx2_two_stage_device_mode, "original")
-        self.assertEqual(
-            args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
-        )
+    def test_ltx23_snapshot_device_mode_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Expected one of"):
+            self._from_dict_with_pipeline_config(
+                LTX2PipelineConfig(),
+                memory_gb=140,
+                available_memory_gb=134,
+                kwargs={
+                    "model_path": "Lightricks/LTX-2.3",
+                    "num_gpus": 2,
+                    "pipeline_class_name": "LTX2TwoStagePipeline",
+                    "ltx2_two_stage_device_mode": "snapshot",
+                },
+            )
 
     def test_explicit_layerwise_components_preserved_in_ltx23_resident(self):
         args = self._from_dict_with_pipeline_config(
@@ -1724,10 +2091,12 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
-        self.assertTrue(args.dit_cpu_offload)
+        # Explicit FSDP selection must not freeze unrelated, implicit DiT
+        # residency decisions on a high-memory GPU.
+        self.assertFalse(args.dit_cpu_offload)
         self.assertFalse(args.vae_cpu_offload)
-        # explicit use_fsdp_inference skips the residency pass, but the layerwise
-        # filter still drops vae (kept resident); encoders stay offloaded
+        # The layerwise filter still drops VAE (kept resident); encoders stay
+        # offloaded.
         self.assertEqual(
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder"],
@@ -1846,6 +2215,8 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.dit_layerwise_offload)
         self.assertIn("text_encoder", args.layerwise_offload_components or [])
         self.assertIn("vae", args.layerwise_offload_components or [])
+        self.assertFalse(args.vae_cpu_offload)
+        self.assertEqual(args.residency_mode("vae"), LAYERWISE_OFFLOAD)
 
     def test_minimax_h3_rejects_explicit_cfg_parallel(self):
         with self.assertRaisesRegex(
@@ -2049,7 +2420,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(server_args.use_fsdp_inference)
         self.assertFalse(server_args.enable_cfg_parallel)
 
-    def test_ltx23_snapshot_device_mode_cli_alias_is_accepted(self):
+    def test_ltx23_snapshot_device_mode_cli_is_rejected(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
         argv = [
@@ -2061,36 +2432,8 @@ class TestOffloadDefaults(unittest.TestCase):
             "snapshot",
         ]
 
-        with (
-            patch.object(sys, "argv", ["sglang"] + argv),
-            patch.object(
-                PipelineConfig, "from_kwargs", return_value=LTX2PipelineConfig()
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cpu",
-                return_value=False,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.platforms.current_platform.is_mps",
-                return_value=False,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.platforms.current_platform.is_cuda",
-                return_value=True,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
-                return_value=140 * 1024**3,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.platforms.current_platform.get_available_gpu_memory",
-                return_value=134,
-            ),
-        ):
-            args, unknown_args = parser.parse_known_args(argv)
-            server_args = ServerArgs.from_cli_args(args, unknown_args)
-
-        self.assertEqual(server_args.ltx2_two_stage_device_mode, "original")
+        with self.assertRaises(SystemExit):
+            parser.parse_known_args(argv)
 
 
 class TestKVGatherDegree(unittest.TestCase):
@@ -2604,10 +2947,19 @@ class TestDirectGpuWeightLoading(unittest.TestCase):
     def _args(self) -> ServerArgs:
         args = ServerArgs.__new__(ServerArgs)
         args.direct_gpu_weight_loading = True
+        args.component_residency = None
+        args.cpu_offload_components = None
         args.dit_cpu_offload = False
+        args.dit_layerwise_offload = False
         args.layerwise_offload_components = []
+        args.text_encoder_cpu_offload = False
+        args.image_encoder_cpu_offload = False
+        args.vae_cpu_offload = False
         args.use_fsdp_inference = False
         args.tp_size = 1
+        args._explicit_arg_names = set()
+        args._required_resident_components = set()
+        args._component_layerwise_capabilities = {}
         return args
 
     def test_cli_defaults_off_and_parses_explicit_enable(self):
