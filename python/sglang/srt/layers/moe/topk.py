@@ -144,30 +144,22 @@ _RENORMALIZE_SUM_EPSILON = 1e-20
 # an accuracy run before becoming the default.
 _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
 
-# ATOM-style shared-expert fusion for the aiter grouped-topk path: keep a
-# persistent topk buffer whose shared-expert columns are pre-populated once (NOT
-# related to the LLM prefill phase — this applies to both prefill and decode), and
-# let the aiter kernel write only the routed columns (via row stride). This removes
-# the per-layer _fused_append_shared_experts kernel.
-# Auto-enabled (no env) when: non-EP aiter path (moe_ep_size == 1) and
-# num_fused_shared_experts > 0. Bit-identical to the plain append: the shared column
-# is filled with the same constant scale_factor the aiter append writes. The
-# persistent buffer is sized to the max prefill batch (chunked-prefill-size); for
-# token counts above it we fall back to the plain path (condition mirrored in
-# _post_process_topk_ids). Mirrors ATOM's init_aiter_topK_meta_data.
-# Hard upper bound on the persistent buffer (safety cap when chunked prefill is
-# disabled / unexpectedly huge); the buffer only costs ~[MAX, topk+n_shared] * 8B.
+# ATOM-style shared-expert fusion for the aiter grouped-topk path: a persistent
+# topk buffer whose shared columns are pre-populated once, so aiter writes only
+# the routed columns and the per-layer append kernel disappears. Taken whenever
+# the aiter path runs non-EP with fused shared experts, at both prefill and
+# decode; a batch too large for the buffer falls back to the plain append.
+# The cap bounds the buffer when chunked prefill is off, and costs
+# ~[cap, topk + n_shared] * 8B.
 _AITER_TOPK_FUSE_SHARED_MAX_TOKENS_CAP = 131072
 _aiter_topk_fuse_shared_max_tokens_cache = None
 _aiter_topk_fuse_shared_bufs: dict = {}
 
 
 def _get_aiter_topk_fuse_shared_max_tokens() -> int:
-    """Max per-forward token count the persistent buffer must cover. Sized to the
-    largest prefill batch (chunked-prefill-size / max-prefill-tokens); decode is
-    always tiny (bs * num_tokens_per_bs). Above this we fall back to the plain
-    path, so this only bounds the fast-path coverage, not correctness. Cached
-    (server args are fixed after startup)."""
+    """Max per-forward token count the persistent buffer must cover, sized to the
+    largest prefill batch since decode is always tiny. Bounds how often the fast
+    path is taken, not correctness. Cached: server args are fixed after startup."""
     global _aiter_topk_fuse_shared_max_tokens_cache
     if _aiter_topk_fuse_shared_max_tokens_cache is None:
         from sglang.srt.runtime_context import get_schedule
@@ -175,12 +167,9 @@ def _get_aiter_topk_fuse_shared_max_tokens() -> int:
         try:
             schedule = get_schedule()
         except ValueError:
-            # Global config not published yet (e.g. a unit test or offline
-            # init that reaches the aiter grouped-topk path before startup).
-            # Degrade gracefully instead of crashing -- this value only bounds
-            # the fast-path coverage, not correctness (see docstring). Return the
-            # safety cap WITHOUT caching, so a later call (once args are set)
-            # still computes and caches the real value.
+            # Reached before the global config is published (a unit test, or
+            # offline init). Return the cap without caching it, so a later call
+            # still picks up the real value.
             return _AITER_TOPK_FUSE_SHARED_MAX_TOKENS_CAP
         cps = schedule.chunked_prefill_size or 0
         mpt = schedule.max_prefill_tokens or 0
@@ -196,10 +185,9 @@ def _get_aiter_topk_fuse_shared_max_tokens() -> int:
 
 def _aiter_topk_fuse_shared_ep_is_single() -> bool:
     """Whether the shared experts live on every rank, which is what lets the fused
-    path pre-populate their columns. Reports False when the MoE EP group is not
-    initialized (a unit test or offline init reaching this path before startup),
-    so both the fused check here and its mirror in select_experts fall back to the
-    plain append path together instead of raising."""
+    path pre-populate their columns. Reports False rather than raising when the
+    MoE EP group is not initialized, so this check and its mirror in
+    select_experts fall back to the plain append together."""
     try:
         return get_parallel().moe_ep_size == 1
     except (AssertionError, ValueError):
@@ -1662,13 +1650,9 @@ def biased_grouped_topk_gpu(
             and token <= _get_aiter_topk_fuse_shared_max_tokens()
         )
         if _shared_fuse:
-            # Persistent buffer with pre-populated shared columns. The weight is the
-            # constant scale_factor the aiter _post_process append writes (default
-            # 1.0), so this is bit-identical for any shared-expert scaling. aiter
-            # writes only the routed columns [:, :topk] via row stride; the shared
-            # column stays intact. If token exceeds the buffer size we drop to the
-            # plain path below (and _post_process appends shared experts as usual) —
-            # the same condition is mirrored there so the two paths stay consistent.
+            # The shared columns already carry the weight the plain append would
+            # write, so the two paths are bit-identical; aiter fills only
+            # [:, :topk] via row stride and leaves those columns intact.
             _shared_w = (
                 1.0
                 if fused_shared_experts_scaling_factor is None
@@ -2156,24 +2140,16 @@ def _post_process_topk_ids(
             num_local_routed,
         )
     elif _aiter_append:
-        # Detect whether the shared experts were already fused/appended in
-        # biased_grouped_topk_gpu via the persistent pre-populated topk buffer.
-        # When fused, topk_ids already has the full width (routed + shared), i.e.
-        # topk_ids.shape[1] == topk_config.top_k; when the fast path fell back to
-        # the plain buffer (e.g. token > MAX during a large prefill), only the
-        # routed columns are present and we must append the shared experts here.
-        # Checking the tensor shape is robust to the exact fast-path conditions
-        # (no fragile mirroring of biased_grouped_topk_gpu's _shared_fuse check).
+        # biased_grouped_topk_gpu already appended the shared experts when it got
+        # the persistent buffer, which shows up as the full routed + shared width.
+        # Reading the width instead of re-deriving its conditions keeps the two
+        # sides from drifting apart.
         _shared_fused_in_topk = (
             num_fused_shared_experts > 0
             and _aiter_topk_fuse_shared_ep_is_single()
             and topk_ids.shape[1] == topk_config.top_k
         )
-        if _shared_fused_in_topk:
-            # Shared experts were already appended in biased_grouped_topk_gpu via
-            # the persistent pre-populated topk buffer; nothing to do here.
-            pass
-        else:
+        if not _shared_fused_in_topk:
             M, N = router_logits.shape
             scale_factor = (
                 1.0
