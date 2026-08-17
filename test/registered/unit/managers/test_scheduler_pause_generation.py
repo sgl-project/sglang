@@ -44,6 +44,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.hisparse_coordinator = MagicMock()
         scheduler.result_queue = deque()
         scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.conditional_agg_enabled = False
         # Support _kv_snap diagnostic logging in patched schedulers
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.token_to_kv_pool_allocator.available_size.return_value = 1000
@@ -463,6 +464,29 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         # the device->host KV offload rather than offload-then-delete it.
         mock_retract_all.assert_called_once()
         self.assertEqual(mock_retract_all.call_args.kwargs["offload_kv"], False)
+
+    def test_pd_decode_local_prefill_retracts_locally(self):
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.conditional_agg_enabled = True
+        scheduler.last_batch = None
+        scheduler._add_request_to_queue = MagicMock()
+        scheduler.disagg_decode_prealloc_queue = MagicMock()
+
+        req = SimpleNamespace(
+            finished=lambda: False,
+            output_ids=[10, 11, 12],
+            do_local_prefill=True,
+            time_stats=MagicMock(),
+        )
+        scheduler.running_batch.reqs = [req]
+
+        with patch("sglang.srt.managers.scheduler.retract_all"):
+            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        scheduler._add_request_to_queue.assert_called_once_with(req, is_retracted=True)
+        scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.assert_not_called()
+        self.assertEqual(req.output_ids, [10, 11, 12])
 
     def test_pd_decode_continue_releases_held_rebootstrap(self):
         """continue_generation must enqueue staged rebootstrap reqs on resume."""

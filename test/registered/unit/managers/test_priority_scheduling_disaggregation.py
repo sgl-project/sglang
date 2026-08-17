@@ -34,6 +34,8 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
         scheduler.model_config = SimpleNamespace(num_key_value_heads=8)
         scheduler.disagg_prefill_bootstrap_queue = MagicMock()
         scheduler.disagg_decode_prealloc_queue = MagicMock()
+        scheduler.disagg_decode_prebuilt_queue = []
+        scheduler.conditional_agg_enabled = False
         scheduler.ipc_channels = MagicMock()
         return scheduler
 
@@ -66,6 +68,31 @@ class TestDisaggregationPriorityQueueing(unittest.TestCase):
             req, is_retracted=False
         )
         req.time_stats.set_decode_prealloc_queue_entry_time.assert_called_once()
+
+    def test_decode_local_prefill_uses_standard_waiting_queue(self):
+        scheduler = self._new_scheduler(DisaggregationMode.DECODE)
+        scheduler.conditional_agg_enabled = True
+        req = self._new_req(priority=None)
+        req.do_local_prefill = True
+
+        scheduler._add_request_to_queue(req)
+
+        self.assertEqual(scheduler.waiting_queue, [req])
+        scheduler._prefetch_kvcache.assert_called_once_with(req)
+        scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
+        req.time_stats.set_wait_queue_entry_time.assert_called_once()
+
+    def test_retracted_decode_local_prefill_returns_to_waiting_queue(self):
+        scheduler = self._new_scheduler(DisaggregationMode.DECODE)
+        scheduler.conditional_agg_enabled = True
+        req = self._new_req(priority=None)
+        req.do_local_prefill = True
+
+        scheduler._add_request_to_queue(req, is_retracted=True)
+
+        self.assertEqual(scheduler.waiting_queue, [req])
+        scheduler.disagg_decode_prealloc_queue.add.assert_not_called()
+        req.time_stats.set_retract_time.assert_called_once()
 
     def test_priority_disabled_abort_validation_applies_to_decode_mode(self):
         scheduler = self._new_scheduler(DisaggregationMode.DECODE)
@@ -418,6 +445,7 @@ class TestDecodePrebuiltPriority(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
+        scheduler.conditional_agg_enabled = False
         original_waiting_queue = [MagicMock(rid="low"), MagicMock(rid="high")]
         scheduler.waiting_queue = original_waiting_queue
         scheduler.waiting_queue[0].priority = 1
@@ -443,11 +471,14 @@ class TestDecodePrebuiltPriority(unittest.TestCase):
         new_batch = MagicMock()
         # get_new_prebuilt_batch reads the published disagg config
         # (disaggregation_decode_enable_radix_cache).
-        with patch(
-            "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
-            return_value=new_batch,
-        ) as init_new, get_context().override_server_args(
-            disaggregation_decode_enable_radix_cache=False
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                return_value=new_batch,
+            ) as init_new,
+            get_context().override_server_args(
+                disaggregation_decode_enable_radix_cache=False
+            ),
         ):
             ret = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
                 scheduler, scheduler.running_batch

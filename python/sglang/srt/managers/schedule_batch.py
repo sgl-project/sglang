@@ -835,6 +835,7 @@ class Req(ReqDllmMixin):
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
+        do_local_prefill: bool = False,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
@@ -1157,6 +1158,7 @@ class Req(ReqDllmMixin):
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
+        self.do_local_prefill = do_local_prefill
 
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
