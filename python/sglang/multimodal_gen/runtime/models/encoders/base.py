@@ -163,6 +163,11 @@ class TextEncoder(nn.Module, ABC, LayerwiseOffloadableModuleMixin):
         "model.language_model.layers",
     ]
     _fsdp_shard_conditions: list = field(default_factory=lambda: [])
+    # Methods that drive a forward pass without going through __call__. FSDP2
+    # only unshards around the wrapped module's own forward, so anything the
+    # shard conditions left in the root group stays sharded unless the entry
+    # point is registered; loaders read this and register each name.
+    _fsdp_forward_methods: tuple[str, ...] = ()
     _stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
     _supported_attention_backends: set[AttentionBackendEnum] = (
         TextEncoderConfig()._supported_attention_backends

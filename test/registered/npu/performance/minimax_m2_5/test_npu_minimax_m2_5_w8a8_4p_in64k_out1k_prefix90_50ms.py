@@ -25,6 +25,7 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS = {
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "1024",
     "SGLANG_EXTERNAL_MODEL_PACKAGE": "custom_eagle3",
+    "SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE": "128",
     "PYTHONPATH": f"{MINIMAX_M2_5_EAGLE3_MODEL_PATH}:{os.environ.get('PYTHONPATH', '')}",
 }
 
@@ -40,6 +41,8 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS = [
     "--tool-call-parser",
     "minimax-m2",
     "--enable-prefill-delayer",
+    "--prefill-delayer-max-delay-passes",
+    128,
     "--prefill-max-requests",
     10,
     "--chunked-prefill-size",

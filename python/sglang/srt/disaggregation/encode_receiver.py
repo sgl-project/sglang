@@ -33,10 +33,14 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Modality, Req
+from sglang.srt.multimodal.cache import media_preprocess_kwargs
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.srt.utils.common import safe_pickle_loads
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.utils.hf_transformers_utils import (
+    get_processor,
+    resolve_image_processor_backend,
+)
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_local_ip_auto,
@@ -722,6 +726,16 @@ def extract_original_req_id(part_req_id: str) -> str:
     return part_req_id
 
 
+def _encoder_media_item(mm_item: dict):
+    """Keep per-media options aligned while preserving the legacy URL shape."""
+    item = {
+        key: value
+        for key, value in mm_item.items()
+        if key != "modality" and value is not None
+    }
+    return item["url"] if set(item) == {"url"} else item
+
+
 def calculate_modality_num_parts(modalities, num_items_assigned):
     """
     Calculate total number of parts and number of parts per modality.
@@ -1099,7 +1113,7 @@ class WaitingImageRDMARequest(WaitingImageRequest):
                     {
                         "encoder_idx": idx,
                         "mm_items": [
-                            d["url"]
+                            _encoder_media_item(d)
                             for d in mm_data_modality[
                                 cum_num_items : cum_num_items + assigned_num
                             ]
@@ -1674,32 +1688,14 @@ class MMReceiverBase(ABC):
         if getattr(server_args, "tokenizer_backend", None) is not None:
             extra_kwargs["tokenizer_backend"] = server_args.tokenizer_backend
 
-        _processor = None
-        try:
-            _processor = get_processor(
-                server_args.tokenizer_path,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-                use_fast=not server_args.disable_fast_image_processor,
-                **extra_kwargs,
-            )
-        except ValueError as e:
-            error_message = str(e)
-            if "does not have a slow version" in error_message:
-                logger.info(
-                    f"Processor {server_args.tokenizer_path} does not have a slow version. Automatically use fast version"
-                )
-                _processor = get_processor(
-                    server_args.tokenizer_path,
-                    tokenizer_mode=server_args.tokenizer_mode,
-                    trust_remote_code=server_args.trust_remote_code,
-                    revision=server_args.revision,
-                    use_fast=True,
-                    **extra_kwargs,
-                )
-            else:
-                raise e
+        _processor = get_processor(
+            server_args.tokenizer_path,
+            tokenizer_mode=server_args.tokenizer_mode,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+            image_processor_backend=resolve_image_processor_backend(server_args),
+            **extra_kwargs,
+        )
 
         enable_adaptive_dispatch_to_encoder = (
             server_args.enable_adaptive_dispatch_to_encoder
@@ -2119,6 +2115,8 @@ class MMReceiverBase(ABC):
                 if self.scheduler.metrics_reporter.enable_metrics
                 else None
             ),
+            extra_key=recv_req.extra_key,
+            cache_salt=recv_req.cache_salt,
             http_worker_ipc=recv_req.http_worker_ipc,
             dllm_config=self.scheduler.dllm_config,
         )
@@ -2184,7 +2182,7 @@ class MMReceiverBase(ABC):
 
         return num_items_assigned
 
-    def _extract_url_data(self, request_obj) -> List[Dict]:
+    def _extract_url_data(self, request_obj: GenerateReqInput) -> List[Dict]:
         def flatten_mm_items(items):
             if not isinstance(items, list):
                 return [items]
@@ -2206,21 +2204,47 @@ class MMReceiverBase(ABC):
             return mm_item
 
         mm_data = []
-        for attr, modality in [
-            ("image_data", Modality.IMAGE),
-            ("video_data", Modality.VIDEO),
-            ("audio_data", Modality.AUDIO),
+        image_hashes = request_obj.mm_content_hashes
+        image_index = 0
+        for mm_items, modality in [
+            (request_obj.image_data, Modality.IMAGE),
+            (request_obj.video_data, Modality.VIDEO),
+            (request_obj.audio_data, Modality.AUDIO),
         ]:
-            mm_items = getattr(request_obj, attr, None)
             if mm_items:
                 mm_items = flatten_mm_items(mm_items)
                 for mm_item in mm_items:
-                    mm_data.append(
-                        {
-                            "url": to_raw_url(mm_item),
-                            "modality": modality,
-                        }
+                    entry = {
+                        "url": to_raw_url(mm_item),
+                        "modality": modality,
+                    }
+                    entry.update(
+                        media_preprocess_kwargs(mm_item, defaults={"detail": "auto"})
                     )
+                    if modality == Modality.IMAGE:
+                        inline_hash = (
+                            mm_item.content_hash
+                            if isinstance(mm_item, ImageData)
+                            else (
+                                mm_item.get("content_hash")
+                                if isinstance(mm_item, dict)
+                                else None
+                            )
+                        )
+                        explicit_hash = (
+                            image_hashes[image_index]
+                            if image_hashes is not None
+                            and image_index < len(image_hashes)
+                            else None
+                        )
+                        entry["content_hash"] = explicit_hash or inline_hash
+                        image_index += 1
+                    mm_data.append(entry)
+        if image_hashes is not None and image_index != len(image_hashes):
+            raise ValueError(
+                f"mm_content_hashes has {len(image_hashes)} entries for "
+                f"{image_index} images"
+            )
         return mm_data
 
 
@@ -2342,7 +2366,7 @@ class MMReceiverHTTP(MMReceiverBase):
                         "encoder_idx": idx,
                         "encoder_url": effective_urls[idx],
                         "mm_items": [
-                            mm_item.get("url")
+                            _encoder_media_item(mm_item)
                             for mm_item in mm_data_modality[
                                 cum_num_items : cum_num_items + assigned_num
                             ]

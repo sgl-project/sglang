@@ -78,10 +78,13 @@ class MlxTpModelWorker(TpModelWorker):
 
     def _init_model_runner(self):
         """Create MLX runner first (auto-sizes pool), then stub with matching size."""
-        from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
         from sglang.srt.hardware_backend.mlx.model_runner_stub import (
             MlxModelRunnerStub,
         )
+
+        MlxModelRunnerStub.validate_startup_weight_load_mode(self.server_args)
+
+        from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
 
         logger.info("Initializing MlxModelRunner for end-to-end MLX inference")
         init_kwargs = dict(
@@ -90,6 +93,7 @@ class MlxTpModelWorker(TpModelWorker):
             disable_radix_cache=get_memory().disable_radix_cache,
             mem_fraction_static=get_schedule().mem_fraction_static,
             quantization=get_model().quantization,
+            revision=get_model().revision,
             enable_sampling=get_device().mlx_enable_sampling,
             sampling_rng_seed=get_device().random_seed,
             deterministic_seeding=(
