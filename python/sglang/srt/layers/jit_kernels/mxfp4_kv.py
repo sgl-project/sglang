@@ -37,6 +37,9 @@ void mxfp4_dequantize_indices(torch::Tensor, torch::Tensor, torch::Tensor,
 void mxfp4_decode_fused(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                         torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                         torch::Tensor, int64_t, int64_t, double, int64_t);
+void mxfp4_decode_fused_mma(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+                            torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+                            torch::Tensor, int64_t, int64_t, double, int64_t);
 """
 
 # Launch wrappers: 256-thread CTA, 16 (token, head) rows per CTA.
@@ -128,6 +131,38 @@ void mxfp4_decode_fused(torch::Tensor q, torch::Tensor k_data, torch::Tensor k_s
   mxfp4_decode_fused_kernel<<<grid, block, smem, cur_stream(stream)>>>(
       *reinterpret_cast<flashinfer::Mxfp4DecodeParams*>(&params));
 }
+
+void mxfp4_decode_fused_mma(torch::Tensor q, torch::Tensor k_data, torch::Tensor k_scale,
+                            torch::Tensor v_data, torch::Tensor v_scale,
+                            torch::Tensor kv_indices, torch::Tensor kv_indptr,
+                            torch::Tensor o, torch::Tensor lse, int64_t num_qo_heads,
+                            int64_t num_kv_heads, double sm_scale, int64_t stream) {
+  flashinfer::Mxfp4DecodeParams params;
+  params.q = (const __nv_bfloat16*)q.data_ptr();
+  params.k_data = (const uint8_t*)k_data.data_ptr();
+  params.k_scale = (const uint8_t*)k_scale.data_ptr();
+  params.v_data = (const uint8_t*)v_data.data_ptr();
+  params.v_scale = (const uint8_t*)v_scale.data_ptr();
+  params.kv_indices = (const int*)kv_indices.data_ptr();
+  params.kv_indptr = (const int*)kv_indptr.data_ptr();
+  params.o = (__nv_bfloat16*)o.data_ptr();
+  params.lse = lse.numel() ? (float*)lse.data_ptr() : nullptr;
+  params.n = (int)kv_indices.numel();
+  params.num_qo_heads = (int)num_qo_heads;
+  params.num_kv_heads = (int)num_kv_heads;
+  params.sm_scale = (float)sm_scale;
+  const int batch = (int)kv_indptr.numel() - 1;
+  dim3 grid(batch, num_kv_heads);
+  dim3 block(32, 4);
+  // Q [16,128] fp16 + per-warp K/V [16,128] fp16 (4 warps) + o_part [4,4,128]
+  // f32 + md_part [4,4,2] f32
+  const size_t smem = 16 * flashinfer::kHeadDim * sizeof(__half) +
+                      4 * 2 * 16 * flashinfer::kHeadDim * sizeof(__half) +
+                      4 * 4 * flashinfer::kHeadDim * sizeof(float) +
+                      4 * 4 * 2 * sizeof(float);
+  mxfp4_decode_fused_mma_kernel<<<grid, block, smem, cur_stream(stream)>>>(
+      *reinterpret_cast<flashinfer::Mxfp4DecodeParams*>(&params));
+}
 """
 
 
@@ -149,6 +184,7 @@ def _load_ext():
             "mxfp4_dequantize",
             "mxfp4_dequantize_indices",
             "mxfp4_decode_fused",
+            "mxfp4_decode_fused_mma",
         ],
         extra_cuda_cflags=[
             "-O3",
@@ -330,6 +366,36 @@ def decode_fused(
     else:
         q, kv_indices, kv_indptr = staged
     ext.mxfp4_decode_fused(
+        q, k_data, k_scale, v_data, v_scale, kv_indices, kv_indptr,
+        o, lse, qh, kh, sm_scale, torch.cuda.current_stream().cuda_stream,
+    )
+
+
+def decode_fused_mma(
+    q: torch.Tensor,       # [batch, qo_heads, 128] bf16
+    k_data: torch.Tensor,  # [S, H, 64] u8
+    k_scale: torch.Tensor, # [S, H, 4] u8
+    v_data: torch.Tensor,
+    v_scale: torch.Tensor,
+    kv_indices: torch.Tensor,  # [n] int32 pool slots
+    kv_indptr: torch.Tensor,   # [batch+1] int32
+    o: torch.Tensor,           # [batch, qo_heads, 128] bf16 out
+    lse: torch.Tensor,         # [batch, qo_heads] float out
+    sm_scale: float,
+    staged=None,
+) -> None:
+    """Tensor-core (mma.m16n8k16) variant of the fused decode kernel."""
+    ext = _load_ext()
+    batch = kv_indptr.numel() - 1
+    qh = q.shape[1] // 128 if q.dim() == 2 else q.shape[1]
+    kh = k_data.shape[1]
+    if staged is None:
+        q = _stage("fused_q", q.contiguous(), _Q_BUF_CAP)
+        kv_indices = _stage("fused_idx", kv_indices, _IDX_BUF_CAP, dtype=torch.int32)
+        kv_indptr = _stage("fused_indptr", kv_indptr, 1 << 16, dtype=torch.int32)
+    else:
+        q, kv_indices, kv_indptr = staged
+    ext.mxfp4_decode_fused_mma(
         q, k_data, k_scale, v_data, v_scale, kv_indices, kv_indptr,
         o, lse, qh, kh, sm_scale, torch.cuda.current_stream().cuda_stream,
     )

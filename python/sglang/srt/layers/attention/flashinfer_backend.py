@@ -610,7 +610,12 @@ class FlashInferAttnBackend(AttentionBackend):
         # Call the wrapped function
         if self.is_mxfp4:
             # Fused MXFP4 decode: reads packed fp4 KV directly, no workspace.
-            from sglang.srt.layers.jit_kernels.mxfp4_kv import alloc_output, decode_fused
+            # mma variant: ldmatrix + mma.m16n8k16 tensor-core pipeline (~22%
+            # faster than the CUDA-cores kernel at batch=100/seq=1024).
+            from sglang.srt.layers.jit_kernels.mxfp4_kv import (
+                alloc_output,
+                decode_fused_mma as decode_fused,
+            )
 
             kv_pool = forward_batch.token_to_kv_pool
             k_data, k_scale, v_data, v_scale = kv_pool.get_kv_fp4_buffers(
