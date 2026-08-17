@@ -143,16 +143,12 @@ class TestSpectrumLifecycle(unittest.TestCase):
         model.spectrum_skipped_steps_negative = 2
         model.spectrum_shadow_rel_l2_sum_negative = 1.5
         model.spectrum_shadow_rel_l2_count_negative = 3
-        model._get_spectrum_context = lambda: _spectrum_context(
-            is_cfg_negative=True
-        )
+        model._get_spectrum_context = lambda: _spectrum_context(is_cfg_negative=True)
 
         self.assertTrue(model.begin_spectrum_step())
 
         self.assertEqual(model.spectrum_cnt_negative, 1)
-        self.assertEqual(
-            model.spectrum_curr_ws_negative, _SpectrumParams.window_size
-        )
+        self.assertEqual(model.spectrum_curr_ws_negative, _SpectrumParams.window_size)
         self.assertEqual(model.spectrum_num_consecutive_cached_steps_negative, 0)
         self.assertEqual(model.spectrum_real_steps_negative, 1)
         self.assertEqual(model.spectrum_skipped_steps_negative, 0)
@@ -184,21 +180,15 @@ class TestSpectrumLifecycle(unittest.TestCase):
         self.assertEqual(model.spectrum_cnt, 1)
         self.assertEqual(model.spectrum_cnt_negative, 1)
         self.assertEqual(model.spectrum_curr_ws, _SpectrumParams.window_size)
-        self.assertEqual(
-            model.spectrum_curr_ws_negative, _SpectrumParams.window_size
-        )
+        self.assertEqual(model.spectrum_curr_ws_negative, _SpectrumParams.window_size)
 
     def test_serial_cfg_shared_counter_is_not_reset_by_negative_branch(self) -> None:
         model = _DummySharedSpectrum()
-        context = _spectrum_context(
-            is_cfg_negative=False, total_forward_steps=100
-        )
+        context = _spectrum_context(is_cfg_negative=False, total_forward_steps=100)
         model._get_spectrum_context = lambda: context
 
         self.assertTrue(model.begin_spectrum_step())
-        context = _spectrum_context(
-            is_cfg_negative=True, total_forward_steps=100
-        )
+        context = _spectrum_context(is_cfg_negative=True, total_forward_steps=100)
         self.assertTrue(model.begin_spectrum_step())
 
         self.assertEqual(model.spectrum_cnt, 2)
