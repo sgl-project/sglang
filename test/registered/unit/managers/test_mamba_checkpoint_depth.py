@@ -30,6 +30,7 @@ def _track_seqlen(*, tree_page: int, prefix_len: int, extend_len: int) -> int:
     """Run one extend through the tracker and report the donated depth."""
     server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
     # The property would otherwise load the HF config for the dummy model.
+    server_args._npu_mamba_state_chunk_size = CHUNK
     server_args._mamba_cache_chunk_size = CHUNK
     set_global_server_args_for_scheduler(server_args)
 

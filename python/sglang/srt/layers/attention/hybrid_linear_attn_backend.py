@@ -317,13 +317,16 @@ class MambaAttnBackendBase(AttentionBackend):
 
         return indices.clamp(0, query_start_loc[-1] - 1)
 
+    def _mamba_state_chunk_size(self) -> int:
+        return mamba_cache_chunk_size()
+
     def _init_track_ssm_indices(
         self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch
     ):
         """src/dst indices to track SSM states for prefix caching: aligned seqs
         cache last_recurrent_state, unaligned cache intermediate `h` at the last
         chunk boundary."""
-        chunk_size = mamba_cache_chunk_size()
+        chunk_size = self._mamba_state_chunk_size()
         # CPU to avoid kernel launches for the masking ops
         mamba_track_mask = forward_batch.mamba_track_mask.cpu()
         extend_seq_lens = forward_batch.extend_seq_lens.cpu()

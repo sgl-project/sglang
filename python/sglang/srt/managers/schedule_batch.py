@@ -11,11 +11,13 @@ from sglang.srt.runtime_context import (
     mamba_checkpoint_grid,
     mamba_extra_buffer_enabled,
     mamba_extra_buffer_lazy_enabled,
+    npu_mamba_state_chunk_size,
 )
 from sglang.srt.utils.common import (
     Range,
     ceil_align,
     flatten_arrays_to_pinned_cpu,
+    is_npu,
     is_pin_memory_available,
 )
 
@@ -147,6 +149,7 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
+_is_npu = is_npu()
 
 
 ReturnHiddenStatesMode = Union[bool, Literal["last"]]
@@ -2623,18 +2626,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         req: Req,
     ) -> _MambaRadixCacheV2TrackEntry:
         chunk_size = mamba_cache_chunk_size()
+        # Preserve the existing CUDA grid; only Ascend packs `h` independently
+        # from the page-aligned L1 checkpoint grid.
+        state_chunk_size = npu_mamba_state_chunk_size() if _is_npu else chunk_size
         # The donated depth has to be a radix node boundary. Read the tree's own
         # page rather than re-deriving how DCP widens it; the kernel still
         # snapshots on the chunk_size grid.
         checkpoint_grid = mamba_checkpoint_grid(self.tree_cache.page_size)
 
         def _force_track_h(i: int) -> int:
-            assert i % chunk_size == 0
+            assert i % state_chunk_size == 0
             # There are 3 cases for mamba_track_seqlen passed to mamba_track_seqlens_cpu:
-            # 1) aligned with chunk_size-> retrieve from last_recurrent_state
+            # 1) aligned with state_chunk_size -> retrieve from last_recurrent_state
             #    a) is the last position -> retrieve from last_recurrent_state
             #    b) is NOT the last position -> retrieve from h
-            # 2) unaligned with chunk_size -> retrieve from h
+            # 2) unaligned with state_chunk_size -> retrieve from h
             # Currently, the math calculation only supports case 1a and 2. So for 1b, we need to add 1
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
@@ -2659,13 +2665,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 + (req.extend_range.length // checkpoint_grid) * checkpoint_grid
             )
 
-            # mamba_track_fla_chunk_aligned is the aligned seqlen based on chunk_size
+            # mamba_track_fla_chunk_aligned is aligned on the kernel state chunk.
             # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which is true when
             # checkpoint_grid is coarser than chunk_size, we need to force the math calculation to
             # retrieve the correct mamba state from h by _force_track_h()
             mamba_track_fla_chunk_aligned = (
                 len(req.prefix_indices)
-                + (req.extend_range.length // chunk_size) * chunk_size
+                + (req.extend_range.length // state_chunk_size) * state_chunk_size
             )
             if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,

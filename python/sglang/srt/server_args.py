@@ -9044,6 +9044,17 @@ class ServerArgs:
             self._mamba_cache_chunk_size = max(chunk_size, page_size)
         return self._mamba_cache_chunk_size
 
+    @property
+    def npu_mamba_state_chunk_size(self) -> int:
+        """Physical chunk used by the Ascend kernel's packed intermediate states."""
+        if not hasattr(self, "_npu_mamba_state_chunk_size"):
+            hf_config = self.get_model_config().hf_config
+            # Matches chunk_gated_delta_rule_fwd_h_npu's default chunk_size.
+            self._npu_mamba_state_chunk_size = getattr(
+                hf_config, "mamba_chunk_size", 64
+            )
+        return self._npu_mamba_state_chunk_size
+
     def _check_two_batch_overlap(self):
         # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
         # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with

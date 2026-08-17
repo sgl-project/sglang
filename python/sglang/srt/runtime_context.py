@@ -1517,6 +1517,11 @@ def mamba_cache_chunk_size() -> int:
     return get_server_args().mamba_cache_chunk_size
 
 
+def npu_mamba_state_chunk_size() -> int:
+    """Physical chunk size of the Ascend kernel's packed intermediate states."""
+    return get_server_args().npu_mamba_state_chunk_size
+
+
 def mamba_checkpoint_grid(tree_page: int) -> int:
     """The granularity a donated mamba checkpoint's depth must land on so the
     radix tree can name it. Pass the page the tree actually allocates on: DCP

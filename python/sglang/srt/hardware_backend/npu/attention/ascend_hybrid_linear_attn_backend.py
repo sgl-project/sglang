@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.runtime_context import npu_mamba_state_chunk_size
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 
@@ -27,6 +28,12 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.state_indices_list_gdn = []
+
+    def _mamba_state_chunk_size(self) -> int:
+        # L1 checkpoints use the 128-token page grid, while the Ascend GDN
+        # kernel packs `h` every 64 tokens. Using the L1 grid selects h[23]
+        # instead of the checkpoint state h[46] at token 2944.
+        return npu_mamba_state_chunk_size()
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         assert (
