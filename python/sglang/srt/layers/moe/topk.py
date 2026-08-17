@@ -1901,7 +1901,14 @@ def biased_grouped_topk_cpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    fused_shared_experts_scaling_factor: Optional[float] = None,
 ):
+    if fused_shared_experts_scaling_factor is not None:
+        raise ValueError(
+            "fused_shared_experts_scaling_factor is not supported for CPU biased "
+            f"grouped topk, got: {fused_shared_experts_scaling_factor}"
+        )
+
     return torch.ops.sgl_kernel.biased_grouped_topk_cpu(
         hidden_states,
         gating_output,
