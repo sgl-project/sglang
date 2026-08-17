@@ -105,7 +105,7 @@ class TestEmbeddingBenchmarkBackends(unittest.TestCase):
 
     def test_embedding_cache_flush_uses_the_engine_specific_endpoint(self):
         with (
-            patch("sglang.benchmark.serving.get_auth_headers", return_value={}),
+            patch("sglang.benchmark.serving.get_request_headers", return_value={}),
             patch("sglang.benchmark.serving.requests.post") as post,
         ):
             post.return_value = MagicMock()

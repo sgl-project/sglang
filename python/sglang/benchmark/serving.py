@@ -121,19 +121,16 @@ class RequestFuncOutput:
         return output
 
 
-def get_auth_headers() -> Dict[str, str]:
+def get_request_headers() -> Dict[str, str]:
     openai_api_key = os.environ.get("OPENAI_API_KEY")
     if openai_api_key:
-        return {"Authorization": f"Bearer {openai_api_key}"}
+        headers = {"Authorization": f"Bearer {openai_api_key}"}
     else:
         api_key = os.environ.get("API_KEY")
         if api_key:
-            return {"Authorization": f"{api_key}"}
-        return {}
-
-
-def get_request_headers() -> Dict[str, str]:
-    headers = get_auth_headers()
+            headers = {"Authorization": f"{api_key}"}
+        else:
+            headers = {}
     if h := getattr(args, "header", None):
         headers.update(parse_custom_headers(h))
     return headers
@@ -152,7 +149,7 @@ def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
     """Wait for the server to become ready by polling the given URL."""
     print(f"Waiting up to {timeout_sec}s for {url} to become ready...")
     start_time = time.perf_counter()
-    headers = get_auth_headers()
+    headers = get_request_headers()
     while True:
         try:
             response = requests.get(url, headers=headers, timeout=5)
@@ -977,7 +974,7 @@ def flush_server_cache(base_url: str, backend: str) -> None:
     cache_endpoint = (
         "/reset_prefix_cache" if backend.startswith("vllm") else "/flush_cache"
     )
-    response = requests.post(base_url + cache_endpoint, headers=get_auth_headers())
+    response = requests.post(base_url + cache_endpoint, headers=get_request_headers())
     response.raise_for_status()
 
 
@@ -1565,7 +1562,7 @@ async def benchmark(
 
     if "sglang" in backend:
         server_info = requests.get(
-            base_url + "/server_info", headers=get_auth_headers()
+            base_url + "/server_info", headers=get_request_headers()
         )
         if server_info.status_code == 200:
             server_info_json = server_info.json()
@@ -1761,7 +1758,7 @@ async def benchmark(
                 print("{:<40} {:.1f}%".format(label, storage_pct))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
+    resp = requests.get(base_url + "/server_info", headers=get_request_headers())
     server_info = resp.json() if resp.status_code == 200 else None
 
     if (
@@ -2026,7 +2023,7 @@ def run_benchmark(args_: argparse.Namespace):
             )
             sys.exit(1)
         try:
-            response = requests.get(model_url, headers=get_auth_headers())
+            response = requests.get(model_url, headers=get_request_headers())
             model_list = response.json().get("data", [])
             args.model = model_list[0]["id"] if model_list else None
         except Exception as e:
@@ -2077,7 +2074,7 @@ def run_benchmark(args_: argparse.Namespace):
     if tokenizer_id is None:
         try:
             resp = requests.get(
-                base_url + "/model_info", headers=get_auth_headers(), timeout=5
+                base_url + "/model_info", headers=get_request_headers(), timeout=5
             )
             if resp.status_code == 200:
                 info = resp.json()
