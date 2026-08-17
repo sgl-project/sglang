@@ -22,6 +22,7 @@ def build_qwen_vl_text_rope(config: Any) -> RotaryEmbedding:
         base=rope_theta,
         is_neox_style=True,
         rope_scaling=rope_scaling,
+        deterministic=False,
     )
 
 

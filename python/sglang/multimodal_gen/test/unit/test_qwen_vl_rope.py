@@ -5,6 +5,8 @@ import torch
 from torch import nn
 
 import sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope as qwen_vl_rope
+import sglang.srt.layers.rotary_embedding.base as rope_base
+import sglang.srt.layers.rotary_embedding.factory as rope_factory
 from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
     apply_qwen_vl_text_rope,
     build_qwen_vl_text_rope,
@@ -55,7 +57,38 @@ def test_qwen_vl_rope_supports_transformers_v5_config(monkeypatch):
         "base": 1_000_000.0,
         "is_neox_style": True,
         "rope_scaling": rope_parameters,
+        "deterministic": False,
     }
+
+
+def test_qwen_vl_rope_does_not_require_srt_runtime_context(monkeypatch):
+    def fail_get_exec():
+        raise AssertionError("Qwen-VL RoPE must not read the SRT exec context")
+
+    monkeypatch.setattr(rope_base, "get_exec", fail_get_exec)
+    monkeypatch.setattr(rope_factory, "_ROPE_DICT", {})
+    config = SimpleNamespace(
+        head_dim=None,
+        hidden_size=32,
+        num_attention_heads=4,
+        max_position_embeddings=37,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 123_457.0,
+            "mrope_section": [2, 1, 1],
+        },
+    )
+
+    rotary_emb = build_qwen_vl_text_rope(config)
+    positions = torch.arange(9).view(3, 3)
+    query = torch.randn(3, 16)
+    key = torch.randn(3, 8)
+
+    rotated_query, rotated_key = rotary_emb.forward_native(positions, query, key)
+
+    assert rotary_emb.deterministic is False
+    assert rotated_query.shape == query.shape
+    assert rotated_key.shape == key.shape
 
 
 def test_qwen_vl_rope_adapts_batched_gqa_layout():

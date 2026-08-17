@@ -102,6 +102,7 @@ def get_rope(
     dtype: Optional[torch.dtype] = None,
     partial_rotary_factor: float = 1.0,
     dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
+    deterministic: Optional[bool] = None,
 ) -> RotaryEmbedding:
     if dtype is None:
         dtype = torch.get_default_dtype()
@@ -134,6 +135,7 @@ def get_rope(
         rope_scaling_args,
         dual_chunk_attention_args,
         dtype,
+        deterministic,
     )
     cached = _get_live_rope_cache_entry(key)
     if cached is not None:
@@ -156,7 +158,13 @@ def get_rope(
         )
     elif rope_scaling is None:
         rotary_emb = RotaryEmbedding(
-            head_size, rotary_dim, max_position, base, is_neox_style, dtype
+            head_size,
+            rotary_dim,
+            max_position,
+            base,
+            is_neox_style,
+            dtype,
+            deterministic=deterministic,
         )
     else:
         if "rope_type" in rope_scaling:
@@ -193,6 +201,7 @@ def get_rope(
                 low_freq_factor,
                 high_freq_factor,
                 original_max_position,
+                deterministic=deterministic,
             )
         elif scaling_type == "default":
             if "mrope_section" in rope_scaling:
@@ -208,6 +217,7 @@ def get_rope(
                     mrope_interleaved_glm=rope_scaling.get(
                         "mrope_interleaved_glm", False
                     ),
+                    deterministic=deterministic,
                 )
             elif rope_scaling.get("use_fope", False):
                 rotary_emb = FourierRotaryEmbedding(
@@ -230,6 +240,7 @@ def get_rope(
                     base,
                     is_neox_style,
                     dtype,
+                    deterministic=deterministic,
                 )
         elif scaling_type == "linear":
             scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
@@ -241,6 +252,7 @@ def get_rope(
                 is_neox_style,
                 scaling_factor,
                 dtype,
+                deterministic=deterministic,
             )
         elif scaling_type == "dynamic":
             scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
@@ -253,6 +265,7 @@ def get_rope(
                     is_neox_style,
                     rope_scaling["alpha"],
                     dtype,
+                    deterministic=deterministic,
                 )
             else:
                 rotary_emb = DynamicNTKScalingRotaryEmbedding(
@@ -263,6 +276,7 @@ def get_rope(
                     is_neox_style,
                     scaling_factor,
                     dtype,
+                    deterministic=deterministic,
                 )
         elif scaling_type == "yarn":
             scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
@@ -297,6 +311,7 @@ def get_rope(
                     dtype,
                     mrope_section=rope_scaling["mrope_section"],
                     mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+                    deterministic=deterministic,
                     **extra_kwargs,
                 )
             else:
@@ -308,6 +323,7 @@ def get_rope(
                     is_neox_style,
                     scaling_factor,
                     dtype,
+                    deterministic=deterministic,
                     **extra_kwargs,
                 )
         elif scaling_type == "deepseek_yarn":
@@ -339,6 +355,7 @@ def get_rope(
                 is_neox_style,
                 scaling_factor,
                 dtype,
+                deterministic=deterministic,
                 **extra_kwargs,
             )
         elif scaling_type == "longrope":
@@ -375,6 +392,7 @@ def get_rope(
                 base,
                 is_neox_style,
                 dtype,
+                deterministic=deterministic,
             )
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
