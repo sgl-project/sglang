@@ -2,8 +2,8 @@
 
 Regression: runtime updates (weight version, model path, HiCache attach) were
 written onto the manager's ServerArgs instance so that the readback endpoints
-would show them. They are per-engine — several Engines can share a tokenizer
-process — so they live on the manager and the endpoints overlay them.
+would show them. The record stays pristine; the updates live in a separate log
+that the endpoints overlay on top of it.
 """
 
 import re
@@ -38,11 +38,6 @@ class TestTokenizerConfigUpdates(CustomTestCase):
         manager = _manager(weight_version="v1")
         manager.record_config_updates("test", weight_version="v2")
         self.assertEqual(manager.server_args.weight_version, "v1")
-
-    def test_two_engines_keep_their_own_updates(self):
-        first, second = _manager(weight_version="v1"), _manager(weight_version="v1")
-        first.record_config_updates("test", weight_version="v2")
-        self.assertEqual(second.config_value("weight_version"), "v1")
 
     def test_the_readback_dict_carries_the_updates(self):
         manager = _manager(hicache_storage_backend=None)

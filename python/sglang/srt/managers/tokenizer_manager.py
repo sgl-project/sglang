@@ -2057,11 +2057,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def record_config_updates(self, source: str, **fields) -> None:
         """Record a control-plane config change for this engine.
 
-        Per-engine state: several ``Engine``s can share one tokenizer process.
-        The readback endpoints overlay these onto the startup config. The
-        process-global sibling is ``RuntimeContext.override`` /
-        ``resolved_server_args_dict``, which writes the config bags every
-        process shares.
+        These are post-startup facts the config bags do not model (weight
+        version, model path, the tokenizer's HiCache mirror); the readback
+        endpoints overlay them onto the startup config. The process-global
+        sibling is ``RuntimeContext.override`` / ``resolved_server_args_dict``,
+        which writes the config bags.
         """
         unknown = sorted(f for f in fields if f not in _SERVER_ARGS_FIELDS)
         if unknown:
