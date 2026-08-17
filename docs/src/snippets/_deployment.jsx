@@ -1981,6 +1981,7 @@ export const Deployment = ({ config, benchmarks }) => {
             <div className="sgd-builder-context-note">
               {currentOption?.description && <p>{currentOption.description}</p>}
               {dim.learnMore && <a href={dim.learnMore}>Learn more →</a>}
+              {dim.docsHref && <a href={dim.docsHref}>SGLang docs →</a>}
             </div>
           )}
         </section>

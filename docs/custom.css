@@ -304,7 +304,9 @@ html.dark table tbody tr:nth-child(even) td,
   background: var(--sgdb-thumb-bg);
   box-shadow: var(--sgdb-thumb-shadow);
   content: "";
-  transition: transform var(--sgdb-spring-dur) var(--sgdb-spring);
+  /* Glide and settle, no overshoot: a scope switch is a frequent functional
+     action, so the slide itself carries the life and a bounce would be noise. */
+  transition: transform 300ms var(--sgdb-ease);
 }
 
 .sgd-builder-scope-tabs:has(> button:nth-child(2)[data-active="true"])::before { transform: translateX(100%); }
