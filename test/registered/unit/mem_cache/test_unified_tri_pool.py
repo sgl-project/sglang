@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.unified_memory_pool import (
     MHASubPoolSpec,
     UnifiedKVPool,
     UnifiedMambaSlotAllocator,
+    init_unified_mamba_swa_pools,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -592,6 +593,89 @@ class TestTriDeferredAbsorption(unittest.TestCase):
             alloc.free_swa(v, start_pos=0)
         self.assertTrue(sa._is_frontier_transparent())
         self.assertEqual(sa._hole_pages(), 0)
+
+
+class TestTriFactorySizing(unittest.TestCase):
+    """Factory-level contracts: byte-budget sizing, the bs=1 feasibility
+    floor, and the boot signature the GPU harness greps for (3 sub-pools,
+    swa grow=float)."""
+
+    def _factory_kwargs(self, **over):
+        import types
+
+        cp = types.SimpleNamespace(
+            shape=types.SimpleNamespace(conv=[(3, 8)], temporal=(0, 0, 0)),
+            dtype=types.SimpleNamespace(conv=torch.bfloat16, temporal=torch.float32),
+            layers=[0, 1],
+        )
+        kw = dict(
+            device=_DEV,
+            kv_cache_dtype=torch.float16,
+            head_num=2,
+            head_dim=4,
+            v_head_dim=4,
+            swa_head_num=2,
+            swa_head_dim=4,
+            swa_v_head_dim=4,
+            page_size=1,
+            start_layer=0,
+            end_layer=2,
+            swa_attention_layer_ids=[1],
+            full_attention_layer_ids=[0],
+            mamba_layer_ids=[0, 1],
+            mamba2_cache_params=cp,
+            full_max_total_num_tokens=64,
+            swa_max_total_num_tokens=32,
+            max_mamba_cache_size=4,
+            model_context_len=16,
+            extra_max_context_len=4,
+            max_num_reqs=4,
+            enable_memory_saver=False,
+            enable_mamba_extra_buffer=False,
+            disable_overlap_schedule=True,
+            need_sort=False,
+        )
+        kw.update(over)
+        return kw
+
+    def test_budget_sizing_and_boot_signature(self):
+        budget = 1 << 20
+        bundle = init_unified_mamba_swa_pools(
+            **self._factory_kwargs(unified_total_bytes=budget)
+        )
+        pool = bundle.unified_memory_pool
+        # Buffer = budget + the state pool's bytes (budget captured AFTER the
+        # state carve-out), never the token-count re-sum.
+        state_bytes = 4 * pool.spec("mamba").entry_bytes()
+        self.assertEqual(pool.total_bytes, budget + state_bytes)
+        # Boot signature: 3 sub-pools in chain order, swa is the float.
+        self.assertEqual(len(pool.sub_pool_specs), 3)
+        self.assertEqual(
+            [(sp.name, sp.grow_direction) for sp in pool.sub_pool_specs],
+            [("mamba", "up"), ("swa", "float"), ("full", "down")],
+        )
+
+    def test_fallback_is_the_token_count_resum(self):
+        bundle = init_unified_mamba_swa_pools(**self._factory_kwargs())
+        pool = bundle.unified_memory_pool
+        want = (
+            64 * pool.spec("full").entry_bytes()
+            + 32 * pool.spec("swa").entry_bytes()
+            + 4 * pool.spec("mamba").entry_bytes()
+        )
+        self.assertEqual(pool.total_bytes, want)
+
+    def test_bs1_floor_fails_loud_before_construction(self):
+        """A budget far below one worst-case request must raise BEFORE any
+        pool construction — under-sizing is a retract LIVELOCK at runtime."""
+        with self.assertRaisesRegex(RuntimeError, "bs=1 floor"):
+            init_unified_mamba_swa_pools(
+                **self._factory_kwargs(
+                    unified_total_bytes=1024,  # << ctx * e_f alone
+                    model_context_len=100_000,
+                    sliding_window_size=64,
+                )
+            )
 
 
 if __name__ == "__main__":

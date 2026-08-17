@@ -1810,3 +1810,226 @@ def init_unified_swa_pools(
         token_to_kv_pool=token_to_kv_pool,
         token_to_kv_pool_allocator=allocator,
     )
+
+
+def init_unified_mamba_swa_pools(
+    *,
+    device: str,
+    kv_cache_dtype: torch.dtype,
+    head_num: int,
+    head_dim: int,
+    v_head_dim: int,
+    swa_head_num: int,
+    swa_head_dim: int,
+    swa_v_head_dim: int,
+    page_size: int,
+    start_layer: int,
+    end_layer: int,
+    swa_attention_layer_ids: List[int],
+    full_attention_layer_ids: List[int],
+    mamba_layer_ids: List[int],
+    mamba2_cache_params,
+    full_max_total_num_tokens: int,
+    swa_max_total_num_tokens: int,
+    max_mamba_cache_size: int,
+    model_context_len: int,
+    extra_max_context_len: int,
+    max_num_reqs: int,
+    enable_memory_saver: bool,
+    enable_mamba_extra_buffer: bool,
+    disable_overlap_schedule: bool,
+    need_sort: bool,
+    speculative_num_draft_tokens: Optional[int] = None,
+    forward_stream: Optional[torch.cuda.Stream] = None,
+    lazy_compaction: bool = False,
+    unified_total_bytes: Optional[int] = None,
+    sliding_window_size: Optional[int] = None,
+) -> UnifiedPoolBundle:
+    """Build the TRI-pool unified-memory-pool stack for models with full KV +
+    SWA KV + mamba/conv state (Inkling-class: `mambaish_config` AND
+    `is_hybrid_swa` simultaneously — Inkling's SConv state is conv-only but
+    rides the mamba machinery, so "mamba" here == the conv state pool).
+
+    Chain: ``[mamba (up END) | swa (FLOAT) | full (down END)]``. The KV side
+    is a `UnifiedSWAKVPool` (per-layer full/swa routing, asymmetric head
+    geometry supported); the state side is a `UnifiedHybridReqToTokenPool`
+    whose `mamba_pool` the model reads directly (sconv:
+    `req_to_token_pool.mamba2_layer_cache(layer).conv[...]` with
+    `translate_mamba_indices` for v->p).
+
+    Sizing inputs are the same token counts the 2-pool factories take (ratio-
+    fed until the byte configurator lands); the buffer budget is their byte
+    sum and the runtime split floats.
+    """
+    from sglang.srt.mem_cache.multi_ended_allocator import (
+        UnifiedMambaSWATokenToKVPoolAllocator,
+    )
+
+    assert page_size >= 1, f"page_size must be >= 1, got {page_size}"
+    assert (
+        len(full_attention_layer_ids) > 0
+    ), "tri-pool with zero full-attention layers is degenerate"
+    assert (
+        len(swa_attention_layer_ids) > 0
+    ), "tri-pool with zero SWA-attention layers is degenerate"
+    assert len(mamba_layer_ids) > 0, "tri-pool with zero state layers is degenerate"
+
+    store_dtype = _store_dtype_for(kv_cache_dtype)
+    # Placement: mamba/conv at the LOWEST bytes (end), full KV at the HIGHEST
+    # (end), SWA floating between — ends never relocate, so the fat request-
+    # granular state pool and the unbounded per-step grower are pinned; SWA's
+    # window-capped span with the cheapest slots to move floats.
+    full_spec = MHASubPoolSpec(
+        name="full",
+        layer_num=len(full_attention_layer_ids),
+        head_num=head_num,
+        head_dim=head_dim,
+        v_head_dim=v_head_dim,
+        store_dtype=store_dtype,
+        grow_direction="down",
+    )
+    swa_spec = MHASubPoolSpec(
+        name="swa",
+        layer_num=len(swa_attention_layer_ids),
+        head_num=swa_head_num,
+        head_dim=swa_head_dim,
+        v_head_dim=swa_v_head_dim,
+        store_dtype=store_dtype,
+        grow_direction="float",
+    )
+    cp = mamba2_cache_params
+    mamba_spec = MambaSubPoolSpec(
+        name="mamba",
+        layer_num=len(mamba_layer_ids),
+        conv_state_shapes=tuple(tuple(int(x) for x in s) for s in cp.shape.conv),
+        conv_dtype=cp.dtype.conv,
+        temporal_state_shape=tuple(int(x) for x in cp.shape.temporal),
+        temporal_dtype=cp.dtype.temporal,
+        grow_direction="up",
+    )
+    if unified_total_bytes is not None:
+        # PROFILED byte budget for the token side (captured pre-ratio-floor);
+        # the state pool's bytes ride on top. The token counts stay boot
+        # labels / conserve caps — the runtime split floats.
+        total_bytes = (
+            unified_total_bytes + max_mamba_cache_size * mamba_spec.entry_bytes()
+        )
+    else:
+        total_bytes = (
+            full_max_total_num_tokens * full_spec.entry_bytes()
+            + swa_max_total_num_tokens * swa_spec.entry_bytes()
+            + max_mamba_cache_size * mamba_spec.entry_bytes()
+        )
+    # bs=1 floor (the retract loop's terminal guarantee), tri form: full KV at
+    # max context + ONE sliding window of swa KV (+ a page of slack, clamped
+    # to the context) + the state slots ONE running request locks (1 active +
+    # 2 radix checkpoints — a per-request FLOOR, not headroom) + the reserved
+    # slot-0 sink.
+    swa_bs1_tokens = (
+        min(model_context_len, sliding_window_size + page_size)
+        if sliding_window_size is not None
+        else model_context_len
+    )
+    _check_bs1_feasibility_floor(
+        total_bytes=total_bytes,
+        floor_terms=[
+            ("full_ctx_kv", model_context_len * full_spec.entry_bytes()),
+            ("swa_window_kv", swa_bs1_tokens * swa_spec.entry_bytes()),
+            ("bs1_state_slots", 3 * mamba_spec.entry_bytes()),
+            (
+                "sink",
+                _reserved_floor_bytes([full_spec, swa_spec, mamba_spec], page_size),
+            ),
+        ],
+        factory="init_unified_mamba_swa_pools",
+    )
+    shared_pool = UnifiedKVPool(
+        total_bytes=total_bytes,
+        sub_pool_specs=[full_spec, swa_spec, mamba_spec],
+        device=device,
+        enable_memory_saver=enable_memory_saver,
+        page_size=page_size,
+    )
+    token_to_kv_pool = UnifiedSWAKVPool(
+        unified_buffer=shared_pool,
+        swa_attention_layer_ids=swa_attention_layer_ids,
+        full_attention_layer_ids=full_attention_layer_ids,
+        page_size=page_size,
+        start_layer=start_layer,
+        end_layer=end_layer,
+        enable_memory_saver=enable_memory_saver,
+    )
+    req_to_token_pool = UnifiedHybridReqToTokenPool(
+        unified_buffer=shared_pool,
+        mamba_sub_pool_name="mamba",
+        size=max_num_reqs,
+        mamba_spec_state_size=max_num_reqs,
+        max_context_len=model_context_len + extra_max_context_len,
+        device=device,
+        enable_memory_saver=enable_memory_saver,
+        cache_params=mamba2_cache_params,
+        mamba_layer_ids=mamba_layer_ids,
+        enable_mamba_extra_buffer=enable_mamba_extra_buffer,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
+        enable_overlap_schedule=not disable_overlap_schedule,
+        start_layer=start_layer,
+    )
+    allocator = UnifiedMambaSWATokenToKVPoolAllocator(
+        unified_buffer=shared_pool,
+        kvcache=token_to_kv_pool,
+        mamba_kvcache=req_to_token_pool.mamba_pool,
+        device=device,
+        full_max_total_num_tokens=full_max_total_num_tokens,
+        swa_max_total_num_tokens=swa_max_total_num_tokens,
+        page_size=page_size,
+        need_sort=need_sort,
+        forward_stream=forward_stream,
+        lazy_compaction=lazy_compaction,
+    )
+    # Wrap the composite's mamba end in the slot allocator (PHYSICAL view) the
+    # radix MambaComponent / model-side sconv reads consume.
+    mamba_slot_allocator = UnifiedMambaSlotAllocator(
+        allocator.mamba_allocator,
+        max_size=req_to_token_pool._shared_mamba_size,
+        device=device,
+    )
+    req_to_token_pool.mamba_allocator = mamba_slot_allocator
+
+    logger.info(
+        "[unified-memory-pool] ============================================================"
+    )
+    logger.info(
+        "[unified-memory-pool] UNIFIED MEMORY POOL ENABLED -- path=SWA+Mamba tri-pool"
+    )
+    logger.info(
+        "[unified-memory-pool]   full_layers=%d, swa_layers=%d, state_layers=%d, "
+        "head_num=%d/%d, head_dim=%d/%d, page_size=%d",
+        len(full_attention_layer_ids),
+        len(swa_attention_layer_ids),
+        len(mamba_layer_ids),
+        head_num,
+        swa_head_num,
+        head_dim,
+        swa_head_dim,
+        page_size,
+    )
+    logger.info(
+        "[unified-memory-pool]   total_bytes=%d (=%.2f GB), full_max=%d, swa_max=%d, "
+        "max_mamba_cache_size=%d, max_num_reqs=%d, joint_available=%d",
+        total_bytes,
+        total_bytes / GB,
+        full_max_total_num_tokens,
+        swa_max_total_num_tokens,
+        max_mamba_cache_size,
+        max_num_reqs,
+        allocator.available_size(),
+    )
+    logger.info(
+        "[unified-memory-pool] ============================================================"
+    )
+    return UnifiedPoolBundle(
+        unified_memory_pool=shared_pool,
+        token_to_kv_pool=token_to_kv_pool,
+        token_to_kv_pool_allocator=allocator,
+        req_to_token_pool=req_to_token_pool,
+    )
