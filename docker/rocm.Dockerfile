@@ -5,6 +5,7 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm10 -t v0.5.10.post1-rocm10-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm10 -t v0.5.10.post1-rocm10-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx1250-rocm7_15 -t v0.5.10.post1-rocm7.15-mi45x -f rocm.Dockerfile .
 
 # Usage (to build SGLang ROCm + Mori docker image):
 # remove --build-arg NIC_BACKEND=ainic since new MoRI JIT will do NIC auto detection on target
@@ -15,6 +16,10 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
+# The rocm7_15 / rocm10 stages build on ubuntu:24.04, so MORI's ainic apt repo
+# needs the matching codename; UBUNTU_CODENAME defaults to jammy for the 22.04 bases.
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm10 --build-arg ENABLE_MORI=1 --build-arg UBUNTU_CODENAME=noble -t v0.5.10.post1-rocm10-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx1250-rocm7_15 --build-arg ENABLE_MORI=1 --build-arg UBUNTU_CODENAME=noble -t v0.5.10.post1-rocm7.15-mi45x -f rocm.Dockerfile .
 
 # Usage (to build SGLang ROCm + NIXL docker image, for prefill/decode disaggregation):
 # Builds UCX (--with-rocm) and upstream ai-dynamo/nixl from source by default.
@@ -33,6 +38,9 @@ ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_rele
 # deps (st_attn, vsa, petit_kernel, wave-lang) have neither a cp314 wheel nor an
 # sdist, so `pip install -e python[dev_hip]` cannot resolve at all.
 ARG BASE_IMAGE_ROCM10="ubuntu:24.04"
+# ROCm 7.15 (gfx1250 / MI45x) is assembled the same way, for the same reason:
+# there is no rocm/pytorch image for it either.
+ARG BASE_IMAGE_1250_ROCM7_15="ubuntu:24.04"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -46,6 +54,8 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+ENV TRITON_COMMIT_DEFAULT=""
+ENV PYTORCH_ROCM_ARCH_DEFAULT="gfx942;gfx950"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -56,6 +66,8 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+ENV TRITON_COMMIT_DEFAULT=""
+ENV PYTORCH_ROCM_ARCH_DEFAULT="gfx942;gfx950"
 
 # ===============================
 # Base image 950 and args
@@ -66,6 +78,8 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+ENV TRITON_COMMIT_DEFAULT=""
+ENV PYTORCH_ROCM_ARCH_DEFAULT="gfx942;gfx950"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -76,6 +90,8 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+ENV TRITON_COMMIT_DEFAULT=""
+ENV PYTORCH_ROCM_ARCH_DEFAULT="gfx942;gfx950"
 
 # ===============================
 # Shared ROCm 10 base: Ubuntu 24.04 + Python 3.12 + the ROCm 10 pip stack.
@@ -169,6 +185,8 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+ENV TRITON_COMMIT_DEFAULT=""
+ENV PYTORCH_ROCM_ARCH_DEFAULT="gfx942;gfx950"
 
 # ===============================
 # Base image 950 with rocm10 and args
@@ -179,6 +197,78 @@ ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+ENV TRITON_COMMIT_DEFAULT=""
+ENV PYTORCH_ROCM_ARCH_DEFAULT="gfx942;gfx950"
+
+# ===============================
+# Base image 1250 (MI45x / Helios) with rocm7_15 and args.
+# Same shape as rocm10-base: Ubuntu 24.04 + Python 3.12 + a pip-installed ROCm
+# SDK, because ROCm 7.15 publishes no rocm/pytorch image either. Kept as its own
+# stage rather than a rocm10-base variant: the SDK version, the torch/triton
+# pins and the device extra all differ, and only the gfx1250 wheels exist here.
+FROM $BASE_IMAGE_1250_ROCM7_15 AS gfx1250-rocm7_15
+
+ARG ROCM_VERSION_7_15="7.15.0a20260712"
+ARG TORCH_VERSION_7_15="2.11.0"
+ARG TORCHVISION_VERSION_7_15="0.26.0"
+ARG TRITON_VERSION_7_15="3.7.1+git0263a6a6"
+ARG ROCM_INDEX_URL="https://rocm.nightlies.amd.com/whl-multi-arch/"
+ARG ROCM_EXTRA_INDEX_URL="https://rocm.devreleases.amd.com/whl-multi-arch/"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        gnupg \
+        libstdc++-12-dev \
+        python-is-python3 \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3.12-venv \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3 -m venv "$VIRTUAL_ENV"
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+RUN python3 -m pip install --no-cache-dir -U pip setuptools setuptools_scm wheel
+
+RUN python3 -m pip install --no-cache-dir --pre \
+        --index-url ${ROCM_INDEX_URL} \
+        --extra-index-url ${ROCM_EXTRA_INDEX_URL} \
+        "rocm[libraries,devel,device-gfx1250]==${ROCM_VERSION_7_15}" \
+        "torch[device-gfx1250]==${TORCH_VERSION_7_15}+rocm${ROCM_VERSION_7_15}" \
+        "torchvision[device-gfx1250]==${TORCHVISION_VERSION_7_15}+rocm${ROCM_VERSION_7_15}" \
+        "torchaudio==${TORCH_VERSION_7_15}+rocm${ROCM_VERSION_7_15}" \
+        "triton==${TRITON_VERSION_7_15}.rocm${ROCM_VERSION_7_15}"
+
+RUN rocm-sdk init && rocm-sdk targets
+
+ENV ROCM_HOME=$VIRTUAL_ENV/lib/python3.12/site-packages/_rocm_sdk_devel
+ENV ROCM_PATH=$ROCM_HOME
+ENV CPATH=$ROCM_HOME/include
+ENV LIBRARY_PATH=$ROCM_HOME/lib
+ENV LD_LIBRARY_PATH=$ROCM_HOME/lib
+RUN echo 'export PATH=$ROCM_HOME/llvm/bin:$ROCM_HOME/bin:$PATH' >> /etc/bash.bashrc
+
+# Same two pip-SDK fixups as rocm10-base: hsakmtTargets.cmake hardcodes
+# /usr/lib64/libc.so from its build host, and everything downstream (AITER's
+# amdgpu-arch probe included) addresses the SDK as /opt/rocm.
+RUN mkdir -p /usr/lib64 && ln -sf /lib/x86_64-linux-gnu/libc.so /usr/lib64/libc.so
+RUN ln -s ${ROCM_HOME} /opt/rocm
+
+ENV BUILD_VLLM="0"
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT="aa30480f3bcda73da17a44339a3d05beedf83f2c"
+ENV TRITON_COMMIT_DEFAULT="76940ad348795521b3dc9f6c79acd7309ff924e3"
+# The 7.15 SDK ships gfx1250 device wheels only, and this image targets one
+# arch; see the PYTORCH_ROCM_ARCH default in the final stage.
+ENV PYTORCH_ROCM_ARCH_DEFAULT="gfx1250"
 
 # Local source stage: with BRANCH_TYPE=local the build context is copied here and
 # used instead of git clone (mirrors docker/Dockerfile's local_src stage).
@@ -192,7 +282,12 @@ FROM ${GPU_ARCH}
 # This is necessary for scope purpose, again
 ARG GPU_ARCH=gfx950
 ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
-ENV PYTORCH_ROCM_ARCH=gfx942;gfx950
+# torch's cpp_extension reads this when building the out-of-tree extensions
+# below (fast-hadamard-transform, Mooncake, ...), so it has to name arches the
+# stage's own ROCm can compile: gfx1250 does not exist for the ROCm 7.0/7.2
+# compilers, and the gfx1250 SDK carries no gfx942/gfx950 device wheels. Each
+# base stage declares what its own SDK can build.
+ENV PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH_DEFAULT}"
 
 ARG SGL_REPO="https://github.com/sgl-project/sglang.git"
 ARG SGL_DEFAULT="main"
@@ -205,6 +300,13 @@ ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
 ENV AITER_COMMIT="${AITER_COMMIT:-${AITER_COMMIT_DEFAULT}}"
+
+# Triton source build, used only by stages with a non-empty TRITON_COMMIT_DEFAULT
+# (currently gfx1250-rocm7_15); everything else keeps its base image's Triton or
+# takes AITER's pin through install_triton.sh.
+ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
+ARG TRITON_COMMIT=""
+ENV TRITON_COMMIT="${TRITON_COMMIT:-${TRITON_COMMIT_DEFAULT}}"
 
 ARG LLVM_REPO="https://github.com/jrbyrnes/llvm-project.git"
 ARG LLVM_BRANCH="MainOpSelV2"
@@ -273,8 +375,8 @@ RUN set -eux; \
       *rocm720*) \
         echo "ROCm 7.2 (GPU_ARCH=${GPU_ARCH}): libdrm-amdgpu packages already present, skipping"; \
         ;; \
-      *rocm10*) \
-        echo "ROCm 10 (GPU_ARCH=${GPU_ARCH}): libdrm comes with the pip ROCm SDK, skipping"; \
+      *rocm10*|*rocm7_15*) \
+        echo "ROCm 7.15 / 10 (GPU_ARCH=${GPU_ARCH}): libdrm comes with the pip ROCm SDK, skipping"; \
         ;; \
       *) \
         echo "ROCm 7.0 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu packages"; \
@@ -299,9 +401,14 @@ RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which
 
 # Install AMD SMI Python package from ROCm distribution.
 # Neither the ROCm 7.2 base image (rocm/pytorch) nor the pip-installed ROCm 10
-# SDK pre-installs this package.
+# SDK pre-installs this package. ROCm 7.15 is excluded on purpose: importing its
+# amdsmi alongside torch races during module initialisation, so the gfx1250
+# image ships without it until that is fixed upstream.
 RUN set -eux; \
     case "${GPU_ARCH}" in \
+      *rocm7_15*) \
+        echo "ROCm 7.15 (GPU_ARCH=${GPU_ARCH}): skip amdsmi installation (torch init race)"; \
+        ;; \
       *rocm720*|*rocm10*) \
         echo "ROCm 7.2 / 10 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
         cd /opt/rocm/share/amd_smi \
@@ -349,10 +456,19 @@ RUN git clone ${AITER_REPO} \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
 
+# The rocm7_15 branch differs on three counts: AITER's CK kernels do not build
+# against the gfx1250 SDK's composable_kernel (ENABLE_CK=0, and no
+# PREBUILD_KERNELS pass), the compiler lives in the pip SDK rather than on PATH,
+# and the install must not be isolated or pip would pull a non-ROCm torch to
+# build against.
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
-     && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
+     && case "${GPU_ARCH}" in *rocm7_15*) AITER_ROCM7_15=1 ;; *) AITER_ROCM7_15=0 ;; esac \
+     && if [ "$AITER_ROCM7_15" = "1" ]; then \
+          PATH=$PATH:$ROCM_HOME/llvm/bin ENABLE_CK=0 GPU_ARCHS="${GPU_ARCH_LIST}" python setup.py build_ext --inplace \
+          && PATH=$PATH:$ROCM_HOME/llvm/bin ENABLE_CK=0 GPU_ARCHS="${GPU_ARCH_LIST}" pip install --no-build-isolation -e .; \
+        elif [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
           sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
           && sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
         elif [ "$BUILD_AITER_ALL" = "1" ]; then \
@@ -410,6 +526,12 @@ ENV CARGO_BUILD_JOBS=4
 RUN pip uninstall -y sgl_kernel sglang
 
 # Obtain sglang source: copied from the build context (BRANCH_TYPE=local) or git clone.
+#
+# On the rocm7_15 stage the install is additionally constrained to the torch and
+# triton already in the venv and run without build isolation: those come from
+# AMD's ROCm 7.15 index under a local version, and an isolated, unconstrained
+# resolve is free to satisfy sglang's bare `torch` requirement with a PyPI CUDA
+# build instead.
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
          echo "Using local source (BRANCH_TYPE=local)."; \
@@ -438,10 +560,15 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
          *rocm7_15*|*rocm10*) CT_EXTRA="rocm_rock" ;; \
          *)                   CT_EXTRA="rocm_legacy" ;; \
        esac \
+    && case "${GPU_ARCH}" in \
+         *rocm7_15*) pip freeze | grep -E '^(torch|triton)' > /tmp/rocm-constraints.txt \
+                     && PIP_EXTRA="--no-build-isolation -c /tmp/rocm-constraints.txt" ;; \
+         *)          PIP_EXTRA="" ;; \
+       esac \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[srt_hip,diffusion_hip,${CT_EXTRA}]"; \
+         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install ${PIP_EXTRA} -e "python[srt_hip,diffusion_hip,${CT_EXTRA}]"; \
        else \
-         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[all_hip,${CT_EXTRA}]"; \
+         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install ${PIP_EXTRA} -e "python[all_hip,${CT_EXTRA}]"; \
        fi
 
 RUN python -m pip cache purge
@@ -534,7 +661,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   git fetch --depth=1 origin "${TILELANG_COMMIT}" || true && \
   git checkout -f "${TILELANG_COMMIT}" && \
   git submodule update --init --recursive && \
-  export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=/opt/rocm -DLLVM_CONFIG=${LLVM_CONFIG} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}" && \
+  export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=${ROCM_HOME:-/opt/rocm} -DLLVM_CONFIG=${LLVM_CONFIG} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}" && \
   "$VENV_PIP" install -e . -v --no-build-isolation --no-deps; \
   if [ -f pyproject.toml ]; then sed -i "/^[[:space:]]*\"torch/d" pyproject.toml || true; fi; \
   "$VENV_PIP" cache purge || true; \
@@ -794,13 +921,33 @@ PY
 # Install the Triton AITER pins, replacing the base image's. No version check
 # on purpose: the pin is AITER's to move, and its installer enforces a floor.
 #
+# rocm7_15 builds from source at TRITON_COMMIT instead: AITER's install_triton.sh
+# reads its index from `dpkg -l rocm-core`, which a pip-installed SDK does not
+# register, so it would silently fall back to the ROCm 7.2 index and drop a
+# 7.2-built Triton into a 7.15 image.
+#
 # Keep this last. Base ROCm Torch pins triton==3.5.1 and the torch patch above
 # is what drops that pin, so installing Triton any earlier lets the next pip
 # install pull CUDA torch instead. The hip check below is the tripwire.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
-        cd /sgl-workspace/aiter \
-     && test -f .github/scripts/install_triton.sh \
-     && PIP_NO_CACHE_DIR=1 bash .github/scripts/install_triton.sh \
+        case "${GPU_ARCH}" in \
+          *rocm7_15*) \
+            echo "[Triton] ROCm 7.15: building from source (${TRITON_COMMIT})"; \
+            pip uninstall -y triton \
+            && apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/* \
+            && git clone ${TRITON_REPO} /sgl-workspace/triton-custom \
+            && cd /sgl-workspace/triton-custom \
+            && git checkout ${TRITON_COMMIT} \
+            && pip install -r python/requirements.txt \
+            && pip install -e . \
+            && if [ -d python/triton_kernels ]; then pip install -e python/triton_kernels --no-deps; fi; \
+            ;; \
+          *) \
+            cd /sgl-workspace/aiter \
+            && test -f .github/scripts/install_triton.sh \
+            && PIP_NO_CACHE_DIR=1 bash .github/scripts/install_triton.sh; \
+            ;; \
+        esac \
      && python3 -c "import torch; from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); assert torch.version.hip is not None, torch.__version__; print(f'[Triton] ROCm Torch {torch.__version__}, Triton {v}, triton-kernels {k}')"; \
     fi
 
