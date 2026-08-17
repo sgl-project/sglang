@@ -1657,21 +1657,34 @@ def _check_dsa_backend_constraints(
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
-    fp8_rocm_only = {"tilelang", "triton"} & chosen
-    if not hip and kv_cache_dtype == "fp8_e4m3" and fp8_rocm_only:
+    cuda_fp8_unsupported = {"tilelang"} & chosen
+    if not hip and kv_cache_dtype == "fp8_e4m3" and cuda_fp8_unsupported:
         raise ValueError(
-            f"The {'/'.join(sorted(fp8_rocm_only))} DSA prefill/decode kernels "
+            f"The {'/'.join(sorted(cuda_fp8_unsupported))} DSA prefill/decode kernels "
             "only support an fp8_e4m3 KV cache on ROCm/HIP; on CUDA they require "
             "a bfloat16 KV cache. Use --kv-cache-dtype bfloat16, or keep "
             "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
-    if hip and kv_cache_dtype != "fp8_e4m3" and fp8_rocm_only:
+    if hip and kv_cache_dtype != "fp8_e4m3" and rocm_only:
         raise ValueError(
-            f"The {'/'.join(sorted(fp8_rocm_only))} DSA kernels on ROCm require "
+            f"The {'/'.join(sorted(rocm_only))} DSA kernels on ROCm require "
             "fp8_e4m3 KV cache. Use --kv-cache-dtype fp8_e4m3."
         )
+
+
+def _check_tilelang_dsa_fp8_kv(
+    kv_cache_dtype: str,
+    prefill_backend: Optional[str],
+    decode_backend: Optional[str],
+    *,
+    hip: bool,
+) -> None:
+    """Backward-compatible entry point for the TileLang DSA validation."""
+    _check_dsa_backend_constraints(
+        kv_cache_dtype, prefill_backend, decode_backend, hip=hip
+    )
 
 
 @register_post_process
@@ -1733,6 +1746,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         return declared
 
     if not user_set_prefill and not user_set_decode and is_hip():
+        default = "triton" if kv_cache_dtype == "fp8_e4m3" else "tilelang"
         declared["dsa_prefill_backend"] = "triton"
         declared["dsa_decode_backend"] = "triton"
     elif kv_cache_dtype == "fp8_e4m3":
