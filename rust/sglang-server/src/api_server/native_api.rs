@@ -7,7 +7,7 @@
 //! generate-request submission (`submit`); the shared `AppState` lives in the
 //! parent `api_server` module.
 
-use std::convert::Infallible;
+use std::{convert::Infallible, time::Instant};
 
 use axum::{
     Json, Router,
@@ -30,7 +30,9 @@ use super::guard::AbortGuard;
 use super::submit::submit;
 use crate::environ::env_bool;
 use crate::ids::Rid;
-use crate::message::{EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams};
+use crate::message::{
+    ChunkEvent, EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams,
+};
 use crate::utils::response::{error_response, error_value};
 
 /// The routes this module owns, mounted by `api_server::serve`.
@@ -168,6 +170,11 @@ async fn generate(
             return native_error(code, &e.to_string(), stream);
         }
     };
+    // Python starts APIServerReqTimeStats after request normalization and before
+    // tokenization / multimodal preprocessing / scheduler dispatch. Start at the
+    // equivalent boundary: into_requests() has normalized the body, while prefetch
+    // and every downstream stage are still ahead of us.
+    let created_at = Instant::now();
     // Media I/O (URL downloads, file reads) happens here, on the API runtime
     // — never on the MM worker pool (see `prefetch`).
     if let Err(e) = super::prefetch::prefetch_all(&mut payloads).await {
@@ -179,9 +186,9 @@ async fn generate(
             .into_iter()
             .next()
             .expect("into_requests yields >=1 payload");
-        generate_single(&state, payload, stream).await
+        generate_single(&state, payload, stream, created_at).await
     } else {
-        generate_batch(&state, payloads, stream).await
+        generate_batch(&state, payloads, stream, created_at).await
     }
 }
 
@@ -190,7 +197,12 @@ async fn generate(
 ///
 /// A single (non-batched) `/generate`: submit one request, then either stream its
 /// SSE frames or fold to one unary response.
-async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -> Response {
+async fn generate_single(
+    state: &AppState,
+    req: GenerateRequest,
+    stream: bool,
+    created_at: Instant,
+) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // `frame_value` just reads them — no tokenizer needed here.
     let (rid_str, mut rx) = match submit(state, RequestKind::Generate(Box::new(req)), stream).await
@@ -209,13 +221,14 @@ async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -
         // A single request is a 1-element batch without the `index` field — reuse
         // the same stream so the frame/abort/truncation logic lives in one place.
         use futures::StreamExt;
-        let s = generation_event_stream(vec![(rid_str, rx)], guard, incremental, false)
+        let s = generation_event_stream(vec![(rid_str, rx, created_at)], guard, incremental, false)
             .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(s).into_response()
     } else {
         // Unary: fold to the terminal, respond once. Disarm only on a real terminal
         // (a truncation leaves the guard armed so the scheduler work is aborted).
-        let (status, value, terminal) = drain_unary(&mut rx, rid_str.client_facing()).await;
+        let (status, value, terminal) =
+            drain_unary(&mut rx, rid_str.client_facing(), created_at).await;
         if terminal {
             guard.disarm(&rid_str);
         }
@@ -228,6 +241,7 @@ async fn generate_single(state: &AppState, req: GenerateRequest, stream: bool) -
 async fn drain_unary(
     rx: &mut mpsc::Receiver<EgressItem>,
     rid_str: &str,
+    created_at: Instant,
 ) -> (StatusCode, serde_json::Value, bool) {
     let mut acc = OutputAccumulator::default();
     while let Some(item) = rx.recv().await {
@@ -246,7 +260,9 @@ async fn drain_unary(
                         StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                     return (status, error_value(code, message), true);
                 }
-                return (StatusCode::OK, frame_value(&final_out, rid_str), true);
+                let mut value = frame_value(&final_out, rid_str);
+                add_e2e_latency(&mut value, created_at);
+                return (StatusCode::OK, value, true);
             }
             EgressItem::Error(e) => {
                 let code = e.http_status();
@@ -267,14 +283,16 @@ async fn drain_unary(
 }
 
 /// Batch `/generate`: submit all sub-requests first (scheduler runs them together),
-/// then either (unary) drain each in order into a JSON array, or (streaming)
-/// multiplex their streams into one SSE response, each frame carrying its `index`.
+/// then either (unary) drain them concurrently into a request-ordered JSON array,
+/// or (streaming) multiplex their streams into one SSE response, each frame carrying
+/// its `index`.
 /// One [`AbortGuard`] covers the batch. A failed unary item is its own
 /// `{ "error": … }` entry; the batch response is 200.
 async fn generate_batch(
     state: &AppState,
     requests: Vec<GenerateRequest>,
     stream: bool,
+    created_at: Instant,
 ) -> Response {
     // No cross-item rid collision to worry about: `into_requests` rejected duplicate
     // rids within this batch, and `Rid::from_client` made each one unique against
@@ -285,7 +303,7 @@ async fn generate_batch(
         match submit(state, RequestKind::Generate(Box::new(req)), stream).await {
             Ok((rid, rx)) => {
                 guard.arm(rid.clone());
-                receivers.push((rid, rx));
+                receivers.push((rid, rx, created_at));
             }
             Err(resp) => return resp,
         }
@@ -300,10 +318,20 @@ async fn generate_batch(
             .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(s).into_response()
     } else {
-        // Unary: drain each in order (already all submitted, so they run together).
-        let mut results = Vec::with_capacity(receivers.len());
-        for (rid_str, mut rx) in receivers {
-            let (_status, value, terminal) = drain_unary(&mut rx, rid_str.client_facing()).await;
+        // Unary: poll every item concurrently, as Python's gather does. `join_all`
+        // preserves input order for the final JSON array, while each drain observes
+        // its own terminal output promptly (important for per-item e2e_latency).
+        let drained = futures::future::join_all(receivers.into_iter().map(
+            |(rid_str, mut rx, request_created_at)| async move {
+                let client_rid = rid_str.client_facing().to_owned();
+                let (_status, value, terminal) =
+                    drain_unary(&mut rx, &client_rid, request_created_at).await;
+                (rid_str, value, terminal)
+            },
+        ))
+        .await;
+        let mut results = Vec::with_capacity(drained.len());
+        for (rid_str, value, terminal) in drained {
             if terminal {
                 guard.disarm(&rid_str);
             }
@@ -335,7 +363,7 @@ async fn recv_indexed(
 /// `with_index` tags each frame (batch only), `incremental` = delta vs cumulative,
 /// `guard` aborts unfinished on drop.
 fn generation_event_stream(
-    receivers: Vec<(Rid, mpsc::Receiver<EgressItem>)>,
+    receivers: Vec<(Rid, mpsc::Receiver<EgressItem>, Instant)>,
     mut guard: AbortGuard,
     incremental: bool,
     with_index: bool,
@@ -344,7 +372,14 @@ fn generation_event_stream(
         use futures::StreamExt;
 
         let n = receivers.len();
-        let rid_strs: Vec<Rid> = receivers.iter().map(|(rid, _)| rid.clone()).collect();
+        let rid_strs: Vec<Rid> = receivers
+            .iter()
+            .map(|(rid, _, _)| rid.clone())
+            .collect();
+        let created_at: Vec<Instant> = receivers
+            .iter()
+            .map(|(_, _, created_at)| *created_at)
+            .collect();
         let mut accs: Vec<OutputAccumulator> =
             (0..n).map(|_| OutputAccumulator::default()).collect();
 
@@ -354,7 +389,7 @@ fn generation_event_stream(
         // Poll all receivers concurrently; re-arm a receiver's future after each
         // non-terminal frame so its stream keeps flowing.
         let mut futs = futures::stream::FuturesUnordered::new();
-        for (i, (_, rx)) in receivers.into_iter().enumerate() {
+        for (i, (_, rx, _)) in receivers.into_iter().enumerate() {
             futs.push(recv_indexed(i, rx));
         }
 
@@ -399,7 +434,14 @@ fn generation_event_stream(
                 // carries the full cumulative state, so any coalesced ones are moot.
                 yield match out.finish_reason.as_ref().and_then(|f| f.abort_status()) {
                     Some((code, message)) => tag_value(error_value(code, message), idx(i)),
-                    None => stream_frame_string(out, &accs[i], incremental, rid_strs[i].client_facing(), idx(i)),
+                    None => terminal_stream_frame_string(
+                        out,
+                        &accs[i],
+                        incremental,
+                        rid_strs[i].client_facing(),
+                        idx(i),
+                        created_at[i],
+                    ),
                 };
                 guard.disarm(&rid_strs[i]); // terminal → not re-pushed
             } else {
@@ -413,12 +455,37 @@ fn generation_event_stream(
     }
 }
 
+/// Python's `e2e_latency` is `finished_time - created_time`, in seconds, and is
+/// attached only when the request finishes. The Rust native API owns the same
+/// lifecycle boundary, so it adds the value while handling the terminal egress
+/// item rather than putting API-only timing onto every scheduler `ChunkEvent`.
+fn add_e2e_latency(value: &mut serde_json::Value, created_at: Instant) {
+    value["meta_info"]["e2e_latency"] = serde_json::json!(created_at.elapsed().as_secs_f64());
+}
+
+/// Render a terminal streaming frame. Intermediate cumulative frames keep the
+/// memoized fast path; the one terminal frame uses the Value path so it can carry
+/// the request-local `e2e_latency`, exactly as Python does.
+fn terminal_stream_frame_string(
+    out: ChunkEvent,
+    acc: &OutputAccumulator,
+    incremental: bool,
+    rid_str: &str,
+    index: Option<usize>,
+    created_at: Instant,
+) -> String {
+    let mut value = super::frame::stream_frame_value(out, acc, incremental, rid_str);
+    add_e2e_latency(&mut value, created_at);
+    tag_value(value, index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::message::ChunkEvent;
     use crate::tokenizer_manager::Senders;
     use futures::StreamExt;
+    use std::time::Duration;
     fn senders() -> Senders {
         Senders {
             tm: flume::unbounded().0,
@@ -453,6 +520,57 @@ mod tests {
         serde_json::from_str(s).expect("frame is JSON")
     }
 
+    fn timed_receiver(
+        rid: u64,
+        rx: mpsc::Receiver<EgressItem>,
+    ) -> (Rid, mpsc::Receiver<EgressItem>, Instant) {
+        (
+            Rid::from(rid.to_string()),
+            rx,
+            Instant::now() - Duration::from_millis(10),
+        )
+    }
+
+    /// The native unary response uses the same names and meanings as Python's
+    /// TokenizerManager metadata, and adds e2e_latency only on the terminal
+    /// result. The timer is seconds from normalized-request acceptance through
+    /// terminal-output handling.
+    #[tokio::test]
+    async fn unary_terminal_meta_info_matches_python_semantics() {
+        let (tx, mut rx) = mpsc::channel(2);
+        tx.send(EgressItem::Done(ChunkEvent {
+            rid: "internal-rid".into(),
+            text: "ok".into(),
+            token_ids: vec![7, 8],
+            prompt_tokens: 5,
+            completion_tokens: 2,
+            finish_reason: serde_json::from_value(serde_json::json!({
+                "type": "length",
+                "length": 2
+            }))
+            .expect("finish reason must parse"),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        let created_at = Instant::now() - Duration::from_millis(20);
+        let (status, value, terminal) = drain_unary(&mut rx, "client-rid", created_at).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(terminal);
+        assert_eq!(value["meta_info"]["id"], "client-rid");
+        assert_eq!(value["meta_info"]["prompt_tokens"], 5);
+        assert_eq!(value["meta_info"]["completion_tokens"], 2);
+        assert_eq!(
+            value["meta_info"]["finish_reason"],
+            serde_json::json!({"type": "length", "length": 2})
+        );
+        assert!(
+            value["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.020,
+            "latency is expressed in seconds from request creation"
+        );
+    }
+
     /// Two sub-requests' frames interleave into one stream, each tagged with its
     /// batch `index`; text accumulates per item; `[DONE]` comes only after both
     /// terminate, then the stream ends.
@@ -460,7 +578,7 @@ mod tests {
     async fn interleaves_indexes_and_accumulates() {
         let (tx0, rx0) = mpsc::channel(8);
         let (tx1, rx1) = mpsc::channel(8);
-        let receivers = vec![("10".into(), rx0), ("11".into(), rx1)];
+        let receivers = vec![timed_receiver(10, rx0), timed_receiver(11, rx1)];
         let stream =
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
         futures::pin_mut!(stream);
@@ -481,11 +599,13 @@ mod tests {
         assert_eq!(v["index"], 0);
         assert_eq!(v["text"], "a!", "cumulative per item");
         assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
+        assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
 
         tx1.send(done(11, "?")).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["index"], 1);
         assert_eq!(v["text"], "b?");
+        assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
 
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
         assert!(stream.next().await.is_none());
@@ -497,7 +617,7 @@ mod tests {
     async fn per_item_error_carries_index() {
         let (tx0, rx0) = mpsc::channel(8);
         let (tx1, rx1) = mpsc::channel(8);
-        let receivers = vec![("10".into(), rx0), ("11".into(), rx1)];
+        let receivers = vec![timed_receiver(10, rx0), timed_receiver(11, rx1)];
         let stream =
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
         futures::pin_mut!(stream);
@@ -523,7 +643,7 @@ mod tests {
     #[tokio::test]
     async fn incremental_emits_deltas_with_cumulative_count() {
         let (tx, rx) = mpsc::channel(8);
-        let receivers = vec![("10".into(), rx)];
+        let receivers = vec![timed_receiver(10, rx)];
         let stream =
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, true);
         futures::pin_mut!(stream);
@@ -532,6 +652,7 @@ mod tests {
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["text"], "Hello");
         assert_eq!(v["meta_info"]["completion_tokens"], 1);
+        assert!(v["meta_info"].get("e2e_latency").is_none());
 
         tx.send(frame(10, " world")).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
@@ -540,12 +661,14 @@ mod tests {
             v["meta_info"]["completion_tokens"], 2,
             "count stays cumulative"
         );
+        assert!(v["meta_info"].get("e2e_latency").is_none());
 
         tx.send(done(10, "!")).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["text"], "!");
         assert_eq!(v["meta_info"]["completion_tokens"], 3);
         assert_eq!(v["meta_info"]["finish_reason"]["type"], "length");
+        assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
 
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
     }
@@ -555,7 +678,7 @@ mod tests {
     #[tokio::test]
     async fn single_shape_omits_index() {
         let (tx, rx) = mpsc::channel(8);
-        let receivers = vec![("10".into(), rx)];
+        let receivers = vec![timed_receiver(10, rx)];
         let stream =
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
         futures::pin_mut!(stream);
@@ -564,6 +687,7 @@ mod tests {
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["text"], "hi");
         assert!(v.get("index").is_none(), "single response has no index");
+        assert!(v["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.010);
 
         assert_eq!(stream.next().await.unwrap(), "[DONE]");
     }
@@ -575,7 +699,7 @@ mod tests {
     #[tokio::test]
     async fn cumulative_backlog_coalesces_to_latest() {
         let (tx, rx) = mpsc::channel(8);
-        let receivers = vec![("10".into(), rx)];
+        let receivers = vec![timed_receiver(10, rx)];
         let stream =
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, false);
         futures::pin_mut!(stream);
@@ -602,7 +726,7 @@ mod tests {
     #[tokio::test]
     async fn incremental_backlog_emits_every_delta() {
         let (tx, rx) = mpsc::channel(8);
-        let receivers = vec![("10".into(), rx)];
+        let receivers = vec![timed_receiver(10, rx)];
         let stream =
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), true, false);
         futures::pin_mut!(stream);
