@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 _LAYER = "sglang.multimodal_gen.runtime.layers.attention.layer"
 _SP = 2
@@ -127,3 +128,28 @@ class TestUSPAttentionMaskedReplicatedGuard(unittest.TestCase):
         ):
             with self.assertRaisesRegex(NotImplementedError, "replicated"):
                 obj.forward(q, q, q, attn_mask=mask, num_replicated_suffix=2)
+
+    def test_single_rank_masked_call_keeps_replicated_args(self):
+        # Without SP the mask describes the full sequence; the replicated
+        # counts are meaningless and must not be refused.
+        obj = USPAttention.__new__(USPAttention)
+        obj.attn_impl = _CaptureAttn()
+        obj.skip_sequence_parallel = False
+        obj.sp_attention_mode = "ulysses"
+        obj.sp_attention_mode_is_auto = False
+        obj.allow_cudnn_sdp = False
+        obj.softmax_scale = 0.5
+        obj.backend = AttentionBackendEnum.TORCH_SDPA
+        obj.causal = False
+        obj.dropout_p = 0.0
+        q = torch.randn(1, 6, 2, 4)
+        mask = torch.ones(1, 6, dtype=torch.bool)
+        with (
+            patch(
+                f"{_LAYER}.get_forward_context",
+                return_value=MagicMock(attn_metadata=None),
+            ),
+            patch(f"{_LAYER}.get_sequence_parallel_world_size", return_value=1),
+        ):
+            out = obj.forward(q, q, q, attn_mask=mask, num_replicated_prefix=2)
+        self.assertEqual(out.shape, q.shape)
