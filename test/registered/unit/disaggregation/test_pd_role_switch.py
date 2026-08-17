@@ -448,6 +448,7 @@ class TestMooncakeBootstrapThreadRobustness(unittest.TestCase):
         # ACKs, giving a side-effect-free probe of the receive loop.
         m.request_status = {}
         m._socket_send_locks = {}
+
         def _connect(endpoint, is_ipv6=False):
             m._socket_send_locks.setdefault(endpoint, threading.Lock())
             return m._connect.return_value

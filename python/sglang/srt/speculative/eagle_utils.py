@@ -92,7 +92,10 @@ def _eagle_prefill_tail_tokens(
         for i, r in enumerate(batch.reqs):
             if r is batch.chunked_req:
                 tail_tokens = tail_tokens.clone()
-                tail_tokens[i] = next_prompt_token
+                # Keep the scalar as a kernel argument. Assigning a Python scalar
+                # through scalar indexing issues a pageable H2D copy and
+                # synchronizes the current CUDA stream before draft extend.
+                tail_tokens[i : i + 1].fill_(next_prompt_token)
                 break
     return tail_tokens
 
@@ -821,19 +824,17 @@ def eagle_sample(
             deterministic=True,
         )
 
-        # Sync sampling results across TP ranks: different GPUs may
-        # produce slightly different target_probs due to floating-point
-        # non-determinism in softmax/top_k/top_p, causing different
-        # sampled tokens. Broadcast from rank 0 to ensure consistency.
-        tp_group = (
-            get_parallel().attn_tp_group
-            if is_dp_attention_enabled()
-            else get_tp_group()
-        )
-        if tp_group.world_size > 1:
-            tp_group.broadcast(predict, src=0)
-            tp_group.broadcast(accept_index, src=0)
-            tp_group.broadcast(num_correct_drafts, src=0)
+    # Sync the verify decision across TP ranks: small per-rank differences in the
+    # tensors feeding this point can make one rank accept a different number of
+    # drafts, which desynchronizes the committed seq_lens and deadlocks the next
+    # TP collective. Broadcast from rank 0 to ensure consistency.
+    tp_group = (
+        get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
+    )
+    if tp_group.world_size > 1:
+        tp_group.broadcast(predict, src=0)
+        tp_group.broadcast(accept_index, src=0)
+        tp_group.broadcast(num_correct_drafts, src=0)
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
