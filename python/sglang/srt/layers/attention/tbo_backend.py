@@ -10,7 +10,10 @@ from sglang.srt.layers.attention.base_attn_backend import (
 )
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.layers.attention.verify_mask import VerifyMask
+    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
@@ -124,6 +127,11 @@ class TboAttnBackend(AttentionBackend):
         return SharedReadEnds.max_of(
             b.shared_read_ends(fm) for b in (self.primary, *self.children)
         )
+
+    def get_query_quantization_dtype(
+        self, layer: RadixAttention, forward_mode: ForwardMode
+    ) -> Optional[torch.dtype]:
+        return self.primary.get_query_quantization_dtype(layer, forward_mode)
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self.primary.init_forward_metadata_in_graph(forward_batch=forward_batch)

@@ -149,6 +149,19 @@ class FlashAttentionBackend(AttentionBackend):
     # KV-index buffers directly, so it needs no backend-private replay state.
     supports_full_cuda_graph_chunked_prefix = True
 
+    def get_query_quantization_dtype(
+        self, layer: RadixAttention, forward_mode: ForwardMode
+    ) -> Optional[torch.dtype]:
+        """Return the graph-visible Q dtype required by the FA3 FP8 path."""
+        if (
+            self.fa_impl_ver != 3
+            or self.kv_cache_dtype_str == "auto"
+            or self.kv_cache_is_mxfp8
+            or layer.head_dim > 256
+        ):
+            return None
+        return self.kv_cache_dtype
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -1290,7 +1303,6 @@ class FlashAttentionBackend(AttentionBackend):
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 fa_k_descale = layer.k_scale.expand(descale_shape)
                 fa_v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         # Check if we should use local attention
@@ -1875,7 +1887,11 @@ class FlashAttentionBackend(AttentionBackend):
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 fa_k_descale = layer.k_scale.expand(descale_shape)
                 fa_v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
+            # FA4 has no graph-visible query-quantization capability yet.
+            # Preserve its decode-only conversion while FA3 receives Q from
+            # the RadixAttention quantization node.
+            if self.fa_impl_ver == 4:
+                q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if fa_k_descale is not None:

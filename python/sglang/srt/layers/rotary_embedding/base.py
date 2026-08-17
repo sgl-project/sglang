@@ -43,6 +43,9 @@ _is_mps = is_mps()
 
 if _is_cuda:
     from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
+    from sglang.kernels.ops.attention.rope_quant import (
+        apply_rope_and_quantize_query,
+    )
 
 if _is_npu:
     import torch_npu
@@ -136,6 +139,10 @@ class RotaryEmbedding(BaseFusedOp):
                 disable=_is_npu,
             )(apply_rotary_emb)
         self.position_cos, self.position_sin = None, None
+        self.supports_query_output_dtype = (
+            type(self).forward_native is RotaryEmbedding.forward_native
+            and type(self).forward_cuda is RotaryEmbedding.forward_cuda
+        )
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
         # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
@@ -238,6 +245,7 @@ class RotaryEmbedding(BaseFusedOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        query_output_dtype: Optional[torch.dtype] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
         assert (
@@ -264,6 +272,8 @@ class RotaryEmbedding(BaseFusedOp):
             query_rot, cos, sin, self.is_neox_style
         )
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+        if query_output_dtype is not None:
+            query = query.to(query_output_dtype)
 
         key_shape = key.shape
         key = key.view(num_tokens, -1, self.head_size)
@@ -280,11 +290,13 @@ class RotaryEmbedding(BaseFusedOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        query_output_dtype: Optional[torch.dtype] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-npu implementation of forward()."""
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for npu implementation"
+        assert query_output_dtype is None
         if (
             query.dtype == torch.bfloat16
             and self.cos_sin_cache.dtype == torch.float
@@ -340,10 +352,12 @@ class RotaryEmbedding(BaseFusedOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        query_output_dtype: Optional[torch.dtype] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for cpu implementation"
+        assert query_output_dtype is None
 
         positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
@@ -367,11 +381,31 @@ class RotaryEmbedding(BaseFusedOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[Union[FusedSetKVBufferArg, dict]] = None,
+        query_output_dtype: Optional[torch.dtype] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not self.use_fallback_kernel:
             batch_size = positions.size(0)
             q_rope = query.view(batch_size, -1, self.head_size)
             k_rope = key.view(batch_size, -1, self.head_size)
+            if (
+                query_output_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                and self.head_size == self.rotary_dim
+                and fused_set_kv_buffer_arg is None
+                and q_rope.dtype == k_rope.dtype
+                and q_rope.dtype in (torch.float16, torch.bfloat16)
+            ):
+                q_out = torch.empty(
+                    q_rope.shape, dtype=query_output_dtype, device=q_rope.device
+                )
+                apply_rope_and_quantize_query(
+                    q_rope,
+                    k_rope,
+                    q_out,
+                    self.cos_sin_cache,
+                    positions,
+                    is_neox=self.is_neox_style,
+                )
+                return q_out.reshape(query.shape), key
             if self.head_size != self.rotary_dim:
                 q_rope = q_rope[..., : self.rotary_dim]
                 k_rope = k_rope[..., : self.rotary_dim]
@@ -431,6 +465,8 @@ class RotaryEmbedding(BaseFusedOp):
                     self.cos_sin_cache,
                     self.is_neox_style,
                 )
+        if query_output_dtype is not None:
+            query = query.to(query_output_dtype)
         return query, key
 
     def extra_repr(self) -> str:
@@ -446,10 +482,12 @@ class RotaryEmbedding(BaseFusedOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
+        query_output_dtype: Optional[torch.dtype] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert (
             fused_set_kv_buffer_arg is None
         ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
+        assert query_output_dtype is None
         positions = torch.add(positions, offsets) if offsets is not None else positions
 
         self._match_cos_sin_cache_dtype(query)

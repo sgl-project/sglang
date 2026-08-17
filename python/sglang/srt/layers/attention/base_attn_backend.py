@@ -62,6 +62,21 @@ class AttentionBackend(ABC):
 
     supports_ragged_verify_graph: bool = False
 
+    def get_query_quantization_dtype(
+        self, layer: RadixAttention, forward_mode: ForwardMode
+    ) -> Optional[torch.dtype]:
+        """Return the dtype required for ``q`` before attention dispatch.
+
+        Query quantization is owned by :class:`RadixAttention`, rather than by
+        individual backend ``forward_*`` implementations. This keeps the cast
+        visible to the surrounding model graph, where ``torch.compile`` can
+        fuse it with preceding model operations. The model runner stamps this
+        static per-mode capability on each attention layer before graph
+        capture, so the model forward does not inspect a Python backend object.
+        Backends that consume the model dtype return ``None``.
+        """
+        return None
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
 
