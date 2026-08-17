@@ -56,6 +56,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
 _use_sgl_xpu = use_intel_xpu_backend()
 _is_musa = is_musa()
+_enable_glm45_fused_moe = envs.SGLANG_ENABLE_GLM45_FUSED_MOE.get()
 
 
 if _is_cuda:
@@ -986,6 +987,59 @@ def fused_experts_impl(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
+
+    if (
+        _is_cuda
+        and _enable_glm45_fused_moe
+        and inplace
+        and activation == "silu"
+        and is_gated
+        and not apply_router_weight_on_input
+        and use_fp8_w8a8
+        and not use_int8_w8a8
+        and not use_int8_w8a16
+        and not use_int4_w4a16
+        and per_channel_quant
+        and b1 is None
+        and b2 is None
+        and w1_zp is None
+        and w2_zp is None
+        and a1_scale is None
+        and a2_scale is None
+        and block_shape is None
+        and not no_combine
+        and routed_scaling_factor == 2.5
+        and gemm1_alpha is None
+        and gemm1_limit is None
+        and not filter_expert
+        and swiglu_limit is None
+        and gate_up_interleaved
+        and a1_q is None
+        and not fuse_swiglu_interleaved
+    ):
+        from sglang.kernels.ops.moe.glm45_fused_moe import (
+            covered as glm45_fused_moe_covered,
+        )
+        from sglang.kernels.ops.moe.glm45_fused_moe import glm45_fused_moe
+
+        if glm45_fused_moe_covered(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            w1_scale,
+            w2_scale,
+        ):
+            return glm45_fused_moe(
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                w1_scale,
+                w2_scale,
+            )
 
     (
         config,
