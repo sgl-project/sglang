@@ -75,9 +75,7 @@ class TestHiCachePrefetchTermination(unittest.TestCase):
                         has_pool_transfers=has_pool_transfers,
                         pool_transfers_done=pool_transfers_done,
                     )
-                    self.assertEqual(
-                        cache.can_terminate_prefetch(operation), expected
-                    )
+                    self.assertEqual(cache.can_terminate_prefetch(operation), expected)
 
     def test_terminated_operation_can_terminate_on_all_cache_types(self):
         for cache_type in self.CACHE_TYPES:
