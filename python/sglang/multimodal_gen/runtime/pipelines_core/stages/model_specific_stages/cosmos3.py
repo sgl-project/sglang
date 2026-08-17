@@ -646,7 +646,7 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         )
 
         if transfer_plan is not None:
-            batch.latents = torch.empty(shape, device=device, dtype=dtype)
+            batch.latents = torch.zeros(shape, device=device, dtype=dtype)
             batch.raw_latent_shape = shape
             batch.extra["video_shape"] = (
                 num_latent_frames,
