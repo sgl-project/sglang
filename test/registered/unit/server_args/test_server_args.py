@@ -1331,6 +1331,27 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertEqual(args.hicache_mem_layout, "page_first")
         self.assertIsNone(args.decode_attention_backend)
 
+    def test_decode_offload_rejects_host_pool_retraction(self):
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_offload_kvcache=True,
+            hicache_storage_backend="file",
+            disaggregation_decode_retraction_backup="host_pool",
+        )
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            args._handle_cache_compatibility()
+
+    def test_decode_offload_allows_cpu_tensor_retraction(self):
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_offload_kvcache=True,
+            hicache_storage_backend="file",
+            disaggregation_decode_retraction_backup="cpu_tensor",
+        )
+
+        args._handle_cache_compatibility()
+
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):
@@ -2119,8 +2140,6 @@ class TestGrpcServerArgs(CustomTestCase):
         arg-parsing tests above never call start_server, so a stray kwarg (e.g.
         the removed max_prefill_tokens) would only surface as a TypeError at
         launch. This mocks the native extension and locks the kwarg set."""
-        import sys
-
         from sglang.srt.entrypoints import http_server
 
         fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
@@ -2128,13 +2147,14 @@ class TestGrpcServerArgs(CustomTestCase):
         server_args = SimpleNamespace(
             host="127.0.0.1", grpc_port=50051, grpc_worker_threads=4
         )
-        with patch.dict(
-            sys.modules,
-            {
-                "sglang.srt.grpc": SimpleNamespace(_core=fake_core),
-                "sglang.srt.grpc._core": fake_core,
-                "sglang.srt.entrypoints.grpc_bridge": fake_bridge,
-            },
+        with (
+            patch(
+                "sglang.srt.rust_extensions.load_rust_extension",
+                return_value=fake_core,
+            ) as load_rust_extension,
+            patch.dict(
+                "sys.modules", {"sglang.srt.entrypoints.grpc_bridge": fake_bridge}
+            ),
         ):
             handle = http_server._start_native_grpc_server_for_runtime(
                 server_args=server_args,
@@ -2144,6 +2164,7 @@ class TestGrpcServerArgs(CustomTestCase):
             )
 
         self.assertEqual(handle, "handle")
+        load_rust_extension.assert_called_once_with("sglang.srt.rust_extensions._grpc")
         _, kwargs = fake_core.start_server.call_args
         self.assertEqual(
             set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
