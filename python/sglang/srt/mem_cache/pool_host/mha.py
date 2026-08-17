@@ -1410,6 +1410,8 @@ class KVarNHostKVCache(HostKVCache):
         pin_memory=True,
         device="cpu",
         allocator_type="default",
+        *,
+        pool_label="kv",
     ):
         # Read KVarN config from the device pool's backend reference.
         # set_kvarn_backend() is called during attention backend init,
@@ -1433,6 +1435,7 @@ class KVarNHostKVCache(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            pool_label=pool_label,
         )
 
     def get_size_per_token(self):
