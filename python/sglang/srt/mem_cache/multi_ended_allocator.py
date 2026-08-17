@@ -342,6 +342,31 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             return self.watermark_physical * self.entry_bytes_per_page
         return self.num_pages * self.entry_bytes_per_page
 
+    def _byte_accounting_violations(self) -> List[str]:
+        """Per-sub-pool conservation strings (empty == healthy): the watermark
+        span must equal live + holes + pending pages, and frontiers must lie
+        inside the buffer. Idle-time diagnostic — pure host arithmetic."""
+        out: List[str] = []
+        total = self.unified_buffer.total_bytes
+        lo_b, hi_b = self._byte_low_frontier(), self._byte_high_frontier()
+        if not (0 <= lo_b <= hi_b <= total):
+            out.append(
+                f"[{self.sub_pool_name}] frontier out of bounds: "
+                f"low={lo_b}, high={hi_b}, total={total}"
+            )
+        if self.lazy_compaction:
+            # Lazy end: the watermark span contains live + holes + pending
+            # (eager has no holes/pending — span == live by construction).
+            holes = int(self._free_phys_pages.numel())
+            pending = len(self._pending_reuse_pages_cpu)
+            wm_span = self._allocated_pages()
+            if wm_span != self.live_page_count + holes + pending:
+                out.append(
+                    f"[{self.sub_pool_name}] span {wm_span} != live "
+                    f"{self.live_page_count} + holes {holes} + pending {pending}"
+                )
+        return out
+
     def _byte_low_frontier(self) -> int:
         """Byte starting this side's allocatable range (grow-up) / just below its lowest live page (grow-down)."""
         if self.grow_direction == "up":
@@ -1780,6 +1805,40 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             self.free(reps, _pages=reps // self.page_size)
 
 
+def _chain_byte_accounting_violations(
+    chain: List[MultiEndedAllocator],
+) -> List[str]:
+    """Conservation for an ordered low→high chain of band allocators: each
+    member's own accounting, plus the frontier total order — a member's low
+    frontier must clear the previous member's high frontier, or the bands
+    overlap in the shared byte buffer.
+
+    Today's chains are the 2-pool end pairs; the N-pool track inserts float
+    middles here (and teaches the walk to skip empty/parked ones).
+    """
+    out: List[str] = []
+    for a in chain:
+        out.extend(a._byte_accounting_violations())
+    frontier = 0
+    for a in chain:
+        lo_b, hi_b = a._byte_low_frontier(), a._byte_high_frontier()
+        if lo_b < frontier:
+            out.append(
+                f"[chain] {a.sub_pool_name} low frontier {lo_b} overlaps the "
+                f"previous pool's high frontier {frontier}"
+            )
+        frontier = max(frontier, hi_b)
+    return out
+
+
+def _end_pair_chain(
+    a: MultiEndedAllocator, b: MultiEndedAllocator
+) -> List[MultiEndedAllocator]:
+    """Order an end pair low→high by grow direction (the factories and the
+    unit fixtures orient the pair differently; the chain check must not care)."""
+    return sorted((a, b), key=lambda x: x.grow_direction != "up")
+
+
 class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     """Composite allocator for the MHA (full-attn) + Mamba hybrid pair.
 
@@ -2065,6 +2124,11 @@ class UnifiedMambaTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_attn_allocator.free(reps, _pages=reps // self.page_size)
         self.full_attn_allocator.clear_inverse_history()
         self.mamba_allocator.clear_inverse_history()
+
+    def verify_byte_accounting(self) -> List[str]:
+        return _chain_byte_accounting_violations(
+            _end_pair_chain(self.mamba_allocator, self.full_attn_allocator)
+        )
 
     def free_group_begin(self) -> None:
         self.is_not_in_free_group = False
@@ -2630,6 +2694,11 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.full_attn_allocator.free(reps, _pages=v_pages)
         self.full_attn_allocator.clear_inverse_history()
         self.swa_attn_allocator.clear_inverse_history()
+
+    def verify_byte_accounting(self) -> List[str]:
+        return _chain_byte_accounting_violations(
+            _end_pair_chain(self.full_attn_allocator, self.swa_attn_allocator)
+        )
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()
