@@ -75,12 +75,7 @@ class LTX2TextConnectorStage(PipelineStage):
                 dtype
             ) * torch.finfo(dtype).max
 
-            with (
-                set_forward_context(current_timestep=None, attn_metadata=None),
-                self.use_declared_component(
-                    component_name="connectors", module=self.connectors
-                ),
-            ):
+            with set_forward_context(current_timestep=None, attn_metadata=None):
                 pos_embeds, pos_audio_embeds, pos_mask = self.connectors(
                     prompt_embeds, pos_additive_mask, additive_mask=True
                 )
@@ -100,12 +95,7 @@ class LTX2TextConnectorStage(PipelineStage):
                 dtype
             ) * torch.finfo(dtype).max
 
-            with (
-                set_forward_context(current_timestep=None, attn_metadata=None),
-                self.use_declared_component(
-                    component_name="connectors", module=self.connectors
-                ),
-            ):
+            with set_forward_context(current_timestep=None, attn_metadata=None):
                 (
                     connector_prompt_embeds,
                     connector_audio_prompt_embeds,
