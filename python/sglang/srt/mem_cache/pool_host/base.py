@@ -108,6 +108,7 @@ class HostKVCache(abc.ABC):
             "paged allocator."
         )
         self.page_size = page_size // dcp_size
+        self._dcp_localized = None
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
@@ -253,9 +254,6 @@ class HostKVCache(abc.ABC):
     ) -> None:
         """
         Load KV data from the host memory pool to the device memory pool for a specific layer.
-
-        ``host_indices`` / ``device_indices`` are this rank's physical rows;
-        callers translate widened DCP slots with ``dcp_localize_indices``.
         """
         raise NotImplementedError()
 
@@ -350,22 +348,27 @@ class HostKVCache(abc.ABC):
         """
         if self.dcp_size == 1:
             return indices
-        owned = indices[indices % self.dcp_size == self.dcp_rank] // self.dcp_size
-        assert owned.numel() * self.dcp_size == indices.numel(), (
-            "HiCache DCP translation expects runs of whole widened pages "
-            f"(every residue class equally represented); got {indices.numel()} "
-            f"logical slots -> {owned.numel()} owned rows with dcp_size="
-            f"{self.dcp_size}."
+        assert indices.numel() % self.dcp_size == 0, (
+            "HiCache DCP translation expects runs of whole widened pages; got "
+            f"{indices.numel()} logical slots with dcp_size={self.dcp_size}."
         )
-        return owned
+        return indices[self.dcp_rank :: self.dcp_size] // self.dcp_size
 
-    def dcp_localize_indices(
+    def maybe_localize_dcp_indices(
         self, host_indices: torch.Tensor, device_indices: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return (
+        if self.dcp_size == 1:
+            return host_indices, device_indices
+        key = (id(host_indices), id(device_indices))
+        cached = self._dcp_localized
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        rows = (
             self.dcp_kernel_indices(host_indices),
             self.dcp_kernel_indices(device_indices),
         )
+        self._dcp_localized = (key, rows, host_indices, device_indices)
+        return rows
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
@@ -395,6 +398,14 @@ class HostKVCache(abc.ABC):
         if indices_cpu.numel() == 0:
             return 0
 
+        assert self.dcp_size == 1 or (
+            indices_cpu.numel() % self.logical_page_size == 0
+        ), (
+            "Host pool frees must cover whole widened pages under DCP "
+            f"(dcp_kernel_indices assumes residue == position); got "
+            f"{indices_cpu.numel()} slots, logical_page_size="
+            f"{self.logical_page_size}."
+        )
         assert self.slot_used[indices_cpu].all(), (
             f"Double-free detected: slots not currently allocated: "
             f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."

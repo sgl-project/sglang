@@ -7341,6 +7341,13 @@ class ServerArgs:
                 "the index translation lives in MLATokenToKVPoolHost, and the "
                 "MHA host pool has none."
             )
+        if self.get_model_config().is_hybrid_swa:
+            raise NotImplementedError(
+                "HiCache with --dcp-size > 1 does not support hybrid SWA "
+                "models yet: only the plain paged allocator is DCP-widened, "
+                "so the SWA host pool would be built for a widened slot space "
+                "that SWATokenToKVPoolAllocator never hands out."
+            )
         logger.info(
             "HiCache + DCP enabled (L1/L2 only): host pool uses widened "
             "logical slot accounting with per-rank physical translation at "

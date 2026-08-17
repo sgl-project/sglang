@@ -11,14 +11,11 @@ kernels.
 """
 
 import unittest
-from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
-from sglang.srt.managers import cache_controller as manager_cache_controller
-from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -208,134 +205,15 @@ class TestTransferEntryPointsTranslate(CustomTestCase):
         with self.assertRaises(AssertionError):
             pool.get_data_page(0)
 
-    def _run_load(self, pool, host_indices, device_indices, **kwargs):
-        device_pool = SimpleNamespace(
-            kv_buffer=[torch.zeros(1)] * 2,
-            layer_shard_enabled=False,
-            layer_num=2,
+    def test_memo_does_not_serve_stale_rows(self):
+        pool = _make_host_pool(dcp_rank=2)
+        first = torch.arange(WIDENED_PAGE)
+        second = torch.arange(WIDENED_PAGE, 3 * WIDENED_PAGE)
+        pool.maybe_localize_dcp_indices(first, first.clone())
+        host_rows, _ = pool.maybe_localize_dcp_indices(second, second.clone())
+        torch.testing.assert_close(
+            host_rows, second[second % DCP_SIZE == 2] // DCP_SIZE
         )
-        with mock.patch(
-            "sglang.srt.mem_cache.pool_host.mla.transfer_kv_per_layer_mla",
-            create=True,
-        ) as kernel:
-            pool.can_use_jit = False
-            pool.load_to_device_per_layer(
-                device_pool, host_indices, device_indices, 0, "kernel", **kwargs
-            )
-            return kernel.call_args.kwargs
-
-    def test_load_forwards_localized_rows_unchanged(self):
-        # Re-translating inside the per-layer path would filter the rows a
-        # second time (64 -> 8 at dcp_size=8) and pass dcp_kernel_indices'
-        # numel assert, so the load would silently read the wrong slots.
-        pool = _make_host_pool(dcp_rank=5)
-        logical = torch.arange(2 * WIDENED_PAGE)
-        localized = pool.dcp_localize_indices(logical, logical.clone())
-        kwargs = self._run_load(pool, *localized)
-        expected = torch.arange(2 * PHYSICAL_PAGE)
-        torch.testing.assert_close(kwargs["src_indices"], expected)
-        torch.testing.assert_close(kwargs["dst_indices"], expected)
-
-
-class _FakeEvent:
-    def __init__(self, enable_timing=False):
-        self.enable_timing = enable_timing
-
-    def record(self):
-        pass
-
-    def wait(self, stream):
-        pass
-
-    def query(self):
-        return True
-
-
-class _FakeDeviceModule:
-    Event = _FakeEvent
-
-    @staticmethod
-    @contextmanager
-    def stream(stream):
-        yield
-
-
-class _CountingHostPool:
-    size_per_token = 2
-    layer_num = 24
-
-    def __init__(self):
-        self.rows = (torch.arange(100, 104), torch.arange(200, 204))
-        self.localize_calls = 0
-        self.load_calls = []
-
-    def dcp_localize_indices(self, host_indices, device_indices):
-        self.localize_calls += 1
-        return self.rows
-
-    def load_to_device_per_layer(
-        self,
-        device_pool,
-        host_indices,
-        device_indices,
-        layer_id,
-        io_backend,
-        *,
-        is_draft: bool = False,
-    ):
-        self.load_calls.append((host_indices, device_indices))
-
-
-class TestLoadLoopLocalizesOnce(CustomTestCase):
-    def setUp(self):
-        manager_cache_controller._timing_events_supported.cache_clear()
-
-    def tearDown(self):
-        manager_cache_controller._timing_events_supported.cache_clear()
-
-    def _controller(self, host_pool):
-        controller = HiCacheController.__new__(HiCacheController)
-        op = CacheOperation(
-            host_indices=torch.arange(0, 4),
-            device_indices=torch.arange(4, 8),
-            node_id=1,
-        )
-        controller.load_queue = [op]
-        controller.io_backend = "kernel"
-        controller.layer_num = host_pool.layer_num
-        controller.mem_pool_host = host_pool
-        controller.mem_pool_device = None
-        controller.has_draft = False
-        controller.load_stream = object()
-        controller.ack_load_queue = []
-        controller.layer_done_counter = SimpleNamespace(
-            update_producer=lambda: 0,
-            events=[
-                SimpleNamespace(
-                    start_event=_FakeEvent(),
-                    complete=lambda layer_index: None,
-                )
-            ],
-        )
-        controller.move_indices = mock.Mock(
-            return_value=(op.host_indices, op.device_indices)
-        )
-        return controller
-
-    def test_localization_is_hoisted_out_of_the_layer_loop(self):
-        host_pool = _CountingHostPool()
-        controller = self._controller(host_pool)
-
-        with mock.patch.object(
-            manager_cache_controller, "device_module", _FakeDeviceModule
-        ):
-            controller.start_loading()
-
-        self.assertEqual(host_pool.localize_calls, 1)
-        self.assertEqual(len(host_pool.load_calls), host_pool.layer_num)
-        for host_rows, device_rows in host_pool.load_calls:
-            self.assertIs(host_rows, host_pool.rows[0])
-            self.assertIs(device_rows, host_pool.rows[1])
 
 
 if __name__ == "__main__":

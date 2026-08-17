@@ -252,7 +252,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     ):
         if not is_draft and not self._is_device_layer_owned(device_pool, layer_id):
             return
-        # Indices arrive already translated by the caller's layer loop.
+        host_indices, device_indices = self.maybe_localize_dcp_indices(
+            host_indices, device_indices
+        )
         # MTP draft layers do not participate in CP layer sharding.
         host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
         device_layer_id = 0 if is_draft else layer_id
@@ -415,7 +417,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
-        host_indices, device_indices = self.dcp_localize_indices(
+        host_indices, device_indices = self.maybe_localize_dcp_indices(
             host_indices, device_indices
         )
         if self._is_device_layer_sharded(device_pool):
