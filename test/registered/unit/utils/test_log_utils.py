@@ -20,7 +20,9 @@ def _close_logger(logger: logging.Logger) -> None:
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
         handler.close()
-    logging.Logger.manager.loggerDict.pop(logger.name, None)
+    registered_logger = logging.Logger.manager.loggerDict.get(logger.name)
+    if registered_logger is logger:
+        logging.Logger.manager.loggerDict.pop(logger.name, None)
 
 
 class TestLogTargets(CustomTestCase):
@@ -36,11 +38,11 @@ class TestLogTargets(CustomTestCase):
         for targets in (None, []):
             with self.subTest(targets=targets):
                 stream = io.StringIO()
-                prefix = f"{__name__}.{self._testMethodName}.{targets!r}"
+                name_prefix = f"{__name__}.{self._testMethodName}.{targets!r}"
                 with patch.object(log_utils.sys, "stdout", stream):
                     logger = self._track_logger(
                         log_utils.create_log_targets(
-                            targets=targets, name_prefix=prefix
+                            targets=targets, name_prefix=name_prefix
                         )[0]
                     )
                     logger.info("stdout-record")
@@ -61,7 +63,7 @@ class TestLogTargets(CustomTestCase):
         self.assertIn("case-insensitive", stream.getvalue())
 
     def test_file_target_uses_distributed_rank_in_filename(self):
-        directory = Path(self._temp_dir.name)
+        log_directory = Path(self._temp_dir.name)
         with (
             patch.object(log_utils.socket, "gethostname", return_value="worker-a"),
             patch.object(log_utils.dist, "is_initialized", return_value=True),
@@ -69,28 +71,30 @@ class TestLogTargets(CustomTestCase):
         ):
             logger = self._track_logger(
                 log_utils.create_log_targets(
-                    targets=[str(directory)], name_prefix=self._testMethodName
+                    targets=[str(log_directory)], name_prefix=self._testMethodName
                 )[0]
             )
             logger.info("file-record")
             logger.handlers[0].flush()
 
-        log_path = directory / "worker-a_7.log"
+        log_path = log_directory / "worker-a_7.log"
         self.assertTrue(log_path.is_file())
         self.assertIn("file-record", log_path.read_text(encoding="utf-8"))
 
     def test_repeated_target_creation_reuses_one_handler(self):
         stream = io.StringIO()
-        prefix = f"{__name__}.{self._testMethodName}"
+        name_prefix = f"{__name__}.{self._testMethodName}"
         with patch.object(log_utils.sys, "stdout", stream):
-            first = self._track_logger(
-                log_utils.create_log_targets(targets=None, name_prefix=prefix)[0]
+            first_logger = self._track_logger(
+                log_utils.create_log_targets(targets=None, name_prefix=name_prefix)[0]
             )
-            second = log_utils.create_log_targets(targets=None, name_prefix=prefix)[0]
-            first.info("one-record")
+            second_logger = log_utils.create_log_targets(
+                targets=None, name_prefix=name_prefix
+            )[0]
+            first_logger.info("one-record")
 
-        self.assertIs(first, second)
-        self.assertEqual(len(first.handlers), 1)
+        self.assertIs(first_logger, second_logger)
+        self.assertEqual(len(first_logger.handlers), 1)
         self.assertEqual(stream.getvalue().count("one-record"), 1)
 
 
@@ -105,7 +109,7 @@ class TestLogJson(CustomTestCase):
     def test_log_json_accepts_one_logger(self):
         logger, stream = self._capture_logger("single")
 
-        log_utils.log_json(logger, "scheduler.status", {"rank": 3})
+        log_utils.log_json(loggers=logger, event="scheduler.status", data={"rank": 3})
 
         record = json.loads(stream.getvalue())
         self.assertEqual(record["event"], "scheduler.status")
@@ -113,20 +117,20 @@ class TestLogJson(CustomTestCase):
         datetime.fromisoformat(record["timestamp"])
 
     def test_log_json_fans_out_unicode_with_one_timestamp(self):
-        first, first_stream = self._capture_logger("first")
-        second, second_stream = self._capture_logger("second")
-        now = datetime(2026, 8, 16, 12, 34, 56, 123456)
+        first_logger, first_stream = self._capture_logger("first")
+        second_logger, second_stream = self._capture_logger("second")
+        fixed_timestamp = datetime(2026, 8, 16, 12, 34, 56, 123456)
 
         with patch.object(log_utils, "datetime") as mock_datetime:
-            mock_datetime.now.return_value = now
+            mock_datetime.now.return_value = fixed_timestamp
             log_utils.log_json(
-                [first, second],
-                "request.finished",
-                {"message": "你好", "count": 2},
+                loggers=[first_logger, second_logger],
+                event="request.finished",
+                data={"message": "你好", "count": 2},
             )
 
         expected = {
-            "timestamp": now.isoformat(),
+            "timestamp": fixed_timestamp.isoformat(),
             "event": "request.finished",
             "message": "你好",
             "count": 2,
