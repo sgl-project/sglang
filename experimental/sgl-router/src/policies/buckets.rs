@@ -22,21 +22,21 @@ pub struct BucketRequest {
 #[derive(Debug, Clone)]
 pub struct BucketSelector {
     config: Option<BucketConfig>,
-    /// 与 `config.buckets` 下标对齐，只在构造时计算一次。
+    /// Precomputed once and aligned by index with `config.buckets`.
     member_ids: Vec<MemberIndex>,
 }
 
-/// 成员 id 查找结构，语义与 `spec.worker_ids.iter().any(|id| id == &worker.id.0)`
-/// 完全一致：精确字符串匹配（不做归一化 / 大小写折叠 / trim），重复 id 不影响
-/// 结果，空列表匹配零个 worker。
+/// Worker-ID lookup with the same semantics as scanning `spec.worker_ids`:
+/// exact string matching without normalization, case folding, or trimming.
+/// Duplicate IDs do not change the result, and an empty list matches no worker.
 #[derive(Debug, Clone)]
 enum MemberIndex {
-    /// 直接扫描 `spec.worker_ids`，不额外持有副本。
+    /// Scan `spec.worker_ids` directly without storing another copy.
     Scan,
     Set(HashSet<String>),
 }
 
-/// 实测的交叉点：低于该值时一次 SipHash 贵于少数几次短字符串比较。
+/// Measured crossover: SipHash costs more than a few short string comparisons.
 const MEMBER_SCAN_MAX: usize = 8;
 
 impl MemberIndex {
