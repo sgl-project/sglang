@@ -755,8 +755,16 @@ class TransformersBase(nn.Module):
         self.recursive_replace()
         # Attention instances
         self.attention_instances = self._create_attention_instances(tp_size)
-        # Vocab embeddings
-        self.replace_vocab_embed_class(self.model)
+        # Vocab embeddings — Molmo2's `wte` is a custom `Molmo2Embedding` holding
+        # two `nn.Parameter` leaves (`embedding` for the base vocab, `new_embedding`
+        # for its additional_vocab_size=128 image tokens). `VocabParallelEmbedding`
+        # is sized for a single unified weight covering only the base vocab, so
+        # replacing loses the additional-vocab slots and leaves the checkpoint's
+        # `wte.embedding` and `wte.new_embedding` keys with nowhere to load. Keep
+        # the custom module in place for the TP=1 path Molmo2 currently runs in P1;
+        # a TP>1 story would need a proper concat into VocabParallelEmbedding.
+        if getattr(config, "model_type", None) != _MOLMO2_MODEL_TYPE:
+            self.replace_vocab_embed_class(self.model)
 
         # Initialize remaining meta-device parameters to real device tensors
         self._init_parameters(self.model)
