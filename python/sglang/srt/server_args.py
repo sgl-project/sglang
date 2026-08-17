@@ -3340,9 +3340,9 @@ class ServerArgs:
         (
             "Opt-in to the adaptive queue-based delay trigger (independent of the "
             "slot-based one). Delays prefill until the waiting queue reaches "
-            "min(running_req * ratio, max_prefill_bs) so small fragments batch "
-            "into a larger prefill. Unset (default) keeps the original slot-only "
-            "behavior. Typical: 0.1 ~ 0.5."
+            "min(running_req * ratio, prefill_max_requests), falling back to the "
+            "observed max_prefill_bs when no request limit is set. Unset (default) "
+            "keeps the original slot-only behavior. Typical: 0.1 ~ 0.5."
         ),
         NS("schedule"),
     ] = None
