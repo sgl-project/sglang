@@ -10,7 +10,10 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     read_draft_checkpoint_config,
     resolve_runtime_config,
 )
-from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftBlockProposer,
+    select_draft_hidden,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     DsparkDraftSampler,
     _resolve_corrected_logits_dtype,
@@ -121,6 +124,23 @@ def test_non_dspark_target_verify_width_is_unchanged():
     )
 
 
+def test_select_draft_hidden_preserves_model_feature_axes():
+    hidden_states = torch.arange(24).view(3, 2, 4)
+
+    model_hidden, sampling_hidden = select_draft_hidden(
+        hidden_states,
+        bs=1,
+        query_token_num=3,
+        gamma=2,
+        sample_from_anchor=False,
+    )
+
+    assert model_hidden.shape == (2, 2, 4)
+    assert torch.equal(model_hidden, hidden_states[1:])
+    assert sampling_hidden.shape == (1, 2, 8)
+    assert torch.equal(sampling_hidden, hidden_states[1:].view(1, 2, 8))
+
+
 def test_dspark_target_verify_width_requires_resolved_layout():
     server_args = SimpleNamespace(
         speculative_num_draft_tokens=8,
@@ -162,7 +182,7 @@ def test_bonus_anchor_eager_forward_uses_draft_embedding_and_counts_all_queries(
 
     embedding = RecordingEmbedding()
     runner = RecordingRunner()
-    draft_model = SimpleNamespace(get_input_embeddings=lambda: embedding)
+    draft_model = SimpleNamespace(embed_tokens=embedding)
     proposer = DraftBlockProposer(
         draft_model=draft_model,
         draft_model_runner=runner,
@@ -192,7 +212,7 @@ def test_bonus_anchor_eager_forward_uses_draft_embedding_and_counts_all_queries(
         "enable_num_token_non_padded",
         return_value=True,
     ):
-        proposer._run_forward(
+        result = proposer._run_forward(
             batch=batch,
             draft_input=draft_input,
             verify_window=verify_window,
@@ -203,6 +223,8 @@ def test_bonus_anchor_eager_forward_uses_draft_embedding_and_counts_all_queries(
 
     assert embedding.input_ids.shape == (2, 3)
     assert runner.forward_batch.input_ids.numel() == 6
+    assert result.raw_hidden.shape == (4, 4)
+    assert result.draft_hidden_3d.shape == (2, 2, 4)
     assert runner.forward_batch.num_token_non_padded.item() == 6
     assert runner.forward_batch.num_token_non_padded_cpu == 6
 

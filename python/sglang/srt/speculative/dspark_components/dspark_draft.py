@@ -80,6 +80,28 @@ class DraftProposal(msgspec.Struct, frozen=True):
     folded: bool = False
 
 
+def select_draft_hidden(
+    hidden_states: torch.Tensor,
+    *,
+    bs: int,
+    query_token_num: int,
+    gamma: int,
+    sample_from_anchor: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    expected_rows = bs * query_token_num
+    if hidden_states.shape[0] != expected_rows:
+        raise RuntimeError(
+            f"DSpark draft returned {hidden_states.shape[0]} hidden rows, "
+            f"expected {expected_rows}."
+        )
+    hidden_by_query = hidden_states.view(bs, query_token_num, *hidden_states.shape[1:])
+    sample_offset = 0 if sample_from_anchor else 1
+    selected = hidden_by_query[:, sample_offset : sample_offset + gamma].contiguous()
+    model_hidden = selected.view(bs * gamma, *hidden_states.shape[1:])
+    sampling_hidden = selected.view(bs, gamma, -1)
+    return model_hidden, sampling_hidden
+
+
 def make_next_draft_input(
     *,
     bonus_tokens: torch.Tensor,
@@ -184,7 +206,7 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
-        self._embed_module = draft_model.get_input_embeddings()
+        self._embed_module = draft_model.embed_tokens
         if self._embed_module is None:
             raise RuntimeError(
                 "DSpark draft embedding must be attached before proposal."
@@ -390,14 +412,16 @@ class DraftBlockProposer:
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:
             raise RuntimeError("DSpark draft model returned no hidden states.")
-        raw_hidden_3d = raw_hidden.view(bs, query_token_num, -1)
-        sample_offset = 0 if self.sample_from_anchor else 1
-        draft_hidden_3d = raw_hidden_3d[
-            :, sample_offset : sample_offset + gamma
-        ].contiguous()
+        model_hidden, draft_hidden_3d = select_draft_hidden(
+            raw_hidden,
+            bs=bs,
+            query_token_num=query_token_num,
+            gamma=gamma,
+            sample_from_anchor=self.sample_from_anchor,
+        )
         return DraftForwardResult(
             draft_block_ids=draft_block_ids,
-            raw_hidden=draft_hidden_3d.view(bs * gamma, -1),
+            raw_hidden=model_hidden,
             draft_hidden_3d=draft_hidden_3d,
             can_run_graph=draft_out.can_run_graph,
         )
