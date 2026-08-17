@@ -35,7 +35,7 @@ import torch.nn.functional as F
 if TYPE_CHECKING:
     from triton_kernels.tensor_details.ragged_tensor import RaggedTensorMetadata
 
-from sglang.srt.runtime_context import get_exec, get_lora, get_parallel, get_schedule
+from sglang.srt.runtime_context import get_exec, get_lora, get_parallel
 
 try:
     from triton_kernels.tensor import make_ragged_tensor_metadata
