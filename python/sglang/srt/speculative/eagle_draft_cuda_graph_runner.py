@@ -502,7 +502,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.captured_req_width
-        raw_out_cache_loc = forward_batch.out_cache_loc
 
         # Pad to nearest captured shape
         if self.require_mlp_tp_gather:
@@ -580,11 +579,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             copy_srcs.append(forward_batch.bootstrap_room_ids_int)
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
-        # Replay metadata must use the bucket-padded cache-location buffer.
-        forward_batch.out_cache_loc = buffers.out_cache_loc[
-            : num_tokens * self.speculative_num_steps
-        ]
-
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
         # DMA engine; foreach would force the ~3x slower compute-kernel copy.
         if (
@@ -626,10 +620,15 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         raw_seq_lens_sum = forward_batch.seq_lens_sum
 
         if bs != raw_bs:
+            raw_out_cache_loc = forward_batch.out_cache_loc
             forward_batch.batch_size = bs
             forward_batch.seq_lens = buffers.seq_lens[:bs]
             forward_batch.req_pool_indices = buffers.req_pool_indices[:bs]
             forward_batch.positions = buffers.positions[:num_tokens]
+            # Match out_cache_loc to the padded graph batch for metadata replay.
+            forward_batch.out_cache_loc = buffers.out_cache_loc[
+                : num_tokens * self.speculative_num_steps
+            ]
             if raw_seq_lens_sum is not None:
                 forward_batch.seq_lens_sum = (
                     raw_seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
@@ -680,7 +679,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             if forward_batch.seq_lens_cpu is not None:
                 forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
             forward_batch.seq_lens_sum = raw_seq_lens_sum
-
-        forward_batch.out_cache_loc = raw_out_cache_loc
+            forward_batch.out_cache_loc = raw_out_cache_loc
 
         return out
