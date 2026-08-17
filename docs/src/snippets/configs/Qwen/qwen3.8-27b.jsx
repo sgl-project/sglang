@@ -508,9 +508,9 @@ export const config = {
     },
     {
       match: { hw: "dgx-spark", variant: "default", quant: "fp8", nodes: "single" },
-      // SM121 / aarch64 validation of this exact command is running on GB10;
-      // the badge reports that rather than collapsing to a flat Not Verified.
-      verificationStatus: "in-progress",
+      // MEASURED on GB10: all 12 configurations served, same envelope and
+      // protocol as the BF16 cell above.
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
@@ -527,9 +527,10 @@ export const config = {
     },
     {
       match: { hw: "dgx-spark", variant: "default", quant: "bf16", nodes: "single" },
-      // SM121 / aarch64 validation of this exact command is running on GB10;
-      // the badge reports that rather than collapsing to a flat Not Verified.
-      verificationStatus: "in-progress",
+      // MEASURED on GB10 (SM121 / aarch64): all 12 configurations served --
+      // Speculative Decoding {None, EAGLE, DSPARK} x Serving Strategy {both} x
+      // Mamba SSM Dtype {both}, at 8192-in/1024-out concurrency 1.
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
