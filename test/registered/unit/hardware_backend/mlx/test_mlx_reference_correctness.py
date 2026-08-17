@@ -40,10 +40,11 @@ import importlib.util
 import os
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_mlx_ci(est_time=1, suite="stage-b-e2e-mlx")
 
 _HAS_MLX = (
     importlib.util.find_spec("mlx") is not None
@@ -201,6 +202,13 @@ class TestMlxReferenceCorrectness(CustomTestCase):
         self.runner.remove_request(rid)
         return out
 
+    def _truncate_at_eos(self, seq):
+        """``seq`` up to and including its first EOS (whole seq if none)."""
+        for i, tok in enumerate(seq):
+            if tok in self.eos_ids:
+                return seq[: i + 1]
+        return list(seq)
+
     def _diff_msg(self, prompt, ref, sgl):
         horizon = min(len(ref), len(sgl))
         first = next((j for j in range(horizon) if ref[j] != sgl[j]), horizon)
@@ -245,10 +253,18 @@ class TestMlxReferenceCorrectness(CustomTestCase):
         for rid in rids:
             self.runner.remove_request(rid)
 
+        # Compare up to and including the first EOS. The horizon is fixed so
+        # the batch composition never changes mid-run, which walks past EOS on
+        # short answers -- and there the distribution is near-degenerate, so
+        # batched and solo argmax can pick different tokens from a numerical
+        # tie. That is float reduction order (a padded batched SDPA vs an
+        # unpadded solo one), not state bleed: any cache crossover would show
+        # up while the model still has an opinion. Measured on this fixture,
+        # case 1 reaches EOS at index 2 and first differs at index 6.
         for i, (prompt, _, _) in enumerate(self.cases):
-            self.assertEqual(
-                batched[i], solo[i], self._diff_msg(prompt, solo[i], batched[i])
-            )
+            want = self._truncate_at_eos(solo[i])
+            got = self._truncate_at_eos(batched[i])
+            self.assertEqual(got, want, self._diff_msg(prompt, want, got))
 
 
 if __name__ == "__main__":

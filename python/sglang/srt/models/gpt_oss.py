@@ -26,7 +26,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.distributed import (
     get_pp_group,
     tensor_model_parallel_all_reduce,
@@ -68,12 +68,14 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
 )
-from sglang.srt.runtime_context import get_parallel, get_server_args
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+)
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
-    get_cuda_version,
     is_blackwell_supported,
     is_cpu,
     is_cuda,
@@ -95,7 +97,7 @@ _is_tinygemm_supported = (
     and (is_sm90_supported() or is_blackwell_supported())
 )
 
-if _is_tinygemm_supported and get_cuda_version()[0] < 13:
+if _is_tinygemm_supported:
     try:
         from flashinfer.gemm import tinygemm_bf16
     except ImportError:
@@ -228,7 +230,7 @@ class GptOssSparseMoeBlock(nn.Module):
 
         self.experts = experts_type(
             num_experts=config.num_local_experts
-            + get_global_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             layer_id=layer_id,
             hidden_size=config.hidden_size,
@@ -255,12 +257,41 @@ class GptOssSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
+        if get_parallel().dwdp_size > 1:
+            return self.forward_dwdp(hidden_states)
+
         if not get_moe_a2a_backend().is_deepep():
-            return self.forward_normal(hidden_states, should_allreduce_fusion)
+            return self.forward_normal(hidden_states)
         else:
-            raise Exception("forward_deepep branch not implemented yet")
+            raise NotImplementedError("forward_deepep branch not implemented yet")
+
+    def forward_dwdp(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        num_tokens = hidden_states.shape[0]
+        hidden_dim_unpadded = self.hidden_size
+        is_prepadded = hidden_states.shape[-1] != hidden_dim_unpadded
+
+        if num_tokens > 0:
+            router_input = (
+                hidden_states[..., :hidden_dim_unpadded]
+                if is_prepadded
+                else hidden_states
+            )
+            router_logits, _ = self.router(router_input)
+            topk_output = self.topk(router_input, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
+        else:
+            final_hidden_states = hidden_states
+
+        if is_prepadded:
+            ans = final_hidden_states[..., :hidden_dim_unpadded].contiguous()
+            ans = ans.view(num_tokens, hidden_dim_unpadded)
+        else:
+            ans = final_hidden_states.view(num_tokens, hidden_dim_unpadded)
+        return ans
 
     def get_moe_weights(self):
         return [
@@ -275,7 +306,6 @@ class GptOssSparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         # `hidden_states` may arrive pre-padded along the last dim when the
         # preceding RMSNorm fused the MoE input pad (gated by
@@ -300,7 +330,7 @@ class GptOssSparseMoeBlock(nn.Module):
             topk_output = self.topk(router_input, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.tp_size > 1 and not should_allreduce_fusion:
+        if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         # When input was pre-padded, FusedMoE.forward_impl captured the
@@ -390,7 +420,7 @@ class GptOssAttention(nn.Module):
 
         # Choose dtype of sinks based on attention backend: trtllm_mha requires float32,
         # others can use bfloat16
-        attn_backend = get_server_args().attention_backend
+        attn_backend = get_exec().kernel.attention_backend
         sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
         self.sinks = nn.Parameter(
             torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False
@@ -604,18 +634,19 @@ class GptOssDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        should_allreduce_fusion = (
+        fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
+        with get_forward().scoped(fuse_mlp_allreduce=fuse_mlp_allreduce):
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
-        if should_allreduce_fusion:
+        if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
 
-        if not should_allreduce_fusion:
+        if not fuse_mlp_allreduce:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
@@ -689,15 +720,25 @@ class GptOssModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        # Capture hidden-state boundaries: boundary 0 is the embedding output,
+        # and boundary i + 1 is the output after transformer block i.
         aux_hidden_states = []
+        if self.start_layer in self.layers_to_capture:
+            aux_hidden_states.append(
+                hidden_states + residual if residual is not None else hidden_states
+            )
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual
                 )
+                if i + 1 in self.layers_to_capture:
+                    aux_hidden_states.append(
+                        hidden_states + residual
+                        if residual is not None
+                        else hidden_states
+                    )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -745,7 +786,7 @@ class GptOssForCausalLM(nn.Module):
             config.hidden_size,
             # quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
@@ -1288,15 +1329,18 @@ class GptOssForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return
 
+        num_layers = self.config.num_hidden_layers
         if layer_ids is None:
             self.capture_aux_hidden_states = True
-            num_layers = self.config.num_hidden_layers
             self.model.layers_to_capture = [2, num_layers // 2, num_layers - 3]
         else:
             self.capture_aux_hidden_states = True
-            # we plus 1 here because in sglang, for the ith layer, it takes the output
-            # of the (i-1)th layer as aux hidden state
-            self.model.layers_to_capture = [val + 1 for val in layer_ids]
+            # Preserve IDs that already include the final hidden-state
+            # boundary; otherwise retain the legacy output-layer conversion.
+            if layer_ids and max(layer_ids) == num_layers:
+                self.model.layers_to_capture = list(layer_ids)
+            else:
+                self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
         if not self.pp_group.is_last_rank:

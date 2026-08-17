@@ -26,7 +26,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
-    cp_split_before_forward,
+    cp_shard_model_inputs,
     is_cp_v2_active,
     prepare_cp_forward,
 )
@@ -49,8 +49,20 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     enable_tc_piecewise_cuda_graph,
     set_tc_piecewise_forward_context,
 )
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_spec,
+    mamba_extra_buffer_enabled,
+    max_prefill_buffer_tokens,
+    max_speculative_num_draft_tokens,
+)
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import ceil_align, require_mlp_sync
+from sglang.srt.utils.common import (
+    ceil_align,
+    get_eager_max_batch_size,
+    require_mlp_sync,
+)
+from sglang.srt.utils.device_timer import device_timer_ctx
 
 logger = logging.getLogger(__name__)
 
@@ -68,53 +80,49 @@ class EagerRunner(BaseRunner):
         sa = mr.server_args
         # Built first so the cg runners coalesce onto its buffers via the shared
         # input pool; size to the largest tokens/req across modes the worker hits.
-        num_tokens_per_bs = 1
+        num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
             # speculative_adaptive can grow draft tokens at runtime; size to the max.
-            num_draft_tokens = sa.max_speculative_num_draft_tokens or 1
+            num_draft_tokens = max_speculative_num_draft_tokens() or 1
             if mr.is_draft_worker:
-                num_tokens_per_bs = max(
-                    sa.speculative_eagle_topk or 1,
+                num_tokens_per_req = max(
+                    get_spec().speculative_eagle_topk or 1,
                     num_draft_tokens,
                     (
-                        2 * (sa.speculative_num_steps or 0)
-                        if sa.enable_multi_layer_eagle
+                        2 * (get_spec().speculative_num_steps or 0)
+                        if get_spec().enable_multi_layer_eagle
                         else 0
                     ),
                 )
             else:
-                num_tokens_per_bs = (
-                    mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                        num_draft_tokens, mr.is_draft_worker
-                    )
+                num_tokens_per_req = mr.decode_num_tokens_per_req(
+                    num_draft_tokens=num_draft_tokens
                 )
         else:
             dllm_config = DllmConfig.from_server_args(sa)
             if dllm_config is not None:
                 # dLLM runs block_size tokens/request (DLLM_EXTEND).
-                num_tokens_per_bs = dllm_config.block_size
+                num_tokens_per_req = dllm_config.block_size
         max_bs = mr.max_running_requests
         if (
             mr.is_draft_worker
             and mr.spec_algorithm.is_frozen_kv_mtp()
-            and sa.speculative_eagle_topk > 1
+            and get_spec().speculative_eagle_topk > 1
         ):
             # Frozen-KV MTP expands the draft batch by topk on the bs axis
             # (expand_for_topk_draft) before the eager fallback.
-            max_bs *= sa.speculative_eagle_topk
+            max_bs *= get_spec().speculative_eagle_topk
         # Mirror prepare_mlp_sync_batch padding so the registry holds what load_batch copies.
+        max_bs = get_eager_max_batch_size(sa, max_bs)
+        prefill_ceiling = max(mr.max_total_num_tokens, max_prefill_buffer_tokens())
+        max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_req)
         if require_mlp_sync(sa):
-            from sglang.srt.layers.utils.cp_utils import get_cp_padding_align_size
+            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 
-            max_bs = ceil_align(max_bs, self.attn_tp_size)
-            max_bs = ceil_align(max_bs, get_cp_padding_align_size())
-        prefill_ceiling = max(mr.max_total_num_tokens, sa.max_prefill_buffer_tokens())
-        max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_bs)
-        if require_mlp_sync(sa):
             max_num_token = ceil_align(max_num_token, self.attn_tp_size)
             max_num_token = ceil_align(max_num_token, get_cp_padding_align_size())
         self._eager_max_bs = max_bs
-        self._eager_num_tokens_per_bs = num_tokens_per_bs
+        self._eager_num_tokens_per_req = num_tokens_per_req
         is_encoder_decoder = mr.model_config.is_encoder_decoder
         self._eager_registry = build_eager_registry(
             device=mr.device,
@@ -122,7 +130,7 @@ class EagerRunner(BaseRunner):
             max_num_token=max_num_token,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=(
-                sa.enable_mamba_extra_buffer() and mr.spec_algorithm.is_none()
+                mamba_extra_buffer_enabled() and mr.spec_algorithm.is_none()
             ),
             is_encoder_decoder=is_encoder_decoder,
             encoder_len_fill_value=(
@@ -133,13 +141,13 @@ class EagerRunner(BaseRunner):
             encoder_lens_dtype=(
                 torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
             ),
-            dp_size=sa.dp_size,
+            dp_size=get_parallel().dp_size,
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
         self.warmup()
 
     def _autotune_buffers(self) -> Tuple[Any, int]:
-        """Decode-shaped dummy buffers (bs * num_tokens_per_bs) for the warmup
+        """Decode-shaped dummy buffers (bs * num_tokens_per_req) for the warmup
         flashinfer-autotune forward.
 
         flashinfer's MoE autotuner times candidate tactics against the buffer it
@@ -148,16 +156,12 @@ class EagerRunner(BaseRunner):
         ceiling; the dummy run only needs the decode-sized slice.
         """
         mr = self.model_runner
-        num_tokens_per_bs = 1
+        num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
-            num_tokens_per_bs = (
-                mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
-                )
-            )
+            num_tokens_per_req = mr.decode_num_tokens_per_req()
         return (
             self._alloc_dummy_decode_buffers(
-                self._eager_max_bs, num_tokens_per_bs=num_tokens_per_bs
+                self._eager_max_bs, num_tokens_per_req=num_tokens_per_req
             ),
             self._eager_max_bs,
         )
@@ -216,7 +220,7 @@ class EagerRunner(BaseRunner):
         runs under. PDmux selects a per-stream backend and publishes it via an
         active ForwardContext; non-pdmux uses attn_backend + the ambient ctx."""
         model_runner = self.model_runner
-        if model_runner.server_args.enable_pdmux:
+        if self.enable_pdmux:
             return model_runner.decode_attn_backend, forward_context(
                 ForwardContext(attn_backend=model_runner.decode_attn_backend)
             )
@@ -228,7 +232,7 @@ class EagerRunner(BaseRunner):
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         model_runner = self.model_runner
-        enable_pdmux = model_runner.server_args.enable_pdmux
+        enable_pdmux = self.enable_pdmux
         attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
         if not enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
@@ -241,11 +245,7 @@ class EagerRunner(BaseRunner):
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
 
-        ctx = (
-            model_runner.device_timer.wrap(metadata={"category": "decode"})
-            if model_runner.device_timer
-            else contextlib.nullcontext()
-        )
+        ctx = device_timer_ctx(model_runner.device_timer, "decode")
 
         with ctx, pdmux_ctx:
             return model_runner.model.forward(
@@ -263,11 +263,27 @@ class EagerRunner(BaseRunner):
         model_runner = self.model_runner
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
 
-        if not model_runner.server_args.enable_pdmux:
+        if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
-        if forward_batch.needs_forward_metadata_init():
-            if hasattr(model_runner.model, "prepare_context_parallel_metadata_for_dcp"):
+        cp_v2_active = is_cp_v2_active(forward_batch)
+        if cp_v2_active:
+            prepare_cp_forward(forward_batch)
+
+        # Target verify can arrive with ``forward_metadata_ready`` set by an
+        # upstream/speculative planning step.  That mark does not initialize
+        # the final target hybrid backend, and unlike a graph replay eager has
+        # no static metadata load to fill the gap.  Re-plan target verify from
+        # the final batch every time; eager metadata is intentionally derived
+        # directly from the live ``spec_info`` tensors.
+        if (
+            forward_batch.needs_forward_metadata_init()
+            or cp_v2_active
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            if model_runner.ps.attn_dcp_size > 1 and hasattr(
+                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            ):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (
                     model_runner.model.prepare_context_parallel_metadata_for_dcp(
@@ -290,22 +306,7 @@ class EagerRunner(BaseRunner):
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
 
-        cp_v2_active = is_cp_v2_active(forward_batch)
-        forward_positions = forward_batch.positions
-        if cp_v2_active:
-            prepare_cp_forward(forward_batch)
-            complete_hidden_states = kwargs.get("input_embeds")
-            if complete_hidden_states is None:
-                embed_layer = model_runner.model.get_input_embeddings()
-                complete_hidden_states = embed_layer(forward_batch.input_ids)
-            sharded_hidden_states, sharded_positions = cp_split_before_forward(
-                complete_hidden_states,
-                forward_batch.positions,
-                forward_batch,
-            )
-            kwargs["input_embeds"] = sharded_hidden_states
-            forward_positions = sharded_positions
-        else:
+        if not cp_v2_active:
             forward_batch.attn_cp_metadata = None
 
         category = (
@@ -313,12 +314,7 @@ class EagerRunner(BaseRunner):
             if forward_batch.forward_mode.is_target_verify()
             else "extend"
         )
-        ctx = (
-            model_runner.device_timer.wrap(metadata={"category": category})
-            if model_runner.device_timer
-            else contextlib.nullcontext()
-        )
-        with ctx:
+        with device_timer_ctx(model_runner.device_timer, category):
             pcg_runner = model_runner.prefill_cuda_graph_runner
             if (
                 _is_hip
@@ -337,54 +333,90 @@ class EagerRunner(BaseRunner):
                         model_runner.moe_layers,
                         model_runner.moe_fusions,
                         dsa_indexers=model_runner.dsa_indexers,
+                        mha_companion_layers=model_runner.mha_companion_layers,
                     ),
                 ):
                     ret = model_runner.model.forward(
                         forward_batch.input_ids,
-                        forward_positions,
+                        forward_batch.positions,
                         forward_batch,
                         **kwargs,
                     )
             elif cp_v2_active:
-                # CP-V2: drive .model directly to gather across CP ranks before logits.
-                hidden_states = model_runner.model.model(
-                    forward_batch.input_ids,
-                    forward_positions,
-                    forward_batch,
-                    input_embeds=kwargs.get("input_embeds"),
-                    pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
-                )
-                aux_hidden_states = None
-                capture_aux_hidden_states = getattr(
-                    model_runner.model, "capture_aux_hidden_states", False
-                )
-                if capture_aux_hidden_states:
-                    hidden_states, aux_hidden_states = hidden_states
-                if model_runner.model.pp_group.is_last_rank:
-                    hidden_states = cp_gather_after_forward(
-                        hidden_states,
-                        forward_batch,
-                        torch.cuda.current_stream(),
-                    )
-                    ret = model_runner.model.logits_processor(
-                        forward_batch.input_ids,
-                        hidden_states,
-                        model_runner.model.lm_head,
-                        forward_batch,
-                        aux_hidden_states,
-                    )
-                elif capture_aux_hidden_states:
-                    ret = hidden_states, aux_hidden_states
-                else:
-                    ret = hidden_states
+                ret = self._execute_extend_cp_v2(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(
                     forward_batch.input_ids,
-                    forward_positions,
+                    forward_batch.positions,
                     forward_batch,
                     **kwargs,
                 )
         return ret
+
+    def _execute_extend_cp_v2(
+        self, forward_batch: ForwardBatch, kwargs: dict
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        """CP-v2 extend: shard inputs at the model boundary, run the body on the
+        rank-local slice, then gather hidden states before the logits step.
+        """
+        model = self.model_runner.model
+
+        input_embeds = kwargs.get("input_embeds")
+        if input_embeds is None:
+            input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+        with cp_shard_model_inputs(
+            input_embeds, forward_batch.positions, forward_batch
+        ) as (sharded_input_embeds, sharded_positions):
+            model_kwargs = {"input_embeds": sharded_input_embeds}
+            if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+                model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+            hidden_states = model.model(
+                forward_batch.input_ids,
+                sharded_positions,
+                forward_batch,
+                **model_kwargs,
+            )
+        capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
+        aux_hidden_states = None
+        if capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
+        if not model.pp_group.is_last_rank:
+            return (
+                (hidden_states, aux_hidden_states)
+                if capture_aux_hidden_states
+                else hidden_states
+            )
+
+        stream = torch.cuda.current_stream()
+        hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
+        # DSpark aux tensors ride the same CP token split; gather them the same way.
+        if aux_hidden_states is not None:
+            if isinstance(aux_hidden_states, torch.Tensor):
+                aux_hidden_states = cp_gather_after_forward(
+                    aux_hidden_states, forward_batch, stream
+                )
+            else:
+                aux_hidden_states = [
+                    cp_gather_after_forward(aux, forward_batch, stream)
+                    for aux in aux_hidden_states
+                ]
+        logits_kwargs = {}
+        # DSV4 returns (hidden_states, hidden_states_before_norm) from its model body.
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_before_norm = hidden_states
+            # Mirror DeepseekV4ForCausalLM.forward: drop pre_hc_head when
+            # DSpark aux capture is on, else it overrides the packed aux.
+            if aux_hidden_states is None:
+                logits_kwargs["hidden_states_before_norm"] = hidden_states_before_norm
+        return model.logits_processor(
+            forward_batch.input_ids,
+            hidden_states,
+            model.lm_head,
+            forward_batch,
+            aux_hidden_states,
+            **logits_kwargs,
+        )
 
     def _execute_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
@@ -393,19 +425,14 @@ class EagerRunner(BaseRunner):
         # Padded idle (DP-attn MLP sync) needs metadata reinit; unpadded must
         # drop stale forward_metadata to avoid an SWA use-after-free on req_pool.
         if forward_batch.batch_size > 0:
-            if not model_runner.server_args.enable_pdmux:
+            if not self.enable_pdmux:
                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
         else:
             model_runner.attn_backend.forward_metadata = None
 
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
-        ctx = (
-            model_runner.device_timer.wrap(metadata={"category": "idle"})
-            if model_runner.device_timer
-            else contextlib.nullcontext()
-        )
-        with ctx:
+        with device_timer_ctx(model_runner.device_timer, "idle"):
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,

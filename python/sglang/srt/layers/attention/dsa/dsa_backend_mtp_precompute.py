@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.ops.attention.utils import seqlens_expand_triton
 from sglang.srt.layers.attention.dsa.utils import compute_dsa_seqlens
-from sglang.srt.layers.attention.utils import seqlens_expand_triton
 from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
@@ -122,7 +122,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
 
         if _is_cuda and not _is_hip:
-            from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+            from sglang.kernels.ops.attention.dsa_metadata import (
                 fused_dsa_decode_metadata,
             )
 
@@ -241,7 +241,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         seqlens_expanded_size = bs * self.speculative_num_draft_tokens
 
         if _is_cuda and not _is_hip:
-            from sglang.srt.layers.attention.triton_ops.dsa_metadata import (
+            from sglang.kernels.ops.attention.dsa_metadata import (
                 fused_dsa_target_verify_metadata,
             )
 

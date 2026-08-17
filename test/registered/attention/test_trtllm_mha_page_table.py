@@ -18,7 +18,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.layers.attention.triton_ops.trtllm_mha_page_table import (
+from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci

@@ -34,14 +34,21 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "77bd016251220fee8917a30ec92e89da03794a8a"
+# GT is read from <repo>@<revision>. A given SHA only exists in the repo it was
+# committed to, so REPO and REVISION must be bumped together. All GT (CUDA and
+# NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
+# publish.
+SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
+SGL_TEST_FILES_CI_DATA_REVISION = "cc3f27fd2d1b4d8e1a7d5eec1247a215a502b9c1"
 
+# The NPU pin is kept as a separate branch so ascend GT can be bumped independently
+# when it's regenerated on its own cadence.
 if current_platform.is_npu():
-    SGL_TEST_FILES_CI_DATA_REVISION = "6b62f4b6825c76a25fd2ba28248df68f2b400e65"
+    SGL_TEST_FILES_CI_DATA_REVISION = "d180ad38872dff3d1ad03e4610cffcda874d3eb8"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
-    f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
+    f"{SGL_TEST_FILES_CI_DATA_REPO}/{SGL_TEST_FILES_CI_DATA_REVISION}/"
     "diffusion-ci/consistency_gt"
 )
 SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = (
@@ -151,6 +158,7 @@ def _load_clip_processor_with_roberta_processing_compat(
 # ---------------------------------------------------------------------------
 
 DEFAULT_SMALL_MODEL_NAME_FOR_TEST = "Tongyi-MAI/Z-Image-Turbo"
+DEFAULT_AR_MODEL_NAME_FOR_TEST = "zai-org/GLM-Image"
 
 # Cosmos3 generation models
 DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST = "nvidia/Cosmos3-Nano"
@@ -194,6 +202,9 @@ DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST = "OpenMOSS-Team/MOVA-360p"
 DEFAULT_SANA_WM_MODEL_NAME_FOR_TEST = "Efficient-Large-Model/SANA-WM_bidirectional"
 DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST = (
     "Efficient-Large-Model/SANA-WM_streaming"
+)
+DEFAULT_SANA_VIDEO_MODEL_NAME_FOR_TEST = (
+    "Efficient-Large-Model/SANA-Video_2B_480p_diffusers"
 )
 
 
@@ -906,12 +917,11 @@ def get_clip_model() -> tuple[Any, Any]:
             if "RobertaProcessing" not in str(e):
                 raise
             logger.warning(
-                "Fast CLIP processor failed (%s), retrying with use_fast=False", e
+                "CLIP processor failed (%s), retrying with compatibility shim", e
             )
             processor = _load_clip_processor_with_roberta_processing_compat(
                 CLIPProcessor,
                 CLIP_MODEL_NAME,
-                use_fast=False,
             )
         model = CLIPModel.from_pretrained(CLIP_MODEL_NAME)
 
@@ -1081,6 +1091,30 @@ def get_consistency_gt_candidates(
     ]
 
 
+def _action_consistency_gt_filenames(case_id: str, num_gpus: int) -> list[str]:
+    case_id = get_consistency_gt_case_id(case_id)
+    return [f"{case_id}_{num_gpus}gpu.json"]
+
+
+def get_action_consistency_gt_candidate_sets(
+    case_id: str,
+    num_gpus: int,
+) -> list[list[str]]:
+    candidates = _action_consistency_gt_filenames(case_id, num_gpus)
+    if _is_ascend_consistency_case(case_id) or current_platform.is_npu():
+        return [candidates]
+    platform = get_consistency_platform()
+    return [[f"{platform}/{candidate}" for candidate in candidates], candidates]
+
+
+def get_action_consistency_gt_candidates(case_id: str, num_gpus: int) -> list[str]:
+    return [
+        candidate
+        for candidate_set in get_action_consistency_gt_candidate_sets(case_id, num_gpus)
+        for candidate in candidate_set
+    ]
+
+
 def get_consistency_gt_remote_files(
     case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
 ) -> list[tuple[str, str]]:
@@ -1094,6 +1128,19 @@ def get_consistency_gt_remote_files(
     return _remote_consistency_gt_candidates(
         SGL_TEST_FILES_CONSISTENCY_GT_BASE, case_id, num_gpus, is_video, output_format
     )
+
+
+def get_action_consistency_gt_remote_files(
+    case_id: str, num_gpus: int
+) -> list[tuple[str, str]]:
+    files = _find_remote_action_consistency_gt_files(case_id, num_gpus)
+    if files:
+        return files
+    filenames = get_action_consistency_gt_candidates(case_id, num_gpus)
+    return [
+        (filename, f"{SGL_TEST_FILES_CONSISTENCY_GT_BASE}/{filename}")
+        for filename in filenames
+    ]
 
 
 def _remote_consistency_gt_candidates(
@@ -1299,6 +1346,35 @@ def _find_remote_consistency_gt_files(
     return []
 
 
+def _find_remote_action_consistency_gt_files(
+    case_id: str,
+    num_gpus: int,
+) -> list[tuple[str, str]]:
+    for filenames in get_action_consistency_gt_candidate_sets(case_id, num_gpus):
+        for base_url in _remote_consistency_gt_base_urls(case_id):
+            candidates = [
+                (filename, f"{base_url}/{filename}") for filename in filenames
+            ]
+            if _is_official_consistency_gt_base_url(base_url):
+                candidates = [
+                    (filename, url)
+                    for filename, url in candidates
+                    if _official_consistency_gt_candidate_is_declared(case_id, filename)
+                ]
+                if not candidates:
+                    continue
+            uncertain_candidate = None
+            for filename, url in candidates:
+                exists = _remote_file_exists(url)
+                if exists is True:
+                    return [(filename, url)]
+                if exists is None and uncertain_candidate is None:
+                    uncertain_candidate = (filename, url)
+            if uncertain_candidate is not None:
+                return [uncertain_candidate]
+    return []
+
+
 def _get_consistency_gt_dir() -> Path | None:
     """Return the local GT directory when configured."""
     d = os.environ.get("SGLANG_CONSISTENCY_GT_DIR")
@@ -1317,6 +1393,13 @@ def _get_consistency_gt_cache_key(
     source = str(gt_dir) if gt_dir is not None else "remote"
     platform = get_consistency_platform()
     return f"{platform}:{case_id}:{num_gpus}:{is_video}:{output_format or ''}:{source}"
+
+
+def _get_action_consistency_gt_cache_key(case_id: str, num_gpus: int) -> str:
+    gt_dir = _get_consistency_gt_dir()
+    source = str(gt_dir) if gt_dir is not None else "remote"
+    platform = get_consistency_platform()
+    return f"{platform}:{case_id}:{num_gpus}:action:{source}"
 
 
 def load_consistency_gt(
@@ -1397,6 +1480,60 @@ def load_consistency_gt(
     return loaded_gt
 
 
+def _load_remote_gt_json(url: str) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for _ in range(3):
+        try:
+            resp = requests.get(url, timeout=60)
+            try:
+                if resp.status_code == 200:
+                    return resp.json()
+                last_error = FileNotFoundError(f"GT JSON not found: {url}")
+                if resp.status_code not in (403, 429) and resp.status_code < 500:
+                    break
+            finally:
+                resp.close()
+        except (ValueError, requests.RequestException) as exc:
+            last_error = exc
+    raise FileNotFoundError(f"GT JSON not found: {url}") from last_error
+
+
+def load_action_consistency_gt(case_id: str, num_gpus: int) -> dict[str, Any]:
+    cache_key = _get_action_consistency_gt_cache_key(case_id, num_gpus)
+    cached = _consistency_gt_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    gt_dir = _get_consistency_gt_dir()
+    if gt_dir is not None:
+        path = None
+        for fn in get_action_consistency_gt_candidates(case_id, num_gpus):
+            candidate = gt_dir / fn
+            if candidate.exists():
+                path = candidate
+                break
+        if path is None:
+            candidates = get_action_consistency_gt_candidates(case_id, num_gpus)
+            raise FileNotFoundError(
+                f"GT action JSON not found in {gt_dir}. Tried: {', '.join(candidates)}"
+            )
+        with path.open("r", encoding="utf-8") as f:
+            loaded_gt = json.load(f)
+        logger.info("Loaded action GT for %s from %s", case_id, path)
+    else:
+        remote_files = _find_remote_action_consistency_gt_files(case_id, num_gpus)
+        if not remote_files:
+            candidates = get_action_consistency_gt_candidates(case_id, num_gpus)
+            raise FileNotFoundError(
+                f"GT action JSON not found for {case_id}. Tried: {', '.join(candidates)}"
+            )
+        loaded_gt = _load_remote_gt_json(remote_files[0][1])
+        logger.info("Loaded action GT for %s from %s", case_id, remote_files[0][1])
+
+    _consistency_gt_cache[cache_key] = loaded_gt
+    return loaded_gt
+
+
 def load_gt_embeddings(
     case_id: str,
     num_gpus: int,
@@ -1443,6 +1580,26 @@ def gt_exists(
     found = bool(
         _find_remote_consistency_gt_files(case_id, num_gpus, is_video, output_format)
     )
+    if found:
+        _gt_exists_remote_cache.add(cache_key)
+    return found
+
+
+def action_gt_exists(case_id: str, num_gpus: int) -> bool:
+    gt_dir = _get_consistency_gt_dir()
+    if gt_dir is not None:
+        return any(
+            (gt_dir / candidate).exists()
+            for candidate_set in get_action_consistency_gt_candidate_sets(
+                case_id, num_gpus
+            )
+            for candidate in candidate_set
+        )
+
+    cache_key = _get_action_consistency_gt_cache_key(case_id, num_gpus)
+    if cache_key in _gt_exists_remote_cache:
+        return True
+    found = bool(_find_remote_action_consistency_gt_files(case_id, num_gpus))
     if found:
         _gt_exists_remote_cache.add(cache_key)
     return found
@@ -1846,6 +2003,30 @@ def _save_generated_artifact_images(
         Image.fromarray(_ensure_rgb_uint8_image(frame)).save(path)
         generated_files.append(str(path.relative_to(out_dir)))
     return generated_files
+
+
+def save_missing_consistency_gt_artifact(
+    artifact_dir: str | Path | None,
+    case_id: str,
+    num_gpus: int,
+    output_frames: list[np.ndarray],
+    is_video: bool,
+    output_format: str | None = None,
+) -> Path | None:
+    if not artifact_dir:
+        return None
+
+    out_dir = Path(artifact_dir) / "missing_consistency_gt"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filenames = _consistency_gt_filenames(
+        case_id,
+        num_gpus,
+        is_video=is_video,
+        output_format=output_format,
+    )
+    for frame, filename in zip(output_frames, filenames):
+        Image.fromarray(_ensure_rgb_uint8_image(frame)).save(out_dir / filename)
+    return out_dir
 
 
 def _write_consistency_failure_index(

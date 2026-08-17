@@ -11,13 +11,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Backward-compatible re-export shim for the moved CUDA runtime utilities.
+"""CUDA runtime binding utilities."""
 
-See :mod:`sglang.srt.breakable_cuda_graph.cuda_utils`.
-"""
+try:
+    from cuda.bindings import runtime as rt
+except ImportError:
+    rt = None
 
-from sglang.srt.breakable_cuda_graph.cuda_utils import (  # noqa: F401
-    checkCudaErrors,
-)
 
-__all__ = ["checkCudaErrors"]
+def _cudaGetErrorString(error):
+    if rt is None:
+        return "<cuda.bindings not available>"
+    err, msg = rt.cudaGetErrorString(error)
+    if err != rt.cudaError_t.cudaSuccess:
+        return "<unknown>"
+    if isinstance(msg, bytes):
+        return msg.decode("utf-8", "replace")
+    return str(msg)
+
+
+def checkCudaErrors(result):
+    if rt is None:
+        raise RuntimeError(
+            "cuda.bindings is not available. "
+            "Install it with: pip install cuda-python"
+        )
+    if result[0] != rt.cudaError_t.cudaSuccess:
+        raise RuntimeError(
+            f"CUDA error {int(result[0])}({_cudaGetErrorString(result[0])})"
+        )
+    if len(result) == 1:
+        return None
+    elif len(result) == 2:
+        return result[1]
+    else:
+        return result[1:]

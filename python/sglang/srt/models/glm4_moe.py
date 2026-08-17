@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
@@ -68,9 +69,9 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
+    is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
@@ -84,12 +85,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
-from sglang.srt.runtime_context import (
-    get_parallel,
-    get_server_args,
-    get_stream,
-)
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -100,7 +96,6 @@ from sglang.srt.utils import (
     is_hip,
     is_non_idle_and_non_empty,
     is_npu,
-    log_info_on_rank0,
     make_layers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -169,17 +164,13 @@ class Glm4MoeMLP(nn.Module):
         self,
         x,
         forward_batch=None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
-        )
+        x, _ = self.down_proj(x)
         return x
 
 
@@ -410,9 +401,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
-            0
-            if get_server_args().disable_shared_experts_fusion
-            else config.n_shared_experts
+            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
         )
 
         self.config = config
@@ -531,8 +520,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
-                config.n_routed_experts
-                + get_global_server_args().ep_num_redundant_experts
+                config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
             )
             self.renormalize = config.norm_topk_prob
             self.topk_group = config.topk_group
@@ -567,8 +555,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if not self._enable_a2a_moe:
             if (
@@ -577,25 +563,15 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
             ):
-                return self.forward_normal_dual_stream(
-                    hidden_states,
-                    should_allreduce_fusion,
-                    use_reduce_scatter,
-                )
+                return self.forward_normal_dual_stream(hidden_states)
             else:
-                return self.forward_normal(
-                    hidden_states,
-                    should_allreduce_fusion,
-                    use_reduce_scatter,
-                )
+                return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
@@ -613,8 +589,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         final_hidden_states += shared_output
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -622,8 +596,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
     def forward_normal(
         self,
         hidden_states: torch.Tensor,
-        should_allreduce_fusion: bool = False,
-        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             shared_output = self._forward_shared_experts(hidden_states)
@@ -646,8 +618,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             final_hidden_states = final_hidden_states_out
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
-            use_reduce_scatter=use_reduce_scatter,
-            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -961,22 +931,24 @@ class Glm4MoeDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        should_allreduce_fusion = (
+        fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+        mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
 
-        hidden_states = self.mlp(
-            hidden_states, forward_batch, should_allreduce_fusion, use_reduce_scatter
-        )
+        with get_forward().scoped(
+            fuse_mlp_allreduce=fuse_mlp_allreduce,
+            mlp_reduce_scatter=mlp_reduce_scatter,
+        ):
+            hidden_states = self.mlp(hidden_states, forward_batch)
 
-        if should_allreduce_fusion:
+        if fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
         else:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
@@ -1192,51 +1164,39 @@ class Glm4MoeForCausalLM(nn.Module):
             config.hidden_size,
             quant_config=quant_config,
             prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            use_attn_tp_group=get_parallel().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    def determine_num_fused_shared_experts(self):
-        if get_server_args().disable_shared_experts_fusion:
-            return
-
-        disable_reason = None
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        """Why this checkpoint cannot fuse its shared expert, or None. Asked by
+        the loader before any layer is built."""
         if (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
-            disable_reason = (
+            return (
                 "Only GLM-4.5 on NV-platform with capability >= 80 "
                 "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
             )
-        elif get_parallel().moe_ep_size > 1 and (
+        if get_parallel().moe_ep_size > 1 and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
         ):
-            disable_reason = "Only GLM-4.5 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
-        elif disable_reason is None and (
-            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori()
-        ):
-            disable_reason = "GLM-4.5 cannot use shared experts fusion optimization under deepep expert parallelism."
-        elif self.quant_config and self.quant_config.get_name() == "w4afp8":
-            disable_reason = "GLM-4.5 W4AFP8 model uses different quant method for routed experts and shared experts."
+            return "Only GLM-4.5 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
+            return "GLM-4.5 cannot use shared experts fusion optimization under deepep expert parallelism."
+        if quant_config and quant_config.get_name() == "w4afp8":
+            return "GLM-4.5 W4AFP8 model uses different quant method for routed experts and shared experts."
+        return None
 
-        if disable_reason is not None:
-            from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-            declare_load_time_override(
-                "Glm4MoeForCausalLM.determine_num_fused_shared_experts",
-                {"disable_shared_experts_fusion": True},
-            )
-            self.num_fused_shared_experts = 0
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
-            return
-
-        self.num_fused_shared_experts = self.config.n_shared_experts
+    def determine_num_fused_shared_experts(self):
+        # The decision was installed by the loader; this only reads it.
+        self.num_fused_shared_experts = (
+            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -1486,8 +1446,7 @@ class Glm4MoeForCausalLM(nn.Module):
 
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
-    def determine_num_fused_shared_experts(self):
-        super().determine_num_fused_shared_experts("GlmMoeDsaForCausalLM")
+    fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
 
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):

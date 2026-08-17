@@ -50,8 +50,8 @@ python3 test/registered/jit/test_add_constant.py
 python3 test/run_suite.py --hw cpu --suite base-a-test-cpu
 python3 test/run_suite.py --hw cuda --suite base-a-test-1-gpu-small
 
-# Nightly tests
-python3 test/run_suite.py --hw cuda --suite nightly-1-gpu --nightly
+# Nightly tests (CUDA nightly suites take no --nightly; the stage is in the name)
+python3 test/run_suite.py --hw cuda --suite nightly-test-1-gpu-large
 
 # With auto-partitioning (for parallel CI jobs)
 python3 test/run_suite.py --hw cuda --suite base-b-test-1-gpu-small \
@@ -72,7 +72,7 @@ Parameters: `est_time` (seconds), `stage` + `runner_config` (target stage and ru
 
 Keep `est_time`, `stage`, `runner_config` as **literal values** — `run_suite.py` collects them by AST parsing.
 
-JIT kernel correctness tests and benchmarks live under `test/registered/jit/`, same as other registered tests (their helpers stay alongside the kernel source under `python/sglang/jit_kernel/` and are imported by absolute path):
+JIT kernel correctness tests and benchmarks live under `test/registered/jit/`, same as other registered tests (their helpers stay alongside the kernel source under `python/sglang/kernels/jit/` and are imported by absolute path):
 - Correctness tests: `test/registered/jit/test_*.py` → `base-b-kernel-unit-test-1-gpu-large`
 - Benchmarks: `test/registered/jit/benchmark/bench_*.py` → `base-b-kernel-benchmark-test-1-gpu-large`
 

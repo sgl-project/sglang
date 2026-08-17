@@ -167,7 +167,7 @@ class TestMiniMaxM27EvalAMD(unittest.TestCase):
     def setUpClass(cls):
         cls.models = MINIMAX_M27_MODELS
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
+        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 
     def test_minimax_m27_accuracy(self):
         """Test MiniMax-M2.7 with GSM8K completion benchmark."""

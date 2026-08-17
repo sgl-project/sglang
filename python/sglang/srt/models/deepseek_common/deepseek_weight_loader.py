@@ -58,6 +58,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
+    is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
@@ -182,7 +183,7 @@ class DeepseekV2WeightLoaderMixin:
         # Params for special naming rules in mixed-precision models, for example:
         # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
         # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
-        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+        if is_wint4afp8_or_wint4a16_config(self.quant_config):
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
@@ -203,6 +204,7 @@ class DeepseekV2WeightLoaderMixin:
             futures = []
             params_dict = dict(self.named_parameters())
             weight_names = []
+
             for name, loaded_weight in weights:
                 use_async_loading = should_async_load(loaded_weight)
                 layer_id = get_layer_id(name)
@@ -604,6 +606,10 @@ class DeepseekV2WeightLoaderMixin:
                     else:
                         weight = w
                         weight_scale = self_attn.kv_b_proj.weight_scale
+                        # Per-channel scale is 1D [out]; reshape to [out, 1] so it
+                        # broadcasts correctly against weight [out, in].
+                        if weight_scale.dim() == 1:
+                            weight_scale = weight_scale.view(-1, 1)
 
                     w, scale = channel_quant_to_tensor_quant(weight, weight_scale)
                     self_attn.w_scale = scale
@@ -636,6 +642,7 @@ class DeepseekV2WeightLoaderMixin:
                 and self.config.architectures
                 and self.config.architectures[0]
                 == "DeepseekV3ForCausalLM"  # Avoid processing other models like GlmMoeDsaForCausalLM
+                and w.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
             ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
