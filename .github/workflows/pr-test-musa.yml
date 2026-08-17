@@ -83,7 +83,7 @@ jobs:
               - "python/sglang/multimodal_gen/test/server/musa/**"
             sgl_kernel:
               - ".github/workflows/pr-test-musa.yml"
-              - "sgl-kernel/csrc/musa/**"
+              - "python/sglang/kernels/aot/csrc/musa/**"
 
   # ==================== PR Gate ==================== #
   pr-gate:
@@ -217,11 +217,11 @@ jobs:
       - name: Run sgl-kernel test
         timeout-minutes: 20
         run: |
-          pytest sgl-kernel/tests/test_per_token_quant_fp8.py
-          pytest sgl-kernel/tests/speculative/test_eagle_utils.py
-          pytest sgl-kernel/tests/speculative/test_ngram_utils.py
-          pytest sgl-kernel/tests/speculative/test_speculative_sampling.py
-          pytest sgl-kernel/tests/test_torch_defaults_reset.py
+          pytest python/sglang/kernels/aot/tests/test_per_token_quant_fp8.py
+          pytest python/sglang/kernels/aot/tests/speculative/test_eagle_utils.py
+          pytest python/sglang/kernels/aot/tests/speculative/test_ngram_utils.py
+          pytest python/sglang/kernels/aot/tests/speculative/test_speculative_sampling.py
+          pytest python/sglang/kernels/aot/tests/test_torch_defaults_reset.py
 
 
   pr-test-musa-finish:
