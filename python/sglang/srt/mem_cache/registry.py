@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.runtime_context import get_memory
 from sglang.srt.utils.tensor_bridge import use_mlx
 
 if TYPE_CHECKING:
@@ -128,7 +129,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         )
         return cache
 
-    if server_args.enable_lmcache:
+    if get_memory().enable_lmcache:
         from sglang.srt.mem_cache.storage.lmcache.lmc_radix_cache import (
             LMCRadixCache,
         )
@@ -141,7 +142,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             tp_group=ctx.tp_group,
         )
 
-    if server_args.enable_flexkv:
+    if get_memory().enable_flexkv:
         # Importing the package side-effect registers the explicit
         # ``--radix-cache-backend=flexkv`` factory; we then call the
         # factory directly so --enable-flexkv stands on its own.
@@ -151,8 +152,8 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
         # Honor a CLI --flexkv-config-file by forwarding it via the env
         # var that FlexKV's config loader actually reads.
-        if server_args.flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
-            os.environ["FLEXKV_CONFIG_PATH"] = server_args.flexkv_config_file
+        if get_memory().flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
+            os.environ["FLEXKV_CONFIG_PATH"] = get_memory().flexkv_config_file
         return _flexkv_factory(ctx)
 
     from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -174,6 +175,17 @@ def _create_unified_radix_cache(
         tree_components.append(ComponentType.SWA)
     if ctx.is_hybrid_ssm:
         tree_components.append(ComponentType.MAMBA)
+
+    if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
+        from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
+            C128SidecarComponent,
+        )
+
+        tree_components.append(ComponentType.C128)
+        params.component_registry_override = {
+            **(params.component_registry_override or {}),
+            ComponentType.C128: C128SidecarComponent,
+        }
 
     params.tree_components = tuple(tree_components)
     if use_mlx() and ctx.is_hybrid_ssm:
