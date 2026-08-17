@@ -855,25 +855,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
     def _draft_extend_plan_for_decode(self, batch: ScheduleBatch) -> bool:
         """Stage draft_extend's shared-buffer reads (the out-graph metadata
-        init's req_to_token gathers) before the verify launch, reading only
-        pre-verify state. Returns False when the graph path is unavailable;
-        everything then stays in the legacy post-verify sequencing."""
+        init's req_to_token gathers) before the verify launch, from pre-verify
+        state only. Returns False to keep everything in the legacy post-verify
+        sequencing."""
         runner = self.cuda_graph_runner_for_draft_extend
         if runner is None or batch.forward_mode.is_idle():
             return False
-        # SWA draft-extend metadata derives its prefix from num_accept_tokens
-        # (see flashinfer update_sliding_window), a verify product that does
-        # not exist yet at plan time.
+        # SWA metadata derives its prefix from num_accept_tokens (see
+        # flashinfer update_sliding_window), a verify product that does not
+        # exist yet at plan time.
         if self.draft_runner.sliding_window_size is not None:
             return False
-        # Mirror can_run_graph without a forward batch. The DP-padded width
-        # would duplicate init_new's token-unit transform; keep legacy
-        # sequencing there.
-        if runner.require_mlp_tp_gather or runner.disable_padding:
-            return False
-        if runner.require_mlp_sync and not batch.can_run_dp_cuda_graph:
-            return False
-        if len(batch.seq_lens) > runner.max_bs:
+        # The DP-padded width would duplicate init_new's token-unit transform;
+        # oversized batches would overflow the bucket pad.
+        if runner.require_mlp_tp_gather or len(batch.seq_lens) > runner.max_bs:
             return False
         num_draft_tokens = self.speculative_num_draft_tokens
         runner.stage_shared_reads(
@@ -968,9 +963,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch, staged=staged
                 )
             else:
-                # The plan gate mirrors can_run_graph; a divergence would leave
-                # the staged metadata unused over an eager forward.
-                assert not staged, "planned staging expects the graph path"
                 draft_logits_output = self.draft_runner.forward(
                     forward_batch
                 ).logits_output
@@ -1220,7 +1212,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             # Stage draft_extend's shared-buffer reads before the verify
-            # launch; all other inputs are filled post-verify in execute().
+            # launch; everything else stays post-verify.
             staged_draft_extend = self.draft_worker._draft_extend_plan_for_decode(batch)
             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
             # Publish before draft_extend so the fence is at verify-end.
