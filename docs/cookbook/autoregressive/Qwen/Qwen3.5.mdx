@@ -1006,7 +1006,6 @@ SGLANG_ENABLE_SPEC_V2=1 \
 python3 -m sglang.launch_server \
   --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
   --served-model-name Qwen/Qwen3.5-397B-A17B-FP8 \
-  --host 0.0.0.0 --port 30000 \
   --trust-remote-code \
   --tensor-parallel-size 8 \
   --data-parallel-size 1 \
@@ -1033,15 +1032,11 @@ python3 -m sglang.launch_server \
   --hicache-write-policy write_through_selective
 ```
 
-`--hicache-size` is a **per-rank, per-host-pool** value in GB — set
-`HICACHE_SIZE_GB` before launch as
-`floor(total_host_dram_gb / tp / hicache_host_pool_count)` (2 host pools by
-default), leaving headroom for other host allocations.
+`--hicache-size` is per-rank, per-host-pool GB: `total_host_dram_gb / tp /
+hicache_host_pool_count` (2 pools by default).
 
-Throughput measurement with golden acceptance length: to compare systems at
-a fixed MTP acceptance target rather than draft-head quality, pin the
-acceptance length to the published golden curve for
-`num_speculative_tokens=3`, thinking-on (3.39):
+For reproducible throughput numbers, pin the golden MTP acceptance length
+(3.39 at 3 speculative tokens, thinking-on):
 
 ```bash Command
 export SGLANG_SIMULATE_ACC_LEN=3.39
