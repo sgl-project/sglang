@@ -115,17 +115,21 @@ def _activation_type(runner_config: MoeRunnerConfig):
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import get_activation_type
 
     _, ActivationType = _flashinfer_cutlass_fused_moe()
-    activation = ActivationType(
-        get_activation_type(
-            runner_config.activation,
-            is_gated=runner_config.is_gated,
+    if runner_config.activation == "situ" and runner_config.is_gated:
+        activation = ActivationType.Situ
+    else:
+        activation = ActivationType(
+            get_activation_type(
+                runner_config.activation,
+                is_gated=runner_config.is_gated,
+            )
         )
-    )
     supported = {
         ActivationType.Swiglu,
         ActivationType.Geglu,
         ActivationType.Relu2,
         ActivationType.Identity,
+        ActivationType.Situ,
     }
     assert activation in supported, (
         f"Activation {runner_config.activation!r} "
@@ -308,7 +312,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
         quant_info, FlashInferCutlassMxfp4MoeQuantInfo
     ), f"Unexpected quant_info type for flashinfer_mxfp4: {type(quant_info)}"
 
-    flashinfer_cutlass_fused_moe, ActivationType = _flashinfer_cutlass_fused_moe()
+    flashinfer_cutlass_fused_moe, _ = _flashinfer_cutlass_fused_moe()
 
     x = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
@@ -386,7 +390,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
         ep_rank=quant_info.moe_ep_rank,
         use_w4_group_scaling=not use_mxfp8_act_scaling,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-        activation_type=ActivationType.Swiglu,
+        activation_type=_activation_type(runner_config),
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
         output=out,
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),

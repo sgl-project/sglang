@@ -1153,15 +1153,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         torch.cuda.empty_cache()
 
     def _process_weights_for_sm120_cutlass(self, layer):
-        """Prepare GPT-OSS MXFP4 experts for FlashInfer CUTLASS on SM120.
+        """Prepare MXFP4 experts for FlashInfer CUTLASS on SM120.
 
-        GPT-OSS stores gate/up rows pair-wise as
-        ``[gate_0, up_0, gate_1, up_1, ...]``. FlashInfer's fused MoE consumes
-        two contiguous halves in ``[up; gate]`` order. Build that layout after
-        checkpoint loading so padding cannot move the split, pad both GEMMs to
-        CUTLASS's 128-element alignment, and swizzle the native E8M0 scales for
-        the SM120 MXFP8-by-MXFP4 kernels. Packed FP4 weight bytes themselves do
-        not need an SM120 permutation.
+        FlashInfer consumes two contiguous halves in ``[up; gate]`` order.
+        GPT-OSS checkpoints store pair-interleaved ``[gate_i, up_i]`` rows,
+        while Kimi-K3 stores contiguous ``[gate; up]`` halves. Normalize either
+        layout after loading, pad both GEMMs to CUTLASS's 128-element alignment,
+        and swizzle the native E8M0 scales. Packed FP4 bytes need no additional
+        SM120 permutation.
         """
         from flashinfer import block_scale_interleave
 
@@ -1173,9 +1172,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         E = layer.num_local_experts
         device = layer.w13_weight.device
 
+        gate_up_interleaved = self.moe_runner_config.gate_up_interleaved
+
+        def _split_gate_up(unpadded):
+            if gate_up_interleaved:
+                return unpadded[:, 0::2, :], unpadded[:, 1::2, :]
+            return unpadded[:, :N_un, :], unpadded[:, N_un : 2 * N_un, :]
+
         def _stack_up_gate_w13(unpadded, last_pad, last_un):
-            gate_rows = unpadded[:, 0::2, :]
-            up_rows = unpadded[:, 1::2, :]
+            gate_rows, up_rows = _split_gate_up(unpadded)
             out = torch.zeros(
                 E, 2 * N_pad, last_pad, dtype=unpadded.dtype, device=device
             )
@@ -1192,8 +1197,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         bias_dtype = layer.w13_weight_bias.dtype
         w13_bias_padded = torch.zeros(E, 2 * N_pad, dtype=bias_dtype, device=device)
-        w13_bias_padded[:, :N_un] = layer.w13_weight_bias.data[:, 1::2]
-        w13_bias_padded[:, N_pad : N_pad + N_un] = layer.w13_weight_bias.data[:, 0::2]
+        if gate_up_interleaved:
+            gate_bias = layer.w13_weight_bias.data[:, 0::2]
+            up_bias = layer.w13_weight_bias.data[:, 1::2]
+        else:
+            gate_bias = layer.w13_weight_bias.data[:, :N_un]
+            up_bias = layer.w13_weight_bias.data[:, N_un : 2 * N_un]
+        w13_bias_padded[:, :N_un] = up_bias
+        w13_bias_padded[:, N_pad : N_pad + N_un] = gate_bias
 
         def _pad_w2_3d(unpadded, last_pad, last_un):
             out = torch.zeros(E, K_pad, last_pad, dtype=unpadded.dtype, device=device)
@@ -1225,17 +1236,34 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w13_weight_bias = Parameter(w13_bias_padded, requires_grad=False)
         layer.w2_weight_bias = Parameter(w2_bias_padded, requires_grad=False)
 
+        activation = self.moe_runner_config.activation
+        alpha = self.moe_runner_config.gemm1_alpha
+        beta = self.moe_runner_config.gemm1_beta
+        limit = self.moe_runner_config.gemm1_clamp_limit
+        if activation == "situ":
+            alpha = 4.0 if alpha is None else alpha
+            beta = 25.0 if limit is None else limit
+            limit = None
+        else:
+            alpha = 1.702 if alpha is None else alpha
+            beta = 1.0 if beta is None else beta
+            limit = 7.0 if limit is None else limit
+
         layer.swiglu_alpha = Parameter(
-            torch.full((E,), 1.702, dtype=torch.float32, device=device),
+            torch.full((E,), alpha, dtype=torch.float32, device=device),
             requires_grad=False,
         )
         layer.swiglu_beta = Parameter(
-            torch.ones(E, dtype=torch.float32, device=device),
+            torch.full((E,), beta, dtype=torch.float32, device=device),
             requires_grad=False,
         )
-        layer.swiglu_limit = Parameter(
-            torch.full((E,), 7.0, dtype=torch.float32, device=device),
-            requires_grad=False,
+        layer.swiglu_limit = (
+            None
+            if limit is None
+            else Parameter(
+                torch.full((E,), limit, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
         )
         # The MXFP4 ABI uses a neutral global weight scale for each GEMM.
         layer.mxfp4_weight_global_scale = Parameter(
@@ -1278,6 +1306,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             "cutlass_sm90",
             "cutlass_sm120",
         ):
+            if (
+                self._fi_kernel == "cutlass_sm120"
+                and moe_runner_config.activation == "situ"
+            ):
+                from flashinfer.fused_moe import core as flashinfer_moe_core
+
+                if not getattr(
+                    flashinfer_moe_core, "CUTLASS_FUSED_MOE_SUPPORTS_SITU", False
+                ):
+                    raise RuntimeError(
+                        "Kimi-K3 FlashInfer MXFP4 MoE on SM120 requires a "
+                        "FlashInfer build with CUTLASS SiTU support. Upgrade "
+                        "FlashInfer or restart with --moe-runner-backend marlin."
+                    )
             # Register the fused func at runner construction so the FusedOpPool
             # lookup at `MoeRunner.__init__` finds it.
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
@@ -1338,7 +1380,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
 
     def _apply_sm120_cutlass(self, layer, dispatch_output):
-        """SM120 GPT-OSS MXFP8 x MXFP4 MoE via FlashInfer CUTLASS."""
+        """SM120 MXFP8 x MXFP4 MoE via FlashInfer CUTLASS."""
         from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
             FlashInferCutlassMxfp4MoeQuantInfo,
         )
@@ -1349,8 +1391,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13_weight_scale=layer.w13_weight_scale,
             w2_weight_scale=layer.w2_weight_scale,
             mxfp4_weight_global_scale=layer.mxfp4_weight_global_scale,
-            w13_bias=layer.w13_weight_bias,
-            w2_bias=layer.w2_weight_bias,
+            w13_bias=layer.w13_weight_bias if self.with_bias else None,
+            w2_bias=layer.w2_weight_bias if self.with_bias else None,
             swiglu_alpha=layer.swiglu_alpha,
             swiglu_beta=layer.swiglu_beta,
             swiglu_limit=layer.swiglu_limit,
