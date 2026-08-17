@@ -335,7 +335,7 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-recipe {
   display: flex;
   min-width: 0;
-  padding: 14px 0;
+  padding: 11px 0;
   gap: 12px;
   align-items: center;
   justify-content: space-between;
@@ -346,9 +346,9 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-builder-recipe > div:first-child strong { font-size: 12px; font-weight: 590; line-height: 1.4; }
 .sgd-builder-recipe > div:last-child { display: flex; flex: none; gap: 10px; align-items: center; }
 .sgd-builder-recipe > div:last-child > small { color: var(--sgdb-muted); font-size: 10px; }
-.sgd-builder-section { min-width: 0; padding: 16px 0; border-bottom: 1px solid var(--sgdb-line); }
+.sgd-builder-section { min-width: 0; padding: 13px 0; border-bottom: 1px solid var(--sgdb-line); }
 .sgd-builder-section:last-child { border-bottom: 0; }
-.sgd-builder-section-heading { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; margin-bottom: 10px; }
+.sgd-builder-section-heading { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; margin-bottom: 8px; }
 .sgd-builder-section-heading > span { font-size: 12px; font-weight: 590; }
 .sgd-builder-section-heading > small { color: var(--sgdb-muted); font-size: 11px; line-height: 1.35; text-align: right; }
 
@@ -388,8 +388,13 @@ html.dark table tbody tr:nth-child(even) td,
     color var(--sgdb-ease-dur) var(--sgdb-ease);
 }
 
+/* Hardware label and its VRAM share one line — the second text row bought
+   no clarity, only cell height. Choice subtitles (checkpoint names) keep
+   their own line: they are long enough to need it. */
+.sgd-builder-hardware { display: flex; min-height: 34px; flex-flow: row wrap; align-items: baseline; gap: 5px; }
 .sgd-builder-hardware strong { font-size: 12.5px; font-weight: 590; letter-spacing: -0.01em; }
 .sgd-builder-hardware small, .sgd-builder-choice small { margin-top: 1px; color: var(--sgdb-muted); font-size: 10.5px; }
+.sgd-builder-hardware small { margin-top: 0; }
 
 /* The radio ring is gone — the fill is the affordance. Kept in the DOM (the
    JSX renders it) but collapsed, so no markup change is needed. */
@@ -723,6 +728,9 @@ html.dark table tbody tr:nth-child(even) td,
 .sgd-command-builder button:not(:disabled):not([data-blocked="true"]):active { transform: scale(0.97); transition-duration: 60ms; }
 
 @container builder-controls (min-width: 560px) {
+  .sgd-builder-scope-panel[data-scope="base"] { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 28px; }
+  .sgd-builder-scope-panel[data-scope="base"] > .sgd-builder-recipe,
+  .sgd-builder-scope-panel[data-scope="base"] > .sgd-builder-topology { grid-column: 1 / -1; }
   .sgd-builder-setting-layout { display: grid; grid-template-columns: minmax(240px, 0.9fr) minmax(0, 1.1fr); }
   .sgd-builder-setting-list { padding-right: 16px; border-right: 1px solid var(--sgdb-line); }
   .sgd-builder-context--inline { display: none; }
