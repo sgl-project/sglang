@@ -44,6 +44,7 @@ from sglang.srt.model_executor.forward_context import ForwardContext, forward_co
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
+    get_is_capture_mode,
 )
 from sglang.srt.runtime_context import (
     get_context,
@@ -121,6 +122,42 @@ _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+
+
+def _sync_draft_sampling_across_tp(*tensors):
+    """Broadcast draft-side sampling results from TP rank 0 (AMD/HIP fix).
+
+    Floating-point non-determinism in the draft sampling path
+    (renorm_draft_probs + fast_topk on HIP) makes TP ranks pick different draft
+    tokens; with speculative_num_steps > 1 the divergence propagates into the
+    next step's input_ids / hidden_states and deadlocks the batch's collectives.
+
+    IMPORTANT: draft_forward runs *inside* a captured CUDA graph. Per
+    GroupCoordinator.graph_capture(), torch.distributed collectives are disabled
+    while capturing (they raise hipErrorCapturedEvent) and PyNccl is the enabled
+    path. Skipping the sync during capture (what patch v4 did) means the replayed
+    graph contains no sync at all. So use pynccl during capture, torch.distributed
+    otherwise.
+    """
+    from sglang.srt.distributed import get_tp_group
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+    grp = (
+        get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
+    )
+    if grp is None or grp.world_size <= 1:
+        return
+    if get_is_capture_mode():
+        pync = getattr(grp, "pynccl_comm", None)
+        if pync is None or pync.disabled:
+            return
+        for t in tensors:
+            if t is not None and t.is_contiguous():
+                pync.broadcast(t, src=0)
+    else:
+        for t in tensors:
+            if t is not None:
+                grp.broadcast(t, src=0)
 
 
 logger = logging.getLogger(__name__)
@@ -696,6 +733,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
+                _sync_draft_sampling_across_tp(topk_index, topk_p, hidden_states)
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1)
@@ -829,6 +867,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             topk_p, topk_index = fast_sample(probs, num_samples=1)
         else:
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        _sync_draft_sampling_across_tp(
+            topk_index, topk_p, logits_output.hidden_states
+        )
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -987,6 +1028,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
             ret_draft_probs = None
         ret_hidden_states = draft_logits_output.hidden_states
+        _sync_draft_sampling_across_tp(
+            ret_topk_index, ret_topk_p, ret_hidden_states
+        )
 
         # Construct the return values
         next_draft_input = batch_result.next_draft_input
