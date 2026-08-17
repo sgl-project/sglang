@@ -1931,12 +1931,14 @@ class KVCacheConfigurator:
             # 2 for overlap ping-pong). Cap it there so the rest goes to KVarN.
             if (
                 self.server_args.kv_cache_dtype.startswith("kvarn_")
-                and self.server_args.max_mamba_cache_size is None
-                and self.server_args.max_running_requests is not None
+                and get_schedule().max_mamba_cache_size is None
+                and get_schedule().max_running_requests is not None
             ):
                 ratio = self._calculate_mamba_ratio()
-                self.server_args.max_mamba_cache_size = (
-                    self.server_args.max_running_requests * ratio
+                get_context().override(
+                    "kvarn.mamba_cap",
+                    max_mamba_cache_size=get_schedule().max_running_requests
+                    * ratio,
                 )
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
