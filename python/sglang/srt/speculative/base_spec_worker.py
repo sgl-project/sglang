@@ -11,7 +11,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
 )
-from sglang.srt.runtime_context import get_exec, get_schedule
+from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import (
@@ -212,7 +212,7 @@ class BaseSpecWorker(ABC):
         return self.draft_worker.weight_load_time
 
     @property
-    def war_fastpath_runner(self):
+    def last_shared_read_runner(self):
         # The runner that runs the step's LAST shared-buffer-reading phase --
         # it owns the read-done event the scheduler's WAR barrier waits on.
         # Default is the target runner; override if the last phase runs
@@ -235,7 +235,7 @@ class BaseSpecWorker(ABC):
         target_model_runner = self.target_worker.model_runner
         target_model_runner.mtp_draft_device_pools = ()
         spec_algorithm = target_model_runner.spec_algorithm
-        if not self.server_args.enable_hierarchical_cache:
+        if not get_memory().enable_hierarchical_cache:
             return HiCacheDraftPlan()
 
         draft_runners = self._draft_model_runners()
