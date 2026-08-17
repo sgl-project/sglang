@@ -99,6 +99,7 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.plugins import load_plugins
+from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -1108,6 +1109,11 @@ class Engine(EngineScoreMixin, EngineBase):
             or server_args.tool_call_parser == "auto"
         ):
             resolve_auto_parsers(server_args)
+
+        # Resolution is complete here; this process goes on to host the
+        # tokenizer manager or the multi-tokenizer router, whose own publish
+        # re-projects the same object.
+        publish(server_args, role="tokenizer")
 
         # Launch daemons (daemon mode only). The handles travel back to the
         # Engine that spawned them; shutdown() reaps from there.

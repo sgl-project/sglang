@@ -393,6 +393,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Parse args
         self.server_args = server_args
+        # In a tokenizer-worker process this is the process's first publish;
+        # the in-process path re-projects the object the launcher published.
+        set_global_server_args_for_tokenizer(server_args)
         self.startup_time: Optional[Dict[str, Any]] = None
         self._config_updates: List[Tuple[str, Dict[str, Any]]] = []
         self.elastic_worker_count = server_args.dp_size
@@ -407,7 +410,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.preferred_sampling_params = server_args.preferred_sampling_params
         self.crash_dump_folder = server_args.crash_dump_folder
-        set_global_server_args_for_tokenizer(server_args)
 
         # Init model config
         self.init_model_config()

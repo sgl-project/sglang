@@ -27,10 +27,13 @@ resolved configuration lives in the namespace bags.**
 
 - Every publishing process entry calls `publish(server_args, role=...)`
   (`run_scheduler_process`, the Ray `SchedulerActor`, the DP controller, tokenizer,
-  encoder, weight-cache daemon, launcher, ...). The one deliberate exception is the
-  detokenizer: its processes never publish and read only the raw config handed to
-  their constructors — code that can run detokenizer-side must not use the
-  namespace accessors. `publish` snapshots the resolved field
+  detokenizer, encoder, weight-cache daemon, ...); the roles are enumerated once,
+  as the keys of `ROLE_NAMESPACE_SETS` — there is no `launcher` role, the launch
+  path publishes as `tokenizer`. The remaining non-publisher is
+  `run_multi_detokenizer_router_process`: it *is* handed a `ServerArgs`, and uses
+  it only for `configure_logger(server_args)` today, so it has nothing to publish
+  for — a bag read added under that entry needs a `publish` at the entry first.
+  `publish` snapshots the resolved field
   values into the config bags; the accessors (`get_exec()` etc.) fail closed before it
   runs. `role` records which process type published, and keys per-role namespace
   enforcement: `SGLANG_ROLE_NAMESPACES=record` audits which namespaces each role's
