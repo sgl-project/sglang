@@ -88,13 +88,17 @@ Qwen3.5-397B, Inkling-Small on GB300/B200/H200).
 - Plans, confirmed on B200 (2026-08-14, 14-arm e2e sweep, three models):
   decode B family, split-K, row domain, overlap windows, route builder and
   route PDL all picked the same winner as on GB300.
-- Tiles, partly confirmed on B200: the per-expert decode ladder was measured
-  against the same five candidate tile sets across r8–r128, and B200 chose
-  the same winner as GB300 at every rank with matching magnitudes (using the
-  wrong tile costs ~25% at r8 on both dies), which is what the rank rule in
-  `gb300.tiles.json` encodes.
-- NOT measured on B200: tile values for the other sites and M buckets
-  (prefill rows, shared decode, the ≤4/≤16 token buckets) and the optional
+- Tiles, confirmed on B200 (2026-08-17, 4-candidate forcing sweep on the
+  per-expert decode row at r16/32/64, the per-expert prefill row and both
+  shared rows): B200 picks the same winner as GB300 in every cell. Forcing
+  the wrong tile costs up to 4.9% on the rank rule and 5–16% for the built-in
+  heuristics, so the ladder earns its place on both dies.
+- The one place both dies wanted something the table did not have: at rank 32
+  the M≤16 tiles keep winning up to 32 tokens, where the ladder used to fall
+  to the wildcard row. `{"max_rank": 32, "max_tokens": 32}` encodes exactly
+  that measured window — above 32 tokens at that rank nothing was measured,
+  so it still serves the wildcard row.
+- NOT measured on B200: tile values for the ≤4-token bucket and the optional
   tp{2,4,8} tile-forcing confirmation. Those inherit GB300's numbers.
 
 Provenance and the full axis inventory: the campaign's best-config tables

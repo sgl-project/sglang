@@ -97,24 +97,21 @@ class TestSm100PerExpert:
         assert c.plan.late_overlap is LateOverlap.NONE
 
     def test_decode_tile_ladder_is_rank_then_token_bucketed(self):
-        # rank <= 16 pins the tiny row for EVERY batch size (the ladder
-        # terminates at the unconditional-M rank rule); larger ranks walk
-        # the M ladder: <=4 tiny-shape, <=16 mse, then the large row.
-        tiny = resolve_tiles(
-            architecture_value="gb300",
-            plan_key_name="decode.per_expert",
-            physical_rank=16,
-        )
-        assert tiny.config_for(4).gate_up_b["BLOCK_SIZE_N"] == 128
-        assert tiny.config_for(4096).gate_up_b["BLOCK_SIZE_N"] == 128
-        ladder = resolve_tiles(
-            architecture_value="gb300",
-            plan_key_name="decode.per_expert",
-            physical_rank=64,
-        )
-        assert ladder.config_for(4).gate_up_b["BLOCK_SIZE_N"] == 128
-        assert ladder.config_for(16).gate_up_b["BLOCK_SIZE_N"] == 512
-        assert ladder.config_for(17).gate_up_b["BLOCK_SIZE_N"] == 256
+        # gate_up_b BLOCK_SIZE_N names the tile set: 128 tiny, 512 mse,
+        # 256 large. Rank 16 pins tiny at every M; rank 32 holds mse to 32
+        # tokens; rank 64 drops to large above 16.
+        def block_n(rank: int, tokens: int) -> int:
+            table = resolve_tiles(
+                architecture_value="gb300",
+                plan_key_name="decode.per_expert",
+                physical_rank=rank,
+            )
+            return table.config_for(tokens).gate_up_b["BLOCK_SIZE_N"]
+
+        assert block_n(16, 4) == 128
+        assert block_n(16, 4096) == 128
+        assert [block_n(32, m) for m in (4, 16, 32, 33)] == [128, 512, 512, 256]
+        assert [block_n(64, m) for m in (4, 16, 17)] == [128, 512, 256]
 
     def test_unknown_row_serves_the_default_launch_config(self):
         table = resolve_tiles(
