@@ -11,28 +11,19 @@ register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
 
 import itertools
 import math
-import os
 import platform
-import sys
 import unittest
 
 import torch
 
-# Add parent dir (test/srt/cpu/) to path for utils import
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 from sglang.srt.layers.amx_utils import CPUQuantMethod
+from sglang.test.cpu_test_utils import precision, torch_w8a8_per_column_fused_moe
 from sglang.test.test_utils import CustomTestCase
 
 kernel = torch.ops.sgl_kernel
 IS_ARM64 = platform.machine().lower() in ("aarch64", "arm64")
 
 torch.manual_seed(128)
-
-from utils import (
-    precision,
-    torch_w8a8_per_column_fused_moe,
-)
 
 
 class TestFusedExpertsInt8(CustomTestCase):
