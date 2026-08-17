@@ -106,6 +106,7 @@ from sglang.srt.models.kimi_k3_vl import (
 )
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     fill_transparent_bg,
@@ -139,14 +140,6 @@ _k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
 
 def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
-
-
-# MegaMoE SiTU sentinel: DeepGEMM 0.1.5.post1+ selects the K3 SiTU
-# activation when activation_clamp == 0.03125 (2^-5: exactly representable and
-# unused by any legitimate swiglu clamp; the host asserts clamp >= 0 so a
-# negative sentinel is impossible). beta=4.0 / linear_beta=25.0 are baked into
-# the DeepGEMM kernel.
-_K3_MEGA_SITU_SENTINEL_CLAMP = 0.03125
 
 
 def _k3_bf16_gemm(
@@ -487,9 +480,8 @@ class KimiK3MoE(nn.Module):
         # through it when enabled — the megamoe backend's non-mega fallback is
         # a StandardDispatcher without a2a, which is wrong for scattered
         # tokens — so SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK must
-        # cover the per-rank prefill chunk. SiTU is selected inside the
-        # DeepGEMM mega kernel via a sentinel activation_clamp with the K3
-        # constants baked in.
+        # cover the per-rank prefill chunk. The DeepGEMM MegaMoE SiTU kernel
+        # bakes in the K3 activation constants.
         self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
         self._mega_intermediate_size = moe_intermediate_size
         self._mega_top_k = config.num_experts_per_token
@@ -499,7 +491,7 @@ class KimiK3MoE(nn.Module):
                 config.activation_situ_beta,
                 config.activation_situ_linear_beta,
             ) == (4.0, 25.0), (
-                "mega SiTU kernel patch bakes beta=4.0/linear_beta=25.0; "
+                "MegaMoE SiTU kernel bakes beta=4.0/linear_beta=25.0; "
                 "got a checkpoint with different constants"
             )
 
@@ -802,10 +794,7 @@ class KimiK3MoE(nn.Module):
             self.experts.mega_l2_weights,
             buf,
             recipe=(1, 1, 32),
-            activation="swiglu",
-            # Sentinel: selects the K3 SiTU branch in the DeepGEMM mega kernel
-            # (beta=4.0 / linear_beta=25.0 baked in).
-            activation_clamp=_K3_MEGA_SITU_SENTINEL_CLAMP,
+            activation="situ",
             fast_math=True,
         )
         y = y[:num_tokens]
@@ -3087,6 +3076,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
     supports_cuda_vmm_feature_transport = True
+    encoder_media_processor_config = EncoderMediaProcessorConfig(
+        image_decode_mode="nvjpeg_fancy",
+        preserve_media_metadata=True,
+    )
 
     # Raw HF checkpoint prefixes, before hf_to_sglang_mapper is applied.
     encoder_only_safetensors_weight_prefixes = (
@@ -3271,49 +3264,79 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 for item in selected_items
             ]
             if any(config is not None for config in deferred):
-                if not all(config is not None for config in deferred):
-                    raise ValueError(
-                        "Kimi-K3 cannot mix deferred and preprocessed image features"
-                    )
-                first_config = deferred[0]
-                backend = first_config["backend"]
-                if any(config["backend"] != backend for config in deferred):
-                    raise ValueError(
-                        "Kimi-K3 cannot mix deferred preprocessing backends"
-                    )
-                if backend == "gpu":
-                    from sglang.srt.multimodal.processors.kimi_k25 import (
-                        _gpu_preprocess_images,
-                    )
+                materialized = [None] * len(selected_items)
+                deferred_by_backend = {}
+                for index, (item, config) in enumerate(zip(selected_items, deferred)):
+                    if config is None:
+                        if not isinstance(item.feature, torch.Tensor):
+                            raise TypeError(
+                                "Kimi-K3 image feature must be a torch.Tensor, "
+                                f"got {type(item.feature)}"
+                            )
+                        materialized[index] = item.feature
+                    else:
+                        deferred_by_backend.setdefault(config.backend, []).append(index)
 
-                    image_scale, image_bias = normalization_tensors(
-                        first_config["image_mean"], first_config["image_std"], device
-                    )
-                    pixel_values, _ = _gpu_preprocess_images(
-                        [item.feature for item in selected_items],
-                        [config["resize_config"] for config in deferred],
-                        image_scale,
-                        image_bias,
-                        self.vision_tower.patch_size,
-                        to_chw=lambda image: to_chw_uint8(image, device=device),
-                        post_resize=lambda x: fill_transparent_bg(
-                            x, first_config["transparent_bg_config"]
-                        ),
-                    )
-                elif backend == "cpu":
-                    from sglang.srt.multimodal.kimi_k3_image_processing import (
-                        materialize_kimi_k3_cpu_features,
-                    )
+                for backend, indices in deferred_by_backend.items():
+                    group_items = [selected_items[index] for index in indices]
+                    group_configs = [deferred[index] for index in indices]
+                    first_config = group_configs[0]
+                    if backend == "gpu":
+                        from sglang.srt.multimodal.processors.kimi_k25 import (
+                            _gpu_preprocess_images,
+                        )
 
-                    pixel_values = materialize_kimi_k3_cpu_features(
-                        selected_items, self._encoder_image_processor
-                    )
-                    pixel_values = pixel_values.to(device, non_blocking=True)
-                else:
-                    raise ValueError(
-                        f"Unsupported Kimi-K3 deferred preprocessing backend: {backend}"
-                    )
-                return pixel_values.to(dtype=target_dtype)
+                        image_scale, image_bias = normalization_tensors(
+                            first_config.image_mean,
+                            first_config.image_std,
+                            device,
+                        )
+                        pixel_values, produced_grids = _gpu_preprocess_images(
+                            [item.feature for item in group_items],
+                            [config.resize_config for config in group_configs],
+                            image_scale,
+                            image_bias,
+                            self.vision_tower.patch_size,
+                            to_chw=lambda image: to_chw_uint8(image, device=device),
+                            post_resize=lambda x: fill_transparent_bg(
+                                x, first_config.transparent_bg_config
+                            ),
+                        )
+                        expected_grids = grid_thws_host[indices]
+                        if not torch.equal(produced_grids.cpu(), expected_grids):
+                            raise ValueError(
+                                "Kimi-K3 deferred GPU preprocessing produced wrong grids"
+                            )
+                    elif backend == "cpu":
+                        from sglang.srt.multimodal.kimi_k3_image_processing import (
+                            materialize_kimi_k3_cpu_features,
+                        )
+
+                        pixel_values = materialize_kimi_k3_cpu_features(
+                            group_items, self._encoder_image_processor
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unsupported Kimi-K3 deferred preprocessing backend: {backend}"
+                        )
+
+                    patch_counts = [
+                        int(grid_thws_host[index].prod().item()) for index in indices
+                    ]
+                    if sum(patch_counts) != pixel_values.shape[0]:
+                        raise ValueError(
+                            "Kimi-K3 deferred feature length does not match image grids"
+                        )
+                    for index, feature in zip(
+                        indices, pixel_values.split(patch_counts), strict=True
+                    ):
+                        materialized[index] = feature
+
+                return materialize_multimodal_features(
+                    materialized,
+                    device=device,
+                    dtype=target_dtype,
+                )
 
             features = []
             for item in selected_items:
