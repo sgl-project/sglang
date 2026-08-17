@@ -1020,11 +1020,15 @@ class SchedulerPPMixin:
             "next_token_ids": result.next_token_ids,
         }
 
-        if batch.return_logprob:
-            logprob_dict = get_logprob_dict_from_result(result)
+        has_sampling_mask_output = (
+            result.logits_output is not None
+            and result.logits_output.sampling_mask_output is not None
+        )
+        if batch.return_logprob or has_sampling_mask_output:
+            logits_output_dict = get_logprob_dict_from_result(result)
             tensor_dict = {
                 **tensor_dict,
-                **logprob_dict,
+                **logits_output_dict,
             }
         return tensor_dict
 
@@ -1144,7 +1148,10 @@ class SchedulerPPMixin:
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
 
-        if batch.return_logprob:
+        if (
+            batch.return_logprob
+            or pp_outputs.tensors.get("sampling_mask_token_ids") is not None
+        ):
             (
                 logits_output,
                 extend_input_len_per_req,
@@ -1266,7 +1273,17 @@ class SchedulerPPMixin:
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
                 d2h_event = self.device_module.Event()
-                d2h_event.record(self.device_module.current_stream())
+                if (
+                    batch_result.logits_output is not None
+                    and batch_result.logits_output.sampling_mask_output is not None
+                ):
+                    batch_result.copy_done = d2h_event
+                    batch_result.copy_to_cpu(
+                        return_logprob=target.return_logprob,
+                        return_hidden_states=False,
+                    )
+                else:
+                    d2h_event.record(self.device_module.current_stream())
 
         if send_first:
             send_output_work = _do_send()

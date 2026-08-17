@@ -696,6 +696,10 @@ class SchedulerDisaggregationPrefillMixin:
             batch=batch,
             logits_output=logits_output,
         )
+        if logits_output is not None and logits_output.sampling_mask_output is not None:
+            self.batch_result_processor.materialize_sampling_mask_output(
+                batch.reqs, logits_output
+            )
 
         def advance_logprob_pt(i: int, req: Req) -> None:
             nonlocal logprob_pt
@@ -715,6 +719,39 @@ class SchedulerDisaggregationPrefillMixin:
                 # Test hook: exercise the release/requeue retry path.
                 if req.pending_bootstrap and should_force_retry(req):
                     self.optimistic_release_and_requeue(req)
+                    advance_logprob_pt(i, req)
+                    continue
+
+                sampling_mask_finish_reason = None
+                if req.return_sampling_mask:
+                    assert logits_output is not None
+                    statuses = logits_output.next_token_sampling_mask_status
+                    status = None if statuses is None else statuses[i]
+                    sampling_mask_finish_reason = (
+                        self.batch_result_processor.get_sampling_mask_finish_reason(
+                            status=status
+                        )
+                    )
+                if sampling_mask_finish_reason is not None:
+                    self.clear_pending_chunk_send(req)
+                    prepare_abort(
+                        req,
+                        sampling_mask_finish_reason.message,
+                        status_code=sampling_mask_finish_reason.status_code,
+                    )
+                    req.time_stats.trace_ctx.abort(
+                        abort_info={"reason": sampling_mask_finish_reason.message}
+                    )
+                    req.disagg_kv_sender.abort()
+                    maybe_release_metadata_buffer(
+                        req, self.req_to_metadata_buffer_idx_allocator
+                    )
+                    req.pending_bootstrap = False
+                    if self.enable_hicache_storage:
+                        self.tree_cache.release_aborted_request(req.rid)
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    req.time_stats.set_completion_time()
+                    self.output_streamer.stream_output([req], req.return_logprob)
                     advance_logprob_pt(i, req)
                     continue
 

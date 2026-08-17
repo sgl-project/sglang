@@ -16,6 +16,7 @@
 import dataclasses
 import logging
 from contextlib import contextmanager
+from enum import IntEnum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -78,6 +79,30 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
 _autotune_run_lm_head: Optional[bool] = None
 
 
+class SamplingMaskStatus(IntEnum):
+    """Ordered by severity so distributed MAX reaches one policy decision."""
+
+    OK = 0
+    TRUNCATED = 1
+    INVALID = 2
+
+
+@dataclasses.dataclass
+class SamplingMaskOutput:
+    """Tensor result for opted-in rows in batch order."""
+
+    token_ids: torch.Tensor
+    lengths: torch.Tensor
+    selected_logprobs: torch.Tensor
+    statuses: torch.Tensor
+
+    def map_device_tensors(self, fn) -> None:
+        self.token_ids = fn(self.token_ids)
+        self.lengths = fn(self.lengths)
+        self.selected_logprobs = fn(self.selected_logprobs)
+        self.statuses = fn(self.statuses)
+
+
 def get_in_autotune_dummy_run() -> bool:
     return _autotune_run_lm_head is not None
 
@@ -114,10 +139,12 @@ class LogitsProcessorOutput:
         List[Union[List[float], torch.Tensor]]
     ] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
-    # Sparse top-k/top-p/min-p support ids and selected-token logprob after
-    # truncation/renormalization. Only populated when requested.
+    # Post-filter support IDs, bounded by server capacity, and selected-token
+    # logprob over the full realized support.
+    sampling_mask_output: Optional[SamplingMaskOutput] = None
     next_token_sampling_mask_idx: Optional[List[Optional[List[int]]]] = None
     next_token_sampling_logprobs: Optional[List[Optional[float]]] = None
+    next_token_sampling_mask_status: Optional[List[Optional[int]]] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
     # The logprobs of input tokens.        shape: [#token]

@@ -76,7 +76,11 @@ def _make_result():
         copy_done=None,
         routed_experts_output=None,
         indexer_topk_output=None,
-        logits_output=SimpleNamespace(hidden_states=None, customized_info=None),
+        logits_output=SimpleNamespace(
+            hidden_states=None,
+            customized_info=None,
+            sampling_mask_output=None,
+        ),
         next_token_ids=[4],
         can_run_cuda_graph=False,
         num_correct_drafts=0,

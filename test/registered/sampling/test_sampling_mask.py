@@ -20,10 +20,13 @@ _MAX_NEW_TOKENS = 4
 _TOP_P = 0.99
 _TOP_P_SMALL = 1e-5
 _TOP_K = 10
+_SAMPLING_MASK_MAX_TOKENS = 16
 _SAMPLING_SEED = 1234
 _SERVER_ARGS = (
     "--mem-fraction-static",
     "0.7",
+    "--sampling-mask-max-tokens",
+    str(_SAMPLING_MASK_MAX_TOKENS),
 )
 
 
@@ -41,7 +44,8 @@ class SamplingMaskTestMixin:
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
 
     def _post_generate(
         self,
@@ -95,12 +99,10 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
                 "ignore_eos": True,
             }
         )
-        # The mask keeps at most top_k tokens, plus possibly the actually
-        # sampled token when the sampling kernel picks one just outside the
-        # mask's topk reconstruction (fp cumsum divergence); see
-        # Sampler._attach_sampling_mask_to_output.
+        # SGLang's sampling primitives retain ties at their threshold, so
+        # top-k can realize more than k support entries.
         for sampling_mask in top_p_sampling_masks:
-            self.assertLessEqual(len(sampling_mask), _TOP_K + 1)
+            self.assertLessEqual(len(sampling_mask), _SAMPLING_MASK_MAX_TOKENS)
 
         top_k_sampling_masks = self._generate_sampling_masks(
             {
@@ -111,7 +113,8 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             }
         )
         for sampling_mask in top_k_sampling_masks:
-            self.assertIn(len(sampling_mask), (_TOP_K, _TOP_K + 1))
+            self.assertGreaterEqual(len(sampling_mask), _TOP_K)
+            self.assertLessEqual(len(sampling_mask), _SAMPLING_MASK_MAX_TOKENS)
 
         top_k_top_p_one_sampling_masks = self._generate_sampling_masks(
             {
@@ -123,15 +126,17 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
             }
         )
         for sampling_mask in top_k_top_p_one_sampling_masks:
-            self.assertIn(len(sampling_mask), (_TOP_K, _TOP_K + 1))
+            self.assertGreaterEqual(len(sampling_mask), _TOP_K)
+            self.assertLessEqual(len(sampling_mask), _SAMPLING_MASK_MAX_TOKENS)
 
     def test_sampling_mask_matches_topk_logprobs(self):
-        """Check the returned mask and its renormalized logprobs.
+        """Check an uncapped mask and its selected-token logprobs.
 
         We get the per-token full-vocab logprobs via ``return_logprob`` with
-        ``top_logprobs_num == top_k``, which covers every token the mask can
-        contain. With ``temperature=1.0`` these are the sampler's distribution,
-        so ``p = exp(logprob)`` are the exact probabilities. For each token, we check:
+        ``top_logprobs_num == sampling_mask_max_tokens``, which covers every token
+        in this mask because ``top_k`` is below the cap. With ``temperature=1.0``
+        these are the sampler's distribution, so ``p = exp(logprob)`` are the
+        exact probabilities. For each token, we check:
 
         1. the returned mask matches the nucleus reconstructed from those probs,
         2. sampling_logprob == log(p[sampled] / sum(p[t] for t in mask)).
@@ -146,7 +151,7 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
                 "ignore_eos": True,
             },
             return_logprob=True,
-            top_logprobs_num=top_k,
+            top_logprobs_num=_SAMPLING_MASK_MAX_TOKENS,
         )
         self.assertEqual(response.status_code, 200, response.text)
 
@@ -168,17 +173,24 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
                 int(tid): math.exp(logprob) for logprob, tid, _ in step_top_logprobs
             }
 
-            reconstructed = []
+            ranked = [
+                (math.exp(logprob), int(tid)) for logprob, tid, _ in step_top_logprobs
+            ]
+            top_k_threshold = ranked[top_k - 1][0]
             mass_before = 0.0
-            for logprob, tid, _ in step_top_logprobs:
+            top_p_threshold = ranked[-1][0]
+            for prob, _ in ranked:
                 if mass_before <= top_p:
-                    reconstructed.append(int(tid))
-                mass_before += math.exp(logprob)
-            if output_id not in reconstructed:
-                reconstructed.append(output_id)
+                    top_p_threshold = prob
+                mass_before += prob
+            reconstructed = {
+                tid
+                for prob, tid in ranked
+                if prob >= top_k_threshold and prob >= top_p_threshold
+            }
             # ``<= 1``: fp32 (server) and fp64 (here) cumsums may split on the
             # single token straddling the top_p cut.
-            self.assertLessEqual(len(set(mask) ^ set(reconstructed)), 1)
+            self.assertLessEqual(len(set(mask) ^ reconstructed), 1)
 
             support_mass = sum(probs[tid] for tid in mask)
             expected_logprob = math.log(probs[output_id] / support_mass)
@@ -224,19 +236,31 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
         for output_id, sampling_mask in zip(output_ids, sampling_masks):
             self.assertIn(output_id, sampling_mask)
 
-    def test_generate_rejects_full_vocabulary_sampling_mask(self):
+    def test_top_p_only_support_above_capacity_is_rejected(self):
+        sampling_params = {
+            "temperature": 1.0,
+            "top_p": _TOP_P,
+            "max_new_tokens": _MAX_NEW_TOKENS,
+            "ignore_eos": True,
+        }
+
+        response = self._post_generate(sampling_params)
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("sampling-mask-max-tokens", response.text)
+
+    def test_support_above_capacity_is_rejected(self):
+        sampling_params = {
+            "temperature": 1.0,
+            "top_k": _SAMPLING_MASK_MAX_TOKENS + 1,
+            "max_new_tokens": _MAX_NEW_TOKENS,
+            "ignore_eos": True,
+        }
+
         response = self._post_generate(
-            {
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "max_new_tokens": _MAX_NEW_TOKENS,
-                "ignore_eos": True,
-            }
+            sampling_params,
         )
         self.assertEqual(response.status_code, 400, response.text)
-        self.assertIn(
-            "return_sampling_mask cannot return the full vocabulary", response.text
-        )
+        self.assertIn("sampling-mask-max-tokens", response.text)
 
 
 class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):

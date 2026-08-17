@@ -292,7 +292,6 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -2534,19 +2533,6 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        uses_top_k_or_top_p_truncation = (
-            req.sampling_params.top_k != TOP_K_ALL or req.sampling_params.top_p < 1.0
-        )
-        if req.return_sampling_mask and not uses_top_k_or_top_p_truncation:
-            error_msg = (
-                "return_sampling_mask cannot return the full vocabulary; set "
-                "top_p < 1 or a finite top_k."
-            )
-            req.set_finish_with_abort(error_msg)
-            self.init_req_max_new_tokens(req)
-            self._add_request_to_queue(req)
-            return
-
         if req.return_sampling_mask and not self.spec_algorithm.is_none():
             # Spec workers do not emit one sampling support per accepted token, so
             # the returned mask would not align 1:1 with generated tokens. Reject
@@ -2559,12 +2545,14 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if req.return_sampling_mask and get_exec().kernel.sampling_backend == "ascend":
-            # The ascend backend samples from logits directly and never builds the
-            # top-k/top-p support, so it cannot produce a sampling mask.
+        sampling_backend = get_exec().kernel.sampling_backend
+        if req.return_sampling_mask and (
+            use_mlx() or sampling_backend not in {"flashinfer", "pytorch"}
+        ):
+            unsupported_backend = "mlx" if use_mlx() else sampling_backend
             error_msg = (
-                "return_sampling_mask is not supported with the ascend "
-                "sampling backend."
+                "return_sampling_mask is not supported with the "
+                f"{unsupported_backend} sampling backend."
             )
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
