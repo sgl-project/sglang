@@ -336,12 +336,16 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
 
     # -- state --
 
-    def clear(self) -> None:
-        """Reset to initial state. Pages in `[0, min_page_index)` are reserved."""
+    def _reset_watermarks(self) -> None:
+        """Reset frontier state to empty (float middles override)."""
         if self.grow_direction == "up":
             self.watermark_physical = self.min_page_index
         else:
             self.watermark_physical = self.num_pages - 1
+
+    def clear(self) -> None:
+        """Reset to initial state. Pages in `[0, min_page_index)` are reserved."""
+        self._reset_watermarks()
         self.virtual_to_physical.fill_(-1)
         # Virtual page 0 <-> physical page 0 (padding sink).
         self.virtual_to_physical[0] = 0
@@ -1376,30 +1380,41 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
         if src_list:
             src_pages = torch.tensor(src_list, dtype=torch.int64, device=self.device)
             dst_pages = torch.tensor(dst_list, dtype=torch.int64, device=self.device)
-            v_moved = self.physical_to_virtual[
-                src_pages
-            ].clone()  # read before clearing
-
-            # Expand page ids to token ids for the token-granular move kernel.
-            if self.page_size == 1:
-                src_t, dst_t = src_pages, dst_pages
-            else:
-                offsets = torch.arange(
-                    self.page_size, dtype=torch.int64, device=self.device
-                )
-                src_t = (src_pages[:, None] * self.page_size + offsets).reshape(-1)
-                dst_t = (dst_pages[:, None] * self.page_size + offsets).reshape(-1)
-
-            # Un-translated copy: the public copy_from translates virtual ids,
-            # which we must NOT do here.
-            self._kvcache.move_kv_cache(dst_t, src_t)
-            # Clear the vacated band, then re-bind the relocated dst pages.
+            # `dst` holes are outside the vacated band by construction, so
+            # rebinding them before the band wipe is order-equivalent.
+            self._move_pages_and_rebind(src_pages, dst_pages)
             self.physical_to_virtual[vacated_lo:vacated_hi] = -1
-            self.virtual_to_physical[v_moved] = dst_pages
-            self.physical_to_virtual[dst_pages] = v_moved
-            self._inverse_history.append((src_pages, dst_pages, v_moved))
         else:
             self.physical_to_virtual[vacated_lo:vacated_hi] = -1
+
+    def _move_pages_and_rebind(
+        self, src_pages: torch.Tensor, dst_pages: torch.Tensor
+    ) -> torch.Tensor:
+        """Copy live pages src->dst (disjoint sets), rebind v2p/p2v for the
+        moved virtuals, and record inverse history. Does NOT clear p2v[src] —
+        callers own vacated-region clearing (end pools wipe the whole vacated
+        band; float middles clear exactly the src set). Returns the moved
+        virtual page ids.
+        """
+        v_moved = self.physical_to_virtual[src_pages].clone()  # read pre-wipe
+
+        # Expand page ids to token ids for the token-granular move kernel.
+        if self.page_size == 1:
+            src_t, dst_t = src_pages, dst_pages
+        else:
+            offsets = torch.arange(
+                self.page_size, dtype=torch.int64, device=self.device
+            )
+            src_t = (src_pages[:, None] * self.page_size + offsets).reshape(-1)
+            dst_t = (dst_pages[:, None] * self.page_size + offsets).reshape(-1)
+
+        # Un-translated copy: the public copy_from translates virtual ids,
+        # which we must NOT do here.
+        self._kvcache.move_kv_cache(dst_t, src_t)
+        self.virtual_to_physical[v_moved] = dst_pages
+        self.physical_to_virtual[dst_pages] = v_moved
+        self._inverse_history.append((src_pages, dst_pages, v_moved))
+        return v_moved
 
     # -- lazy compaction primitives --
 
