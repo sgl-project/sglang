@@ -313,8 +313,8 @@ export const config = {
     h200:    "lmsysorg/sglang:qwen38-27b",
     rtx6000: "lmsysorg/sglang:qwen38-27b",
     rtx5090: "lmsysorg/sglang:qwen38-27b",
-    // TODO: verify an arm64 build of this tag for DGX Spark (GB10 is aarch64);
-    // the x86-only tag will not pull there.
+    // Multi-arch: this tag ships both linux/amd64 and linux/arm64, so it pulls
+    // natively on DGX Spark (GB10 is aarch64).
     "dgx-spark": "lmsysorg/sglang:qwen38-27b",
     gb300:   "lmsysorg/sglang:dev",
   },
