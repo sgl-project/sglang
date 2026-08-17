@@ -23,6 +23,7 @@ inline CommunicatorObj::CommunicatorObj(
     std::vector<TensorView> push_workspaces,
     std::vector<TensorView> pull_workspaces,
     std::vector<TensorView> pull_semaphores,
+    std::vector<TensorView> gather_workspaces,
     TensorView push_counter,
     const std::optional<int64_t> pull_mc_workspace_ptr) {
   this->rank = rank;
@@ -32,10 +33,12 @@ inline CommunicatorObj::CommunicatorObj(
   RuntimeCheck(push_workspaces.size() == world_size, "Bad push workspace count");
   RuntimeCheck(pull_workspaces.size() == world_size, "Bad pull workspace count");
   RuntimeCheck(pull_semaphores.size() == world_size, "Bad pull semaphore count");
+  RuntimeCheck(gather_workspaces.size() == world_size, "Bad gather workspace count");
   // Shared symbolic sizes / device enforce consistency across ranks; the
   // matchers also require contiguity (no strides given) and uint8 dtype.
   auto push_bytes = SymbolicSize{"push_bytes"};
   auto pull_bytes = SymbolicSize{"pull_bytes"};
+  auto gather_bytes = SymbolicSize{"gather_bytes"};
   auto num_pull_blocks = SymbolicSize{"num_pull_blocks"};
   auto num_push_blocks = SymbolicSize{"num_push_blocks"};
   auto device = SymbolicDevice{};
@@ -50,9 +53,14 @@ inline CommunicatorObj::CommunicatorObj(
         .with_dtype<uint8_t>()
         .with_device(device)
         .verify(pull_semaphores[i]);
+    TensorMatcher({gather_bytes})  //
+        .with_dtype<uint8_t>()
+        .with_device(device)
+        .verify(gather_workspaces[i]);
     this->push_workspaces[i] = static_cast<uint8_t*>(push_workspaces[i].data_ptr());
     this->pull_workspaces[i] = static_cast<uint8_t*>(pull_workspaces[i].data_ptr());
     this->pull_semaphores[i] = static_cast<Semaphore*>(pull_semaphores[i].data_ptr());
+    this->gather_workspaces[i] = static_cast<uint8_t*>(gather_workspaces[i].data_ptr());
   }
   TensorMatcher({num_push_blocks, static_cast<int64_t>(sizeof(Counter))})
       .with_dtype<uint8_t>()
@@ -70,6 +78,10 @@ inline CommunicatorObj::CommunicatorObj(
   this->push_counter = static_cast<Counter*>(push_counter.data_ptr());
   this->push_bytes = push_bytes.unwrap();
   this->num_push_blocks = static_cast<uint32_t>(num_push_blocks.unwrap());
+
+  // gather config (two phases, so an even size)
+  this->gather_bytes = gather_bytes.unwrap();
+  RuntimeCheck(this->gather_bytes % 2 == 0, "Gather workspace must hold two phases");
 
   // pull config
   this->pull_bytes = pull_bytes.unwrap();
@@ -103,6 +115,7 @@ inline void register_communicator() {
           refl::init<
               uint32_t,
               uint32_t,
+              std::vector<TensorView>,
               std::vector<TensorView>,
               std::vector<TensorView>,
               std::vector<TensorView>,

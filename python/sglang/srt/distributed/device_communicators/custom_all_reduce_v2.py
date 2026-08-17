@@ -55,6 +55,7 @@ MB = 1024 * 1024
 
 _ALIGN_BYTES = 1024
 _SEMAPHORE_BYTES = 128
+_LAMPORT_PHASES = 2
 _MAX_GRAPH_INPUTS = 131072
 # resolved once at import time; explicit constructor sizes take precedence
 _DEFAULT_MAX_SIZE = envs.SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB.get() * 1024
@@ -101,6 +102,7 @@ class CustomAllReduceV2:
         *,
         max_pull_size: Optional[int] = None,
         max_push_size: Optional[int] = None,
+        max_lamport_size: Optional[int] = None,
         max_pull_blocks: Optional[int] = None,
         max_push_blocks: Optional[int] = None,
     ) -> None:
@@ -113,6 +115,8 @@ class CustomAllReduceV2:
                               the tuned size and ``max_size``.
         :param max_push_size: explicit per-buffer push workspace size;
                               overrides both the tuned size and ``max_size``.
+        :param max_lamport_size: explicit ``2shot_lamport`` gather phase size;
+                                 overrides both the tuned size and ``max_size``.
 
         ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB`` /
         ``SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB`` take the highest
@@ -131,6 +135,8 @@ class CustomAllReduceV2:
             max_pull_size = min(base_config.max_pull_bytes, max_size)
         if max_push_size is None:
             max_push_size = min(base_config.max_push_bytes, max_size)
+        if max_lamport_size is None:
+            max_lamport_size = min(base_config.max_lamport_bytes, max_size)
         if _FORCE_PULL_SIZE_KB is not None:
             max_pull_size = int(_FORCE_PULL_SIZE_KB) * 1024
         if _FORCE_PUSH_SIZE_KB is not None:
@@ -155,6 +161,9 @@ class CustomAllReduceV2:
         self.max_pull_size = _ceil_align(max(max_pull_size, _ALIGN_BYTES), _ALIGN_BYTES)
         self.max_push_size = _ceil_align(max(max_push_size, _ALIGN_BYTES), _ALIGN_BYTES)
         self.max_size = max(self.max_pull_size, self.max_push_size)
+        self.max_lamport_size = _ceil_align(
+            max(max_lamport_size, _ALIGN_BYTES), _ALIGN_BYTES
+        )
         num_pull_blocks = base_config.num_pull_blocks
         num_push_blocks = base_config.num_push_blocks
         if max_pull_blocks is not None:
@@ -162,7 +171,9 @@ class CustomAllReduceV2:
         if max_push_blocks is not None:
             num_push_blocks = max(max_push_blocks, 1)
         self.config = base_config.clip(
-            max_push_bytes=self.max_push_size, max_pull_bytes=self.max_pull_size
+            max_push_bytes=self.max_push_size,
+            max_pull_bytes=self.max_pull_size,
+            max_lamport_bytes=self.max_lamport_size,
         )._replace(num_pull_blocks=num_pull_blocks, num_push_blocks=num_push_blocks)
         self.override_algo: Optional[AllReduceAlgo] = None
         # On a multi-node (MNNVL) group the symm-mem workspace plane works
@@ -195,17 +206,19 @@ class CustomAllReduceV2:
         """Slice one symmetric-memory allocation into all shared buffers.
 
         Layout per rank: ``[2 * world_size push buffers | pull buffer |
-        pull semaphores]``. The push counter is rank-local, so it lives in a
-        plain CUDA tensor instead.
+        pull semaphores | gather buffer]``. The push counter is rank-local, so
+        it lives in a plain CUDA tensor instead.
         """
         cfg = self.config
         push_num_bufs = 2 * self.world_size  # 2 phases x world_size peers
         push_ws_bytes = push_num_bufs * self.max_push_size
         pull_ws_bytes = self.max_pull_size
         pull_sem_bytes = _SEMAPHORE_BYTES * cfg.num_pull_blocks
-        total_bytes = push_ws_bytes + pull_ws_bytes + pull_sem_bytes
+        gather_ws_bytes = _LAMPORT_PHASES * self.max_lamport_size
+        total_bytes = push_ws_bytes + pull_ws_bytes + pull_sem_bytes + gather_ws_bytes
         pull_ws_offset = push_ws_bytes
         pull_sem_offset = push_ws_bytes + pull_ws_bytes
+        gather_ws_offset = pull_sem_offset + pull_sem_bytes
 
         self._symm_tensor, symm_mem = _allocate_symmetric_memory(
             total_bytes, device=self.device, group=self.group
@@ -236,6 +249,10 @@ class CustomAllReduceV2:
             slice_ws(i, [cfg.num_pull_blocks, _SEMAPHORE_BYTES], pull_sem_offset)
             for i in range(self.world_size)
         ]
+        gather_workspaces = [
+            slice_ws(i, [gather_ws_bytes], gather_ws_offset)
+            for i in range(self.world_size)
+        ]
         self._push_counter = torch.zeros(
             (cfg.num_push_blocks,), dtype=torch.uint32, device=self.device
         )
@@ -258,6 +275,7 @@ class CustomAllReduceV2:
             push_workspaces=push_workspaces,
             pull_workspaces=pull_workspaces,
             pull_semaphores=pull_semaphores,
+            gather_workspaces=gather_workspaces,
             push_counter=self._push_counter.view(-1, 1).view(torch.uint8),
             pull_mc_workspace=pull_mc_workspace,
         )
@@ -310,6 +328,8 @@ class CustomAllReduceV2:
         heuristic = self.config.graph if can_use_graph else self.config.eager
         default_mode = _PullMode.GRAPH if can_use_graph else _PullMode.EAGER
         use_multicast = self.config.num_mc_blocks is not None
+        if heuristic.lamport.contains(nbytes):
+            return AllReduceAlgo.TWO_SHOT_LAMPORT, default_mode
         if nbytes <= heuristic.one_shot_push_threshold:
             return AllReduceAlgo.ONE_SHOT_PUSH, _PullMode.EAGER
         if nbytes <= heuristic.one_shot_pull_threshold:

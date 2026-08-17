@@ -93,6 +93,7 @@ struct CommunicatorObj : public tvm::ffi::Object {
       std::vector<TensorView> push_workspaces,
       std::vector<TensorView> pull_workspaces,
       std::vector<TensorView> pull_semaphores,
+      std::vector<TensorView> gather_workspaces,
       TensorView push_counter,
       std::optional<int64_t> pull_mc_workspace_ptr);
 
@@ -102,11 +103,13 @@ struct CommunicatorObj : public tvm::ffi::Object {
   uint32_t world_size;
   int64_t push_bytes;  // per-buffer bytes; each rank holds 2 * world_size buffers
   int64_t pull_bytes;
+  int64_t gather_bytes;
   uint32_t num_push_blocks;  // not configurable (bound to the counter array)
   uint32_t num_pull_blocks;
   uint32_t num_multicast_blocks;
   std::array<uint8_t*, kMaxWorldSize> pull_workspaces;    // symmetric memory
   std::array<uint8_t*, kMaxWorldSize> push_workspaces;    // symmetric memory
+  std::array<uint8_t*, kMaxWorldSize> gather_workspaces;  // symmetric memory
   std::array<Semaphore*, kMaxWorldSize> pull_semaphores;  // symmetric memory
   Counter* push_counter;                                  // local memory
   uint8_t* pull_mc_workspace;                             // multicast address of the pull workspace (may be null)

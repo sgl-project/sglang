@@ -19,7 +19,9 @@ class Range(NamedTuple):
     max_bytes: int
 
     def contains(self, nbytes: int) -> bool:
-        return self.min_bytes <= nbytes <= self.max_bytes
+        # `Range(0, 0)` is the "algo disabled here" convention, so it must not
+        # match even a zero-byte message
+        return self.max_bytes > 0 and self.min_bytes <= nbytes <= self.max_bytes
 
     def clip(self, max_bytes: int) -> "Range":
         return Range(
@@ -31,22 +33,28 @@ class Range(NamedTuple):
 class Heuristic(NamedTuple):
     """Self-contained algo ranges for one dispatch context (graph or eager).
 
-    Four algos are tried in order of preference (fastest first):
-      1. ``1shot_push``:    nbytes <= ``one_shot_push_threshold``
-      2. ``1shot_pull``:    nbytes <= ``one_shot_pull_threshold``
-      3. ``2shot_pull`` mc: nbytes in ``mc.min_bytes..mc.max_bytes``
-                            (only when multicast is enabled at runtime)
-      4. ``2shot_pull``:    nbytes <= ``two_shot_pull_threshold``
+    Five algos are tried in order of preference (fastest first):
+      1. ``2shot_lamport``:   nbytes in ``lamport.min_bytes..lamport.max_bytes``
+      2. ``1shot_push``:      nbytes <= ``one_shot_push_threshold``
+      3. ``1shot_pull``:      nbytes <= ``one_shot_pull_threshold``
+      4. ``2shot_pull`` mc:   nbytes in ``mc.min_bytes..mc.max_bytes``
+                              (only when multicast is enabled at runtime)
+      5. ``2shot_pull``:      nbytes <= ``two_shot_pull_threshold``
     Above all of these, the caller falls back to NCCL.
 
+    ``lamport`` is tried first so its band can start below
+    ``one_shot_push_threshold``: the push threshold also sizes the push
+    workspace, which other kernels depend on, so it is not free to lower.
+
     Setting two adjacent thresholds equal effectively disables the middle
-    algo; leaving ``mc`` at the default disables multicast.
+    algo; leaving ``mc`` / ``lamport`` at the default disables that algo.
     """
 
     one_shot_push_threshold: int
     one_shot_pull_threshold: int
     two_shot_pull_threshold: int
     mc: Range = Range(0, 0)  # default: multicast disabled in this context
+    lamport: Range = Range(0, 0)
 
     @property
     def max_push_bytes(self) -> int:
@@ -62,12 +70,15 @@ class Heuristic(NamedTuple):
             self.mc.max_bytes,
         )
 
-    def clip(self, *, max_push_bytes: int, max_pull_bytes: int) -> "Heuristic":
+    def clip(
+        self, *, max_push_bytes: int, max_pull_bytes: int, max_lamport_bytes: int
+    ) -> "Heuristic":
         return Heuristic(
             min(self.one_shot_push_threshold, max_push_bytes),
             min(self.one_shot_pull_threshold, max_pull_bytes),
             min(self.two_shot_pull_threshold, max_pull_bytes),
             self.mc.clip(max_pull_bytes),
+            self.lamport.clip(max_lamport_bytes),
         )
 
 
@@ -96,14 +107,21 @@ class AllReduceConfig(NamedTuple):
     def max_pull_bytes(self) -> int:
         return max(self.graph.max_pull_bytes, self.eager.max_pull_bytes)
 
-    def clip(self, *, max_push_bytes: int, max_pull_bytes: int) -> "AllReduceConfig":
+    @property
+    def max_lamport_bytes(self) -> int:
+        return max(self.graph.lamport.max_bytes, self.eager.lamport.max_bytes)
+
+    def clip(
+        self, *, max_push_bytes: int, max_pull_bytes: int, max_lamport_bytes: int
+    ) -> "AllReduceConfig":
+        bounds = dict(
+            max_push_bytes=max_push_bytes,
+            max_pull_bytes=max_pull_bytes,
+            max_lamport_bytes=max_lamport_bytes,
+        )
         return self._replace(
-            graph=self.graph.clip(
-                max_push_bytes=max_push_bytes, max_pull_bytes=max_pull_bytes
-            ),
-            eager=self.eager.clip(
-                max_push_bytes=max_push_bytes, max_pull_bytes=max_pull_bytes
-            ),
+            graph=self.graph.clip(**bounds),
+            eager=self.eager.clip(**bounds),
         )
 
 
@@ -117,7 +135,7 @@ def _sm100_config(world_size: int, num_sm: int) -> AllReduceConfig:
     graph_map = {
         2: (8.000 * MB, 32.00 * MB, 128.0 * MB),
         3: (4.000 * MB, 4.000 * MB, 128.0 * MB),
-        4: (2.250 * MB, 2.250 * MB, 128.0 * MB),
+        4: (1.125 * MB, 1.125 * MB, 128.0 * MB, Range(0, 0), Range(1.125 * MB, 8 * MB)),
         5: (1.500 * MB, 1.500 * MB, 128.0 * MB),
         6: (1.000 * MB, 1.000 * MB, 128.0 * MB),
         7: (0.625 * MB, 0.625 * MB, 128.0 * MB),
@@ -127,7 +145,7 @@ def _sm100_config(world_size: int, num_sm: int) -> AllReduceConfig:
     eager_map = {
         2: (16.00 * MB, 128.0 * MB, 128.0 * MB),
         3: (8.000 * MB, 8.000 * MB, 32.00 * MB),
-        4: (3.000 * MB, 3.000 * MB, 32.00 * MB),
+        4: (3.000 * MB, 3.000 * MB, 32.00 * MB, Range(0, 0), Range(2 * MB, 8 * MB)),
         5: (2.000 * MB, 2.000 * MB, 32.00 * MB, Range(0, 32 * MB)),
         6: (1.250 * MB, 1.250 * MB, 64.00 * MB, Range(0, 64 * MB)),
         7: (1.000 * MB, 1.000 * MB, 64.00 * MB, Range(0, 64 * MB)),
@@ -135,11 +153,14 @@ def _sm100_config(world_size: int, num_sm: int) -> AllReduceConfig:
         16: (0.250 * MB, 0.250 * MB, 128.0 * MB, Range(256 * KB, 128 * MB)),
     }
     mc_blocks_map = {5: 64, 6: 48, 7: 48, 8: 32, 16: 32}
+    # Measured on GB200, 64 blocks beats 96 by 4-5% at 8-16 MB for
+    # ~1% back at 64 MB+. The unmeasured world sizes keep the old default.
+    pull_blocks_map = {2: num_sm, 4: 64}
     return AllReduceConfig(
         graph=_pack_heuristic(*graph_map[world_size]),
         eager=_pack_heuristic(*eager_map[world_size]),
         num_push_blocks=num_sm,
-        num_pull_blocks=num_sm if world_size == 2 else 96,
+        num_pull_blocks=pull_blocks_map.get(world_size, 96),
         num_mc_blocks=mc_blocks_map.get(world_size, None),
     )
 
