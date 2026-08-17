@@ -901,11 +901,12 @@ class HiCacheController:
         backend = self.storage_backend_type
 
         # Multi-pool zero-copy backends.
-        if backend == "mooncake":
+        if backend in {"mooncake", "nixl"}:
             if self.storage_config.should_split_heads:
                 logger.warning(
                     "HiCache draft L3 disabled: should_split_heads not yet "
-                    "supported on the mooncake v2 path."
+                    "supported on the %s v2 path.",
+                    backend,
                 )
                 return
             self.storage_backend.register_mem_host_pool_v2(
@@ -915,8 +916,8 @@ class HiCacheController:
             self.draft_page_set_func = self._draft_page_set_v2
             return
 
-        # TODO: support "hf3fs", "eic", "nixl", "simm"
-        if backend in {"hf3fs", "eic", "nixl", "simm"}:
+        # TODO: support "hf3fs", "eic", "simm"
+        if backend in {"hf3fs", "eic", "simm"}:
             logger.warning(
                 "HiCache draft L3 disabled: backend %s does not yet support "
                 "draft pool registration.",
