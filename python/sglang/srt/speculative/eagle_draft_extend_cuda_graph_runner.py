@@ -465,9 +465,12 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
-    def execute(self, forward_batch: ForwardBatch):
+    def stage_shared_inputs(self, forward_batch: ForwardBatch):
+        """Pre-verify half of the replay staging: pad fills, static input
+        copies, host mirrors, and the out-graph metadata init. Everything
+        here is known before the verify launch; verify products go through
+        stage_verify_outputs() afterwards."""
         assert forward_batch.out_cache_loc is not None
-        self.deepep_adapter.replay()
         buffers = self.buffers
 
         raw_bs = forward_batch.batch_size
@@ -495,20 +498,19 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.extend_seq_lens.fill_(self.captured_req_width)
 
         # Batch the small per-field device copies into a grouped foreach copy
-        # (one foreach call per dtype pair) to cut launch overhead. hidden_states
-        # is handled separately below (see note), and seq_lens_cpu is handled
-        # further down since it lives on host.
+        # (one foreach call per dtype pair) to cut launch overhead. Sources
+        # are plan-time tensors the planned tuple keeps alive until the post
+        # half; they sit pre-verify because the metadata init below consumes
+        # the padded buffers. seq_lens_cpu lives on host, handled further
+        # down. out_cache_loc is verify's fresh output -- staged in
+        # stage_verify_outputs().
         copy_dsts = [
-            buffers.input_ids[:num_tokens],
             buffers.seq_lens[:raw_bs],
-            buffers.out_cache_loc[:num_tokens],
             buffers.positions[:num_tokens],
             buffers.req_pool_indices[:raw_bs],
         ]
         copy_srcs = [
-            forward_batch.input_ids,
             forward_batch.seq_lens,
-            forward_batch.out_cache_loc,
             forward_batch.positions,
             forward_batch.req_pool_indices,
         ]
@@ -517,24 +519,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             copy_srcs.append(forward_batch.extend_seq_lens)
         else:
             buffers.extend_seq_lens[:raw_bs].fill_(self.captured_req_width)
-        if forward_batch.spec_info.num_correct_drafts is not None:
-            copy_dsts.append(buffers.num_correct_drafts[:raw_bs])
-            copy_srcs.append(forward_batch.spec_info.num_correct_drafts)
-            copy_dsts.append(buffers.num_accept_tokens[:raw_bs])
-            copy_srcs.append(forward_batch.spec_info.num_accept_tokens)
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
-
-        # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
-        # DMA engine; foreach would force the ~3x slower compute-kernel copy.
-        if (
-            buffers.hidden_states is not None
-            and forward_batch.spec_info.hidden_states is not None
-            and forward_batch.spec_info.hidden_states.shape[1]
-            == buffers.hidden_states.shape[1]
-        ):
-            buffers.hidden_states[:num_tokens].copy_(
-                forward_batch.spec_info.hidden_states
-            )
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
@@ -589,16 +574,65 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
-        # Snapshot built -- the forward is done reading the shared pool. Publish
+        self.raw_bs = raw_bs
+        self.bs = bs
+        self._staged_num_tokens = num_tokens
+
+    def stage_verify_outputs(
+        self,
+        forward_batch: ForwardBatch,
+        input_ids: torch.Tensor,
+        hidden_states: Optional[torch.Tensor],
+        num_correct_drafts: Optional[torch.Tensor],
+        num_accept_tokens: Optional[torch.Tensor],
+        out_cache_loc: Optional[torch.Tensor] = None,
+    ):
+        """Copy verify products (incl. verify's fresh out_cache_loc) into the
+        graph buffers; the post-verify half of the staging."""
+        buffers = self.buffers
+        num_tokens = self._staged_num_tokens
+        raw_bs = self.raw_bs
+        copy_dsts = [buffers.input_ids[:num_tokens]]
+        copy_srcs = [input_ids]
+        if out_cache_loc is not None:
+            copy_dsts.append(buffers.out_cache_loc[:num_tokens])
+            copy_srcs.append(out_cache_loc)
+        if num_correct_drafts is not None:
+            copy_dsts.append(buffers.num_correct_drafts[:raw_bs])
+            copy_srcs.append(num_correct_drafts)
+            copy_dsts.append(buffers.num_accept_tokens[:raw_bs])
+            copy_srcs.append(num_accept_tokens)
+        _grouped_foreach_copy_(copy_dsts, copy_srcs)
+
+        # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
+        # DMA engine; foreach would force the ~3x slower compute-kernel copy.
+        if (
+            buffers.hidden_states is not None
+            and hidden_states is not None
+            and hidden_states.shape[1] == buffers.hidden_states.shape[1]
+        ):
+            buffers.hidden_states[:num_tokens].copy_(hidden_states)
+
+    def execute(self, forward_batch: ForwardBatch, staged: bool = False):
+        self.deepep_adapter.replay()
+        if not staged:
+            self.stage_shared_inputs(forward_batch)
+            self.stage_verify_outputs(
+                forward_batch,
+                input_ids=forward_batch.input_ids,
+                hidden_states=forward_batch.spec_info.hidden_states,
+                num_correct_drafts=forward_batch.spec_info.num_correct_drafts,
+                num_accept_tokens=forward_batch.spec_info.num_accept_tokens,
+                out_cache_loc=forward_batch.out_cache_loc,
+            )
+        # Staging done -- the forward is done reading the shared pool. Publish
         # a read-done event the scheduler's WAR barrier waits on (draft extend
         # is the EAGLE-family last shared-read phase; last write wins the mailbox).
         read_done = self.device_module.Event()
         read_done.record()
         self.model_runner.shared_read_done_event = read_done
-
-        self.raw_bs = raw_bs
-        self.bs = bs
-        shape_key = self._make_graph_key(bs)
+        num_tokens = self._staged_num_tokens
+        shape_key = self._make_graph_key(self.bs)
         with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
             out = self._replay_graph(shape_key, forward_batch)
 

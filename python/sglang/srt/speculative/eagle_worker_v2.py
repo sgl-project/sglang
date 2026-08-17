@@ -853,20 +853,83 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.dsa_extend_topk_buf = buf
         return buf[:num_tokens]
 
-    def _draft_extend_for_decode(
-        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
-    ):
-        # Batch 2: Draft extend
+    def _draft_extend_plan_for_decode(self, batch: ScheduleBatch):
+        """Build the draft-extend forward batch and stage the graph inputs
+        before the verify launch. The returned tuple keeps the plan-time
+        tensors alive for the post half. Returns None when the graph path is
+        unavailable; the caller falls back to the legacy post-verify
+        sequencing."""
+        runner = self.cuda_graph_runner_for_draft_extend
+        if runner is None or batch.forward_mode.is_idle():
+            return None
+        num_draft_tokens = self.speculative_num_draft_tokens
         draft_extend_input = EagleDraftExtendInput(
-            hidden_states=batch_result.logits_output.hidden_states,
-            # accept_lens includes the bonus token; correct drafts exclude it.
-            num_correct_drafts=batch_result.accept_lens - 1,
-            num_accept_tokens=batch_result.accept_lens,
-            # Draft-extend fills the whole tree width (num_draft_tokens) per req,
-            # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
-            num_tokens_per_req=self.speculative_num_draft_tokens,
-            num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
+            hidden_states=None,
+            num_correct_drafts=None,
+            num_accept_tokens=None,
+            num_tokens_per_req=num_draft_tokens,
+            num_tokens_for_logprob_per_req=num_draft_tokens,
         )
+        # out_cache_loc is deliberately absent: prepare_for_draft_extend does
+        # not touch it (no widening on this path), and the post half must see
+        # verify's fresh value, not a replay of the pre-verify one.
+        fields = (
+            "spec_info",
+            "forward_mode",
+            "input_ids",
+            "prefix_lens",
+            "extend_lens",
+            "extend_num_tokens",
+        )
+        saved = tuple(getattr(batch, f) for f in fields)
+        placeholder_ids = torch.zeros(
+            len(batch.seq_lens) * num_draft_tokens,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        try:
+            forward_batch = prepare_for_draft_extend(
+                draft_extend_input,
+                batch,
+                placeholder_ids,
+                num_draft_tokens,
+                self.draft_runner,
+                runner,
+                return_hidden_states_before_norm=False,
+            )
+            if not (runner and runner.can_run_graph(forward_batch)):
+                return None
+            runner.stage_shared_inputs(forward_batch)
+            prepared = tuple(getattr(batch, f) for f in fields)
+            return forward_batch, draft_extend_input, fields, prepared
+        finally:
+            for f, v in zip(fields, saved):
+                setattr(batch, f, v)
+
+    def _draft_extend_for_decode(
+        self, batch: ScheduleBatch, batch_result: GenerationBatchResult, planned=None
+    ):
+        if planned is None:
+            # Batch 2: Draft extend
+            draft_extend_input = EagleDraftExtendInput(
+                hidden_states=batch_result.logits_output.hidden_states,
+                # accept_lens includes the bonus token; correct drafts exclude it.
+                num_correct_drafts=batch_result.accept_lens - 1,
+                num_accept_tokens=batch_result.accept_lens,
+                # Draft-extend fills the whole tree width (num_draft_tokens) per req,
+                # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
+                num_tokens_per_req=self.speculative_num_draft_tokens,
+                num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
+            )
+        else:
+            forward_batch, draft_extend_input, fields, prepared = planned
+            # Replay the prepared batch mutations so the post-step batch state
+            # matches the legacy path exactly.
+            for f, v in zip(fields, prepared):
+                setattr(batch, f, v)
+            draft_extend_input.hidden_states = batch_result.logits_output.hidden_states
+            draft_extend_input.num_correct_drafts = batch_result.accept_lens - 1
+            draft_extend_input.num_accept_tokens = batch_result.accept_lens
         select_index = (
             torch.arange(
                 0,
@@ -882,28 +945,31 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # synchronization issues with .to() inside the plan stream context.
         next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
-        # Prepare for draft extend in a separate stream
-        with self.plan_stream_ctx:
-            forward_batch = prepare_for_draft_extend(
-                draft_extend_input,
-                batch,
-                next_token_ids,
-                self.speculative_num_draft_tokens,
-                self.draft_runner,
-                self.cuda_graph_runner_for_draft_extend,
-                return_hidden_states_before_norm=False,
-            )
+        if planned is not None:
+            can_run_decode_cuda_graph = True
+        else:
+            # Prepare for draft extend in a separate stream
+            with self.plan_stream_ctx:
+                forward_batch = prepare_for_draft_extend(
+                    draft_extend_input,
+                    batch,
+                    next_token_ids,
+                    self.speculative_num_draft_tokens,
+                    self.draft_runner,
+                    self.cuda_graph_runner_for_draft_extend,
+                    return_hidden_states_before_norm=False,
+                )
 
-        if self.plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
-            )
+            if self.plan_stream:
+                torch.get_device_module(self.device).current_stream().wait_stream(
+                    self.plan_stream
+                )
 
-        # Run draft extend batch in the main compute stream
-        can_run_decode_cuda_graph = (
-            self.cuda_graph_runner_for_draft_extend
-            and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
-        )
+            # Run draft extend batch in the main compute stream
+            can_run_decode_cuda_graph = (
+                self.cuda_graph_runner_for_draft_extend
+                and self.cuda_graph_runner_for_draft_extend.can_run_graph(forward_batch)
+            )
 
         # Eager path publishes the indexer top-k into a worker buffer (the graph
         # path uses the runner's static buffer). Gathered at select_index below.
@@ -925,8 +991,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         with canary_ctx:
             if can_run_decode_cuda_graph:
+                if planned is not None:
+                    self.cuda_graph_runner_for_draft_extend.stage_verify_outputs(
+                        forward_batch,
+                        input_ids=next_token_ids,
+                        hidden_states=draft_extend_input.hidden_states,
+                        num_correct_drafts=draft_extend_input.num_correct_drafts,
+                        num_accept_tokens=draft_extend_input.num_accept_tokens,
+                        # Verify's fresh out_cache_loc: the KV write target.
+                        out_cache_loc=batch.out_cache_loc,
+                    )
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
-                    forward_batch
+                    forward_batch, staged=planned is not None
                 )
             else:
                 draft_logits_output = self.draft_runner.forward(
@@ -1177,6 +1253,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
+            # Build and stage draft_extend's graph inputs before the verify
+            # launch; verify products are staged in the post half.
+            planned_draft_extend = self.draft_worker._draft_extend_plan_for_decode(
+                batch
+            )
             batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
@@ -1195,7 +1276,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     speculative_moe_a2a_backend_context(),
                     spec_stage_span("draft_extend"),
                 ):
-                    self.draft_worker._draft_extend_for_decode(batch, batch_output)
+                    self.draft_worker._draft_extend_for_decode(
+                        batch, batch_output, planned=planned_draft_extend
+                    )
 
             return batch_output
 
