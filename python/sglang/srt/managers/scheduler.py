@@ -4061,11 +4061,11 @@ class Scheduler(
         # Also skipped while deferred KV releases are pending: they hold pages out
         # of the allocator by design, so the pool is transiently below `total` and
         # would trip the idle leak invariant. Resumes once the holds resolve.
-        _transfer_q = getattr(self, "disagg_decode_transfer_queue", None)
-        _deferred_pending = (
-            _transfer_q is not None and _transfer_q.has_pending_deferred_releases()
+        deferred_pending = (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
         )
-        if not self.enable_hisparse and not _deferred_pending:
+        if not self.enable_hisparse and not deferred_pending:
             has_leak, messages = self.invariant_checker._check_all_pools(
                 self.pool_stats_observer.get_pool_stats(),
             )
@@ -4553,19 +4553,22 @@ class Scheduler(
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    was_notified = decode_req.kv_receiver.abort_notified
-                    decode_req.kv_receiver.abort()
-                    # Arm drain-ack accounting when the ABORT is sent (only on the
-                    # notify transition, so a repeated abort can't wipe collected
-                    # acks) so acks arriving before this req is deferred -- e.g.
-                    # during the next forward step -- are captured, not dropped.
-                    kv_mgr = decode_req.kv_receiver.kv_mgr
+                    receiver = decode_req.kv_receiver
+                    # abort() sends the ABORT and flips abort_notified False->True
+                    # on its first call only; snapshot the value before so we can
+                    # tell whether *this* call is the one that sent it.
+                    already_notified = receiver.abort_notified
+                    receiver.abort()
+                    newly_notified = not already_notified and receiver.abort_notified
+                    # Arm drain-ack accounting on that first ABORT so acks arriving
+                    # before this req is deferred (e.g. during the next forward
+                    # step) are captured; only on the transition, so a repeated
+                    # abort of the same req cannot reset the set and drop acks.
                     if (
-                        kv_mgr.enable_deferred_decode_kv_release
-                        and not was_notified
-                        and decode_req.kv_receiver.abort_notified
+                        receiver.kv_mgr.enable_deferred_decode_kv_release
+                        and newly_notified
                     ):
-                        kv_mgr.register_deferred_abort_room(
+                        receiver.kv_mgr.register_deferred_abort_room(
                             decode_req.req.bootstrap_room
                         )
 
