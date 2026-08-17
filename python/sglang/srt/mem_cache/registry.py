@@ -176,6 +176,17 @@ def _create_unified_radix_cache(
     if ctx.is_hybrid_ssm:
         tree_components.append(ComponentType.MAMBA)
 
+    if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
+        from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
+            C128SidecarComponent,
+        )
+
+        tree_components.append(ComponentType.C128)
+        params.component_registry_override = {
+            **(params.component_registry_override or {}),
+            ComponentType.C128: C128SidecarComponent,
+        }
+
     params.tree_components = tuple(tree_components)
     if use_mlx() and ctx.is_hybrid_ssm:
         from sglang.srt.hardware_backend.mlx.kv_cache.auxiliary_state import (
