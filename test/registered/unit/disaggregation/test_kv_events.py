@@ -78,6 +78,21 @@ class TestSelectKvPublisherDpRank(CustomTestCase):
         ]
         self.assertEqual(dp_attention, expected)
 
+    def test_replay_endpoint_binds_sequential_ports_per_replica(self):
+        # The replay ROUTER socket is offset by the same DP rank as the live PUB
+        # socket. `/server_info` advertises only the base port; routers derive
+        # rank-local replay endpoints with port_base + rank.
+        endpoint = "tcp://*:5657"
+        expected = [f"tcp://*:{5657 + r}" for r in range(4)]
+
+        replay_endpoints = [
+            ZmqEventPublisher.offset_endpoint_port(
+                endpoint, select_kv_publisher_dp_rank(1, 0, r)
+            )
+            for r in range(4)
+        ]
+        self.assertEqual(replay_endpoints, expected)
+
     def test_publisher_rank_count_matches_advertised_dp_size(self):
         # The router subscribes to `dp_size` per-rank ports (from /server_info).
         # The engine must produce exactly `dp_size` distinct publisher ranks in

@@ -9575,6 +9575,13 @@ class ServerArgs:
                                                   # prompts at this size
                 "dp_size": <dp_size>,             # number of SUB sockets
                                                   # to open
+                # Present only when a valid TCP replay endpoint is
+                # configured. Routers construct the per-DP-rank DEALER
+                # endpoint as
+                # tcp://<worker_host>:<replay_endpoint_port_base + dp_rank>.
+                "replay_endpoint_host": "*",
+                "replay_endpoint_port_base": 5657,
+                "replay_buffer_steps": 10000,
             }
 
         Returns None (i.e. "no publisher to describe") when any of:
@@ -9588,14 +9595,28 @@ class ServerArgs:
           ipc://, missing port, non-integer port, or port outside
           1..65535).
 
-        Reuses KVEventsConfig.from_cli for JSON parsing; the inline
-        rfind(":") endpoint split mirrors
-        ZmqEventPublisher.offset_endpoint_port rather than adding a
-        new module-level helper.
+        Reuses KVEventsConfig.from_cli for JSON parsing. The endpoint
+        split mirrors ZmqEventPublisher.offset_endpoint_port.
         """
         # Lazy import so loading server_args doesn't pull in
         # disaggregation / msgspec / zmq at module top level.
         from sglang.srt.disaggregation.kv_events import KVEventsConfig
+
+        def parse_tcp_endpoint(endpoint: Optional[str]) -> Optional[tuple[str, int]]:
+            if not endpoint or not endpoint.startswith("tcp://"):
+                return None
+            body = endpoint[len("tcp://") :]
+            last_colon = body.rfind(":")
+            if last_colon < 0:
+                return None
+            host = body[:last_colon]
+            try:
+                port = int(body[last_colon + 1 :])
+            except ValueError:
+                return None
+            if not host or not (0 < port < 65536):
+                return None
+            return host, port
 
         raw = self.kv_events_config
         page_size = self.page_size
@@ -9610,21 +9631,12 @@ class ServerArgs:
             return None
         if cfg.publisher == "null" or not cfg.endpoint:
             return None
-        if not cfg.endpoint.startswith("tcp://"):
+        live_endpoint = parse_tcp_endpoint(cfg.endpoint)
+        if live_endpoint is None:
             return None
-        body = cfg.endpoint[len("tcp://") :]
-        last_colon = body.rfind(":")
-        if last_colon < 0:
-            return None
-        host = body[:last_colon]
-        try:
-            port = int(body[last_colon + 1 :])
-        except ValueError:
-            return None
-        if not host or not (0 < port < 65536):
-            return None
+        host, port = live_endpoint
 
-        return {
+        descriptor = {
             "publisher": cfg.publisher,
             "endpoint_host": host,
             "endpoint_port_base": port,
@@ -9632,6 +9644,17 @@ class ServerArgs:
             "block_size": page_size,
             "dp_size": self.dp_size,
         }
+        replay_endpoint = parse_tcp_endpoint(cfg.replay_endpoint)
+        if replay_endpoint is not None:
+            replay_host, replay_port = replay_endpoint
+            descriptor.update(
+                {
+                    "replay_endpoint_host": replay_host,
+                    "replay_endpoint_port_base": replay_port,
+                    "replay_buffer_steps": cfg.buffer_steps,
+                }
+            )
+        return descriptor
 
     def should_report_expert_balancedness(self) -> bool:
         return self.expert_balancedness_report_mode != "off"
