@@ -113,7 +113,7 @@ class SchedulerPPMixin:
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
                             recv_reqs,
-                            async_send=not is_npu(),
+                            async_send=True,
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
@@ -171,9 +171,19 @@ class SchedulerPPMixin:
                         ):
                             self.send_proxy_work = self._pp_send_dict_to_next_stage(
                                 result.pp_hidden_states_proxy_tensors.tensors,
-                                async_send=not is_npu(),
+                                async_send=True,
                                 msg_type="proxy",
                             )
+
+                # NPU last rank: deferred output send (after proxy send to
+                # avoid blocking the proxy channel with output isend).
+                if is_npu() and self.pp_group.is_last_rank:
+                    self.send_output_work = self._pp_send_output_to_next_stage(
+                        next_first_rank_mb_id,
+                        self.mbs,
+                        self.last_rank_comm_queue,
+                        self.pp_outputs,
+                    )
 
                 self.pp_outputs = next_pp_outputs
 
@@ -341,13 +351,13 @@ class SchedulerPPMixin:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=not is_npu()
+                        recv_reqs, async_send=True
                     )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
-                        bootstrapped_rids, async_send=not is_npu()
+                        bootstrapped_rids, async_send=True
                     )
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=not is_npu()
+                        transferred_rids, async_send=True
                     )
                     if cur_batch:
                         self.device_module.current_stream().wait_event(
@@ -355,7 +365,7 @@ class SchedulerPPMixin:
                         )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=not is_npu(),
+                            async_send=True,
                             msg_type="proxy",
                         )
 
@@ -529,16 +539,16 @@ class SchedulerPPMixin:
 
                 if not self.pp_group.is_last_rank:
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=not is_npu()
+                        recv_reqs, async_send=True
                     )
                     send_retract_work = self._pp_send_pyobj_to_next_stage(
-                        retract_rids, async_send=not is_npu()
+                        retract_rids, async_send=True
                     )
                     send_prealloc_work = self._pp_send_pyobj_to_next_stage(
-                        prealloc_rids, async_send=not is_npu()
+                        prealloc_rids, async_send=True
                     )
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
-                        transferred_rids, async_send=not is_npu()
+                        transferred_rids, async_send=True
                     )
                     if cur_batch and not cur_batch.forward_mode.is_prebuilt():
                         self.device_module.current_stream().wait_event(
@@ -546,7 +556,7 @@ class SchedulerPPMixin:
                         )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
                             result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=not is_npu(),
+                            async_send=True,
                             msg_type="proxy",
                         )
 
@@ -1205,7 +1215,7 @@ class SchedulerPPMixin:
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
                             pp_outputs_to_send.tensors,
-                            async_send=not is_npu(),
+                            async_send=True,
                             msg_type="output",
                         )
         # send the outputs from the last round to let the next stage worker run post processing
@@ -1214,7 +1224,7 @@ class SchedulerPPMixin:
                 with torch.profiler.record_function("send_res_dict_to_next_stage"):
                     send_output_work = self._pp_send_dict_to_next_stage(
                         pp_outputs.tensors,
-                        async_send=not is_npu(),
+                        async_send=True,
                         msg_type="output",
                     )
         return send_output_work
@@ -1251,6 +1261,15 @@ class SchedulerPPMixin:
         # XPU/NPU: even ranks send first, odd ranks recv first.
         send_first = (not (is_xpu() or is_npu())) or ((self.ps.pp_rank % 2) == 0)
 
+        # NPU last rank: defer the output send to after proxy send.
+        # NPU's isend blocks until a matching recv is posted. If the last
+        # rank sends output (to rank 0) before sending proxy (to next stage),
+        # the blocking isend stalls the pipeline: rank 0 is waiting for
+        # proxy from the last rank, but the last rank is blocked in output
+        # send waiting for rank 0 to post a recv. Deferring the output send
+        # to after proxy send breaks this circular dependency.
+        defer_output_send = is_npu() and self.pp_group.is_last_rank
+
         def _do_send():
             return self._pp_send_output_to_next_stage(
                 next_first_rank_mb_id,
@@ -1279,7 +1298,10 @@ class SchedulerPPMixin:
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
 
-        if send_first:
+        if defer_output_send:
+            # NPU last rank: only recv here, send is deferred
+            _do_recv()
+        elif send_first:
             send_output_work = _do_send()
             _do_recv()
         else:
