@@ -7,27 +7,54 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
+    SampleStepTokens,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    enable_num_token_non_padded,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
-from sglang.srt.speculative.dspark_components.kernels.dspark_draft_model import (
-    SampleStepTokens,
-)
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     spec_scale_global_num_tokens,
 )
 from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 
 logger = logging.getLogger(__name__)
+
+
+def _one_hot_token0(probs: torch.Tensor) -> torch.Tensor:
+    degenerate = torch.isnan(probs[:, :1])
+    one_hot = torch.zeros_like(probs)
+    one_hot[:, 0] = 1.0
+    return torch.where(degenerate, one_hot, probs)
+
+
+# Draft step logits: NaN is a bug, but -inf is legitimate (masking). The data
+# layer lives downstream (probs one-hot below, or the fast kernel's clamp).
+_DRAFT_STEP_LOGITS = Invariant("dspark.draft.step_logits", Bucket.GUARD, NotNaN())
+# Draft sampling probs: SOFTEN (tolerate + count), matching the original
+# unconditional clamp; an all-NaN row would otherwise make multinomial raise.
+_DRAFT_PROBS = Invariant(
+    "dspark.draft.probs", Bucket.SOFTEN, NotNaN(), recover=_one_hot_token0
+)
+
+
+def _make_num_token_non_padded(
+    num_tokens: int, device: str | torch.device
+) -> Optional[torch.Tensor]:
+    if not enable_num_token_non_padded():
+        return None
+    return torch.tensor(num_tokens, dtype=torch.int32).to(device, non_blocking=True)
 
 
 class DraftBlockResult(msgspec.Struct, frozen=True):
@@ -51,90 +78,6 @@ class DraftProposal(msgspec.Struct, frozen=True):
     confidence: Optional[torch.Tensor] = None
     confidence_tap: Optional[torch.Tensor] = None
     folded: bool = False
-
-
-def greedy_step_sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-    del step_idx
-    return torch.argmax(step_logits, dim=-1)
-
-
-class DsparkDraftSampler:
-
-    def __init__(self, *, model, gamma, max_bs, device, confidence_fn=None, out=None):
-        self.model = model
-        self.markov_head = model.markov_head
-        self.gamma = int(gamma)
-        if out is not None:
-            assert out.shape == (int(max_bs) * self.gamma,) and out.dtype == torch.int64
-            self.out = out
-        else:
-            self.out = torch.empty(
-                (int(max_bs) * self.gamma,), dtype=torch.int64, device=device
-            )
-        self.confidence_fn = confidence_fn
-        self.confidence_out = (
-            torch.empty((int(max_bs), self.gamma), dtype=torch.float32, device=device)
-            if confidence_fn is not None
-            else None
-        )
-
-    def __call__(self, hidden_states, input_ids):
-        bs = hidden_states.shape[0] // self.gamma
-        base_logits, confidence_tap = self.model.compute_base_logits(hidden_states)
-        base_logits = base_logits.view(bs, self.gamma, -1)
-        anchor = input_ids.view(bs, self.gamma)[:, 0]
-        draft_tokens, _ = self.markov_head.sample_block(
-            base_logits,
-            first_prev_tokens=anchor,
-            hidden_states=hidden_states.view(bs, self.gamma, -1),
-            sampler=greedy_step_sampler,
-        )
-        self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
-        if self.confidence_out is not None:
-            confidence = self.confidence_fn(
-                draft_hidden=hidden_states.view(bs, self.gamma, -1),
-                anchor_tokens=anchor,
-                draft_tokens=draft_tokens,
-                confidence_tap=confidence_tap,
-            )
-            self.confidence_out[:bs].copy_(confidence)
-
-
-def maybe_build_draft_sampler(
-    *,
-    draft_model,
-    gamma: int,
-    max_bs: int,
-    device,
-    tp_rank: int,
-    confidence_fn=None,
-    out=None,
-) -> Optional[DsparkDraftSampler]:
-    """Build the graph-folded greedy draft sampler, or return None (with the
-    reason logged) when the draft model cannot support folding and the
-    proposal must stay eager."""
-
-    def _eager(reason):
-        if tp_rank == 0:
-            logger.info("DSpark draft greedy proposal kept eager (reason=%s).", reason)
-        return None
-
-    if gamma <= 0:
-        return _eager("gamma<=0")
-    if not hasattr(draft_model, "compute_base_logits"):
-        return _eager("no compute_base_logits")
-    if getattr(draft_model, "markov_head", None) is None:
-        return _eager("no markov head")
-    if tp_rank == 0:
-        logger.info("DSpark draft greedy proposal folded into the draft cuda graph.")
-    return DsparkDraftSampler(
-        model=draft_model,
-        gamma=gamma,
-        max_bs=max_bs,
-        device=device,
-        confidence_fn=confidence_fn,
-        out=out,
-    )
 
 
 def make_next_draft_input(
@@ -180,11 +123,13 @@ def sample_draft_block(
     if not any_sampling:
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+            expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
             return torch.argmax(step_logits, dim=-1)
 
     else:
 
         def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
+            expect(_DRAFT_STEP_LOGITS, step_logits, msg=f"step {step_idx}")
             if fast_sampling:
                 exp_noise = torch.empty(
                     step_logits.shape, dtype=torch.float32, device=step_logits.device
@@ -199,6 +144,7 @@ def sample_draft_block(
                 probs = torch.softmax(
                     step_logits.float() / temperatures[:, None], dim=-1
                 )
+                probs = expect(_DRAFT_PROBS, probs)
                 argmax_tokens = torch.argmax(step_logits, dim=-1)
                 sampled_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)
                 return torch.where(greedy_mask, argmax_tokens, sampled_tokens)
@@ -256,6 +202,8 @@ class DraftBlockProposer:
         sampling_info,
     ) -> DraftProposal:
         embed_module = target_model.get_input_embeddings()
+        draft_sampler = self._draft_sampler
+        all_greedy = sampling_info is None or sampling_info.is_all_greedy
         fwd = self._run_forward(
             batch=batch,
             draft_input=draft_input,
@@ -263,30 +211,52 @@ class DraftBlockProposer:
             bs=bs,
             device=device,
             embed_module=embed_module,
+            draft_sampler=draft_sampler,
+            sampling_info=sampling_info,
         )
         draft_block_ids = fwd.draft_block_ids
 
-        draft_sampler = self._draft_sampler
-        all_greedy = sampling_info is None or sampling_info.is_all_greedy
         folded_confidence = None
         confidence_tap = None
         folded = False
-        if draft_sampler is not None and fwd.can_run_graph and all_greedy:
+        if (
+            envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
+            and draft_sampler is not None
+            and fwd.can_run_graph
+            and (all_greedy or draft_sampler.folded_sampling)
+        ):
             folded = True
-            if sampling_info is None:
-                temperatures = torch.ones(bs, dtype=torch.float32, device=device)
-            else:
-                temperatures = (
-                    sampling_info.temperatures.view(-1)
-                    .to(torch.float32)
-                    .clamp_min(1e-5)
+            if draft_sampler.folded_sampling:
+                greedy_mask = draft_sampler.greedy_mask[:bs]
+                temperatures = draft_sampler.temperatures[:bs]
+                # The sampling accept path needs the markov-corrected block
+                # logits; greedy accept only compares tokens.
+                corrected_logits = (
+                    None
+                    if all_greedy
+                    else draft_sampler.corrected_out[: bs * self.gamma].view(
+                        bs, self.gamma, -1
+                    )
                 )
+            else:
+                # Greedy-only folding: the hook argmaxed every row and kept no
+                # sampling buffers, so derive the params on the fly.
+                greedy_mask = resolve_greedy_mask(
+                    bs=bs, sampling_info=sampling_info, device=device
+                )
+                if sampling_info is None:
+                    temperatures = torch.ones(bs, dtype=torch.float32, device=device)
+                else:
+                    temperatures = (
+                        sampling_info.temperatures.view(-1)
+                        .to(torch.float32)
+                        .clamp_min(1e-5)
+                    )
+                corrected_logits = None
             draft_block = DraftBlockResult(
                 draft_tokens=draft_sampler.out[: bs * self.gamma].view(bs, self.gamma),
-                corrected_logits=None,
-                greedy_mask=resolve_greedy_mask(
-                    bs=bs, sampling_info=sampling_info, device=device
-                ),
+                corrected_logits=corrected_logits,
+                greedy_mask=greedy_mask,
                 temperatures=temperatures,
             )
             if draft_sampler.confidence_out is not None:
@@ -346,6 +316,8 @@ class DraftBlockProposer:
         bs: int,
         device: str,
         embed_module,
+        draft_sampler=None,
+        sampling_info=None,
     ) -> DraftForwardResult:
         gamma = self.gamma
         prefix_lens = batch.seq_lens
@@ -359,7 +331,9 @@ class DraftBlockProposer:
         draft_positions = positions_2d[:, :gamma].reshape(-1)
         draft_cache_loc = verify_cache_loc_2d[:, :gamma].reshape(-1)
 
-        draft_owns_embed = hasattr(self.draft_model, "forward_embed")
+        draft_owns_embed = envs.SGLANG_DSPARK_EMBED_IN_GRAPH.get() and hasattr(
+            self.draft_model, "forward_embed"
+        )
         draft_input_embeds: Optional[torch.Tensor] = None
         if not draft_owns_embed:
             noise_embedding = embed_module(draft_block_ids)
@@ -374,6 +348,7 @@ class DraftBlockProposer:
         else:
             raise RuntimeError("DSpark decode expected batch.seq_lens_cpu, got None")
 
+        draft_num_tokens = bs * gamma
         draft_forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
@@ -388,8 +363,17 @@ class DraftBlockProposer:
             spec_algorithm=SpeculativeAlgorithm.DSPARK,
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
+            num_token_non_padded=_make_num_token_non_padded(draft_num_tokens, device),
+            num_token_non_padded_cpu=draft_num_tokens,
         )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
+        graph_runner = self.draft_model_runner.decode_cuda_graph_runner
+        if (
+            draft_sampler is not None
+            and graph_runner is not None
+            and graph_runner.can_run_graph(draft_forward_batch)
+        ):
+            draft_sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
         with torch.inference_mode():
             draft_out = self.draft_model_runner.forward(draft_forward_batch)
         logits_output = draft_out.logits_output
@@ -407,6 +391,9 @@ class DraftBlockProposer:
     def _fill_dp_moe_sync_metadata(
         self, forward_batch: ForwardBatch, batch: ScheduleBatch
     ) -> None:
+        # The dense DSpark draft still reuses the target batch's graph tier.
+        # Set graph eligibility before the DP-MoE-only metadata early return.
+        forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
         if not self._dp_moe_sync or batch.global_num_tokens is None:
             return
         gnt, gnt_logprob = spec_scale_global_num_tokens(
@@ -415,6 +402,13 @@ class DraftBlockProposer:
             batch.global_num_tokens_for_logprob,
         )
         device = self.draft_model_runner.device
+        forward_batch.original_global_num_tokens_cpu = batch.global_num_tokens
+        num_tokens = forward_batch.input_ids.numel()
+        if enable_num_token_non_padded():
+            forward_batch.num_token_non_padded = torch.tensor(
+                num_tokens, dtype=torch.int32, device=device
+            )
+        forward_batch.num_token_non_padded_cpu = num_tokens
         forward_batch.global_num_tokens_cpu = gnt
         forward_batch.global_num_tokens_for_logprob_cpu = gnt_logprob
         forward_batch.global_num_tokens_gpu = torch.tensor(gnt, dtype=torch.int64).to(
@@ -423,4 +417,3 @@ class DraftBlockProposer:
         forward_batch.global_num_tokens_for_logprob_gpu = torch.tensor(
             gnt_logprob, dtype=torch.int64
         ).to(device, non_blocking=True)
-        forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph

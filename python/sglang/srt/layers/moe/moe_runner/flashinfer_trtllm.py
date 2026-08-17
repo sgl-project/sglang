@@ -51,6 +51,12 @@ _deferred_finalize_enabled: contextvars.ContextVar[bool] = contextvars.ContextVa
 _TRTLLM_MOE_PDL_MAX_TOKENS = envs.SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS.get()
 
 
+def trtllm_moe_enable_pdl(num_tokens: int) -> bool:
+    from sglang.kernels.jit.utils import is_arch_support_pdl
+
+    return is_arch_support_pdl() and num_tokens <= _TRTLLM_MOE_PDL_MAX_TOKENS
+
+
 @dataclass
 class FlashInferTrtllmDeferredFinalizeOutput:
     gemm2_out: torch.Tensor
@@ -74,8 +80,7 @@ def finalize_flashinfer_trtllm_deferred_output(
     deferred_output: FlashInferTrtllmDeferredFinalizeOutput,
     shared_output: torch.Tensor,
 ) -> torch.Tensor:
-    from sglang.jit_kernel.moe_finalize_fuse_shared import moe_finalize_fuse_shared
-    from sglang.jit_kernel.utils import is_arch_support_pdl
+    from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
 
     return moe_finalize_fuse_shared(
         deferred_output.gemm2_out,
@@ -83,7 +88,7 @@ def finalize_flashinfer_trtllm_deferred_output(
         deferred_output.expert_weights,
         shared_output,
         deferred_output.top_k,
-        enable_pdl=is_arch_support_pdl(),
+        enable_pdl=trtllm_moe_enable_pdl(deferred_output.expert_weights.shape[0]),
     )
 
 
@@ -646,6 +651,9 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     weight_block_k: int | None = None
     w13_weight_scale_inv: torch.Tensor | None = None
     w2_weight_scale_inv: torch.Tensor | None = None
+    gemm1_alpha: torch.Tensor | None = None
+    gemm1_beta: torch.Tensor | None = None
+    gemm1_clamp_limit: torch.Tensor | None = None
 
     # Per-tensor path
     w13_input_scale: torch.Tensor | None = None
@@ -703,9 +711,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
 
         if quant_info.use_mxfp8:
             assert quant_info.weight_block_k == 32
-            from flashinfer import mxfp8_quantize
+            from sglang.srt.layers.quantization.fp8_utils import (
+                flashinfer_mxfp8_quantize,
+            )
 
-            a_q, a_sf = mxfp8_quantize(hidden_states, False, backend="cute-dsl")
+            a_q, a_sf = flashinfer_mxfp8_quantize(hidden_states, False)
             # FlashInfer TRT-LLM MxFP8 expects token-major activation scales:
             # [num_tokens, hidden_size // 32] (no transpose).
             a_sf_t = a_sf.view(torch.uint8).reshape(hidden_states.shape[0], -1)
@@ -742,6 +752,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 hidden_states_scale=a_sf_t,
                 gemm1_weights=quant_info.w13_weight,
                 gemm1_weights_scale=quant_info.w13_weight_scale_inv,
+                gemm1_alpha=quant_info.gemm1_alpha,
+                gemm1_beta=quant_info.gemm1_beta,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
                 gemm2_weights=quant_info.w2_weight,
                 gemm2_weights_scale=quant_info.w2_weight_scale_inv,
                 num_experts=quant_info.global_num_experts,
@@ -777,6 +790,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 hidden_states_scale=a_sf_t,
                 gemm1_weights=quant_info.w13_weight,
                 gemm1_weights_scale=quant_info.w13_weight_scale_inv,
+                gemm1_alpha=quant_info.gemm1_alpha,
+                gemm1_beta=quant_info.gemm1_beta,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
                 gemm2_weights=quant_info.w2_weight,
                 gemm2_weights_scale=quant_info.w2_weight_scale_inv,
                 output=symm_output,
@@ -884,6 +900,8 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     routing_method_type: int
     use_per_token_activation: bool = False
 
+    gemm1_alpha: Optional[torch.Tensor] = None
+    gemm1_beta: Optional[torch.Tensor] = None
     gemm1_clamp_limit: Optional[torch.Tensor] = None
 
 
@@ -965,9 +983,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         ):
             e4m3_max = 256.0
 
+        global_scale_inv = torch.full(
+            (1,),
+            1.0 / (e4m3_max * 6.0),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
         hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
             hidden_states,
-            1.0 / (e4m3_max * 6.0),
+            global_scale_inv,
             sfLayout=SfLayout.layout_linear,
             per_token_activation=True,
             backend="cute-dsl",
@@ -1045,8 +1069,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_weights=quant_info.w13_weight,
             gemm1_weights_scale=quant_info.w13_weight_scale.view(torch.float8_e4m3fn),
             gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
+            gemm1_alpha=quant_info.gemm1_alpha,
+            gemm1_beta=quant_info.gemm1_beta,
             gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
@@ -1068,7 +1092,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             output=symm_output,
-            enable_pdl=hs_fp4.shape[0] <= _TRTLLM_MOE_PDL_MAX_TOKENS,
+            enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
         )[0]
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
@@ -1086,8 +1110,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             gemm1_weights=quant_info.w13_weight,
             gemm1_weights_scale=quant_info.w13_weight_scale.view(torch.float8_e4m3fn),
             gemm1_bias=None,
-            gemm1_alpha=None,
-            gemm1_beta=None,
+            gemm1_alpha=quant_info.gemm1_alpha,
+            gemm1_beta=quant_info.gemm1_beta,
             gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
             gemm2_weights=quant_info.w2_weight,
             gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
@@ -1112,7 +1136,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             do_finalize=not defer_finalize,
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
-            enable_pdl=hs_fp4.shape[0] <= _TRTLLM_MOE_PDL_MAX_TOKENS,
+            enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
         )
         if not defer_finalize:
             moe_kwargs["output"] = symm_output
@@ -1120,13 +1144,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:
             gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
-            # FIXME(kpham-sgl): flashinfer sizes this buffer from routing_logits
-            # dtype (fp32 in DSv3 decode) but always writes bf16 weights into it.
-            # Reinterpret the live bf16 prefix. Fix upstream alloc to drop this,
-            # tracking in https://github.com/flashinfer-ai/flashinfer/issues/3595
-            if expert_weights.dtype == torch.float32:
-                n, k = expert_weights.shape
-                expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
             result = FlashInferTrtllmDeferredFinalizeOutput(
                 gemm2_out=gemm2_out,
                 expert_weights=expert_weights,

@@ -24,6 +24,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import is_npu
 from sglang.srt.utils.network import NetworkAddress
 
@@ -40,10 +41,25 @@ _is_npu = is_npu()
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
 
+def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
+    precompile = getattr(model, "precompile_kernels_after_loading", None)
+    if precompile is None:
+        return
+
+    if device == "cuda":
+        current_platform.synchronize()
+        current_platform.empty_cache()
+    precompile()
+    if device == "cuda":
+        current_platform.synchronize()
+        current_platform.empty_cache()
+
+
 class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
     loader: Any
     model: Any
     remote_instance_weight_info: Optional[Any]
+    startup_weight_load: Optional[Any] = None
 
 
 def maybe_downgrade_dtype_for_legacy_gpu(
@@ -53,21 +69,24 @@ def maybe_downgrade_dtype_for_legacy_gpu(
         logger.info(
             "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
         )
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
+        from sglang.srt.runtime_context import get_context
 
-        declare_load_time_override(
-            "ModelRunner._sm80_dtype_fallback", {"dtype": "float16"}
-        )
+        # Device-driven, so every runner in the process resolves the same way;
+        # the per-runner truth is model_config.dtype, this is the record.
+        get_context().override("ModelRunner._sm80_dtype_fallback", dtype="float16")
         model_config.dtype = torch.float16
         if torch.cuda.get_device_capability()[1] < 5:
             raise RuntimeError("SGLang only supports sm75 and above.")
 
 
 def maybe_trigger_remote_instance_nccl_send_group(
-    *, server_args: ServerArgs, tp_rank: int
+    *, server_args: ServerArgs, tp_rank: int, load_format: Optional[str] = None
 ) -> None:
+    """``load_format`` is this runner's effective format: a draft loading under
+    ``--speculative-draft-draft-load-format`` needs its own send group, and the
+    target's format cannot answer for it."""
     if (
-        server_args.load_format == LoadFormat.REMOTE_INSTANCE
+        (load_format or server_args.load_format) == LoadFormat.REMOTE_INSTANCE
         and server_args.remote_instance_weight_loader_backend
         == RemoteInstanceWeightLoaderBackend.NCCL
     ):
@@ -85,8 +104,13 @@ def maybe_trigger_remote_instance_nccl_send_group(
             t.start()
 
 
-def load_kv_cache_scales(*, model, server_args: ServerArgs) -> None:
-    if server_args.kv_cache_dtype == "fp8_e4m3":
+def load_kv_cache_scales(
+    *, model, server_args: ServerArgs, kv_cache_dtype: str
+) -> None:
+    """``kv_cache_dtype`` is the caller's resolved value. Required rather than
+    defaulted: a fallback to ``server_args`` would be a hidden global read for
+    any future caller that forgets to pass one."""
+    if kv_cache_dtype == "fp8_e4m3":
         if server_args.quantization_param_path is not None:
             if callable(getattr(model, "load_kv_cache_scales", None)):
                 model.load_kv_cache_scales(server_args.quantization_param_path)
@@ -169,9 +193,12 @@ def build_load_config(
     *,
     server_args: ServerArgs,
     tp_rank: int,
+    load_format: Optional[str] = None,
     remote_instance_weight_transporter_engine: Any,
     remote_instance_weight_transporter_session_id: str,
     draft_model_idx: Optional[int],
+    weight_cache_mode: str,
+    weight_cache_socket: Optional[str],
 ) -> LoadConfig:
     from sglang.srt.configs.modelopt_config import ModelOptConfig
 
@@ -184,7 +211,7 @@ def build_load_config(
     )
 
     return LoadConfig(
-        load_format=server_args.load_format,
+        load_format=load_format or server_args.load_format,
         download_dir=server_args.download_dir,
         model_loader_extra_config=server_args.model_loader_extra_config,
         tp_rank=tp_rank,
@@ -199,7 +226,43 @@ def build_load_config(
         modelopt_config=modelopt_config,
         rl_quant_profile=server_args.rl_quant_profile,
         draft_model_idx=draft_model_idx,
+        weight_cache_mode=weight_cache_mode,
+        weight_cache_socket=weight_cache_socket,
     )
+
+
+def maybe_enable_ipc_weight_cache(
+    *,
+    load_config: LoadConfig,
+    server_args: ServerArgs,
+    tp_size: int,
+    pp_rank: int,
+    tp_rank: int,
+) -> None:
+    """Switch ``load_config`` onto the IPC weight-cache path, in place.
+
+    Overrides the load format to ``IPC_CACHE`` (remembering the original as the
+    disk fallback) and derives the per-rank daemon socket if unset. Idempotent:
+    the format swap is guarded on ``!= IPC_CACHE`` so a second call (e.g. a
+    weight reload) can't overwrite the captured fallback format.
+    """
+    if server_args.weight_cache_mode == "off":
+        return
+
+    if load_config.load_format != LoadFormat.IPC_CACHE:
+        load_config.fallback_load_format = load_config.load_format
+        load_config.load_format = LoadFormat.IPC_CACHE
+
+    # Compute socket path using global rank (tp_size * pp_rank + tp_rank) so
+    # each daemon has a unique socket even across PP stages and nodes.
+    if load_config.weight_cache_socket is None:
+        from sglang.srt.weight_cache.protocol import (
+            compute_global_rank,
+            get_socket_path,
+        )
+
+        global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
+        load_config.weight_cache_socket = get_socket_path(global_rank=global_rank)
 
 
 def load_model_with_memory_saver(
@@ -218,7 +281,19 @@ def load_model_with_memory_saver(
     enable_cpu_backup = server_args.enable_weights_cpu_backup or (
         is_draft_worker and server_args.enable_draft_weights_cpu_backup
     )
+
+    # In zero-copy IPC mode, the weights are shared with the daemon via
+    # CUDA IPC and must not be offloaded/reloaded by the memory saver.
+    is_ipc_zero_copy = server_args.weight_cache_mode != "off"
+    if is_ipc_zero_copy and enable_cpu_backup:
+        logger.warning(
+            "[ModelRunner] Disabling weights CPU backup in zero-copy IPC mode — "
+            "IPC-mapped weights cannot be offloaded to CPU."
+        )
+        enable_cpu_backup = False
+
     remote_instance_weight_info = None
+    startup_weight_load = None
     with memory_saver_adapter.region(
         GPU_MEMORY_TYPE_WEIGHTS,
         enable_cpu_backup=enable_cpu_backup,
@@ -227,10 +302,26 @@ def load_model_with_memory_saver(
             load_config=load_config,
             model_config=model_config,
         )
-        model = loader.load_model(
-            model_config=model_config,
-            device_config=DeviceConfig(device, gpu_id),
-        )
+        device_config = DeviceConfig(device, gpu_id)
+        if server_args.is_startup_weight_load_overlap:
+            from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
+                StartupWeightLoadManager,
+            )
+
+            startup_weight_load = StartupWeightLoadManager.create_from_server_args(
+                loader=loader,
+                model_config=model_config,
+                load_config=load_config,
+                device_config=device_config,
+                server_args=server_args,
+                is_draft_worker=is_draft_worker,
+            )
+            model = startup_weight_load.prepare()
+        else:
+            model = loader.load_model(
+                model_config=model_config,
+                device_config=device_config,
+            )
         if hasattr(loader, "remote_instance_transfer_engine_weight_info"):
             remote_instance_weight_info = (
                 loader.remote_instance_transfer_engine_weight_info
@@ -245,6 +336,7 @@ def load_model_with_memory_saver(
         loader=loader,
         model=model,
         remote_instance_weight_info=remote_instance_weight_info,
+        startup_weight_load=startup_weight_load,
     )
 
 
@@ -252,11 +344,11 @@ def dist_barrier_after_load(
     *,
     elastic_ep_backend: Optional[str],
     tp_rank: int,
-    is_ep_scale_joiner: bool = False,
+    is_ep_joiner: bool = False,
 ) -> None:
     if elastic_ep_backend == "mooncake":
         # Mooncake does not support `monitored_barrier`
-        if not is_ep_scale_joiner:
+        if not is_ep_joiner:
             dist.barrier(group=get_tp_group().cpu_group)
     else:
         # Handle the case where some ranks do not finish loading.

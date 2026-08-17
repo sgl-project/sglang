@@ -6,7 +6,10 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+from sglang.srt.mem_cache.memory_pool_host import (
+    DeepSeekV4PagedHostPool,
+    LogicalHostPool,
+)
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -81,6 +84,24 @@ class TestHostKVCache(CustomTestCase):
         self.assertIn("Double-free", msg)
         self.assertIn(str(indices.tolist()), msg)
 
+    def test_shm_allocator(self):
+        shm_host_pool = MHATokenToKVPoolHost(
+            device_pool=self.device_pool,
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=self.page_size,
+            layout="layer_first",
+            pin_memory=False,
+            device="cpu",
+            allocator_type="shm",
+        )
+        self.assertIsNotNone(shm_host_pool.fd)
+        self.assertGreaterEqual(shm_host_pool.fd, 0)
+
+        indices = shm_host_pool.alloc(4)
+        self.assertEqual(len(indices), 4)
+        shm_host_pool.free(indices)
+
     def test_empty_free_keeps_release_list_empty(self):
         self.assertEqual(self.host_pool.free(torch.empty(0, dtype=torch.int64)), 0)
         self.assertEqual(self.host_pool.num_release_slots, 0)
@@ -106,6 +127,10 @@ class TestLazyHostPoolRelease(CustomTestCase):
         pool.lock = threading.RLock()
         pool.clear()
         return pool
+
+    @staticmethod
+    def _make_logical_pool():
+        return LogicalHostPool(size=8, page_size=2)
 
     def _assert_lazy_release(self, pool):
         self.assertEqual(pool.free(torch.empty(0, dtype=torch.int64)), 0)
@@ -160,6 +185,17 @@ class TestLazyHostPoolRelease(CustomTestCase):
         # Preserve the pool's page-aligned allocation behavior.
         pool.clear()
         self.assertEqual(len(pool.alloc(1)), 2)
+
+    def test_logical_pool_lazy_release(self):
+        pool = self._make_logical_pool()
+        self._assert_lazy_release(pool)
+
+        # Preserve the logical pool's strict page-alignment checks.
+        pool.clear()
+        with self.assertRaises(ValueError):
+            pool.alloc(1)
+        with self.assertRaises(ValueError):
+            pool.free(torch.tensor([0]))
 
 
 if __name__ == "__main__":
