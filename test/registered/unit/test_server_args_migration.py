@@ -8,6 +8,7 @@ import argparse
 import unittest
 
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.common import configure_media_url_security
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -78,6 +79,33 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         )
         self.assertEqual(sa.extra_metric_labels, {"k": "v"})
         self.assertEqual(sa.forward_hooks, [{"type": "test"}])
+
+    def test_media_url_security_args(self):
+        try:
+            sa = self._parse(
+                [
+                    "--allowed-media-domains",
+                    "Media.Example.com.",
+                    "127.0.0.1",
+                    "--media-url-max-file-size-mb",
+                    "32",
+                ]
+            )
+            self.assertEqual(
+                sa.allowed_media_domains, ["127.0.0.1", "media.example.com"]
+            )
+            self.assertEqual(sa.media_url_max_file_size_mb, 32)
+        finally:
+            configure_media_url_security([], max_file_size_mb=64)
+
+    def test_media_url_security_args_reject_invalid_values(self):
+        try:
+            with self.assertRaises(ValueError):
+                self._parse(["--allowed-media-domains", "https://media.example.com"])
+            with self.assertRaises(ValueError):
+                self._parse(["--media-url-max-file-size-mb", "-1"])
+        finally:
+            configure_media_url_security([], max_file_size_mb=64)
 
     def test_literal_auto_derives_choices(self):
         """Literal type annotations produce argparse choices automatically."""

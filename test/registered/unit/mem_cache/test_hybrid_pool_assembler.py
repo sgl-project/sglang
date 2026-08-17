@@ -1,8 +1,13 @@
-"""Unit test for hybrid HiCache fixed-size budget splitting."""
+"""Unit tests for hybrid HiCache pool assembly."""
 
 import unittest
+from types import SimpleNamespace
 
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import _split_hicache_size
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    _split_hicache_size,
+    build_full_draft_pools,
+)
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,6 +38,21 @@ class TestSplitHicacheSize(CustomTestCase):
         )
         self.assertEqual(shares, (55.0, 25.0, 20.0))  # proportional to device KV bytes
         self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
+
+
+class TestDraftSidecarPoolDispatch(CustomTestCase):
+    def test_full_builder_unwraps_empty_hybrid_linear_pool(self):
+        draft_kv_pool = object.__new__(HybridLinearKVPool)
+        draft_kv_pool.full_kv_pool = SimpleNamespace(layer_num=0)
+
+        specs, entries = build_full_draft_pools(
+            draft_kv_pool=draft_kv_pool,
+            tree_cache=None,
+            server_args=None,
+        )
+
+        self.assertEqual(specs, [])
+        self.assertEqual(entries, [])
 
 
 if __name__ == "__main__":

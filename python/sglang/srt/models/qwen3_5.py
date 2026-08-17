@@ -693,7 +693,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        core_attn_out = core_attn_out.reshape(
+            *core_attn_out.shape[:-2],
+            core_attn_out.shape[-2] * core_attn_out.shape[-1],
+        )
 
         output, _ = self.out_proj(core_attn_out)
         return output
@@ -800,7 +803,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle():
+        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
@@ -1204,7 +1207,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle():
+        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
