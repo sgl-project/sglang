@@ -1534,6 +1534,10 @@ impl RouterTrait for PDRouter {
         }
     }
 
+    fn use_router_health_generate(&self) -> bool {
+        true
+    }
+
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         // Get info from the first decode server to match sglang's server info format
         // Note: We use decode workers for server info to match expected format

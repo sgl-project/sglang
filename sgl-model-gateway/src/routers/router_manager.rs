@@ -404,7 +404,25 @@ impl RouterTrait for RouterManager {
         self
     }
 
-    async fn health_generate(&self, _req: Request<Body>) -> Response {
+    async fn health_generate(&self, req: Request<Body>) -> Response {
+        if !self.enable_igw {
+            let router = {
+                let default_router = self
+                    .default_router
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+
+                default_router
+                    .as_ref()
+                    .and_then(|id| self.routers.get(&id).map(|r| r.clone()))
+            };
+
+            if let Some(router) = router {
+                if router.use_router_health_generate() {
+                    return router.health_generate(req).await;
+                }
+            }
+        }
         // IGW readiness: return 200 if at least one router has healthy workers
         let has_healthy_workers = self
             .worker_registry
