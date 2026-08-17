@@ -323,14 +323,6 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         ) from e
 
     quant_mode = "w4a16" if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() else "w4a4"
-    if quant_mode == "w4a16":
-        capability = torch.cuda.get_device_capability(layer.w13_weight.device)
-        if capability not in ((10, 0), (10, 3)):
-            raise ValueError(
-                "FlashInfer CuTe DSL NVFP4 W4A16 currently supports only "
-                "NVIDIA SM100-family GPUs (SM100/SM103) in SGLang, "
-                f"got sm{capability[0]}{capability[1]}."
-            )
 
     assert layer.intermediate_size_per_partition > 0, (
         f"CuteDSL MoE: intermediate_size_per_partition must be > 0, "
@@ -362,7 +354,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
     )
     use_fused_finalize = envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
     if quant_mode == "w4a16" and activation_type == ActivationType.Swiglu:
-        # FlashInfer's gated W4A16 epilogue currently uses two-stage finalize.
+        # FlashInfer's gated W4A16 epilogue uses two-stage finalize.
         use_fused_finalize = False
 
     with torch.inference_mode(False):
@@ -402,8 +394,9 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
 
     Shared by the two CuteDSL runner entries:
 
-    * "v2" route-based path (a2a=none/flashinfer): drives
-      CuteDslMoEWrapper.run. Weights are [Up, Gate]
+    * "v2" standard path (a2a=none/flashinfer): consumed by the
+      @register_fused_func("none", "flashinfer_cutedsl") entry, which
+      drives CuteDslMoEWrapper.run. Weights are [Up, Gate]
       interleaved with MMA-layout blockscales. wrapper is set;
       w*_scale are scalarized.
 
@@ -448,92 +441,6 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
 
 
-def _run_cutedsl_v2_fp4(
-    hidden_states: torch.Tensor,
-    hidden_states_scale: Optional[torch.Tensor],
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    quant_info: CuteDslFp4MoeQuantInfo,
-) -> torch.Tensor:
-    """Run the route-based CuTe DSL FP4 wrapper."""
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
-
-    assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
-
-    if topk_ids.dtype != torch.int32:
-        topk_ids = topk_ids.to(torch.int32)
-
-    x_sf = hidden_states_scale
-    if quant_info.quant_mode == "w4a16":
-        if x_sf is not None:
-            raise ValueError(
-                "FlashInfer CuTe DSL NVFP4 W4A16 requires BF16 dispatch; "
-                "received pre-quantized FP4 activations."
-            )
-        if hidden_states.dtype != torch.bfloat16:
-            raise TypeError(
-                "FlashInfer CuTe DSL NVFP4 W4A16 requires BF16 activations, "
-                f"got {hidden_states.dtype}."
-            )
-        x = hidden_states
-        per_token_scale = None
-    elif quant_info.quant_mode == "w4a4":
-        if x_sf is not None:
-            if quant_info.use_per_token_activation:
-                raise ValueError(
-                    "flashinfer_cutedsl per-token activation requires BF16 dispatch "
-                    "so the runner can forward per_token_scale to FlashInfer."
-                )
-            x = hidden_states
-            per_token_scale = None
-        else:
-            if quant_info.use_per_token_activation:
-                from flashinfer import SfLayout, nvfp4_quantize
-
-                x, x_sf, per_token_scale = nvfp4_quantize(
-                    hidden_states,
-                    quant_info.a1_scale,
-                    sfLayout=SfLayout.layout_linear,
-                    per_token_activation=True,
-                    backend="cute-dsl",
-                )
-            else:
-                x, x_sf = fp4_quantize(
-                    hidden_states,
-                    quant_info.a1_scale,
-                    sf_vec_size=_FP4_SF_VEC_SIZE,
-                    is_sf_swizzled_layout=False,
-                )
-                per_token_scale = None
-
-            seq_len, hidden_size = hidden_states.shape
-            x = x.reshape(seq_len, hidden_size // 2)
-            x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
-                seq_len, hidden_size // _FP4_SF_VEC_SIZE
-            )
-    else:
-        raise ValueError(
-            f"Unsupported Cute DSL FP4 quant mode: {quant_info.quant_mode}"
-        )
-
-    return quant_info.wrapper.run(
-        x=x,
-        x_sf=x_sf,
-        token_selected_experts=topk_ids,
-        token_final_scales=topk_weights,
-        w1_weight=quant_info.w13_weight,
-        w1_weight_sf=quant_info.w13_weight_sf,
-        w1_alpha=quant_info.w1_alpha,
-        fc2_input_scale=(
-            None if quant_info.quant_mode == "w4a16" else quant_info.a2_scale
-        ),
-        w2_weight=quant_info.w2_weight,
-        w2_weight_sf=quant_info.w2_weight_sf,
-        w2_alpha=quant_info.w2_alpha,
-        per_token_scale=per_token_scale,
-    )
-
-
 @register_fused_func("none", "flashinfer_cutedsl")
 def fused_experts_none_to_flashinfer_cutedsl_fp4(
     dispatch_output: StandardDispatchOutput,
@@ -542,24 +449,67 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     assert runner_config.activation in (
         "silu",
         "relu2",
-    ), (
-        f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
-    )
+    ), f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+    assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
     assert TopKOutputChecker.format_is_standard(topk_output)
 
-    output = _run_cutedsl_v2_fp4(
-        hidden_states=hidden_states,
-        hidden_states_scale=None,
-        topk_ids=topk_output.topk_ids,
-        topk_weights=topk_output.topk_weights,
-        quant_info=quant_info,
+    topk_ids = topk_output.topk_ids
+    topk_weights = topk_output.topk_weights
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
+
+    is_w4a16 = quant_info.quant_mode == "w4a16"
+    if is_w4a16:
+        x_fp4 = hidden_states
+        x_sf = None
+        per_token_scale = None
+    elif quant_info.use_per_token_activation:
+        from flashinfer import SfLayout, nvfp4_quantize
+
+        x_fp4, x_sf, per_token_scale = nvfp4_quantize(
+            hidden_states,
+            quant_info.a1_scale,
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
+            backend="cute-dsl",
+        )
+    else:
+        x_fp4, x_sf = fp4_quantize(
+            hidden_states,
+            quant_info.a1_scale,
+            sf_vec_size=_FP4_SF_VEC_SIZE,
+            is_sf_swizzled_layout=False,
+        )
+        per_token_scale = None
+
+    if not is_w4a16:
+        seq_len, hidden_size = hidden_states.shape
+        x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
+        x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
+            seq_len, hidden_size // _FP4_SF_VEC_SIZE
+        )
+
+    output = quant_info.wrapper.run(
+        x=x_fp4,
+        x_sf=x_sf,
+        token_selected_experts=topk_ids,
+        token_final_scales=topk_weights,
+        w1_weight=quant_info.w13_weight,
+        w1_weight_sf=quant_info.w13_weight_sf,
+        w1_alpha=quant_info.w1_alpha,
+        fc2_input_scale=None if is_w4a16 else quant_info.a2_scale,
+        w2_weight=quant_info.w2_weight,
+        w2_weight_sf=quant_info.w2_weight_sf,
+        w2_alpha=quant_info.w2_alpha,
+        per_token_scale=per_token_scale,
     )
 
     return StandardCombineInput(hidden_states=output)
@@ -581,24 +531,76 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         FlashinferCombineInput,
     )
     from sglang.srt.layers.moe.topk import TopKOutputChecker
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     assert runner_config.activation in (
         "silu",
         "relu2",
-    ), (
-        f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
-    )
+    ), f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+    assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
     hidden_states = dispatch_output.hidden_states
+    x_sf = dispatch_output.hidden_states_scale
     topk_output = dispatch_output.topk_output
     assert TopKOutputChecker.format_is_standard(topk_output)
 
-    output = _run_cutedsl_v2_fp4(
-        hidden_states=hidden_states,
-        hidden_states_scale=dispatch_output.hidden_states_scale,
-        topk_ids=topk_output.topk_ids,
-        topk_weights=topk_output.topk_weights,
-        quant_info=quant_info,
+    topk_ids = topk_output.topk_ids
+    topk_weights = topk_output.topk_weights
+    if topk_ids.dtype != torch.int32:
+        topk_ids = topk_ids.to(torch.int32)
+
+    is_w4a16 = quant_info.quant_mode == "w4a16"
+    if is_w4a16:
+        x_fp4 = hidden_states
+        per_token_scale = None
+    elif x_sf is not None:
+        if quant_info.use_per_token_activation:
+            raise ValueError(
+                "flashinfer_cutedsl per-token activation requires BF16 dispatch "
+                "so the runner can forward per_token_scale to FlashInfer."
+            )
+        # NVFP4 dispatch, inputs are already quantized.
+        x_fp4 = hidden_states
+        per_token_scale = None
+    else:
+        if quant_info.use_per_token_activation:
+            from flashinfer import SfLayout, nvfp4_quantize
+
+            x_fp4, x_sf, per_token_scale = nvfp4_quantize(
+                hidden_states,
+                quant_info.a1_scale,
+                sfLayout=SfLayout.layout_linear,
+                per_token_activation=True,
+                backend="cute-dsl",
+            )
+        else:
+            x_fp4, x_sf = fp4_quantize(
+                hidden_states,
+                quant_info.a1_scale,
+                sf_vec_size=_FP4_SF_VEC_SIZE,
+                is_sf_swizzled_layout=False,
+            )
+            per_token_scale = None
+
+        seq_len, hidden_size = hidden_states.shape
+        x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
+        x_sf = x_sf.view(torch.float8_e4m3fn).reshape(
+            seq_len, hidden_size // _FP4_SF_VEC_SIZE
+        )
+
+    output = quant_info.wrapper.run(
+        x=x_fp4,
+        x_sf=x_sf,
+        token_selected_experts=topk_ids,
+        token_final_scales=topk_weights,
+        w1_weight=quant_info.w13_weight,
+        w1_weight_sf=quant_info.w13_weight_sf,
+        w1_alpha=quant_info.w1_alpha,
+        fc2_input_scale=None if is_w4a16 else quant_info.a2_scale,
+        w2_weight=quant_info.w2_weight,
+        w2_weight_sf=quant_info.w2_weight_sf,
+        w2_alpha=quant_info.w2_alpha,
+        per_token_scale=per_token_scale,
     )
 
     # Note: output contains routed expert results; shared_expert is handled separately
