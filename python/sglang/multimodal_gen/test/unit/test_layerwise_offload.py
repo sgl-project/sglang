@@ -33,18 +33,20 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     LayerwiseOffloadStrategy,
     ResidentStrategy,
 )
+
 =======
 import torch.nn as nn
 
 >>>>>>> theirs
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadManager,
-<<<<<<< ours
+    <<<<<<<,
     compute_streamed_layers,
     configure_layerwise_offload_modules,
     get_layerwise_offload_component_names_for_pipeline,
     is_layerwise_offloaded_module,
     is_resident_layerwise_module,
+    ours,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     RESIDENCY_POLICY_LEADING,

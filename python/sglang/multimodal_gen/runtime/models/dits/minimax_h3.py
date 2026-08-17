@@ -51,7 +51,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionRequirements,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
-from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -70,6 +69,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -525,7 +525,9 @@ def _preferred_minimax_h3_cpu_attention_backend(
     head_dim: int, dtype: torch.dtype
 ) -> AttentionBackendEnum | None:
     server_args = get_global_server_args()
-    component_backends = getattr(server_args, "component_attention_backends", None) or {}
+    component_backends = (
+        getattr(server_args, "component_attention_backends", None) or {}
+    )
     if getattr(server_args, "attention_backend", None) is not None:
         return None
     if component_backends.get("transformer") is not None:
