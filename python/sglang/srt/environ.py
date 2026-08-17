@@ -534,6 +534,7 @@ class Envs:
     # "legacy" (rectangular grid, max_extend_len-shaped).
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
+    SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
@@ -761,6 +762,13 @@ class Envs:
     # (matches `gate_mode="separated"`, the layout used by gptoss_fp4 tuned
     # configs and by Mxfp4MoEMethod's post-fix weight shuffle).
     SGLANG_USE_AITER_MOE_GU_ITLV = EnvBool(True)
+    # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
+    # permuted in place at load so gate/up land in adjacent columns of the same
+    # output tile, which removes intermediate_cache1 and the standalone
+    # activation launch per MoE layer. Opt-in because the in-place permute is
+    # not compatible with runtime weight updates or EPLB expert rearrangement,
+    # both of which assume the checkpoint's halves layout.
+    SGLANG_OPT_FUSE_SWIGLU_INTERLEAVED = EnvBool(False)
     # Fuse the `residual_add + RMSNorm + zero-pad` triplet that appears
     # before the MoE block for models whose MoE input hidden_size must be
     # padded up to a stride (e.g. GPT-OSS MXFP4 needs pad to multiple of
@@ -847,6 +855,15 @@ class Envs:
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
+    # On by default; set SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 as a kill switch.
+    # Consults the tuned per-(N, K, M) Triton tile config table in
+    # apply_fp8_linear. When a tuned config exists for this GPU / weight shape /
+    # token count, run the Triton w8a8 FP8 GEMM with it; otherwise keep the
+    # default CUTLASS path. Only takes effect on a GPU with a matching
+    # dtype=fp8_w8a8_channelwise config JSON under
+    # kernels/ops/quantization/configs/ (currently L40S), so it is a no-op on
+    # any other GPU / untuned shape even when enabled.
+    SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE = EnvBool(True)
 
     # ===================================================================
     # Humming quantization
@@ -922,7 +939,6 @@ class Envs:
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
     SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
-    SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC = EnvBool(False)
     # Chunk size for the rebalance expert-weight P2P exchange; set
     # >= num_physical_experts to submit a single batch_isend_irecv.
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(
@@ -963,6 +979,15 @@ class Envs:
     # Cache directories
     # ===================================================================
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
+    # JIT kernel build cache. None = unset, resolving to ~/.cache/sglang/jit;
+    # point it at a persistent mount to share builds across CI jobs.
+    SGLANG_JIT_CACHE_DIR = EnvStr(None)
+    # Log, at INFO, which dependency changed whenever a module is rebuilt.
+    SGLANG_JIT_CACHE_DEBUG = EnvBool(False)
+    # How many builds to keep per module variant. None = unset = keep all, which
+    # is what makes reverting an edit an instant hit instead of a rebuild; set
+    # it to trade that away for disk (1 keeps only the most recent build).
+    SGLANG_JIT_CACHE_KEEP = EnvInt(None)
 
     # ===================================================================
     # Expert-parallel dispatch and MoE execution
@@ -1497,6 +1522,9 @@ class Envs:
     # Rust server
     # ===================================================================
     SGLANG_RUST_SERVER = EnvBool(False)
+    # Build a missing Rust extension from source (auto), require a bundled or
+    # cached extension (never), or rebuild the local cache entry (force).
+    SGLANG_RUST_BUILD_MODE = EnvStr("auto")
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 

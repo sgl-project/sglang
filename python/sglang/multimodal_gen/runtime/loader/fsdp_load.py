@@ -231,12 +231,13 @@ def maybe_load_fsdp_model(
     hsdp_shard_dim: int,
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
-    cpu_offload: bool = False,
+    component_starts_on_cpu: bool = False,
     fsdp_inference: bool = False,
     output_dtype: torch.dtype | None = None,
     pin_cpu_memory: bool = True,
     strict: bool = True,
     weight_load_plan: WeightLoadPlan | None = None,
+    checkpoint_key_filter: Callable[[str], bool] | None = None,
 ) -> torch.nn.Module:
     """Load a model with optional FSDP (Fully Sharded Data Parallel) support.
 
@@ -250,6 +251,8 @@ def maybe_load_fsdp_model(
               original parameter dtypes
             - Weight loading and casting
         reduce_dtype: Data type for gradient reduction in FSDP mixed precision.
+        component_starts_on_cpu: Load a non-FSDP component onto CPU initially.
+            Runtime residency strategies move it to the compute device before use.
         strict: If True, enforce strict state dict loading (all keys must match).
         weight_load_plan: Optional checkpoint/postprocess device plan for this load.
     """
@@ -292,16 +295,12 @@ def maybe_load_fsdp_model(
         logger.info("Disabling FSDP for MPS platform as it's not compatible")
 
     weight_load_plan = weight_load_plan or WeightLoadPlan(checkpoint_load_device=device)
-    defer_cpu_offload = bool(
-        cpu_offload and weight_load_plan.defer_component_cpu_offload
+    defer_cpu_placement = bool(
+        component_starts_on_cpu
+        and weight_load_plan.defer_cpu_placement
+        and not use_fsdp
     )
-    if defer_cpu_offload and use_fsdp:
-        logger.warning(
-            "Ignoring deferred CPU offload for FSDP loading; keeping the existing "
-            "FSDP offload policy."
-        )
-        defer_cpu_offload = False
-    load_cpu_offload = bool(cpu_offload and not defer_cpu_offload)
+    load_on_cpu = bool(component_starts_on_cpu and not defer_cpu_placement)
     weight_postprocess_device = weight_load_plan.weight_postprocess_device
     if use_fsdp and weight_postprocess_device is not None:
         logger.warning("Ignoring weight postprocess device override for FSDP loading.")
@@ -326,7 +325,7 @@ def maybe_load_fsdp_model(
         )
         shard_model(
             model,
-            cpu_offload=load_cpu_offload,
+            cpu_offload=False,
             reshard_after_forward=True,
             mp_policy=mp_policy,
             mesh=device_mesh,
@@ -347,6 +346,7 @@ def maybe_load_fsdp_model(
         and use_fsdp
         and weight_dir_list
         and preprocess_loaded_state_dict is None
+        and checkpoint_key_filter is None
         and not is_bnb_quantized
     ):
         preconverted_state_dict = (
@@ -361,6 +361,7 @@ def maybe_load_fsdp_model(
         and not use_fsdp
         and weight_dir_list
         and preprocess_loaded_state_dict is None
+        and checkpoint_key_filter is None
         and not is_bnb_quantized
     ):
         preconverted_state_dict = (
@@ -375,10 +376,14 @@ def maybe_load_fsdp_model(
         if weight_load_plan.load_full_state_dict_on_device:
             weight_iterator = safetensors_weights_iterator(
                 weight_dir_list,
+                key_filter=checkpoint_key_filter,
                 weight_load_plan=weight_load_plan,
             )
         else:
-            weight_iterator = safetensors_weights_iterator(weight_dir_list)
+            weight_iterator = safetensors_weights_iterator(
+                weight_dir_list,
+                key_filter=checkpoint_key_filter,
+            )
         if preprocess_loaded_state_dict is not None:
             weight_iterator = preprocess_loaded_state_dict(weight_iterator)
         if is_bnb_quantized:
@@ -401,7 +406,7 @@ def maybe_load_fsdp_model(
         weight_load_plan.checkpoint_load_device,
         param_dtype,
         strict=strict,
-        cpu_offload=load_cpu_offload,
+        cpu_offload=load_on_cpu,
         param_names_mapping=param_names_mapping_fn,
         preconverted_state_dict=preconverted_state_dict,
     )
@@ -437,7 +442,7 @@ def maybe_load_fsdp_model(
             p.requires_grad = False
 
     # 4. deferred cpu offload
-    if defer_cpu_offload:
+    if defer_cpu_placement:
         model.to("cpu")
 
     return model

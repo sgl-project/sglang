@@ -21,7 +21,9 @@ from transformers import AutoProcessor
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
+    EncoderMediaProcessorConfig,
     EncoderPreprocessOutput,
     invoke_encoder_preprocessor,
 )
@@ -104,11 +106,13 @@ class EncoderPreprocessor:
         self,
         server_args: ServerArgs,
         model_config: ModelConfig,
+        encoder_media_processor_config: EncoderMediaProcessorConfig,
         model_preprocessor: Optional[Callable] = None,
     ):
         self.server_args = server_args
         self.model_config = model_config
         self._model_preprocessor = model_preprocessor
+        self.encoder_media_processor_config = encoder_media_processor_config
         self.model_type = getattr(
             model_config.hf_config, "model_type", "unknown"
         ).lower()
@@ -282,13 +286,29 @@ class EncoderPreprocessor:
         frame_count_limit=None,
         discard_alpha_channel=True,
     ):
+        from sglang.srt.disaggregation.encoder.server import BadRequestError, MMError
+
+        media_metadata = {}
+        content_hash = None
         if isinstance(data, dict):
-            return data
+            if "url" not in data:
+                return data
+            media_metadata = {key: value for key, value in data.items() if key != "url"}
+            content_hash = parse_content_hash(data.get("content_hash"))
+            data = data["url"]
         try:
             if modality == Modality.IMAGE:
+                if content_hash is not None:
+                    snapshot = snapshot_media(data)
+                    if snapshot.content_digest != content_hash:
+                        raise BadRequestError(
+                            "Encoder media content hash mismatch: "
+                            f"expected {content_hash}, got {snapshot.content_digest}"
+                        )
+                    data = snapshot.data
                 gpu_image_decode = (
-                    "nvjpeg_fancy"
-                    if self.use_image_processor_gpu and self.model_type == "kimi_k3"
+                    self.encoder_media_processor_config.image_decode_mode
+                    if self.use_image_processor_gpu
                     else False
                 )
                 img, _ = load_image(data, gpu_image_decode)
@@ -298,17 +318,26 @@ class EncoderPreprocessor:
                     and img.mode != "RGB"
                 ):
                     img = img.convert("RGB")
+                if (
+                    media_metadata
+                    and self.encoder_media_processor_config.preserve_media_metadata
+                ):
+                    return {
+                        "type": "image",
+                        "image": img,
+                        **media_metadata,
+                    }
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
                 return load_audio(data, self.model_audio_sr)
 
+        except MMError:
+            raise
         except CLIENT_MEDIA_EXCEPTIONS as e:
             # Not ValueError: the DP envelope classifies by `.code`, which only
-            # MMError carries. Lazy import: server imports this module.
-            from sglang.srt.disaggregation.encoder.server import BadRequestError
-
+            # MMError carries.
             raise BadRequestError(f"Error while loading data {data}: {e}") from e
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")

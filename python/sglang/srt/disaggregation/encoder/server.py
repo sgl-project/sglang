@@ -54,10 +54,12 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.srt.model_loader import get_model
 from sglang.srt.multimodal.encoder_preprocessing import (
     get_encoder_preprocessed_items,
+    resolve_encoder_media_processor_config,
 )
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
 from sglang.srt.runtime_context import get_disagg, get_exec, get_mm, publish
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import configure_media_url_security
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
@@ -442,6 +444,10 @@ class MMEncoder:
         argument."""
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
+        configure_media_url_security(
+            server_args.allowed_media_domains,
+            server_args.media_url_max_file_size_mb,
+        )
         publish(server_args, role="encoder")
         self.transfer_backend = get_disagg().encoder_transfer_backend
         self.use_mooncake = self.transfer_backend == "mooncake"
@@ -491,6 +497,9 @@ class MMEncoder:
             load_config=self.load_config,
             device_config=self.device_config,
         )
+        encoder_media_processor_config = resolve_encoder_media_processor_config(
+            self.model
+        )
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
         # CPU preprocessing pipeline (Rust-replaceable)
@@ -498,6 +507,7 @@ class MMEncoder:
             server_args=server_args,
             model_config=self.model_config,
             model_preprocessor=getattr(self.model, "preprocess_mm_for_encoder", None),
+            encoder_media_processor_config=encoder_media_processor_config,
         )
 
         self.context = zmq.asyncio.Context(2)

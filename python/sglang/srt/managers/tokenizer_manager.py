@@ -1046,7 +1046,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.audio_data = [obj.audio_data]
             if contains_mm_input:
                 self._validate_mm_limits(obj)
-                self._normalize_mm_content_hashes(obj)
+                # mm_content_hashes is a GenerateReqInput field; EmbeddingReqInput
+                # has no such attribute.
+                if isinstance(obj, GenerateReqInput):
+                    self._normalize_mm_content_hashes(obj)
 
             mm_inputs = None
             mm_processor_input = (

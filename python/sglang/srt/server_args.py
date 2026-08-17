@@ -44,6 +44,7 @@ from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
     mamba_extra_buffer_lazy_of,
     mamba_extra_buffer_of,
+    remote_instance_transfer_engine_of,
     resolved_view,
 )
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
@@ -69,6 +70,7 @@ from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
+    configure_media_url_security,
     get_device,
     get_device_memory_capacity,
     get_device_sm,
@@ -167,7 +169,7 @@ QUANTIZATION_CHOICES = [
     "mxfp_w4a8",  # for NPU W4A8 (MXFP4 weights + MXFP8 activations)
     "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
-    "quark_mxfp4",  # Online MOE + linear quantization.
+    "quark_mxfp4",  # Online MOE + linear quantization (incl. NVFP4 -> MXFP4 requantization).
     # Apple Silicon MLX backend — on-the-fly quantization of fp16 weights at load
     # time via mlx.nn.quantize. Only takes effect when SGLANG_USE_MLX=1.
     "mlx_q4",  # 4 bits, group_size=64 (mlx-community default)
@@ -377,6 +379,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "flashkda",
     "nvidia_kda",
     "ptx_kda",
+    "helion",
 ]
 
 
@@ -1303,6 +1306,12 @@ class ServerArgs:
         "Use Granian instead of Uvicorn as the ASGI server, enabling HTTP/1.1 and HTTP/2 auto-negotiation. Clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. Requires 'pip install sglang[http2]'.",
         NS("serving"),
     ] = False
+    http2_max_concurrent_streams: A[
+        int,
+        "Maximum number of concurrent streams advertised on each HTTP/2 "
+        "connection (1 to 2^32 - 1). Only applies with --enable-http2.",
+        NS("serving"),
+    ] = 200
 
     # -------------------------------------------------------------------------
     # SSL/TLS
@@ -2025,7 +2034,7 @@ class ServerArgs:
     ] = False
 
     # -------------------------------------------------------------------------
-    # Torch compile and torchao
+    # Torch compile
     # -------------------------------------------------------------------------
     enable_torch_compile: A[
         bool,
@@ -2038,12 +2047,6 @@ class ServerArgs:
     torch_compile_max_bs: A[
         int, "Set the maximum batch size when using torch compile.", NS("exec.graph")
     ] = 32
-    torchao_config: A[
-        str,
-        "Optimize the model with torchao. Experimental feature. Current choices are: int8dq, int8wo, int4wo-<group_size>, fp8wo, fp8dq-per_tensor, fp8dq-per_row",
-        NS("exec.graph"),
-    ] = ""
-
     # -------------------------------------------------------------------------
     # Speculative decoding
     # -------------------------------------------------------------------------
@@ -2406,9 +2409,11 @@ class ServerArgs:
         "Circular buffer size of expert distribution recorder. Set to -1 to denote infinite buffer.",
         NS("exec.moe"),
     ] = None
-    enable_expert_distribution_metrics: A[
-        bool, "Enable logging metrics for expert balancedness", NS("exec.moe")
-    ] = False
+    expert_balancedness_report_mode: A[
+        Literal["off", "server_log", "prometheus", "both"],
+        "Where to report expert balancedness. Options: off, server_log, prometheus, both.",
+        NS("exec.moe"),
+    ] = "off"
     deepep_config: A[
         Optional[str],
         "Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
@@ -2577,7 +2582,7 @@ class ServerArgs:
     linear_attn_backend: A[
         str,
         Arg(
-            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend.",
+            help="The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend. The Helion backend is KDA-only.",
             choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
         ),
         NS("exec.mamba"),
@@ -2612,11 +2617,10 @@ class ServerArgs:
         bool,
         "Enable the ReplaySSM buffered output-only linear-attn decode kernel. "
         "Primarily a GDN (scalar-gate) decode-bandwidth optimization (~1.2-1.5x "
-        "at batch >= 64). The unified kernel also supports KDA (per-K gate) and "
-        "is numerically correct, but KDA decode is SLOWER than the packed "
-        "baseline (the per-K g_cache is K x larger and the reconstruction "
-        "refolds the per-K decay every step), so it is not recommended for KDA "
-        "models. Requires the Triton linear-attn decode backend and "
+        "at batch >= 64). KDA uses its selected Triton or Helion implementation, "
+        "but its per-K gate ring is larger and ReplaySSM is typically slower "
+        "than packed KDA decode; benchmark before enabling it. Requires the "
+        "Triton linear-attn decode backend, or Helion for KDA, and "
         "--mamba-radix-cache-strategy no_buffer (the default).",
         NS("exec.mamba"),
     ] = False
@@ -2769,6 +2773,19 @@ class ServerArgs:
         "environment override when this argument is 0.",
         NS("mm"),
     ] = 0
+    allowed_media_domains: A[
+        List[str],
+        "Restrict client-supplied HTTP(S) image, video, and audio URLs to these "
+        "exact hostnames. Redirect destinations are checked against the same "
+        "allowlist. When unset, remote media from any domain is allowed.",
+        NS("mm"),
+    ] = dataclasses.field(default_factory=list)
+    media_url_max_file_size_mb: A[
+        int,
+        "Maximum size in MiB for one client-supplied remote media download. "
+        "The limit is enforced while streaming; set to 0 to disable it.",
+        NS("mm"),
+    ] = 64
     mm_preprocess_cache_size_mb: A[
         Optional[int],
         "CPU memory budget for content-addressed multimodal preprocessing "
@@ -3532,6 +3549,9 @@ class ServerArgs:
     ] = None
 
     def __post_init__(self):
+        self._run_resolution_pipeline()
+
+    def _run_resolution_pipeline(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
 
@@ -3563,6 +3583,7 @@ class ServerArgs:
 
         self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
+        self._handle_media_url_security()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -4016,6 +4037,12 @@ class ServerArgs:
             )
 
         if self.enable_http2:
+            if not 0 < self.http2_max_concurrent_streams < 2**32:
+                raise ValueError(
+                    "--http2-max-concurrent-streams must be between 1 and "
+                    "4294967295."
+                )
+
             try:
                 import granian  # noqa: F401
             except ImportError:
@@ -4052,6 +4079,13 @@ class ServerArgs:
                         f"mm_process_config['{key}'] must be a dict, "
                         f"but got {type(self.mm_process_config[key])}"
                     )
+
+    def _handle_media_url_security(self):
+        """Normalize and publish the media URL policy before workers start."""
+        self.allowed_media_domains = configure_media_url_security(
+            self.allowed_media_domains,
+            self.media_url_max_file_size_mb,
+        )
 
     def _handle_deprecated_args(self):
         if self.disable_fast_image_processor:
@@ -4486,13 +4520,14 @@ class ServerArgs:
         if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
             return
 
-        # Breakable is the general CUDA default, but it is not compatible with
-        # multimodal prefill. Models on this allowlist have had their decoder
-        # prefill validated under tc_piecewise; the vision encoder remains
-        # eager outside the captured LM forward.
+        # Breakable is the CUDA default but not multimodal-compatible;
+        # piecewise-allowlisted archs run their validated decoder prefill
+        # there instead. Archs also on the breakable allowlist keep it --
+        # this runs first, so piecewise would otherwise silently win.
         if (
             self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
             and self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
+            and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported
             # Keep trtllm_mla on the preferred breakable path, which now serves
             # MLA by falling back to the flashinfer MLA impl for extend.
             and self._resolved_attention_backends()[0] != "trtllm_mla"
@@ -4879,7 +4914,7 @@ class ServerArgs:
             if self.post_capture_kv_sizing_planned():
                 # Post-capture sizing measures free memory after graph capture, so
                 # skip the graph/activation reserve; keep only the floor + parallel slack.
-                reserved_mem = 512
+                reserved_mem = 1536
                 reserved_mem += self.tp_size * self.pp_size / 8 * 1024
             else:
                 # Tokens the activation working set scales with (per serving mode).
@@ -5448,6 +5483,8 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                if not envs.SGLANG_OPT_FUSE_MHC_POST_PRE.is_set():
+                    envs.SGLANG_OPT_FUSE_MHC_POST_PRE.set(True)
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
                 # Prefer TileLang over the Torch fallback.
@@ -5598,13 +5635,19 @@ class ServerArgs:
             # Default attention backend selection moved to the override registry
             # (arg_groups/overrides.py: _gemma4_overrides).
             prefill_backend, decode_backend = self._resolved_attention_backends()
-            accepted_backends = ("trtllm_mha", "triton", "ascend", "intel_xpu")
+            accepted_backends = (
+                "trtllm_mha",
+                "triton",
+                "ascend",
+                "intel_xpu",
+                "intel_amx",
+            )
             assert (
                 prefill_backend in accepted_backends
                 and decode_backend in accepted_backends
             ), (
-                "Gemma4 only supports trtllm_mha, triton, or intel_xpu attention backend, "
-                f"got prefill={prefill_backend}, decode={decode_backend}"
+                "Gemma4 only supports trtllm_mha, triton, ascend, intel_xpu, or intel_amx "
+                f"attention backend, got prefill={prefill_backend}, decode={decode_backend}"
             )
 
             # The quantization/moe_runner_backend resolution moved to the override
@@ -5738,13 +5781,9 @@ class ServerArgs:
                 "extra_buffer_lazy unsupported under PD disaggregation; use "
                 "--mamba-radix-cache-strategy extra_buffer."
             )
-            algo = (view.speculative_algorithm or "").upper()
-            # dspark verifies through prepare_mamba_track_for_verify (lazy plan
-            # wired); dflash bypasses that hook, so it stays unsupported.
-            assert algo != "DFLASH", (
-                f"extra_buffer_lazy unsupported with {view.speculative_algorithm}; "
-                "use --mamba-radix-cache-strategy extra_buffer."
-            )
+            # eagle/ngram/dspark/dflash all verify through
+            # prepare_mamba_track_for_verify (lazy plan wired); dflash gained
+            # the hook in DFlashVerifyInput.prepare_for_verify.
         if view.speculative_num_draft_tokens is not None:
             assert view.mamba_track_interval >= view.speculative_num_draft_tokens
         if view.page_size is not None:
@@ -6175,6 +6214,7 @@ class ServerArgs:
         # Fixed in FlashInfer v0.6.7: flashinfer-ai/flashinfer#2810
         if (
             self.linear_attn_decode_backend is None
+            and self.linear_attn_backend != "helion"
             and is_sm100_supported()
             and self.mamba_ssm_dtype == "bfloat16"
             # Stage 4: flashinfer's recurrent_kda compiles the state slot stride
@@ -6253,8 +6293,8 @@ class ServerArgs:
                 f"got CUDA {cuda_version or 'unknown'}"
             )
 
-        # GDN ReplaySSM buffered decode guards. Runs on the Triton GDN decode
-        # backend. cuda-graph is supported (slice 1b: CUDA-graph-safe static
+        # ReplaySSM buffered decode guards. Runs on Triton, or Helion for KDA.
+        # cuda-graph is supported (slice 1b: CUDA-graph-safe static
         # write-cursor buffers). The RADIX prefix cache is now supported (slice
         # 2b: the decode kernel force-flushes the ring into temporal[slot] on
         # the radix track boundary `seq_lens % mamba_track_interval == 0`, and
@@ -6268,10 +6308,10 @@ class ServerArgs:
         # cursor of the donated/kept slot would not be reset there. Handling
         # that donation path is a follow-up; for now require no_buffer.
         if self.enable_linear_replayssm:
-            if decode != "triton":
+            if decode not in {"triton", "helion"}:
                 raise ValueError(
-                    "--enable-linear-replayssm requires the Triton "
-                    "linear-attn decode backend, got "
+                    "--enable-linear-replayssm requires Triton, or Helion for "
+                    "KDA, as the linear-attn decode backend; got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
             from sglang.srt.arg_groups.overrides import (
@@ -7167,7 +7207,14 @@ class ServerArgs:
         # ===== END TO BE REFACTORED ====
 
     def _handle_expert_distribution_metrics(self):
-        if self.enable_expert_distribution_metrics and (
+        if "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC" in os.environ:
+            raise ValueError(
+                "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC is no longer supported. Use "
+                "--expert-balancedness-report-mode with one of: off, server_log, "
+                "prometheus, both."
+            )
+
+        if self.should_report_expert_balancedness() and (
             self.expert_distribution_recorder_mode is None
         ):
             self.expert_distribution_recorder_mode = "stat"
@@ -8289,21 +8336,20 @@ class ServerArgs:
         # The Mamba/KDA state is stored in envelope-strided views; only
         # stride-audited kernels may read it (Stage 4 audit, per slot):
         # - decode: triton; flashinfer (recurrent_kda compiles the state slot
-        #   stride as a free int64 — natively strided); cutedsl (KDA fused
-        #   sigmoid-gating update made stride-safe) on KDA-hybrid models only —
-        #   cutedsl_gdn still compiles h0 against a contiguous dummy.
-        # - prefill: triton; flashkda (wrapper gathers/scatters a contiguous
-        #   per-slot copy, external kernel never sees the pool); cutedsl
-        #   (kernel_h compiles h0/ht with dynamic int64 strides), same
-        #   KDA-only caveat.
+        #   stride as a free int64); helion (specializes KDA state strides 0-3
+        #   and rejects a non-unit innermost stride); cutedsl (KDA fused sigmoid-
+        #   gating update is stride-safe) on KDA-hybrid models only.
+        # - prefill: triton; flashkda (the wrapper gathers/scatters a contiguous
+        #   per-slot copy); helion; cutedsl (kernel_h compiles h0/ht with dynamic
+        #   int64 strides), with the same KDA-only caveat.
         # - mamba (mamba2/short-conv state): triton only.
         # use_mla_backend() distinguishes the KDA-hybrid family (K3/KimiLinear
-        # are MLA-hybrid) from GDN models (GQA-hybrid) for the cutedsl caveat.
+        # are MLA-hybrid) from GDN models (GQA-hybrid) for the KDA-only caveat.
         decode_allowed = {"triton", "flashinfer"}
         prefill_allowed = {"triton", "flashkda"}
         if self.use_mla_backend():
-            decode_allowed.add("cutedsl")
-            prefill_allowed.add("cutedsl")
+            decode_allowed.update({"cutedsl", "helion"})
+            prefill_allowed.update({"cutedsl", "helion"})
         resolved_linear_decode = (
             self.linear_attn_decode_backend or self.linear_attn_backend
         )
@@ -8590,6 +8636,19 @@ class ServerArgs:
         )
 
         # --- Deprecated argument registrations ---
+        parser.add_argument(
+            "--enable-expert-distribution-metrics",
+            action=DeprecatedAction,
+            error_message=(
+                "--enable-expert-distribution-metrics is no longer supported. Use "
+                "--expert-balancedness-report-mode with one of: off, server_log, "
+                "prometheus, both."
+            ),
+            help=(
+                "Removed. Use --expert-balancedness-report-mode with one of: "
+                "off, server_log, prometheus, both."
+            ),
+        )
         parser.add_argument(
             "--stream-output",
             action=DeprecatedStoreTrueAction,
@@ -8990,10 +9049,16 @@ class ServerArgs:
         # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
         # the other ubatch's compute), which requires DP attention. Enabling it
         # there needs no extra opt-in env flag.
+        cp_tbo = (
+            is_hip()
+            and self.enable_dsa_prefill_context_parallel
+            and self.dsa_prefill_cp_mode == "round-robin-split"
+        )
         if (
             self.enable_two_batch_overlap
             and self.moe_a2a_backend == "none"
             and not self.enable_dp_attention
+            and not cp_tbo
         ):
             raise ValueError(
                 "When enabling two batch overlap without an EP a2a backend "
@@ -9474,20 +9539,7 @@ class ServerArgs:
     def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
         """``load_format`` overrides the seed's: a draft runner loading under
         ``--speculative-draft-load-format`` needs its own transfer engine."""
-        # Use TransferEngine as seed backend.
-        if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
-            return True
-        # Use TransferEngine as client backend.
-        if (load_format or self.load_format) == "remote_instance" and (
-            self.remote_instance_weight_loader_backend == "transfer_engine"
-            or (
-                self.remote_instance_weight_loader_backend == "modelexpress"
-                and self.modelexpress_transport == "transfer_engine"
-            )
-        ):
-            return True
-        else:
-            return False
+        return remote_instance_transfer_engine_of(self, load_format)
 
     def describe_kv_events_publisher(self) -> Optional[dict]:
         """Return a structured description of this server's KV-event
@@ -9575,6 +9627,15 @@ class ServerArgs:
             "block_size": page_size,
             "dp_size": self.dp_size,
         }
+
+    def should_report_expert_balancedness(self) -> bool:
+        return self.expert_balancedness_report_mode != "off"
+
+    def should_log_expert_balancedness_to_server_log(self) -> bool:
+        return self.expert_balancedness_report_mode in ("server_log", "both")
+
+    def should_export_expert_balancedness_to_prometheus(self) -> bool:
+        return self.expert_balancedness_report_mode in ("prometheus", "both")
 
 
 def m3_fp8_attn_gemm_enabled(args) -> bool:
