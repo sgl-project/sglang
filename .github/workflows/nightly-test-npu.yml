@@ -130,12 +130,94 @@ jobs:
     with:
       runner: linux-aarch64-a2-4
       test_type: perf
-      test_suite: nightly-mix-1-npu-a2
+      test_suite: nightly-1-npu-a2
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a2 }}
       install_sglang_deps: false
       device_type_for_deps: '910b'
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+
+  nightly-1-npu-a3:
+    name: nightly-1-npu-a3
+    if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-2-
+      test_type: 'perf'
+      test_suite: nightly-1-npu-a3
+      is_nightly_pipeline_job: true
+      skip_pr_test_health_check: 'true'
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      install_sglang_deps: false
+      device_type_for_deps: 'a3'
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+
+  nightly-2-npu-a3:
+    name: nightly-2-npu-a3
+    if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-2-
+      test_type: 'perf'
+      test_suite: nightly-2-npu-a3
+      is_nightly_pipeline_job: true
+      skip_pr_test_health_check: 'true'
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      install_sglang_deps: false
+      device_type_for_deps: 'a3'
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+
+  # The nightly-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring base-b-test-4-npu-a3 in the PR pipeline.
+  nightly-4-npu-a3:
+    name: nightly-4-npu-a3
+    if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-4-
+      test_type: 'perf'
+      test_suite: nightly-4-npu-a3
+      is_nightly_pipeline_job: true
+      partitions: '{"size":2,"arr":[0,1]}'
+      skip_pr_test_health_check: 'true'
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      install_sglang_deps: false
+      device_type_for_deps: 'a3'
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+
+  nightly-8-npu-a3:
+    name: nightly-8-npu-a3
+    if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-8-
+      test_type: 'perf'
+      test_suite: nightly-8-npu-a3
+      is_nightly_pipeline_job: true
+      skip_pr_test_health_check: 'true'
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      install_sglang_deps: false
+      device_type_for_deps: 'a3'
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+
+  nightly-16-npu-a3:
+    name: nightly-16-npu-a3
+    if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-16-
+      test_type: 'perf'
+      test_suite: nightly-16-npu-a3
+      is_nightly_pipeline_job: true
+      skip_pr_test_health_check: 'true'
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      install_sglang_deps: false
+      device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
   nightly-perf-2-npu-a3:
@@ -163,6 +245,22 @@ jobs:
       runner: linux-aarch64-a3-800t-4
       test_type: 'perf'
       test_suite: nightly-perf-4-npu-a3
+      is_nightly_pipeline_job: true
+      skip_pr_test_health_check: 'true'
+      image: ${{ needs.set-image-config.outputs.image_a3 }}
+      install_sglang_deps: false
+      device_type_for_deps: 'a3'
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+
+  nightly-perf-8-npu-a3:
+    name: nightly-perf-8-npu-a3
+    if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-aarch64-a3-800t-8
+      test_type: 'perf'
+      test_suite: nightly-perf-8-npu-a3
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -325,8 +423,14 @@ jobs:
     if: ${{ !cancelled() }}
     needs:
       - nightly-mix-single-node-a2-tests
+      - nightly-1-npu-a3
+      - nightly-2-npu-a3
+      - nightly-4-npu-a3
+      - nightly-8-npu-a3
+      - nightly-16-npu-a3
       - nightly-perf-2-npu-a3
       - nightly-perf-4-npu-a3
+      - nightly-perf-8-npu-a3
       - nightly-perf-16-npu-a3
       - nightly-acc-2-npu-a3
       - nightly-acc-4-npu-a3
@@ -351,8 +455,14 @@ jobs:
           # single-node suites are reported per suite; overall status is success if none failed
           single_result="success"
           for r in \
+            "${{ needs.nightly-1-npu-a3.result }}" \
+            "${{ needs.nightly-2-npu-a3.result }}" \
+            "${{ needs.nightly-4-npu-a3.result }}" \
+            "${{ needs.nightly-8-npu-a3.result }}" \
+            "${{ needs.nightly-16-npu-a3.result }}" \
             "${{ needs.nightly-perf-2-npu-a3.result }}" \
             "${{ needs.nightly-perf-4-npu-a3.result }}" \
+            "${{ needs.nightly-perf-8-npu-a3.result }}" \
             "${{ needs.nightly-perf-16-npu-a3.result }}" \
             "${{ needs.nightly-acc-2-npu-a3.result }}" \
             "${{ needs.nightly-acc-4-npu-a3.result }}" \
@@ -378,8 +488,14 @@ jobs:
           echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| single-node-mix-a2 | $(group_icon ${single_result_a2}) ${single_result_a2} |" >> $GITHUB_STEP_SUMMARY
           for entry in \
+            "nightly-1-npu-a3:${{ needs.nightly-1-npu-a3.result }}" \
+            "nightly-2-npu-a3:${{ needs.nightly-2-npu-a3.result }}" \
+            "nightly-4-npu-a3:${{ needs.nightly-4-npu-a3.result }}" \
+            "nightly-8-npu-a3:${{ needs.nightly-8-npu-a3.result }}" \
+            "nightly-16-npu-a3:${{ needs.nightly-16-npu-a3.result }}" \
             "nightly-perf-2-npu-a3:${{ needs.nightly-perf-2-npu-a3.result }}" \
             "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \
+            "nightly-perf-8-npu-a3:${{ needs.nightly-perf-8-npu-a3.result }}" \
             "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
             "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
             "nightly-acc-4-npu-a3:${{ needs.nightly-acc-4-npu-a3.result }}" \

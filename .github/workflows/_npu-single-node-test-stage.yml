@@ -214,8 +214,8 @@ jobs:
           GDN_ATTN_BACKEND_TRITON: 1
         shell: bash
         run: |
-          # Fail fast on any command error; GH default bash also applies -eo pipefail.
-          set -eo pipefail
+          # Fail fast on any command error, undefined variable, or pipe failure.
+          set -euo pipefail
 
           sglang_source_path=$(pwd)
           echo "Source code path: ${sglang_source_path}"
@@ -270,19 +270,16 @@ jobs:
           PIP_INDEXES=("https://pypi.org/simple/" "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple" "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple")
           PIP_TRUSTED_HOST=cache-service.nginx-pypi-cache.svc.cluster.local
 
-          # Shared pip installer: retry the package across indexes (3 attempts), fail the job if all fail.
+          # Shared pip installer: try each index until one succeeds, fail the job if all fail.
           install_pkg() {
             local pkg="$1"
             ok=0
-            for attempt in 1 2 3; do
-              for index in "${PIP_INDEXES[@]}"; do
-                echo "${pkg}: attempt ${attempt}/3 via ${index}"
-                if ${PYTHON_FOR_SGLANG} -m pip install "${pkg}" --retries 3 --timeout 60 \
-                    -i "${index}" --trusted-host "${PIP_TRUSTED_HOST}"; then
-                  ok=1; break 2
-                fi
-              done
-              [ "${attempt}" -lt 3 ] && sleep 15
+            for index in "${PIP_INDEXES[@]}"; do
+              echo "${pkg}: try via ${index}"
+              if ${PYTHON_FOR_SGLANG} -m pip install "${pkg}" --retries 3 --timeout 60 \
+                  -i "${index}" --trusted-host "${PIP_TRUSTED_HOST}"; then
+                ok=1; break
+              fi
             done
             [ "${ok}" = "1" ] || { echo "ERROR: failed to install ${pkg}"; exit 1; }
           }
@@ -380,7 +377,9 @@ jobs:
           fi
 
           # Run NPU test suite with run_suite.py.
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log ${LOG_TEE_TARGET} || test_exit_code=$?
+          # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses off the
+          # tee pipe, so leftover server processes cannot block the pipeline on exit.
+          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log ${LOG_TEE_TARGET} || test_exit_code=$?
 
           echo "Finished test: ${tc_name}"
 
