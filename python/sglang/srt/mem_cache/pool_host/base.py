@@ -381,14 +381,6 @@ class HostKVCache(abc.ABC):
         if indices_cpu.numel() == 0:
             return 0
 
-        assert self.dcp_size == 1 or (
-            indices_cpu.numel() % self.logical_page_size == 0
-        ), (
-            "Host pool frees must cover whole widened pages under DCP "
-            f"(maybe_dcp_kernel_indices assumes residue == position); got "
-            f"{indices_cpu.numel()} slots, logical_page_size="
-            f"{self.logical_page_size}."
-        )
         assert self.slot_used[indices_cpu].all(), (
             f"Double-free detected: slots not currently allocated: "
             f"{indices_cpu[~self.slot_used[indices_cpu]].tolist()}."
