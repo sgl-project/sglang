@@ -1,5 +1,8 @@
 """SGLang public API."""
 
+import platform as _platform
+import sys as _sys
+
 # sglang.srt.environ must run before the rest of this file's imports
 # (hf_transformers_patches, lang.api, ...), which pull in torch and
 # FlashInfer: those claim these cache dirs early, and the first value set is
@@ -10,31 +13,10 @@ from sglang.srt.environ import (
 
 _redirect_third_party_caches()
 
+if _sys.platform == "darwin" and _platform.machine() == "arm64":
+    from sglang._platform_stubs import install_platform_stubs as _install_platform_stubs
 
-def _install_platform_stubs() -> None:
-    """Install missing dependency APIs for Apple Silicon MPS."""
-    import platform
-    import sys
-
-    if sys.platform != "darwin" or platform.machine() != "arm64":
-        return
-
-    try:
-        import torch
-    except ImportError:
-        return
-
-    if not torch.backends.mps.is_available():
-        return
-
-    from sglang._mps_stub import install as install_mps_stub
-    from sglang._triton_stub import install as install_triton_stub
-
-    install_triton_stub()
-    install_mps_stub()
-
-
-_install_platform_stubs()
+    _install_platform_stubs()
 
 from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
 
