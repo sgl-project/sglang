@@ -29,7 +29,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     ceil_div,
@@ -252,7 +252,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         assert self.config.activation in ("silu", "situ")
         assert self.config.is_gated
         self.swiglu_limit = self.config.swiglu_limit
-        self.use_swizzle = self.swiglu_limit is not None
+        self.use_swizzle = get_moe_a2a_backend().is_megamoe()
 
     def run(
         self,
@@ -390,7 +390,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     scale_ue8m0=False,
                 )
                 del down_input
-        else:
+        elif self.use_swizzle:
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
 
             down_input_fp8 = torch.empty(
@@ -417,6 +417,35 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 swizzle=self.use_swizzle,
             )
             del gateup_output
+        else:
+            from sglang.kernels.ops.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
+
+            if self.swiglu_limit is not None:
+                gateup_output = _apply_swiglu_limit(
+                    gateup_output, swiglu_limit=self.swiglu_limit
+                )
+
+            if not _is_musa:
+                down_input = torch.empty(
+                    (all_tokens, N // 2),
+                    device=gateup_output.device,
+                    dtype=torch.bfloat16,
+                )
+                _legacy_silu_and_mul(gateup_output.view(-1, N), down_input)
+            else:
+                down_input = _silu_and_mul_musa(gateup_output.view(-1, N))
+            del gateup_output
+
+            down_input_fp8, down_input_scale = sglang_per_token_group_quant_fp8(
+                down_input,
+                scale_block_size,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+            del down_input
 
         # Allocate the MoE output in the NCCL symmetric memory pool when symmetric
         # allocation is required, so the downstream all-reduce takes the low-latency
