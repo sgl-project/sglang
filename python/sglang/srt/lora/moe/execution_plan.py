@@ -312,15 +312,6 @@ class MoeLoraExecutionPlan:
     def __post_init__(self) -> None:
         self.validate()
 
-    @property
-    def has_overlap(self) -> bool:
-        """Whether any stage is scheduled concurrently with the base path."""
-
-        return (
-            self.early_overlap is not EarlyOverlap.NONE
-            or self.late_overlap is not LateOverlap.NONE
-        )
-
     def _gate_up_b_contract(self) -> StageContract:
         if self.gate_up_b is not None:
             return self.gate_up_b.contract

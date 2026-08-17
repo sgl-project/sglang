@@ -1,11 +1,13 @@
 """MoE-LoRA runner for the MoE LoRA execution engine.
 
-``MoeLoraRunner`` is the single object the LoRA layer wrapper holds for one
-MoE layer. Construction admits the resident provider contract and binds the
-base provider; ``run`` executes the pipeline. No stock ``MoeRunner`` is
-involved — the per-quant base stages live behind :class:`MoeBaseProvider`,
-and this class owns the LoRA route views, the LoRA kernels, and every pipeline
-buffer.
+``MoeLoraRunner`` holds one MoE layer's LoRA execution state. The layer
+wrapper holds a :class:`MoeLoraLayerEngine`; that engine creates the runner at
+weight bind and keeps it for the layer's life. Construction admits every
+resident base provider, keyed by name, plus the layer geometry they share;
+``run`` selects the provider its plan names and executes the pipeline. No
+stock ``MoeRunner`` is involved — the per-quant base stages live behind
+:class:`MoeBaseProvider`, and this class owns the LoRA route views, the LoRA
+kernels, and every pipeline buffer.
 
 Every forward runs a typed ``MoeLoraExecutionPlan`` supplied by the caller —
 :class:`MoeLoraLayerEngine` resolves one per phase from the plan tables at
