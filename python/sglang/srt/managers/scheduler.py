@@ -4058,11 +4058,9 @@ class Scheduler(
 
         # memory leak check (skipped for hisparse — pool counters intentionally
         # diverge during host-backup, see _get_swa_token_info clamp).
-        # Also skipped while deferred KV releases are pending: those hold an
-        # aborted request's KV pages/req-slot out of the allocator until the
-        # prefill confirms the transfer drained (or a timeout fires), so the pool
-        # is transiently below `total` by design and would otherwise trip the
-        # idle-time leak invariant. Once the holds resolve the check resumes.
+        # Also skipped while deferred KV releases are pending: they hold pages out
+        # of the allocator by design, so the pool is transiently below `total` and
+        # would trip the idle leak invariant. Resumes once the holds resolve.
         _transfer_q = getattr(self, "disagg_decode_transfer_queue", None)
         _deferred_pending = (
             _transfer_q is not None and _transfer_q.has_pending_deferred_releases()
@@ -4557,13 +4555,10 @@ class Scheduler(
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     was_notified = decode_req.kv_receiver.abort_notified
                     decode_req.kv_receiver.abort()
-                    # Arm drain-ack accounting the first time the ABORT is sent,
-                    # so ABORT_ACKs that arrive before the scheduler defers this
-                    # req -- e.g. during the next forward step -- are captured
-                    # rather than dropped. Only on the notify transition, so a
-                    # repeated abort of the same req cannot wipe acks already
-                    # collected. A fresh set also drops any stale acks from a
-                    # prior request that reused this bootstrap_room.
+                    # Arm drain-ack accounting when the ABORT is sent (only on the
+                    # notify transition, so a repeated abort can't wipe collected
+                    # acks) so acks arriving before this req is deferred -- e.g.
+                    # during the next forward step -- are captured, not dropped.
                     kv_mgr = decode_req.kv_receiver.kv_mgr
                     if (
                         kv_mgr.enable_deferred_decode_kv_release

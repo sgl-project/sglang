@@ -1822,9 +1822,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.deferred_kv_release_timeout = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
         )
-        # Requests aborted mid-transfer whose KV pages/req-slot are held until the
-        # prefill confirms the transfer drained (is_abort_release_safe) or the
-        # timeout fires. Entries: (decode_req, deadline, metadata_idx, required_acks).
+        # Aborted-mid-transfer requests whose KV pages/slot are held until drained
+        # or timed out. Entries: (decode_req, deadline, metadata_idx, required_acks).
         self._deferred_releases: List[Tuple[DecodeRequest, float, int, int]] = []
 
     def add(self, decode_req: DecodeRequest) -> None:
@@ -2045,9 +2044,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         transferred_reqs = []
         indices_to_remove = set()
-        # Removed from the queue but whose KV pages / metadata buffer are held
-        # for deferred release (see resolve_deferred_releases); excluded from the
-        # immediate metadata-buffer teardown below.
+        # Queue-removed but held for deferred release; excluded from the metadata
+        # teardown below.
         deferred_indices = set()
         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -2090,15 +2088,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.enable_deferred_kv_release
                     and decode_req.kv_receiver.abort_notified
                 ):
-                    # This decode initiated the abort (an ABORT was sent to
-                    # prefill and the drain-ack tracker was armed), so an
-                    # in-flight prefill->decode write may still target this
-                    # request's KV pages. Hold the pages/req-slot + metadata
-                    # buffer until the prefill confirms the transfer drained
-                    # (ABORT_ACK) or the timeout fires (resolve_deferred_releases).
-                    # A prefill-initiated failure (abort_notified is False) has
-                    # already stopped writing, so it falls through to immediate
-                    # release below.
+                    # Decode-initiated abort: a prefill write may still target
+                    # these pages, so hold them until the drain ack or timeout.
+                    # (A prefill-initiated failure has already stopped writing ->
+                    # immediate release below.)
                     self._defer_release(decode_req)
                     deferred_indices.add(i)
                     indices_to_remove.add(i)
@@ -2146,8 +2139,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
         for i in indices_to_remove:
             if i in deferred_indices:
-                # Held for deferred release: its metadata buffer stays an RDMA
-                # target until the transfer drains; freed in resolve_deferred_releases.
+                # Held for deferred release; metadata buffer freed at resolve time.
                 continue
             if self.enable_staging and self.staging_handler.is_staging_room(
                 self.queue[i].req.bootstrap_room
@@ -2170,11 +2162,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def _defer_release(self, decode_req: DecodeRequest) -> None:
         deadline = time.monotonic() + self.deferred_kv_release_timeout
-        # Every prefill rank we notified of the abort acks exactly once (real
-        # ranks after their in-flight write drains, dummy/already-done ranks
-        # immediately). Requiring an ack from each is dummy-proof: reaching the
-        # count means no prefill can still be writing to these pages. Snapshot
-        # now -- the receiver may be cleared by the time we resolve.
+        # Require an ack from every notified prefill rank (dummy-proof). Snapshot
+        # now -- the receiver may be cleared by resolve time.
         required_acks = len(decode_req.kv_receiver.bootstrap_infos)
         self._deferred_releases.append(
             (decode_req, deadline, decode_req.metadata_buffer_index, required_acks)
@@ -2196,9 +2185,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return bool(self._deferred_releases)
 
     def resolve_deferred_releases(self) -> None:
-        """Release KV pages/req-slots held for aborted mid-transfer requests once
-        every prefill rank confirms its transfer drained (is_abort_release_safe),
-        or the per-request hold times out."""
+        """Release held requests once every prefill rank acks the drain, or the
+        hold times out."""
         if not self._deferred_releases:
             return
         now = time.monotonic()
@@ -2212,9 +2200,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 still_held.append((decode_req, deadline, idx, required_acks))
             else:
                 to_release.append((decode_req, idx, room, drained))
-        # Commit the surviving set before releasing anything: an exception in
-        # _do_release must not leave an already-released entry in the list
-        # (a retry would double-free its metadata idx / hit a None receiver).
+        # Commit the survivors before releasing so a _do_release exception can't
+        # leave a released entry in the list (double-free / None receiver on retry).
         self._deferred_releases = still_held
         for decode_req, idx, room, drained in to_release:
             if not drained:
@@ -2226,15 +2213,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             try:
                 self._do_release(decode_req, idx)
             except Exception:
-                # Isolate a single failed release so the rest still run and the
-                # decode loop is not bricked; the entry is already dropped.
+                # Isolate a failed release so the rest still run; entry already dropped.
                 logger.exception(f"Deferred KV release failed for room {room}")
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
         self.queue.clear()
-        # The whole KV pool is being torn down; drop held entries without
-        # per-request release (they point into the pool being freed).
+        # Pool is being torn down; drop held entries without per-request release.
         self._deferred_releases.clear()
 
     def resume_memory_occupation(self):
@@ -2454,10 +2439,8 @@ class SchedulerDisaggregationDecodeMixin:
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
-        # Resolve held deferred releases first, every iteration and regardless of
-        # the polling gate / retraction early-return below: their timeouts must
-        # still fire under memory pressure, and freeing them here gives the
-        # retracted-request resumption more room to work with.
+        # Resolve held releases every iteration (before the retraction/polling
+        # gates below) so their timeouts fire under memory pressure.
         self.disagg_decode_transfer_queue.resolve_deferred_releases()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
