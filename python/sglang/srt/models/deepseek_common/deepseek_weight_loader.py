@@ -753,7 +753,8 @@ class DeepseekV2WeightLoaderMixin:
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
-
+            if not hasattr(self_attn.kv_b_proj, "qweight"):
+                self_attn.kv_b_proj.weight.data.untyped_storage().resize_(0)
             self_attn.refresh_fa_k_scale_params()
 
     @classmethod
