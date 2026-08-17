@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 
 use crate::message::ids::Rid;
-use crate::tokenizer_manager::{AbortSource, Senders};
+use crate::tokenizer_manager::wiring::{AbortSource, Senders};
 
 /// Aborts still-in-flight rids on drop. Each rid is disarmed on natural finish;
 /// whatever remains at drop is aborted.

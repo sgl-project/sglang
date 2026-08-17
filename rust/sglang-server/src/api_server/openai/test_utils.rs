@@ -22,7 +22,7 @@ use super::{openai_error, routes};
 use crate::message::config::ServerArgs;
 use crate::message::egress::{ChunkEvent, EgressItem};
 use crate::message::ids::Rid;
-use crate::tokenizer_manager::Senders;
+use crate::tokenizer_manager::wiring::Senders;
 
 pub(super) fn senders() -> Senders {
     Senders {

@@ -24,7 +24,7 @@ use super::threads::{plan_cores, spawn_pool};
 use crate::tokenizer_manager::channel::{
     EgressConsumer, EgressProducer, IngressConsumer, IngressProducer, egress_ring, ingress_ring,
 };
-use crate::tokenizer_manager::{Senders, TmEvent};
+use crate::tokenizer_manager::wiring::{Senders, TmEvent};
 use crate::utils::sock::bind_tcp_listener;
 use crate::{
     api_server, tokenizer_manager, tokenizer_manager::detokenizer, tokenizer_manager::tokenizer,
@@ -152,7 +152,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 
     // Aborts get their own UNBOUNDED lane: on the bounded inbox they are dropped
     // exactly under the overload that makes them necessary (see `Senders::abort`).
-    let (abort_tx, abort_rx) = flume::unbounded::<crate::tokenizer_manager::AbortSource>();
+    let (abort_tx, abort_rx) = flume::unbounded::<crate::tokenizer_manager::wiring::AbortSource>();
     let senders = Senders {
         tm: tm_tx.clone(),
         abort: abort_tx.clone(),
@@ -226,7 +226,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     }
 
     // Egress heartbeat: bumped per drained frame, watched by `/health_generate`.
-    let egress_activity: tokenizer_manager::ActivityCounter =
+    let egress_activity: tokenizer_manager::egress::ActivityCounter =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // --- Egress dispatcher: drains egress ring → routes chunks to shards ---
@@ -242,7 +242,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let activity = egress_activity.clone();
         let shutdown_rx = shutdown_rx.clone();
         spawn_pool("tm-egress", cores, 1, &mut threads, |_| {
-            tokenizer_manager::Egress::new(
+            tokenizer_manager::egress::Egress::new(
                 egress_rx.take().unwrap(),
                 senders.clone(),
                 activity.clone(),
@@ -259,9 +259,9 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .as_ref()
             .and_then(|p| p.tm.get(1).or_else(|| p.tm.first()).copied())
             .map(|c| vec![c]);
-        let limits = tokenizer_manager::Limits::try_from(&*cfg.server_args)
+        let limits = tokenizer_manager::ingress::Limits::try_from(&*cfg.server_args)
             .map_err(|e| format!("ingress limits: {e}"))?;
-        let mm = tokenizer_manager::Mm {
+        let mm = tokenizer_manager::ingress::Mm {
             enabled: cfg.server_args.model_is_multimodal(),
             tx: mm_tx,
             sidecar: mm_sidecar.clone(),
@@ -270,7 +270,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let shutdown_rx = shutdown_rx.clone();
         spawn_pool("tm-ingress", cores, 1, &mut threads, |_| {
             let (tm_rx, ingress_tx) = parts.take().unwrap();
-            tokenizer_manager::Ingress::new(
+            tokenizer_manager::ingress::Ingress::new(
                 tm_rx,
                 abort_rx.clone(),
                 senders.clone(),

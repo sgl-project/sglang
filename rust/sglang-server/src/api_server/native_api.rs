@@ -542,7 +542,7 @@ fn terminal_stream_frame_string(
 mod tests {
     use super::*;
     use crate::message::egress::ChunkEvent;
-    use crate::tokenizer_manager::Senders;
+    use crate::tokenizer_manager::wiring::Senders;
     use crate::utils::error::Error;
     use futures::StreamExt;
     use std::time::Duration;

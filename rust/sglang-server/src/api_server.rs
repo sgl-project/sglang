@@ -18,8 +18,8 @@ use std::sync::Arc;
 use axum::Router;
 
 use crate::message::config::ServerArgs;
-use crate::tokenizer_manager::ActivityCounter;
-use crate::tokenizer_manager::Senders;
+use crate::tokenizer_manager::egress::ActivityCounter;
+use crate::tokenizer_manager::wiring::Senders;
 use disaggregation::bootstrap as pd_bootstrap;
 
 /// Shared handler state: submission handles, immutable server configuration,

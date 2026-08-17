@@ -6,8 +6,8 @@ use std::sync::Arc;
 use super::sidecar::{FeatureStore, MmSidecarEntry, Sidecar, park_features_in_shm};
 use crate::message::ids::Rid;
 use crate::message::request::MmRequest;
-use crate::tokenizer_manager::TmEvent;
 use crate::tokenizer_manager::tokenizer::TextTokenizer;
+use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::runtime::Runnable;
 
 /// Python parity: caller hashes override the computed ones so an external

@@ -29,7 +29,7 @@ use crate::message::io_struct::{AbortReq, ControlRequest};
 use crate::message::request::{GenerateRequest, IngressMsg, MmRequest, Request, RequestKind};
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::IngressProducer;
-use crate::tokenizer_manager::{AbortSource, Senders, TmEvent};
+use crate::tokenizer_manager::wiring::{AbortSource, Senders, TmEvent};
 use crate::utils::{
     error::Error,
     fsm::{Event, RequestState, ValidationOutcome},

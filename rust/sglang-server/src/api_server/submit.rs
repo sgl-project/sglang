@@ -9,7 +9,7 @@ use super::{AppState, native_api::native_error};
 use crate::message::egress::{EgressItem, EgressSink};
 use crate::message::ids::Rid;
 use crate::message::request::{Request, RequestKind};
-use crate::tokenizer_manager::TmEvent;
+use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::fsm::RequestState;
 
 /// Submit one request; returns the rid, its hashed routing key, and the egress

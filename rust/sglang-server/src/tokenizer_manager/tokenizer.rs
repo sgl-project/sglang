@@ -17,7 +17,7 @@ use std::sync::Arc;
 use crate::message::request::{Request, RequestKind};
 use crate::message::types::TokenIds;
 use crate::runtime::Runnable;
-use crate::tokenizer_manager::TmEvent;
+use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::{error::Error, fsm::Event};
 
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared

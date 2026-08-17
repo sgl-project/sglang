@@ -20,7 +20,7 @@ use crate::message::egress::{
 use crate::message::ids::Rid;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::EgressConsumer;
-use crate::tokenizer_manager::{Senders, recv};
+use crate::tokenizer_manager::wiring::{Senders, recv};
 
 /// A monotonic counter bumped once per egress-ring frame the dispatcher drains.
 /// It's the rust-native equivalent of the Python `TokenizerManager`'s
