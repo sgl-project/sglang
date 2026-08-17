@@ -70,6 +70,16 @@ class MemoryPoolConfig:
 
     mem_fraction_static: Optional[float] = None
 
+    # Unified memory pool only: the PROFILED byte budget for the token-granular
+    # sub-pools, captured at config_from_budget time. When set, the unified
+    # factories size the byte buffer from it DIRECTLY (plus the state pool's
+    # bytes) instead of re-summing the ratio-derived token counts — the
+    # re-sum's floor losses and the swa ratio's byte-partition effect disappear
+    # from the buffer; the token counts stay boot labels / conserve caps. None
+    # on the token-capped re-derivation path (a user token cap IS the budget
+    # then).
+    unified_total_bytes: Optional[int] = None
+
     def __post_init__(self):
         if self.max_total_num_tokens <= 0:
             msg = "Not enough memory. Please try to increase --mem-fraction-static."

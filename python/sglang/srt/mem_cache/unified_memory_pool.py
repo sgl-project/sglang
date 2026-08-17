@@ -286,6 +286,9 @@ class UnifiedKVPool:
         # For a page-aware sub-pool the slot-0 write touches layer blocks spread
         # across the WHOLE page-0 envelope (up to page_size * entry_bytes), not
         # just one slot envelope — reserve the max of both.
+        # For a page-aware sub-pool the slot-0 write touches layer blocks spread
+        # across the WHOLE page-0 envelope (up to page_size * entry_bytes), not
+        # just one slot envelope — reserve the max of both.
         entry_max = max(s.entry_bytes() for s in sub_pool_specs)
         reserved_floor = max(
             [entry_max]
@@ -1112,6 +1115,7 @@ def init_unified_mamba_pools(
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
     decode_pre_alloc_size: int = 0,
+    unified_total_bytes: Optional[int] = None,
 ) -> UnifiedPoolBundle:
     """Build the Mamba-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.multi_ended_allocator import (
@@ -1160,10 +1164,18 @@ def init_unified_mamba_pools(
         conv_slice_axis=getattr(cp.shape, "conv_slice_axis", 0),
         grow_direction="up",
     )
-    total_bytes = (
-        max_total_num_tokens * full_spec.entry_bytes()
-        + max_mamba_cache_size * mamba_spec.entry_bytes()
-    )
+    if unified_total_bytes is not None:
+        # PROFILED byte budget for the token side (captured pre-ratio-floor);
+        # the state pool's bytes ride on top. The token counts stay boot
+        # labels / conserve caps — the runtime split floats.
+        total_bytes = (
+            unified_total_bytes + max_mamba_cache_size * mamba_spec.entry_bytes()
+        )
+    else:
+        total_bytes = (
+            max_total_num_tokens * full_spec.entry_bytes()
+            + max_mamba_cache_size * mamba_spec.entry_bytes()
+        )
     # Dense MLA views are per-layer shifted, so the last layer's view reaches one
     # page envelope past the final page — allocation-only tail pad (~page bytes).
     view_tail_pad_bytes = page_size * full_spec.entry_bytes() if use_mla_backend else 0
@@ -1586,6 +1598,7 @@ def init_unified_swa_pools(
     need_sort: bool,
     forward_stream: Optional[torch.cuda.Stream] = None,
     lazy_compaction: bool = False,
+    unified_total_bytes: Optional[int] = None,
 ) -> UnifiedSWAPoolBundle:
     """Build the SWA-hybrid unified-memory-pool stack."""
     from sglang.srt.mem_cache.multi_ended_allocator import (
@@ -1622,10 +1635,17 @@ def init_unified_swa_pools(
         store_dtype=store_dtype,
         grow_direction="up",
     )
-    total_bytes = (
-        full_max_total_num_tokens * full_spec.entry_bytes()
-        + swa_max_total_num_tokens * swa_spec.entry_bytes()
-    )
+    if unified_total_bytes is not None:
+        # PROFILED byte budget: the buffer is sized from it directly, so the
+        # swa ratio's byte-partition effect and the re-sum's floor losses
+        # disappear from the BUFFER; the ratio-derived token counts remain
+        # boot labels / conserve caps.
+        total_bytes = unified_total_bytes
+    else:
+        total_bytes = (
+            full_max_total_num_tokens * full_spec.entry_bytes()
+            + swa_max_total_num_tokens * swa_spec.entry_bytes()
+        )
     shared_pool = UnifiedKVPool(
         total_bytes=total_bytes,
         sub_pool_specs=[full_spec, swa_spec],
