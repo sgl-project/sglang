@@ -44,7 +44,9 @@ sections 7.1 and 29 R1).  Three views exist:
     never reads is pure cost.
 ``fused_ids``
     ``virtual_topk_ids`` only.  For a consumer that wants the fused key without
-    the sort-and-pad plan.
+    the sort-and-pad plan.  Builder-level: no ``RouteRequirement`` names it, so
+    an execution plan cannot request it and ``build_routes`` never returns one;
+    ask ``build_virtual_expert_routing`` directly.
 ``aligned``
     The block plan, for grouped GEMMs. NOTE: not a superset of ``fused_ids`` —
     when the config selects the fused kernel, the key array is never

@@ -84,8 +84,9 @@ def _build_plan(
     middle_family=MiddleFamily.MATERIALIZED,
     down_b_scatter=False,
 ) -> MoeLoraExecutionPlan:
-    """The serial one-launch plan shape, built the way config.py's
-    ``_build_plan`` materializes a scenario (spec classes directly)."""
+    """The serial one-launch plan shape, built the way
+    ``execution_plan.build_plan`` materializes a table row (spec classes
+    directly)."""
     pe = False
     consumes_gate_up_b = middle_family is MiddleFamily.B_ACTIVATION
     gate_up_b_contract = StageContract(Site.GATE_UP, pe, BridgeLayout.PAIR_MAJOR)

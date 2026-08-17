@@ -14,6 +14,46 @@ from sglang.srt.lora.moe.routing import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
+
+def _serial_materialized_reference():
+    """The simplest correct pipeline: every stage standalone, nothing fused,
+    no overlap window."""
+    from sglang.srt.lora.moe.execution_plan import (
+        ActivationFamily,
+        BridgeLayout,
+        FinalizeFamily,
+        FinalizeSpec,
+        LoraAFamily,
+        LoraASpec,
+        LoraBFamily,
+        LoraBSpec,
+        MiddleFamily,
+        MiddleSpec,
+        MoeLoraExecutionPlan,
+        Site,
+    )
+
+    return MoeLoraExecutionPlan(
+        gate_up_a=LoraASpec(
+            Site.GATE_UP, LoraAFamily.GROUPED, False, BridgeLayout.PAIR_MAJOR
+        ),
+        gate_up_b=LoraBSpec(
+            Site.GATE_UP,
+            LoraBFamily.ONE_LAUNCH_SLICED,
+            False,
+            BridgeLayout.PAIR_MAJOR,
+        ),
+        middle=MiddleSpec(MiddleFamily.MATERIALIZED, ActivationFamily.SWIGLU),
+        down_a=LoraASpec(
+            Site.DOWN, LoraAFamily.GROUPED, False, BridgeLayout.PAIR_MAJOR
+        ),
+        down_b=LoraBSpec(
+            Site.DOWN, LoraBFamily.ONE_LAUNCH_SLICED, False, BridgeLayout.PAIR_MAJOR
+        ),
+        finalize=FinalizeSpec(FinalizeFamily.MATERIALIZED),
+    )
+
+
 register_cuda_ci(est_time=35, stage="base-b", runner_config="1-gpu-small")
 
 
@@ -650,9 +690,6 @@ class TestMoeLoraDualGranularityRoutes(CustomTestCase):
     def test_build_routes_takes_one_dual_pass_at_fused_shapes(self):
         """End-to-end wiring: one dual pass replaces both standalone builds."""
         from sglang.srt.lora.moe import route_factory
-        from sglang.srt.lora.moe.execution_plan import (
-            SERIAL_MATERIALIZED_REFERENCE,
-        )
         from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
         lora_experts_per_adapter, max_loras = 8, 32
@@ -666,7 +703,7 @@ class TestMoeLoraDualGranularityRoutes(CustomTestCase):
             side_effect=original,
         ) as dual:
             routes = route_factory.build_routes(
-                SERIAL_MATERIALIZED_REFERENCE,
+                _serial_materialized_reference(),
                 topk_ids=topk_ids,
                 token_slots=token_slots,
                 num_local_experts=lora_experts_per_adapter,

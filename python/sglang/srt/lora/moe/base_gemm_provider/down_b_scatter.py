@@ -60,8 +60,6 @@ import triton.language as tl
 
 from sglang.srt.lora.moe.routing import ROUTE_ALIGNED, RouteView
 
-DOWN_B_SCATTER_TRITON = "triton"
-
 
 @triton.jit
 def _down_b_scatter_kernel(

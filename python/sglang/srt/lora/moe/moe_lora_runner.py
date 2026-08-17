@@ -7,10 +7,11 @@ involved — the per-quant base stages live behind :class:`MoeBaseProvider`,
 and this class owns the LoRA route views, the LoRA kernels, and every pipeline
 buffer.
 
-The default remains the serial correctness pipeline.  A typed
-``MoeLoraExecutionPlan`` may instead force one of the retained fusion and
-overlap candidates; every consumed stage then has exactly one owner and every
-required route representation is built once:
+Every forward runs a typed ``MoeLoraExecutionPlan`` supplied by the caller —
+:class:`MoeLoraLayerEngine` resolves one per phase from the plan tables at
+weight bind, and the serial correctness pipeline ships there as the
+``fallback.serial`` rows.  Whichever plan arrives, every consumed stage has
+exactly one owner and every required route representation is built once:
 
     gate/up LoRA A  (grouped_lora_a: token-major hidden -> pair-major rank)
     gate/up LoRA B  (one_launch_sliced_lora_b -> canonical [gate | up] delta)

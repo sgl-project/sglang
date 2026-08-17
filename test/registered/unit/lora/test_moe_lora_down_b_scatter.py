@@ -99,8 +99,9 @@ def _build_plan(
     finalize_family=FinalizeFamily.MATERIALIZED,
     late_overlap=LateOverlap.NONE,
 ) -> MoeLoraExecutionPlan:
-    """The serial one-launch plan shape, built the way config.py's
-    ``_build_plan`` materializes a scenario (spec classes directly)."""
+    """The serial one-launch plan shape, built the way
+    ``execution_plan.build_plan`` materializes a table row (spec classes
+    directly)."""
     pe = False
     consumes_down_b = finalize_family is not FinalizeFamily.MATERIALIZED
     down_b_contract = StageContract(Site.DOWN, is_shared_outer, BridgeLayout.PAIR_MAJOR)

@@ -39,7 +39,6 @@ import triton.language as tl
 
 from sglang.srt.lora.moe.routing import RouteView
 
-MASKED_FINALIZE_FAMILIES = ("shared_rank_reduce",)
 MASKED_FINALIZE_TRITON = "triton"
 
 SHARED_RANK_DEFAULT_CONFIG: dict[str, dict[str, int]] = {

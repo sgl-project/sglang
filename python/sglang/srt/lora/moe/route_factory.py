@@ -15,7 +15,6 @@ from sglang.srt.lora.moe.execution_plan import (
 from sglang.srt.lora.moe.joint_routing import build_joint_shared_routes
 from sglang.srt.lora.moe.routing import (
     ROUTE_ALIGNED,
-    ROUTE_FUSED_IDS,
     ROUTE_RAW,
     FusedAlignScratch,
     RouteView,
@@ -32,8 +31,6 @@ class MoeLoraRoutes:
 
     raw_per_expert: RouteView | None = None
     raw_shared_outer: RouteView | None = None
-    fused_per_expert: RouteView | None = None
-    fused_shared_outer: RouteView | None = None
     aligned_per_expert: RouteView | None = None
     aligned_shared_outer: RouteView | None = None
     # Optional second per-expert plan used only by grouped gate/up-A when its
@@ -56,14 +53,6 @@ class MoeLoraRoutes:
         if route is None:
             raise ValueError(
                 f"the execution plan did not request aligned {_ownership_name(is_shared_outer)}"
-            )
-        return route
-
-    def fused(self, is_shared_outer: bool) -> RouteView:
-        route = self.fused_shared_outer if is_shared_outer else self.fused_per_expert
-        if route is None:
-            raise ValueError(
-                f"the execution plan did not request fused IDs for {_ownership_name(is_shared_outer)}"
             )
         return route
 
@@ -316,30 +305,6 @@ def build_routes(
             view=ROUTE_RAW,
             use_pdl=use_pdl,
         )
-
-    for requirement, fused_is_shared_outer, name in (
-        (
-            RouteRequirement.FUSED_PER_EXPERT,
-            False,
-            "fused_per_expert",
-        ),
-        (
-            RouteRequirement.FUSED_SHARED_OUTER,
-            True,
-            "fused_shared_outer",
-        ),
-    ):
-        if requirement in requirements:
-            values[name] = _pair_route(
-                topk_ids,
-                token_slots,
-                is_shared_outer=fused_is_shared_outer,
-                num_local_experts=num_local_experts,
-                max_loras=max_loras,
-                block_size=block_size,
-                view=ROUTE_FUSED_IDS,
-                use_pdl=use_pdl,
-            )
 
     need_per_expert = RouteRequirement.ALIGNED_PER_EXPERT in requirements
     need_shared = RouteRequirement.ALIGNED_SHARED_OUTER in requirements

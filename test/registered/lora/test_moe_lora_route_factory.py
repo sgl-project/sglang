@@ -38,6 +38,44 @@ def _load_execution_plan():
 PLAN = _load_execution_plan()
 
 
+def _serial_materialized_reference():
+    """The simplest correct pipeline: every stage standalone, nothing fused,
+    no overlap window.  Every plan below is a departure from this one."""
+    return PLAN.MoeLoraExecutionPlan(
+        gate_up_a=PLAN.LoraASpec(
+            PLAN.Site.GATE_UP,
+            PLAN.LoraAFamily.GROUPED,
+            False,
+            PLAN.BridgeLayout.PAIR_MAJOR,
+        ),
+        gate_up_b=PLAN.LoraBSpec(
+            PLAN.Site.GATE_UP,
+            PLAN.LoraBFamily.ONE_LAUNCH_SLICED,
+            False,
+            PLAN.BridgeLayout.PAIR_MAJOR,
+        ),
+        middle=PLAN.MiddleSpec(
+            PLAN.MiddleFamily.MATERIALIZED, PLAN.ActivationFamily.SWIGLU
+        ),
+        down_a=PLAN.LoraASpec(
+            PLAN.Site.DOWN,
+            PLAN.LoraAFamily.GROUPED,
+            False,
+            PLAN.BridgeLayout.PAIR_MAJOR,
+        ),
+        down_b=PLAN.LoraBSpec(
+            PLAN.Site.DOWN,
+            PLAN.LoraBFamily.ONE_LAUNCH_SLICED,
+            False,
+            PLAN.BridgeLayout.PAIR_MAJOR,
+        ),
+        finalize=PLAN.FinalizeSpec(PLAN.FinalizeFamily.MATERIALIZED),
+    )
+
+
+SERIAL_MATERIALIZED_REFERENCE = _serial_materialized_reference()
+
+
 def _arch_pdl(enabled: bool):
     """Pin build_routes' architecture probe: route PDL is arch-keyed now."""
     arch = types.ModuleType("sglang.kernels.jit.utils")
@@ -122,7 +160,6 @@ def _load_route_factory():
 
     routing = types.ModuleType("sglang.srt.lora.moe.routing")
     routing.ROUTE_RAW = "raw"
-    routing.ROUTE_FUSED_IDS = "fused_ids"
     routing.ROUTE_ALIGNED = "aligned"
     routing.RouteView = _HostRouteView
     routing.FusedAlignScratch = types.SimpleNamespace
@@ -400,7 +437,7 @@ class TestDualGateUpARoute(unittest.TestCase):
                     )
                 )
             routes = ROUTE_FACTORY.build_routes(
-                PLAN.SERIAL_MATERIALIZED_REFERENCE,
+                SERIAL_MATERIALIZED_REFERENCE,
                 topk_ids=self.topk_ids,
                 token_slots=self.token_slots,
                 num_local_experts=2,
@@ -469,7 +506,7 @@ class TestDualGateUpARoute(unittest.TestCase):
             ),
         ):
             routes = ROUTE_FACTORY.build_routes(
-                PLAN.SERIAL_MATERIALIZED_REFERENCE,
+                SERIAL_MATERIALIZED_REFERENCE,
                 topk_ids=self.topk_ids,
                 token_slots=self.token_slots,
                 num_local_experts=2,
@@ -545,7 +582,7 @@ class TestDualGateUpARoute(unittest.TestCase):
         )
 
     def test_second_route_is_rejected_for_non_grouped_gate_up_a(self):
-        reference = PLAN.SERIAL_MATERIALIZED_REFERENCE
+        reference = SERIAL_MATERIALIZED_REFERENCE
         token_dedup_plan = dataclasses.replace(
             reference,
             gate_up_a=PLAN.LoraASpec(
@@ -576,7 +613,7 @@ class TestDualGateUpARoute(unittest.TestCase):
 
 class TestRoutePdlWiring(unittest.TestCase):
     def test_standard_plan_threads_architecture_pdl_to_every_aligned_route(self):
-        reference = PLAN.SERIAL_MATERIALIZED_REFERENCE
+        reference = SERIAL_MATERIALIZED_REFERENCE
         shared_down = dataclasses.replace(
             reference,
             down_b=dataclasses.replace(
@@ -690,7 +727,7 @@ class TestRoutePdlWiring(unittest.TestCase):
             self.assertEqual(dual_calls, [enabled, enabled])
 
     def test_joint_plan_threads_architecture_pdl_control(self):
-        reference = PLAN.SERIAL_MATERIALIZED_REFERENCE
+        reference = SERIAL_MATERIALIZED_REFERENCE
         shared_down_b = dataclasses.replace(
             reference.down_b,
             is_shared_outer=True,
@@ -1061,7 +1098,7 @@ class TestDualGranularityRoutingHost(unittest.TestCase):
 
 class TestSharedTokenRoute(unittest.TestCase):
     def test_token_dedup_skips_tokens_without_a_local_pair(self):
-        reference = PLAN.SERIAL_MATERIALIZED_REFERENCE
+        reference = SERIAL_MATERIALIZED_REFERENCE
         shared_plan = dataclasses.replace(
             reference,
             gate_up_a=PLAN.LoraASpec(
@@ -1137,7 +1174,7 @@ class TestSharedTokenRoute(unittest.TestCase):
 
     def test_large_shared_token_route_cannot_overwrite_retained_pair_counts(self):
         """Every retained fused route owns its scalar, even at shared bucket V."""
-        reference = PLAN.SERIAL_MATERIALIZED_REFERENCE
+        reference = SERIAL_MATERIALIZED_REFERENCE
         shared_plan = dataclasses.replace(
             reference,
             gate_up_a=PLAN.LoraASpec(
@@ -1313,10 +1350,10 @@ class TestLaunchConfigRoutePreflight(unittest.TestCase):
             gate_up_a_routing_block_size=8,
         )
         with self.assertRaisesRegex(ValueError, "at least 16"):
-            config.validate_for_plan(PLAN.SERIAL_MATERIALIZED_REFERENCE)
+            config.validate_for_plan(SERIAL_MATERIALIZED_REFERENCE)
 
     def test_distinct_gate_up_tile_rejects_non_grouped_gate_up_family(self):
-        reference = PLAN.SERIAL_MATERIALIZED_REFERENCE
+        reference = SERIAL_MATERIALIZED_REFERENCE
         token_dedup = dataclasses.replace(
             reference,
             gate_up_a=PLAN.LoraASpec(

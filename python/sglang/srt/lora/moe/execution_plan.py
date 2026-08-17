@@ -59,8 +59,6 @@ class RouteRequirement(str, Enum):
     """
 
     RAW = "raw"
-    FUSED_PER_EXPERT = "fused_per_expert"
-    FUSED_SHARED_OUTER = "fused_shared_outer"
     ALIGNED_PER_EXPERT = "aligned_per_expert"
     ALIGNED_SHARED_OUTER = "aligned_shared_outer"
     SHARED_TOKEN_PLAN = "shared_token_plan"
@@ -527,79 +525,6 @@ class MoeLoraExecutionPlan:
                 "plan down-B ownership does not match resident down-B weights"
             )
         return self
-
-
-SERIAL_MATERIALIZED_REFERENCE = MoeLoraExecutionPlan(
-    gate_up_a=LoraASpec(
-        Site.GATE_UP,
-        LoraAFamily.GROUPED,
-        False,
-        BridgeLayout.PAIR_MAJOR,
-    ),
-    gate_up_b=LoraBSpec(
-        Site.GATE_UP,
-        LoraBFamily.ONE_LAUNCH_SLICED,
-        False,
-        BridgeLayout.PAIR_MAJOR,
-    ),
-    middle=MiddleSpec(
-        family=MiddleFamily.MATERIALIZED,
-        activation=ActivationFamily.SWIGLU,
-    ),
-    down_a=LoraASpec(
-        Site.DOWN,
-        LoraAFamily.GROUPED,
-        False,
-        BridgeLayout.PAIR_MAJOR,
-    ),
-    down_b=LoraBSpec(
-        Site.DOWN,
-        LoraBFamily.ONE_LAUNCH_SLICED,
-        False,
-        BridgeLayout.PAIR_MAJOR,
-    ),
-    finalize=FinalizeSpec(family=FinalizeFamily.MATERIALIZED),
-)
-
-
-def materialized_reference_plan(
-    *,
-    activation: ActivationFamily,
-    is_shared_outer: bool,
-) -> MoeLoraExecutionPlan:
-    """Build the serial correctness plan for one resident layer contract."""
-    _require_bool(is_shared_outer, "is_shared_outer")
-    return MoeLoraExecutionPlan(
-        gate_up_a=LoraASpec(
-            Site.GATE_UP,
-            LoraAFamily.GROUPED,
-            is_shared_outer,
-            BridgeLayout.PAIR_MAJOR,
-        ),
-        gate_up_b=LoraBSpec(
-            Site.GATE_UP,
-            LoraBFamily.ONE_LAUNCH_SLICED,
-            False,
-            BridgeLayout.PAIR_MAJOR,
-        ),
-        middle=MiddleSpec(
-            family=MiddleFamily.MATERIALIZED,
-            activation=activation,
-        ),
-        down_a=LoraASpec(
-            Site.DOWN,
-            LoraAFamily.GROUPED,
-            False,
-            BridgeLayout.PAIR_MAJOR,
-        ),
-        down_b=LoraBSpec(
-            Site.DOWN,
-            LoraBFamily.ONE_LAUNCH_SLICED,
-            is_shared_outer,
-            BridgeLayout.PAIR_MAJOR,
-        ),
-        finalize=FinalizeSpec(family=FinalizeFamily.MATERIALIZED),
-    )
 
 
 # ---------------------------------------------------------------------------

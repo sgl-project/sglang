@@ -25,7 +25,6 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
-SERIAL_MATERIALIZED_REFERENCE = _MODULE.SERIAL_MATERIALIZED_REFERENCE
 ActivationFamily = _MODULE.ActivationFamily
 EarlyOverlap = _MODULE.EarlyOverlap
 StageContract = _MODULE.StageContract
@@ -82,6 +81,11 @@ def _plan(**changes) -> MoeLoraExecutionPlan:
     }
     values.update(changes)
     return MoeLoraExecutionPlan(**values)
+
+
+# The simplest correct pipeline: every stage standalone, nothing fused, no
+# overlap window.  Other plans are described as departures from it.
+SERIAL_MATERIALIZED_REFERENCE = _plan()
 
 
 class TestFactorAndKernelSpecs(unittest.TestCase):
