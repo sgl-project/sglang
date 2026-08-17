@@ -1695,6 +1695,7 @@ class ServerArgs:
     enable_lean_attention: A[
         Optional[bool],
         "Enable Lean (Work-Centric) Attention decode kernel for long-context serving. When None (default), uses auto-gate that activates Lean for long contexts and falls back to standard kernel for short contexts. Set to True to force enable, False to force disable.",
+        NS("exec.kernel"),
     ] = None
     prefill_attention_backend: A[
         Optional[str],
