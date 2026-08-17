@@ -34,9 +34,18 @@ from sglang.srt.configs.model_config import ModelImpl, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_disagg,
+    get_memory,
+    get_parallel,
+    get_schedule,
+)
 
 if TYPE_CHECKING:
 
@@ -130,6 +139,57 @@ def _register_legacy_hicache_draft(
     tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
 
 
+def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
+    """Resolve the retraction backend onto the config bags and return it.
+
+    The backend needs the built KV pool, so it cannot resolve in
+    ``ServerArgs.__post_init__``; it lands on the bags via ``override`` and
+    every reader goes through ``get_disagg()`` / ``get_memory()``.
+    """
+    disagg = get_disagg()
+    memory = get_memory()
+    fields = {}
+
+    backend = disagg.disaggregation_decode_retraction_backup
+    if backend is None:
+        kv_cache = tp_worker.get_memory_pool()[1].get_kvcache()
+        full_tokens_per_layer = (
+            tp_worker.get_tokens_per_layer_info()[0]
+            if tp_worker.is_hybrid_swa
+            else None
+        )
+        supports_host_pool = isinstance(kv_cache, MHATokenToKVPool) or (
+            isinstance(kv_cache, SWAKVPool) and full_tokens_per_layer > 0
+        )
+        schedule = get_schedule()
+        priority_preemption = (
+            schedule.enable_priority_scheduling
+            and not schedule.disable_priority_preemption
+        )
+        backend = (
+            "host_pool"
+            if disagg.disaggregation_mode == "decode"
+            and not get_parallel().dcp_enabled
+            and not disagg.disaggregation_decode_enable_radix_cache
+            # KV offload already owns a host pool; a second one double-books host memory.
+            and not disagg.disaggregation_decode_enable_offload_kvcache
+            and not priority_preemption
+            and supports_host_pool
+            else "cpu_tensor"
+        )
+        fields["disaggregation_decode_retraction_backup"] = backend
+
+    if memory.hicache_ratio is None:
+        # Only a decode server reaches resolution with the ratio unset; host-pool
+        # retraction sizes the host pool 1:1 with the device pool, everything
+        # else keeps the standard default.
+        fields["hicache_ratio"] = 1.0 if backend == "host_pool" else 2.0
+
+    source = "kv_cache_builder.decode_retraction"
+    get_context().override(source, **fields)
+    return backend
+
+
 def build_kv_cache(
     *,
     server_args: ServerArgs,
@@ -178,6 +238,8 @@ def build_kv_cache(
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
 
+    retraction_backup = resolve_decode_retraction_backup(tp_worker=tp_worker)
+
     disable_radix_cache = server_args.disable_radix_cache or (
         model_config.is_multimodal and uses_transformers_backend
     )
@@ -205,7 +267,7 @@ def build_kv_cache(
                 "with Mamba/SSM models"
             )
 
-    effective_chunked_prefill_size = server_args.chunked_prefill_size
+    effective_chunked_prefill_size = get_schedule().chunked_prefill_size
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
 
@@ -260,13 +322,23 @@ def build_kv_cache(
         )
     )
 
-    if enable_hierarchical_cache and hicache_draft_plan is not None:
+    if (
+        enable_hierarchical_cache or retraction_backup == "host_pool"
+    ) and hicache_draft_plan is not None:
         maybe_register_hicache_draft(
             tree_cache=tree_cache,
             draft_plan=hicache_draft_plan,
             server_args=server_args,
             page_size=page_size,
         )
+
+    if retraction_backup == "host_pool":
+        if not isinstance(tree_cache, UnifiedRadixCache):
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=host_pool requires "
+                "UnifiedRadixCache with HiCache attached."
+            )
+        tree_cache.validate_retraction_host_capacity()
 
     embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
     init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
