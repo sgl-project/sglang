@@ -203,6 +203,9 @@ class DeepseekV2WeightLoaderMixin:
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             params_dict = dict(self.named_parameters())
+            indexer_present_prefixes = {
+                n.rsplit(".indexer.", 1)[0] for n in params_dict if ".indexer." in n
+            }
             weight_names = []
 
             for name, loaded_weight in weights:
@@ -255,6 +258,11 @@ class DeepseekV2WeightLoaderMixin:
                                     continue
 
                 if "rotary_emb.inv_freq" in name:
+                    continue
+
+                if ".indexer." in name and (
+                    name.rsplit(".indexer.", 1)[0] not in indexer_present_prefixes
+                ):
                     continue
 
                 # CUDA fuses wk + weights_proj into one bf16 wk_weights_proj; the
