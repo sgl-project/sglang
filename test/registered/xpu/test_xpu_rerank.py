@@ -1,7 +1,13 @@
-"""XPU decoder-only rerank model test (Qwen3-Reranker style).
+"""XPU rerank test suite.
+
+This file validates score parity between HuggingFace and SRT for two rerank
+serving styles:
+- Decoder-only reranker scoring (Qwen3-Reranker style).
+- Cross-encoder scoring (BAAI/bge-reranker-v2-m3).
 
 Usage:
-python3 -m unittest test_xpu_decoder_rerank.TestXPUDecoderRerank
+python3 -m unittest test_xpu_rerank.TestXPUDecoderRerank
+python3 -m unittest test_xpu_rerank.TestXpuCrossEncoderReank
 """
 
 import math
@@ -13,17 +19,17 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_xpu_ci
-from sglang.test.runners import HFRunner, SRTRunner
+from sglang.test.runners import TEST_RERANK_QUERY_DOCS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=120, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=180, suite="stage-b-test-1-gpu-xpu")
 
 MODEL_PATH = "Qwen/Qwen3-Reranker-0.6B"
 TP_SIZE = 1
 SCORE_TOLERANCE = 1e-2
 ATTENTION_BACKEND = "intel_xpu"
 TORCH_DTYPE = torch.bfloat16
-# Source template: examples/chat_template/qwen3_reranker.jinja
+# Prompt template mirrored from examples/chat_template/qwen3_reranker.jinja.
 QWEN3_RERANKER_TEMPLATE = r"""<|im_start|>system
 Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>
 <|im_start|>user
@@ -36,8 +42,8 @@ Judge whether the Document meets the requirements based on the Query and the Ins
 JINJA_ENV = ImmutableSandboxedEnvironment(autoescape=False)
 QWEN3_RERANKER_JINJA = JINJA_ENV.from_string(QWEN3_RERANKER_TEMPLATE)
 
-# Decoder-reranker-friendly data (mirrors the Qwen3-Reranker cookbook example).
-# Chosen so yes/no scoring has a clear relevant vs. irrelevant contrast.
+# Small decoder-reranker dataset (from the Qwen3-Reranker cookbook style).
+# The documents intentionally include clear relevant/irrelevant contrast.
 
 RERANK_QUERY_DOCS = [
     {
@@ -133,8 +139,6 @@ class TestXPUDecoderRerank(CustomTestCase):
 
         self.assertEqual(len(hf_scores), len(srt_scores))
         for hf_score, srt_score in zip(hf_scores, srt_scores):
-            print(f"hf_score: {hf_score}")
-            print(f"srt_score: {srt_score}")
             self.assertLess(
                 abs(hf_score - srt_score),
                 SCORE_TOLERANCE,
@@ -150,6 +154,71 @@ class TestXPUDecoderRerank(CustomTestCase):
         for query_doc in RERANK_QUERY_DOCS:
             prompts = self._preprocess_prompts(query_doc)
             self._assert_close_scores(prompts)
+
+# This cross-encoder test is from test/manual/prefill_only/test_cross_encoder_models.py, which uses float32 and triton backend. Now intel_xpu attention backend only supports bfloat16 backend, 
+# so we choose triton backend as well. 
+CROSS_ENCODER_MODEL_PATH = "BAAI/bge-reranker-v2-m3"
+CROSS_ENCODER_TP_SIZE = 1
+CROSS_ENCODER_SCORE_TOLERANCE = 1e-2
+CROSS_ENCODER_ATTENTION_BACKEND = "triton"
+CROSS_ENCODER_TORCH_DTYPE = torch.float32
+
+
+class TestXpuCrossEncoderReank(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        mp.set_start_method("spawn", force=True)
+
+    def _assert_close_scores(
+        self,
+        prompts,
+        model_path,
+        tp_size,
+        torch_dtype,
+        score_tolerance,
+        attention_backend,
+    ) -> None:
+        with HFRunner(
+            model_path,
+            torch_dtype=torch_dtype,
+            model_type="cross_encoder",
+        ) as hf_runner:
+            hf_scores = hf_runner.forward(prompts).scores
+
+        with SRTRunner(
+            model_path,
+            tp_size=tp_size,
+            torch_dtype=torch_dtype,
+            model_type="cross_encoder",
+            attention_backend=attention_backend,
+            chunked_prefill_size=-1,
+            disable_radix_cache=True,
+        ) as srt_runner:
+            srt_scores = srt_runner.forward(prompts).scores
+
+        self.assertEqual(len(hf_scores), len(srt_scores))
+        for hf_score, srt_score in zip(hf_scores, srt_scores):
+            self.assertLess(
+                abs(hf_score - srt_score),
+                score_tolerance,
+                "cross encoder scores are not all close",
+            )
+
+    def _preprocess_prompts(self, query_doc):
+        query = query_doc["query"]
+        return [[query, document] for document in query_doc["documents"]]
+
+    def test_prefill_logits(self):
+        for query_doc in TEST_RERANK_QUERY_DOCS:
+            prompts = self._preprocess_prompts(query_doc)
+            self._assert_close_scores(
+                prompts,
+                CROSS_ENCODER_MODEL_PATH,
+                CROSS_ENCODER_TP_SIZE,
+                CROSS_ENCODER_TORCH_DTYPE,
+                CROSS_ENCODER_SCORE_TOLERANCE,
+                CROSS_ENCODER_ATTENTION_BACKEND,
+            )
 
 
 if __name__ == "__main__":
