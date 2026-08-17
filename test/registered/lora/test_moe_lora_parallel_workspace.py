@@ -30,13 +30,8 @@ class TestMoeLoraParallelWorkspace(CustomTestCase):
         runner._validate_plan_provider = mock.Mock()
         plan = mock.Mock()
 
-        runner.prepare_plan(
-            plan,
-            provider_name="test",
-            is_shared_outer=False,
-        )
+        runner.prepare_plan(plan, provider_name="test")
 
-        plan.validate_ownership.assert_called_once_with(False)
         runner._validate_plan_provider.assert_called_once_with(plan, provider)
 
     def test_side_stream_is_capture_safe_and_fully_joined(self):

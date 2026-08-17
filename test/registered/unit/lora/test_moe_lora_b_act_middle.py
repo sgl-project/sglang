@@ -132,7 +132,7 @@ def _build_plan(
         ),
         finalize=FinalizeSpec(FinalizeFamily.MATERIALIZED),
         down_b_scatter=down_b_scatter,
-    ).validate_ownership(is_shared_outer)
+    )
 
 
 # ---- CPU: shipped config structure ----------------------------------------------
@@ -321,7 +321,7 @@ def _build_runner(plan, launch_config, provider_name: str, gpu, num_experts: int
     runner._test_execution = dict(
         plan=plan, launch_config=launch_config, provider_name="test"
     )
-    runner.prepare_plan(plan, provider_name="test", is_shared_outer=False)
+    runner.prepare_plan(plan, provider_name="test")
     return runner
 
 

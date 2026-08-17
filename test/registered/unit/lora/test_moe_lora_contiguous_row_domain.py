@@ -779,7 +779,7 @@ def _build_runner(architecture, choice, provider_name: str, gpu, num_experts, la
         launch_config=_shipped_launch(architecture, choice),
         provider_name="test",
     )
-    runner.prepare_plan(choice.plan, provider_name="test", is_shared_outer=layout)
+    runner.prepare_plan(choice.plan, provider_name="test")
     return runner
 
 

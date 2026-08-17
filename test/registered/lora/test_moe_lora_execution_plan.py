@@ -228,20 +228,6 @@ class TestWholePipelineValidation(unittest.TestCase):
         with self.assertRaises(dataclasses.FrozenInstanceError):
             SERIAL_MATERIALIZED_REFERENCE.gate_up_b = None  # type: ignore[misc]
 
-    def test_plan_validates_against_the_resident_ownership_flag(self):
-        self.assertIs(
-            SERIAL_MATERIALIZED_REFERENCE.validate_ownership(False),
-            SERIAL_MATERIALIZED_REFERENCE,
-        )
-        with self.assertRaisesRegex(ValueError, "gate/up-A ownership"):
-            SERIAL_MATERIALIZED_REFERENCE.validate_ownership(True)
-        with self.assertRaisesRegex(ValueError, "down-B ownership"):
-            _plan(gate_up_a=_a(Site.GATE_UP, is_shared_outer=True)).validate_ownership(
-                True
-            )
-        with self.assertRaises(TypeError):
-            SERIAL_MATERIALIZED_REFERENCE.validate_ownership(1)  # type: ignore
-
     def test_every_required_middle_and_finalize_composition_constructs(self):
         gate = _factor(Site.GATE_UP)
         shared_down = _factor(Site.DOWN, is_shared_outer=True)

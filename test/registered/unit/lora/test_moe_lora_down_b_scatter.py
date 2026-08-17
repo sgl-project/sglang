@@ -145,7 +145,7 @@ def _build_plan(
             finalize_family, down_b_contract if consumes_down_b else None
         ),
         late_overlap=late_overlap,
-    ).validate_ownership(is_shared_outer)
+    )
 
 
 def _serial_plan():
@@ -706,7 +706,7 @@ def _build_runner(plan, launch_config, provider_name: str, gpu, num_experts: int
     runner._test_execution = dict(
         plan=plan, launch_config=launch_config, provider_name="test"
     )
-    runner.prepare_plan(plan, provider_name="test", is_shared_outer=False)
+    runner.prepare_plan(plan, provider_name="test")
     return runner
 
 

@@ -110,11 +110,6 @@ class LateOverlap(str, Enum):
     DOWN_A_B = "down_a_b"
 
 
-def _require_bool(value: object, field: str) -> None:
-    if not isinstance(value, bool):
-        raise TypeError(f"{field} must be bool, got {type(value).__name__}")
-
-
 def _aligned_requirement(is_shared_outer: bool) -> RouteRequirement:
     if is_shared_outer:
         return RouteRequirement.ALIGNED_SHARED_OUTER
@@ -508,24 +503,6 @@ class MoeLoraExecutionPlan:
         # multiple times per layer/forward.
         return self._route_requirements_unchecked()
 
-    def validate_ownership(self, is_shared_outer: bool) -> MoeLoraExecutionPlan:
-        """Validate plan identity against the resident A/B weight layout.
-
-        One flag covers both outer factors: an adapter that shares gate/up A
-        across experts shares down B too.
-        """
-
-        _require_bool(is_shared_outer, "is_shared_outer")
-        if self.gate_up_a.is_shared_outer is not is_shared_outer:
-            raise ValueError(
-                "plan gate/up-A ownership does not match resident gate/up-A weights"
-            )
-        if self._down_b_contract().is_shared_outer is not is_shared_outer:
-            raise ValueError(
-                "plan down-B ownership does not match resident down-B weights"
-            )
-        return self
-
 
 # ---------------------------------------------------------------------------
 # Plan tables: pydantic-validated JSON, loaded once per architecture.
@@ -707,7 +684,7 @@ def build_plan(
         route_builder=spec.route_builder,
         down_b_scatter=spec.down_b_scatter,
     )
-    return plan.validate_ownership(is_shared_outer)
+    return plan
 
 
 def resolve_plans(

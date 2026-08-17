@@ -254,7 +254,7 @@ def test_config_chosen_per_expert_swiglu_matches_fp32_reference(
     runner._test_execution = dict(
         plan=choice.plan, launch_config=launch_config, provider_name="test"
     )
-    runner.prepare_plan(choice.plan, provider_name="test", is_shared_outer=False)
+    runner.prepare_plan(choice.plan, provider_name="test")
 
     dispatch = StandardDispatchOutput(
         hidden_states=gpu["hidden_states"],
@@ -349,7 +349,7 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
     runner._test_execution = dict(
         plan=choice.plan, launch_config=launch_config, provider_name="test"
     )
-    runner.prepare_plan(choice.plan, provider_name="test", is_shared_outer=False)
+    runner.prepare_plan(choice.plan, provider_name="test")
     dispatch = StandardDispatchOutput(
         hidden_states=gpu["hidden_states"],
         hidden_states_scale=None,

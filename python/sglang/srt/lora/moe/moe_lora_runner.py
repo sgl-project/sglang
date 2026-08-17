@@ -366,17 +366,9 @@ class MoeLoraRunner:
             )
         )
 
-    def prepare_plan(
-        self,
-        plan: MoeLoraExecutionPlan,
-        *,
-        provider_name: str,
-        is_shared_outer: bool,
-    ) -> None:
+    def prepare_plan(self, plan: MoeLoraExecutionPlan, *, provider_name: str) -> None:
         """Validate one menu entry against its provider, once, at bind time."""
-        provider = self.providers[provider_name]
-        plan.validate_ownership(is_shared_outer)
-        self._validate_plan_provider(plan, provider)
+        self._validate_plan_provider(plan, self.providers[provider_name])
 
     def _validate_plan_provider(
         self, plan: MoeLoraExecutionPlan, provider: MoeBaseProvider
@@ -1289,11 +1281,7 @@ class MoeLoraLayerEngine:
         )
         tiles: dict[Phase, TileTable] = {}
         for phase, sel in selected.items():
-            runner.prepare_plan(
-                sel.plan,
-                provider_name=sel.provider,
-                is_shared_outer=is_shared_outer,
-            )
+            runner.prepare_plan(sel.plan, provider_name=sel.provider)
             table = resolve_tiles(
                 architecture_value=self.architecture.value,
                 plan_key_name=sel.name,

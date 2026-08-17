@@ -26,8 +26,7 @@ class _FakeRunner:
         self.prepared: list[str] = []
         self.runs = 0
 
-    def prepare_plan(self, _plan, *, provider_name, is_shared_outer):
-        del is_shared_outer
+    def prepare_plan(self, _plan, *, provider_name):
         self.prepared.append(provider_name)
 
     def run(
@@ -136,8 +135,7 @@ def test_run_before_binding_is_an_error(monkeypatch) -> None:
 
 def test_failed_initial_binding_is_transactional(monkeypatch) -> None:
     class _FailingRunner(_FakeRunner):
-        def prepare_plan(self, _plan, *, provider_name, is_shared_outer):
-            del is_shared_outer
+        def prepare_plan(self, _plan, *, provider_name):
             self.prepared.append(provider_name)
             if len(self.prepared) == 2:
                 raise NotImplementedError("unsupported plan")
