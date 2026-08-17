@@ -2468,6 +2468,32 @@ class FloatMultiEndedAllocator(MultiEndedAllocator):
         self._free_phys_pages = torch.empty(0, dtype=torch.int64, device=self.device)
         return len(pairs)
 
+    def _byte_accounting_violations(self) -> List[str]:
+        out: List[str] = []
+        total = self.unified_buffer.total_bytes
+        lo_b, hi_b = self._byte_low_frontier(), self._byte_high_frontier()
+        if not self._is_frontier_transparent() and not (0 <= lo_b <= hi_b <= total):
+            out.append(
+                f"[{self.sub_pool_name}] float span out of bounds: "
+                f"low={lo_b}, high={hi_b}, total={total}"
+            )
+        # Independent live count from the p2v table (`_live_pages()` is
+        # DERIVED as span - holes, so checking against it would be circular):
+        # every span page must be either p2v-bound or an interior hole.
+        if self._span_pages() > 0:
+            bound = int(
+                (self.physical_to_virtual[self.low_wm_page : self.high_wm_page] != -1)
+                .sum()
+                .item()
+            )
+            if self._span_pages() != bound + self._hole_pages():
+                out.append(
+                    f"[{self.sub_pool_name}] float span {self._span_pages()} != "
+                    f"p2v-bound {bound} + holes {self._hole_pages()}"
+                )
+        out.extend(self._capacity_memo_violations())
+        return out
+
     def _flush(self, *, urgent: bool) -> int:
         """Boundary absorption only — never data movement. The base `_flush`
         treats `_free_phys_pages` as a lazy compaction backlog to be drained,
@@ -3759,6 +3785,18 @@ class UnifiedMambaSWATokenToKVPoolAllocator(UnifiedSWATokenToKVPoolAllocator):
         # (the 2-pool mamba composite's convention).
         super().set_inflight_forward(forward_done, out_cache_loc_virtual)
         self.mamba_allocator.set_inflight_forward(forward_done, None)
+
+    def verify_byte_accounting(self) -> List[str]:
+        return (
+            _chain_byte_accounting_violations(
+                [
+                    self.mamba_allocator,
+                    self.swa_attn_allocator,
+                    self.full_attn_allocator,
+                ]
+            )
+            + self._joint_capacity_memo_violations()
+        )
 
     def verify_byte_accounting(self) -> List[str]:
         return (
