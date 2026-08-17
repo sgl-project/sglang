@@ -31,6 +31,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
     channel_quant_to_tensor_quant,
+    input_to_float8,
     inverse_transform_scale_ue8m0,
     normalize_e4m3fn_to_e4m3fnuz,
     quant_weight_ue8m0,
@@ -638,6 +639,16 @@ class DeepseekV2WeightLoaderMixin:
                     w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
                         torch.bfloat16
                     )
+
+            # GLM ships kv_b_proj as bf16, which falls back to torch.bmm. Quantize to
+            # per-tensor e4m3fn (not fnuz) to match forward_mla_rocm's dtype gate.
+            if (
+                _use_aiter_gfx95
+                and self.config.architectures
+                and self.config.architectures[0] == "GlmMoeDsaForCausalLM"
+                and w.dtype == torch.bfloat16
+            ):
+                w, self_attn.w_scale = input_to_float8(w, dtype=torch.float8_e4m3fn)
 
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
