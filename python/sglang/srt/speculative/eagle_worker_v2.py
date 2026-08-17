@@ -862,11 +862,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         runner = self.cuda_graph_runner_for_draft_extend
         if runner is None or batch.forward_mode.is_idle():
             return None
+        # Metadata that reads verify products by value cannot be built before
+        # the verify launch (e.g. flashinfer SWA derives prefix_lens from
+        # num_accept_tokens).
+        if self.draft_extend_attn_backend.draft_extend_metadata_reads_verify_products:
+            return None
         num_draft_tokens = self.speculative_num_draft_tokens
+        # Shape-only placeholder: opted-in backends read verify products only
+        # for their numel at metadata time; the post half fills real values.
+        placeholder_accepts = torch.zeros(
+            len(batch.seq_lens), dtype=torch.int32, device=self.device
+        )
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=None,
-            num_correct_drafts=None,
-            num_accept_tokens=None,
+            num_correct_drafts=placeholder_accepts,
+            num_accept_tokens=placeholder_accepts,
             num_tokens_per_req=num_draft_tokens,
             num_tokens_for_logprob_per_req=num_draft_tokens,
         )

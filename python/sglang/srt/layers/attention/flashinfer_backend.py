@@ -387,6 +387,12 @@ class FlashInferAttnBackend(AttentionBackend):
             self.num_wrappers = 1
             self.dispatch_reason = None
 
+        # SWA draft-extend init derives prefix_lens from num_accept_tokens
+        # (update_sliding_window); the single-wrapper path reads only shapes.
+        self.draft_extend_metadata_reads_verify_products = (
+            model_runner.sliding_window_size is not None
+        )
+
         # Qwen2/Qwen3 models require higher flashinfer workspace size
         if (
             "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures

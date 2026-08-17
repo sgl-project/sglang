@@ -116,6 +116,12 @@ class AttentionBackend(ABC):
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
+    # True when this backend's DRAFT_EXTEND_V2 metadata init reads verify
+    # products (accept counts / hidden states) by VALUE, not just shape.
+    # Such metadata cannot be staged before the verify launch. Conservative
+    # default; opt out per backend after auditing its draft-extend init.
+    draft_extend_metadata_reads_verify_products: bool = True
+
     # True for backends that preallocate per-seq extend metadata at req-pool
     # size (e.g. triton's kv_indptr): dummy extend batches must then keep
     # batch_size <= req_to_token_pool.size.
