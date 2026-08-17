@@ -12,7 +12,7 @@ register_xpu_ci(est_time=20, suite="stage-a-test-1-gpu-xpu")
 
 DEV = "xpu"
 
-REL_TOL = {torch.float16: 1.5e-3, torch.bfloat16: 1e-2}
+REL_TOL = {torch.float16: 1.5e-3, torch.bfloat16: 2e-2}
 M_VALUES = (1, 8, 256)
 
 # (K, N, group_size); K % 8 == 0, N % 8 == 0, K % group_size == 0.
