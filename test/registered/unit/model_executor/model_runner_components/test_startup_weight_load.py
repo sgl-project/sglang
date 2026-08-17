@@ -18,7 +18,7 @@ from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
     ModelStorageManifest,
@@ -29,6 +29,7 @@ from sglang.srt.model_executor.model_runner_components.startup_weight_load impor
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import initialize_capture_safe_weights
 from sglang.srt.runtime_context import get_context
+from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -64,7 +65,6 @@ def _make_options(**overrides):
         offload_group_size=-1,
         enable_memory_saver=False,
         enable_weights_cpu_backup=False,
-        torchao_config="",
         enable_lora=False,
         has_lora_paths=False,
         weight_loader_disable_mmap=False,
@@ -200,6 +200,17 @@ class TestStartupWeightLoadSelector(CustomTestCase):
             self._create(options=_make_options(tp_size=2)),
             StartupWeightLoadManager,
         )
+
+    def test_options_accept_current_server_args_schema(self):
+        """Removed server options must not break overlap startup initialization."""
+        options = StartupWeightLoadOptions.from_server_args(
+            server_args=ServerArgs(
+                model_path="dummy", cuda_graph_config=CudaGraphConfig()
+            ),
+            is_draft_worker=False,
+        )
+
+        self.assertIsInstance(options, StartupWeightLoadOptions)
 
     def test_unsupported_overlap_is_rejected_instead_of_falling_back(self):
         cases = (
