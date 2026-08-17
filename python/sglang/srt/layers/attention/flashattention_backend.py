@@ -148,6 +148,19 @@ class FlashAttentionBackend(AttentionBackend):
     # KV-index buffers directly, so it needs no backend-private replay state.
     supports_full_cuda_graph_chunked_prefix = True
 
+    def get_query_quantization_dtype(
+        self, layer: RadixAttention, forward_mode: ForwardMode
+    ) -> Optional[torch.dtype]:
+        """Return the graph-visible Q dtype required by the FA3 FP8 path."""
+        if (
+            self.fa_impl_ver != 3
+            or self.kv_cache_dtype_str == "auto"
+            or self.kv_cache_is_mxfp8
+            or layer.head_dim > 256
+        ):
+            return None
+        return self.kv_cache_dtype
+
     def __init__(
         self,
         model_runner: ModelRunner,
