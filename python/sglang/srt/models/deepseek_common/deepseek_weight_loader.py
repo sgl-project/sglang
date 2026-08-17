@@ -501,8 +501,6 @@ class DeepseekV2WeightLoaderMixin:
                         if layer_id < self.config.num_hidden_layers:
                             layer_ids.add(layer_id)
 
-        arch = self.config.architectures[0] if self.config.architectures else None
-
         for layer_id in layer_ids:
             self_attn = (
                 self.model.layers[layer_id].self_attn
@@ -638,7 +636,8 @@ class DeepseekV2WeightLoaderMixin:
             # per-tensor e4m3fn (not fnuz) to match forward_mla_rocm's dtype gate.
             if (
                 _use_aiter_gfx95
-                and arch == "GlmMoeDsaForCausalLM"
+                and self.config.architectures
+                and self.config.architectures[0] == "GlmMoeDsaForCausalLM"
                 and w.dtype == torch.bfloat16
             ):
                 w, self_attn.w_scale = input_to_float8(w, dtype=torch.float8_e4m3fn)
@@ -651,8 +650,9 @@ class DeepseekV2WeightLoaderMixin:
                 _use_aiter_gfx95
                 and self.quant_config is not None
                 and self.quant_config.get_name() == "quark"
-                # Avoid processing other models like GlmMoeDsaForCausalLM
-                and arch == "DeepseekV3ForCausalLM"
+                and self.config.architectures
+                and self.config.architectures[0]
+                == "DeepseekV3ForCausalLM"  # Avoid processing other models like GlmMoeDsaForCausalLM
                 and w.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
             ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
