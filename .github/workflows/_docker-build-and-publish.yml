@@ -96,6 +96,11 @@ on:
         required: false
         type: string
         default: "oci,zstd,nydus"
+      verify_image:
+        description: "Run in-container provenance/runtime verification after each pushed image. Default true. Callers that build a source tree without the ep_main runtime smoke tests (e.g. the deepseek_v4 nightly) pass false; provenance labels/env are still baked into the image regardless."
+        required: false
+        type: boolean
+        default: true
 
 jobs:
   build-and-publish:
@@ -367,6 +372,7 @@ jobs:
           done
 
       - name: Verify pushed AMD64 image and source provenance
+        if: ${{ inputs.verify_image }}
         env:
           EXPECTED_BUILD_COMMIT: ${{ steps.build-metadata.outputs.build-commit }}
           EXPECTED_BUILD_SOURCE: ${{ steps.build-metadata.outputs.build-source }}
@@ -490,7 +496,7 @@ jobs:
           done
 
       - name: Verify pushed AMD64 zstd image and source provenance
-        if: ${{ contains(inputs.image_formats, 'zstd') }}
+        if: ${{ inputs.verify_image && contains(inputs.image_formats, 'zstd') }}
         env:
           EXPECTED_BUILD_COMMIT: ${{ steps.build-metadata.outputs.build-commit }}
           EXPECTED_BUILD_SOURCE: ${{ steps.build-metadata.outputs.build-source }}
@@ -618,7 +624,7 @@ jobs:
           done
 
       - name: Verify pushed nydus image
-        if: ${{ contains(inputs.image_formats, 'nydus') }}
+        if: ${{ inputs.verify_image && contains(inputs.image_formats, 'nydus') }}
         env:
           IMAGE_TAGS: ${{ steps.image-tag.outputs.image-tags }}
           EXPECTED_BUILD_COMMIT: ${{ steps.build-metadata.outputs.build-commit }}

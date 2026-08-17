@@ -149,6 +149,11 @@ jobs:
       cuda_key: cu130
       cuda_version: 13.0.1
       cuda_suffix: cu130
+      # deepseek_v4 source lacks the ep_main runtime smoke tests baked into the
+      # shared verify step (sglang.srt.runtime_context / arg_groups.arg_utils and
+      # scripts/eic_integration_check.py exist only on ep_main). Provenance
+      # labels/env are still baked into the image; skip the in-container verify.
+      verify_image: false
       publish_default_cuda_alias: false
       variant_suffix: deepseek-v4
       tag_mode: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
