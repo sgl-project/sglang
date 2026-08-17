@@ -365,13 +365,8 @@ class NGRAMWorker(BaseSpecWorker):
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
-            # Under DP attention, batch.seq_lens_cpu may be None (lengths kept on
-            # GPU); fall back to a one-time D2H copy so the full-mask build works.
-            seq_lens_cpu = batch.seq_lens_cpu
-            if seq_lens_cpu is None:
-                seq_lens_cpu = batch.seq_lens.cpu()
             for i in range(bs):
-                seq_len = seq_lens_cpu[i]
+                seq_len = batch.seq_lens_cpu[i]
                 req_mask = torch.ones(
                     (self.draft_token_num, seq_len), device=self.device
                 )
