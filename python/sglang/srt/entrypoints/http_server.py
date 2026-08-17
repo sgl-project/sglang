@@ -2331,6 +2331,25 @@ def _execute_server_warmup(server_args: ServerArgs):
     return success
 
 
+def _freeze_gc_after_server_warmup(server_args: ServerArgs):
+    # Freeze GC after server warmup so static objects skip future GC gen2 collection.
+    # Use /freeze_gc to freeze scheduler and detokenizer as well.
+    freeze_key = server_args.admin_api_key or server_args.api_key
+    freeze_headers = {}
+    if freeze_key:
+        freeze_headers["Authorization"] = f"Bearer {freeze_key}"
+    try:
+        res = requests.post(
+            server_args.url() + "/freeze_gc",
+            headers=freeze_headers,
+            timeout=10,
+            verify=server_args.ssl_verify(),
+        )
+        res.raise_for_status()
+    except requests.exceptions.RequestException:
+        logger.warning("post-warmup freeze_gc failed", exc_info=True)
+
+
 def _wait_and_warmup(
     server_args: ServerArgs,
     launch_callback: Optional[Callable[[], None]] = None,
@@ -2353,6 +2372,8 @@ def _wait_and_warmup(
             return
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
+
+    _freeze_gc_after_server_warmup(server_args)
 
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
@@ -2392,6 +2413,7 @@ def _run_granian_server(
     host,
     port,
     log_level,
+    http2_max_concurrent_streams,
     tokenizer_worker_num=1,
     ssl_certfile=None,
     ssl_keyfile=None,
@@ -2415,6 +2437,7 @@ def _run_granian_server(
 
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
+    from granian.http import HTTP2Settings
     from granian.server.embed import Server as GranianEmbeddedServer
 
     Server = GranianEmbeddedServer if tokenizer_worker_num == 1 else Granian
@@ -2427,6 +2450,9 @@ def _run_granian_server(
         port=port,
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
+        http2_settings=HTTP2Settings(
+            max_concurrent_streams=http2_max_concurrent_streams
+        ),
         log_level=log_level,
         ssl_cert=ssl_certfile,
         ssl_key=ssl_keyfile,
@@ -2556,6 +2582,9 @@ def _setup_and_run_http_server(
                     host=server_args.host,
                     port=server_args.port,
                     log_level=server_args.log_level_http or server_args.log_level,
+                    http2_max_concurrent_streams=(
+                        server_args.http2_max_concurrent_streams
+                    ),
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_keyfile=server_args.ssl_keyfile,
                     ssl_ca_certs=server_args.ssl_ca_certs,
@@ -2640,6 +2669,9 @@ def _setup_and_run_http_server(
                     host=server_args.host,
                     port=server_args.port,
                     log_level=server_args.log_level_http or server_args.log_level,
+                    http2_max_concurrent_streams=(
+                        server_args.http2_max_concurrent_streams
+                    ),
                     tokenizer_worker_num=server_args.tokenizer_worker_num,
                     ssl_certfile=server_args.ssl_certfile,
                     ssl_keyfile=server_args.ssl_keyfile,
@@ -2676,16 +2708,10 @@ def _start_native_grpc_server_for_runtime(
     template_manager,
     scheduler_info,
 ):
-    try:
-        from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
-        from sglang.srt.grpc import _core as grpc_native
-    except ImportError as e:
-        raise RuntimeError(
-            "Native gRPC extension (sglang.srt.grpc._core) not found in this wheel, "
-            "but --grpc-port was set. The extension is built from "
-            "rust/sglang-grpc/ via setuptools-rust during wheel build. Either "
-            "install a wheel that includes the extension or unset --grpc-port."
-        ) from e
+    from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+    from sglang.srt.rust_extensions import load_rust_extension
+
+    grpc_native = load_rust_extension("sglang.srt.rust_extensions._grpc")
 
     runtime_handle = RuntimeHandle(
         tokenizer_manager=tokenizer_manager,
