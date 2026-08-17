@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -33,6 +34,12 @@ from sglang.srt.utils import (
     point_to_point_pyobj,
 )
 from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+
+logger = logging.getLogger(__name__)
+
+# [DEBUG-CI] flag to enable verbose rank info logging before broadcast_pyobj.
+# Used to diagnose attn_tp_group / attn_cp_group slicing mismatch.
+_DEBUG_CI_BROADCAST = True
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -159,6 +166,35 @@ class SchedulerRequestReceiver:
                 control_reqs = None
 
             if self.ps.attn_tp_size != 1:
+                if _DEBUG_CI_BROADCAST:
+                    try:
+                        _g = self.attn_tp_group
+                        logger.info(
+                            "[DEBUG-CI work_reqs attn_tp] "
+                            "global_rank=%d src=%d is_src=%s data_is_none=%s "
+                            "data_type=%s tp_rank=%d pp_rank=%d "
+                            "attn_tp_rank=%d attn_cp_rank=%d attn_dp_rank=%d "
+                            "attn_tp_size=%d attn_cp_size=%d attn_dp_size=%d "
+                            "group.ranks=%s group.rank=%d group.rank_in_group=%d",
+                            _g.rank,
+                            _g.ranks[0],
+                            _g.rank == _g.ranks[0],
+                            work_reqs is None,
+                            type(work_reqs).__name__,
+                            self.ps.tp_rank,
+                            self.ps.pp_rank,
+                            self.ps.attn_tp_rank,
+                            self.ps.attn_cp_rank,
+                            self.ps.attn_dp_rank,
+                            self.ps.attn_tp_size,
+                            self.ps.attn_cp_size,
+                            self.ps.attn_dp_size,
+                            _g.ranks,
+                            _g.rank,
+                            getattr(_g, "rank_in_group", -1),
+                        )
+                    except Exception as _e:
+                        logger.warning("[DEBUG-CI work_reqs attn_tp] log failed: %s", _e)
                 work_reqs = broadcast_pyobj(
                     work_reqs,
                     self.attn_tp_group.rank,
@@ -167,6 +203,35 @@ class SchedulerRequestReceiver:
                 )
 
             if self.ps.attn_cp_size != 1:
+                if _DEBUG_CI_BROADCAST:
+                    try:
+                        _g = self.attn_cp_group
+                        logger.info(
+                            "[DEBUG-CI work_reqs attn_cp] "
+                            "global_rank=%d src=%d is_src=%s data_is_none=%s "
+                            "data_type=%s tp_rank=%d pp_rank=%d "
+                            "attn_tp_rank=%d attn_cp_rank=%d attn_dp_rank=%d "
+                            "attn_tp_size=%d attn_cp_size=%d attn_dp_size=%d "
+                            "group.ranks=%s group.rank=%d group.rank_in_group=%d",
+                            _g.rank,
+                            _g.ranks[0],
+                            _g.rank == _g.ranks[0],
+                            work_reqs is None,
+                            type(work_reqs).__name__,
+                            self.ps.tp_rank,
+                            self.ps.pp_rank,
+                            self.ps.attn_tp_rank,
+                            self.ps.attn_cp_rank,
+                            self.ps.attn_dp_rank,
+                            self.ps.attn_tp_size,
+                            self.ps.attn_cp_size,
+                            self.ps.attn_dp_size,
+                            _g.ranks,
+                            _g.rank,
+                            getattr(_g, "rank_in_group", -1),
+                        )
+                    except Exception as _e:
+                        logger.warning("[DEBUG-CI work_reqs attn_cp] log failed: %s", _e)
                 work_reqs = broadcast_pyobj(
                     work_reqs,
                     self.attn_cp_group.rank,

@@ -7,6 +7,11 @@ on:
         required: false
         type: string
         default: linux-amd64-cpu-8
+      ref:
+        required: false
+        type: string
+        default: ''
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the git ref inherited from the caller.'
       test_type:
         required: false
         type: string
@@ -92,6 +97,8 @@ jobs:
 
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Prepare code for testing
         run: |
