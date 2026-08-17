@@ -17,10 +17,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.base_attn_backend import (
-    AttentionBackend,
-    normalize_page_table_rows,
-)
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
@@ -122,17 +119,6 @@ class FlashAttentionMetadata:
         local_max_seq_len: int = 0  # max sequence length for local attention
 
     local_attn_metadata: Optional[LocalAttentionMetadata] = None
-
-    @dataclass
-    class SWAMLAPrefillMetadata:
-        kv_indices: torch.Tensor = None
-        cu_seqlens_q: torch.Tensor = None
-        cu_seqlens_k: torch.Tensor = None
-        max_seq_len_q: int = 0
-        max_seq_len_k: int = 0
-
-    # Metadata for expanding the latent SWA cache during prefill.
-    swa_mla_prefill_metadata: Optional[SWAMLAPrefillMetadata] = None
 
     # For sliding window attention topk>1 spec decoding
     swa_spec_metadata: Optional[FlashAttentionMetadata] = None
@@ -1041,14 +1027,6 @@ class FlashAttentionBackend(AttentionBackend):
             if forward_batch.forward_mode == ForwardMode.EXTEND:
                 self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
 
-            if (
-                forward_batch.forward_mode.is_extend_without_speculative()
-                and self.use_mla
-                and self.use_sliding_window_kv_pool
-                and self.sliding_window_size is not None
-            ):
-                self._init_swa_mla_prefill_metadata(forward_batch, metadata, device)
-
             if self.is_prefill_aware_swa:
                 self._pa_swa_prefill_lens[
                     forward_batch.req_pool_indices[:batch_size]
@@ -1061,14 +1039,6 @@ class FlashAttentionBackend(AttentionBackend):
                     max_pf = int(forward_batch.seq_lens[:batch_size].max().item())
                 if max_pf > self._pa_swa_max_prefill_len:
                     self._pa_swa_max_prefill_len = max_pf
-
-        if (
-            forward_batch.forward_mode.is_decode_or_idle()
-            and self.use_mla
-            and self.use_sliding_window_kv_pool
-            and self.sliding_window_size is not None
-        ):
-            self._init_swa_mla_prefill_metadata(forward_batch, metadata, device)
 
         # Encoder metadata for cross attention. Supports per-request varlen
         # encoder lengths (e.g. MossVL with different image sizes per request).
@@ -1584,28 +1554,6 @@ class FlashAttentionBackend(AttentionBackend):
                 o = result
         else:
             if (
-                window_size != (-1, -1)
-                and metadata.swa_mla_prefill_metadata is not None
-                and not forward_batch.forward_mode.is_target_verify()
-                and not forward_batch.forward_mode.is_draft_extend_v2()
-            ):
-                swa_metadata = metadata.swa_mla_prefill_metadata
-                return flash_attn_varlen_func(
-                    q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
-                    v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
-                    cu_seqlens_q=swa_metadata.cu_seqlens_q,
-                    cu_seqlens_k=swa_metadata.cu_seqlens_k,
-                    max_seqlen_q=swa_metadata.max_seq_len_q,
-                    max_seqlen_k=swa_metadata.max_seq_len_k,
-                    softmax_scale=layer.scaling,
-                    causal=True,
-                    window_size=window_size,
-                    out=_fa_out,
-                    ver=self.fa_impl_ver,
-                    **kwargs,
-                )
-            elif (
                 forward_batch.attn_attend_prefix_cache is not None
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -3189,115 +3137,6 @@ class FlashAttentionBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
-
-    def _init_swa_mla_prefill_metadata(
-        self,
-        forward_batch: ForwardBatch,
-        metadata: FlashAttentionMetadata,
-        device,
-    ):
-        """Prepare the logical tail of each SWA sequence for latent expansion."""
-        assert forward_batch.seq_lens_cpu is not None
-        batch_kv_indices = self.req_to_token[forward_batch.req_pool_indices, :]
-        sliced_indices = []
-        kv_lens = []
-        for i in range(forward_batch.batch_size):
-            q_len = (
-                1
-                if forward_batch.forward_mode.is_decode_or_idle()
-                else int(forward_batch.extend_seq_lens_cpu[i])
-            )
-            kv_len = int(forward_batch.seq_lens_cpu[i])
-            tail_len = min(q_len + self.sliding_window_size, kv_len)
-            sliced_indices.append(batch_kv_indices[i, kv_len - tail_len : kv_len])
-            kv_lens.append(tail_len)
-
-        full_kv_indices = torch.cat(sliced_indices)
-        kv_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(
-            full_kv_indices
-        ).to(torch.int32)
-        lens_cpu = torch.tensor([0, *kv_lens], dtype=torch.int32, pin_memory=True)
-        cu_seqlens_k = torch.cumsum(
-            lens_cpu.to(device=device, non_blocking=True),
-            dim=0,
-            dtype=torch.int32,
-        )
-        metadata.swa_mla_prefill_metadata = (
-            FlashAttentionMetadata.SWAMLAPrefillMetadata(
-                kv_indices=kv_indices,
-                cu_seqlens_q=metadata.cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seq_len_q=metadata.max_seq_len_q,
-                max_seq_len_k=max(kv_lens),
-            )
-        )
-
-    def get_swa_mla_prefill_latent_cache(
-        self, forward_batch: ForwardBatch, layer_id: int
-    ):
-        metadata = self.forward_metadata.swa_mla_prefill_metadata
-        assert metadata is not None
-        return self.token_to_kv_pool.get_key_buffer(layer_id)[metadata.kv_indices]
-
-    def forward_swa_mla_expanded(self, q, k, v, layer, forward_batch=None):
-        """Run dense SWA after the model expands its compact MLA cache."""
-        metadata = self.forward_metadata.swa_mla_prefill_metadata
-        assert metadata is not None
-        q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-        k = k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype)
-        v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype)
-
-        # FA3 requires equal QK/V widths when QK exceeds 192.
-        pad_v_to_qk = layer.head_dim > 192 and layer.v_head_dim != layer.head_dim
-        if pad_v_to_qk:
-            v = torch.nn.functional.pad(v, (0, layer.head_dim - layer.v_head_dim))
-
-        output = flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=metadata.cu_seqlens_q,
-            cu_seqlens_k=metadata.cu_seqlens_k,
-            max_seqlen_q=metadata.max_seq_len_q,
-            max_seqlen_k=metadata.max_seq_len_k,
-            softmax_scale=layer.scaling,
-            causal=True,
-            window_size=(layer.sliding_window_size, 0),
-            ver=self.fa_impl_ver,
-        )
-        if pad_v_to_qk:
-            output = output[..., : layer.v_head_dim]
-        return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
-
-    def forward_swa_mla_absorbed(self, q, layer, forward_batch):
-        """Page64 fallback for SWA-shaped MLA decode and speculative steps."""
-        from sglang.srt.layers.attention.swa_mla_fallback.forward import (
-            forward_dense_kvlora_swa_torch_fallback,
-        )
-
-        metadata = self.forward_metadata
-        if metadata.swa_page_table is None:
-            raise RuntimeError("SWA latent attention requires an SWA page table.")
-        bs = forward_batch.batch_size
-        block_table = normalize_page_table_rows(metadata.swa_page_table, bs)
-        cache_seqlens = metadata.cache_seqlens_int32
-        if cache_seqlens.shape[0] != bs:
-            # DP padding may append a row after per-step metadata is planned.
-            cache_seqlens = forward_batch.seq_lens[:bs].to(torch.int32)
-        reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        output = forward_dense_kvlora_swa_torch_fallback(
-            reshape_q=reshape_q,
-            k_cache=k_cache,
-            block_table=block_table,
-            # Use phase-adjusted lengths for verify and draft steps.
-            cache_seqlens=cache_seqlens,
-            layer=layer,
-            kv_cache_dim=layer.head_dim,
-            head_dim_v=layer.v_head_dim,
-            window_size=layer.sliding_window_size + 1,
-        )
-        return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def _maybe_init_local_attn_metadata(
         self,

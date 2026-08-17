@@ -920,6 +920,7 @@ class Dots3AttentionMLA(nn.Module):
         backend = get_attn_backend()
         from sglang.srt.layers.attention.dots_hybrid_backend import (
             DotsHybridAttnBackend,
+            DotsSWAMLAAttnBackend,
         )
         from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 
@@ -927,6 +928,8 @@ class Dots3AttentionMLA(nn.Module):
             backend = backend.selected_swa_backend(forward_batch)
         elif isinstance(backend, HybridAttnBackend):
             backend = backend._select_backend(forward_batch.forward_mode)
+        if isinstance(backend, DotsSWAMLAAttnBackend):
+            backend = backend.selected_backend(forward_batch)
         backend_name = type(backend).__name__.lower()
         if "flashattention" in backend_name:
             attention_backend = "fa3"
@@ -1234,15 +1237,19 @@ class Dots3AttentionMLA(nn.Module):
 
         from sglang.srt.layers.attention.dots_hybrid_backend import (
             DotsHybridAttnBackend,
-        )
-        from sglang.srt.layers.attention.flashattention_backend import (
-            FlashAttentionBackend,
+            DotsSWAMLAAttnBackend,
         )
 
         backend = get_attn_backend()
         if (
             self.use_swa
-            and isinstance(backend, (DotsHybridAttnBackend, FlashAttentionBackend))
+            and (
+                isinstance(backend, DotsHybridAttnBackend)
+                or (
+                    isinstance(backend, DotsSWAMLAAttnBackend)
+                    and backend.uses_flash_attention(forward_batch)
+                )
+            )
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
@@ -1382,12 +1389,10 @@ class Dots3AttentionMLA(nn.Module):
             backend = get_attn_backend()
             from sglang.srt.layers.attention.dots_hybrid_backend import (
                 DotsHybridAttnBackend,
-            )
-            from sglang.srt.layers.attention.flashattention_backend import (
-                FlashAttentionBackend,
+                DotsSWAMLAAttnBackend,
             )
 
-            if isinstance(backend, (DotsHybridAttnBackend, FlashAttentionBackend)):
+            if isinstance(backend, (DotsHybridAttnBackend, DotsSWAMLAAttnBackend)):
                 backend.init_mha_chunk_metadata(forward_batch)
 
         # Zero padded V rows because FA3 tiles may read past cu_seqlens_q[-1].
@@ -1456,12 +1461,10 @@ class Dots3AttentionMLA(nn.Module):
         backend = get_attn_backend()
         from sglang.srt.layers.attention.dots_hybrid_backend import (
             DotsHybridAttnBackend,
-        )
-        from sglang.srt.layers.attention.flashattention_backend import (
-            FlashAttentionBackend,
+            DotsSWAMLAAttnBackend,
         )
 
-        assert isinstance(backend, (DotsHybridAttnBackend, FlashAttentionBackend))
+        assert isinstance(backend, (DotsHybridAttnBackend, DotsSWAMLAAttnBackend))
         latent_cache = backend.get_swa_mla_prefill_latent_cache(
             forward_batch, self.attn_mha.layer_id
         )
@@ -1495,12 +1498,10 @@ class Dots3AttentionMLA(nn.Module):
         backend = get_attn_backend()
         from sglang.srt.layers.attention.dots_hybrid_backend import (
             DotsHybridAttnBackend,
-        )
-        from sglang.srt.layers.attention.flashattention_backend import (
-            FlashAttentionBackend,
+            DotsSWAMLAAttnBackend,
         )
 
-        assert isinstance(backend, (DotsHybridAttnBackend, FlashAttentionBackend))
+        assert isinstance(backend, (DotsHybridAttnBackend, DotsSWAMLAAttnBackend))
         attn_output = backend.forward_swa_mla_expanded(
             q, k, v, self.attn_mha, forward_batch
         )
