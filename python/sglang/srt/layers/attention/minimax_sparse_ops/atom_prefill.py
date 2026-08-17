@@ -31,13 +31,13 @@ in the builder (the gather kernel does the slot indirection once).
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_utils import (
     get_recommended_splits,
     pa_decode_gluon,
@@ -64,7 +64,7 @@ def _max_scratch_pages() -> int:
     # this sits on the per-layer hot path and the env is fixed at launch.
     global _max_scratch_pages_cached
     if _max_scratch_pages_cached is None:
-        mb = int(os.environ.get("SGLANG_OPT_ATOM_PREFILL_MAX_SCRATCH_MB", "512"))
+        mb = envs.SGLANG_OPT_ATOM_PREFILL_MAX_SCRATCH_MB.get()
         _max_scratch_pages_cached = max(1, (mb * 1024 * 1024) // (_PAGE_ELEMS * 2))
     return _max_scratch_pages_cached
 
@@ -122,9 +122,7 @@ def _gather_nhd_to_shuffle_kernel(
     page_base = pid.to(tl.int64) * (HEAD_DIM_C * PAGE)
     # K shuffle page [1, D//X, PAGE, X]: elem(d, t) at (d//X)*(PAGE*X) + t*X + d%X
     k_off = (
-        (off_d[None, :] // X) * (PAGE * X)
-        + off_t[:, None] * X
-        + (off_d[None, :] % X)
+        (off_d[None, :] // X) * (PAGE * X) + off_t[:, None] * X + (off_d[None, :] % X)
     )
     # V transposed page [1, PAGE//X, D, X]: elem(d, t) at (t//X)*(D*X) + d*X + t%X
     v_off = (
@@ -155,10 +153,22 @@ def _get_scratch(
         cap_pages = (
             (total_pages + _SCRATCH_GROW_PAGES - 1) // _SCRATCH_GROW_PAGES
         ) * _SCRATCH_GROW_PAGES
-        entry = (
-            torch.empty(cap_pages * _PAGE_ELEMS, dtype=dtype, device=device),
-            torch.empty(cap_pages * _PAGE_ELEMS, dtype=dtype, device=device),
-        )
+        # This lands after the KV pool has already claimed its budget, so a grow
+        # can be what tips the device over. Surface it as a normal unsupported
+        # case: the caller catches and runs the Triton kernel, which reads the
+        # pool in place and needs no scratch at all.
+        try:
+            entry = (
+                torch.empty(cap_pages * _PAGE_ELEMS, dtype=dtype, device=device),
+                torch.empty(cap_pages * _PAGE_ELEMS, dtype=dtype, device=device),
+            )
+        except torch.cuda.OutOfMemoryError as exc:
+            raise ValueError(
+                f"atom prefill scratch of {cap_pages} pages "
+                f"({cap_pages * _PAGE_ELEMS * dtype.itemsize * 2 >> 20} MiB) "
+                "does not fit; lower SGLANG_OPT_ATOM_PREFILL_MAX_SCRATCH_MB or "
+                "--mem-fraction-static"
+            ) from exc
         _SCRATCH[key] = entry
     return entry
 
@@ -254,45 +264,25 @@ def _build_atom_sparse_bt_prefill_kernel(
 
     n_used = n_valid * pages_per_block
     off_w = tl.arange(0, BLOCK_SIZE_T * pages_per_block)
-    tl.store(out_row + off_w, tl.zeros_like(off_w), mask=off_w >= n_used)
+    # BLOCK_SIZE_T is next_power_of_2(topk), so off_w overshoots the row whenever
+    # topk is not a power of two -- bound the tail fill by the real row width.
+    tl.store(
+        out_row + off_w,
+        tl.zeros_like(off_w),
+        mask=(off_w >= n_used) & (off_w < max_topk * pages_per_block),
+    )
 
     # Effective KV length the kernel will walk across the packed pages.
     tail_tokens = causal_len - self_blk * sparse_block_size
     has_tail = tl.sum(is_tail.to(tl.int32), axis=0) > 0
     ctx = n_full * sparse_block_size + tl.where(has_tail, tail_tokens, 0)
-    ctx = tl.where(
-        has_tail, ctx, tl.minimum(n_valid * sparse_block_size, causal_len)
-    )
+    ctx = tl.where(has_tail, ctx, tl.minimum(n_valid * sparse_block_size, causal_len))
     tl.store(sparse_ctx_ptr + pid_n, ctx)
 
 
-# Per-forward reuse of (req_id, abs_pos) plus the scratch-page layout (the
-# NHD->SHUFFLE gather needs the latter too, so it is hoisted out of the
-# block-table builder). All depend ONLY on cu_seqlens / prefix_lens / seq_lens /
-# total_q, which are identical across all ~57 sparse layers within one forward
-# (the per-layer topk_idx differs, but the token->request mapping does not).
-# Recomputing them every sparse layer added searchsorted + a few copies per
-# layer. Key on the tensor object ids + total_q: within a forward the
-# cu_seqlens/prefix_lens/seq_lens objects are stable, so consecutive sparse
-# layers hit; the next forward gets new objects (id changes) -> miss ->
-# recompute. Bounded to the most recent entry (LRU-1) so no unbounded growth
-# and no stale reuse.
-_META_CACHE: dict = {}
+_META_CACHE: Optional[tuple] = None
 
-# Per-group reuse of the built (sparse_bt, sparse_ctx). For the 3/4 skip layers
-# in an index-topk group, topk_idx IS the shared cached_topk_idx object (same
-# object across the group), and req_id/abs_pos are forward-invariant, so the
-# block-table kernel produces IDENTICAL output for every skip layer in the
-# group. Keying on id(topk_idx) lets the group's source layer build once (fresh
-# object -> miss) and its skip layers reuse (same object -> hit), removing the
-# per-skip-layer _build_atom_sparse_bt_prefill_kernel launch (the last kernel
-# between the fused rope+cache kernel and paged_attention). LRU-1: layers run in
-# order (source, skip, skip, ... then next group's source), so one entry covers
-# a whole group and the next source evicts it -- no stale reuse, no growth.
-# Additionally cleared on every _META_CACHE miss (the first sparse layer of a
-# new forward) so a recycled tensor id from a previous forward can never
-# produce a stale hit.
-_BT_OUT_CACHE: dict = {}
+_BT_OUT_CACHE: Optional[tuple] = None
 
 
 def _build_atom_prefill_meta(
@@ -302,10 +292,16 @@ def _build_atom_prefill_meta(
     seq_lens_cpu: torch.Tensor,
     total_q: int,
 ):
-    cache_key = (id(cu_seqlens), id(prefix_lens), id(seq_lens), total_q)
-    cached = _META_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    global _META_CACHE, _BT_OUT_CACHE
+    if _META_CACHE is not None:
+        (k_cu, k_prefix, k_seq, k_total_q), cached = _META_CACHE
+        if (
+            k_cu is cu_seqlens
+            and k_prefix is prefix_lens
+            and k_seq is seq_lens
+            and k_total_q == total_q
+        ):
+            return cached
 
     device = cu_seqlens.device
     pos = torch.arange(total_q, dtype=torch.int32, device=device)
@@ -340,9 +336,8 @@ def _build_atom_prefill_meta(
     ).to(torch.int32)
 
     meta = (req_id, abs_pos, page_start, page_req, page_pos, total_pages)
-    _META_CACHE.clear()  # LRU-1: only keep the current forward's mapping
-    _BT_OUT_CACHE.clear()  # new forward: no block table can be valid anymore
-    _META_CACHE[cache_key] = meta
+    _BT_OUT_CACHE = None  # new forward: no block table can be valid anymore
+    _META_CACHE = ((cu_seqlens, prefix_lens, seq_lens, total_q), meta)
     return meta
 
 
@@ -357,10 +352,16 @@ def _build_atom_sparse_bt_prefill(
     total_q = topk_idx.shape[1]
     topk = topk_idx.shape[2]
 
-    out_key = (id(topk_idx), total_q, topk, sparse_block_size)
-    out_cached = _BT_OUT_CACHE.get(out_key)
-    if out_cached is not None:
-        return out_cached
+    global _BT_OUT_CACHE
+    if _BT_OUT_CACHE is not None:
+        (k_topk_idx, k_total_q, k_topk, k_block_size), out_cached = _BT_OUT_CACHE
+        if (
+            k_topk_idx is topk_idx
+            and k_total_q == total_q
+            and k_topk == topk
+            and k_block_size == sparse_block_size
+        ):
+            return out_cached
 
     sparse_bt = torch.empty(
         (total_q, topk * PAGES_PER_BLOCK),
@@ -383,8 +384,10 @@ def _build_atom_sparse_bt_prefill(
         pages_per_block=PAGES_PER_BLOCK,
         BLOCK_SIZE_T=triton.next_power_of_2(topk),
     )
-    _BT_OUT_CACHE.clear()  # LRU-1: only the current group's block table
-    _BT_OUT_CACHE[out_key] = (sparse_bt, sparse_ctx)
+    _BT_OUT_CACHE = (
+        (topk_idx, total_q, topk, sparse_block_size),
+        (sparse_bt, sparse_ctx),
+    )
     return sparse_bt, sparse_ctx
 
 
@@ -523,7 +526,7 @@ def atom_gluon_sparse_prefill(
     # batches, adding ~400us of empty-partition launch overhead per extra split
     # (3433us vs 1013us/launch at num_seqs=16384). Match ATOM: rec_splits only.
     # Escape hatch: SGLANG_M3_PA_NEEDED_PARTS=1 restores the old floor.
-    if os.environ.get("SGLANG_M3_PA_NEEDED_PARTS", "0") == "1":
+    if envs.SGLANG_M3_PA_NEEDED_PARTS.get():
         # Only the escape-hatch path needs the max sparse context, which requires
         # a GPU->CPU sync (.item()). The default path uses get_recommended_splits
         # alone, so skip the sync entirely there (it ran once per sparse layer).

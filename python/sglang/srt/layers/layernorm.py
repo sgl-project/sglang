@@ -39,6 +39,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -137,8 +138,9 @@ if _is_hip:
     except ImportError:
         _has_rocm_triton_gemma_rms_norm = False
 
-# Only decode-sized batches take the ptpc GEMM that consumes the fused quant.
-_FUSE_NORM_FP8_MAX_M = envs.SGLANG_OPT_MXFP8_DENSE_PTPC_DECODE_M.get()
+_FUSE_NORM_FP8_MAX_M = (
+    envs.SGLANG_OPT_MXFP8_DENSE_PTPC_DECODE_M.get() if is_gfx95_supported() else 0
+)
 
 if _is_cuda:
     # HF-semantics RMSNorm kernel (JIT-compiled).  Used when `cast_x_before_out_mul=True`

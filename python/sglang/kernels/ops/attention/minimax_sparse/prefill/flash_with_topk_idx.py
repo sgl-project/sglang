@@ -16,6 +16,8 @@ from ..common.utils import (
     unit_scale,
 )
 
+_MAX_PER_PAGE_SLOT_UNROLL = 8
+
 
 @triton.heuristics(
     {
@@ -479,7 +481,8 @@ def _index_block_score_only_kernel(
     stride_r2t_b,
     BLOCK_SIZE_Q: tl.constexpr,
     block_size: tl.constexpr,  # sparse K block size (== 128)
-    page_size: tl.constexpr,  # paged-cache page size (== 64); block_size % page_size == 0
+    page_size: tl.constexpr,  # paged-cache page size; block_size % page_size == 0
+    PER_PAGE_SLOTS: tl.constexpr,  # derive slots from one base slot per page
     BLOCK_SIZE_KD: tl.constexpr,
 ):
     """Score-only variant of the index attention (ATOM-style).
@@ -490,16 +493,18 @@ def _index_block_score_only_kernel(
     idx_o is unused. Minimal registers (no acc_o/sink/lse) -> faster than the
     full flash-attention _flash_attn_fwd_with_block_score_kernel.
 
-    K addressing is PER-PAGE (ATOM-style): a sparse block of ``block_size``
-    tokens spans ``block_size // page_size`` physical pages, and within a page
-    the paged allocator lays the ``page_size`` slots out contiguously and
-    ascending (slot = base_slot + offset). So instead of a per-token
-    req_to_token lookup for every token in the block (``block_size`` loads), we
-    read ONE base slot per page (``block_size // page_size`` loads) and derive
-    every token's slot as ``base_slot + in-page offset``. The resulting slot
-    vector is page-contiguous, so the single wide QK K-load coalesces. One
-    BLOCK_SIZE_Q x block_size QK tile per KV block, reduced with tl.max over the
-    block. Only score_type == "max".
+    With ``PER_PAGE_SLOTS`` K addressing is PER-PAGE (ATOM-style): a sparse block
+    of ``block_size`` tokens spans ``block_size // page_size`` physical pages, and
+    within a page the paged allocator lays the ``page_size`` slots out
+    contiguously and ascending (slot = base_slot + offset). So instead of a
+    per-token req_to_token lookup for every token in the block (``block_size``
+    loads), we read ONE base slot per page (``block_size // page_size`` loads) and
+    derive every token's slot as ``base_slot + in-page offset``. The resulting
+    slot vector is page-contiguous, so the single wide QK K-load coalesces. That
+    unrolls one load per page, so it is only selected while the page count is
+    small; otherwise the plain per-token gather runs and only the score-only
+    register saving applies. Either way: one BLOCK_SIZE_Q x block_size QK tile per
+    KV block, reduced with tl.max over the block. Only score_type == "max".
     """
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q, pid_bh = tl.program_id(0), tl.program_id(1)
@@ -547,16 +552,27 @@ def _index_block_score_only_kernel(
         # [block_size] slot vector affinely, then do ONE wide QK dot over the
         # whole block (a single 128-wide MFMA is far more efficient than
         # per-page narrow dots).
-        slots = tl.zeros([block_size], dtype=tl.int64)
-        for p in tl.static_range(0, pages_per_block):
-            page_tok0 = i + p * page_size
-            base_slot = tl.load(
-                req_to_token_ptr + sid * stride_r2t_b + page_tok0,
-                mask=page_tok0 < seq_len,
+        # PER_PAGE_SLOTS is off when a block spans too many pages for the unroll
+        # to pay (notably page_size 1, where it would degenerate into one scalar
+        # load per token); then take the plain wide per-token gather instead.
+        if PER_PAGE_SLOTS:
+            slots = tl.zeros([block_size], dtype=tl.int64)
+            for p in tl.static_range(0, pages_per_block):
+                page_tok0 = i + p * page_size
+                base_slot = tl.load(
+                    req_to_token_ptr + sid * stride_r2t_b + page_tok0,
+                    mask=page_tok0 < seq_len,
+                    other=0,
+                ).to(tl.int64)
+                base_slot = (base_slot + max_slots) % max_slots
+                slots = tl.where(page_of == p, base_slot + in_page, slots)
+        else:
+            slots = tl.load(
+                req_to_token_ptr + sid * stride_r2t_b + pos,
+                mask=pos_mask,
                 other=0,
             ).to(tl.int64)
-            base_slot = (base_slot + max_slots) % max_slots
-            slots = tl.where(page_of == p, base_slot + in_page, slots)
+            slots = (slots + max_slots) % max_slots
         # head_dim (128) is a power of 2 == BLOCK_SIZE_KD, so the dim mask is
         # always true -> only mask the K (token) dimension.
         k = tl.load(
@@ -706,6 +722,7 @@ def flash_prefill_with_topk_index(
             req_to_token.stride(0),
             block_size=block_size_k,
             page_size=page_size,
+            PER_PAGE_SLOTS=(block_size_k // page_size <= _MAX_PER_PAGE_SLOT_UNROLL),
         )
     else:
         _flash_attn_fwd_with_block_score_kernel[grid](

@@ -328,7 +328,6 @@ class MiniMaxM3MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.alt_stream = alt_stream
         self.tp_size = get_parallel().tp_size
         self.alt_stream = alt_stream
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
@@ -446,11 +445,12 @@ class MiniMaxM3MoE(nn.Module):
                 and self.shared_experts is not None
                 and get_is_capture_mode()
             ):
-                self.alt_stream.wait_stream(torch.cuda.current_stream())
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self._forward_shared_experts(hidden_states)
                     if shared_output is not None:
-                        shared_output.record_stream(self.alt_stream)
+                        shared_output.record_stream(current_stream)
                         shared_event = self.alt_stream.record_event()
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
@@ -470,11 +470,6 @@ class MiniMaxM3MoE(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states
-
-    def _forward_router_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        router_logits = self._compute_router_logits(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        return self.experts(hidden_states, topk_output)
 
     def forward_deepep(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
@@ -1558,6 +1553,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
             is_last_layer=(layer_id == config.num_hidden_layers - 1),
+            enable_fused_ar_quant_per_token=True,
         )
 
     def forward(

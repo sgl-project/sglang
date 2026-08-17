@@ -2037,13 +2037,10 @@ def _post_process_topk_ids(
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
-    capture_routed_experts_if_allowed(
-        topk_config,
-        layer_id,
-        # keep recorder semantics (routed experts only) when the gate already
-        # appended the shared columns
-        topk_ids[:, :-num_fused_shared_experts] if gate_appended_shared else topk_ids,
+    routed_only_topk_ids = (
+        topk_ids[:, :-num_fused_shared_experts] if gate_appended_shared else topk_ids
     )
+    capture_routed_experts_if_allowed(topk_config, layer_id, routed_only_topk_ids)
     recorder_topk_ids = None
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
@@ -2105,7 +2102,12 @@ def _post_process_topk_ids(
         # second zeroing here would be redundant (zeroing is idempotent).
 
     if recorder_topk_ids is None:
-        recorder_topk_ids = topk_ids
+        # Trim after the remaps above so the recorder sees physical routed ids.
+        recorder_topk_ids = (
+            topk_ids[:, :-num_fused_shared_experts]
+            if gate_appended_shared
+            else topk_ids
+        )
 
     _aiter_append = (
         num_fused_shared_experts > 0 and _use_aiter and not gate_appended_shared

@@ -1467,8 +1467,14 @@ class Envs:
     # MiniMax-M3 sparse-attention toggles for ROCm.
     # Compute the sparse index top-k on every Nth sparse
     # layer ("source") and reuse it on the following N-1 ("skip") layers.
-    # 1 disables the sharing (every layer computes its own top-k).
+    # 1 disables the sharing (every layer computes its own top-k). The sharing
+    # changes which KV blocks the skip layers attend, so it is applied on ROCm
+    # only (and never under two-batch overlap); elsewhere the backend pins 1.
     SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(6)
+    # Reuse the index-topk group source layer's decode top-k on its skip layers
+    # (device-side, CUDA-graph safe). Only has an effect when
+    # SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ > 1.
+    SGLANG_M3_DECODE_TOPK_REUSE = EnvBool(True)
     # Gluon sparse PREFILL. Replaces the Triton flash_prefill_with_gqa_share_sparse
     # main-attention step with AITER's pa_decode_gluon (every prefill query
     # token treated as a length-1 decode over a per-token sparse block table).
@@ -1477,6 +1483,18 @@ class Envs:
     # (fp8 KV, sinks, non-128 head/block dims, missing aiter) fall back to the
     # Triton kernel.
     SGLANG_OPT_USE_ATOM_PREFILL = EnvBool(True)
+    # Cap on the ATOM prefill gather scratch (per K/V buffer). The scratch is
+    # allocated lazily after the KV pool, so exceeding the cap -- or failing to
+    # allocate -- falls back to the Triton sparse kernel rather than OOM-ing.
+    SGLANG_OPT_ATOM_PREFILL_MAX_SCRATCH_MB = EnvInt(512)
+    # ATOM prefill: floor the paged-attention context-partition count at
+    # ceil(max_sparse_ctx / 256). Costs one device sync per sparse layer; the
+    # default sizes splits from get_recommended_splits alone (what ATOM does).
+    SGLANG_M3_PA_NEEDED_PARTS = EnvBool(False)
+    # Sub-tile the CDNA Triton sparse-prefill KV loop (SUB_K = block_size_k / 2 on
+    # gfx950, / 4 on gfx942) so each QK/PV MFMA is right-sized. 0 restores the
+    # single-tile dense loop.
+    SGLANG_SPARSE_ATTN_SUBK = EnvBool(True)
     # Index-topk skip layers drop the index
     # arms of the fused rope+cache kernel in prefill (main-only norm+rope+KV
     # write, no idx-K cache write). Only takes effect when the elision is safe:

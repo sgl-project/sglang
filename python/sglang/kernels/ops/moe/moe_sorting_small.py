@@ -266,7 +266,6 @@ def apply_aiter_small_moe_sort_patch() -> None:
     global _patched
     if _patched:
         return
-    _patched = True
 
     import aiter.fused_moe as fm
     from aiter import dtypes
@@ -390,4 +389,5 @@ def apply_aiter_small_moe_sort_patch() -> None:
     fm.fused_moe = fused_moe_wrapper
     fm._moe_sorting_impl = sorting_impl_wrapper
     fm.fused_dynamic_mxfp8_quant_moe_sort = mx_quant_wrapper
+    _patched = True
     logger.info("aiter small-batch MoE sorting patch applied")

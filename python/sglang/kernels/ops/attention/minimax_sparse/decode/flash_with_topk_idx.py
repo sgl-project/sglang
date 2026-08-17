@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
+
 from ..common.utils import (
     _bitonic_merge,
     _sort_ids_ascending,
@@ -865,7 +867,11 @@ def flash_decode_with_topk_idx(
         dtype=torch.float32,
         device=q.device,
     )
-    use_jit_topk = score.shape[2] <= 16384 and topk <= 32
+    use_jit_topk = (
+        envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get()
+        and score.shape[2] <= 16384
+        and topk <= 32
+    )
     # If the live context has <= topk sparse blocks, the downstream dense
     # page-table/JIT top-k kernels select every block from seq_lens directly
     # without reading score. Keep this gate in sync with the consumers below:

@@ -21,10 +21,11 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
+from sglang.srt.layers.moe.utils import is_tbo_enabled
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 if is_npu():
     from sglang.kernels.ops.attention.minimax_sparse.common.index import (
@@ -143,6 +144,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         # NPU: per-forward cached metadata for the triton paths (rebuilt each forward).
         self._prefill_meta: Optional[SimpleNamespace] = None
+        # (owning ForwardBatch, cu_seqlens, seq_lens, prefix_lens, cu_seqblocks_q,
+        # max_seqblock_q, all_seqblock_q). The owner is part of the key because one
+        # metadata init can be followed by more than one ForwardBatch reaching the
+        # layers (two-batch overlap splits into two children with different
+        # extend_seq_lens); a hit requires the SAME object, not just a live cache.
         self._prefill_seqblock_meta: Optional[tuple] = None
         self._extend_meta: Optional[SimpleNamespace] = None
         self._extend_meta_key: Optional[int] = None
@@ -277,35 +283,29 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         self.dense_backend: Optional[AttentionBackend] = None
 
-        # Index cache: share indexer top-k across groups of
-        # consecutive sparse layers. freq=N -> each group of N sparse layers
-        # computes top-k once (first layer) and the other N-1 reuse it. Prefill
-        # only for now (decode runs under cuda graph; the per-forward host dict
-        # would not be graph-safe). Only the group's source layer computes.
-        self.index_topk_freq = max(int(envs.SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ.get()), 1)
+        self.index_topk_freq = (
+            max(int(envs.SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ.get()), 1)
+            if is_hip() and not is_tbo_enabled()
+            else 1
+        )
         self.index_cache_enabled = self.index_topk_freq > 1
         # Persistent per-bs device buffer for decode top-k reuse. CUDA-graph safe: alloc eager outside capture; the
         # captured graph only copy_()s into / reads from a fixed address.
         self._decode_topk_buf: dict = {}
-        import os as _os_dtr
-
-        self._decode_topk_reuse = _os_dtr.environ.get(
-            "SGLANG_M3_DECODE_TOPK_REUSE", "1"
-        ) not in ("0", "false", "False")
+        self._decode_topk_reuse = envs.SGLANG_M3_DECODE_TOPK_REUSE.get()
         # Opt-in prefill skip-layer index elision (default off). Effective only when the elision is safe; see
         # prefill_skip_index_elision().
         self._prefill_skip_index = envs.SGLANG_OPT_USE_PREFILL_SKIP_INDEX.get()
-        # Map each sparse layer_id -> (group_key, is_source). Source layers compute
-        # and store; non-source layers in a group reuse the stored top-k. Groups run
-        # over the sparse-layer ordinal (position among sparse layers only).
         self._topk_group_of_layer: dict[int, int] = {}
         self._topk_is_source: dict[int, bool] = {}
-        for ordinal, lid in enumerate(self.sparse_layer_ids):
+        for ordinal, lid in enumerate(
+            lid for lid in self.sparse_layer_ids if lid in self.disable_value_layer_ids
+        ):
             group = ordinal // self.index_topk_freq
             self._topk_group_of_layer[lid] = group
             self._topk_is_source[lid] = (ordinal % self.index_topk_freq) == 0
-        # Per-forward cache {group_key: reduced_topk_idx}; cleared each forward.
         self._topk_cache: dict = {}
+        self._topk_cache_owner: Optional[ForwardBatch] = None
 
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
@@ -365,6 +365,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # New forward -> drop the per-forward index-cache top-k (prefill only).
         if self.index_cache_enabled:
             self._topk_cache = {}
+            self._topk_cache_owner = None
         # Decode top-k reuse: pre-allocate the per-bs persistent buffer so graph
         # capture never allocates. num_kv_heads == 1 at TP>=4 for M3.
         if (
@@ -1443,10 +1444,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
-        # The lens and the cu_seqblocks trio are layer-invariant within a forward, but
-        # were rebuilt on every one of the 57 sparse layers (cat/cumsum glue kernels).
-        # Build once per forward; init_forward_metadata_out_graph resets the cache.
-        if self._prefill_seqblock_meta is None:
+        cached = self._prefill_seqblock_meta
+        if cached is None or cached[0] is not forward_batch:
             cu_seqlens, seq_lens, prefix_lens = self._resolve_extend_meta(
                 forward_batch, q
             )
@@ -1457,7 +1456,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self.block_size_k,
                 forward_batch.extend_seq_lens_cpu,
             )
-            self._prefill_seqblock_meta = (
+            cached = (
+                forward_batch,
                 cu_seqlens,
                 seq_lens,
                 prefix_lens,
@@ -1465,14 +1465,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 max_seqblock_q,
                 all_seqblock_q,
             )
+            self._prefill_seqblock_meta = cached
         (
+            _,
             cu_seqlens,
             seq_lens,
             prefix_lens,
             cu_seqblocks_q,
             max_seqblock_q,
             all_seqblock_q,
-        ) = self._prefill_seqblock_meta
+        ) = cached
 
         # DP attention pads q beyond real tokens; trim (CPU list avoids a sync).
         if forward_batch.extend_seq_lens_cpu is not None:
@@ -1530,6 +1532,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             cached_topk_idx = None
             want_topk = False
             if use_index_cache:
+                if self._topk_cache_owner is not forward_batch:
+                    self._topk_cache = {}
+                    self._topk_cache_owner = forward_batch
                 group = self._topk_group_of_layer[layer.layer_id]
                 if self._topk_is_source[layer.layer_id]:
                     want_topk = True  # compute and store for this group
@@ -1802,9 +1807,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 topk_out=_topk_buf if _want_topk else None,
             )
             if _want_topk:
-                idx_o, o, _reduced = result
-                if _reduced.data_ptr() != _topk_buf.data_ptr():
-                    _topk_buf.copy_(_reduced)
+                idx_o, o, _ = result
             else:
                 idx_o, o = result
         return (

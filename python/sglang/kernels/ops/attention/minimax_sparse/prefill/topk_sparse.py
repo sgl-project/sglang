@@ -1,10 +1,13 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
+import functools
 from typing import Optional
 
 import torch
 import triton
 import triton.language as tl
+
+from sglang.srt.environ import envs
 
 from ..common.utils import (
     check_sparse_kv_fp8,
@@ -15,32 +18,32 @@ from ..common.utils import (
 )
 
 
+@functools.cache
+def _sparse_subk_divisor() -> int:
+    """How many sub-tiles a CDNA KV tile is split into: 2 on gfx950, 4 on gfx942,
+    0 (no sub-tiling) elsewhere or under SGLANG_SPARSE_ATTN_SUBK=0."""
+    if not (torch.version.hip and envs.SGLANG_SPARSE_ATTN_SUBK.get()):
+        return 0
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return 0
+    if "gfx950" in arch:
+        return 2
+    if "gfx942" in arch:
+        return 4
+    return 0
 
-# CDNA sub-tiling params.
-# gfx950 -> SUB_K = BLOCK_SIZE_K//2, gfx942 -> //4. SGLANG_SPARSE_ATTN_SUBK=0
-# disables and restores the original dense path.
-_SPARSE_SUBK_CACHE = None
 
-
-def _sparse_subk(block_size_k):
-    global _SPARSE_SUBK_CACHE
-    if _SPARSE_SUBK_CACHE is None:
-        sub_k = 0
-        try:
-            import os
-
-            if torch.version.hip and os.environ.get(
-                "SGLANG_SPARSE_ATTN_SUBK", "1"
-            ) not in ("0", "false", "False"):
-                arch = torch.cuda.get_device_properties(0).gcnArchName
-                if "gfx950" in arch:
-                    sub_k = block_size_k // 2
-                elif "gfx942" in arch:
-                    sub_k = block_size_k // 4
-        except Exception:
-            sub_k = 0
-        _SPARSE_SUBK_CACHE = sub_k
-    return _SPARSE_SUBK_CACHE
+def _sparse_subk(block_size_k: int) -> int:
+    """KV sub-tile width, or 0 to keep the single-tile loop. Derived from
+    block_size_k on every call: the kernel walks BLOCK_SIZE_K // SUB_K sub-tiles,
+    so a width that does not divide the block would silently drop the remainder.
+    """
+    divisor = _sparse_subk_divisor()
+    if divisor == 0 or block_size_k % divisor != 0:
+        return 0
+    return block_size_k // divisor
 
 
 @triton.heuristics(
@@ -232,9 +235,8 @@ def _gqa_share_sparse_fwd_kernel(
         q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_KD)
         # sparse attention
         if SUB_K > 0:
-            # Split each
-            # BLOCK_SIZE_K-token KV block into SUB_K-token sub-tiles so each
-            # QK/PV MFMA is right-sized. Numerically equivalent to the dense
+            # Split each BLOCK_SIZE_K-token KV block into SUB_K-token sub-tiles so
+            # each QK/PV MFMA is right-sized. Numerically equivalent to the dense
             # path (flash-softmax reassociation).
             NUM_SUB: tl.constexpr = BLOCK_SIZE_K // SUB_K
             for i in range(real_topk):
@@ -246,22 +248,29 @@ def _gqa_share_sparse_fwd_kernel(
                     pos_mask_s = pos_s < seq_len
                     slots_s = tl.load(
                         req_to_token_ptr + sid * stride_r2t_b + pos_s,
-                        mask=pos_mask_s, other=0,
+                        mask=pos_mask_s,
+                        other=0,
                     ).to(tl.int64)
                     slots_s = (slots_s + max_slots) % max_slots
                     k_s = tl.load(
-                        k_cache_ptr + slots_s[None, :] * stride_ks
-                        + pid_kh * stride_kh + off_kd[:, None] * stride_kd,
-                        mask=kd_mask[:, None] & pos_mask_s[None, :], other=0.0,
+                        k_cache_ptr
+                        + slots_s[None, :] * stride_ks
+                        + pid_kh * stride_kh
+                        + off_kd[:, None] * stride_kd,
+                        mask=kd_mask[:, None] & pos_mask_s[None, :],
+                        other=0.0,
                     )
                     if IS_FP8:
                         k_s = k_s.to(q.dtype)
                     off_q_s = (
                         tl.arange(0, BLOCK_SIZE_Q)[:, None]
-                        + pid_q_j * BLOCK_SIZE_Q + prefix_len
+                        + pid_q_j * BLOCK_SIZE_Q
+                        + prefix_len
                         - off_sub[None, :]
                     )
-                    qk_s = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, SUB_K), dtype=tl.float32)
+                    qk_s = tl.zeros(
+                        (BLOCK_SIZE_Q, BLOCK_SIZE_H, SUB_K), dtype=tl.float32
+                    )
                     qk_s += tl.where(off_q_s[:, None, :] >= c, 0, float("-inf"))
                     qk_s = tl.reshape(qk_s, BLOCK_SIZE_QH, SUB_K)
                     qk_s += tl.dot(q, k_s) * (sm_scale_log2e * k_scale)
@@ -271,9 +280,12 @@ def _gqa_share_sparse_fwd_kernel(
                     l_ij = tl.sum(p_s, axis=1)
                     acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
                     v_s = tl.load(
-                        v_cache_ptr + slots_s[:, None] * stride_vs
-                        + pid_kh * stride_vh + off_vd[None, :] * stride_vd,
-                        mask=pos_mask_s[:, None] & vd_mask[None, :], other=0.0,
+                        v_cache_ptr
+                        + slots_s[:, None] * stride_vs
+                        + pid_kh * stride_vh
+                        + off_vd[None, :] * stride_vd,
+                        mask=pos_mask_s[:, None] & vd_mask[None, :],
+                        other=0.0,
                     )
                     if IS_FP8:
                         v_s = v_s.to(q.dtype)
@@ -281,72 +293,74 @@ def _gqa_share_sparse_fwd_kernel(
                     acc_o += tl.dot(p_s, v_s) * v_scale
                     m_i = m_ij
                     lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
-        elif True:
-          for i in range(real_topk):
-            # get current block start index (absolute K position)
-            c = tl.load(t_ptr_j).to(tl.int32) * BLOCK_SIZE_K
-            t_ptr_j = t_ptr_j + stride_tk
-            # paged load K via req_to_token: pos -> slot -> k_cache
-            pos = c + off_n
-            pos_mask = pos < seq_len
-            slots = tl.load(
-                req_to_token_ptr + sid * stride_r2t_b + pos,
-                mask=pos_mask,
-                other=0,
-            ).to(tl.int64)
-            slots = (slots + max_slots) % max_slots  # safety against negative
-            # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
-            k = tl.load(
-                k_cache_ptr
-                + slots[None, :] * stride_ks
-                + pid_kh * stride_kh
-                + off_kd[:, None] * stride_kd,
-                mask=kd_mask[:, None] & pos_mask[None, :],
-                other=0.0,
-            )
-            if IS_FP8:
-                # fp8 main K cache: widening cast with bf16/fp16 Q (unit-scaled
-                # cache -> exact inverse dequant; k_scale covers calibrated
-                # caches), no-op with fp8 Q (fp8 attn-GEMM mode) so tl.dot runs
-                # fp8x8. Compiled out when the cache is bf16.
-                k = k.to(q.dtype)
-            # compute qk
-            qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
-            # causal mask
-            qk += tl.where(off_q_k[:, None, :] >= c, 0, float("-inf"))
-            qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
-            # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
-            #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]
-            qk += tl.dot(q, k) * (sm_scale_log2e * k_scale)
-            # K boundary mask: positions beyond seq_len contribute -inf
-            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
-            # compute m_ij and l_ij
-            m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-            p = tl.exp2(qk - m_ij[:, None])
-            l_ij = tl.sum(p, axis=1)
-            # scale acc_o
-            acc_o_scale = tl.exp2(m_i - m_ij)
-            acc_o = acc_o * acc_o_scale[:, None]
-            # paged load V
-            v = tl.load(
-                v_cache_ptr
-                + slots[:, None] * stride_vs
-                + pid_kh * stride_vh
-                + off_vd[None, :] * stride_vd,
-                mask=pos_mask[:, None] & vd_mask[None, :],
-                other=0.0,
-            )
-            if IS_FP8:
-                # Cast V to the compute dtype: widening with bf16/fp16 Q (so
-                # `p.to(v.dtype)` keeps P in the compute dtype), no-op with fp8
-                # Q where P is quantized to e4m3 for the fp8 PV MMA — the same
-                # accuracy contract as fmha_sm100's fp8 kernel.
-                v = v.to(q.dtype)
-            p = p.to(v.dtype)
-            acc_o += tl.dot(p, v) * v_scale
-            # update statistics
-            m_i = m_ij
-            lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+        else:
+            for i in range(real_topk):
+                # get current block start index (absolute K position)
+                c = tl.load(t_ptr_j).to(tl.int32) * BLOCK_SIZE_K
+                t_ptr_j = t_ptr_j + stride_tk
+                # paged load K via req_to_token: pos -> slot -> k_cache
+                pos = c + off_n
+                pos_mask = pos < seq_len
+                slots = tl.load(
+                    req_to_token_ptr + sid * stride_r2t_b + pos,
+                    mask=pos_mask,
+                    other=0,
+                ).to(tl.int64)
+                slots = (slots + max_slots) % max_slots  # safety against negative
+                # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
+                k = tl.load(
+                    k_cache_ptr
+                    + slots[None, :] * stride_ks
+                    + pid_kh * stride_kh
+                    + off_kd[:, None] * stride_kd,
+                    mask=kd_mask[:, None] & pos_mask[None, :],
+                    other=0.0,
+                )
+                if IS_FP8:
+                    # fp8 main K cache: widening cast with bf16/fp16 Q (unit-scaled
+                    # cache -> exact inverse dequant; k_scale covers calibrated
+                    # caches), no-op with fp8 Q (fp8 attn-GEMM mode) so tl.dot runs
+                    # fp8x8. Compiled out when the cache is bf16.
+                    k = k.to(q.dtype)
+                # compute qk
+                qk = tl.zeros(
+                    (BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32
+                )
+                # causal mask
+                qk += tl.where(off_q_k[:, None, :] >= c, 0, float("-inf"))
+                qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
+                # [BLOCK_SIZE_QH, qk_head_dim] @ [qk_head_dim, BLOCK_SIZE_K]
+                #   -> [BLOCK_SIZE_QH, BLOCK_SIZE_K]
+                qk += tl.dot(q, k) * (sm_scale_log2e * k_scale)
+                # K boundary mask: positions beyond seq_len contribute -inf
+                qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+                # compute m_ij and l_ij
+                m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+                p = tl.exp2(qk - m_ij[:, None])
+                l_ij = tl.sum(p, axis=1)
+                # scale acc_o
+                acc_o_scale = tl.exp2(m_i - m_ij)
+                acc_o = acc_o * acc_o_scale[:, None]
+                # paged load V
+                v = tl.load(
+                    v_cache_ptr
+                    + slots[:, None] * stride_vs
+                    + pid_kh * stride_vh
+                    + off_vd[None, :] * stride_vd,
+                    mask=pos_mask[:, None] & vd_mask[None, :],
+                    other=0.0,
+                )
+                if IS_FP8:
+                    # Cast V to the compute dtype: widening with bf16/fp16 Q (so
+                    # `p.to(v.dtype)` keeps P in the compute dtype), no-op with fp8
+                    # Q where P is quantized to e4m3 for the fp8 PV MMA — the same
+                    # accuracy contract as fmha_sm100's fp8 kernel.
+                    v = v.to(q.dtype)
+                p = p.to(v.dtype)
+                acc_o += tl.dot(p, v) * v_scale
+                # update statistics
+                m_i = m_ij
+                lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         # final scale
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
         # save output

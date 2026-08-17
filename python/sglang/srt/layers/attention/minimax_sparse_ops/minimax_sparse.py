@@ -353,12 +353,15 @@ def minimax_sparse_decode(
             q_scale=idx_q_scale,
             k_scale=idx_k_scale,
             v_scale=idx_v_scale,
-            # Only safe when no reduce step follows (idx heads == kv heads).
             topk_out=(topk_out if dense_main_attn_fn is None else None),
         )
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]
     idx_group_size = num_idx_heads // num_kv_heads
+    assert not (
+        return_topk_idx and dense_main_attn_fn is not None
+    ), "return_topk_idx is not available on the dense main-attention path"
+    reduced_topk_idx = topk_idx
     if dense_main_attn_fn is not None:
         # topk_idx is the page table; real_seq_lens is the per-query cache_seqlens
         assert idx_group_size == 1
