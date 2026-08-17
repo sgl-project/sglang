@@ -73,7 +73,7 @@ export const Qwen38MambaRatioCalculator = () => {
   //
   //   r = (S + D) x state_bytes / (L x kv_bytes_per_token)
   //
-  const derive = (flags) => {
+  const derive = (flags, env) => {
     const flagArg = (name) => {
       for (const f of flags) {
         const parts = f.split(/\s+/);
@@ -118,18 +118,43 @@ export const Qwen38MambaRatioCalculator = () => {
     // S mirrors kv_cache_configurator._calculate_mamba_ratio (single GPU,
     // overlap scheduler on): extra_buffer=5, extra_buffer_lazy=4,
     // no_buffer=3, radix cache disabled=1.
+    // Mirrors kv_cache_configurator._calculate_mamba_ratio: base 3, minus 1
+    // under the decode-lock skip, plus the ping-pong track buffer (2 under the
+    // overlap scheduler, 1 for lazy or without overlap). no_buffer has no track
+    // buffer and adds the skip's drop back, so it stays 3; radix off is 1.
+    // Hardcoding 5/4/3 ignored both knobs and over-provisioned when either was
+    // set. Matches the sibling K3 calculator.
+    const skipLock = env.some((e) =>
+      e.startsWith("SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1"));
+    const overlapOff =
+      hasFlag("--disable-overlap-schedule") ||
+      (Number(flagArg("--pp-size")) || 1) > 1;
     const slots = radixOff
       ? 1
       : strategy === "no_buffer"
         ? 3
-        : strategy === "extra_buffer_lazy"
-          ? 4
-          : 5;
+        : 3 -
+          (skipLock ? 1 : 0) +
+          (overlapOff || strategy === "extra_buffer_lazy" ? 1 : 2);
 
     // Verify intermediates under speculative decoding: the draft-token count
     // (4 at the recommended EAGLE/MTP 3/1/4), 0 when spec is off.
     const specOn = hasFlag("--speculative-algorithm");
-    const drafts = specOn ? Number(flagArg("--speculative-num-draft-tokens")) || 4 : 0;
+    const algo = (flagArg("--speculative-algorithm") || "").toUpperCase();
+    // ReplaySSM spec-verify moves the D intermediate SSM states off the
+    // per-request slot budget onto a fixed ring, so D is 0 even though spec is
+    // on (see the compute-mamba-ratio skill's ReplaySSM caveat). Counting them
+    // over-provisions the state pool ~2x and starves KV.
+    const replaySpec = hasFlag("--enable-linear-replayssm-spec");
+    // DSPARK never emits --speculative-num-draft-tokens: its verify window is
+    // --speculative-dspark-block-size (gamma) + 1, auto-inferred from the draft
+    // checkpoint when omitted. The old `|| 4` fallback silently under-counted.
+    const dsparkBlock = Number(flagArg("--speculative-dspark-block-size")) || 5;
+    const drafts = !specOn || replaySpec
+      ? 0
+      : algo === "DSPARK"
+        ? dsparkBlock + 1
+        : Number(flagArg("--speculative-num-draft-tokens")) || 4;
 
     // Fixed Qwen3.8-27B geometry (TP1):
     // GDN: 48 layers, 48 value heads x 128 x 128 SSM state (--mamba-ssm-dtype),
@@ -147,14 +172,22 @@ export const Qwen38MambaRatioCalculator = () => {
 
   // Two evaluations: `eff` matches the Playground's composed command, `bs`
   // matches the Deploy command (cell + overlays only).
-  const eff = derive(cfg.flags);
-  const bs = derive(cfg.baseFlags.length ? cfg.baseFlags : cfg.flags);
+  const eff = derive(cfg.flags, cfg.env);
+  const bs = derive(
+    cfg.baseFlags.length ? cfg.baseFlags : cfg.flags,
+    cfg.baseEnv.length ? cfg.baseEnv : cfg.env,
+  );
   const { ratio, tp, kvDtype, ssmDtype, radixOff, strategy, slots, specOn,
           drafts, stateBytesPerSlot, kvBytesPerToken } = eff;
 
   const valid = Number.isFinite(ratio) && ratio > 0 && L > 0 && tp === 1;
   const baseValid = Number.isFinite(bs.ratio) && bs.ratio > 0 && L > 0 && bs.tp === 1;
-  const pin = Math.ceil(C * (slots + drafts));
+  // C x S, NOT C x (S + D): the engine divides the main state pool by S alone
+  // (kv_cache_configurator.py, mamba_cap = max_mamba_cache_size // ratio where
+  // ratio = _calculate_mamba_ratio() = S) and sizes the spec intermediate
+  // buffer separately from D. Folding D in double-counts it and the surplus
+  // comes straight out of KV.
+  const pin = Math.ceil(C * slots);
   const pinValid = valid && Number.isFinite(pin) && pin > 0 && C > 0;
 
   const formatRatio = (value) => (Math.round(value * 100) / 100).toString();
