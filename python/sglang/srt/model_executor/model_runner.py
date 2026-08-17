@@ -1142,6 +1142,11 @@ class ModelRunner:
                 * self.model_config.hf_config.mamba_cache_per_req
                 / (1 << 30)
             )
+        if self.server_args.kv_cache_dtype == "fp4_mx_block32":
+            # Reserve ~2.5 GB for activations: the fp4 pool is denser than bf16
+            # (same rest_memory budget, ~3.7x tokens), leaving no slack for
+            # concurrent decode/prefill activations — OOMs under load.
+            rest_memory -= 2.5
         max_num_token = int(rest_memory * (1 << 30) // cell_size)
         return max_num_token
 
