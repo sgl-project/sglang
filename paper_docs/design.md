@@ -1,11 +1,13 @@
 # sm86 (RTX 3090) MXFP4 KV Cache 设计方案
 
-状态:设计 v3(最终),全部验收通过
-# 2026-08-16 最终结果:
-# - block16 + RNE(round-to-nearest-even)量化:GSM8K 200 = 90.0%(达标线 90%)
-# - M2 融合 decode kernel(sm86, 读 fp4 直接计算):TPOT +0.5%、TTFT +4%(达标线 +20%)
-# - KV 容量 2x(93,591 -> 187,182 tokens)
-日期:2026-08-15
+状态:设计 v4(最终),全部验收通过
+# 2026-08-17 最终结果(生产默认配置:CUDA graph + radix + overlap 全开):
+# - block32 + RNE 量化(MXFP4 标准):GSM8K 200 = 89.2%(3 轮均值;BF16 94%;block16 消融 90.0%)
+# - 融合 decode kernel,tensor-core 路径(ldmatrix + mma.m16n8k16):
+#     TPOT +16.2%(38.15 vs 32.84 ms)、ITL +18.9%、TTFT +7.3%(达标线 +20%)
+#     kernel 级 0.677ms(fp4)vs 0.474ms(flashinfer fp16 mma)@ b=100/seq=1024
+# - KV 容量 3.03x(93,591 -> 283,808 tokens;token 密度 3.76x)
+日期:2026-08-15(v3)→ 2026-08-17(v4 定稿)
 基线:容器 v0.5.2-cu126(torch 2.8.0+cu126, flashinfer 0.3.1),单卡 GPU 3
 模型:Qwen3-4B(GQA:32 Q heads / 8 KV heads, head_dim=128)
 验收:GSM8K 200 题 ≥90%(BF16 baseline 94%);TTFT/TPOT 增幅 ≤20%
@@ -70,6 +72,40 @@
   - dequant 在寄存器内完成,不产生额外全局带宽 —— 这是性能达标的关键
 - 工作量最大,参考:flashinfer `decode` kernel(0.3.1 源码,sm86 路径)+ 用户 PR #32741 的 dequant 技巧 + sglang jit_kernels 现有 decode 实现。
 
+### 2.3 最终实现(v4,两代融合 kernel 的演进)
+
+**第一代(CUDA-cores scalar,`mxfp4_decode_fused_kernel`)**:flashinfer decode 同构
+(bdx=head_dim 向量 + shfl 归约 + state_t),生产 TPOT +26%。留作对照与回退。
+
+**第二代(tensor-core,`mxfp4_decode_fused_mma_kernel`,生产路径)**,核心决策:
+
+1. **fragment 构造必须用 ldmatrix,不能用手工 LDS**。中间走过弯路:按 PTX ISA fragment
+   表手工 LDS 构造 A/B 片段(QK 32×LDS.32 + PV 64×LDS.16/iter),指令开销爆炸,
+   实测 1.815ms(比 scalar 还慢 2.1×)。ldmatrix 语义(PTX ISA §9.7.15.5.15,曾被
+   误判为"黑盒",实为 probe bug):
+   - 非 trans:source[r][c] → slot(r,c);**自然 [t][d] tile + 非 trans `ldmatrix.x4`
+     即 K^T 的 col-major B**(B 是加载矩阵的转置),一次 x4 同时覆盖一个 16-dim
+     k-block 的两个 8-token n-tile(R0..R3 = nt0-b01, nt1-b01, nt0-b23, nt1-b23)
+   - `ldmatrix.x2.trans` 加载转置 → 抵消自然 [t][d] 布局,V 直接作 PV 的 B
+2. **朝向 m=qo heads / n=kv tokens / k=head_dim**(flashinfer prefill 同构):
+   QK 的 C fragment 布局(c0,c1 = S[g][2tig])恰好就是 PV 的 A fragment 布局
+   (a0,a1 = P[g][2tig])—— **softmax 后原地复用,零 shuffle**;O 的每个 (head, dim)
+   恰好由唯一 lane 持有,**epilogue 直接写回,零重排**。
+   m=16 行中只有 4 行真 head(GQA group),Q 零填充,零行使 a2a3/a6a7 恒 0,
+   Q fragment 寄存器减半。
+3. **4 warps 按 token 分块**(tile w, w+4, ...),每 warp 独立 online softmax,
+   SMEM 合并 4 份 partial(与 scalar 的 bdz split-KV 同构,天然兼容任意序列长度)。
+4. **128B swizzle** `phys(r,u) = r·16 + (u^(r%8))`(16B 单位)使 STS.128 与两种
+   ldmatrix 均无 bank conflict(闪存 flashinfer permuted_smem 同式)。
+5. **寄存器预取**:下一 tile 的 fp4 数据(32B/lane/tensor)先 LDG 进寄存器,延迟
+   藏在当前 tile 的 32 条 mma 下(无需 cp.async —— 它无法在搬运中做 dequant)。
+6. **精度关键**:softmax 分母 d 必须从与 PV 分子同一批 **fp16 舍入后的 p** 累加
+   (`__half2float(p16)`),否则 o/d 不同源,GSM8K 系统性 -2.7pt(85.6% → 89.2%)。
+   这是 tensor-core softmax 与 scalar(float p)的本质差异,有消融数据。
+
+实测(b=100, seq=1024, qh=32, kh=8):scalar 0.846 → **mma 0.677ms(-20%)**;
+`__launch_bounds__(128,3)` 为实测最优。
+
 ## 3. 上层接入(基于容器 v0.5.2 源码)
 
 1. **server_args.py**:`kv_cache_dtype` choices 增加 `fp4_mx_block16`;启动检查允许 sm86(与 main 分支相反的断言)。
@@ -90,15 +126,17 @@
 
 ## 5. 里程碑
 
-| 里程碑 | 内容 | 产出 |
-|---|---|---|
-| M1 | 布局 + 量化/反量化 CUDA kernel + pool/backend 接入 + workspace decode | 端到端跑通,GSM8K 精度 ≥90% |
-| M2 | 融合 decode kernel(阶段 B) | TPOT/TTFT ≤ +20% |
-| M3 | 收尾:radix cache 适配(可选)、benchmark 报告、代码推送 fork | 毕设交付 |
+| 里程碑 | 内容 | 产出 | 状态 |
+|---|---|---|---|
+| M1 | 布局 + 量化/反量化 CUDA kernel + pool/backend 接入 + workspace decode | 端到端跑通 | ✅(workspace 方案 TPOT +63%,验证精度后弃用) |
+| M2a | 融合 decode kernel(CUDA-cores scalar) | TPOT 达标(eager 配置 +0.5%) | ✅ |
+| M2b | tensor-core decode kernel(ldmatrix + mma) | 生产配置 TPOT +16.2% | ✅(2026-08-17) |
+| M3 | 收尾:生产配置复测、文档、推送 fork、宿主归档 | 毕设交付 | ✅(Draft PR #35078 作变更面板) |
 
-## 6. 风险
+## 6. 风险(终局回顾)
 
-- M1 的性能必然超预算(workspace 方案带宽翻倍)→ M2 融合 kernel 是必经之路,不能省
-- 融合 kernel 工作量最大(预估 1-3 周),是毕设核心增量
-- flashinfer 0.3.1 的 decode 调度结构(sm86)需精读源码才能保证融合 kernel 性能不输
-- 0.5.2 的 CUDA-graph 捕获路径(fp4 模式涉及新 kernel,需验证 graph 兼容)
+- ~~M1 性能超预算(workspace 带宽翻倍)~~ → 确认发生(+63%),M2 融合 kernel 解决
+- ~~融合 kernel 工作量~~ → 两代共 ~2 周;手工 LDS fragment 弯路(-2.1×)后被 ldmatrix 路线取代
+- ~~flashinfer 调度结构精读~~ → 其 prefill.cuh(手写 PTX mma + cp.async producer)是最终参考
+- ~~CUDA graph 兼容~~ → 生产默认配置(graph+radix+overlap)验证通过
+- 遗留:prefill 仍走 dequant workspace(TTFT +7.3% 的主因);NCU 被驱动权限挡(kernel 级 A/B 基准替代)
