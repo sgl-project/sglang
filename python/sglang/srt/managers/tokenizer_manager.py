@@ -211,6 +211,11 @@ class ReqState:
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
+    # Exactly-once guard for releasing the acquired LoRA registry reference;
+    # the batch-output, abort-ack and scheduler abort/error paths can race
+    # for the same rid, so only the first terminal path may release.
+    lora_released: bool = False
+
     # For streaming output
     last_output_offset: int = 0
 
@@ -402,6 +407,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.enable_metrics = server_args.enable_metrics
         self.incremental_streaming_output = server_args.incremental_streaming_output
         self.enable_lora = server_args.enable_lora
+        # Strong references to in-flight LoRA release tasks so they are not
+        # garbage-collected before the registry counter is decremented.
+        self._lora_release_tasks = set()
         self.enable_trace = server_args.enable_trace
         self.allow_auto_truncate = server_args.allow_auto_truncate
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
@@ -1695,6 +1703,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             finish_reason.get("type") == "abort"
             and finish_reason.get("status_code") == HTTPStatus.BAD_REQUEST
         ):
+            self._release_lora_once(state)
             if not is_stream:
                 raise ValueError(finish_reason["message"])
             return out
@@ -1711,8 +1720,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 del self.rid_to_state[state.obj.rid]
 
             # Mark ongoing LoRA request as finished.
-            if self.enable_lora and state.obj.lora_path:
-                await self.lora_registry.release(state.obj.lora_id)
+            self._release_lora_once(state)
             if not is_stream:
                 raise fastapi.HTTPException(
                     status_code=finish_reason["status_code"],
@@ -2484,8 +2492,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 del self.rid_to_state[rid]
 
                 # Mark ongoing LoRA request as finished.
-                if self.enable_lora and state.obj.lora_path:
-                    asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+                self._release_lora_once(state)
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
@@ -3165,6 +3172,27 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         """Put some custom force exit logic here."""
         pass
 
+    def _release_lora_once(self, state: ReqState):
+        """Release the LoRA registry reference for *state* exactly once.
+
+        The abort ack path, the batch-output path and the scheduler
+        abort/error finish-reason path can race for the same rid; the
+        lora_released flag guarantees the acquire is paired with a single
+        release whichever terminal path wins.
+        """
+        if not (self.enable_lora and state.obj.lora_path):
+            return
+        if state.lora_released:
+            return
+        if not getattr(state.obj, "lora_id", None):
+            # acquire failed before setting lora_id (e.g. unregistered adapter);
+            # nothing was counted, so there is nothing to release.
+            return
+        state.lora_released = True
+        task = asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
+        self._lora_release_tasks.add(task)
+        task.add_done_callback(self._lora_release_tasks.discard)
+
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
@@ -3218,6 +3246,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "meta_info": meta_info,
         }
         del self.rid_to_state[recv_obj.rid]
+
+        # Release the LoRA registry reference acquired for this request.
+        self._release_lora_once(state)
 
         state.out_list.append(out)
         state.event.set()
@@ -3430,7 +3461,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         else:
             rids = obj.rid
         for rid in rids:
-            self.rid_to_state.pop(rid, None)
+            state = self.rid_to_state.pop(rid, None)
+            if state is not None and not state.finished:
+                # Release the LoRA registry reference acquired for this request.
+                self._release_lora_once(state)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

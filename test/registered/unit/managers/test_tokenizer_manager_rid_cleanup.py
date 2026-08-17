@@ -159,6 +159,25 @@ def _make_abort_req(rid: str, abort_message: str = "Aborted") -> AbortReq:
     )
 
 
+def _make_tm_with_lora() -> TokenizerManager:
+    """Create a TokenizerManager with LoRA enabled and a mocked registry."""
+    tm = _make_tokenizer_manager()
+    tm.enable_lora = True
+    tm.server_args.enable_lora = True
+    tm.lora_registry = AsyncMock()
+    tm.lora_registry.release = AsyncMock()
+    tm._lora_release_tasks = set()
+    return tm
+
+
+def _make_lora_req_state(rid: str = "test_rid") -> ReqState:
+    """Create a ReqState whose obj references a loaded LoRA adapter."""
+    state = _make_req_state(rid)
+    state.obj.lora_path = "test-lora"
+    state.obj.lora_id = "lora-id-1"
+    return state
+
+
 def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
     """Create a minimal BatchStrOutput for a single request.
 
@@ -603,6 +622,234 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
             asyncio.run(drive())
 
         self.assertFalse(tm.rid_to_state)
+
+
+class TestLoraReleaseOnAbort(CustomTestCase):
+    """LoRA registry references must be released exactly once on every
+    terminal path.
+
+    Regression guards for issue #34205: aborted or pre-dispatch-failed
+    requests kept their LoRARegistry acquire() reference forever, which
+    wedges wait_for_unload / eviction once the per-adapter counter never
+    reaches zero. Each terminal path (batch output, abort ack, scheduler
+    400/503/500 finish reason, pre-dispatch discard) must pair the single
+    acquire with at most one release.
+    """
+
+    def test_abort_releases_lora_exactly_once(self):
+        """_handle_abort_req must release the acquired LoRA reference."""
+        tm = _make_tm_with_lora()
+        rid = "abort_lora"
+        state = _make_lora_req_state(rid)
+        tm.rid_to_state[rid] = state
+
+        async def drive():
+            tm._handle_abort_req(_make_abort_req(rid))
+            await asyncio.sleep(0)
+
+        asyncio.run(drive())
+
+        self.assertNotIn(rid, tm.rid_to_state)
+        self.assertEqual(tm.lora_registry.release.await_count, 1)
+        tm.lora_registry.release.assert_awaited_once_with("lora-id-1")
+
+    def test_release_lora_once_is_idempotent(self):
+        """Calling _release_lora_once twice must release only once."""
+        tm = _make_tm_with_lora()
+        state = _make_lora_req_state("idem_lora")
+
+        async def drive():
+            tm._release_lora_once(state)
+            tm._release_lora_once(state)
+            await asyncio.sleep(0)
+
+        asyncio.run(drive())
+
+        self.assertEqual(tm.lora_registry.release.await_count, 1)
+
+    def test_abort_then_batch_output_does_not_double_release(self):
+        """An abort that wins the race against a batch output must not
+        double-release: the later output finds no state and is skipped."""
+        tm = _make_tm_with_lora()
+        rid = "abort_then_output"
+        tm.rid_to_state[rid] = _make_lora_req_state(rid)
+        batch_output = _make_batch_str_output(rid)
+
+        async def drive():
+            tm._handle_abort_req(_make_abort_req(rid))
+            await asyncio.sleep(0)
+            await tm._handle_batch_output(batch_output)
+            await asyncio.sleep(0)
+
+        asyncio.run(drive())
+
+        self.assertEqual(tm.lora_registry.release.await_count, 1)
+        tm.lora_registry.release.assert_awaited_once_with("lora-id-1")
+
+    def test_abort_finish_reason_status_release_once(self):
+        """Scheduler 503/500 finish reasons must release only once even if
+        the path is reached twice for the same state."""
+        tm = _make_tm_with_lora()
+        rid = "afr_status"
+        state = _make_lora_req_state(rid)
+        tm.rid_to_state[rid] = state
+        out = {
+            "meta_info": {
+                "finish_reason": {
+                    "type": "abort",
+                    "status_code": 503,
+                    "message": "scheduler busy",
+                }
+            }
+        }
+
+        async def drive():
+            await tm._handle_abort_finish_reason(out, state, is_stream=True)
+            await tm._handle_abort_finish_reason(out, state, is_stream=True)
+
+        asyncio.run(drive())
+
+        self.assertEqual(tm.lora_registry.release.await_count, 1)
+        tm.lora_registry.release.assert_awaited_once_with("lora-id-1")
+
+    def test_abort_finish_reason_bad_request_releases_lora(self):
+        """The scheduler BAD_REQUEST abort path must also release the
+        acquired LoRA reference."""
+        tm = _make_tm_with_lora()
+        rid = "afr_bad_request"
+        state = _make_lora_req_state(rid)
+        tm.rid_to_state[rid] = state
+        out = {
+            "meta_info": {
+                "finish_reason": {
+                    "type": "abort",
+                    "status_code": 400,
+                    "message": "bootstrap room missing",
+                }
+            }
+        }
+
+        async def drive():
+            abort_out = await tm._handle_abort_finish_reason(out, state, is_stream=True)
+            self.assertIsNotNone(abort_out)
+            await asyncio.sleep(0)
+
+        asyncio.run(drive())
+
+        self.assertEqual(tm.lora_registry.release.await_count, 1)
+        tm.lora_registry.release.assert_awaited_once_with("lora-id-1")
+
+    def test_discard_pending_req_states_releases_lora(self):
+        """Pre-dispatch failures (via _discard_pending_req_states) must
+        release the acquired LoRA reference."""
+        tm = _make_tm_with_lora()
+        rid = "d_lora"
+        tm.rid_to_state[rid] = _make_lora_req_state(rid)
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = True
+        obj.rid = rid
+
+        async def drive():
+            tm._discard_pending_req_states(obj)
+            await asyncio.sleep(0)
+
+        asyncio.run(drive())
+
+        self.assertNotIn(rid, tm.rid_to_state)
+        self.assertEqual(tm.lora_registry.release.await_count, 1)
+        tm.lora_registry.release.assert_awaited_once_with("lora-id-1")
+
+    def test_discard_without_lora_id_does_not_call_release(self):
+        """A request whose lora_id was never set (acquire failed) has nothing
+        to release and must not raise."""
+        tm = _make_tm_with_lora()
+        rid = "d_no_id"
+        state = _make_req_state(rid)
+        state.obj.lora_path = "test-lora"
+        state.obj.lora_id = None
+        tm.rid_to_state[rid] = state
+        obj = Mock(spec=GenerateReqInput)
+        obj.is_single = True
+        obj.rid = rid
+
+        async def drive():
+            tm._discard_pending_req_states(obj)
+            await asyncio.sleep(0)
+
+        asyncio.run(drive())
+
+        self.assertNotIn(rid, tm.rid_to_state)
+        tm.lora_registry.release.assert_not_awaited()
+
+    def test_enable_lora_false_does_not_release(self):
+        """With LoRA disabled the abort path must never touch the registry."""
+        tm = _make_tokenizer_manager()
+        tm.lora_registry = AsyncMock()
+        tm.lora_registry.release = AsyncMock()
+        tm._lora_release_tasks = set()
+        rid = "no_lora"
+        tm.rid_to_state[rid] = _make_lora_req_state(rid)
+
+        tm._handle_abort_req(_make_abort_req(rid))
+
+        self.assertNotIn(rid, tm.rid_to_state)
+        tm.lora_registry.release.assert_not_awaited()
+
+    def test_running_timeout_no_double_release(self):
+        """Normal finish followed by a scheduler 503 finish reason for the
+        same state must still release exactly once."""
+        tm = _make_tm_with_lora()
+        rid = "timeout_lora"
+        state = _make_lora_req_state(rid)
+        tm.rid_to_state[rid] = state
+        batch_output = _make_batch_str_output(rid)
+        out = {
+            "meta_info": {
+                "finish_reason": {
+                    "type": "abort",
+                    "status_code": 503,
+                    "message": "scheduler timeout",
+                }
+            }
+        }
+
+        async def drive():
+            await tm._handle_batch_output(batch_output)
+            await asyncio.sleep(0)
+            await tm._handle_abort_finish_reason(out, state, is_stream=True)
+
+        asyncio.run(drive())
+
+        self.assertEqual(tm.lora_registry.release.await_count, 1)
+        tm.lora_registry.release.assert_awaited_once_with("lora-id-1")
+
+    def test_abort_without_lora_path_does_not_release(self):
+        """An abort for a request with no LoRA path must not touch the
+        registry."""
+        tm = _make_tm_with_lora()
+        rid = "no_lora_path"
+        state = _make_req_state(rid)
+        tm.rid_to_state[rid] = state
+
+        tm._handle_abort_req(_make_abort_req(rid))
+
+        self.assertNotIn(rid, tm.rid_to_state)
+        tm.lora_registry.release.assert_not_awaited()
+
+    def test_abort_without_lora_id_does_not_release(self):
+        """An abort for a request whose acquire() failed (lora_path set but
+        no lora_id) must not call release(None) and must not raise."""
+        tm = _make_tm_with_lora()
+        rid = "no_lora_id"
+        state = _make_req_state(rid)
+        state.obj.lora_path = "test-lora"
+        state.obj.lora_id = None
+        tm.rid_to_state[rid] = state
+
+        tm._handle_abort_req(_make_abort_req(rid))
+
+        self.assertNotIn(rid, tm.rid_to_state)
+        tm.lora_registry.release.assert_not_awaited()
 
 
 if __name__ == "__main__":
