@@ -728,7 +728,6 @@ class MoeLoraRunner:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> tuple[object, torch.Tensor]:
-        provider = provider
         ws = provider.prepare(
             hidden_states,
             topk_ids,
@@ -832,7 +831,6 @@ class MoeLoraRunner:
         batch: MoeLoraBatch,
         num_tokens: int,
     ) -> tuple[torch.Tensor, _DownAInput | None]:
-        provider = provider
         act_out = self.workspace.tensor(
             "middle:act_masked",
             provider.act_out_shape(ws),

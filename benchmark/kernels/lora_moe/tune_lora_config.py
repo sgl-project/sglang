@@ -17,7 +17,7 @@ Three steps, each usable alone:
      through SGLANG_LORA_MOE_CONFIG_DIR; winner written back into the seed);
    - base GEMM: the masked-GEMM M-bucket tiles, by delegating to
      ``sweep_masked_gemm_configs.py`` on this device (output lands in
-     ``<out>/gemm``, so SGLANG_LORA_MOE_CONFIG_DIR=<out> serves both).
+     ``<out>/base_gemm``, so SGLANG_LORA_MOE_CONFIG_DIR=<out> serves both).
    Axes proven geometry-insensitive in the campaign (route builder, PDL
    edges, B families, prefill serial shape) are not re-swept; evidence in
    the campaign's best-config tables document.
