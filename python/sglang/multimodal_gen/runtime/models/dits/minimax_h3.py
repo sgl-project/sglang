@@ -51,6 +51,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionRequirements,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -479,6 +480,9 @@ def _minimax_h3_attention_core_impl(
             get_attn_backend(
                 attention.head_dim,
                 q.dtype,
+                selected_attention_backend=_preferred_minimax_h3_cpu_attention_backend(
+                    attention.head_dim, q.dtype
+                ),
                 attention_requirements=AttentionRequirements(packed_varlen=True),
             )
         )
@@ -515,6 +519,20 @@ def _minimax_h3_attention_core_impl(
 
 
 _minimax_h3_attention_core_bcg = eager_on_graph(True)(_minimax_h3_attention_core_impl)
+
+
+def _preferred_minimax_h3_cpu_attention_backend(
+    head_dim: int, dtype: torch.dtype
+) -> AttentionBackendEnum | None:
+    server_args = get_global_server_args()
+    component_backends = getattr(server_args, "component_attention_backends", None) or {}
+    if getattr(server_args, "attention_backend", None) is not None:
+        return None
+    if component_backends.get("transformer") is not None:
+        return None
+    if current_platform.is_cpu() and dtype == torch.bfloat16 and head_dim == 128:
+        return AttentionBackendEnum.CPU_AMX
+    return None
 
 
 class MiniMaxH3Attention(nn.Module):

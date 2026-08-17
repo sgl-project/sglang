@@ -131,11 +131,21 @@ class LayerwiseOffloadManager:
         # never flips back, so disable_offload/enable_offload can toggle
         # `enabled` without losing track of which managers can be re-armed.
         self._configured = False
-        self.enabled = bool(enabled and torch.get_device_module().is_available())
+        # Layerwise offload streams weights from an accelerator into pinned CPU
+        # memory. On pure CPU execution there is nothing to offload, and trying
+        # to build the pinned-memory path breaks torch.compile warmup.
+        self.enabled = bool(
+            enabled
+            and current_platform.device_type != "cpu"
+            and torch.get_device_module().is_available()
+        )
         if not self.enabled:
             return
-        self.device = torch.device(
-            current_platform.device_type, torch.get_device_module().current_device()
+        current_device = torch.get_device_module().current_device()
+        self.device = (
+            torch.device(current_platform.device_type, current_device)
+            if isinstance(current_device, int)
+            else torch.device(str(current_device))
         )
         self.copy_stream = torch.get_device_module().Stream()
 
@@ -803,8 +813,9 @@ class LayerwiseOffloadableModuleMixin:
                     else RESIDENCY_POLICY_LEADING
                 ),
             )
-            self.layerwise_offload_managers.append(manager)
-            configured_layer_names.append(layer_name)
+            if manager.enabled:
+                self.layerwise_offload_managers.append(manager)
+                configured_layer_names.append(layer_name)
 
         if configured_layer_names:
             logger.debug(

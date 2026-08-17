@@ -1,6 +1,6 @@
-from contextlib import nullcontext
-from types import SimpleNamespace
+import unittest
 
+<<<<<<< ours
 import pytest
 import torch
 
@@ -33,9 +33,13 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
     LayerwiseOffloadStrategy,
     ResidentStrategy,
 )
+=======
+import torch.nn as nn
+
+>>>>>>> theirs
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-    LayerwiseOffloadableModuleMixin,
     LayerwiseOffloadManager,
+<<<<<<< ours
     compute_streamed_layers,
     configure_layerwise_offload_modules,
     get_layerwise_offload_component_names_for_pipeline,
@@ -923,42 +927,28 @@ def test_holds_residents_reflects_configuration(monkeypatch):
     assert resident.holds_residents is True
     assert streaming.holds_residents is False
 
-
-def test_is_resident_layerwise_module_detector():
-    class _Comp(torch.nn.Module, LayerwiseOffloadableModuleMixin):
-        pass
-
-    comp = _Comp()
-    comp.layerwise_offload_managers = [SimpleNamespace(holds_residents=True)]
-    assert is_resident_layerwise_module(comp) is True
-
-    comp.layerwise_offload_managers = [SimpleNamespace(holds_residents=False)]
-    assert is_resident_layerwise_module(comp) is False
+=======
+)
 
 
-def test_configure_resolves_resident_layers_absolute(monkeypatch):
-    _patch_fake_device(monkeypatch)
-    comp = _ResidentComponent(8)
-    comp.configure_layerwise_offload(_server_args(dit_layerwise_resident_layers=3))
-    assert comp.layerwise_offload_managers[0].resident_layers == 3
+class _TinyBlockStack(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.blocks = nn.ModuleList([nn.Linear(4, 4, bias=False)])
+>>>>>>> theirs
 
 
-def test_configure_resolves_resident_layers_ratio(monkeypatch):
-    _patch_fake_device(monkeypatch)
-    comp = _ResidentComponent(8)
-    comp.configure_layerwise_offload(_server_args(dit_layerwise_resident_layers=0.5))
-    # 0.5 * 8 = 4 leading layers resident
-    assert comp.layerwise_offload_managers[0].resident_layers == 4
+class TestLayerwiseOffloadManager(unittest.TestCase):
+    def test_cpu_execution_disables_layerwise_offload(self):
+        model = _TinyBlockStack()
 
-
-def test_auxiliary_layerwise_components_ignore_dit_tuning(monkeypatch):
-    _patch_fake_device(monkeypatch)
-    comp = _AuxiliaryResidentComponent(8)
-    comp.configure_layerwise_offload(
-        _server_args(
-            dit_offload_prefetch_size=3,
-            dit_layerwise_resident_layers=0.5,
+        manager = LayerwiseOffloadManager(
+            model=model,
+            layers_attr_str="blocks",
+            num_layers=1,
+            enabled=True,
         )
+<<<<<<< ours
     )
 
     manager = comp.layerwise_offload_managers[0]
@@ -1024,13 +1014,13 @@ def test_enable_offload_rearms_after_disable(monkeypatch):
     # blocks[2] holds a placeholder right after configure; the real values are
     # what _MixinBlock was constructed with.
     original = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+=======
+>>>>>>> theirs
 
-    model.disable_offload()
-    assert not is_layerwise_offloaded_module(model)
+        self.assertFalse(manager.enabled)
 
-    model.enable_offload()
-    assert is_layerwise_offloaded_module(model)
 
+<<<<<<< ours
     manager = model.layerwise_offload_managers[0]
     manager.release_layer(2)
     assert tuple(model.blocks[2].weight.shape) == (1,)
@@ -1169,3 +1159,7 @@ def test_strided_forward_leaves_exactly_the_resident_set(monkeypatch):
     resident = set(range(8)) - set(manager._streamed_order)
     assert resident <= manager._gpu_layers
     assert len(manager._gpu_layers) <= len(resident) + manager.prefetch_size
+=======
+if __name__ == "__main__":
+    unittest.main()
+>>>>>>> theirs

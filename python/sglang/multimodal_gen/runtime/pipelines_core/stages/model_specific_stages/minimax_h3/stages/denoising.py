@@ -306,6 +306,24 @@ def _ref2va_ordered_blocks_and_rows(
     return blocks, _cat_optional(visual_rows), _cat_optional(audio_rows)
 
 
+def _select_full_loop_device(
+    transformer: Any,
+    *,
+    fallback: torch.device | None = None,
+) -> torch.device:
+    model = getattr(transformer, "model", transformer)
+    for accessor in ("parameters", "buffers"):
+        iterator = getattr(model, accessor, None)
+        if not callable(iterator):
+            continue
+        first = next(iter(iterator()), None)
+        if first is not None:
+            return first.device
+    if fallback is not None:
+        return fallback
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def _resolve_denoise_model(
     transformer: Any,
     device: torch.device,
@@ -598,9 +616,10 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
 
         ctx = _resolve_full_loop_context(batch)
 
-        if not torch.cuda.is_available():
-            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA")
-        device = torch.device("cuda")
+        device = _select_full_loop_device(
+            self.transformer,
+            fallback=ctx.state["initial_video_rows"].device,
+        )
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
         self._maybe_enable_cache_dit_and_torch_compile(
             len(sigmas_video) - 1,
@@ -634,6 +653,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device,
                 placement_managed=placement_managed,
             )
+            device = _select_full_loop_device(model, fallback=device)
             positive = MiniMaxH3DenoiseBranch(
                 packed=packed,
                 text_embeddings=emb["hidden_states"],
