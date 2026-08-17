@@ -10,6 +10,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -144,42 +145,25 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                     processor.process_batch_result_decode(result_batch, batch_result)
 
                 scheduler.process_batch_result = process_batch_result
-                server_args = SimpleNamespace(
-                    enable_mamba_extra_buffer=lambda: True,
-                    enable_mamba_extra_buffer_lazy=lambda: False,
-                )
 
                 with (
+                    # The mamba predicates and the track interval read the
+                    # published bags, so publish the configuration under test
+                    # (non-lazy extra buffer, interval 4); observability and
+                    # disagg reads are served by the same publish at their
+                    # defaults.
+                    get_context().override_server_args(
+                        mamba_radix_cache_strategy="extra_buffer",
+                        mamba_track_interval=4,
+                    ),
                     patch(
                         "sglang.srt.managers.schedule_batch.alloc_for_decode",
                         return_value=torch.tensor([3], dtype=torch.int64),
                     ),
                     patch(
-                        "sglang.srt.managers.schedule_batch.get_server_args",
-                        return_value=server_args,
-                    ),
-                    patch(
-                        "sglang.srt.managers.schedule_batch.get_exec",
-                        return_value=SimpleNamespace(
-                            mamba=SimpleNamespace(mamba_track_interval=4)
-                        ),
-                    ),
-                    patch(
                         "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs"
                     ),
                     patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
-                    patch(
-                        "sglang.srt.managers.scheduler_components."
-                        "batch_result_processor.get_observability",
-                        return_value=SimpleNamespace(enable_metrics=False),
-                    ),
-                    patch(
-                        "sglang.srt.managers.scheduler_components."
-                        "batch_result_processor.get_disagg",
-                        return_value=SimpleNamespace(
-                            disaggregation_decode_enable_offload_kvcache=False
-                        ),
-                    ),
                     patch.object(
                         SchedulerBatchResultProcessor,
                         "_mamba_prefix_cache_update",

@@ -21,18 +21,22 @@ register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd")
 def test_dsv4_topk_appends_semantic_shared_expert_384():
     hidden = torch.zeros(3, 16, device="cuda")
     logits = torch.randn(3, 384, device="cuda", dtype=torch.bfloat16)
-    output = select_experts(
-        hidden,
-        logits,
-        TopKConfig(
-            top_k=7,
-            correction_bias=torch.zeros(384, device="cuda", dtype=torch.float32),
-            scoring_func="sqrtsoftplus",
-            num_fused_shared_experts=1,
-            routed_scaling_factor=2.5,
-            apply_routed_scaling_factor_on_output=True,
-        ),
-    )
+    with patch(
+        "sglang.srt.layers.moe.topk.get_parallel",
+        return_value=SimpleNamespace(moe_ep_size=1),
+    ):
+        output = select_experts(
+            hidden,
+            logits,
+            TopKConfig(
+                top_k=7,
+                correction_bias=torch.zeros(384, device="cuda", dtype=torch.float32),
+                scoring_func="sqrtsoftplus",
+                num_fused_shared_experts=1,
+                routed_scaling_factor=2.5,
+                apply_routed_scaling_factor_on_output=True,
+            ),
+        )
 
     assert output.topk_ids.shape == (3, 7)
     assert torch.all(output.topk_ids[:, -1] == 384)

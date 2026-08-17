@@ -61,6 +61,7 @@ from sglang.srt.entrypoints.openai.utils import (
     should_include_usage,
     to_openai_style_logprobs,
 )
+from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -727,11 +728,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 remaining_logprobs = None
 
         # Handle tool calls
-        if (
-            request.tool_choice != "none"
-            and self._effective_tools(request)
-            and self.tool_call_parser
-        ):
+        if self._tool_call_parsing_active(request):
             async for chunk in self._process_tool_call_stream(
                 index,
                 delta,
@@ -740,6 +737,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 request,
                 has_tool_calls,
                 continuous_usage_stats,
+                flush=finish_reason_type is not None and finish_reason_type != "abort",
             ):
                 if chunk:
                     yield chunk
@@ -802,10 +800,25 @@ class OpenAIServingChat(OpenAIServingBase):
                 usage=usage,
             )
 
+    def _tool_call_parsing_active(self, request: ChatCompletionRequest) -> bool:
+        """Whether this request's output runs through the tool-call parser.
+
+        The reasoning parser is told the same thing, so channel-framed formats
+        keep their framing intact exactly when a tool-call parser consumes it.
+        """
+        return bool(
+            request.tool_choice != "none"
+            and self._effective_tools(request)
+            and self.tool_call_parser
+        )
+
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
         if not request.messages:
             return "Messages cannot be empty."
+
+        if request.return_sampling_mask and not request.return_meta_info:
+            return "return_sampling_mask requires return_meta_info=true."
 
         media_error = self._validate_media_content(request)
         if media_error:
@@ -995,6 +1008,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
+            return_sampling_mask=request.return_sampling_mask,
             stream=request.stream,
             return_text_in_logprobs=True,
             modalities=processed_messages.modalities,
@@ -1009,7 +1023,8 @@ class OpenAIServingChat(OpenAIServingBase):
             routed_experts_start_len=request.routed_experts_start_len,
             rid=request.rid,
             session_id=request.session_id,
-            extra_key=self._compute_extra_key(request),
+            extra_key=request.extra_key,
+            cache_salt=request.cache_salt,
             require_reasoning=processed_messages.require_reasoning,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
@@ -1023,6 +1038,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return_prompt_token_ids=request.return_prompt_token_ids
             or request.return_token_ids,
         )
+        if (
+            raw_request is not None
+            and envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get()
+        ):
+            apply_header_overrides(adapted_request, raw_request.headers)
 
         return adapted_request, request
 
@@ -1129,6 +1149,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         result.tool_call_constraint = tool_call_constraint
         result.require_reasoning = thinking_mode
+        result.skip_special_tokens = request.skip_special_tokens
         return result
 
     def _apply_jinja_template(
@@ -1797,6 +1818,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         force_reasoning=force_reasoning,
                         request=request,
                         tokenizer=self.tokenizer_manager.tokenizer,
+                        tool_call_parser_active=self._tool_call_parsing_active(request),
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                 except Exception as e:
@@ -1810,11 +1832,7 @@ class OpenAIServingChat(OpenAIServingBase):
             # Handle tool calls
             tool_calls = None
             effective_tools = self._effective_tools(request)
-            if (
-                request.tool_choice != "none"
-                and effective_tools
-                and self.tool_call_parser
-            ):
+            if self._tool_call_parsing_active(request):
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
                 tool_calls, text, finish_reason = self._process_tool_calls(
                     text,
@@ -2106,6 +2124,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 is_force_reasoning,
                 request,
                 tokenizer=self.tokenizer_manager.tokenizer,
+                tool_call_parser_active=self._tool_call_parsing_active(request),
             )
         reasoning_parser = reasoning_parser_dict[index]
         reasoning_text, normal_text = reasoning_parser.parse_stream_chunk(delta)
@@ -2157,6 +2176,8 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             request.skip_special_tokens = False
         elif self.reasoning_parser == "inkling":
+            request.skip_special_tokens = False
+        elif self.reasoning_parser == "muse":
             request.skip_special_tokens = False
 
     def wrap_reasoning_history(self, reasoning_text: str) -> str:
@@ -2357,8 +2378,13 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         has_tool_calls: Dict[int, bool],
         continuous_usage_stats: bool = False,
+        flush: bool = False,
     ):
-        """Process tool calls in streaming response"""
+        """Process tool calls in streaming response.
+
+        With flush=True (the terminal delta), the parser also drains text it
+        held back waiting for a marker that can no longer arrive.
+        """
         effective_tools = self._effective_tools(request)
         if index not in parser_dict:
             is_required = request.tool_choice == "required" or isinstance(
@@ -2400,6 +2426,10 @@ class OpenAIServingChat(OpenAIServingBase):
             normal_text, calls = result.normal_text, result.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
+            if flush:
+                end_text, end_calls = parser.parse_stream_end()
+                normal_text = (normal_text or "") + end_text
+                calls = list(calls) + end_calls
 
         # Yield normal text
         if normal_text:

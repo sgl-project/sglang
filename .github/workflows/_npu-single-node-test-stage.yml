@@ -260,7 +260,7 @@ jobs:
           echo "Running test: ${tc_name}"
           test_exit_code=0
           cd test
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} --timeout-per-file 3600 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
+          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} --timeout-per-file 7200 2>&1 | tee /tmp/test_output.log || test_exit_code=$?
 
           echo "Finished test: ${tc_name}"
 

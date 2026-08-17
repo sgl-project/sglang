@@ -9,10 +9,12 @@ from sglang.multimodal_gen.runtime.layers.attention.layer import (
     UlyssesAttention,
     UlyssesAttention_VSA,
     USPAttention,
+    _count_active_replicated_modes,
     _kv_gather_unsupported_reason,
     _resolve_sp_attention_mode,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.test.test_utils import CustomTestCase
 
 _LAYER = "sglang.multimodal_gen.runtime.layers.attention.layer"
 
@@ -342,6 +344,22 @@ class TestKVGatherCallSupport(unittest.TestCase):
             attn.sp_attention_mode_is_auto = False
             with self.assertRaisesRegex(NotImplementedError, "pre-all-to-all"):
                 attn.forward(q, q, q, qkv_pre_all_to_all=True)
+
+
+class TestReplicatedModeCountCompile(CustomTestCase):
+    def test_symbolic_shape_compiles(self):
+        def add_mode_count(x):
+            count = _count_active_replicated_modes(x.shape[0], 0, 0)
+            return x + count
+
+        compiled = torch.compile(
+            add_mode_count,
+            backend="eager",
+            fullgraph=True,
+            dynamic=True,
+        )
+        actual = compiled(torch.ones(3))
+        torch.testing.assert_close(actual, torch.full((3,), 2.0))
 
 
 if __name__ == "__main__":

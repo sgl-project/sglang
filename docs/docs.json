@@ -82,6 +82,10 @@
       "destination": "/docs/advanced_features/cuda_graph_for_multi_modal_encoder"
     },
     {
+      "source": "/advanced_features/dcp.html",
+      "destination": "/docs/advanced_features/dcp"
+    },
+    {
       "source": "/advanced_features/deterministic_inference.html",
       "destination": "/docs/advanced_features/deterministic_inference"
     },
@@ -231,7 +235,7 @@
     },
     {
       "source": "/basic_usage/llama4.html",
-      "destination": "/cookbook/autoregressive/Llama/Llama4"
+      "destination": "/cookbook/autoregressive/Meta/Llama4"
     },
     {
       "source": "/basic_usage/minimax_m2.html",
@@ -932,7 +936,9 @@
               "docs/advanced_features/separate_reasoning",
               "docs/advanced_features/quantization",
               "docs/advanced_features/quantized_kv_cache",
+              "docs/advanced_features/reasoning_aware_compression",
               "docs/advanced_features/dp_dpa_smg_guide",
+              "docs/advanced_features/dcp",
               "docs/advanced_features/expert_parallelism",
               "docs/advanced_features/lora",
               "docs/advanced_features/pd_disaggregation",
@@ -1006,6 +1012,7 @@
             "pages": [
               "docs/developer_guide/overview",
               "docs/developer_guide/contribution_guide",
+              "docs/developer_guide/serve_backend_plugins",
               {
                 "group": "Development",
                 "pages": [
@@ -1106,6 +1113,7 @@
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v3_2",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_1",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/hy3",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/kimi_k2_6",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/mimo_v2_flash",
@@ -1116,7 +1124,8 @@
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_5_397b",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_6_27b",
                           "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_6_35b_a3b",
-                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_next_80b_a3b_instruct"
+                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_next_80b_a3b_instruct",
+                          "docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8_max"
                         ]
                       },
                       {
@@ -1233,6 +1242,8 @@
                   {
                     "group": "Qwen",
                     "pages": [
+                      "cookbook/autoregressive/Qwen/Qwen3.8",
+                      "cookbook/autoregressive/Qwen/Qwen3.8-27B",
                       "cookbook/autoregressive/Qwen/Qwen3.6",
                       "cookbook/autoregressive/Qwen/Qwen3.5",
                       "cookbook/autoregressive/Qwen/Qwen3",
@@ -1263,17 +1274,24 @@
                     ]
                   },
                   {
-                    "group": "Llama",
+                    "group": "Meta",
                     "pages": [
-                      "cookbook/autoregressive/Llama/Llama4",
-                      "cookbook/autoregressive/Llama/Llama3.3-70B",
-                      "cookbook/autoregressive/Llama/Llama3.1"
+                      "cookbook/autoregressive/Meta/MuseGlimmer",
+                      "cookbook/autoregressive/Meta/Llama4",
+                      "cookbook/autoregressive/Meta/Llama3.3-70B",
+                      "cookbook/autoregressive/Meta/Llama3.1"
                     ]
                   },
                   {
                     "group": "Meituan",
                     "pages": [
                       "cookbook/autoregressive/Meituan/LongCat-2.0"
+                    ]
+                  },
+                  {
+                    "group": "RedNote",
+                    "pages": [
+                      "cookbook/autoregressive/RedNote/Dots3-Note"
                     ]
                   },
                   {
@@ -1308,6 +1326,7 @@
                   {
                     "group": "NVIDIA",
                     "pages": [
+                      "cookbook/autoregressive/NVIDIA/Nemotron3.5-Lightning",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Ultra",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano-Omni",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano",
@@ -1339,6 +1358,7 @@
                     "group": "InclusionAI",
                     "pages": [
                       "cookbook/autoregressive/InclusionAI/Ling-3.0-flash",
+                      "cookbook/autoregressive/InclusionAI/Ling-3.0-tiny",
                       "cookbook/autoregressive/InclusionAI/Ring-2.6-1T",
                       "cookbook/autoregressive/InclusionAI/Ling-2.6",
                       "cookbook/autoregressive/InclusionAI/Ling-2.5-1T",
@@ -1349,6 +1369,7 @@
                   {
                     "group": "InternLM",
                     "pages": [
+                      "cookbook/autoregressive/InternLM/Intern-S2-Mobius",
                       "cookbook/autoregressive/InternLM/Intern-S2-Preview",
                       "cookbook/autoregressive/InternLM/Intern-S1"
                     ]
@@ -1448,8 +1469,10 @@
                   },
                   {
                     "group": "LTX",
+                    "tag": "NEW",
                     "pages": [
-                      "cookbook/diffusion/LTX/LTX2 & LTX2.3"
+                      "cookbook/diffusion/LTX/LTX2 & LTX2.3",
+                      "cookbook/diffusion/LTX/LTX2.5"
                     ]
                   },
                   {
@@ -1490,10 +1513,24 @@
                     ]
                   },
                   {
+                    "group": "SANA Video",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/SANA-Video/SANA-Video"
+                    ]
+                  },
+                  {
                     "group": "MiniMax",
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/MiniMax/MiniMax-H3"
+                    ]
+                  },
+                  {
+                    "group": "LingBot Video",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/LingBot-Video/LingBot-Video-MoE"
                     ]
                   },
                   {
