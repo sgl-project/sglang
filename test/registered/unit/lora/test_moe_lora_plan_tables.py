@@ -257,6 +257,28 @@ class TestResolution:
             with pytest.raises(ValueError):
                 _resolve()
 
+    def test_tuner_annotations_load_but_near_misses_do_not(self, tmp_path):
+        # tune_lora_config.py --emit-seed stamps row "provenance" and a
+        # file-level "seeded_for"; those must load (the whole onboarding
+        # flow serves through SGLANG_LORA_MOE_CONFIG_DIR) while a typo of
+        # either still fails closed.
+        packaged = json.load(open(f"{ep._CONFIG_DIR}/h200.plans.json"))
+        packaged["seeded_for"] = {"model": "acme/moe", "hidden": 6144}
+        for row in packaged["scenarios"]:
+            row["provenance"] = "campaign-2026-08"
+        json.dump(packaged, open(tmp_path / "h200.plans.json", "w"))
+        with envs.SGLANG_LORA_MOE_CONFIG_DIR.override(str(tmp_path)):
+            _clear_caches()
+            served = _resolve(architecture=_H200, layout=True, rank=64)
+            assert served[Phase.PREFILL].name == "prefill.shared_rank"
+
+            _clear_caches()
+            typo = json.loads(json.dumps(packaged))
+            typo["scenarios"][0]["provenence"] = "typo"
+            json.dump(typo, open(tmp_path / "h200.plans.json", "w"))
+            with pytest.raises(ValueError, match="provenence"):
+                _resolve(architecture=_H200, layout=True, rank=64)
+
     def test_unknown_tile_field_fails_closed(self, tmp_path):
         packaged = json.load(open(f"{ep._CONFIG_DIR}/gb300.tiles.json"))
         packaged["rules"]["decode.per_expert"][0]["min_tokens"] = 1

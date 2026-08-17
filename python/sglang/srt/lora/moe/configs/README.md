@@ -60,6 +60,9 @@ tile dicts). A plan row with no rules serves the built-in heuristics.
 
 Both loaders are pydantic models with `extra="forbid"`: a field this build
 does not understand aborts startup instead of silently widening a match.
+Two annotation fields are declared and ignored by selection, so tuned
+tables stay loadable: a row may carry `provenance`, and a plans file may
+carry `seeded_for` (both written by the tuner below).
 
 Every value in the shipped files is a measured sweep winner from the
 2026-08 best-config campaign (bs 1–32, 4k/1k, mlpb=4, r16/32; Qwen3.5-35B,

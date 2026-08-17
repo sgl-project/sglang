@@ -27,6 +27,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum
 from functools import cache
+from typing import Any
 
 import pydantic
 from pydantic.dataclasses import dataclass as pydantic_dataclass
@@ -665,6 +666,10 @@ class _PlanRowModel(pydantic.BaseModel):
     max_rank: int | None = None
     provider: str
     plan: _PlanSpecModel
+    # Free-form annotation the offline tuner stamps on rows it emits or
+    # sweeps.  Declared so extra="forbid" still rejects genuine typos while
+    # a tuned table stays loadable (see tune_lora_config.py --emit-seed).
+    provenance: str | None = None
 
 
 class _PlansFileModel(pydantic.BaseModel):
@@ -674,6 +679,8 @@ class _PlansFileModel(pydantic.BaseModel):
     domain: dict[str, int] = pydantic.Field(default_factory=dict)
     scenarios: list[_PlanRowModel] = pydantic.Field(default_factory=list)
     fallback: list[_PlanRowModel]
+    # Same: the geometry the tuner widened this table's domain for.
+    seeded_for: dict[str, Any] | None = None
 
 
 _CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
