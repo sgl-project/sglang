@@ -17,7 +17,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
-from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
+from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -28,7 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -77,6 +77,14 @@ def _get_fused_kv_materialize_helper():
 
         _FusedKVMaterializeHelper = FusedKVMaterializeHelper
     return _FusedKVMaterializeHelper
+
+
+# is_floating_point() is True for fp8; list dtypes explicitly.
+_DENSE_HEAD_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def _is_dense_head_weight(weight) -> bool:
+    return weight is not None and weight.dtype in _DENSE_HEAD_DTYPES
 
 
 class _DflashDraftSampler:
@@ -181,7 +189,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self._need_mamba_verify_commit = False
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = (
             server_args.speculative_draft_window_size
@@ -231,6 +239,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
         )
+        target_model = self._target_worker.model_runner.model
+        self._noise_embed_scale = (
+            float(target_model.get_dflash_noise_embedding_scale())
+            if hasattr(target_model, "get_dflash_noise_embedding_scale")
+            else 1.0
+        )
         if self.ps.tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -241,10 +255,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self.use_compact_draft_cache,
             )
             logger.info(
-                "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s",
+                "DFLASH draft runner ready. mask_token=%s, mask_token_id=%s, mask_token_id_override=%s, noise_embed_scale=%s",
                 self._mask_token,
                 self._mask_token_id,
                 self._mask_token_id_override,
+                self._noise_embed_scale,
             )
 
         self._block_pos_offsets = build_block_pos_offsets(
@@ -375,9 +390,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             return _eager("block_size<=1")
         target_model = self._target_worker.model_runner.model
         lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight"):
+        if lm_head is None:
             return _eager("no target lm_head")
-        if not torch.is_floating_point(lm_head.weight):
+        if not hasattr(lm_head, "weight"):
+            return _eager("quantized lm_head has no dense weight")
+        if not _is_dense_head_weight(lm_head.weight):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
         tp_group = get_tp_group()
@@ -805,6 +822,42 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return int(resolved_id)
 
+    def _greedy_sample_from_quantized_head(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        lm_head,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        """Greedy argmax over a target LM head that has no dense ``weight``.
+
+        A GGUF head stores packed ``qweight`` plus a type tag, so the dense path's
+        ``weight[:num_org]`` slicing has nothing to slice. Logits come from the
+        layer's own kernel instead -- the same call ``LogitsProcessor._get_logits``
+        makes for GGUF models. Padding rows are excluded so argmax cannot return
+        an id outside the real vocabulary.
+        """
+        tp_size = int(get_tp_group().world_size)
+        if tp_size != 1:
+            raise RuntimeError(
+                "DFLASH with a quantized target lm_head is only supported at "
+                f"tp=1, got tp_size={tp_size}."
+            )
+
+        num_tokens = int(hidden_states.shape[0])
+        out_tokens = torch.empty(
+            (num_tokens,), dtype=torch.long, device=hidden_states.device
+        )
+        num_org = int(getattr(lm_head, "org_vocab_size", 0)) or None
+
+        for start in range(0, num_tokens, int(chunk_size)):
+            end = min(num_tokens, start + int(chunk_size))
+            logits = lm_head.quant_method.apply(lm_head, hidden_states[start:end], None)
+            if num_org is not None and logits.shape[-1] > num_org:
+                logits = logits[:, :num_org]
+            out_tokens[start:end] = torch.argmax(logits, dim=-1).to(torch.long)
+        return out_tokens
+
     def _greedy_sample_from_vocab_parallel_head(
         self,
         *,
@@ -821,6 +874,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if hidden_states.numel() == 0:
             return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+
+        if not _is_dense_head_weight(getattr(lm_head, "weight", None)):
+            return self._greedy_sample_from_quantized_head(
+                hidden_states=hidden_states, lm_head=lm_head, chunk_size=chunk_size
+            )
 
         weight = lm_head.weight  # [local_vocab_padded, hidden]
         weight_dtype = weight.dtype
@@ -1487,9 +1545,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
         lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight"):
+        if lm_head is None or not (
+            hasattr(lm_head, "weight")
+            or callable(getattr(getattr(lm_head, "quant_method", None), "apply", None))
+        ):
             raise RuntimeError(
-                "DFLASH requires the target model to expose `lm_head` with `weight`."
+                "DFLASH requires the target model to expose `lm_head` with either "
+                "`weight` or a `quant_method` that can produce logits."
             )
 
         block_size = int(self.block_size)
@@ -1562,6 +1624,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
         noise_embedding = embed_module(block_ids)
+        if self._noise_embed_scale != 1.0:
+            noise_embedding = noise_embedding * self._noise_embed_scale
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
@@ -1833,15 +1897,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens = None
 
         if batch.return_logprob:
-            output_indices = torch.arange(
-                bs * block_size, dtype=torch.int64, device=device
-            ).view(bs, block_size)
-            compute_spec_v2_logprobs(
+            compute_spec_logprobs(
                 batch,
                 logits_output,
                 out_tokens.reshape(-1),
-                output_indices,
-                block_size - 1,
+                chain_stride=block_size,
             )
 
         if self._need_mamba_verify_commit:

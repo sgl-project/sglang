@@ -72,7 +72,9 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
 
     def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
         layer_id = self.pool.start_layer + layer_idx
-        return num_pages if self.pool._is_layer_owned(layer_id) else 0
+        if not self.pool._is_layer_owned(layer_id):
+            return 0
+        return super()._layer_num_pages(layer_idx, num_pages)
 
     def clear(self) -> None:
         super().clear()
@@ -150,7 +152,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         ]
         data_ptrs = [self.buffer[i].data_ptr() for i in owned_layer_ids]
         data_lens = [self.buffer[i].nbytes for i in owned_layer_ids]
-        item_lens = [self.buffer[i][0].nbytes for i in owned_layer_ids]
+        item_lens = [self._item_len(i) for i in owned_layer_ids]
         return data_ptrs, data_lens, item_lens
 
     def cpu_copy(self, indices):
