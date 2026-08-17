@@ -112,6 +112,7 @@ def _jit_compress_128_online_module(
             ("prefill", f"{kernel_class}::run_prefill"),
             ("plan_decode", "plan_compress_128_online_decode"),
             ("plan_prefill", "plan_compress_128_online_prefill"),
+            ("plan_prefill_mtp", "plan_compress_128_online_mtp_prefill"),
         ],
         extra_cuda_cflags=["-use_fast_math"],
     )
@@ -371,6 +372,46 @@ class CompressorPrefillPlan(NamedTuple):
             plan_w_dev[: int(num_w)],
             pin_buffer,
         )
+
+    @staticmethod
+    def generate_online_mtp(
+        prefix_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        num_draft_tokens: int,
+        state_slot_offset: int = 0,
+        active_batch_size: Optional[int] = None,
+    ) -> CompressorPrefillPlan:
+        """Build a fixed-shape online-C128 target-verify plan on GPU."""
+        batch_size = int(prefix_lens.shape[0])
+        if active_batch_size is None:
+            active_batch_size = batch_size
+        assert prefix_lens.ndim == req_pool_indices.ndim == 1
+        assert req_pool_indices.shape == prefix_lens.shape
+        assert prefix_lens.device == req_pool_indices.device
+        assert prefix_lens.is_cuda and req_pool_indices.is_cuda
+        assert prefix_lens.is_contiguous() and req_pool_indices.is_contiguous()
+        assert prefix_lens.dtype == torch.int64
+        assert req_pool_indices.dtype == torch.int64
+        assert 0 < num_draft_tokens <= 8
+        assert 0 <= active_batch_size <= batch_size
+        assert active_batch_size * num_draft_tokens <= 1 << 16
+        assert state_slot_offset >= 0
+
+        plan_c = torch.empty(
+            (batch_size, 16), dtype=torch.uint8, device=prefix_lens.device
+        )
+        plan_w = torch.empty_like(plan_c)
+        module = _jit_compress_128_online_module(512)
+        module.plan_prefill_mtp(
+            prefix_lens,
+            req_pool_indices,
+            plan_c,
+            plan_w,
+            int(num_draft_tokens),
+            int(state_slot_offset),
+            int(active_batch_size),
+        )
+        return CompressorPrefillPlan(128, plan_c, plan_w)
 
     @property
     def is_decode(self) -> bool:

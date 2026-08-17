@@ -572,8 +572,9 @@ struct FlashCompress128OnlineKernel {
 //     so the slot tensors never leave GPU memory. The online state pool keeps
 //     a single in-progress chunk per request, so each segment's load and
 //     store slot collapse to one value (the slot for the segment's own chunk).
-//     For online-c128 MTP, stage 1 keeps that write slot in `read_page_0` and
-//     stores the committed-bank load slot in `read_page_1`.
+//   - MTP prefill: a single GPU kernel reads prefix lengths and request pool
+//     indices and emits fixed-shape final PlanC/PlanW tensors. Inactive CUDA
+//     graph rows are filled with invalid plans.
 // ===========================================================================
 
 namespace host::compress {
@@ -663,7 +664,7 @@ inline void plan_online_decode(
 }
 
 // ---------------------------------------------------------------------------
-// Prefill plan builder: host stage 0 + GPU stage 1.
+// Prefill plan builder: host stage 0 + GPU stage 1, or single-kernel MTP.
 // ---------------------------------------------------------------------------
 
 struct OnlinePrefillStage0Params {
@@ -734,6 +735,65 @@ struct OnlinePrefillStage1Params {
   uint32_t num_w;
 };
 
+struct OnlineMTPPrefillParams {
+  CompressPlan* __restrict__ plan_c;
+  CompressPlan* __restrict__ plan_w;
+  const int64_t* __restrict__ prefix_lens;       // (batch_size,)
+  const int64_t* __restrict__ req_pool_indices;  // (batch_size,)
+  int32_t state_slot_offset;
+  uint32_t batch_size;
+  uint32_t active_batch_size;
+  uint32_t num_draft_tokens;
+};
+
+__global__ void plan_c128_online_mtp_prefill_kernel(const OnlineMTPPrefillParams params) {
+  const uint32_t batch_id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (batch_id >= params.batch_size) return;
+
+  const auto invalid = CompressPlan::invalid();
+  if (batch_id >= params.active_batch_size) {
+    params.plan_c[batch_id] = invalid;
+    params.plan_w[batch_id] = invalid;
+    return;
+  }
+
+  const uint32_t prefix_len = static_cast<uint32_t>(params.prefix_lens[batch_id]);
+  const uint32_t end_pos = prefix_len + params.num_draft_tokens;
+  const uint32_t chunk_end = (prefix_len / 128u + 1u) * 128u;
+  const uint32_t ragged_base = batch_id * params.num_draft_tokens;
+  const int32_t main_slot = static_cast<int32_t>(params.req_pool_indices[batch_id]);
+  const int32_t state_slot = main_slot + params.state_slot_offset;
+
+  if (chunk_end <= end_pos) {
+    const uint32_t compress_len = chunk_end - prefix_len;
+    params.plan_c[batch_id] = CompressPlan{
+        .seq_len = chunk_end,
+        .ragged_id = static_cast<uint16_t>(ragged_base + compress_len - 1u),
+        .buffer_len = static_cast<uint16_t>(compress_len),
+        .read_page_0 = state_slot,
+        .read_page_1 = main_slot,
+    };
+  } else {
+    params.plan_c[batch_id] = invalid;
+  }
+
+  // An exact-boundary request has no trailing partial segment. A request
+  // that crosses a boundary writes only the tail after the closed chunk;
+  // otherwise all draft tokens form the trailing segment.
+  if (chunk_end != end_pos) {
+    const uint32_t write_len = chunk_end < end_pos ? end_pos - chunk_end : params.num_draft_tokens;
+    params.plan_w[batch_id] = CompressPlan{
+        .seq_len = end_pos,
+        .ragged_id = static_cast<uint16_t>(ragged_base + params.num_draft_tokens - 1u),
+        .buffer_len = static_cast<uint16_t>(write_len),
+        .read_page_0 = state_slot,
+        .read_page_1 = main_slot,
+    };
+  } else {
+    params.plan_w[batch_id] = invalid;
+  }
+}
+
 __global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params params) {
   const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t total = params.num_c + params.num_w;
@@ -749,6 +809,54 @@ __global__ void plan_c128_online_prefill_kernel(const OnlinePrefillStage1Params 
   plan.read_page_0 = main_slot + params.state_slot_offset;
   plan.read_page_1 = main_slot;
   *plan_ptr = plan;
+}
+
+inline void plan_online_mtp_prefill(
+    const tvm::ffi::TensorView prefix_lens,
+    const tvm::ffi::TensorView req_pool_indices,
+    const tvm::ffi::TensorView plan_c_dev_,
+    const tvm::ffi::TensorView plan_w_dev_,
+    const int32_t num_draft_tokens,
+    const int32_t state_slot_offset,
+    const int32_t active_batch_size) {
+  auto B = SymbolicSize{"batch_size"};
+  auto device_ = SymbolicDevice{};
+  device_.set_options<kDLCUDA>();
+
+  TensorMatcher({B})  //
+      .with_dtype<int64_t>()
+      .with_device(device_)
+      .verify(prefix_lens);
+  TensorMatcher({B})  //
+      .with_dtype<int64_t>()
+      .with_device(device_)
+      .verify(req_pool_indices);
+  TensorMatcher({B, sizeof(CompressPlan)})  //
+      .with_dtype<uint8_t>()
+      .with_device(device_)
+      .verify(plan_c_dev_)
+      .verify(plan_w_dev_);
+
+  const auto batch_size = static_cast<uint32_t>(B.unwrap());
+  RuntimeCheck(0 < num_draft_tokens && num_draft_tokens <= 8);
+  RuntimeCheck(0 <= active_batch_size && static_cast<uint32_t>(active_batch_size) <= batch_size);
+  RuntimeCheck(static_cast<uint32_t>(active_batch_size) * static_cast<uint32_t>(num_draft_tokens) <= (1u << 16));
+  RuntimeCheck(state_slot_offset >= 0);
+  if (batch_size == 0) return;
+
+  const auto device = device_.unwrap();
+  const auto params = OnlineMTPPrefillParams{
+      .plan_c = static_cast<CompressPlan*>(plan_c_dev_.data_ptr()),
+      .plan_w = static_cast<CompressPlan*>(plan_w_dev_.data_ptr()),
+      .prefix_lens = static_cast<const int64_t*>(prefix_lens.data_ptr()),
+      .req_pool_indices = static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+      .state_slot_offset = state_slot_offset,
+      .batch_size = batch_size,
+      .active_batch_size = static_cast<uint32_t>(active_batch_size),
+      .num_draft_tokens = static_cast<uint32_t>(num_draft_tokens),
+  };
+  constexpr uint32_t kBlockSize = 128;
+  LaunchKernel(host::div_ceil(batch_size, kBlockSize), kBlockSize, device)(plan_c128_online_mtp_prefill_kernel, params);
 }
 
 using OnlinePrefillPlan = tvm::ffi::Tuple<uint32_t, uint32_t>;
@@ -925,5 +1033,6 @@ inline OnlinePrefillPlan plan_online_prefill(
 
 [[maybe_unused]] constexpr auto& plan_compress_128_online_decode = host::compress::plan_online_decode;
 [[maybe_unused]] constexpr auto& plan_compress_128_online_prefill = host::compress::plan_online_prefill;
+[[maybe_unused]] constexpr auto& plan_compress_128_online_mtp_prefill = host::compress::plan_online_mtp_prefill;
 
 }  // namespace sglang

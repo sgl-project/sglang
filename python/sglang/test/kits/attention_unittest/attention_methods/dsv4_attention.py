@@ -630,7 +630,7 @@ def _make_forward_batch(
 ) -> ForwardBatch:
     seq_lens = case.seq_lens
     input_lens = case.input_lens
-    req_pool_indices = torch.arange(case.batch_size, dtype=torch.int32, device=device)
+    req_pool_indices = torch.arange(case.batch_size, dtype=torch.int64, device=device)
     out_cache_locs: list[int] = []
     positions: list[int] = []
 
