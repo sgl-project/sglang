@@ -598,6 +598,11 @@ class Envs:
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
+    # Strict bit-exact SWA HiCache for unified_kv (DeepSeek-V4): offload the SWA
+    # ring to host and restore it on reuse instead of reprefilling a 128-token
+    # tail. Sizing: --hicache-swa-offload-page-stride. OFF == #29417 best-effort (tail
+    # reprefill, no SWA host pool) -- cheaper for short-prefix workloads.
+    SGLANG_UNIFIED_KV_BIT_EXACT_HICACHE = EnvBool(False)
 
     # ===================================================================
     # PD disaggregation runtime
