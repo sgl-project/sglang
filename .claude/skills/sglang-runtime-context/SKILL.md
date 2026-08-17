@@ -10,7 +10,7 @@ One container owns process-static runtime state: `sglang.srt.runtime_context.Run
 
 | Tier | Accessor | Holds | Lifecycle |
 |------|----------|-------|-----------|
-| raw config seed | `get_server_args()` | the published `ServerArgs` — the startup record, for debugging, dumps and provenance. **Business code does not read fields off it**: the read ratchet pins that at zero, and "Reading config: the seed is off limits" below says what to read instead, which forms the ratchet sees, and what is outside it by construction (a runtime-computed name; a whole-object hand-off) | published at process entry; re-publish is **last-publish-wins** (in-process tokenizer build, multi-Engine) and re-projects the bags; read-only |
+| raw config seed | `get_server_args()` | the published `ServerArgs` — the startup record, for debugging, dumps and provenance. **Business code does not read fields off it**: the read ratchet pins that at zero, and "Reading config: the seed is off limits" below says what to read instead, which forms the ratchet sees, and what is outside it by construction (a runtime-computed name; a whole-object hand-off) | published at process entry; re-publish is **last-publish-wins** (the tokenizer publish in the launcher process; sequential engine rebuild in one process, e.g. unit tests) and re-projects the bags; read-only |
 | resolved config | `get_exec()` `get_memory()` `get_schedule()` `get_model()` `get_spec()` `get_serving()` `get_observability()` `get_disagg()` `get_lora()` `get_mm()` `get_device()` | namespace **config bags** — the single source of truth for resolved config; leaves are real attributes (dynamo-traceable) | projected from `server_args` at `publish`; mutated only via `get_context().override` |
 | runtime flags | `get_flags()` | state that is *not* a pure function of config: `capture` (cuda-graph lifecycle), `moe` (ACTIVE backends, swappable), `dp` (DP-attention runtime flags) | materialized at subsystem init; groups offer `override()` for tests |
 | resources | `get_resources()`, `get_stream(name)`, `get_buffer(name, factory)` | process-level handles: graph pools, EPLB state, EP dispatcher state, named side streams, workspace buffers | lazy; cleared by `reset_context()` |
@@ -79,11 +79,6 @@ re-projects its own bags, so a parent-side override is lost. Values that feed
 construction before any bag exists (group init reads `server_args.tp_size`) have no
 bag to override at all.
 
-- **Nested publishes**: `get_context().preserve_config()` snapshots the enclosing
-  lifecycle (including its post-publish overrides) and reinstates it on exit. No
-  production caller is left — the draft build was the last one, and per-runner
-  values are constructor arguments now — so it survives for tests and for a future
-  construction step that genuinely has to publish a private copy.
 
 ### Reads that legitimately stay on a `ServerArgs` instance
 
@@ -110,28 +105,31 @@ bag to override at all.
   the scope. When there is a runner in hand, read its
   stamp; that is a different rule from "read the instance".
 - **Per-instance boundaries** — the tokenizer-manager family, everything under
-  `entrypoints/`, and the tokenizer-process multimodal processors read
-  `self.server_args`: several `Engine`s can share one process, and the process-global
-  bags are last-publish-wins across engines. `base_gpu_id` also differs per engine,
-  so no process-global value can stand in for it —
-  `BaseMultimodalProcessor._fast_image_processor_device` is the shape to copy. (The
-  encode-server DP workers used to specialize a config copy for the same reason;
-  their device now travels as `MMEncoder(gpu_id=...)`.)
+  `entrypoints/`, and the tokenizer-process multimodal processors still read
+  `self.server_args` today. The old justification ("several `Engine`s can share
+  one process, bags are last-publish-wins across them") is **retracted** — owner
+  ruling (2026-08-15): a process holds at most one live config at a time
+  (concurrent multi-Engine is unsupported; sequential rebuild stays legal, unit
+  tests rely on it). These reads are scheduled to become bag reads in the
+  bag-read series; treat them as pinned debt, not as a boundary to imitate. What
+  genuinely stays per-instance is what differs per *worker* within one engine:
+  `base_gpu_id` travels as a constructor argument (`MMEncoder(gpu_id=...)`;
+  `BaseMultimodalProcessor._fast_image_processor_device` is the shape to copy).
 - **Whole-object passes** (`f(server_args)` handing the instance along) keep the
   supplied-instance contract; don't rewrite the parameter reads unless the
   field is runtime-mutated (see the elastic-EP `ep_size` case in
   `eplb/expert_location.py`) — **or the field is one that resolution fills in
   and the callee runs in a process that has published.** That second case is
-  step-12 debt, not a style question: the record is destined to carry the
+  pinned debt, not a style question: the record is destined to carry the
   user's raw input, so `server_args.page_size` inside a runner-owned
   constructor will read the raw pre-resolution value instead of the effective
   one. Debt means a decision, not automatically a bag read: pick where the
   value should come from — usually the `get_*()` bag, sometimes a runner stamp
   or a constructor argument (the per-mode attention pair and the encode-server
-  `gpu_id` above are dispositions of exactly this debt). And the per-instance
-  boundaries above stay exempt from this unless-clause: a multi-Engine site
-  must not become a process-global bag read even for a resolution-filled
-  field. `test_supplied_instance_exposure_ratchet.py`
+  `gpu_id` above are dispositions of exactly this debt). The per-instance
+  boundaries above are **not** exempt from this unless-clause (the multi-Engine
+  exemption is retracted); each one gets its own disposition.
+  `test_supplied_instance_exposure_ratchet.py`
   pins the remaining set — three spellings of the read: `server_args.field`,
   literal-name `getattr(server_args, "field", default)`, and the parked form
   (`self.x = server_args` in a method that takes the parameter, read as
@@ -224,13 +222,15 @@ this).
 `self.server_args.field` is still right for handed per-instance config (see
 "Reads that legitimately stay on a ServerArgs instance" above for the full set —
 per-instance boundaries and whole-object passes; there are no per-runner config
-copies to read any more). The allow-list is the
-tokenizer-manager family, `entrypoints/`, the tokenizer-process multimodal
-processors, `GrammarManager`, `MMEncoder` — but not for one single reason:
+copies to read any more). The allow-list is `GrammarManager` and `MMEncoder`;
+the tokenizer-manager family, `entrypoints/`, and the tokenizer-process
+multimodal processors sit beside it only as pinned debt — not for one single
+reason:
 
-- the tokenizer-manager family and `entrypoints/` are the multi-Engine case
-  proper: several of them can live in one process, so a bag read would answer
-  from whichever Engine published last;
+- the tokenizer-manager family and `entrypoints/` are **pinned debt awaiting
+  conversion to bag reads** (the old multi-Engine justification is retracted —
+  one process, one live config); the reads still work today because the
+  instance carries resolved values;
 - `GrammarManager` is a handed instance — it is constructed with the config its
   owner hands it and never assumes a published namespace;
 - `MMEncoder` publishes the very instance it is handed (`publish(server_args,
@@ -474,7 +474,7 @@ Never module-skip a test "until the migration settles" — seed the context inst
 ## Where to read the code
 
 Key source files: `python/sglang/srt/runtime_context.py` (the container, every tier,
-`publish`, `_ConfigBag`, `preserve_config`, `override_server_args`),
+`publish`, `_ConfigBag`, `override_server_args`),
 `python/sglang/srt/arg_groups/overrides.py` (override registry, passes,
 `declare_late_resolution`), `python/sglang/srt/server_args.py` (`NS` metadata,
 `Arg(..., resolvable=True)`, `__setattr__` strict guard), and the guardrail tests under
