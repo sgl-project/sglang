@@ -16,11 +16,21 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.normalization import AdaLayerNormContinuous
 
+from sglang.kernels.ops.diffusion.bitexact_gate import BitExactFusionGate
 from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
+from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
+    can_use_fused_layernorm_modulate,
+    fused_layernorm_modulate_raw,
+    is_plain_layer_norm,
+)
+from sglang.kernels.ops.diffusion.triton.silu_mul_bitexact import (
+    fused_packed_silu_mul_bitexact,
+)
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
@@ -58,6 +68,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -66,31 +77,119 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
+_get_qkv_projections = get_qkv_projections
 
-def _get_qkv_projections(
-    attn: "Flux2Attention", hidden_states, encoder_hidden_states=None
-):
-    if attn.use_fused_qkv:
-        qkv, _ = attn.to_qkv(hidden_states)
-        query, key, value = [t.contiguous() for t in qkv.chunk(3, dim=-1)]
-    else:
-        query, _ = attn.to_q(hidden_states)
-        key, _ = attn.to_k(hidden_states)
-        value, _ = attn.to_v(hidden_states)
+_FLUX2_LN_MOD = BitExactFusionGate("FLUX.2 fused LN+modulate", per_signature=True)
+_FLUX2_LN_MOD_SIGS = _FLUX2_LN_MOD.verified_sigs
+assert _FLUX2_LN_MOD_SIGS is not None
+_FLUX2_SWIGLU = BitExactFusionGate("FLUX.2 fused SwiGLU", per_signature=True)
+_FLUX2_SWIGLU_SIGS = _FLUX2_SWIGLU.verified_sigs
+assert _FLUX2_SWIGLU_SIGS is not None
 
-    encoder_query = encoder_key = encoder_value = None
-    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        if attn.use_fused_added_qkv:
-            added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-            encoder_query, encoder_key, encoder_value = [
-                t.contiguous() for t in added_qkv.chunk(3, dim=-1)
-            ]
+
+def _flux2_norm_modulate(
+    norm: nn.Module,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+) -> torch.Tensor:
+    """Bit-exact single-kernel ``LN(x) * (1 + scale) + shift``."""
+    # Preserve the original expression for Dynamo/Inductor.  This direct
+    # Triton dispatch is intentionally an eager fast path.
+    if torch.compiler.is_compiling():
+        return norm(x) * (1 + scale) + shift
+
+    scale_row = scale.squeeze(1) if scale.dim() == 3 and scale.shape[1] == 1 else scale
+    shift_row = shift.squeeze(1) if shift.dim() == 3 and shift.shape[1] == 1 else shift
+    if (
+        _FLUX2_LN_MOD.disabled
+        or not is_plain_layer_norm(norm, x.shape[-1])
+        or not can_use_fused_layernorm_modulate(x, scale_row, shift_row)
+    ):
+        return norm(x) * (1 + scale) + shift
+
+    # The bit-exact contract is set by dtype/reduction width/affine-row
+    # layout, not by the number of independent rows.  Excluding sequence
+    # length lets the representative warmup verify the real prompt path too.
+    sig = (
+        x.dtype,
+        x.device,
+        x.shape[0],
+        x.shape[-1],
+        x.stride(-1),
+        scale_row.stride(0) if scale_row.shape[0] > 1 else x.shape[-1],
+        shift_row.stride(0) if shift_row.shape[0] > 1 else x.shape[-1],
+        norm.eps,
+    )
+    verified = sig in _FLUX2_LN_MOD_SIGS
+    if not verified and torch.cuda.is_current_stream_capturing():
+        return norm(x) * (1 + scale) + shift
+    try:
+        # Direct dispatch avoids custom-op overhead on this eager-only path.
+        out = fused_layernorm_modulate_raw(x, scale_row, shift_row, norm.eps)
+    except Exception as exc:
+        _FLUX2_LN_MOD.on_exception(exc, logger=logger)
+        return norm(x) * (1 + scale) + shift
+    if verified:
+        return out
+    ref = norm(x) * (1 + scale) + shift
+    return _FLUX2_LN_MOD.accept_or_fallback(
+        out,
+        ref,
+        sig=sig,
+        logger=logger,
+        mismatch_msg=(
+            "FLUX.2 fused LN+modulate fast path is not bit-exact on this "
+            "platform; falling back to eager"
+        ),
+    )
+
+
+def _flux2_swiglu(x: torch.Tensor) -> torch.Tensor:
+    """Bit-exact fused SwiGLU for the packed FLUX.2 FFN projection."""
+    half = x.shape[-1] // 2
+    # Let Inductor fuse the reference expression in torch.compile mode.
+    if torch.compiler.is_compiling():
+        return F.silu(x[..., :half]) * x[..., half:]
+
+    # Sequence length only changes the launch grid; D and row stride define
+    # how the two packed halves are addressed and therefore need verification.
+    sig = (x.dtype, x.device, x.shape[0], x.shape[-1], x.stride(-2), x.stride(-1))
+    verified = sig in _FLUX2_SWIGLU_SIGS
+    can_fuse = (
+        not _FLUX2_SWIGLU.disabled
+        and x.is_cuda
+        and x.dtype is torch.bfloat16
+        and x.dim() == 3
+        and x.stride(-1) == 1
+        and x.stride(-2) >= x.shape[-1]
+        and x.stride(0) == x.shape[1] * x.stride(1)
+        and x.shape[-1] % 2 == 0
+        and x.numel() > 0
+    )
+    # Per-signature verification may compare tensors and synchronize.  Never
+    # verify a new layout while a CUDA graph is being captured.
+    if can_fuse and not verified and torch.cuda.is_current_stream_capturing():
+        return F.silu(x[..., :half]) * x[..., half:]
+    if can_fuse:
+        try:
+            out = fused_packed_silu_mul_bitexact(x)
+        except Exception as exc:
+            _FLUX2_SWIGLU.on_exception(exc, logger=logger)
         else:
-            encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
-            encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
-            encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
-
-    return query, key, value, encoder_query, encoder_key, encoder_value
+            if verified:
+                return out
+            return _FLUX2_SWIGLU.accept_or_fallback(
+                out,
+                F.silu(x[..., :half]) * x[..., half:],
+                sig=sig,
+                logger=logger,
+                mismatch_msg=(
+                    "FLUX.2 fused SwiGLU fast path is not bit-exact on this "
+                    "platform; falling back to eager"
+                ),
+            )
+    return F.silu(x[..., :half]) * x[..., half:]
 
 
 class Flux2SwiGLU(nn.Module):
@@ -99,14 +198,8 @@ class Flux2SwiGLU(nn.Module):
     layer fused into the first linear layer of the FF sub-block. Thus, this module has no trainable parameters.
     """
 
-    def __init__(self):
-        super().__init__()
-        self.gate_fn = nn.SiLU()
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x1, x2 = x.chunk(2, dim=-1)
-        x = self.gate_fn(x1) * x2
-        return x
+        return _flux2_swiglu(x)
 
 
 class Flux2FeedForward(nn.Module):
@@ -646,8 +739,9 @@ class Flux2SingleTransformerBlock(nn.Module):
 
         mod_shift, mod_scale, mod_gate = temb_mod_params
 
-        norm_hidden_states = self.norm(hidden_states)
-        norm_hidden_states = (1 + mod_scale) * norm_hidden_states + mod_shift
+        norm_hidden_states = _flux2_norm_modulate(
+            self.norm, hidden_states, mod_scale, mod_shift
+        )
 
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
@@ -760,14 +854,17 @@ class Flux2TransformerBlock(nn.Module):
         ) = temb_mod_params_txt
 
         # Img stream
-        norm_hidden_states = self.norm1(hidden_states)
-        norm_hidden_states = (1 + scale_msa) * norm_hidden_states + shift_msa
+        norm_hidden_states = _flux2_norm_modulate(
+            self.norm1, hidden_states, scale_msa, shift_msa
+        )
 
         # Conditioning txt stream
-        norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
-        norm_encoder_hidden_states = (
-            1 + c_scale_msa
-        ) * norm_encoder_hidden_states + c_shift_msa
+        norm_encoder_hidden_states = _flux2_norm_modulate(
+            self.norm1_context,
+            encoder_hidden_states,
+            c_scale_msa,
+            c_shift_msa,
+        )
 
         # Attention on concatenated img + txt stream
         attention_outputs = self.attn(
@@ -783,8 +880,9 @@ class Flux2TransformerBlock(nn.Module):
         # Process attention outputs for the image stream (`hidden_states`).
         hidden_states = residual_gate_add(hidden_states, attn_output, gate_msa)
 
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+        norm_hidden_states = _flux2_norm_modulate(
+            self.norm2, hidden_states, scale_mlp, shift_mlp
+        )
 
         ff_output = self.ff(norm_hidden_states)
         hidden_states = residual_gate_add(hidden_states, ff_output, gate_mlp)
@@ -794,9 +892,11 @@ class Flux2TransformerBlock(nn.Module):
             encoder_hidden_states, context_attn_output, c_gate_msa
         )
 
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = (
-            norm_encoder_hidden_states * (1 + c_scale_mlp) + c_shift_mlp
+        norm_encoder_hidden_states = _flux2_norm_modulate(
+            self.norm2_context,
+            encoder_hidden_states,
+            c_scale_mlp,
+            c_shift_mlp,
         )
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
