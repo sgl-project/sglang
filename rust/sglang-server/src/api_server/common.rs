@@ -16,8 +16,9 @@ use axum::{
 use super::AppState;
 use super::guard::AbortGuard;
 use super::submit::submit;
+use crate::message::config::ServerArgs;
+use crate::message::ids::Rid;
 use crate::message::{ControlRequest, EgressItem, GetInternalStateReq, RequestKind};
-use crate::runtime::ServerArgs;
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
@@ -114,9 +115,7 @@ async fn model_info(State(state): State<AppState>) -> Response {
 async fn server_info(State(state): State<AppState>) -> Response {
     let bytes = match await_control_result(
         &state,
-        ControlRequest::GetInternalStateReq(GetInternalStateReq::new(
-            crate::ids::Rid::new().to_string(),
-        )),
+        ControlRequest::GetInternalStateReq(GetInternalStateReq::new(Rid::new().to_string())),
     )
     .await
     {

@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use axum::Router;
 
-use crate::runtime::ServerArgs;
+use crate::message::config::ServerArgs;
 use crate::tokenizer_manager::ActivityCounter;
 use crate::tokenizer_manager::Senders;
 use disaggregation::bootstrap as pd_bootstrap;

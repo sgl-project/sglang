@@ -26,11 +26,11 @@ use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_egress_stream,
     openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::ids::Rid;
 use crate::message::{
     ChunkEvent, ChunkExtras, EgressItem, GenerateRequest, Matched, OneOrMany, RequestKind,
-    SamplingParams, TokenIds,
+    SamplingParams, TokenIds, ids::Rid,
 };
+use crate::utils::error::Error;
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new().route("/v1/completions", post(completions))
@@ -259,7 +259,7 @@ async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<Str
                 false,
             )
         }),
-        Some(EgressItem::Error(crate::error::Error::Validation(message))) => {
+        Some(EgressItem::Error(Error::Validation(message))) => {
             Err(openai_error(StatusCode::BAD_REQUEST, &message, false))
         }
         Some(EgressItem::Error(error)) => {

@@ -15,6 +15,7 @@ use axum::routing::{post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use crate::utils::environ;
 use crate::utils::response::json_error;
 use crate::utils::serialize::{parse_int, parse_int_opt, parse_int_vec};
 
@@ -337,7 +338,7 @@ fn router(state: Arc<Registry>) -> Router {
 
 /// Drop room entries
 async fn cleanup_sweeper(state: Arc<Registry>) {
-    let cleanup_interval = Duration::from_secs(crate::environ::env_u64(
+    let cleanup_interval = Duration::from_secs(environ::env_u64(
         ENTRY_CLEANUP_INTERVAL_ENV,
         ENTRY_CLEANUP_INTERVAL_DEFAULT_SECS,
     ));
@@ -356,7 +357,8 @@ pub(crate) fn router_and_sweeper() -> (Router, impl std::future::Future<Output =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{Runtime, RuntimeConfig, RustServerServerArgs, ServerArgs};
+    use crate::message::config::{RuntimeConfig, RustServerServerArgs, ServerArgs};
+    use crate::runtime::Runtime;
     use std::io::{Read, Write};
     use std::net::SocketAddr;
 

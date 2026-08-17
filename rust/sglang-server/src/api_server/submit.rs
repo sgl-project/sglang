@@ -6,10 +6,9 @@ use axum::{http::StatusCode, response::Response};
 use tokio::sync::mpsc;
 
 use super::{AppState, native_api::native_error};
-use crate::fsm::RequestState;
-use crate::ids::Rid;
-use crate::message::{EgressItem, EgressSink, Request, RequestKind};
+use crate::message::{EgressItem, EgressSink, Request, RequestKind, ids::Rid};
 use crate::tokenizer_manager::TmEvent;
+use crate::utils::fsm::RequestState;
 
 /// Submit one request; returns the rid, its hashed routing key, and the egress
 /// receiver. Every request arrives with its final rid — a generate request from

@@ -14,11 +14,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::error::Error;
-use crate::fsm::Event;
 use crate::message::{Request, RequestKind, TokenIds};
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::TmEvent;
+use crate::utils::{error::Error, fsm::Event};
 
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
 /// (read-only) across all pinned workers.
@@ -230,8 +229,8 @@ impl Runnable for TokenizerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsm::RequestState;
     use crate::message::{EgressSink, GenerateRequest, RequestKind, SamplingParams};
+    use crate::utils::fsm::RequestState;
     use tokio::sync::mpsc;
 
     /// One token per whitespace-separated word, so a stop's token count differs

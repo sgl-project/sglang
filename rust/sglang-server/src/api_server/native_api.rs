@@ -31,12 +31,13 @@ use super::frame::{
 };
 use super::guard::AbortGuard;
 use super::submit::submit;
-use crate::environ::env_bool;
-use crate::ids::Rid;
 use crate::message::{
-    ChunkEvent, EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams,
+    ChunkEvent, EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams, ids::Rid,
 };
-use crate::utils::response::{error_response, error_value};
+use crate::utils::{
+    environ,
+    response::{error_response, error_value},
+};
 
 /// API-local timing for one request.
 ///
@@ -99,9 +100,9 @@ pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Res
 /// request already proves the frontend is up).
 fn health_routes() -> Router<AppState> {
     let timeout =
-        std::time::Duration::from_secs(crate::environ::env_u64("SGLANG_HEALTH_CHECK_TIMEOUT", 20));
+        std::time::Duration::from_secs(environ::env_u64("SGLANG_HEALTH_CHECK_TIMEOUT", 20));
     let probe = get(move |state: State<AppState>| health_generate(state, timeout));
-    let health = if env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
+    let health = if environ::env_bool("SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION", true) {
         probe.clone()
     } else {
         get(|| async { StatusCode::OK.into_response() })
@@ -541,6 +542,7 @@ mod tests {
     use super::*;
     use crate::message::ChunkEvent;
     use crate::tokenizer_manager::Senders;
+    use crate::utils::error::Error;
     use futures::StreamExt;
     use std::time::Duration;
     fn senders() -> Senders {
@@ -723,11 +725,9 @@ mod tests {
             generation_event_stream(receivers, AbortGuard::new_empty(senders()), false, true);
         futures::pin_mut!(stream);
 
-        tx0.send(EgressItem::Error(crate::error::Error::Validation(
-            "bad".into(),
-        )))
-        .await
-        .unwrap();
+        tx0.send(EgressItem::Error(Error::Validation("bad".into())))
+            .await
+            .unwrap();
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["index"], 0);
         assert_eq!(v["error"]["code"], 400);

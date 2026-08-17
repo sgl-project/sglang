@@ -12,9 +12,8 @@ use serde::Deserialize;
 
 use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
 use super::{OneOrMany, OneOrManyItem, SamplingParams, SamplingParamsInput, TokenIds};
-use crate::environ::env_u64;
-use crate::error::Error;
-use crate::ids::Rid;
+use crate::message::ids::Rid;
+use crate::utils::{environ::env_u64, error::Error};
 
 /// Hard cap on how many scheduler requests one `/generate` HTTP call may expand
 /// into. Every column below is allocated per item before anything is dispatched,
@@ -519,7 +518,7 @@ fn split_mm_column(
 /// plus the owned inputs from [`GenerateRequest::take_mm_work`].
 #[derive(Debug)]
 pub struct MmRequest {
-    pub rid: crate::ids::Rid,
+    pub rid: Rid,
     pub work: MmWorkItem,
 }
 

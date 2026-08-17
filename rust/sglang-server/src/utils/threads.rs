@@ -11,7 +11,8 @@ use std::thread::JoinHandle;
 
 use core_affinity::CoreId;
 
-use super::{Runnable, RuntimeConfig};
+use super::runtime::Runnable;
+use crate::message::config::RuntimeConfig;
 
 /// Cores reserved for the two TokenizerManager router threads (`tm-ingress`,
 /// `tm-egress`) — light, latency-sensitive channel routers, so one core each.

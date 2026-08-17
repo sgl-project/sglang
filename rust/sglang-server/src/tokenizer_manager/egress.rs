@@ -13,13 +13,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
-use crate::ids::Rid;
-use crate::message::DetokMsg;
 use crate::message::{
-    ChunkEvent, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, for_each_chunk,
+    ChunkEvent, DetokMsg, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, for_each_chunk,
+    ids::Rid,
 };
-use crate::ring::EgressConsumer;
 use crate::runtime::Runnable;
+use crate::tokenizer_manager::channel::EgressConsumer;
 use crate::tokenizer_manager::{Senders, recv};
 
 /// A monotonic counter bumped once per egress-ring frame the dispatcher drains.

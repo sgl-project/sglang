@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 
 use super::TokenIds;
 use super::finish_reason::FinishReason;
-use crate::error::Error;
-use crate::ids::Rid;
+use crate::message::ids::Rid;
+use crate::utils::error::Error;
 
 /// Per-request back-channel the detok shard writes egress frames to and the API
 /// handler drains for SSE; bounded, and receiver-drop (disconnect) = stream end.

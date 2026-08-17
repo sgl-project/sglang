@@ -11,16 +11,8 @@
 //! All are non-blocking, so the GIL is never held across a wait.
 
 mod api_server;
-mod detokenizer;
-mod environ;
-mod error;
-mod fsm;
-mod ids;
 mod message;
 mod mm;
-mod ring;
-mod runtime;
-mod tokenizer;
 mod tokenizer_manager;
 mod utils;
 
@@ -30,7 +22,8 @@ use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 
-use crate::runtime::{Runtime, RuntimeConfig};
+use crate::message::config::{RuntimeConfig, RustServerServerArgs, ServerArgs};
+use crate::utils::runtime;
 
 /// One drained MM result (see [`Server::take_mm`]). Exactly one of
 /// `features`/`shm_names` is `Some`: inline features for single-rank serving
@@ -64,7 +57,7 @@ struct IngressBatch {
 /// [`Server::start`], then poll it from the scheduler event loop.
 #[pyclass]
 struct Server {
-    rt: Runtime,
+    rt: runtime::Runtime,
 }
 
 #[pymethods]
@@ -93,12 +86,9 @@ impl Server {
         // Static server metadata (server_args + model_config) dumped by the
         // scheduler; parse and validate mandatory fields now so a bad/missing
         // field is a boot error, not a request-time 500.
-        let server_args: runtime::ServerArgs = runtime::ServerArgs::from_json(server_args_json)
-            .map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "bad server_args_json: {e}"
-                ))
-            })?;
+        let server_args: ServerArgs = ServerArgs::from_json(server_args_json).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad server_args_json: {e}"))
+        })?;
         server_args.validate_mandatory().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("server_args: {e}"))
         })?;
@@ -115,7 +105,7 @@ impl Server {
             })?;
 
         let cfg = RuntimeConfig {
-            rust_server_args: runtime::RustServerServerArgs {
+            rust_server_args: RustServerServerArgs {
                 http_addr,
                 api_worker_num: server_args.api_worker_num(),
                 ingress_ring_cap,

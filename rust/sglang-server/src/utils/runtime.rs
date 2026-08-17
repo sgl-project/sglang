@@ -17,23 +17,23 @@
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-mod config;
-mod runnable;
-mod threads;
+use crate::message::{DetokMsg, config::RuntimeConfig};
 
-pub use config::{DefaultSamplingParams, RuntimeConfig, RustServerServerArgs, ServerArgs};
-
-use crate::message::DetokMsg;
-use crate::ring::{
+use super::threads::{plan_cores, spawn_pool};
+use crate::tokenizer_manager::channel::{
     EgressConsumer, EgressProducer, IngressConsumer, IngressProducer, egress_ring, ingress_ring,
 };
-use crate::runtime::threads::{plan_cores, spawn_pool};
 use crate::tokenizer_manager::{Senders, TmEvent};
 use crate::utils::sock::bind_tcp_listener;
-use crate::{api_server, detokenizer, tokenizer, tokenizer_manager};
+use crate::{
+    api_server, tokenizer_manager, tokenizer_manager::detokenizer, tokenizer_manager::tokenizer,
+};
 
-// Re-export so stages keep importing `crate::runtime::Runnable`.
-pub use runnable::Runnable;
+/// A pipeline stage that owns its channel handles + config and runs a blocking
+/// loop until its inbox closes.
+pub trait Runnable: Send + 'static {
+    fn run(self);
+}
 
 /// Live runtime. Held by the pyo3 bridge; the Python boundary reads `ingress`
 /// and `egress`. `request_shutdown` (also run on `Drop`) stops every stage.
@@ -340,6 +340,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::config::{RuntimeConfig, RustServerServerArgs, ServerArgs};
 
     /// Minimal boot args. `skip_tokenizer_init` avoids loading a tokenizer/detok
     /// model; `model_config` carries the two fields `Limits::from_server_args`

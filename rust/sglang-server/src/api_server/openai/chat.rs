@@ -36,7 +36,8 @@ use super::{
     AppState, ChatFormatter, collect_output, contains_media, error_payload, indexed_egress_stream,
     openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::ids::Rid;
+use crate::message::config::{DefaultSamplingParams, ServerArgs};
+use crate::message::ids::Rid;
 use crate::message::{ChunkExtras, EgressItem, GenerateRequest, OneOrMany, SamplingParams};
 
 pub(super) fn routes() -> Router<AppState> {
@@ -283,7 +284,7 @@ pub(super) fn chat_sampling(
     tool_choice: &DynamoToolChoice,
     tools: &[ToolDefinition],
     parallel_tool_calls: Option<bool>,
-    server_args: &crate::runtime::ServerArgs,
+    server_args: &ServerArgs,
 ) -> Result<SamplingParams, String> {
     let mut sampling = chat_sampling_params(
         request,
@@ -352,10 +353,7 @@ impl SamplingDefaults {
     };
     /// The resolved model defaults (empty in `--sampling-defaults openai`
     /// mode), which slot between the user's values and the OpenAI terminals.
-    pub(super) fn with_model_defaults(
-        mut self,
-        model: &crate::runtime::DefaultSamplingParams,
-    ) -> SamplingDefaults {
+    pub(super) fn with_model_defaults(mut self, model: &DefaultSamplingParams) -> SamplingDefaults {
         self.temperature = model.temperature;
         self.top_p = model.top_p;
         self
@@ -855,7 +853,7 @@ mod tests {
     };
     use crate::api_server::guard::AbortGuard;
     use crate::message::ChunkExtras;
-    use crate::runtime::DefaultSamplingParams;
+    use crate::message::config::DefaultSamplingParams;
     use axum::http::StatusCode;
     use dynamo_protocols::types::{CreateChatCompletionRequest, Stop};
     use futures::StreamExt;

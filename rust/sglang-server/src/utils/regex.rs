@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
-use crate::error::Error;
+use super::error::Error;
 
 /// `MAX_LEN` from Python's `get_max_seq_length`: the bound for an *unbounded* stop
 /// regex (`\d+`, `.*`, …) or one we can't statically size — the scheduler then

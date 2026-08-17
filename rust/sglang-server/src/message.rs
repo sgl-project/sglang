@@ -8,8 +8,10 @@
 //! `SamplingParams` port), [`io_struct`] (the scheduler wire structs), [`types`]
 //! (the shared wire-shape adapters both directions use).
 
+pub mod config;
 mod egress;
 mod finish_reason;
+pub mod ids;
 mod io_struct;
 pub mod mm_payload;
 mod request;
@@ -32,8 +34,8 @@ pub(crate) use types::{OneOrMany, OneOrManyItem, TokenIds};
 
 use bytes::Bytes;
 
-use crate::fsm::RequestState;
-use crate::ids::Rid;
+use crate::utils::fsm::RequestState;
+use ids::Rid;
 
 /// The owned request as it travels ingress stages (single owner, so `state` is
 /// mutated lock-free). Common fields here; variant data in [`RequestKind`].

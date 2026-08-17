@@ -21,9 +21,9 @@ use super::AppState;
 use super::frame::OutputAccumulator;
 use super::guard::AbortGuard;
 use super::submit::submit;
-use crate::ids::Rid;
-use crate::message::{ChunkEvent, EgressItem, GenerateRequest, RequestKind};
-use crate::runtime::ServerArgs;
+use crate::message::config::ServerArgs;
+use crate::message::{ChunkEvent, EgressItem, GenerateRequest, RequestKind, ids::Rid};
+use crate::tokenizer_manager::tokenizer;
 use crate::utils::response::error_response;
 
 const MAX_OPENAI_CHOICES: usize = 4096;
@@ -47,7 +47,7 @@ pub(super) fn load_chat_support(server_args: &ServerArgs) -> Option<ChatFormatte
     if server_args.skip_tokenizer_init || server_args.tokenizer_path.is_empty() {
         return None;
     }
-    let config_file = crate::tokenizer::resolve_model_file(
+    let config_file = tokenizer::resolve_model_file(
         &server_args.tokenizer_path,
         server_args.revision.as_deref(),
         "tokenizer_config.json",

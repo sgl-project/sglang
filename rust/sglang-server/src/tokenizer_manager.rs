@@ -10,14 +10,16 @@
 //! the rest of the pipeline only through `flume` channels: [`TmEvent`] into the
 //! ingress loop, [`Senders`] fanning out to the pools.
 
+pub mod channel;
+pub mod detokenizer;
 mod egress;
 mod ingress;
+pub mod tokenizer;
 
 pub use egress::{ActivityCounter, Egress};
 pub use ingress::{Ingress, Limits, Mm};
 
-use crate::ids::Rid;
-use crate::message::{DetokMsg, Request};
+use crate::message::{DetokMsg, Request, ids::Rid};
 
 /// Blocking receive that also wakes on shutdown: returns `None` when `rx` closes
 /// *or* the `shutdown` sender is dropped.

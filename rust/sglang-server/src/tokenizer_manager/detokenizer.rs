@@ -23,13 +23,14 @@
 
 use std::collections::HashMap;
 
-use crate::error::Error;
-use crate::fsm::{Event, RequestState};
-use crate::ids::Rid;
 use crate::message::DetokMsg;
-use crate::message::{ChunkEvent, EgressItem, EgressSink, Matched, SinkError, TokenIds};
-use crate::runtime::Runnable;
+use crate::message::{ChunkEvent, EgressItem, EgressSink, Matched, SinkError, TokenIds, ids::Rid};
 use crate::tokenizer_manager::AbortSource;
+use crate::utils::runtime::Runnable;
+use crate::utils::{
+    error::Error,
+    fsm::{Event, RequestState},
+};
 
 /// Default for `skip_special_tokens` (SGLang's SamplingParams default). The
 /// per-request value isn't available on the egress side yet; see the note in

@@ -21,17 +21,18 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 
-use crate::error::Error;
-use crate::fsm::{Event, RequestState, ValidationOutcome};
-use crate::ids::Rid;
-
+use crate::message::config::ServerArgs;
 use crate::message::{
     AbortReq, ControlRequest, DetokMsg, EgressItem, GenerateRequest, IngressMsg, MmRequest,
-    Request, RequestKind,
+    Request, RequestKind, ids::Rid,
 };
-use crate::ring::IngressProducer;
-use crate::runtime::{Runnable, ServerArgs};
+use crate::runtime::Runnable;
+use crate::tokenizer_manager::channel::IngressProducer;
 use crate::tokenizer_manager::{AbortSource, Senders, TmEvent};
+use crate::utils::{
+    error::Error,
+    fsm::{Event, RequestState, ValidationOutcome},
+};
 
 /// Ingress FSM dispatcher stage. Owns its inbox + downstream handles, so the
 /// runtime spawns it as a [`Runnable`] rather than calling a free `run_*` fn
@@ -722,9 +723,9 @@ fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Er
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsm::RequestState;
     use crate::message::{EgressSink, GenerateRequest, SamplingParams};
-    use crate::ring::{IngressConsumer, ingress_ring};
+    use crate::tokenizer_manager::channel::{IngressConsumer, ingress_ring};
+    use crate::utils::fsm::RequestState;
     use tokio::sync::mpsc;
 
     /// An `Ingress` plus its detok-shard receiver, ring consumer (keep alive —

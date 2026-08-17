@@ -12,10 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::message::MmRequest;
-use crate::runtime::Runnable;
-use crate::tokenizer::TextTokenizer;
+use crate::message::ids::Rid;
 use crate::tokenizer_manager::TmEvent;
-
+use crate::tokenizer_manager::tokenizer::TextTokenizer;
+use crate::utils::runtime::Runnable;
 /// A named POSIX shared-memory segment owning its name: dropped → unlinked.
 ///
 /// Written by an MM worker so the TP broadcast carries a ~100-byte
@@ -211,7 +211,7 @@ impl Context {
 /// buffers already parked; `Err` rejects the request back to the client.
 fn process(
     ctx: &Context,
-    rid: &crate::ids::Rid,
+    rid: &Rid,
     mut work: crate::message::MmWorkItem,
 ) -> Result<Vec<i32>, String> {
     let caller_hashes = std::mem::take(&mut work.mm_hashes);

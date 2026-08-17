@@ -34,8 +34,7 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::OneOrMany;
-use crate::error::Error;
-use crate::utils::regex::RegexPattern;
+use crate::utils::{error::Error, regex::RegexPattern};
 
 /// `_SAMPLING_EPS` — temperatures in `[0, eps)` mean greedy decoding.
 const SAMPLING_EPS: f64 = 1e-6;

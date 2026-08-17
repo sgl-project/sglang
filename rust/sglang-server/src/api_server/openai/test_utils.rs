@@ -19,9 +19,9 @@ use serde_json::json;
 use tower::util::ServiceExt;
 
 use super::{openai_error, routes};
-use crate::ids::Rid;
+use crate::message::config::ServerArgs;
+use crate::message::ids::Rid;
 use crate::message::{ChunkEvent, EgressItem};
-use crate::runtime::ServerArgs;
 use crate::tokenizer_manager::Senders;
 
 pub(super) fn senders() -> Senders {
