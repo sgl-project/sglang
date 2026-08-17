@@ -465,18 +465,31 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                 )
 
-    def stage_shared_inputs(self, forward_batch: ForwardBatch):
-        """Pre-verify half of the replay staging: pad fills, static input
-        copies, host mirrors, and the out-graph metadata init. Everything
-        here is known before the verify launch; verify products go through
-        stage_verify_outputs() afterwards."""
-        assert forward_batch.out_cache_loc is not None
+    def stage_shared_reads(
+        self,
+        *,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor],
+        req_pool_indices: torch.Tensor,
+        spec_info=None,
+        extend_seq_lens: Optional[torch.Tensor] = None,
+        extend_seq_lens_cpu=None,
+        seq_lens_sum: Optional[int] = None,
+        global_num_tokens_cpu=None,
+        out_cache_loc_dsv4=None,
+    ):
+        """Pad fills, the gather-input copies, and the out-graph metadata
+        init -- the only staging whose pool gathers read shared buffers
+        (req_to_token), so the only part that may run before the verify
+        launch. Callable with just the three lead tensors (plan time builds
+        a spec view over the static buffers) or with the full forward-batch
+        fields (execute's unstaged path). Everything else is filled by
+        stage_replay_inputs()."""
         buffers = self.buffers
-
-        raw_bs = forward_batch.batch_size
-        num_tokens = forward_batch.input_ids.shape[0]
+        raw_bs = req_pool_indices.shape[0]
+        num_tokens = raw_bs * self.captured_req_width
         if self.require_mlp_tp_gather:
-            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
+            max_num_tokens = max(global_num_tokens_cpu)
             max_batch_size = (
                 max_num_tokens // self.captured_req_width
                 if self.model_runner.spec_algorithm.is_eagle()
@@ -497,27 +510,13 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.num_accept_tokens.fill_(self.captured_req_width)
             buffers.extend_seq_lens.fill_(self.captured_req_width)
 
-        # Batch the small per-field device copies into a grouped foreach copy
-        # (one foreach call per dtype pair) to cut launch overhead. Sources
-        # are plan-time tensors the planned tuple keeps alive until the post
-        # half; they sit pre-verify because the metadata init below consumes
-        # the padded buffers. seq_lens_cpu lives on host, handled further
-        # down. out_cache_loc is verify's fresh output -- staged in
-        # stage_verify_outputs().
-        copy_dsts = [
-            buffers.seq_lens[:raw_bs],
-            buffers.positions[:num_tokens],
-            buffers.req_pool_indices[:raw_bs],
-        ]
-        copy_srcs = [
-            forward_batch.seq_lens,
-            forward_batch.positions,
-            forward_batch.req_pool_indices,
-        ]
-        if forward_batch.extend_seq_lens is not None:
+        copy_dsts = [buffers.seq_lens[:raw_bs], buffers.req_pool_indices[:raw_bs]]
+        copy_srcs = [seq_lens, req_pool_indices]
+        if extend_seq_lens is not None:
             copy_dsts.append(buffers.extend_seq_lens[:raw_bs])
-            copy_srcs.append(forward_batch.extend_seq_lens)
+            copy_srcs.append(extend_seq_lens)
         else:
+            # v2 draft-extend windows are constant-width.
             buffers.extend_seq_lens[:raw_bs].fill_(self.captured_req_width)
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
@@ -528,49 +527,57 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 bs * self.captured_req_width
             )
 
-        if forward_batch.seq_lens_cpu is not None:
+        if seq_lens_cpu is not None:
             if bs != raw_bs:
                 buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
-            buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+            buffers.seq_lens_cpu[:raw_bs].copy_(seq_lens_cpu)
+            if seq_lens_sum is None:
+                seq_lens_sum = int(seq_lens_cpu.sum())
 
-        if forward_batch.extend_seq_lens_cpu is not None:
-            self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
+        if extend_seq_lens_cpu is not None:
+            self.extend_seq_lens_cpu[:raw_bs] = extend_seq_lens_cpu
         else:
             self.extend_seq_lens_cpu[:raw_bs] = [self.captured_req_width] * raw_bs
         if bs > raw_bs:
             self.extend_seq_lens_cpu[raw_bs:bs] = [self.captured_req_width] * (
                 bs - raw_bs
             )
-        forward_batch.spec_info.extend_seq_lens_cpu = list(
-            self.extend_seq_lens_cpu[:bs]
-        )
-        forward_batch.spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
 
+        if spec_info is None:
+            # Plan time: the real spec_info still belongs to verify. Metadata
+            # init reads verify products only by shape, so a view over the
+            # static buffers stands in.
+            spec_info = EagleDraftExtendInput(
+                hidden_states=None,
+                num_correct_drafts=buffers.num_correct_drafts[:bs],
+                num_accept_tokens=buffers.num_accept_tokens[:bs],
+                num_tokens_per_req=self.captured_req_width,
+                num_tokens_for_logprob_per_req=self.captured_req_width,
+            )
+        spec_info.extend_seq_lens_cpu = list(self.extend_seq_lens_cpu[:bs])
+        spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
         if bs != raw_bs:
-            forward_batch.spec_info.positions = buffers.positions[:num_tokens]
-            forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
-            forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
+            spec_info.positions = buffers.positions[:num_tokens]
+            spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
+            spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
 
         from types import SimpleNamespace
 
-        seq_lens_sum = forward_batch.seq_lens_sum
         if seq_lens_sum is not None:
             seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
         fb_view = SimpleNamespace(
             batch_size=bs,
             forward_mode=self.forward_mode,
-            input_ids=getattr(forward_batch, "input_ids", None),
+            input_ids=buffers.input_ids[:num_tokens],
             req_pool_indices=buffers.req_pool_indices,
             seq_lens=buffers.seq_lens,
             seq_lens_sum=seq_lens_sum,
             # Mirror absence must survive replay (stale buffer defeats None-guards).
-            seq_lens_cpu=(
-                None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu
-            ),
+            seq_lens_cpu=(None if seq_lens_cpu is None else buffers.seq_lens_cpu),
             encoder_lens=None,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
-            out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
-            spec_info=forward_batch.spec_info,
+            out_cache_loc_dsv4=out_cache_loc_dsv4,
+            spec_info=spec_info,
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 
@@ -578,53 +585,64 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.bs = bs
         self._staged_num_tokens = num_tokens
 
-    def stage_verify_outputs(
-        self,
-        forward_batch: ForwardBatch,
-        input_ids: torch.Tensor,
-        hidden_states: Optional[torch.Tensor],
-        num_correct_drafts: Optional[torch.Tensor],
-        num_accept_tokens: Optional[torch.Tensor],
-        out_cache_loc: Optional[torch.Tensor] = None,
-    ):
-        """Copy verify products (incl. verify's fresh out_cache_loc) into the
-        graph buffers; the post-verify half of the staging."""
+    def stage_replay_inputs(self, forward_batch: ForwardBatch):
+        """Fill the remaining graph inputs from the (post-verify) forward
+        batch: token ids, positions, verify products, and the padded
+        spec_info views."""
         buffers = self.buffers
-        num_tokens = self._staged_num_tokens
         raw_bs = self.raw_bs
-        copy_dsts = [buffers.input_ids[:num_tokens]]
-        copy_srcs = [input_ids]
-        if out_cache_loc is not None:
-            copy_dsts.append(buffers.out_cache_loc[:num_tokens])
-            copy_srcs.append(out_cache_loc)
-        if num_correct_drafts is not None:
+        bs = self.bs
+        num_tokens = self._staged_num_tokens
+        spec_info = forward_batch.spec_info
+        copy_dsts = [
+            buffers.input_ids[:num_tokens],
+            buffers.positions[:num_tokens],
+            buffers.out_cache_loc[:num_tokens],
+        ]
+        copy_srcs = [
+            forward_batch.input_ids,
+            forward_batch.positions,
+            forward_batch.out_cache_loc,
+        ]
+        if spec_info.num_correct_drafts is not None:
             copy_dsts.append(buffers.num_correct_drafts[:raw_bs])
-            copy_srcs.append(num_correct_drafts)
+            copy_srcs.append(spec_info.num_correct_drafts)
             copy_dsts.append(buffers.num_accept_tokens[:raw_bs])
-            copy_srcs.append(num_accept_tokens)
+            copy_srcs.append(spec_info.num_accept_tokens)
         _grouped_foreach_copy_(copy_dsts, copy_srcs)
 
         # hidden_states is large + contiguous: copy_() uses the cudaMemcpyAsync
         # DMA engine; foreach would force the ~3x slower compute-kernel copy.
         if (
             buffers.hidden_states is not None
-            and hidden_states is not None
-            and hidden_states.shape[1] == buffers.hidden_states.shape[1]
+            and spec_info.hidden_states is not None
+            and spec_info.hidden_states.shape[1] == buffers.hidden_states.shape[1]
         ):
-            buffers.hidden_states[:num_tokens].copy_(hidden_states)
+            buffers.hidden_states[:num_tokens].copy_(spec_info.hidden_states)
+
+        spec_info.extend_seq_lens_cpu = list(self.extend_seq_lens_cpu[:bs])
+        spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
+        if bs != raw_bs:
+            spec_info.positions = buffers.positions[:num_tokens]
+            spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
+            spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
 
     def execute(self, forward_batch: ForwardBatch, staged: bool = False):
+        assert forward_batch.out_cache_loc is not None
         self.deepep_adapter.replay()
         if not staged:
-            self.stage_shared_inputs(forward_batch)
-            self.stage_verify_outputs(
-                forward_batch,
-                input_ids=forward_batch.input_ids,
-                hidden_states=forward_batch.spec_info.hidden_states,
-                num_correct_drafts=forward_batch.spec_info.num_correct_drafts,
-                num_accept_tokens=forward_batch.spec_info.num_accept_tokens,
-                out_cache_loc=forward_batch.out_cache_loc,
+            self.stage_shared_reads(
+                seq_lens=forward_batch.seq_lens,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+                req_pool_indices=forward_batch.req_pool_indices,
+                spec_info=forward_batch.spec_info,
+                extend_seq_lens=forward_batch.extend_seq_lens,
+                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                seq_lens_sum=forward_batch.seq_lens_sum,
+                global_num_tokens_cpu=forward_batch.global_num_tokens_cpu,
+                out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
             )
+        self.stage_replay_inputs(forward_batch)
         # Staging done -- the forward is done reading the shared pool. Publish
         # a read-done event the scheduler's WAR barrier waits on (draft extend
         # is the EAGLE-family last shared-read phase; last write wins the mailbox).
