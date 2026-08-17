@@ -50,6 +50,7 @@ docker run -d --name sglang-qwen3 --gpus '"device=3"' -p 30000:30000 \
 
 > 注:容器重建会丢失 pip 安装的额外包(sgl-eval 装在宿主客户端,不受影响)。
 > 仓库在宿主 `~/mxfp4/sglang`(分支 `paper/mxfp4-kv-sm86`,remote `fork` = `git@github.com:TobyMint/sglang.git`)。
+> 旧的开发目录(`~/gsm8k`、`~/design`、`~/sglang-dev`)已归档至 `~/mxfp4-archive/`(内容均已入库,可删)。
 
 ## 3. 启动服务(生产默认配置)
 
@@ -85,7 +86,6 @@ docker exec sglang-qwen3 bash -c "cd /sgl-workspace/sglang && \
 脚本在 repo `paper_docs/eval/sgl_eval_grouped.py`(基于 sgl-eval,按 finish_reason 分组统计)。
 
 ```bash
-cd /home/xubowen/gsm8k   # 或任意位置,脚本路径换 repo 内版本
 HF_ENDPOINT=https://hf-mirror.com HF_DATASETS_CACHE=/data/xbw/datasets/hf_cache \
   /data/xbw/conda_envs/sglang/bin/python \
   /home/xubowen/mxfp4/sglang/paper_docs/eval/sgl_eval_grouped.py \
