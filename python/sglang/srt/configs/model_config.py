@@ -125,6 +125,15 @@ def is_kimi_k3(config) -> bool:
     return _hf_arch(config) == "KimiK3ForConditionalGeneration"
 
 
+def is_qwen3_5(config) -> bool:
+    return _hf_arch(config) in (
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+    )
+
+
 def is_deepseek_v4(config) -> bool:
     return _hf_arch(config) in (
         "DeepseekV4ForCausalLM",
@@ -707,6 +716,7 @@ class ModelConfig:
                 )
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
+            self.hf_text_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
@@ -1506,16 +1516,21 @@ class ModelConfig:
                 and self.quantization == "nvfp4_online"
                 and quant_method == "modelopt_fp4"
             )
-            # Detect which checkpoint is it
-            if not preserve_online_draft_quantization:
-                for _, method in QUANTIZATION_METHODS.items():
-                    quantization_override = method.override_quantization_method(
-                        quant_cfg, self.quantization
-                    )
-                    if quantization_override:
-                        quant_method = quantization_override
-                        self.quantization = quantization_override
-                        break
+            # An explicit online-requantization request (e.g. quark_mxfp4 on top
+            # of an NVFP4/mixed checkpoint) must not be overridden back to the
+            # source format
+            if self.quantization not in REQUANTIZATION_METHODS:
+
+                # Detect which checkpoint is it
+                if not preserve_online_draft_quantization:
+                    for _, method in QUANTIZATION_METHODS.items():
+                        quantization_override = method.override_quantization_method(
+                            quant_cfg, self.quantization
+                        )
+                        if quantization_override:
+                            quant_method = quantization_override
+                            self.quantization = quantization_override
+                            break
 
             # Verify quantization configurations.
             if self.quantization is None:
@@ -1890,11 +1905,17 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
 
 # Multimodal archs whose LM prefill is validated under breakable CUDA graph;
 # embed-carrying batches are rejected at replay (can_run_graph) and run eager.
+# The Kimi archs are structurally multimodal -- their configs always carry a
+# vision_config, so is_multimodal is True even for text-only serving -- and the
+# generic multimodal rule disabled prefill CG for them despite the LM prefill
+# capturing cleanly.
 multimodal_breakable_cuda_graph_supported_model_archs = [
     "InternS2MobiusForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
     "MuseGlimmerForConditionalGeneration",
+    "KimiK3ForConditionalGeneration",
+    "KimiK25ForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():

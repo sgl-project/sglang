@@ -2909,7 +2909,9 @@ class DeepseekSparseAttnBackend(
             f"cu_seqlens_k has {len(cu_seqlens_k)-1} requests"
         )
 
-        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues
+        # Use TRTLLm ragged attention for SM100 (Blackwell/B200) to avoid FA4 accuracy issues.
+        # gfx950 reports device capability sm_(9,5), so it never enters this SM100+
+        # branch and falls through to the aiter flash_attn_varlen_func path below.
         if self.device_sm_major >= 10:
             import flashinfer
 
@@ -3468,12 +3470,13 @@ class DeepseekSparseAttnBackend(
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
-            # Requirements: H200/B200, short sequences, supported dtype, fits in chunk
-            # XPU uses flash_mla_prefill for all prefill lengths; MHA_ONE_SHOT not needed.
+            # Requirements: H200/B200/MI355X, short sequences, supported dtype, fits in chunk
             self.use_mha = (
                 (
-                    device_sm == 90 or (device_sm >= 100 and device_sm < 110)
-                )  # SM90/SM100 only (not XPU)
+                    device_sm == 90
+                    or (device_sm >= 100 and device_sm < 110)
+                    or _IS_GFX95
+                )  # SM90/SM100 (NVIDIA) or gfx95x (MI355X)
                 and max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
