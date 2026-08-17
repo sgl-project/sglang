@@ -253,6 +253,7 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
+    tokenizer_manager.max_total_num_tokens = scheduler_info["max_total_num_tokens"]
     tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
 
     set_global_state(

@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import msgspec
 import torch
@@ -13,8 +13,8 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers import io_struct
-from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 
@@ -190,37 +190,101 @@ class GenerationBatchResult:
         )
 
 
-def validate_input_length(
-    req: Req, max_req_input_len: int, allow_auto_truncate: bool
-) -> Optional[str]:
-    """Validate and potentially truncate input length.
+def validate_request_input_length(
+    max_req_input_len: int,
+    max_total_num_tokens: int,
+    page_size: int,
+    req_input_len: int,
+    req_max_new_tokens: int = 0,
+    auto_truncate: bool = False,
+) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+    """Validate the request input length.
 
     Args:
-        req: The request containing input_ids to validate
-        max_req_input_len: Maximum allowed input length
-        allow_auto_truncate: Whether to truncate long inputs
+        max_req_input_len (int): Maximum allowed input length.
+        max_total_num_tokens (int): Maximum allowed total number of tokens.
+        page_size (int): Page size.
+        req_input_len (int): Request input token length.
+        req_max_new_tokens (int, optional): Request maximum allowed new tokens. Defaults to 0.
+        auto_truncate (bool, optional): Whether to auto-truncate the length. Defaults to False.
 
     Returns:
-        Error message if validation fails, None if successful
+        Tuple[Optional[int], Optional[int], Optional[str]): (truncated_input_len, truncated_new_tokens, error_msg)
+        truncated_input_len: Length of the truncated input. None if no truncation is performed.
+        truncated_new_tokens: Number of truncated new tokens. None if no truncation is performed.
+        error_msg: Error message if the input must be rejected. None if the input is valid.
     """
-    if len(req.origin_input_ids) >= max_req_input_len:
-        if allow_auto_truncate:
-            logger.warning(
-                "Request length is longer than the KV cache pool size or "
-                "the max context length. Truncated. "
-                f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
-            )
-            req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
-            return None
-        else:
-            error_msg = (
-                f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
-                f"the maximum allowed length ({max_req_input_len} tokens). "
-                f"Use a shorter input or enable --allow-auto-truncate."
-            )
-            return error_msg
+    if req_input_len <= 0:
+        error_msg = f"Invalid request input length ({req_input_len})."
+        return None, None, error_msg
 
-    return None
+    if req_max_new_tokens < 0:
+        error_msg = (
+            f"Invalid request maximum allowed new tokens ({req_max_new_tokens})."
+        )
+        return None, None, error_msg
+
+    paged_req_input_len = -(-req_input_len // page_size) * page_size
+
+    aggregate_max_total_num_tokens = max_total_num_tokens * get_parallel().attn_dcp_size
+    max_new_tokens = min(
+        max_req_input_len - req_input_len - 1,
+        aggregate_max_total_num_tokens - paged_req_input_len - page_size - 1,
+    )
+
+    # req_input_len exceeds the maximum allowed length
+    if max_new_tokens < 0:
+        if auto_truncate:
+            max_allowed_req_len = max_req_input_len - 1
+            max_allowed_tokens = (
+                (aggregate_max_total_num_tokens - page_size - 1)
+                // page_size
+                * page_size
+            )
+            truncated_input_len = min(max_allowed_req_len, max_allowed_tokens)
+            truncated_new_tokens = 0
+
+            if truncated_input_len <= 0:
+                error_msg = (
+                    f"Origin input length ({req_input_len} tokens) exceeds "
+                    f"the maximum allowed length ({max_req_input_len - 1} tokens), "
+                    f"or page-aligned input length ({paged_req_input_len} tokens) exceeds "
+                    f"the maximum allowed length ({aggregate_max_total_num_tokens - page_size - 1} tokens). "
+                    f"And cannot truncate input length."
+                )
+                return None, None, error_msg
+
+            return truncated_input_len, truncated_new_tokens, None
+
+        error_msg = (
+            f"Origin input length ({req_input_len} tokens) exceeds "
+            f"the maximum allowed length ({max_req_input_len - 1} tokens), "
+            f"or page-aligned input length ({paged_req_input_len} tokens) exceeds "
+            f"the maximum allowed length ({aggregate_max_total_num_tokens - page_size - 1} tokens). "
+            f"Use a shorter input or enable --allow-auto-truncate."
+        )
+        return None, None, error_msg
+
+    # (req_input_len + req_max_new_tokens) exceeds the maximum allowed length
+    if max_new_tokens < req_max_new_tokens:
+        if auto_truncate:
+            truncated_input_len = None
+            truncated_new_tokens = max_new_tokens
+
+            return truncated_input_len, truncated_new_tokens, None
+
+        error_msg = (
+            f"Origin input length ({req_input_len} tokens) "
+            f"+ {req_max_new_tokens} new tokens exceeds "
+            f"the maximum allowed length ({max_req_input_len - 1} tokens), "
+            f"or page-aligned input length ({paged_req_input_len} tokens) "
+            f"+ {req_max_new_tokens} new tokens exceeds "
+            f"the maximum allowed length ({aggregate_max_total_num_tokens - page_size - 1} tokens). "
+            f"Use a shorter input or enable --allow-auto-truncate."
+        )
+        return None, None, error_msg
+
+    return None, None, None
 
 
 def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:

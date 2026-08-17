@@ -1218,6 +1218,9 @@ class Engine(EngineScoreMixin, EngineBase):
             tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
                 0
             ]["max_req_input_len"]
+            tokenizer_manager.max_total_num_tokens = (
+                scheduler_init_result.scheduler_infos[0]["max_total_num_tokens"]
+            )
 
             # Set up subprocess liveness watchdog to detect crashes
             # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process

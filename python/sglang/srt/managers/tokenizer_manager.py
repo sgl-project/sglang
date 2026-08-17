@@ -101,6 +101,7 @@ from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerSc
 from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
     is_health_check_generate_req,
+    validate_request_input_length,
 )
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
@@ -458,6 +459,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
+        self.max_total_num_tokens = None  # Will be set later in engine.py
+        self.page_size = server_args.page_size
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.default_priority_value = server_args.default_priority_value
         self.num_reserved_tokens = compute_num_reserved_tokens(server_args)
@@ -1188,54 +1191,35 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _validate_one_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
     ) -> None:
-        """Validates that the input token count and the requested token count doesn't exceed the model's context length."""
-        # FIXME: unify the length validation logic with the one in the scheduler.
-        _max_req_len = self.context_len
-        input_token_num = len(input_ids) if input_ids is not None else 0
-        input_token_num += self.num_reserved_tokens
-
-        # Validate input length
-        if input_token_num >= self.context_len:
-            if self.allow_auto_truncate:
-                logger.warning(
-                    f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens). "
-                    "Truncating the input."
-                )
-                del input_ids[_max_req_len:]
-                input_token_num = len(input_ids)
-            else:
-                raise ValueError(
-                    f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens)."
-                )
-
-        # Validate total tokens (input + max_new_tokens)
-        max_new_tokens = obj.sampling_params.get("max_new_tokens")
-        if (
-            self.validate_total_tokens
-            and max_new_tokens is not None
-            and (max_new_tokens + input_token_num) > _max_req_len
-        ):
-            if self.allow_auto_truncate:
-                logger.warning(
-                    f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
-                    f"exceeds the model's context length ({self.context_len} tokens). "
-                    "Truncating max_new_tokens."
-                )
-                obj.sampling_params["max_new_tokens"] = max(
-                    0, _max_req_len - input_token_num
-                )
-            else:
-                total_tokens = max_new_tokens + input_token_num
-                error_msg = (
-                    f"Requested token count exceeds the model's maximum context length "
-                    f"of {self.context_len} tokens. You requested a total of {total_tokens} "
-                    f"tokens: {input_token_num} tokens from the input messages and "
-                    f"{max_new_tokens} tokens for the completion. Please reduce the number "
-                    f"of tokens in the input messages or the completion to fit within the limit."
-                )
-                raise ValueError(error_msg)
+        """Validates that the input token count and the requested token count
+        doesn't exceed the model's context length and KV cache size."""
+        req_max_new_tokens = obj.sampling_params.get("max_new_tokens", 0)
+        truncated_input_len, truncated_new_tokens, error_msg = (
+            validate_request_input_length(
+                self.max_req_input_len,
+                self.max_total_num_tokens,
+                self.page_size,
+                req_input_len=len(input_ids) + self.num_reserved_tokens,
+                req_max_new_tokens=req_max_new_tokens,
+                auto_truncate=self.allow_auto_truncate,
+            )
+        )
+        if error_msg:
+            raise ValueError(error_msg)
+        if truncated_input_len is not None:
+            logger.warning(
+                f"Requested token count ({len(input_ids)} input) "
+                f"exceeds the maximum allowed length. "
+                f"Truncating the input to {truncated_input_len} tokens."
+            )
+            del input_ids[truncated_input_len:]
+        if truncated_new_tokens is not None:
+            logger.warning(
+                f"Requested token count ({len(input_ids)} input + {req_max_new_tokens} new) "
+                f"exceeds the maximum allowed length. "
+                f"Truncating the new to {truncated_new_tokens} tokens."
+            )
+            obj.sampling_params["max_new_tokens"] = truncated_new_tokens
 
         # Validate embedding requests
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:

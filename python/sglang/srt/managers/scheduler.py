@@ -263,7 +263,7 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     is_health_check_generate_req,
-    validate_input_length,
+    validate_request_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
@@ -2175,7 +2175,7 @@ class Scheduler(
             abort_request=self.abort_request,
         )
 
-    def init_req_max_new_tokens(self, req):
+    def init_req_max_new_tokens(self, req, check: bool = False):
         input_len = len(req.origin_input_ids)
         max_new_tokens = (
             req.sampling_params.max_new_tokens
@@ -2197,17 +2197,17 @@ class Scheduler(
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
-        req.sampling_params.max_new_tokens = max(
-            0,
-            min(
-                max_new_tokens,
-                self.max_req_len - input_len - 1,
-                self.max_total_num_tokens * get_parallel().attn_dcp_size
-                - paged_input_len
-                - self.page_size
-                - 1,
-            ),
+        max_new_tokens = min(
+            max_new_tokens,
+            self.max_req_len - input_len - 1,
+            self.max_total_num_tokens * get_parallel().attn_dcp_size
+            - paged_input_len
+            - self.page_size
+            - 1,
         )
+        assert not check or max_new_tokens >= 0
+        req.sampling_params.max_new_tokens = max(0, max_new_tokens)
+
         # Clipping above can push max_new_tokens below min_new_tokens, which
         # would suppress EOS for the whole generation. Restore the invariant.
         if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:
@@ -2598,19 +2598,23 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # initialize before returning
-        self.init_req_max_new_tokens(req)
-
         # Validate prompt length
-        error_msg = validate_input_length(
-            req,
+        truncated_input_len, _, error_msg = validate_request_input_length(
             self.max_req_input_len,
-            get_serving().allow_auto_truncate,
+            self.max_total_num_tokens,
+            self.page_size,
+            req_input_len=len(req.origin_input_ids),
+            auto_truncate=get_serving().allow_auto_truncate,
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+        if truncated_input_len is not None:
+            del req.origin_input_ids[truncated_input_len:]
+
+        # initialize before returning
+        self.init_req_max_new_tokens(req, check=True)
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
@@ -2898,14 +2902,18 @@ class Scheduler(
                 return
 
         # Validate prompts length
-        error_msg = validate_input_length(
-            req,
+        truncated_input_len, _, error_msg = validate_request_input_length(
             self.max_req_input_len,
-            get_serving().allow_auto_truncate,
+            self.max_total_num_tokens,
+            self.page_size,
+            req_input_len=len(req.origin_input_ids),
+            auto_truncate=get_serving().allow_auto_truncate,
         )
         if error_msg:
             self._add_request_to_queue(req)
             return
+        if truncated_input_len is not None:
+            del req.origin_input_ids[truncated_input_len:]
 
         # Copy more attributes
         req.logprob_start_len = -1
