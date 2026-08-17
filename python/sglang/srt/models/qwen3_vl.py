@@ -1241,9 +1241,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
         self.language_model_only = getattr(config, "language_model_only", False)
-        if self.language_model_only:
-            self.visual = None
-        else:
+        self.enable_multimodal = getattr(config, "enable_multimodal", True)
+        self.visual = None
+        if self.enable_multimodal and not self.language_model_only:
             self.visual = Qwen3VLMoeVisionModel(
                 config.vision_config,
                 # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
@@ -1253,6 +1253,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 prefix=add_prefix("model.visual", prefix),
                 use_data_parallel=self.use_data_parallel,
             )
+        elif not self.enable_multimodal:
+            logger.info("Skipping the vision tower because multimodal is disabled")
 
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:

@@ -7,7 +7,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -22,20 +22,26 @@ class ConfigArgumentMerger:
         parser: argparse.ArgumentParser = None,
         boolean_actions: List[str] = None,
     ):
-        """Initialize with list of store_true action names."""
-        # NOTE: The current code does not support actions other than "store_true" and "store".
+        """Initialize with the parser's supported boolean actions."""
         if parser is not None:
             self.parser = parser
-            self.store_true_actions = [
-                action.dest
-                for action in parser._actions
-                if isinstance(action, argparse._StoreTrueAction)
-            ]
+            self.boolean_options = {}
+            for action in parser._actions:
+                if isinstance(action, argparse._StoreTrueAction):
+                    value = True
+                elif isinstance(action, argparse._StoreFalseAction):
+                    value = False
+                else:
+                    continue
+                self.boolean_options.setdefault(action.dest, {})[value] = (
+                    action.option_strings[0]
+                )
             self.unsupported_actions = {
                 a.dest: a
                 for a in parser._actions
                 if a.option_strings
                 and not isinstance(a, argparse._StoreTrueAction)
+                and not isinstance(a, argparse._StoreFalseAction)
                 and not isinstance(a, argparse._StoreAction)
                 and "--config" not in a.option_strings
                 and "--help" not in a.option_strings
@@ -43,10 +49,14 @@ class ConfigArgumentMerger:
             }
         elif boolean_actions is not None:
             # Legacy interface for compatibility
-            self.store_true_actions = boolean_actions
+            self.boolean_options = {
+                name: {True: f"--{name.replace('_', '-')}"} for name in boolean_actions
+            }
+            self.parser = None
             self.unsupported_actions = {}
         else:
-            self.store_true_actions = []
+            self.boolean_options = {}
+            self.parser = None
             self.unsupported_actions = {}
 
     def merge_config_with_args(self, cli_args: List[str]) -> List[str]:
@@ -70,7 +80,6 @@ class ConfigArgumentMerger:
             return cli_args
 
         config_data = self._parse_yaml_config(config_file_path)
-        config_args = self._convert_config_to_args(config_data)
 
         # Merge config args into CLI args
         config_index = cli_args.index("--config")
@@ -79,8 +88,35 @@ class ConfigArgumentMerger:
         before_config = cli_args[:config_index]
         after_config = cli_args[config_index + 2 :]  # Skip --config and file path
 
+        cli_boolean_dests = {
+            dest
+            for arg in before_config + after_config
+            if (dest := self._boolean_dest(arg)) is not None
+        }
+        config_data = {
+            key: value
+            for key, value in config_data.items()
+            if key.replace("-", "_") not in cli_boolean_dests
+        }
+        config_args = self._convert_config_to_args(config_data)
+
         # Simple merge: config args + CLI args
         return config_args + before_config + after_config
+
+    def _boolean_dest(self, arg: str) -> Optional[str]:
+        if self.parser is None or not arg.startswith("-") or arg == "--":
+            return None
+        action = self.parser._option_string_actions.get(arg)
+        if action is None:
+            actions = {option[0] for option in self.parser._get_option_tuples(arg)}
+            if len(actions) != 1:
+                return None
+            action = actions.pop()
+        if not isinstance(
+            action, (argparse._StoreTrueAction, argparse._StoreFalseAction)
+        ):
+            return None
+        return action.dest
 
     def _extract_config_file_path(self, args: List[str]) -> str:
         """Extract the config file path from arguments."""
@@ -163,16 +199,18 @@ class ConfigArgumentMerger:
         """
         Add boolean argument to the list.
 
-        Only store_true flags:
-            - value True -> add flag
-            - value False -> skip
+        Boolean flags:
+            - store_true: value True adds the flag
+            - store_false: value False adds the flag
+            - paired actions use the flag matching the configured value
         Regular booleans:
             - always add --key true/false
         """
         key_norm = key.replace("-", "_")
-        if key_norm in self.store_true_actions:
-            if value:
-                args.append(f"--{key}")
+        if key_norm in self.boolean_options:
+            option = self.boolean_options[key_norm].get(value)
+            if option is not None:
+                args.append(option)
         else:
             args.extend([f"--{key}", str(value).lower()])
 
