@@ -49,7 +49,6 @@ __global__ __launch_bounds__(1024, 2) void  //
   const uint32_t bid = blockIdx.x;
   const uint32_t tid = threadIdx.x;
 
-  PDLWaitPrimary<kUsePDL>();
   if (bid < params.num_tokens) {
     // ---- Quantize path: one CTA per valid token ----
 
@@ -95,13 +94,6 @@ __global__ __launch_bounds__(1024, 2) void  //
       const uint32_t byte_off = token_id * params.num_groups + group_id;
       reinterpret_cast<uint8_t*>(params.buf_x_sf)[byte_off] = static_cast<uint8_t>(ue8m0_exp);
     }
-
-    // Copy this token's topk row (no alignment assumptions; top_k is small).
-    if (tid < params.top_k) {
-      const uint32_t off = token_id * params.top_k + tid;
-      params.buf_topk_idx[off] = params.topk_idx[off];
-      params.buf_topk_weights[off] = params.topk_weights[off];
-    }
   } else {
     // ---- Pad path: trailing blocks fill [num_tokens, padded_max) with (-1, 0) ----
     const uint32_t copy_bid = bid - params.num_tokens;
@@ -113,6 +105,18 @@ __global__ __launch_bounds__(1024, 2) void  //
       params.buf_topk_idx[slot] = -1;
       params.buf_topk_weights[slot] = 0.0f;
     }
+  }
+
+  // Quantization and padding do not consume the primary TopK kernel's output.
+  // Let them overlap with its tail, then wait immediately before the first
+  // TopK-dependent loads. Keep the wait outside the block branch so every CTA
+  // and every thread reaches the grid dependency barrier uniformly.
+  PDLWaitPrimary<kUsePDL>();
+
+  if (bid < params.num_tokens && tid < params.top_k) {
+    const uint32_t off = bid * params.top_k + tid;
+    params.buf_topk_idx[off] = params.topk_idx[off];
+    params.buf_topk_weights[off] = params.topk_weights[off];
   }
   PDLTriggerSecondary<kUsePDL>();
 }
