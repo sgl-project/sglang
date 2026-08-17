@@ -1537,19 +1537,19 @@ class DeepseekV4AscendAttnBackend(
         c1a_kwargs = base_kwargs | common
         if self._is_dspark_draft_worker:
             seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
-            max_seqlen_kv = (
-                int(seq_lens_cpu[:bs].max().item())
-                if seq_lens_cpu is not None and bs > 0
-                else int(actual_seq_lengths_kv[:bs].max().item())
+            # do sparse_attn_sharedkv_metadata on CPU, Simple but with better performance, data movement can be ignored
+            cu_q_cpu = actual_seq_lengths_q_pa[: bs + 1].to("cpu", torch.int32)
+            seq_kv_cpu = (
+                seq_lens_cpu[:bs].int()
+                if seq_lens_cpu is not None
+                else actual_seq_lengths_kv[:bs].to("cpu", torch.int32)
             )
-            c1a_kwargs.update(
-                cu_seqlens_ori_kv=actual_seq_lengths_q_pa,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_kv=max_seqlen_kv,
-            )
-            c1a_metadata = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
-                device=str(actual_seq_lengths_kv.device),
-                **c1a_kwargs,
+            c1a_metadata = torch.ops.npu.sparse_attn_sharedkv_metadata_host(
+                **c1a_kwargs
+                | {
+                    "cu_seqlens_q": cu_q_cpu,
+                    "seqused_kv": seq_kv_cpu,
+                }
             )
         else:
             c1a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
