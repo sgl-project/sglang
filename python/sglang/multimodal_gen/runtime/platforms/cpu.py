@@ -20,9 +20,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_CPU_AMX_BACKEND = (
-    "sglang.multimodal_gen.runtime.layers.attention.backends.cpu_amx.CPUAMXAttentionBackend"
-)
+_CPU_AMX_BACKEND = "sglang.multimodal_gen.runtime.layers.attention.backends.cpu_amx.CPUAMXAttentionBackend"
 _SDPA_BACKEND = (
     "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 )
