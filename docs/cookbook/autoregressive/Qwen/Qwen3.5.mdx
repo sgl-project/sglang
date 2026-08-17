@@ -1027,13 +1027,14 @@ python3 -m sglang.launch_server \
   --speculative-num-draft-tokens 4 \
   --page-size 64 \
   --enable-hierarchical-cache \
-  --hicache-size <per_pool_gb> \
+  --hicache-size "$HICACHE_SIZE_GB" \
   --hicache-io-backend kernel \
   --hicache-mem-layout page_first \
   --hicache-write-policy write_through_selective
 ```
 
-`--hicache-size` is per rank per host pool. Size it as
+`--hicache-size` is a **per-rank, per-host-pool** value in GB — set
+`HICACHE_SIZE_GB` before launch as
 `floor(total_host_dram_gb / tp / hicache_host_pool_count)` (2 host pools by
 default), leaving headroom for other host allocations.
 

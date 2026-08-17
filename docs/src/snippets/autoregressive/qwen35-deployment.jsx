@@ -110,15 +110,6 @@ export const Qwen35Deployment = () => {
         { id: 'enabled',  label: 'Enabled',  default: true  }
       ]
     },
-    hicache: {
-      name: 'hicache',
-      title: 'HiCache (L2)',
-      condition: (values) => values.model === '397b' && values.hardware === 'h200' && values.quantization === 'fp8' && values.speculative === 'enabled',
-      items: [
-        { id: 'disabled', label: 'Disabled', default: true  },
-        { id: 'enabled',  label: 'Enabled',  default: false }
-      ]
-    },
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
@@ -305,11 +296,7 @@ export const Qwen35Deployment = () => {
   // Generate command — must produce byte-identical output to sgl-cookbook's
   // config.generateCommand(values) for every valid combination.
   const generateCommand = () => {
-    const { model, hardware, quantization, speculative, mambaCache, hicache } = values;
-    // hicache isn't reset by the hardware/model useEffect (it uses static
-    // items, not getDynamicItems), so re-check its condition here rather than
-    // trusting a value left over from a hardware/model switch.
-    const hicacheEnabled = hicache === 'enabled' && model === '397b' && hardware === 'h200' && quantization === 'fp8' && speculative === 'enabled';
+    const { model, hardware, quantization, speculative, mambaCache } = values;
 
     let hwConfig = modelConfigs[model]?.[hardware]?.[quantization];
     if (!hwConfig) {
@@ -332,12 +319,6 @@ export const Qwen35Deployment = () => {
     // tp=4 across the concurrency sweep.
     if (model === '397b' && hardware === 'b200' && quantization === 'fp4' && speculative === 'enabled') {
       hwConfig = { ...hwConfig, tp: 2, ep: 2, mem: 0.8 };
-    }
-    // 397B H200 FP8 AgentX HiCache MTP: the DRAM-offload arm runs EP1 (not the
-    // GPU-resident EP8 arm) so a single KV/mamba host pool covers the full
-    // TP8 group.
-    if (hicacheEnabled) {
-      hwConfig = { ...hwConfig, ep: 1 };
     }
 
     let modelName;
@@ -396,7 +377,7 @@ export const Qwen35Deployment = () => {
     const commandRules = {
       reasoning: (value) => value === 'enabled' ? '--reasoning-parser qwen3' : null,
       toolcall: (value) => value === 'enabled' ? '--tool-call-parser qwen3_coder' : null,
-      speculative: (value) => value === 'enabled' ? `--speculative-algorithm ${hicacheEnabled ? 'EAGLE' : 'NEXTN'} \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4` : null,
+      speculative: (value) => value === 'enabled' ? '--speculative-algorithm NEXTN \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4' : null,
       mambaCache: (value) => value === 'v2' ? '--mamba-radix-cache-strategy extra_buffer' : null,
     };
 
@@ -444,18 +425,6 @@ export const Qwen35Deployment = () => {
       if (MOE_MODELS.has(model)) {
         cmd += ` \\\n  --mamba-ssm-dtype bfloat16`;
       }
-    }
-
-    // AgentX HiCache DRAM offload: extends RadixAttention (don't pass
-    // --disable-radix-cache), one KV + one Mamba host pool per TP rank.
-    // --hicache-size is host-DRAM-capacity dependent; size it per node.
-    if (hicacheEnabled) {
-      cmd += ` \\\n  --page-size 64`;
-      cmd += ` \\\n  --enable-hierarchical-cache`;
-      cmd += ` \\\n  --hicache-size <hicache-size-gb>`;
-      cmd += ` \\\n  --hicache-io-backend kernel`;
-      cmd += ` \\\n  --hicache-mem-layout page_first`;
-      cmd += ` \\\n  --hicache-write-policy write_through_selective`;
     }
 
     // Append backend configurations
