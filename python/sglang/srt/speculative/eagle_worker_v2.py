@@ -59,6 +59,7 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     SpecRuntimeState,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
+from sglang.srt.speculative.draft_worker_common import build_draft_tp_worker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -163,18 +164,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         else:
             ctx = empty_context()
         with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
-            self.draft_worker = TpModelWorker(
+            ctx,
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            draft_model_build_scope(),
+        ):
+            bundle = build_draft_tp_worker(
                 server_args=server_args,
                 gpu_id=gpu_id,
                 # spec workers don't support pipeline parallelism
                 ps=replace(ps, pp_rank=0),
                 nccl_port=nccl_port,
-                is_draft_worker=True,
-                # The draft runs at absolute target positions.
-                context_length=target_worker.model_runner.model_config.context_len,
+                target_model_config=target_worker.model_runner.model_config,
+                algo_label=server_args.speculative_algorithm or "EAGLE",
             )
+        self.draft_worker = bundle.draft_worker
+        # Use the draft-specific copy so downstream backend factories observe
+        # the backend resolved by build_draft_tp_worker rather than inheriting
+        # the target's backend (for example, DSV4's dedicated backend).
+        self.server_args = self.draft_worker.server_args
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
