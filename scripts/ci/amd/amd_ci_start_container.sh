@@ -239,13 +239,41 @@ find_latest_image() {
 # TEST_IMAGE_ROCM_VERSION overrides ROCM_VERSION for the tag only: the suites pass
 # their own --rocm-version (or default to rocm700) for image lookup, but the images
 # we want are tagged rocm10.
+# Only the repo has to be supplied. The version defaults to the same
+# get_version_tag.py output the release job composes its tag from, and the date is
+# discovered by probing back a week the way find_latest_image does, so a rebuild on
+# another day still resolves and a new release tag cannot desync the two sides.
 # Revert before merging anything from this branch.
 TEST_IMAGE_REPO="${TEST_IMAGE_REPO:-}"
-TEST_IMAGE_VERSION="${TEST_IMAGE_VERSION:-}"
+TEST_IMAGE_VERSION="${TEST_IMAGE_VERSION:-${SGLANG_VERSION}}"
 TEST_IMAGE_ROCM_VERSION="${TEST_IMAGE_ROCM_VERSION:-${ROCM_VERSION}}"
 TEST_IMAGE_DATE="${TEST_IMAGE_DATE:-}"
+
+find_test_image() {
+  local base="${TEST_IMAGE_REPO}:${TEST_IMAGE_VERSION}-${TEST_IMAGE_ROCM_VERSION}-${GPU_ARCH}"
+  local days_back candidate
+
+  if [[ -n "${TEST_IMAGE_DATE}" ]]; then
+    echo "${base}-${TEST_IMAGE_DATE}"
+    return 0
+  fi
+
+  for days_back in {0..6}; do
+    candidate="${base}-$(date -d "${days_back} days ago" +%Y%m%d)"
+    if docker manifest inspect "${candidate}" >/dev/null 2>&1; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+
+  echo "Error: no ${base}-<date> image published in the last 7 days" >&2
+  return 1
+}
+
+# Failing here is deliberate: falling through to find_latest_image would silently
+# run the suite against the published nightly and report it as a ROCm 10 result.
 if [[ -z "${CUSTOM_IMAGE}" && -n "${TEST_IMAGE_REPO}" ]]; then
-  CUSTOM_IMAGE="${TEST_IMAGE_REPO}:${TEST_IMAGE_VERSION}-${TEST_IMAGE_ROCM_VERSION}-${GPU_ARCH}-${TEST_IMAGE_DATE}"
+  CUSTOM_IMAGE="$(find_test_image)"
   echo "[rocm10-fullflow] Pinning image to ${CUSTOM_IMAGE}"
 fi
 

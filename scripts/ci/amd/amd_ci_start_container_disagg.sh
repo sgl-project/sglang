@@ -212,20 +212,59 @@ find_latest_image() {
   esac
 }
 
+# TEST-ONLY (branch bingxche/rocm10-fullflow): same override as
+# amd_ci_start_container.sh. This script has no --custom-image flag, so without
+# this the disaggregation job is the one job that ignores the pin and pulls the
+# published rocm700 nightly, then reports the result as a ROCm 10 one.
+# Only the repo has to be supplied; version and date are derived the same way.
+# Revert before merging anything from this branch.
+TEST_IMAGE_REPO="${TEST_IMAGE_REPO:-}"
+TEST_IMAGE_VERSION="${TEST_IMAGE_VERSION:-${SGLANG_VERSION}}"
+TEST_IMAGE_ROCM_VERSION="${TEST_IMAGE_ROCM_VERSION:-${ROCM_VERSION}}"
+TEST_IMAGE_DATE="${TEST_IMAGE_DATE:-}"
+
+find_test_image() {
+  local base="${TEST_IMAGE_REPO}:${TEST_IMAGE_VERSION}-${TEST_IMAGE_ROCM_VERSION}-${GPU_ARCH}"
+  local days_back candidate
+
+  if [[ -n "${TEST_IMAGE_DATE}" ]]; then
+    echo "${base}-${TEST_IMAGE_DATE}"
+    return 0
+  fi
+
+  for days_back in {0..6}; do
+    candidate="${base}-$(date -d "${days_back} days ago" +%Y%m%d)"
+    if docker manifest inspect "${candidate}" >/dev/null 2>&1; then
+      echo "${candidate}"
+      return 0
+    fi
+  done
+
+  echo "Error: no ${base}-<date> image published in the last 7 days" >&2
+  return 1
+}
+
 # Pull and run the latest image
-IMAGE=$(find_latest_image "${GPU_ARCH}")
-# Try the local docker registry first (avoids Docker Hub rate limits and is
-# faster on the LAN); if that fails for any reason, fall back to the
-# public registry with exponential-backoff retries. Capture stderr so the
-# real failure reason (TLS handshake, 404, connection refused, etc.) is
-# visible in the job log instead of being silently swallowed.
-if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
-  echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
-  docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
-else
-  echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
-  printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
+if [[ -n "${TEST_IMAGE_REPO}" ]]; then
+  # Failing here is deliberate; see the comment above.
+  IMAGE="$(find_test_image)"
+  echo "[rocm10-fullflow] Pinning image to ${IMAGE}"
   retry_with_backoff 6 docker pull "${IMAGE}"
+else
+  IMAGE=$(find_latest_image "${GPU_ARCH}")
+  # Try the local docker registry first (avoids Docker Hub rate limits and is
+  # faster on the LAN); if that fails for any reason, fall back to the
+  # public registry with exponential-backoff retries. Capture stderr so the
+  # real failure reason (TLS handshake, 404, connection refused, etc.) is
+  # visible in the job log instead of being silently swallowed.
+  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
+    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
+  else
+    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
+    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
+    retry_with_backoff 6 docker pull "${IMAGE}"
+  fi
 fi
 
 CACHE_HOST=/home/runner/sglang-data

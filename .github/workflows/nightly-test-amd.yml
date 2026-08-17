@@ -123,10 +123,10 @@ env:
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
   # TEST-ONLY (branch bingxche/rocm10-fullflow): run against the images that
   # release-docker-amd-rocm10-nightly built from this branch, not the published nightly.
+  # The version and date halves of the tag are derived by the container-start
+  # scripts, so a new release tag or a rebuild on another day needs no edit here.
   TEST_IMAGE_REPO: bingxche/sgl-test
-  TEST_IMAGE_VERSION: v0.5.17
   TEST_IMAGE_ROCM_VERSION: rocm10
-  TEST_IMAGE_DATE: "20260817"
 
 concurrency:
   # When called via workflow_call with ref set, use a unique group per caller run to avoid
