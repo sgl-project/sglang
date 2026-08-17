@@ -150,6 +150,14 @@ class TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16(
         "1",
         "--speculative-num-draft-tokens",
         "4",
+        "--dp-size",
+        "4",
+        "--enable-dp-attention",
+        "--enable-dp-lm-head",
+        "--moe-a2a-backend",
+        "flashinfer",
+        "--cuda-graph-backend-prefill",
+        "disabled",
     ]
     eval_args = {"max_tokens": 16000, "temperature": 1.0, "top_p": 0.95}
     spec_accept_length_threshold = 2.5
@@ -162,6 +170,7 @@ class TestFlashinferCuteDSLMoeBackendNvFp4OnlineW4A16(
         "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0",
         "SGLANG_FLASHINFER_MOE_FUSED_FINALIZE": "1",
         "SGLANG_MOE_NVFP4_DISPATCH": "0",
+        "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "4096",
     }
 
 
