@@ -1053,6 +1053,8 @@ class Envs:
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
     SGLANG_CUTLASS_MOE = EnvBool(False)
+    # Opt-in H200 fast path for the TP=8 GLM-4.5-FP8 fused MoE layout.
+    SGLANG_ENABLE_GLM45_FUSED_MOE = EnvBool(False)
 
     # ===================================================================
     # Logits and log-probability processing
