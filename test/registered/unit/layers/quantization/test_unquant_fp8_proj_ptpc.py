@@ -180,16 +180,14 @@ class TestUnquantFp8ProjPtpc(CustomTestCase):
         bf16_output = torch.empty(512, 4, dtype=torch.bfloat16, device="meta")
         ptpc_output = torch.empty(513, 4, dtype=torch.bfloat16, device="meta")
 
-        with patch.object(unquant, "_use_aiter", True), patch.object(
-            unquant.tgemm, "mm", return_value=bf16_output
-        ) as bf16_gemm, patch.object(
+        with patch.object(unquant, "_use_aiter", False), patch.object(
+            unquant.F, "linear", return_value=bf16_output
+        ) as bf16_linear, patch.object(
             fp8_utils, "apply_fp8_ptpc_linear", return_value=ptpc_output
         ) as apply_ptpc:
             x_bf16 = torch.empty(512, 8, dtype=torch.bfloat16, device="meta")
             self.assertIs(method.apply(layer, x_bf16), bf16_output)
-            bf16_gemm.assert_called_once_with(
-                x_bf16, layer.weight, None, otype=x_bf16.dtype
-            )
+            bf16_linear.assert_called_once_with(x_bf16, layer.weight, None)
             apply_ptpc.assert_not_called()
 
             x_ptpc = torch.empty(513, 8, dtype=torch.bfloat16, device="meta")
