@@ -718,11 +718,16 @@ class TransformersBase(nn.Module):
                 "requires custom attention support."
             )
 
-        self.vocab_size = getattr(
-            self.text_config,
-            "vocab_size",
-            self.model.get_input_embeddings().num_embeddings,
-        )
+        # `text_config.vocab_size` is nearly always set; the embedding-attribute
+        # fallback exists for the rare custom config that omits it. Evaluate
+        # lazily — `getattr(x, "y", <default>)` computes <default> eagerly, and
+        # some custom embeddings (e.g. Molmo2's `Molmo2Embedding`) do not expose
+        # a `num_embeddings` attribute, so eager evaluation would crash even
+        # when we don't need the fallback.
+        vocab_size = getattr(self.text_config, "vocab_size", None)
+        if vocab_size is None:
+            vocab_size = self.model.get_input_embeddings().num_embeddings
+        self.vocab_size = vocab_size
         self.unpadded_vocab_size = self.vocab_size
 
         # Embedding scale (e.g. Whisper)
