@@ -1831,9 +1831,6 @@ def biased_grouped_topk_cpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
-    # Accepted for API parity with the GPU variant (aiter shared-expert fusion
-    # fast path); unused on CPU.
-    fused_shared_experts_scaling_factor: Optional[float] = None,
 ):
     return torch.ops.sgl_kernel.biased_grouped_topk_cpu(
         hidden_states,
