@@ -75,6 +75,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -1864,6 +1865,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             v_head_dim=config.v_head_dim,
             q_lora_rank=config.q_lora_rank,
             kv_lora_rank=config.kv_lora_rank,
+            mla_enable_prefill_cp=is_mla_prefill_cp_enabled(),
             skip_rope=True,
             reduce_results=not self.all_reduce_fusion,
             alt_stream=alt_stream,
@@ -3135,6 +3137,22 @@ class KimiK3ForConditionalGeneration(nn.Module):
     @property
     def model(self):
         return self.language_model
+
+    @property
+    def logits_processor(self):
+        return self.language_model.logits_processor
+
+    @property
+    def capture_aux_hidden_states(self):
+        return self.language_model.capture_aux_hidden_states
+
+    @property
+    def pp_group(self):
+        return self.language_model.pp_group
+
+    def get_context_parallel_model(self):
+        """Return the text backbone used between CP shard and gather."""
+        return self.language_model.model
 
     def __setattr__(self, name, value):
         if name == "model":

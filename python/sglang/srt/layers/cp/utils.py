@@ -45,6 +45,7 @@ CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
         "DeepseekV32ForCausalLM",
         "GlmMoeDsaForCausalLM",
         "GptOssForCausalLM",
+        "KimiK3ForConditionalGeneration",
         "MiMoV2FlashForCausalLM",
         "MiMoV2ForCausalLM",
         "Qwen3MoeForCausalLM",

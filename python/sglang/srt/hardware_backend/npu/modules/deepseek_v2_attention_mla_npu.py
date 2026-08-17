@@ -16,6 +16,8 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
+from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
 if TYPE_CHECKING:
@@ -206,6 +208,9 @@ def forward_mla_prepare_npu(
                 if (
                     qkv_latent.shape[0] < 65536
                     and not dsa_use_prefill_cp(forward_batch)
+                    and not mla_use_prefill_cp(
+                        forward_batch, m.mla_enable_prefill_cp
+                    )
                     and not getattr(m, "_disable_npu_fused_split_qk_norm", False)
                 ):
                     q, k_nope, k_pe = fused_split_qk_norm(
@@ -252,7 +257,10 @@ def forward_mla_prepare_npu(
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
-        if dsa_use_prefill_cp(forward_batch):
+        if (
+            dsa_use_prefill_cp(forward_batch)
+            or mla_use_prefill_cp(forward_batch, m.mla_enable_prefill_cp)
+        ) and not is_cp_v2_active(forward_batch):
             # support allgather+rerrange
             k_nope, k_pe = m.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
@@ -266,6 +274,22 @@ def forward_mla_prepare_npu(
                 forward_batch=forward_batch,
                 layer_id=m.layer_id,
             )
+
+    if (
+        is_mla_preprocess_enabled()
+        and mla_use_prefill_cp(forward_batch, m.mla_enable_prefill_cp)
+        and not is_cp_v2_active(forward_batch)
+    ):
+        # The fused preprocess returns normalized latent K and rotated K-RoPE
+        # separately.  Reconstruct a temporary latent only for the legacy
+        # CP-v1 gather; CP-v2 materializes KV in the attention backend through
+        # the configured strategy.
+        latent_cache = k_nope.new_empty(
+            (k_nope.shape[0], m.kv_lora_rank + m.qk_rope_head_dim)
+        )
+        k_nope, k_pe = m.rebuild_cp_kv_cache(
+            latent_cache, forward_batch, k_nope, k_pe
+        )
 
     return (
         q_pe,
