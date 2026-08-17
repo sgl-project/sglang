@@ -21,7 +21,9 @@ from sglang.srt.managers.scheduler_components.sensenova_u1_interleave import (
 )
 from sglang.srt.models.neo_chat_limits import (
     U1_EXACT_TEXT_CUSTOM_PARAM,
+    U1_FLOW_BATCH_ISOLATION_PARAM,
     U1_FLOW_CUSTOM_PARAM,
+    U1_FLOW_RADIX_PREFIX_LIMIT_PARAM,
     U1_INTERLEAVE_CUSTOM_PARAM,
     U1_MAX_INTERLEAVE_IMAGES,
     normalize_u1_interleave_request,
@@ -231,6 +233,7 @@ def test_u1_interleave_normalization_reserves_image_context() -> None:
     )
     assert spec["image_tokens"] == 4
     assert spec["image_span_tokens"] == 5
+    assert spec["turn_seeds"] == [0, 1]
 
     with pytest.raises(ValueError, match="context window"):
         normalize_u1_interleave_request(
@@ -255,6 +258,20 @@ def test_u1_interleave_normalization_bounds_image_turns() -> None:
             img_context_token_id=IMG_CONTEXT,
             img_end_token_id=IMG_END,
         )
+
+
+def test_u1_interleave_normalization_wraps_deterministic_turn_seeds() -> None:
+    spec = normalize_u1_interleave_request(
+        {"max_images": 2, "seed": 2**63 - 1},
+        input_token_count=1,
+        max_new_tokens=1,
+        context_len=10000,
+        img_start_token_id=IMG_START,
+        img_context_token_id=IMG_CONTEXT,
+        img_end_token_id=IMG_END,
+    )
+
+    assert spec["turn_seeds"] == [2**63 - 1, 0]
 
 
 def test_u1_exact_text_request_skips_shared_radix_insert() -> None:
@@ -287,6 +304,13 @@ def test_u1_exact_text_request_skips_shared_radix_insert() -> None:
     assert req.batch_isolation_key == "sensenova_u1_exact_text:exact-text"
     assert req.radix_cache_prefix_limit == 0
     assert req.skip_radix_cache_insert
+    assert req.extra_key == "sensenova_u1_exact_text:exact-text"
+    assert req._compute_max_prefix_len(len(req.origin_input_ids)) == 0
+    assert (
+        req.sampling_params.custom_params[U1_FLOW_BATCH_ISOLATION_PARAM]
+        == "sensenova_u1_exact_text:exact-text"
+    )
+    assert req.sampling_params.custom_params[U1_FLOW_RADIX_PREFIX_LIMIT_PARAM] == 0
 
 
 def test_u1_exact_text_rejects_work_beyond_sampling_budget() -> None:
@@ -352,7 +376,7 @@ def test_u1_interleave_lifecycle_parks_flows_reencodes_and_resumes() -> None:
     assert child.radix_cache_prefix_limit == 4
     assert child.sampling_params.stop_strs == []
     assert child.sampling_params.stop_regex_strs == []
-    assert parent.batch_isolation_key == "sensenova_u1_exact_text:parent"
+    assert parent.batch_isolation_key == "sensenova_u1_exact_text:interleave"
 
     scheduler.waiting_queue.clear()
     _complete_child(controller, child)
@@ -395,11 +419,33 @@ def test_u1_interleave_resume_recomputes_exact_parent_prefix() -> None:
     assert parent.skip_radix_cache_insert
 
 
+def test_u1_interleave_parents_share_only_the_isolated_scheduling_lane() -> None:
+    controller = SenseNovaU1InterleaveController(_FakeScheduler())
+    first = _parent_req()
+    second = _parent_req()
+    second.rid = "neighbor"
+
+    assert controller.register_parent(first) is None
+    assert controller.register_parent(second) is None
+
+    assert first.batch_isolation_key == second.batch_isolation_key
+    assert first.batch_isolation_key == "sensenova_u1_exact_text:interleave"
+    assert first.extra_key != second.extra_key
+    assert first.radix_cache_prefix_limit == second.radix_cache_prefix_limit == 0
+    assert first.skip_radix_cache_insert
+    assert second.skip_radix_cache_insert
+
+
 def test_u1_interleave_repeated_images_use_deterministic_turn_seeds() -> None:
     scheduler, controller, parent, child = _park_parent(max_images=2, seed=41)
+    first_flow = child.sampling_params.custom_params[U1_FLOW_CUSTOM_PARAM]
+    assert first_flow["seed"] == 41
     scheduler.waiting_queue.clear()
     _complete_child(controller, child, value=0.1)
     scheduler.waiting_queue.clear()
+    mutable_spec = parent.sampling_params.custom_params[U1_INTERLEAVE_CUSTOM_PARAM]
+    mutable_spec["seed"] = 100
+    mutable_spec["turn_seeds"] = [100, 101]
 
     parent.output_ids.extend([20, IMG_START])
     parent.req_pool_idx = 1
@@ -414,6 +460,7 @@ def test_u1_interleave_repeated_images_use_deterministic_turn_seeds() -> None:
     second_prefix_child = scheduler.waiting_queue[-1]
     assert second_prefix_child.rid == "parent::sensenova_u1_prefix:1"
     assert second_prefix_child.extra_key != child.extra_key
+    assert second_prefix_child.radix_cache_prefix_limit == 0
     second_prefix_child.finished_reason = FINISH_LENGTH(length=1)
     scheduler.waiting_queue.clear()
     controller.complete_child(second_prefix_child)

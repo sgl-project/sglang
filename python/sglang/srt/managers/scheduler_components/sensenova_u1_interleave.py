@@ -34,6 +34,7 @@ from sglang.srt.models.neo_chat_limits import (
     U1_FLOW_PREFILL_GRAPH_VARIANT_PARAM,
     U1_FLOW_RADIX_PREFIX_LIMIT_PARAM,
     U1_INTERLEAVE_CUSTOM_PARAM,
+    derive_u1_turn_seeds,
 )
 
 if TYPE_CHECKING:
@@ -54,6 +55,7 @@ class U1InterleaveState:
     parent: Req
     spec: dict
     original_max_new_tokens: int
+    turn_seeds: tuple[int, ...]
     phase: U1InterleavePhase = U1InterleavePhase.DECODING
     image_count: int = 0
     inserted_span_tokens: int = 0
@@ -143,15 +145,22 @@ class SenseNovaU1InterleaveController:
                 )
                 if unsupported is not None:
                     return unsupported
-                req._sensenova_u1_exact_text = True
-                req.batch_isolation_key = f"sensenova_u1_exact_text:{req.rid}"
-                req.radix_cache_prefix_limit = 0
-                req.skip_radix_cache_insert = True
+                self._isolate_exact_text_request(
+                    req,
+                    namespace=f"sensenova_u1_exact_text:{req.rid}",
+                    isolate_radix_namespace=True,
+                )
             return None
 
         unsupported = self._unsupported_reason(req)
         if unsupported is not None:
             return unsupported
+        turn_seeds = self._validated_turn_seeds(spec)
+        if turn_seeds is None:
+            return (
+                "SenseNova U1 interleave has an invalid deterministic turn "
+                "seed schedule"
+            )
 
         namespace = f"sensenova_u1_interleave:{req.rid}"
         req.extra_key = f"{req.extra_key}|{namespace}" if req.extra_key else namespace
@@ -159,14 +168,65 @@ class SenseNovaU1InterleaveController:
             parent=req,
             spec=spec,
             original_max_new_tokens=int(req.sampling_params.max_new_tokens),
+            turn_seeds=turn_seeds,
         )
         self._parents[req.rid] = state
-        req._sensenova_u1_exact_text = True
-        req.batch_isolation_key = f"sensenova_u1_exact_text:{req.rid}"
-        req.radix_cache_prefix_limit = 0
-        req.skip_radix_cache_insert = True
+        self._isolate_exact_text_request(
+            req,
+            namespace="sensenova_u1_exact_text:interleave",
+            isolate_radix_namespace=False,
+        )
         self._prepare_exact_text_segment(state)
         return None
+
+    @staticmethod
+    def _validated_turn_seeds(spec: dict) -> tuple[int, ...] | None:
+        max_images = spec.get("max_images")
+        seed = spec.get("seed")
+        if (
+            isinstance(max_images, bool)
+            or not isinstance(max_images, int)
+            or max_images <= 0
+            or isinstance(seed, bool)
+            or not isinstance(seed, int)
+            or seed < 0
+            or seed >= 2**63
+        ):
+            return None
+        values = spec.get("turn_seeds")
+        if values is None:
+            values = derive_u1_turn_seeds(seed, max_images)
+        if not isinstance(values, (list, tuple)) or len(values) != max_images:
+            return None
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value >= 2**63
+            for value in values
+        ):
+            return None
+        return tuple(int(value) for value in values)
+
+    @staticmethod
+    def _isolate_exact_text_request(
+        req: Req,
+        *,
+        namespace: str,
+        isolate_radix_namespace: bool,
+    ) -> None:
+        req._sensenova_u1_exact_text = True
+        req.batch_isolation_key = namespace
+        req.radix_cache_prefix_limit = 0
+        req.skip_radix_cache_insert = True
+        custom_params = dict(req.sampling_params.custom_params or {})
+        custom_params[U1_FLOW_BATCH_ISOLATION_PARAM] = namespace
+        custom_params[U1_FLOW_RADIX_PREFIX_LIMIT_PARAM] = 0
+        req.sampling_params.custom_params = custom_params
+        if isolate_radix_namespace:
+            req.extra_key = (
+                f"{req.extra_key}|{namespace}" if req.extra_key else namespace
+            )
 
     def _unsupported_standalone_exact_text_reason(
         self,
@@ -444,7 +504,7 @@ class SenseNovaU1InterleaveController:
             "width": int(spec["width"]),
             "height": int(spec["height"]),
             "num_steps": int(spec["num_steps"]),
-            "seed": (int(spec["seed"]) + state.image_count) % (2**63),
+            "seed": state.turn_seeds[state.image_count],
             "image_start": image_start,
             "image_tokens": image_tokens,
             "image_t_index": _next_u1_t_index(
@@ -520,6 +580,7 @@ class SenseNovaU1InterleaveController:
         custom_params[U1_FLOW_BATCH_ISOLATION_PARAM] = (
             f"sensenova_u1_interleave_prefix:{parent.rid}:{state.image_count}"
         )
+        custom_params[U1_FLOW_RADIX_PREFIX_LIMIT_PARAM] = 0
         sampling_params.custom_params = custom_params
         sampling_params.max_new_tokens = 1
         sampling_params.min_new_tokens = 0

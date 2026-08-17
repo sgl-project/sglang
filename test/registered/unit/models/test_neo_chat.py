@@ -189,6 +189,54 @@ def test_neo_chat_reuses_bounded_flow_timestep_embeddings() -> None:
     assert len(model._flow_timestep_embed_cache) == 1
 
 
+def test_neo_chat_batches_exact_interleave_through_regular_decode(
+    monkeypatch,
+) -> None:
+    class FakeLanguageModel(nn.Module):
+        def forward(self, *_args, **_kwargs):
+            return "batched-text"
+
+    model = object.__new__(NEOChatModel)
+    nn.Module.__init__(model)
+    model.language_model = FakeLanguageModel()
+    forward_batch = SimpleNamespace(
+        batch_size=2,
+        forward_mode=SimpleNamespace(
+            is_decode=lambda: False,
+            is_extend=lambda: True,
+        ),
+        model_specific_states={
+            "image_gen_indicators": torch.zeros(2, dtype=torch.bool),
+        },
+        contains_mm_inputs=lambda: False,
+    )
+    monkeypatch.setattr(
+        NEOChatModel,
+        "_exact_text_specs",
+        staticmethod(lambda _forward_batch: [{}, {}]),
+    )
+    monkeypatch.setattr(
+        NEOChatModel,
+        "_install_hybrid_mask",
+        lambda _self, _forward_batch: None,
+    )
+    monkeypatch.setattr(
+        NEOChatModel,
+        "_forward_exact_text",
+        lambda *_args, **_kwargs: pytest.fail(
+            "batched exact interleave must use regular continuous decode"
+        ),
+    )
+
+    output = model.forward(
+        torch.tensor([1, 2]),
+        torch.tensor([0, 0]),
+        forward_batch,
+    )
+
+    assert output == "batched-text"
+
+
 @pytest.mark.skipif(
     MODEL_PATH is None or not (MODEL_PATH / "model.safetensors.index.json").exists(),
     reason="SENSENOVA_U1_MODEL_PATH must point to a local checkpoint",

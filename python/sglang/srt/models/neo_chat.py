@@ -1852,6 +1852,7 @@ class NEOChatModel(nn.Module):
         if (
             forward_batch.forward_mode.is_extend()
             and self._exact_text_specs(forward_batch) is not None
+            and forward_batch.batch_size == 1
         ):
             return self._forward_exact_text(
                 input_ids,

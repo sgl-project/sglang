@@ -330,6 +330,9 @@ class AcceptanceRunner:
         expected = TEXT_EXPECTED_IDS[:decode_steps]
         output_ids = [[int(token) for token in row["output_ids"]] for row in rows]
         server_s = max(float(row["meta_info"]["e2e_latency"]) for row in rows)
+        cached_tokens = [
+            int(row["meta_info"].get("cached_tokens") or 0) for row in rows
+        ]
         exact_stats = []
         for row in rows:
             exact_stats.extend(
@@ -341,6 +344,9 @@ class AcceptanceRunner:
             "request_count": len(rows),
             "all_exact": all(tokens == expected for tokens in output_ids),
             "output_ids": output_ids,
+            "cached_tokens": cached_tokens,
+            "radix_isolated": not exact_bs1
+            or all(value == 0 for value in cached_tokens),
             "exact_stats": exact_stats,
         }
 
@@ -502,6 +508,7 @@ class AcceptanceRunner:
             speedup = server_tps / TEXT_HF_TOKENS_PER_S[batch_size]
             passed = bool(
                 all(row["all_exact"] for row in rows)
+                and all(row["radix_isolated"] for row in rows)
                 and server_tps >= TEXT_TARGET_TOKENS_PER_S[batch_size]
                 and speedup >= TEXT_TARGET_SPEEDUP[batch_size]
             )
@@ -516,6 +523,7 @@ class AcceptanceRunner:
                 "server_latency_s": _stats(server_values),
                 "client_wall_s": _stats(wall_values),
                 "all_exact": all(row["all_exact"] for row in rows),
+                "radix_isolated": all(row["radix_isolated"] for row in rows),
                 "passed": passed,
                 "rows": rows,
             }
@@ -587,6 +595,7 @@ class AcceptanceRunner:
             and t2i_passed
             and interleave_passed
             and all(row["all_exact"] for row in coexistence.values())
+            and warm_text_bs1["radix_isolated"]
         )
         return {
             "ok": all_passed,

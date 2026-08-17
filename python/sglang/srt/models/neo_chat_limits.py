@@ -22,6 +22,10 @@ U1_MAX_FLOW_STEPS = 64
 U1_MAX_INTERLEAVE_IMAGES = 8
 
 
+def derive_u1_turn_seeds(seed: int, max_images: int) -> tuple[int, ...]:
+    return tuple((seed + image_index) % (2**63) for image_index in range(max_images))
+
+
 def parse_u1_int(value: Any, *, name: str) -> int:
     if isinstance(value, bool):
         raise TypeError(f"{name} must be an integer, not a boolean")
@@ -180,6 +184,7 @@ def normalize_u1_interleave_request(
         raise TypeError("enable_timestep_shift must be a boolean")
     if not isinstance(return_images, bool):
         raise TypeError("return_images must be a boolean")
+    turn_seeds = derive_u1_turn_seeds(seed, max_images)
 
     token_width = width // U1_IMAGE_SIZE_DIVISOR
     token_height = height // U1_IMAGE_SIZE_DIVISOR
@@ -200,6 +205,7 @@ def normalize_u1_interleave_request(
         "num_steps": num_steps,
         "max_images": max_images,
         "seed": seed,
+        "turn_seeds": list(turn_seeds),
         "timestep_shift": timestep_shift,
         "enable_timestep_shift": enable_timestep_shift,
         "return_images": return_images,
@@ -214,11 +220,11 @@ def normalize_u1_interleave_request(
 
 
 __all__ = [
+    "U1_EXACT_TEXT_CUSTOM_PARAM",
     "U1_FLOW_BATCH_ISOLATION_PARAM",
     "U1_FLOW_CUSTOM_PARAM",
     "U1_FLOW_PREFILL_GRAPH_VARIANT_PARAM",
     "U1_FLOW_RADIX_PREFIX_LIMIT_PARAM",
-    "U1_EXACT_TEXT_CUSTOM_PARAM",
     "U1_IMAGE_CONDITIONING_CUSTOM_PARAM",
     "U1_IMAGE_CONDITIONING_MAX_PIXELS",
     "U1_IMAGE_CONDITIONING_MIN_PIXELS",
@@ -228,6 +234,7 @@ __all__ = [
     "U1_MAX_IMAGE_DIMENSION",
     "U1_MAX_IMAGE_PIXELS",
     "U1_MAX_INTERLEAVE_IMAGES",
+    "derive_u1_turn_seeds",
     "normalize_u1_flow_request",
     "normalize_u1_interleave_request",
     "parse_u1_int",

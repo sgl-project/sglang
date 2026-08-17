@@ -896,6 +896,24 @@ def test_u1_flow_selects_matching_prefill_cuda_graph_variant() -> None:
     assert not runner.can_run_graph(forward_batch)
 
 
+def test_u1_exact_text_rejects_shared_prefill_cuda_graph() -> None:
+    runner = object.__new__(PrefillCudaGraphRunner)
+    runner.model_runner = SimpleNamespace(prefill_cuda_graph_variant=None)
+    forward_batch = SimpleNamespace(
+        sampling_info=SimpleNamespace(
+            custom_params=[
+                {
+                    "sensenova_u1_exact_text": {
+                        "decode_steps": 32,
+                    }
+                }
+            ]
+        )
+    )
+
+    assert not runner.can_run_graph(forward_batch)
+
+
 def test_u1_prefill_graph_trim_preserves_customized_info() -> None:
     runner = object.__new__(PrefillCudaGraphRunner)
     runner.raw_bs = 1

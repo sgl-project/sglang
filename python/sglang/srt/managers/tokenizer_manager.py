@@ -1393,6 +1393,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and isinstance(sampling_params.custom_params, dict)
         ):
             from sglang.srt.models.neo_chat_limits import (
+                U1_EXACT_TEXT_CUSTOM_PARAM,
                 U1_FLOW_BATCH_ISOLATION_PARAM,
                 U1_FLOW_CUSTOM_PARAM,
                 U1_FLOW_PREFILL_GRAPH_VARIANT_PARAM,
@@ -1406,9 +1407,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             interleave_spec = sampling_params.custom_params.get(
                 U1_INTERLEAVE_CUSTOM_PARAM
             )
-            if flow_spec is not None and interleave_spec is not None:
+            exact_text_spec = sampling_params.custom_params.get(
+                U1_EXACT_TEXT_CUSTOM_PARAM
+            )
+            enabled_modes = sum(
+                spec is not None
+                for spec in (
+                    flow_spec,
+                    interleave_spec,
+                    exact_text_spec,
+                )
+            )
+            if enabled_modes > 1:
                 raise ValueError(
-                    "SenseNova U1 flow and interleave modes are mutually exclusive"
+                    "SenseNova U1 flow, interleave, and exact text modes are "
+                    "mutually exclusive"
                 )
             if flow_spec is not None:
                 if input_ids is None:
@@ -1422,12 +1435,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 custom_params[U1_FLOW_BATCH_ISOLATION_PARAM] = (
                     f"sensenova_u1_flow:{obj.rid}"
                 )
-                custom_params[U1_FLOW_RADIX_PREFIX_LIMIT_PARAM] = (
-                    normalized_flow_spec["image_start"]
-                )
-                custom_params[U1_FLOW_PREFILL_GRAPH_VARIANT_PARAM] = (
-                    "sensenova_u1_flow"
-                )
+                custom_params[U1_FLOW_RADIX_PREFIX_LIMIT_PARAM] = normalized_flow_spec[
+                    "image_start"
+                ]
+                custom_params[U1_FLOW_PREFILL_GRAPH_VARIANT_PARAM] = "sensenova_u1_flow"
                 sampling_params.custom_params = custom_params
             elif interleave_spec is not None:
                 if input_ids is None:
@@ -1447,14 +1458,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     img_end_token_id=img_end_token_id,
                 )
                 custom_params = dict(sampling_params.custom_params)
-                custom_params[U1_INTERLEAVE_CUSTOM_PARAM] = (
-                    normalized_interleave_spec
+                custom_params[U1_INTERLEAVE_CUSTOM_PARAM] = normalized_interleave_spec
+                custom_params[U1_FLOW_BATCH_ISOLATION_PARAM] = (
+                    "sensenova_u1_exact_text:interleave"
                 )
+                custom_params[U1_FLOW_RADIX_PREFIX_LIMIT_PARAM] = 0
                 sampling_params.custom_params = custom_params
                 stop_token_ids = set(sampling_params.stop_token_ids or ())
                 stop_token_ids.add(img_start_token_id)
                 sampling_params.stop_token_ids = stop_token_ids
                 sampling_params.ignore_eos = False
+            elif exact_text_spec is not None:
+                if not isinstance(exact_text_spec, dict):
+                    raise TypeError("sensenova_u1_exact_text must be an object")
+                custom_params = dict(sampling_params.custom_params)
+                custom_params[U1_FLOW_BATCH_ISOLATION_PARAM] = (
+                    f"sensenova_u1_exact_text:{obj.rid}"
+                )
+                custom_params[U1_FLOW_RADIX_PREFIX_LIMIT_PARAM] = 0
+                sampling_params.custom_params = custom_params
 
         # Build return object
         if isinstance(obj, GenerateReqInput):

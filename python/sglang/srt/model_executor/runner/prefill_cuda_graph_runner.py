@@ -1080,11 +1080,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
         sampling_info = getattr(forward_batch, "sampling_info", None)
-        custom_params = (
-            None
-            if sampling_info is None
-            else sampling_info.custom_params
-        )
+        custom_params = None if sampling_info is None else sampling_info.custom_params
+        if custom_params is not None and any(
+            isinstance(params, dict) and "sensenova_u1_exact_text" in params
+            for params in custom_params
+        ):
+            # Exact text owns a private decode graph and private KV tensors.
+            # Wrapping it in the shared prefill graph would couple those caches
+            # to the ordinary SRT graph lifecycle.
+            return False
         captured_variant = getattr(
             getattr(self, "model_runner", None),
             "prefill_cuda_graph_variant",
@@ -1094,8 +1098,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             custom_params is None
             or any(
                 not isinstance(params, dict)
-                or params.get("__sglang_prefill_cuda_graph_variant")
-                != captured_variant
+                or params.get("__sglang_prefill_cuda_graph_variant") != captured_variant
                 for params in custom_params
             )
         ):
