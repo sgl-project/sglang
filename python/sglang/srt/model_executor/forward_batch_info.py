@@ -1731,6 +1731,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
 
+        # Re-pad reused eager draft batches on the next step.
+        self.mlp_sync_prepared = False
+
     @property
     def can_run_tbo(self):
         return self.tbo_split_seq_index is not None

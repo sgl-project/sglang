@@ -130,6 +130,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual(fb.req_pool_indices.shape[0], padded)
         torch.testing.assert_close(fb.positions[:3], torch.tensor([6, 7, 8]))
 
+        fb.mlp_sync_prepared = True
         logits_output = _logits_output(padded)
         fb.post_forward_mlp_sync_batch(logits_output)
 
@@ -141,6 +142,7 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual(logits_output.next_token_logits.shape[0], 3)
         # Seeded sampling asserts positions rows == sampled (real) rows.
         self.assertEqual(fb.positions.shape[0], fb.batch_size)
+        self.assertFalse(fb.mlp_sync_prepared)
 
     def test_extend_post_forward_unpads_positions(self):
         fb = ForwardBatch(
