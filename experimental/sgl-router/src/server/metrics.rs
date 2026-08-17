@@ -969,38 +969,35 @@ impl MetricsRegistry {
         hist.observe(seconds);
     }
 
-    /// Observe ingress tokenize cost (seconds) for `sgl_router_tokenize_seconds`.
+    /// Observe ingress tokenize cost (seconds) for `sgl_router_tokenize_seconds`
+    /// — body-fully-read to ids-ready, i.e. JSON parse + chat-template render +
+    /// encode.
     ///
-    /// BOUNDARY — the span starts once the request body is fully read into
-    /// memory and ends the instant token ids are ready. Concretely it covers the
-    /// body's JSON parse, the chat-template render, and the encode. It excludes
-    /// everything on both sides: body read and header handling before it,
-    /// admission wait, request build, worker connect, send, and dispatch after
-    /// it. That exclusion is the entire point. Widen this span to include
-    /// dispatch and the metric degenerates into a second, worse measurement of
-    /// `Server-Timing: router.ttfb`, answering nothing that header does not.
+    /// The exclusions are the point: admission wait, request build, connect,
+    /// send and dispatch are all outside. Widen the span to reach dispatch and
+    /// this degenerates into a worse copy of the `Server-Timing: router.ttfb`
+    /// header. The parse is deliberately INSIDE — unavoidable work between bytes
+    /// and ids, and on multimodal bodies (cap 100 MiB) it can outweigh the
+    /// encode, so read this as "bytes to ids", not pure BPE time.
     ///
-    /// The JSON parse is inside the span deliberately — it is unavoidable work
-    /// on the path from bytes to ids, and on large multimodal payloads (the body
-    /// cap is 100 MiB) it can outweigh the encode itself. Read this metric as
-    /// "bytes to ids", not as pure BPE time.
+    /// The first term of `sgl_router_ttft_overhead_seconds`, split out because
+    /// the terms have unrelated fixes — tokenize is CPU scaling with prompt
+    /// length and BPE-cache locality, admission wait is queueing under
+    /// saturation, and the latter dominates the aggregate exactly when someone
+    /// asks about the former. The two overlap by construction: do not sum them.
     ///
-    /// This is the FIRST TERM of `sgl_router_ttft_overhead_seconds`
-    /// (tokenize + admission wait + request build), broken out because the three
-    /// terms have unrelated causes and unrelated fixes: tokenize is CPU work
-    /// scaling with prompt length and BPE-cache locality, admission wait is
-    /// queueing under saturation. The aggregate cannot distinguish them, and
-    /// admission wait dominates it under load. The two metrics deliberately
-    /// overlap — do not sum them.
+    /// `/v1/chat/completions` ingress only, regardless of outcome, including
+    /// requests later shed at admission — a superset of `ttft_overhead_seconds`
+    /// (streaming-2xx only), so expect `tokenize_count ≥ overhead_count`.
+    /// `/v1/tokenize` encodes too but is not counted: its whole cost is already
+    /// `request_duration_seconds`, and blending it in would make the
+    /// distribution unattributable.
     ///
-    /// Recorded for EVERY request the ingress tokenizes, on every route and
-    /// regardless of outcome, including requests later shed at admission. Its
-    /// sample set is therefore a superset of `ttft_overhead_seconds`, which is
-    /// streaming-2xx only. Expect `tokenize_count ≥ overhead_count`; the gap is
-    /// non-streaming, non-2xx, and shed requests. Requests the ingress does not
-    /// tokenize (no chat encoder and a policy that needs no tokens) record
-    /// nothing at all rather than a zero, so the histogram stays a distribution
-    /// of real tokenize work. Uses [`TOKENIZE_BUCKETS`].
+    /// Gated on ATTEMPTED tokenization. Never-attempted records nothing rather
+    /// than a zero; an attempt yielding no ids (render failure, no tokenizable
+    /// field) IS recorded — a slow *failing* render is worth seeing — so a
+    /// sample can be parse-time only. Pair with
+    /// `sgl_router_ingress_tokenize_errors_total`. Uses [`TOKENIZE_BUCKETS`].
     pub fn observe_tokenize(&self, model_id: &str, seconds: f64) {
         // See `observe_request_duration` — drop non-finite before the map.
         if !seconds.is_finite() {
@@ -1468,7 +1465,7 @@ impl MetricsRegistry {
 
         // tokenize histogram
         out.push_str(
-            "# HELP sgl_router_tokenize_seconds Ingress cost from body-fully-read to token-ids-ready (JSON parse + chat-template render + encode), in seconds. Excludes admission wait, request build and engine dispatch. The tokenize term of sgl_router_ttft_overhead_seconds, recorded for every request the router tokenizes; overlaps that metric by construction - do not sum them.\n",
+            "# HELP sgl_router_tokenize_seconds Ingress cost from body-fully-read to token-ids-ready (JSON parse + chat-template render + encode), in seconds. Excludes admission wait, request build and engine dispatch. Recorded on the /v1/chat/completions ingress whenever it attempts tokenization, including requests later shed at admission; /v1/tokenize is not counted. The tokenize term of sgl_router_ttft_overhead_seconds - overlaps it by construction, do not sum them.\n",
         );
         out.push_str("# TYPE sgl_router_tokenize_seconds histogram\n");
         let guard = self.tokenize_seconds.lock();
