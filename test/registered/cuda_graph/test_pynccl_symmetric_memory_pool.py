@@ -96,6 +96,7 @@ def _worker_main() -> None:
                         ]
                     for prime_output in prime_outputs:
                         prime_output.copy_(static_input)
+                        tp_group.all_reduce(prime_output)
             del prime_output, prime_outputs
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=graph_pool, stream=capture_stream):
@@ -103,12 +104,18 @@ def _worker_main() -> None:
                     graph_outputs = [torch.empty_like(static_input) for _ in range(4)]
                 for graph_output in graph_outputs:
                     graph_output.copy_(static_input)
+                    tp_group.all_reduce(graph_output)
             del prime_graph
             graphs.append(graph)
             all_graph_outputs.append(graph_outputs)
 
     for graph in graphs:
         graph.replay()
+    torch.cuda.synchronize()
+
+    with use_symmetric_memory(tp_group):
+        eager_output = torch.full((1024,), rank + 1, dtype=torch.float32, device="cuda")
+    tp_group.all_reduce(eager_output)
     torch.cuda.synchronize()
 
     data_ptr = all_graph_outputs[0][0].untyped_storage().data_ptr()
@@ -125,12 +132,15 @@ def _worker_main() -> None:
     dist.all_gather_object(offsets, relative_offset, group=tp_group.cpu_group)
     if len(set(offsets)) != 1:
         raise AssertionError(f"captured symmetric-memory offsets diverged: {offsets}")
+    expected_sum = world_size * (world_size + 1) // 2
     if not all(
-        torch.equal(graph_output, static_input)
+        torch.all(graph_output == expected_sum)
         for graph_outputs in all_graph_outputs
         for graph_output in graph_outputs
     ):
         raise AssertionError("captured graph output mismatch")
+    if not torch.all(eager_output == expected_sum):
+        raise AssertionError("post-capture eager all-reduce output mismatch")
 
     set_graph_pool_id(None)
     set_use_dedicated_symmetric_memory_graph_pool(False)

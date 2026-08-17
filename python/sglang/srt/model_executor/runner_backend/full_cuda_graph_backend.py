@@ -131,6 +131,9 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         prime_graph = None
         with defer_symmetric_memory_graph_registration(self._tp_group) as should_prime:
             if should_prime:
+                # Keep lazy/JIT work from the final warmup out of this extra capture.
+                self._device_module.synchronize()
+                self._tp_group.barrier()
                 prime_graph = torch.cuda.CUDAGraph()
                 with graph_ctx(
                     cuda_graph=prime_graph,
