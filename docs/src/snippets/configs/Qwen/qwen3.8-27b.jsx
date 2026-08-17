@@ -484,14 +484,15 @@ export const config = {
     // separate SM121 operating point: both cards are SM12x Blackwell, and
     // GB10's 128GB unified pool is larger than the 6000's 96GB, so a recipe
     // that fits the smaller card has headroom here. Still unvalidated on
-    // SM121 / aarch64 -- the cells carry `verificationStatus: "in-progress"`
-    // while that round runs, since the shared recipe is an inheritance choice,
-    // not a measurement.
+    // VALIDATED on SM121 / aarch64: all 36 configurations (3 checkpoints x
+    // Speculative Decoding 3 x Serving Strategy 2 x Mamba SSM Dtype 2) served on
+    // GB10 under this recipe, so the inheritance is now backed by measurement.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", nodes: "single" },
-      // SM121 / aarch64 validation of this exact command is running on GB10;
-      // the badge reports that rather than collapsing to a flat Not Verified.
-      verificationStatus: "in-progress",
+      // MEASURED on GB10: all 12 configurations served, same envelope and
+      // protocol as the FP8 and BF16 cells below. DSPARK here also exercises
+      // the 4-bit `lm_head` this checkpoint quantizes, with no shape error.
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
