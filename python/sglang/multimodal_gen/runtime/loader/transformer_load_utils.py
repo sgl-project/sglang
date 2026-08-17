@@ -21,16 +21,23 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     _patch_nunchaku_scales,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    COMPONENT_OFFLOAD,
+    ComponentResidencyError,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    maybe_download_model,
+    snapshot_download,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     build_nvfp4_config_from_safetensors_list,
     get_metadata_from_safetensors_file,
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
 )
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.layers.quantization import QuantizationConfig
 
 logger = init_logger(__name__)
@@ -119,6 +126,7 @@ class TransformerQuantLoadSpec:
     quant_config: Optional[QuantizationConfig]
     nunchaku_config: Optional[NunchakuConfig]
     param_dtype: Optional[torch.dtype]
+    needs_device_weight_postprocess: bool = False
     post_load_hooks: list[PostLoadHook] = field(default_factory=list)
 
     @property
@@ -126,6 +134,10 @@ class TransformerQuantLoadSpec:
         if self.quant_config is not None:
             return self.quant_config
         return self.nunchaku_config
+
+    @property
+    def is_modelopt_fp4(self) -> bool:
+        return _get_quant_config_name(self.quant_config) == "modelopt_fp4"
 
 
 class _TransformerQuantAdapter:
@@ -136,6 +148,35 @@ class _TransformerQuantAdapter:
     def get_post_load_hooks(self) -> list[PostLoadHook]:
         """post - fsdp load - hook"""
         return []
+
+
+def _uses_component_offload(
+    server_args: ServerArgs,
+    component_name: str | None,
+    *,
+    legacy_enabled: bool,
+) -> bool:
+    if component_name is None:
+        return legacy_enabled
+    return server_args.residency_mode(component_name) == COMPONENT_OFFLOAD
+
+
+def _reject_explicit_component_selector(
+    server_args: ServerArgs,
+    component_name: str | None,
+    *,
+    feature_name: str,
+) -> None:
+    if component_name is None:
+        return
+    selected_by_component_residency = (
+        server_args.canonical_residency_mode(component_name) == COMPONENT_OFFLOAD
+    )
+    if selected_by_component_residency:
+        raise ComponentResidencyError(
+            f"{feature_name} does not support component-offload for "
+            f"{component_name!r}; select resident or layerwise-offload"
+        )
 
 
 class _NunchakuQuantAdapter(_TransformerQuantAdapter):
@@ -188,16 +229,19 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
         cls_name: str,
         server_args: ServerArgs,
         quant_config: Optional[QuantizationConfig],
+        component_name: str | None,
     ) -> None:
         self.cls_name = cls_name
         self.server_args = server_args
         self.quant_config = quant_config
+        self.component_name = component_name
 
     @staticmethod
     def _maybe_adjust_flux2_nvfp4_fallback_defaults(
         cls_name: str,
         server_args: ServerArgs,
         quant_config: Optional[QuantizationConfig],
+        component_name: str | None = None,
     ) -> None:
         if cls_name != "Flux2Transformer2DModel" or quant_config is None:
             return
@@ -211,14 +255,47 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
         if not weights_path.endswith("-mixed.safetensors") or server_args.tp_size <= 1:
             return
 
-        if server_args.dit_cpu_offload or server_args.text_encoder_cpu_offload:
-            server_args.dit_cpu_offload = False
-            server_args.text_encoder_cpu_offload = False
+        dit_component_offload = _uses_component_offload(
+            server_args,
+            component_name,
+            legacy_enabled=bool(server_args.dit_cpu_offload),
+        )
+        text_encoder_component_offload = _uses_component_offload(
+            server_args,
+            "text_encoder" if component_name is not None else None,
+            legacy_enabled=bool(server_args.text_encoder_cpu_offload),
+        )
+        if dit_component_offload:
+            _reject_explicit_component_selector(
+                server_args,
+                component_name,
+                feature_name="FLUX.2 mixed NVFP4 with tensor parallelism",
+            )
+        if text_encoder_component_offload:
+            _reject_explicit_component_selector(
+                server_args,
+                "text_encoder" if component_name is not None else None,
+                feature_name="FLUX.2 mixed NVFP4 with tensor parallelism",
+            )
+        if dit_component_offload or text_encoder_component_offload:
+            if component_name is None:
+                server_args.dit_cpu_offload = False
+                server_args.text_encoder_cpu_offload = False
+            else:
+                if dit_component_offload:
+                    server_args.require_component_resident(
+                        component_name,
+                        feature_name="FLUX.2 mixed NVFP4 with tensor parallelism",
+                    )
+                if text_encoder_component_offload:
+                    server_args.require_component_resident(
+                        "text_encoder",
+                        feature_name="FLUX.2 mixed NVFP4 with tensor parallelism",
+                    )
             logger.warning(
                 "FLUX.2 mixed NVFP4 is using the ModelOpt FP4 path with tp_size=%d; "
-                "disabling dit/text-encoder CPU offload to avoid TP all-gather "
-                "launch failures. Override the offload flags explicitly if you need "
-                "the old behavior.",
+                "keeping the DiT and text encoder resident to avoid TP all-gather "
+                "launch failures.",
                 server_args.tp_size,
             )
 
@@ -227,6 +304,7 @@ class _Flux2Nvfp4FallbackAdapter(_TransformerQuantAdapter):
             cls_name=self.cls_name,
             server_args=self.server_args,
             quant_config=self.quant_config,
+            component_name=self.component_name,
         )
 
 
@@ -238,35 +316,55 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
         *,
         server_args: ServerArgs,
         quant_config: Optional[QuantizationConfig],
+        component_name: str | None,
     ) -> None:
         self.server_args = server_args
         self.quant_config = quant_config
+        self.component_name = component_name
 
     @staticmethod
     def _maybe_disable_incompatible_dit_offload_modes(
         server_args: ServerArgs,
         quant_config: Optional[QuantizationConfig],
+        component_name: str | None = None,
     ) -> None:
         if quant_config is None:
             return
 
         quant_name_getter = getattr(type(quant_config), "get_name", None)
         quant_name = quant_name_getter() if callable(quant_name_getter) else None
+
         if quant_name != "modelopt_fp8":
             return
 
-        if server_args.dit_cpu_offload:
-            server_args.dit_cpu_offload = False
+        component_offload = _uses_component_offload(
+            server_args,
+            component_name,
+            legacy_enabled=bool(server_args.dit_cpu_offload),
+        )
+        if component_offload:
+            _reject_explicit_component_selector(
+                server_args,
+                component_name,
+                feature_name="ModelOpt FP8 diffusion checkpoints",
+            )
+            if component_name is None:
+                server_args.dit_cpu_offload = False
+            else:
+                server_args.require_component_resident(
+                    component_name,
+                    feature_name="ModelOpt FP8 diffusion checkpoints",
+                )
             logger.warning(
-                "ModelOpt FP8 diffusion checkpoints currently keep dit_cpu_offload "
-                "disabled. Layerwise DiT offload stays enabled because the runtime "
-                "now preserves the restored FP8 tensor strides.",
+                "ModelOpt FP8 diffusion checkpoints keep the DiT resident instead "
+                "of using component offload. Layerwise offload remains supported.",
             )
 
     def prepare(self) -> None:
         _ModelOptFp8OffloadAdapter._maybe_disable_incompatible_dit_offload_modes(
             server_args=self.server_args,
             quant_config=self.quant_config,
+            component_name=self.component_name,
         )
 
 
@@ -278,25 +376,52 @@ class _BitsAndBytes4BitAdapter(_TransformerQuantAdapter):
         *,
         server_args: ServerArgs,
         quant_config: Optional[QuantizationConfig],
+        component_name: str | None,
     ) -> None:
         self.server_args = server_args
         self.quant_config = quant_config
+        self.component_name = component_name
 
     @staticmethod
     def _maybe_disable_incompatible_offload_modes(
         server_args: ServerArgs,
         quant_config: Optional[QuantizationConfig],
+        component_name: str | None = None,
     ) -> None:
         if _get_quant_config_name(quant_config) != "bitsandbytes":
             return
 
         changed = []
-        if server_args.dit_cpu_offload:
-            server_args.dit_cpu_offload = False
-            changed.append("dit_cpu_offload=False")
-        if server_args.use_fsdp_inference:
-            server_args.use_fsdp_inference = False
-            changed.append("use_fsdp_inference=False")
+        component_offload = _uses_component_offload(
+            server_args,
+            component_name,
+            legacy_enabled=bool(server_args.dit_cpu_offload),
+        )
+        if component_offload:
+            _reject_explicit_component_selector(
+                server_args,
+                component_name,
+                feature_name="bitsandbytes 4-bit transformer checkpoints",
+            )
+            if component_name is None:
+                server_args.dit_cpu_offload = False
+            else:
+                server_args.require_component_resident(
+                    component_name,
+                    feature_name="bitsandbytes 4-bit transformer checkpoints",
+                )
+            changed.append(
+                "dit_cpu_offload=False"
+                if component_name is None
+                else f"{component_name}=resident"
+            )
+        if component_name is None:
+            if server_args.use_fsdp_inference:
+                server_args.use_fsdp_inference = False
+                changed.append("use_fsdp_inference=False")
+        elif server_args.should_use_fsdp_for_component(component_name):
+            server_args.disable_fsdp_for_component(component_name)
+            changed.append(f"{component_name}.fsdp=False")
         if changed:
             logger.warning(
                 "Keeping bitsandbytes 4-bit transformer GPU-resident: %s",
@@ -307,6 +432,7 @@ class _BitsAndBytes4BitAdapter(_TransformerQuantAdapter):
         _BitsAndBytes4BitAdapter._maybe_disable_incompatible_offload_modes(
             server_args=self.server_args,
             quant_config=self.quant_config,
+            component_name=self.component_name,
         )
 
 
@@ -317,12 +443,31 @@ def resolve_transformer_safetensors_to_load(
     quantized_path = server_args.transformer_weights_path
 
     if quantized_path:
-        quantized_path = maybe_download_model(quantized_path)
+        original_quantized_path = quantized_path
+        quantized_path = maybe_download_model(original_quantized_path)
         logger.info("using quantized transformer weights from: %s", quantized_path)
         if os.path.isfile(quantized_path) and quantized_path.endswith(".safetensors"):
             safetensors_list = [quantized_path]
         else:
             safetensors_list = _list_safetensors_files(quantized_path)
+            if not safetensors_list and not os.path.exists(original_quantized_path):
+                logger.warning(
+                    "No safetensors files found in cached transformer weights path "
+                    "%s; refreshing snapshot for %s",
+                    quantized_path,
+                    original_quantized_path,
+                )
+                quantized_path = snapshot_download(
+                    repo_id=original_quantized_path,
+                    ignore_patterns=["*.onnx", "*.msgpack"],
+                    allow_patterns=[
+                        "*.json",
+                        "*.safetensors",
+                        "*.safetensors.index.json",
+                    ],
+                    max_workers=8,
+                )
+                safetensors_list = _list_safetensors_files(quantized_path)
     else:
         safetensors_list = _list_safetensors_files(component_model_path)
 
@@ -412,6 +557,7 @@ def resolve_transformer_quant_load_spec(
     component_model_path: str,
     model_cls: type[nn.Module],
     cls_name: str,
+    component_name: str | None = None,
 ) -> TransformerQuantLoadSpec:
     if getattr(model_cls, "handles_checkpoint_quantization", False):
         quant_config = None
@@ -444,6 +590,7 @@ def resolve_transformer_quant_load_spec(
         nunchaku_config=nunchaku_config,
         model_cls=model_cls,
         safetensors_list=safetensors_list,
+        component_name=component_name,
     )
     for adapter in adapters:
         adapter.prepare()
@@ -458,8 +605,29 @@ def resolve_transformer_quant_load_spec(
         quant_config=quant_config,
         nunchaku_config=nunchaku_config,
         param_dtype=param_dtype,
+        needs_device_weight_postprocess=_needs_device_weight_postprocess(quant_config),
         post_load_hooks=post_load_hooks,
     )
+
+
+def _needs_device_weight_postprocess(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Return whether post-load weight processing needs CUDA/NPU tensors."""
+    quant_name = _get_quant_config_name(quant_config)
+    if quant_name == "modelopt_fp8":
+        return True
+
+    serialized_flag_by_quant_name = {
+        "fp8": "is_checkpoint_fp8_serialized",
+        "mxfp8": "is_checkpoint_fp8_serialized",
+        "mxfp4": "is_checkpoint_mxfp4_serialized",
+        "mxfp4_npu": "is_checkpoint_mxfp4_npu_serialized",
+    }
+    serialized_flag = serialized_flag_by_quant_name.get(quant_name)
+    if serialized_flag is None:
+        return False
+    return not getattr(quant_config, serialized_flag, False)
 
 
 def _build_transformer_quant_adapters(
@@ -470,20 +638,24 @@ def _build_transformer_quant_adapters(
     nunchaku_config: Optional[NunchakuConfig],
     model_cls: type[nn.Module],
     safetensors_list: list[str],
+    component_name: str | None,
 ) -> list[_TransformerQuantAdapter]:
     adapters: list[_TransformerQuantAdapter] = [
         _Flux2Nvfp4FallbackAdapter(
             cls_name=cls_name,
             server_args=server_args,
             quant_config=quant_config,
+            component_name=component_name,
         ),
         _ModelOptFp8OffloadAdapter(
             server_args=server_args,
             quant_config=quant_config,
+            component_name=component_name,
         ),
         _BitsAndBytes4BitAdapter(
             server_args=server_args,
             quant_config=quant_config,
+            component_name=component_name,
         ),
     ]
     if nunchaku_config is not None:
@@ -559,7 +731,12 @@ def _resolve_quant_config(
         # in source dtype and are quantized in
         # process_weights_after_loading.
         quant_cls = get_quantization_config(server_args.quantization)
-        return quant_cls()
+        quant_kwargs = {}
+        if server_args.quantization in {"fp8", "mxfp4"}:
+            quant_kwargs["ignored_layers"] = getattr(
+                server_args, "quantization_ignored_layers", None
+            )
+        return quant_cls(**quant_kwargs)
 
     quant_config = get_quant_config(hf_config, component_model_path)
     if quant_config is None and server_args.transformer_weights_path:
@@ -573,10 +750,12 @@ def _resolve_quant_config(
     reverse_param_names_mapping_dict = getattr(
         arch_config, "reverse_param_names_mapping", None
     )
+    quant_ignore_remap_dict = getattr(arch_config, "quant_ignore_remap", None)
     quant_config = get_quant_config(
         hf_config,
         component_model_path,
         reverse_param_names_mapping=reverse_param_names_mapping_dict,
+        quant_ignore_remap=quant_ignore_remap_dict,
     )
     quant_config_name = _get_quant_config_name(quant_config)
     inferred_nvfp4_config = None
@@ -617,4 +796,4 @@ def _resolve_target_param_dtype(
 ) -> Optional[torch.dtype]:
     if quant_config is not None or nunchaku_config is not None:
         return None
-    return PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
+    return resolve_precision(server_args, "dit", precision_attr="dit_precision")

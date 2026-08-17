@@ -110,6 +110,16 @@ def normalize_gpu_ids(gpu_ids: Any) -> list[int] | None:
     return parsed
 
 
+def parse_size(size: str) -> tuple[int | None, int | None]:
+    try:
+        parts = size.lower().replace(" ", "").split("x")
+        if len(parts) != 2:
+            raise ValueError
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None, None
+
+
 def parse_tcp_host_port(value: str | None, field_name: str) -> tuple[str, int]:
     if value is None or not str(value).strip():
         raise ValueError(f"{field_name} is required")
@@ -388,14 +398,15 @@ def get_bool_env_var(name: str, default: str = "false") -> bool:
     return value in truthy_values
 
 
-try:
-    import sgl_kernel  # noqa: F401
+@lru_cache(maxsize=1)
+def _is_intel_amx_backend_available():
+    try:
+        import sgl_kernel  # noqa: F401
 
-    is_intel_amx_backend_available = hasattr(
-        torch.ops.sgl_kernel, "convert_weight_packed"
-    )
-except:
-    is_intel_amx_backend_available = False
+        return hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+    except Exception:
+        return False
+
 
 try:
     # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
@@ -406,7 +417,7 @@ except:
 
 
 def cpu_has_amx_support():
-    return is_amx_tile_supported and is_intel_amx_backend_available
+    return is_amx_tile_supported and _is_intel_amx_backend_available()
 
 
 def use_intel_amx_backend(layer):

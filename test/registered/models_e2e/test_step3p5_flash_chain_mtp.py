@@ -3,7 +3,6 @@ import unittest
 import numpy as np
 import requests
 
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
@@ -51,18 +50,12 @@ class TestStep3p5FlashChainMTP(GSM8KMixin, DefaultServerBase):
     gsm8k_accuracy_thres = 0.83
     gsm8k_accept_length_thres = 2.6
 
-    @classmethod
-    def setUpClass(cls):
-        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
-            super().setUpClass()
+    def test_logprob_decode_match_prefill(self):
+        """Decode logprobs from the spec path must match prefill scoring.
 
-    def test_logprob_spec_v2_match(self):
-        """Verify spec v2 decode logprobs match prefill scoring logprobs.
-
-        Generate tokens with chain MTP spec v2, then score the same sequence
-        via prefill-only (no speculation). The two sets of logprobs should be
-        close, validating that spec v2 + multi-layer EAGLE computes logprobs
-        correctly.
+        Generate tokens with chain MTP, then score the same sequence via
+        prefill-only (no speculation). The two sets of logprobs should be
+        close, validating that multi-layer EAGLE computes logprobs correctly.
         """
         requests.get(self.base_url + "/flush_cache")
 

@@ -28,7 +28,7 @@ DSV4_POOL_SERVER_ARGS: Final[tuple[str, ...]] = (
     "--enable-dp-attention",
     "--moe-a2a-backend",
     "deepep",
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     "128",
     "--max-running-requests",
     "256",

@@ -30,12 +30,15 @@ def print_deprecated_warning(message: str):
 
 
 class DeprecatedAction(argparse.Action):
-    def __init__(self, option_strings, dest, nargs=0, **kwargs):
+    def __init__(self, option_strings, dest, error_message=None, nargs=0, **kwargs):
+        self.error_message = error_message
         super(DeprecatedAction, self).__init__(
             option_strings, dest, nargs=nargs, **kwargs
         )
 
     def __call__(self, parser, namespace, values, option_string=None):
+        if self.error_message is not None:
+            parser.error(self.error_message)
         print_deprecated_warning(
             f"The command line argument '{option_string}' is deprecated and will be removed in future versions."
         )
@@ -65,6 +68,34 @@ class DeprecatedStoreTrueAction(argparse.Action):
             f"'{option_string}' is deprecated and will be removed in a future release.{replacement}"
         )
         setattr(namespace, self.dest, True)
+
+
+class DeprecatedStoreConstAction(argparse.Action):
+    """Deprecated boolean flag that stores a fixed string/value into ``dest``
+    and prints a warning. Used to translate a legacy boolean flag into a
+    setting on the new per-phase config dict (e.g.
+    ``--disable-piecewise-cuda-graph`` -> ``cuda_graph_backend_prefill="disabled"``)."""
+
+    def __init__(
+        self,
+        option_strings,
+        dest,
+        new_flag=None,
+        const_value=None,
+        nargs=0,
+        default=None,
+        **kwargs,
+    ):
+        self.new_flag = new_flag
+        self.const_value = const_value
+        super().__init__(option_strings, dest, nargs=nargs, default=default, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        replacement = f" Use '{self.new_flag}' instead." if self.new_flag else ""
+        print_deprecated_warning(
+            f"'{option_string}' is deprecated and will be removed in a future release.{replacement}"
+        )
+        setattr(namespace, self.dest, self.const_value)
 
 
 class DeprecatedAliasStoreAction(argparse.Action):

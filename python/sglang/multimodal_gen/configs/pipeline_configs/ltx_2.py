@@ -136,6 +136,8 @@ def sync_ltx23_runtime_vae_markers(
     for key in (
         "ltx_variant",
         "condition_encoder_subdir",
+        "video_encoder_variant",
+        "video_encoder_config",
         "video_decoder_variant",
         "video_decoder_config",
     ):
@@ -176,6 +178,10 @@ class LTX2PipelineConfig(PipelineConfig):
     generator_device: str = "cpu"
     dit_config: LTX2Config = field(default_factory=LTX2Config)
 
+    # Distilled checkpoints are trained against one fixed sigma schedule rather
+    # than a step count. When set, it replaces the derived schedule.
+    default_sigmas: tuple[float, ...] | None = None
+
     # Model architecture
     in_channels: int = 128
     out_channels: int = 128
@@ -198,8 +204,9 @@ class LTX2PipelineConfig(PipelineConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_disable_component_offload_min_available_memory_gb=70,
-            auto_disable_component_offload_components=("dit",),
+            keep_resident_min_available_gb=70,
+            keep_resident_components=("dit",),
+            auto_cfg_parallel_degree_by_num_gpus=((4, 1), (8, 1)),
         )
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):
@@ -306,6 +313,9 @@ class LTX2PipelineConfig(PipelineConfig):
             self.patch_size,
         )
         latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
+        # Deliberately left non-contiguous: both flattens are views, so this
+        # keeps the permuted strides. Normalising here would change which GEMM
+        # kernel runs and move bf16 output. The fp8 path makes its own copy.
         return latents
 
     def _infer_video_latent_frames_and_tokens_per_frame(
@@ -711,5 +721,5 @@ class LTX2PipelineConfig(PipelineConfig):
 
 
 @dataclasses.dataclass
-class LTX2I2VPipelineConfig(LTX2PipelineConfig):
-    task_type: ModelTaskType = ModelTaskType.TI2V
+class LTX23PipelineConfig(LTX2PipelineConfig):
+    """Configuration overrides for LTX-2.3."""

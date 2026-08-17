@@ -11,7 +11,6 @@ import dataclasses
 import importlib
 import os
 import pkgutil
-import sys
 from functools import lru_cache
 from typing import (
     TYPE_CHECKING,
@@ -37,6 +36,8 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     HeliosT2VConfig,
     HunyuanConfig,
     LingBotWorldCausalDMDConfig,
+    LingBotWorldV2CausalDMDConfig,
+    MiniMaxH3PipelineConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -59,16 +60,33 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ideogram import (
+    Ideogram4DistilledPipelineConfig,
     Ideogram4PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.joy_echo import (
+    JoyEchoPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
+    LingBotVideoMoEPipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
+    LongCatImagePipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    LTX2PipelineConfig,
+    LTX23PipelineConfig,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
     MOVA720PConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImageEditPlus_2511_PipelineConfig,
@@ -77,6 +95,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
+    SanaVideoPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
@@ -85,6 +106,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_1_T2V_480P_Config,
     FastWan2_2_TI2V_5B_Config,
     TurboWanI2V720Config,
+    TurboWanT2V1_3B480PConfig,
     TurboWanT2V480PConfig,
     Wan2_2_I2V_A14B_Config,
     Wan2_2_T2V_A14B_Config,
@@ -109,22 +131,40 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
-from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParams
+from sglang.multimodal_gen.configs.sample.ideogram import (
+    Ideogram4FastSamplingParams,
+    Ideogram4InstantSamplingParams,
+    Ideogram4SamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.joy_echo import JoyEchoSamplingParams
 from sglang.multimodal_gen.configs.sample.joy_image import (
     JoyImageEditSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.krea2 import (
+    Krea2SamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
+    LingBotVideoMoESamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.longcat_image import (
+    LongCatImageSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
     LTX23HQSamplingParams,
     LTX23SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
     MOVA_720P_SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImage2512SamplingParams,
     QwenImageEditPlusSamplingParams,
@@ -132,6 +172,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
+from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
@@ -159,7 +200,6 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model_index,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.utils import KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
 
 logger = init_logger(__name__)
 
@@ -265,6 +305,22 @@ _MODEL_HF_PATH_TO_NAME: Dict[str, str] = {}
 
 # Detectors to identify model families from paths or class names
 _MODEL_NAME_DETECTORS: List[Tuple[str, Callable[[str], bool]]] = []
+
+# native pipelines do not have a diffusers model_index.json. Keep their path
+# aliases next to the resolver that consumes them so CLI detection and
+# pipeline selection cannot drift apart
+KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
+    "minimaxai/minimax-h3": "MiniMaxH3Pipeline",
+    "minimax/minimax-h3": "MiniMaxH3Pipeline",
+    "lerobot/pi05": "Pi05Pipeline",
+    "pi05": "Pi05Pipeline",
+    "pi0.5": "Pi05Pipeline",
+    "hunyuan3d": "Hunyuan3D2Pipeline",
+    "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
+    "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
+    "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
+    "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+}
 
 
 def register_configs(
@@ -450,6 +506,7 @@ def _get_diffusers_model_info(
     works correctly even under the diffusers backend.
     """
     from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
+        DIFFUSERS_TASK_TYPE_TO_CONFIG,
         DiffusersGenericPipelineConfig,
     )
     from sglang.multimodal_gen.configs.sample.diffusers_generic import (
@@ -462,36 +519,17 @@ def _get_diffusers_model_info(
     sampling_param_cls = DiffusersGenericSamplingParams
     pipeline_config_cls = DiffusersGenericPipelineConfig
 
-    # If there is a registered native config for this model, inherit its task_type
+    # If there is a registered native config for this model, inherit its task_type.
+    # We use pre-defined static subclasses instead of make_dataclass so the config
+    # class is pickle-safe for multiprocessing spawn (fixes #21453).
     if model_path is not None:
         config_info = _get_config_info(model_path, model_id=model_id)
         if config_info is not None:
             sampling_param_cls = config_info.sampling_param_cls
             native_task_type = config_info.pipeline_config_cls.task_type
             if native_task_type != DiffusersGenericPipelineConfig.task_type:
-                pipeline_config_cls = dataclasses.make_dataclass(
-                    "DiffusersGenericPipelineConfig",
-                    [
-                        (
-                            "task_type",
-                            type(native_task_type),
-                            dataclasses.field(default=native_task_type),
-                        )
-                    ],
-                    bases=(DiffusersGenericPipelineConfig,),
-                )
-                # make_dataclass sets __module__="types"; fix for pickle.
-                pipeline_config_cls.__module__ = (
-                    DiffusersGenericPipelineConfig.__module__
-                )
-                pipeline_config_cls.__qualname__ = (
-                    DiffusersGenericPipelineConfig.__qualname__
-                )
-                parent_module = sys.modules[DiffusersGenericPipelineConfig.__module__]
-                setattr(
-                    parent_module,
-                    DiffusersGenericPipelineConfig.__name__,
-                    pipeline_config_cls,
+                pipeline_config_cls = DIFFUSERS_TASK_TYPE_TO_CONFIG.get(
+                    native_task_type, DiffusersGenericPipelineConfig
                 )
                 logger.debug(
                     "Inherited task_type=%s from native config for diffusers backend",
@@ -635,6 +673,20 @@ def get_model_info(
 
 # Registration of model configs
 def _register_configs():
+    # Pi0.5 / OpenPI / LeRobot action policies.
+    register_configs(
+        sampling_param_cls=Pi05SamplingParams,
+        pipeline_config_cls=Pi05PipelineConfig,
+        hf_model_paths=[
+            "lerobot/pi05_base",
+            "lerobot/pi05_libero_base",
+        ],
+        model_detectors=[
+            lambda hf_id: "pi05" in hf_id.lower(),
+            lambda hf_id: "pi0.5" in hf_id.lower(),
+        ],
+    )
+
     # LTX-2
     register_configs(
         sampling_param_cls=LTX2SamplingParams,
@@ -642,15 +694,29 @@ def _register_configs():
         hf_model_paths=["Lightricks/LTX-2"],
         model_detectors=[
             lambda path: "ltx" in path.lower() and "video" in path.lower(),
-            lambda path: "ltx-2" in path.lower() and "ltx-2.3" not in path.lower(),
+            lambda path: "ltx-2" in path.lower()
+            and "ltx-2.3" not in path.lower()
+            and "ltx-2.5" not in path.lower(),
         ],
     )
     register_configs(
         sampling_param_cls=LTX23SamplingParams,
-        pipeline_config_cls=LTX2PipelineConfig,
+        pipeline_config_cls=LTX23PipelineConfig,
         hf_model_paths=["Lightricks/LTX-2.3"],
         model_detectors=[
             lambda path: "ltx-2.3" in path.lower(),
+        ],
+    )
+    # Keeps the LTX-2 pipeline class; only component geometry and the pinned
+    # distilled schedule differ. Only the `-Diffusers` repo is listed --
+    # `Lightricks/LTX-2.5` is a split pack of bare `.safetensors` and would need
+    # a model overlay first.
+    register_configs(
+        sampling_param_cls=LTX25SamplingParams,
+        pipeline_config_cls=LTX25PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2.5-Diffusers"],
+        model_detectors=[
+            lambda path: "ltx-2.5" in path.lower(),
         ],
     )
     # register dedicated sampling params for LTX2TwoStageHQPipeline
@@ -686,7 +752,7 @@ def _register_configs():
     )
     register_configs(
         sampling_param_cls=WanT2V_1_3B_SamplingParams,
-        pipeline_config_cls=TurboWanT2V480PConfig,
+        pipeline_config_cls=TurboWanT2V1_3B480PConfig,
         hf_model_paths=[
             "IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
         ],
@@ -772,6 +838,22 @@ def _register_configs():
         ],
     )
     register_configs(
+        sampling_param_cls=LingBotWorldSamplingParams,
+        pipeline_config_cls=LingBotWorldV2CausalDMDConfig,
+        hf_model_paths=[
+            "robbyant/lingbot-world-v2-14b-causal-fast-diffusers",
+        ],
+    )
+    register_configs(
+        sampling_param_cls=LongLive2SamplingParams,
+        pipeline_config_cls=LongLive2T2VConfig,
+        hf_model_paths=[
+            # Since LongLive-2.0-5B does not have official diffusers release
+            "Rabinovich/LongLive-2.0-5B-Diffusers",
+            "Efficient-Large-Model/LongLive-2.0-5B",
+        ],
+    )
+    register_configs(
         sampling_param_cls=FastWanT2V480PConfig,
         pipeline_config_cls=FastWan2_1_T2V_480P_Config,
         hf_model_paths=[
@@ -791,6 +873,18 @@ def _register_configs():
         pipeline_config_cls=MOVA720PConfig,
         model_detectors=[
             lambda hf_id: "mova" in hf_id.lower() and "720p" in hf_id.lower()
+        ],
+    )
+    register_configs(
+        sampling_param_cls=MiniMaxH3SamplingParams,
+        pipeline_config_cls=MiniMaxH3PipelineConfig,
+        hf_model_paths=[
+            "MiniMaxAI/MiniMax-H3",
+            "MiniMax/MiniMax-H3",
+        ],
+        model_detectors=[
+            lambda model_id: "minimaxh3"
+            in model_id.lower().replace("-", "").replace("_", "")
         ],
     )
     # FLUX
@@ -859,11 +953,18 @@ def _register_configs():
             lambda hf_id: "z-image" in hf_id.lower() and "turbo" not in hf_id.lower()
         ],
     )
+    # Krea-2 (K2)
+    register_configs(
+        sampling_param_cls=Krea2SamplingParams,
+        pipeline_config_cls=Krea2PipelineConfig,
+        hf_model_paths=["krea/Krea-2"],
+        model_detectors=[lambda hf_id: "krea-2" in hf_id.lower()],
+    )
     # Qwen-Image
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
-        hf_model_paths=["Qwen/Qwen-Image"],
+        hf_model_paths=["Qwen/Qwen-Image", "nvidia/Qwen-Image-NVFP4"],
         model_detectors=[
             lambda hf_id: (
                 "qwen-image" in hf_id.lower()
@@ -993,20 +1094,38 @@ def _register_configs():
         ],
     )
 
+    # SANA-Video (register before generic SANA to avoid detector overlap).
+    register_configs(
+        sampling_param_cls=SanaVideoSamplingParams,
+        pipeline_config_cls=SanaVideoPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                "sana-video" in hf_id.lower() or "sana_video" in hf_id.lower()
+            )
+        ],
+    )
+
     # Cosmos3 — single checkpoint serves T2V, I2V, and T2I. Mode is dispatched
     # per-request inside the pipeline from ``num_frames`` and ``image_path``.
-    # Both Nano (8B) and Super (32B) share the same pipeline; arch dimensions
-    # come from ``transformer/config.json`` via ``update_model_arch``.
+    # All variants share the same pipeline; arch dimensions (size, activation,
+    # QK-norm) come from ``transformer/config.json`` via ``update_model_arch``.
     register_configs(
         sampling_param_cls=Cosmos3SamplingParams,
         pipeline_config_cls=Cosmos3Config,
         hf_model_paths=[
             "nvidia/Cosmos3-Nano",
+            "nvidia/Cosmos3-Nano-Policy-DROID",
             "nvidia/Cosmos3-Super",
             "nvidia/Cosmos3-Super-Text2Image",
             "nvidia/Cosmos3-Super-Image2Video",
+            "nvidia/Cosmos3-Edge",
         ],
-        model_detectors=[lambda hf_id: "cosmos3omnidiffuserspipeline" in hf_id.lower()],
+        # Match both the new ``Cosmos3OmniPipeline`` and the legacy
+        # ``Cosmos3OmniDiffusersPipeline`` ``_class_name`` (diffusers rename).
+        model_detectors=[lambda hf_id: "cosmos3omni" in hf_id.lower()],
     )
 
     # SANA
@@ -1026,6 +1145,8 @@ def _register_configs():
                 "sana" in hf_id.lower()
                 and "sana-wm" not in hf_id.lower()
                 and "sana_wm" not in hf_id.lower()
+                and "sana-video" not in hf_id.lower()
+                and "sana_video" not in hf_id.lower()
             )
         ],
     )
@@ -1064,8 +1185,29 @@ def _register_configs():
             lambda hf_id: "joyai-image-edit" in hf_id.lower(),
         ],
     )
+    register_configs(
+        sampling_param_cls=JoyEchoSamplingParams,
+        pipeline_config_cls=JoyEchoPipelineConfig,
+        hf_model_paths=[
+            "jdopensource/JoyAI-Echo",
+        ],
+        model_detectors=[
+            lambda hf_id: ("joy-echo" in hf_id.lower() or "joyai-echo" in hf_id.lower())
+            and "image-edit" not in hf_id.lower(),
+        ],
+    )
 
     # Ideogram 4
+    register_configs(
+        sampling_param_cls=Ideogram4FastSamplingParams,
+        pipeline_config_cls=Ideogram4DistilledPipelineConfig,
+        hf_model_paths=["fal/ideogram-v4-fast"],
+    )
+    register_configs(
+        sampling_param_cls=Ideogram4InstantSamplingParams,
+        pipeline_config_cls=Ideogram4DistilledPipelineConfig,
+        hf_model_paths=["fal/ideogram-v4-instant"],
+    )
     register_configs(
         sampling_param_cls=Ideogram4SamplingParams,
         pipeline_config_cls=Ideogram4PipelineConfig,
@@ -1083,22 +1225,53 @@ def _register_configs():
         ],
     )
 
+    register_configs(
+        sampling_param_cls=LingBotVideoMoESamplingParams,
+        pipeline_config_cls=LingBotVideoMoEPipelineConfig,
+        model_detectors=[
+            lambda hf_id: "lingbot-video-moe" in hf_id.lower(),
+        ],
+    )
+
+    # LongCat-Image
+    register_configs(
+        sampling_param_cls=LongCatImageSamplingParams,
+        pipeline_config_cls=LongCatImagePipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image",
+        ],
+        model_detectors=[
+            lambda hf_id: "longcat" in hf_id.lower() and "edit" not in hf_id.lower(),
+        ],
+    )
+
 
 _register_configs()
 
 
 def is_known_non_diffusers_multimodal_model(model_path: str) -> bool:
-    model_path_lower = model_path.lower()
-    return any(
-        pattern in model_path_lower
-        for pattern in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
-    )
+    return get_non_diffusers_pipeline_name(model_path) is not None
 
 
 def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     """Get the pipeline name for a known non-diffusers model."""
-    model_path_lower = model_path.lower()
+    normalized_model_path = _normalize_hf_cache_path(model_path)
+    model_short_name = get_model_short_name(normalized_model_path)
     for pattern, pipeline_name in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS.items():
-        if pattern in model_path_lower:
+        pattern = pattern.lower()
+        if "/" not in pattern and pattern in normalized_model_path:
+            return pipeline_name
+        if "/" in pattern and (
+            normalized_model_path == pattern
+            or model_short_name == get_model_short_name(pattern)
+            or f"models--{pattern.replace('/', '--')}" in normalized_model_path
+        ):
             return pipeline_name
     return None
+
+
+def is_registered_diffusion_model_path(model_path: str) -> bool:
+    """Return whether the diffusion registry recognizes a model path."""
+    return has_registered_diffusion_model_path(model_path) or (
+        get_non_diffusers_pipeline_name(model_path) is not None
+    )

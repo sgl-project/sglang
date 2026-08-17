@@ -1,17 +1,28 @@
 from __future__ import annotations
 
+import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.sampler import (
+    apply_custom_logit_processor,
+    top_p_normalize_probs_torch,
+)
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.utils import is_cuda, is_musa
+from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
+
+logger = logging.getLogger(__name__)
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
@@ -20,6 +31,7 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "FlashInferAttnBackend",
         "FlashInferMLAAttnBackend",
         "FlashAttentionBackend",
+        "TritonAttnBackend",
         "TRTLLMHAAttnBackend",
         "TRTLLMMLABackend",
     }
@@ -39,6 +51,15 @@ if is_cuda() or is_musa():
         top_k_renorm_prob = None
         top_p_renorm_prob = None
         tree_speculative_sampling_target_only = None
+elif is_hip():
+    from sglang.kernels.ops.sampling.renorm_triton import (
+        top_k_renorm_probs_triton as top_k_renorm_prob,
+    )
+    from sglang.kernels.ops.sampling.renorm_triton import (
+        top_p_renorm_probs_triton as top_p_renorm_prob,
+    )
+
+    tree_speculative_sampling_target_only = None
 else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None
@@ -47,6 +68,88 @@ else:
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+
+
+def _dflash_npu_top_k_top_p_renorm_prob(
+    probs: torch.Tensor,
+    *,
+    top_ks: Optional[torch.Tensor] = None,
+    top_ps: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    if not is_npu() or probs.device.type != "npu":
+        return None
+    try:
+        import torch_npu
+    except ImportError:
+        return None
+    if not hasattr(torch_npu, "npu_top_k_top_p"):
+        return None
+
+    logits = probs.log()
+    npu_top_ps = (
+        top_ps.reshape(-1).to(device=probs.device, dtype=probs.dtype)
+        if top_ps is not None
+        else None
+    )
+    npu_top_ks = (
+        top_ks.reshape(-1).to(device=probs.device, dtype=torch.int32)
+        if top_ks is not None
+        else None
+    )
+    if npu_top_ks is not None and not bool(
+        torch.all((npu_top_ks >= 1) & (npu_top_ks <= 1024)).item()
+    ):
+        return None
+    filtered_logits = torch_npu.npu_top_k_top_p(logits, npu_top_ps, npu_top_ks)
+    return filtered_logits.softmax(dim=-1)
+
+
+def _dflash_top_k_renorm_prob(
+    probs: torch.Tensor, top_ks: torch.Tensor
+) -> torch.Tensor:
+    if top_k_renorm_prob is not None:
+        return top_k_renorm_prob(probs, top_ks)
+
+    npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ks=top_ks)
+    if npu_probs is not None:
+        return npu_probs
+
+    vocab_size = probs.shape[-1]
+    top_ks = top_ks.reshape(-1).to(device=probs.device, dtype=torch.int64)
+    top_ks = top_ks.clamp(min=1, max=vocab_size)
+    max_top_k = int(top_ks.max().item())
+    topk_probs, topk_indices = torch.topk(probs, k=max_top_k, dim=-1)
+    ranks = torch.arange(max_top_k, device=probs.device)[None, :]
+    topk_probs.masked_fill_(ranks >= top_ks[:, None], 0.0)
+    topk_probs.div_(topk_probs.sum(dim=-1, keepdim=True))
+    return torch.zeros_like(probs).scatter_(1, topk_indices, topk_probs)
+
+
+def _dflash_top_p_renorm_prob(
+    probs: torch.Tensor, top_ps: torch.Tensor
+) -> torch.Tensor:
+    if top_p_renorm_prob is not None:
+        return top_p_renorm_prob(probs, top_ps)
+    npu_probs = _dflash_npu_top_k_top_p_renorm_prob(probs, top_ps=top_ps)
+    if npu_probs is not None:
+        return npu_probs
+    return top_p_normalize_probs_torch(probs, top_ps)
+
+
+def dflash_draft_cell_size_per_token(
+    *,
+    draft_model_config: Any,
+    draft_num_layers: int,
+    draft_kv_cache_dtype: torch.dtype,
+    tp_size: int,
+) -> int:
+    """Exact bytes/token of the DFLASH draft KV pool."""
+    if draft_num_layers <= 0:
+        return 0
+    num_kv_heads = draft_model_config.get_num_kv_heads(tp_size)
+    kv_dim_per_head = draft_model_config.head_dim + draft_model_config.v_head_dim
+    dtype_size = torch._utils._element_size(draft_kv_cache_dtype)
+    return int(num_kv_heads * kv_dim_per_head * int(draft_num_layers) * dtype_size)
 
 
 def scale_kv_cell_size_per_token_for_dflash(
@@ -99,6 +202,95 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
         backend = full_backend
     backend_name = type(backend).__name__
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
+
+
+def apply_dflash_verify_logits_adjustments(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    draft_token_num: int,
+) -> None:
+    """Apply sampling-time logit adjustments for DFlash verify in place.
+
+    This keeps v1 and v2 verify semantics aligned while letting overlap scheduling
+    use the cheaper precomputed `acc_linear_penalties` path instead of allocating a
+    repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+    """
+    if sampling_info is None:
+        return
+    if next_token_logits.ndim != 2:
+        raise ValueError(
+            "next_token_logits must be 2D, "
+            f"got shape={tuple(next_token_logits.shape)}."
+        )
+    if draft_token_num <= 0:
+        raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
+
+    bs = len(sampling_info)
+    if next_token_logits.shape[0] != bs * draft_token_num:
+        raise ValueError(
+            "next_token_logits row count mismatch for DFlash verify adjustments. "
+            f"Expected {bs * draft_token_num}, got {next_token_logits.shape[0]}."
+        )
+
+    if sampling_info.has_custom_logit_processor:
+        apply_custom_logit_processor(
+            next_token_logits,
+            sampling_info,
+            num_tokens_in_batch=draft_token_num,
+        )
+
+    acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
+    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+    grammar_mask = getattr(sampling_info, "grammar_mask", None)
+    logit_bias = getattr(sampling_info, "logit_bias", None)
+
+    logits_3d: Optional[torch.Tensor] = None
+
+    def get_logits_3d() -> torch.Tensor:
+        nonlocal logits_3d
+        if logits_3d is None:
+            logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
+        return logits_3d
+
+    # Dense fallback only when we need live penalizer application or a vocab mask.
+    # In overlap scheduling the common path is `acc_linear_penalties`, which can be
+    # broadcast over the verify block without materializing a repeated buffer.
+    if (
+        penalizer is not None and penalizer.is_required and acc_linear_penalties is None
+    ) or grammar_mask is not None:
+        linear_penalty = torch.zeros(
+            (bs, next_token_logits.shape[1]),
+            dtype=torch.float32,
+            device=next_token_logits.device,
+        )
+        sampling_info.apply_logits_bias(linear_penalty)
+        get_logits_3d().add_(
+            linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
+        )
+        return
+
+    if acc_linear_penalties is not None:
+        if (
+            acc_linear_penalties.device != next_token_logits.device
+            or acc_linear_penalties.dtype != next_token_logits.dtype
+        ):
+            acc_linear_penalties = acc_linear_penalties.to(
+                device=next_token_logits.device,
+                dtype=next_token_logits.dtype,
+            )
+        get_logits_3d().add_(acc_linear_penalties[:, None, :])
+
+    if logit_bias is not None:
+        if (
+            logit_bias.device != next_token_logits.device
+            or logit_bias.dtype != next_token_logits.dtype
+        ):
+            logit_bias = logit_bias.to(
+                device=next_token_logits.device,
+                dtype=next_token_logits.dtype,
+            )
+        get_logits_3d().add_(logit_bias[:, None, :])
 
 
 def _get_or_create_chain_verify_buffers(
@@ -198,6 +390,36 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
         int(round(start + (i * span) / (num_draft_layers - 1)))
         for i in range(num_draft_layers)
     ]
+
+
+def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
+    text_config = _get_text_config(config)
+    layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
+    if layer_types is None:
+        return None
+    if isinstance(layer_types, str) or not isinstance(layer_types, Sequence):
+        raise ValueError(
+            "DFLASH config.layer_types must be a sequence of attention type strings."
+        )
+    return layer_types
+
+
+def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
+    layer_types = get_dflash_layer_types(config)
+    if layer_types is None or "sliding_attention" not in layer_types:
+        return None
+
+    text_config = _get_text_config(config)
+    sliding_window = _cfg_get(
+        text_config, "sliding_window", _cfg_get(config, "sliding_window")
+    )
+    if sliding_window is None:
+        raise ValueError(
+            "DFLASH sliding_attention layers require config.sliding_window."
+        )
+
+    # HF sliding windows include the current token; SGLang stores window_left.
+    return int(sliding_window) - 1
 
 
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
@@ -362,7 +584,9 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
                 f"Got len(target_layer_ids)={len(parsed_target_layer_ids)}."
             )
 
-    mask_token = dflash_cfg.get("mask_token", None)
+    mask_token = dflash_cfg.get(
+        "mask_token", _cfg_get(draft_hf_config, "mask_token", None)
+    )
     if mask_token is None:
         mask_token = DEFAULT_DFLASH_MASK_TOKEN
     if not isinstance(mask_token, str) or not mask_token:
@@ -371,7 +595,9 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
             f"got {mask_token!r}."
         )
 
-    mask_token_id = dflash_cfg.get("mask_token_id", None)
+    mask_token_id = dflash_cfg.get(
+        "mask_token_id", _cfg_get(draft_hf_config, "mask_token_id", None)
+    )
     if mask_token_id is not None:
         if not isinstance(mask_token_id, Integral) or isinstance(mask_token_id, bool):
             raise ValueError(
@@ -419,6 +645,29 @@ def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
     return True, ""
 
 
+@triton.jit
+def _fused_correct_drafts_and_bonus_kernel(
+    candidates_ptr,
+    target_predict_ptr,
+    num_correct_drafts_ptr,
+    bonus_tokens_ptr,
+    block_size,
+    BLOCK: tl.constexpr,
+):
+    b = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK)
+    in_row = offs < block_size - 1
+    drafts = tl.load(candidates_ptr + b * block_size + 1 + offs, mask=in_row, other=-1)
+    targets = tl.load(target_predict_ptr + b * block_size + offs, mask=in_row, other=-2)
+    eq = (drafts == targets) & in_row
+    # Leading-match count = index of the first mismatch lane; lanes past the
+    # row and all-match rows both resolve to block_size - 1 via the min.
+    num_correct = tl.min(tl.where(eq, BLOCK, offs), 0)
+    bonus_token = tl.load(target_predict_ptr + b * block_size + num_correct)
+    tl.store(num_correct_drafts_ptr + b, num_correct.to(tl.int32))
+    tl.store(bonus_tokens_ptr + b, bonus_token.to(tl.int64))
+
+
 def compute_dflash_correct_drafts_and_bonus(
     *,
     candidates: torch.Tensor,
@@ -454,10 +703,62 @@ def compute_dflash_correct_drafts_and_bonus(
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}.")
 
+    if candidates.is_cuda:
+        num_correct_drafts = torch.empty(
+            bs, dtype=torch.int32, device=candidates.device
+        )
+        bonus_tokens = torch.empty(bs, dtype=torch.int64, device=candidates.device)
+        _fused_correct_drafts_and_bonus_kernel[(bs,)](
+            candidates.contiguous(),
+            target_predict.contiguous(),
+            num_correct_drafts,
+            bonus_tokens,
+            block_size,
+            BLOCK=triton.next_power_of_2(max(block_size - 1, 1)),
+        )
+        return num_correct_drafts, bonus_tokens
+
     matches = candidates[:, 1:] == target_predict[:, :-1]
     correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
     bonus = target_predict[torch.arange(bs, device=target_predict.device), correct_len]
-    return correct_len, bonus.to(torch.int64)
+    return correct_len.to(torch.int32), bonus.to(torch.int64)
+
+
+def apply_dflash_simulated_acceptance(
+    *,
+    candidates: torch.Tensor,
+    target_predict: Optional[torch.Tensor],
+    accept_len: torch.Tensor,
+    commit_lens: torch.Tensor,
+    bonus: torch.Tensor,
+    out_tokens: torch.Tensor,
+    simulate_acc_len: float,
+    simulate_acc_method: str,
+    simulate_acc_token_mode: str,
+    fixed_token_id: int = 100,
+) -> None:
+    """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob)."""
+    block_size = candidates.shape[1]
+
+    # sample_simulated_acc_len clamps to [1, block_size].
+    forced_commit_len = sample_simulated_acc_len(
+        simulate_acc_len, simulate_acc_method, block_size
+    )
+    forced_accept_len = forced_commit_len - 1
+
+    accept_len.fill_(forced_accept_len)
+    commit_lens.fill_(forced_commit_len)
+
+    if simulate_acc_token_mode != "real-draft-token":
+        bonus.fill_(fixed_token_id)
+        out_tokens.fill_(fixed_token_id)
+        return
+
+    out_tokens.zero_()
+    if forced_accept_len > 0:
+        out_tokens[:, :forced_accept_len].copy_(candidates[:, 1:forced_commit_len])
+    bonus.copy_(target_predict[:, forced_accept_len].to(dtype=bonus.dtype))
+    out_tokens[:, forced_accept_len].copy_(bonus.to(dtype=out_tokens.dtype))
 
 
 def compute_dflash_sampling_correct_drafts_and_bonus(
@@ -465,6 +766,8 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     candidates: torch.Tensor,
     next_token_logits: torch.Tensor,
     sampling_info: Any,
+    max_top_k: Optional[int] = None,
+    uniform_top_k_value: Optional[int] = None,
     threshold_single: Optional[float] = None,
     threshold_acc: Optional[float] = None,
     uniform_samples: Optional[torch.Tensor] = None,
@@ -507,13 +810,13 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         )
 
     if threshold_single is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_spec
 
-        threshold_single = get_global_server_args().speculative_accept_threshold_single
+        threshold_single = get_spec().speculative_accept_threshold_single
     if threshold_acc is None:
-        from sglang.srt.server_args import get_global_server_args
+        from sglang.srt.runtime_context import get_spec
 
-        threshold_acc = get_global_server_args().speculative_accept_threshold_acc
+        threshold_acc = get_spec().speculative_accept_threshold_acc
     threshold_single = float(threshold_single)
     threshold_acc = max(float(threshold_acc), 1e-9)
 
@@ -546,57 +849,15 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             dtype=torch.float32,
         )
 
-    need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
-    need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
-    # Build target distribution once over all verify rows.
-    expanded_temperature = torch.repeat_interleave(
-        sampling_info.temperatures, draft_token_num, dim=0
+    target_probs = build_dflash_verify_target_probs(
+        next_token_logits=next_token_logits,
+        sampling_info=sampling_info,
+        draft_token_num=draft_token_num,
+        bs=bs,
+        max_top_k=max_top_k,
+        uniform_top_k_value=uniform_top_k_value,
+        use_sparse_topk=use_sparse_topk,
     )
-    scaled_logits = next_token_logits / expanded_temperature
-    sparse_topk_applied = False
-
-    if use_sparse_topk and need_top_k:
-        repeated_top_ks = torch.repeat_interleave(
-            sampling_info.top_ks, draft_token_num, dim=0
-        ).to(dtype=torch.int64)
-        vocab_size = int(scaled_logits.shape[-1])
-        repeated_top_ks.clamp_(min=1, max=vocab_size)
-        max_top_k = int(repeated_top_ks.max().item())
-
-        # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
-        if 0 < max_top_k < vocab_size:
-            topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
-            if not torch.all(repeated_top_ks == max_top_k):
-                ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[
-                    None, :
-                ]
-                valid = ranks < repeated_top_ks.unsqueeze(1)
-                topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
-
-            topk_probs = F.softmax(topk_logits, dim=-1)
-            if need_top_p:
-                repeated_top_ps = torch.repeat_interleave(
-                    sampling_info.top_ps, draft_token_num, dim=0
-                )
-                topk_probs = top_p_renorm_prob(topk_probs, repeated_top_ps)
-
-            target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
-            target_probs.scatter_(1, topk_indices, topk_probs)
-            sparse_topk_applied = True
-
-    if not sparse_topk_applied:
-        target_probs = F.softmax(scaled_logits, dim=-1)
-        if need_top_k:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
-            )
-        if need_top_p:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
-            )
-    target_probs = target_probs.view(bs, draft_token_num, -1).contiguous()
     draft_probs = torch.zeros_like(target_probs)
 
     (
@@ -619,7 +880,6 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         accept_index=accept_index,
         accept_token_num=accept_token_num,
         candidates=candidates_i64,
-        # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
         retrive_index=retrieve_index,
         retrive_next_token=retrieve_next_token,
         retrive_next_sibling=retrieve_next_sibling,
@@ -639,19 +899,158 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
-def validate_dflash_request(req: Req) -> Optional[str]:
-    if req.return_logprob:
-        return "DFLASH speculative decoding does not support return_logprob yet."
+def build_dflash_verify_target_probs(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    draft_token_num: int,
+    bs: int,
+    max_top_k: Optional[int] = None,
+    uniform_top_k_value: Optional[int] = None,
+    use_sparse_topk: bool = True,
+) -> torch.Tensor:
+    device = next_token_logits.device
+    need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
+    need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
+    expanded_temperature = torch.repeat_interleave(
+        sampling_info.temperatures, draft_token_num, dim=0
+    )
+    scaled_logits = next_token_logits / expanded_temperature
+    sparse_topk_applied = False
 
-    if (
-        req.sampling_params.json_schema is not None
-        or req.sampling_params.regex is not None
-        or req.sampling_params.ebnf is not None
-        or req.sampling_params.structural_tag is not None
-    ):
-        return (
-            "DFLASH speculative decoding does not support "
-            "grammar-constrained decoding yet."
-        )
+    if use_sparse_topk and need_top_k:
+        repeated_top_ks = torch.repeat_interleave(
+            sampling_info.top_ks, draft_token_num, dim=0
+        ).to(dtype=torch.int64)
+        vocab_size = int(scaled_logits.shape[-1])
+        repeated_top_ks.clamp_(min=1, max=vocab_size)
+        if max_top_k is None:
+            max_top_k = int(repeated_top_ks.max().item())
+        else:
+            max_top_k = int(max_top_k)
+        if max_top_k < 1:
+            max_top_k = 1
+        elif max_top_k > vocab_size:
+            max_top_k = vocab_size
+
+        # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
+        if 0 < max_top_k < vocab_size:
+            topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
+            if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
+                ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[
+                    None, :
+                ]
+                valid = ranks < repeated_top_ks.unsqueeze(1)
+                topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
+
+            topk_probs = F.softmax(topk_logits, dim=-1)
+            if need_top_p:
+                repeated_top_ps = torch.repeat_interleave(
+                    sampling_info.top_ps, draft_token_num, dim=0
+                )
+                topk_probs = _dflash_top_p_renorm_prob(topk_probs, repeated_top_ps)
+
+            target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
+            target_probs.scatter_(1, topk_indices, topk_probs)
+            sparse_topk_applied = True
+
+    if not sparse_topk_applied:
+        target_probs = F.softmax(scaled_logits, dim=-1)
+        if need_top_k:
+            target_probs = _dflash_top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+            )
+        if need_top_p:
+            target_probs = _dflash_top_p_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+            )
+    return target_probs.view(bs, draft_token_num, -1).contiguous()
+
+
+def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+    if enable_overlap and req.return_hidden_states:
+        return "DFLASH speculative decoding does not support return_hidden_states yet."
 
     return None
+
+
+@triton.jit
+def _table_qk_norm_rope_kernel(
+    qkv_ptr,
+    q_weight_ptr,
+    k_weight_ptr,
+    cos_sin_ptr,
+    pos_ptr,
+    row_stride,
+    q_size,
+    NHQ: tl.constexpr,
+    D: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    t = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1)
+    pos = tl.load(pos_ptr + t).to(tl.int64)
+
+    HALF: tl.constexpr = D // 2
+    half_ar = tl.arange(0, HALF)
+    d_ar = tl.arange(0, D)
+    cos = tl.load(cos_sin_ptr + pos * D + half_ar).to(tl.float32)
+    sin = tl.load(cos_sin_ptr + pos * D + HALF + half_ar).to(tl.float32)
+
+    is_q = h < NHQ
+    col0 = tl.where(is_q, h * D, q_size + (h - NHQ) * D).to(tl.int64)
+    w_ptr = tl.where(is_q, q_weight_ptr.to(tl.int64), k_weight_ptr.to(tl.int64)).to(
+        tl.pointer_type(tl.bfloat16)
+    )
+
+    row = qkv_ptr + t * row_stride + col0
+    x = tl.load(row + d_ar).to(tl.float32)
+    ms = tl.sum(x * x, 0) / D
+    inv = 1.0 / tl.sqrt(ms + EPS)
+    w1 = tl.load(w_ptr + half_ar).to(tl.float32)
+    w2 = tl.load(w_ptr + HALF + half_ar).to(tl.float32)
+    x1 = tl.load(row + half_ar).to(tl.float32) * inv * w1
+    x2 = tl.load(row + HALF + half_ar).to(tl.float32) * inv * w2
+    x1 = x1.to(tl.bfloat16).to(tl.float32)
+    x2 = x2.to(tl.bfloat16).to(tl.float32)
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    tl.store(row + half_ar, o1.to(tl.bfloat16))
+    tl.store(row + HALF + half_ar, o2.to(tl.bfloat16))
+
+
+def table_qk_norm_rope_(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    num_q_heads: int,
+    num_k_heads: int,
+    head_dim: int,
+    eps: float,
+) -> None:
+    """In-place QK RMSNorm + table-lookup neox RoPE on the fused QKV tensor.
+
+    Reads cos/sin from the SAME rotary table as the unfused path, so there is
+    no large-position angle drift (unlike theta-recompute kernels). V columns
+    are untouched.
+    """
+    T = qkv.shape[0]
+    if T == 0:
+        return
+    grid = (T, num_q_heads + num_k_heads)
+    _table_qk_norm_rope_kernel[grid](
+        qkv,
+        q_weight,
+        k_weight,
+        cos_sin_cache,
+        positions,
+        qkv.stride(0),
+        num_q_heads * head_dim,
+        NHQ=num_q_heads,
+        D=head_dim,
+        EPS=eps,
+    )

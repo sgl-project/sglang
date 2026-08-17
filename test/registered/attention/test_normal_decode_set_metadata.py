@@ -17,11 +17,12 @@ from sglang.srt.layers.attention.flashattention_backend import (
     normal_decode_set_metadata,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 # Register this test for CUDA CI in base-b (fast attention/kernel tests)
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-large")
+register_amd_ci(est_time=17, suite="stage-b-test-1-gpu-large-amd")
 
 
 def reference_normal_decode_set_metadata(
@@ -53,6 +54,22 @@ def reference_normal_decode_set_metadata(
     if swa_page_table is not None and token_to_kv_pool is not None:
         swa_page_indices = token_to_kv_pool.translate_loc_from_full_to_swa(page_indices)
         swa_page_table[:, :max_seq_pages].copy_(swa_page_indices // page_size)
+
+
+def page_table_live_mask(
+    seq_lens: torch.Tensor,
+    seq_len_delta: int,
+    page_size: int,
+    max_seq_pages: int,
+    width: int,
+) -> torch.Tensor:
+    """Per-row live region of the page table: the fused kernel self-guards on
+    seq_len and leaves columns past pages(seq_len + delta) untouched."""
+    live_pages = torch.clamp(
+        (seq_lens + seq_len_delta + page_size - 1) // page_size, max=max_seq_pages
+    )
+    cols = torch.arange(width, device=seq_lens.device)
+    return cols.view(1, -1) < live_pages.view(-1, 1)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -234,14 +251,26 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
             f"cu_seqlens_k mismatch. Expected:\n{ref_data['cu_seqlens_k']}\nGot:\n{test_data['cu_seqlens_k']}",
         )
 
+        live_mask = page_table_live_mask(
+            test_data["seq_lens"],
+            test_data["seq_len_delta"],
+            page_size,
+            test_data["max_seq_pages"],
+            test_data["page_table"].shape[1],
+        )
         self.assertTrue(
-            torch.equal(test_data["page_table"], ref_data["page_table"]),
+            torch.equal(
+                test_data["page_table"][live_mask], ref_data["page_table"][live_mask]
+            ),
             f"page_table mismatch at bs={batch_size}, page_size={page_size}",
         )
 
         if has_swa:
             self.assertTrue(
-                torch.equal(test_data["swa_page_table"], ref_data["swa_page_table"]),
+                torch.equal(
+                    test_data["swa_page_table"][live_mask],
+                    ref_data["swa_page_table"][live_mask],
+                ),
                 f"swa_page_table mismatch at bs={batch_size}, page_size={page_size}",
             )
 
@@ -411,7 +440,18 @@ class TestNormalDecodeSetMetadata(CustomTestCase):
         self.assertTrue(
             torch.equal(test_data["cu_seqlens_k"], ref_data["cu_seqlens_k"])
         )
-        self.assertTrue(torch.equal(test_data["page_table"], ref_data["page_table"]))
+        live_mask = page_table_live_mask(
+            test_data["seq_lens"],
+            0,
+            page_size,
+            test_data["max_seq_pages"],
+            test_data["page_table"].shape[1],
+        )
+        self.assertTrue(
+            torch.equal(
+                test_data["page_table"][live_mask], ref_data["page_table"][live_mask]
+            )
+        )
 
 
 if __name__ == "__main__":

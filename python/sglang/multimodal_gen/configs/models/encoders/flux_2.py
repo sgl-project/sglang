@@ -7,9 +7,7 @@ from sglang.multimodal_gen.configs.models.encoders.base import (
     TextEncoderArchConfig,
     TextEncoderConfig,
 )
-from sglang.multimodal_gen.configs.models.encoders.mistral3 import (
-    Mistral3EncoderArchConfig,
-)
+from sglang.multimodal_gen.configs.models.fsdp import is_layer
 
 FLUX_2_SYSTEM_MESSAGE = (
     "You are an AI that reasons about image descriptions. You give structured responses focusing on object relationships, object\n"
@@ -32,15 +30,15 @@ def build_flux2_text_messages(prompts: list[str]) -> list[list[dict]]:
 
 
 @dataclass
-class Flux2MistralTextArchConfig(Mistral3EncoderArchConfig):
-    """FLUX.2 text-encoder arch config.
-
-    Inherits Mistral3 defaults (hidden_size, num_attention_heads, head_dim,
-    rms_norm_eps, rope_parameters, ...) so the TP-parallel runtime has every
-    field it needs even when the checkpoint config doesn't override them.
-    Only the tokenizer behavior (max_length=512, padding=max_length) is
-    flux2-specific.
-    """
+class Flux2MistralTextArchConfig(TextEncoderArchConfig):
+    stacked_params_mapping: list[tuple[str, str, str]] = field(
+        default_factory=lambda: [
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+        ]
+    )
+    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_layer])
 
     def __post_init__(self) -> None:
         self.tokenizer_kwargs = {

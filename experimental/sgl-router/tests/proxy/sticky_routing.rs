@@ -93,12 +93,12 @@ fn chat_request(header: Option<(&str, &str)>) -> Request<Body> {
         .unwrap()
 }
 
-/// Parse `sgl_router_requests_total{...,outcome="success"} N` lines into a
+/// Parse `sgl_router_worker_requests_total{...,outcome="success"} N` lines into a
 /// map of worker_url -> success count.
 fn success_counts(metrics: &str) -> std::collections::HashMap<String, u64> {
     let mut counts = std::collections::HashMap::new();
     for line in metrics.lines() {
-        let Some(rest) = line.strip_prefix("sgl_router_requests_total{") else {
+        let Some(rest) = line.strip_prefix("sgl_router_worker_requests_total{") else {
             continue;
         };
         if !rest.contains(r#"outcome="success""#) {
@@ -252,4 +252,86 @@ async fn only_the_configured_header_name_is_honored() {
     assert_eq!(sticky_count(&metrics, "assigned"), 1, "{metrics}");
     assert_eq!(sticky_count(&metrics, "hit"), 1);
     assert_eq!(sticky_count(&metrics, "no_routing_key"), 1);
+}
+
+/// True-sticky scale-up: a worker that joins the registry at runtime must
+/// NOT redistribute an already-pinned key — the defining difference from
+/// consistent hashing, where adding a node remaps a fraction of keys. The
+/// policy unit tests assert this over a bare worker slice; this drives it
+/// end-to-end through the HTTP stack and a live `WorkerRegistry::add`, so
+/// the freshly-added worker is a genuine healthy candidate the policy could
+/// pick — and provably doesn't.
+#[tokio::test]
+async fn adding_a_worker_does_not_redistribute_existing_key() {
+    let w0 = MockWorker::start(vec![]).await;
+    let w1 = MockWorker::start(vec![]).await;
+    let ctx = build_sticky_ctx("x-sgl-routing-key", &[w0.url.clone(), w1.url.clone()]);
+    let app = build_router(ctx.clone());
+
+    // Pin "alice" to whichever worker the round-robin fallback selects.
+    let res = app
+        .clone()
+        .oneshot(chat_request(Some(("x-sgl-routing-key", "alice"))))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let pinned_url = success_counts(&ctx.metrics.render())
+        .into_iter()
+        .find(|(_, c)| *c > 0)
+        .map(|(url, _)| url)
+        .expect("first request should have been served by some worker");
+
+    // Scale up: a third worker joins the registry at runtime. With no
+    // circuit breaker configured it is immediately a healthy candidate
+    // (`healthy_workers_for` filters only on the breaker), so the policy
+    // *could* route to it — the assertions below prove it does not.
+    let w2 = MockWorker::start(vec![]).await;
+    ctx.registry
+        .add(WorkerSpec {
+            id: WorkerId("w2".into()),
+            url: w2.url.clone(),
+            mode: WorkerMode::Plain,
+            model_ids: vec![ModelId("tiny".into())],
+            bootstrap_port: None,
+        })
+        .unwrap();
+    // Guard the premise: w2 really is an eligible candidate now, so the
+    // "policy doesn't pick it" assertions below are meaningful and can't
+    // pass vacuously if a future change stops enumerating added workers.
+    assert_eq!(
+        ctx.registry
+            .healthy_workers_for(&ModelId("tiny".into()))
+            .len(),
+        3,
+        "added worker must be an eligible candidate"
+    );
+
+    const N: usize = 5;
+    for _ in 0..N {
+        let res = app
+            .clone()
+            .oneshot(chat_request(Some(("x-sgl-routing-key", "alice"))))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    let metrics = ctx.metrics.render();
+    let counts = success_counts(&metrics);
+    // All N+1 successes stayed on the original pin — nothing leaked to the
+    // newly-added worker or the other pre-existing one.
+    assert_eq!(
+        counts.get(&pinned_url).copied().unwrap_or(0),
+        (N + 1) as u64,
+        "all same-key requests must stay on the original pin: {counts:?}"
+    );
+    assert_eq!(
+        counts.values().sum::<u64>(),
+        (N + 1) as u64,
+        "no request should leak to another worker: {counts:?}"
+    );
+    // One initial assign, the pin survived the scale-up (no remap), N hits.
+    assert_eq!(sticky_count(&metrics, "assigned"), 1, "{metrics}");
+    assert_eq!(sticky_count(&metrics, "remap"), 0, "{metrics}");
+    assert_eq!(sticky_count(&metrics, "hit"), N as u64, "{metrics}");
 }

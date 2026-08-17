@@ -10,9 +10,9 @@ if TYPE_CHECKING:
 
 class ScriptedKvPoolExhauster:
 
-    def __init__(self, scheduler: "Scheduler") -> None:
+    def __init__(self, scheduler: Scheduler) -> None:
         self.scheduler = scheduler
-        self._held: List["torch.Tensor"] = []
+        self._held: List[torch.Tensor] = []
 
     def exhaust(self, *, leave_pages: int) -> None:
         allocator = self.scheduler.token_to_kv_pool_allocator

@@ -17,7 +17,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 
 def _require_bitsandbytes() -> None:
@@ -105,7 +105,7 @@ class BitsAndBytesConfig(QuantizationConfig):
         return []
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "BitsAndBytesConfig":
+    def from_config(cls, config: dict[str, Any]) -> BitsAndBytesConfig:
         def get_safe_value(keys, default_value=None):
             try:
                 value = QuantizationConfig.get_from_keys(config, keys)

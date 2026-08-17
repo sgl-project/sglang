@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from sglang.jit_kernel.kv_canary.consts import (
+from sglang.kernels.ops.kv_canary.consts import (
     RealKvHashMode,
 )
 from sglang.srt.environ import envs
@@ -60,7 +60,7 @@ class CanaryConfig:
     stats_print_every_n_steps: int
 
     @classmethod
-    def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
+    def from_env(cls, server_args: ServerArgs) -> CanaryConfig:
         mode_raw = server_args.kv_canary.strip().lower()
         if mode_raw not in ("none", "log", "raise"):
             raise ValueError(

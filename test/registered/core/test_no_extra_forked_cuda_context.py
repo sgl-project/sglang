@@ -34,8 +34,10 @@ class TestTPServerGPUProcesses(CustomTestCase):
                 str(cls.tp_size),
                 "--mem-fraction-static",
                 "0.70",
-                "--disable-cuda-graph",
-                "--disable-piecewise-cuda-graph",
+                "--cuda-graph-backend-decode",
+                "disabled",
+                "--cuda-graph-backend-prefill",
+                "disabled",
             ],
         )
 

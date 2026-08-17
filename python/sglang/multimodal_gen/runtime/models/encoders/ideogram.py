@@ -26,6 +26,7 @@ class IdeogramQwen3VLTextEncoder(TextEncoder):
     """Language-only Qwen3-VL text encoder stored inside Ideogram checkpoints."""
 
     _activation_layers = (0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 35)
+    layer_names = ["language_model.layers"]
 
     def __init__(self, config: Ideogram4TextEncoderConfig) -> None:
         super().__init__(config)
@@ -51,7 +52,11 @@ class IdeogramQwen3VLTextEncoder(TextEncoder):
             text_config,
             quant_config=quant_config,
             use_weight_only_fp8=self._uses_weight_only_fp8,
-            use_tensor_parallel=True,
+            # bitsandbytes 4-bit quant states can be sliced safely for output
+            # (column-parallel) shards, but not for the row-parallel input
+            # shards used by attention/MLP output projections. Replicate the
+            # relatively small NF4 text encoder while keeping DiT TP enabled.
+            use_tensor_parallel=not self._uses_bitsandbytes_4bit,
         )
 
     @torch.no_grad()

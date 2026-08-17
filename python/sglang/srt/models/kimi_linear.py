@@ -8,16 +8,15 @@ from typing import Optional
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
     get_pp_group,
-    get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -34,13 +33,13 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -49,8 +48,23 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAttention
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
+from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import make_layers
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
+
+
+def _get_kda_local_num_heads(num_heads: int, tp_size: int) -> int:
+    if num_heads % tp_size != 0:
+        raise ValueError(
+            f"KDA num_heads ({num_heads}) must be divisible by global tp_size ({tp_size})"
+        )
+    return num_heads // tp_size
+
+
+def _materialize_residual_stream(
+    hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
+) -> torch.Tensor:
+    return hidden_states if residual is None else hidden_states + residual
 
 
 class KimiMoE(nn.Module):
@@ -68,7 +82,7 @@ class KimiMoE(nn.Module):
         moe_intermediate_size = config.moe_intermediate_size
         num_experts = config.num_experts
         moe_renormalize = config.moe_renormalize
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
@@ -99,6 +113,9 @@ class KimiMoE(nn.Module):
             layer_id=self.layer_idx,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
+            activation=config.hidden_act,
+            gemm1_alpha=config.activation_situ_beta,
+            gemm1_clamp_limit=config.activation_situ_linear_beta,
             prefix=add_prefix("experts", prefix),
         )
 
@@ -177,8 +194,8 @@ class KimiDeltaAttention(nn.Module):
         **kwargs,
     ) -> None:
         super().__init__()
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.attn_tp_size = get_attention_tp_size()
+        self.tp_size = get_parallel().tp_size
+        self.attn_tp_size = get_parallel().attn_tp_size
         self.hidden_size = hidden_size
         self.config = config
         self.head_dim = config.linear_attn_config["head_dim"]
@@ -186,11 +203,10 @@ class KimiDeltaAttention(nn.Module):
         self.num_k_heads = config.linear_attn_config["num_heads"]
         self.num_v_heads = config.linear_attn_config["num_heads"]
         self.head_k_dim = config.linear_attn_config["head_dim"]
-        self.head_v_dim = config.v_head_dim
+        self.head_v_dim = config.linear_attn_config["head_dim"]
         self.layer_idx = layer_idx
         self.prefix = prefix
-        assert self.num_heads % self.tp_size == 0
-        self.local_num_heads = divide(self.num_heads, self.tp_size)
+        self.local_num_heads = _get_kda_local_num_heads(self.num_heads, self.tp_size)
 
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
@@ -225,7 +241,7 @@ class KimiDeltaAttention(nn.Module):
             )
         else:
             # Unfused path: separate QKVParallelLinear
-            attn_tp_rank = get_attention_tp_rank()
+            attn_tp_rank = get_parallel().attn_tp_rank
             self.qkv_proj = QKVParallelLinear(
                 self.hidden_size,
                 self.head_dim,
@@ -318,9 +334,9 @@ class KimiDeltaAttention(nn.Module):
 
         self.attn = RadixLinearAttention(
             layer_id=self.layer_idx,
-            num_q_heads=self.num_k_heads // self.attn_tp_size,
-            num_k_heads=self.num_k_heads // self.attn_tp_size,
-            num_v_heads=self.num_v_heads // self.attn_tp_size,
+            num_q_heads=_get_kda_local_num_heads(self.num_k_heads, self.tp_size),
+            num_k_heads=_get_kda_local_num_heads(self.num_k_heads, self.tp_size),
+            num_v_heads=_get_kda_local_num_heads(self.num_v_heads, self.tp_size),
             head_q_dim=self.head_k_dim,
             head_k_dim=self.head_k_dim,
             head_v_dim=self.head_v_dim,
@@ -383,14 +399,19 @@ class KimiDeltaAttention(nn.Module):
                 hidden_states
             )
 
-        # For prefill: raw gate is passed to chunk_kda_fwd, which fuses gate
-        # activation with chunk_local_cumsum (kda_gate_chunk_cumsum kernel).
-        # For decode: gate activation is handled inside fused_recurrent kernel.
-        if not forward_batch.forward_mode.is_decode():
+        # Prefill passes raw gates to chunk KDA; decode and target-verify kernels
+        # apply the activation internally.
+        if (
+            not forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
             forget_gate = forget_gate.unflatten(
                 -1, (-1, self.head_dim)
             )  # [T, H*K] -> [T, H, K]
-            beta = beta.float().sigmoid()
+            if not forward_batch.forward_mode.is_target_verify():
+                # Only chunk_kda (extend) wants pre-activated beta; the verify
+                # kernel sigmoids it in-kernel like decode.
+                beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
@@ -518,6 +539,7 @@ class KimiLinearModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+        self.dspark_layers_to_capture: Optional[list[int]] = None
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -528,7 +550,7 @@ class KimiLinearModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = get_stream("alt")
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
@@ -549,7 +571,7 @@ class KimiLinearModel(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
-        world_size = get_tensor_model_parallel_world_size()
+        world_size = get_parallel().tp_size
         assert (
             config.num_attention_heads % world_size == 0
         ), "num_attention_heads must be divisible by world_size"
@@ -580,7 +602,6 @@ class KimiLinearModel(nn.Module):
             dtype=torch.float32,
             device=device,
         )
-        # TODO: capture aux hidden states
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             ctx = get_global_expert_distribution_recorder().with_current_layer(i)
@@ -592,6 +613,13 @@ class KimiLinearModel(nn.Module):
                     forward_batch=forward_batch,
                     residual=residual,
                     zero_allocator=zero_allocator,
+                )
+            if (
+                self.dspark_layers_to_capture is not None
+                and i in self.dspark_layers_to_capture
+            ):
+                aux_hidden_states.append(
+                    _materialize_residual_stream(hidden_states, residual)
                 )
 
         if not self.pp_group.is_last_rank:
@@ -608,10 +636,9 @@ class KimiLinearModel(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+        if self.dspark_layers_to_capture is not None:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 class KimiLinearForCausalLM(nn.Module):
@@ -627,6 +654,8 @@ class KimiLinearForCausalLM(nn.Module):
         self.model = KimiLinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )
+        self.start_layer = self.model.start_layer
+        self.end_layer = self.model.end_layer
         self.pp_group = get_pp_group()
         if self.pp_group.is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -639,6 +668,22 @@ class KimiLinearForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
+        self.capture_aux_hidden_states = False
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if self.pp_group.world_size > 1:
+            raise NotImplementedError("DSPARK aux hidden capture requires PP=1.")
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.dspark_layers_to_capture = list(layer_ids)
 
     @torch.no_grad()
     def forward(
@@ -657,11 +702,59 @@ class KimiLinearForCausalLM(nn.Module):
             pp_proxy_tensors,
         )
         if self.pp_group.is_last_rank:
+            aux_hidden_states = None
+            if self.capture_aux_hidden_states:
+                hidden_states, aux_hidden_states = hidden_states
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
             )
         else:
             return hidden_states
+
+    def prepare_context_parallel_metadata_for_dcp(
+        self,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        req_to_token: torch.Tensor,
+        seq_lens_sum: int,
+        kv_buffer_shape: torch.Size,
+        kv_cache_dtype,
+        kv_cache_device,
+        create_chunked_prefix_cache_kv_indices_fn,
+    ):
+        return prepare_decode_context_parallel_metadata(
+            seq_lens=seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens=extend_seq_lens,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            seq_lens_sum=seq_lens_sum,
+            kv_buffer_shape=kv_buffer_shape,
+            kv_cache_dtype=kv_cache_dtype,
+            kv_cache_device=kv_cache_device,
+            create_chunked_prefix_cache_kv_indices_fn=create_chunked_prefix_cache_kv_indices_fn,
+        )
+
+    def _is_non_local_pp_weight(self, name: str) -> bool:
+        if self.pp_group.world_size == 1:
+            return False
+
+        layer_id = get_layer_id(name)
+        if layer_id is not None:
+            return not (self.model.start_layer <= layer_id < self.model.end_layer)
+        if name.startswith("model.embed_tokens."):
+            return not self.pp_group.is_first_rank
+        if name.startswith(("model.norm.", "lm_head.")):
+            return not self.pp_group.is_last_rank
+        return False
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -702,6 +795,8 @@ class KimiLinearForCausalLM(nn.Module):
         for args in weights:
             name, loaded_weight = args[:2]
             kwargs = args[2] if len(args) > 2 else {}
+            if self._is_non_local_pp_weight(name):
+                continue
             if "rotary_emb.inv_freq" in name:
                 continue
 
@@ -737,8 +832,6 @@ class KimiLinearForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # if is_pp_missing_parameter(name, self):
-                #     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -750,8 +843,6 @@ class KimiLinearForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    # if is_pp_missing_parameter(name, self):
-                    #     continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -774,9 +865,6 @@ class KimiLinearForCausalLM(nn.Module):
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:
                         continue
-                    # if is_pp_missing_parameter(name, self):
-                    #     continue
-
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
@@ -784,7 +872,15 @@ class KimiLinearForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
+        self.post_load_weights()
+
+    def post_load_weights(self):
+        # Derive the absorbed MLA weights. Also called by the dummy loader
+        # (`_post_load_weights`), which never runs `load_weights` — keeping the
+        # derivation only there left `w_kc` None under --load-format dummy.
         for layer_id in self.config.full_attention_layer_ids:
+            if not self.model.start_layer <= layer_id < self.model.end_layer:
+                continue
             self_attn = self.model.layers[layer_id].self_attn
             w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)

@@ -10,7 +10,7 @@ import unittest
 import torch
 
 import sglang as sgl
-from sglang.bench_offline_throughput import BenchArgs, throughput_test
+from sglang.benchmark.offline_throughput import BenchArgs, throughput_test
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
