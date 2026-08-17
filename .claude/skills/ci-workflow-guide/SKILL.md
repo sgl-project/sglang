@@ -1,6 +1,6 @@
 ---
 name: ci-workflow-guide
-description: Guide to SGLang CI workflow orchestration — stage ordering, fast-fail, gating, partitioning, execution modes, and debugging CI failures. Use when modifying CI workflows, adding stages, debugging CI pipeline issues, or understanding how tests are dispatched and gated across stages.
+description: Guide to SGLang CI workflow orchestration — stage ordering, fast-fail, gating, partitioning, execution modes, AMD nightly conventions, and debugging CI failures. Use when modifying CI workflows, adding stages or AMD nightly jobs, debugging CI pipeline issues, or understanding how tests are dispatched and gated.
 ---
 
 # SGLang CI Workflow Orchestration Guide
@@ -23,6 +23,8 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 |------|------|
 | `.github/workflows/pr-test.yml` | Main workflow — all stages, jobs, conditions, matrix definitions |
 | `.github/workflows/pr-test-extra.yml` | Extra workflow — gated by BOTH `run-ci` and `run-ci-extra` labels |
+| `.github/workflows/nightly-test-amd-rocm720.yml` | AMD nightly, ROCm 7.2 (see [AMD nightly workflows](#amd-nightly-workflows)) |
+| `.github/workflows/nightly-test-amd.yml` | AMD nightly, ROCm 7.0 — near-duplicate of the 7.2 file |
 | `.github/workflows/pr-gate.yml` | PR gating: draft check, `run-ci` label, per-user rate limiting |
 | `.github/actions/check-pr-test-health/action.yml` | Cross-job fast-fail: queries API for any failed job |
 | `.github/actions/wait-for-jobs/action.yml` | Stage gating: polls API until stage jobs complete |
@@ -366,6 +368,69 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 
 ---
 
+## AMD nightly workflows
+
+`pr-test.yml`'s machinery — stages, `wait-for-*` gating, partitioning, `check-pr-test-health` — does not exist here. Each AMD nightly job is standalone: checkout → `ensure_vram_clear.sh` → `amd_ci_start_container.sh` → `amd_ci_install_dependency.sh` → one or more test steps.
+
+| File | ROCm | Jobs | Cron |
+|------|------|------|------|
+| `nightly-test-amd-rocm720.yml` | 7.2 | 48 | 17:30 UTC |
+| `nightly-test-amd.yml` | 7.0 | 44 | 17:30 UTC |
+
+Job names differ only by the `-rocm720` suffix, and 7.0 has **no** unique jobs (7.2 adds the DeepSeek-V4 set). **A change to one almost always belongs in both.**
+
+### The test-step contract
+
+64 of the 67 test steps in the 7.2 workflow follow this exact shape. Copy it:
+
+```yaml
+- name: Performance Test ROCm 7.2 (8-GPU <model>)
+  timeout-minutes: 120
+  run: |
+    > github_summary.md  # Clear summary file
+    bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+      -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+      python3 run_suite.py --hw amd --suite <suite> --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+    echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+    exit ${TEST_EXIT_CODE:-0}
+```
+
+Both halves are load-bearing:
+
+- **Clear `github_summary.md` first.** Tests append to that file; the step then copies it into `GITHUB_STEP_SUMMARY`. Without the clear, a second step in the same job republishes the first step's block and the rendered summary shows it twice. A job with one test step gets away without it — until someone adds a second step.
+- **Capture the exit code.** Steps run under `bash -e`, so a bare failing command aborts the step before the `echo`, losing the summary on exactly the run whose numbers you need. The DeepSeek-V4 steps are the current exceptions.
+
+MI35x jobs also `pip install tabulate` (missing from that container). `ENABLE_CACHE_HOST: "1"` mounts the host weight cache; it already defaults on for runners whose name contains `300` or `35x`.
+
+### Registering a job — three places
+
+1. the job definition
+2. `workflow_dispatch.inputs.job_select.options`
+3. `check-all-jobs.needs`
+
+Miss (2) and the job can't be dispatched selectively; miss (3) and its failures never fail the workflow.
+
+### No retry
+
+AMD nightlies never pass `--enable-retry`, so a flaky accuracy or perf assertion fails the job on its first occurrence. Give thresholds real headroom — derive them from the job's own history rather than from one run.
+
+### Validating a change before merge
+
+These jobs only exist on AMD runners, so dispatch the workflow against your branch and filter to what you touched:
+
+```bash
+gh workflow run nightly-test-amd-rocm720.yml --ref <branch> \
+  -f job_filter='<job-a>,<job-b>' -f continue_on_error=true
+```
+
+`job_filter` is a free-form comma-separated string that overrides the `job_select` dropdown; every unmatched job skips, so a two-job filter costs two jobs, not 48. Results land in each job's step summary.
+
+### Cost
+
+An MI30x job spends ~49 min median pulling the image and installing dependencies before any test runs — 59% of all MI30x GPU-hours in the 7.2 workflow. MI35x pays ~6 min. **Prefer adding a step to a job that already serves the model over creating a new job**, which repeats that setup.
+
+---
+
 ## How To: Debug CI Failures
 
 | Symptom | Likely cause | What to check |
@@ -376,6 +441,9 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 | Tests pass locally but fail in CI | Partition assignment, runner GPU type, or `est_time` inaccuracy | Check which partition the test lands in; verify runner label |
 | Flaky test retried and passed | Retriable failure (accuracy/perf) | Check `[CI Retry]` markers in job logs |
 | Flaky test NOT retried | Matched non-retriable pattern | Check if error matches `NON_RETRIABLE_PATTERNS` in `ci_utils.py` |
+| AMD step summary shows the same block twice | A test step didn't clear `github_summary.md`, so it republished the previous step's content | Every test step must start with `> github_summary.md` |
+| AMD job red but its step summary is empty | Step aborted under `bash -e` before the `echo` that publishes the summary | Add `\|\| TEST_EXIT_CODE=$?` and `exit ${TEST_EXIT_CODE:-0}` |
+| A registered test never runs | Its suite is referenced by no workflow job | Grep the suite name across `.github/workflows/`; wire it up or mark it `disabled=` |
 
 ---
 
