@@ -14,6 +14,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion.qknorm_rope import (
+    can_use_fused_inplace_qknorm_rope,
+    fused_qknorm_rope_pack_kv,
+)
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.distributed import (
@@ -227,17 +231,66 @@ def _apply_qwen3_qk_norm_rope(
     head_dim: int,
     cos_sin_cache: torch.Tensor,
     rope_cache_positions: torch.Tensor,
+    *,
+    round_norm_before_rope: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return apply_qk_norm_rope(
-        q=q.contiguous(),
-        k=k.contiguous(),
+        q=q,
+        k=k,
         q_norm=q_norm,
         k_norm=k_norm,
         head_dim=head_dim,
         cos_sin_cache=cos_sin_cache,
         is_neox=True,
         positions=rope_cache_positions,
+        allow_strided_qk=True,
+        round_norm_before_rope=round_norm_before_rope,
     )
+
+
+def _apply_qwen3_qk_norm_rope_pack_kv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_prefix: torch.Tensor,
+    v_prefix: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    head_dim: int,
+    cos_sin_cache: torch.Tensor,
+    rope_cache_positions: torch.Tensor,
+    *,
+    round_norm_before_rope: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size, suffix_tokens, _, _ = q.shape
+    prefix_tokens = k_prefix.shape[1]
+    packed_kv = torch.empty(
+        2,
+        batch_size,
+        prefix_tokens + suffix_tokens,
+        k.shape[2],
+        head_dim,
+        dtype=q.dtype,
+        device=q.device,
+    )
+    fused_qknorm_rope_pack_kv(
+        q,
+        k,
+        v,
+        k_prefix,
+        v_prefix,
+        packed_kv,
+        q_norm.weight,
+        k_norm.weight,
+        cos_sin_cache,
+        rope_cache_positions,
+        is_neox=True,
+        eps=q_norm.variance_epsilon,
+        head_dim=head_dim,
+        rope_dim=cos_sin_cache.shape[-1],
+        round_norm_before_rope=round_norm_before_rope,
+    )
+    return q, packed_kv[0], packed_kv[1]
 
 
 def _apply_qwen3_rope_from_cache(
@@ -699,6 +752,7 @@ class Cosmos3CrossAttention(nn.Module):
         cos_sin_cache: torch.Tensor,
         rope_cache_positions: torch.Tensor,
         use_fused_qk_norm_rope: bool,
+        round_norm_before_rope: bool = False,
     ) -> torch.Tensor:
         """Cross-attention from GEN to cached UND K/V.
 
@@ -733,7 +787,41 @@ class Cosmos3CrossAttention(nn.Module):
             :,
         ]
 
-        if use_fused_qk_norm_rope:
+        use_fused_kv_pack = (
+            use_fused_qk_norm_rope
+            and q.device.type == "cuda"
+            and not torch.compiler.is_compiling()
+            and get_sp_world_size() == 1
+            and q.dtype == k.dtype == v.dtype == k_und.dtype == v_und.dtype
+            and self.norm_q.weight.dtype == q.dtype
+            and self.norm_k.weight.dtype == k.dtype
+            and self.norm_q.variance_epsilon == self.norm_k.variance_epsilon
+            and can_use_fused_inplace_qknorm_rope(
+                self.head_dim,
+                cos_sin_cache.shape[-1],
+                True,
+                q.dtype,
+                cos_sin_cache.dtype,
+                round_norm_before_rope=round_norm_before_rope,
+                pack_kv=True,
+            )
+        )
+        if use_fused_kv_pack:
+            q, packed_k, packed_v = _apply_qwen3_qk_norm_rope_pack_kv(
+                q,
+                k,
+                v,
+                k_und,
+                v_und,
+                self.norm_q,
+                self.norm_k,
+                self.head_dim,
+                cos_sin_cache,
+                rope_cache_positions,
+                round_norm_before_rope=round_norm_before_rope,
+            )
+            out = self.attn.forward(q, packed_k, packed_v)
+        elif use_fused_qk_norm_rope:
             q, k = _apply_qwen3_qk_norm_rope(
                 q,
                 k,
@@ -742,16 +830,16 @@ class Cosmos3CrossAttention(nn.Module):
                 self.head_dim,
                 cos_sin_cache,
                 rope_cache_positions,
+                round_norm_before_rope=round_norm_before_rope,
             )
         else:
             q, k = _apply_qwen3_qk_norm_rope_split(
                 q, k, self.norm_q, self.norm_k, self.head_dim, cos_sin_cache
             )
-
-        # K/V = [text (replicated on every SP rank) | image (sharded same as Q)].
-        # USPAttention routes through the registered attention backend (FA, sage,
-        # …) and handles the Ulysses all-to-all when SP > 1.
-        out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
+        if not use_fused_kv_pack:
+            # K/V = [UND prefix (replicated on SP ranks) | GEN suffix].
+            # USPAttention applies the configured backend and SP collectives.
+            out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
         out = out.reshape(batch_size, seq_len_gen, -1)
         out, _ = self.to_out(out)
         return out
@@ -882,6 +970,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         cos_sin_cache: torch.Tensor,
         rope_cache_positions: torch.Tensor,
         use_fused_qk_norm_rope: bool,
+        round_norm_before_rope: bool = False,
         residual: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Fused add+rmsnorm: each `(hidden_states, residual) = norm(...)`
@@ -901,6 +990,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             cos_sin_cache,
             rope_cache_positions,
             use_fused_qk_norm_rope,
+            round_norm_before_rope,
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -1048,6 +1138,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.rms_norm_eps = arch.rms_norm_eps
         self.hidden_act = arch.hidden_act
         self.rope_theta = arch.rope_theta
+        self._gen_layers_torch_compiled = False
 
         # The checkpoint may override the activation (and thus the MLP weight
         # layout), so bind the arch-derived mappings on the instance.
@@ -1540,10 +1631,20 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 vis_pos_ids = vis_pos_ids.view(
                     3, batch_size, self.sp_size, local_seq_len
                 )[:, :, self.sp_rank, :]
-            self.cached_gen_rope_inputs[cache_key] = (
+            cos_sin_gen, gen_rope_cache_positions = (
                 self.language_model.rotary_emb.build_rope_cache_inputs(
                     vis_pos_ids, cache_dtype=hidden_gen.dtype
                 )
+            )
+            if T == 1 and not self._gen_layers_torch_compiled:
+                # build_rope_cache_inputs already rounds through cache_dtype
+                # before returning FP32 storage. Keep that rounded cache in the
+                # activation dtype so the exact fused QKNorm+RoPE kernel can
+                # consume it without repeating the cast in every GEN layer.
+                cos_sin_gen = cos_sin_gen.to(hidden_gen.dtype)
+            self.cached_gen_rope_inputs[cache_key] = (
+                cos_sin_gen,
+                gen_rope_cache_positions,
             )
 
         cos_sin_gen, gen_rope_cache_positions = self.cached_gen_rope_inputs[cache_key]
@@ -1553,7 +1654,22 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         # fused add+rmsnorm path instead of separate add + norm kernels.
         cached_kv_for_key = self.cached_kv[cache_key]
         residual: torch.Tensor | None = None
-        use_fused_qk_norm_rope = T > 1
+        round_norm_before_rope = T == 1
+        use_fused_qk_norm_rope = T > 1 or (
+            hidden_gen.device.type == "cuda"
+            and not torch.compiler.is_compiling()
+            and not self._gen_layers_torch_compiled
+            and get_sp_world_size() == 1
+            and can_use_fused_inplace_qknorm_rope(
+                self.head_dim,
+                cos_sin_gen.shape[-1],
+                True,
+                hidden_gen.dtype,
+                cos_sin_gen.dtype,
+                round_norm_before_rope=True,
+                pack_kv=True,
+            )
+        )
         for i, layer in enumerate(self.gen_layers):
             k_und, v_und = cached_kv_for_key[i]
             hidden_gen, residual = layer(
@@ -1563,6 +1679,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 cos_sin_gen,
                 gen_rope_cache_positions,
                 use_fused_qk_norm_rope,
+                round_norm_before_rope,
                 residual=residual,
             )
 

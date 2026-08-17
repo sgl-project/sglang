@@ -52,6 +52,8 @@ DP_ATTENTION_EP_ARGS = [
     "0.93",
     "--max-prefill-tokens",
     "8192",
+    "--cuda-graph-backend-prefill",
+    "disabled",
 ]
 
 MTP_ARGS = [

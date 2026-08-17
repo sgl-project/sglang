@@ -492,20 +492,16 @@ class TextEncodingStage(ConditionEncodingStage):
 
         return tok_kwargs
 
-    def _manage_text_encoder_use(self, encoder_index: int) -> None:
-        manager = self._component_residency_manager
-        if manager is None:
-            return
+    def _begin_text_encoder_use(self, encoder_index: int) -> None:
         component_name = (
             "text_encoder"
             if encoder_index == 0
             else f"text_encoder_{encoder_index + 1}"
         )
-        use = self._declared_component_use(component_name=component_name)
-        # TODO: Keep this begin-only interval until manager supports explicit
-        # declared-use interval grouping. Wrapping each encoder call separately
-        # can offload between positive and negative prompt encoding.
-        manager.begin_use(use, module=self.text_encoders[encoder_index])
+        self.begin_declared_component_use(
+            component_name=component_name,
+            module=self.text_encoders[encoder_index],
+        )
 
     def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
         if not getattr(text_encoder, "uses_sglang_forward_context", True):
@@ -703,7 +699,7 @@ class TextEncodingStage(ConditionEncodingStage):
                 encoder_forward_kwargs["attention_mask"] = attention_mask
             if "use_cache" in inspect.signature(text_encoder.forward).parameters:
                 encoder_forward_kwargs["use_cache"] = False
-            self._manage_text_encoder_use(i)
+            self._begin_text_encoder_use(i)
             dp_group = self._text_encode_dp_group(
                 server_args, encoder_config, input_ids.shape[0], text_encoder
             )
