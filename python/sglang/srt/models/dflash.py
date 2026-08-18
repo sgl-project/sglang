@@ -14,7 +14,6 @@ from torch import nn
 
 from sglang.kernels.ops.speculative.dflash import selector_walk_triton
 from sglang.srt.configs.laguna import normalize_gating
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
@@ -971,7 +970,7 @@ class DFlash2DraftModel(DFlashDraftModel):
                 "DFlash2 selector requires a dense FP16/BF16/FP32 target lm_head."
             )
         hidden = hidden.to(weight.dtype)
-        if get_tensor_model_parallel_world_size() == 1:
+        if get_parallel().tp_size == 1:
             org = int(self.lm_head.org_vocab_size)
             vals, ids = _radix_topk(torch.matmul(hidden, weight[:org].T), k)
             return ids.long(), self._transform_unary_logits(vals)
