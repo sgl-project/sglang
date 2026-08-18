@@ -30,6 +30,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     get_cuda_graph_batch_size_alignment,
     get_cuda_graph_max_batch_size,
+    is_npu,
 )
 
 if TYPE_CHECKING:
@@ -75,6 +76,22 @@ def get_batch_sizes_to_capture(
     num_max_requests = model_runner.req_to_token_pool.size
 
     mul_base = get_cuda_graph_batch_size_alignment(server_args)
+    if (
+        is_npu()
+        and model_runner.is_draft_worker
+        and model_runner.spec_algorithm.is_dspark()
+    ):
+        from sglang.srt.speculative.dspark_components.dspark_config import (
+            draft_is_deepseek_v4,
+        )
+
+        # A dense DSpark draft is TP-local: it uses ordinary tensor-parallel
+        # attention/linears and never consumes the target MoE gathered buffer.
+        # Reusing the target alignment here turns gamma=15, attn-TP=16 into a
+        # bs=16 graph (240 draft rows) even for a single live request.  NPU can
+        # capture the real bs=1/15-row shape directly.
+        if not draft_is_deepseek_v4(server_args=server_args):
+            mul_base = 1
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.
     alignment_width = captured_req_width
