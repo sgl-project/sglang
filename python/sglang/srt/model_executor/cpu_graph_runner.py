@@ -39,7 +39,14 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
-from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    configured_pp_size,
+    get_exec,
+    get_flags,
+    get_lora,
+    get_parallel,
+    get_spec,
+)
 from sglang.srt.utils import (
     empty_context,
     log_info_on_rank0,
@@ -585,22 +592,20 @@ class CPUGraphRunner:
         self.enable_two_batch_overlap = (
             model_runner.server_args.enable_two_batch_overlap
         )
-        self.speculative_algorithm = model_runner.server_args.speculative_algorithm
+        self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = get_parallel().dp_size
-        self.pp_size = model_runner.server_args.pp_size
+        self.pp_size = configured_pp_size()
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = self.return_hidden_states_mode
         # Static capture width: CPU graphs are decode-only.
         self.captured_req_width = 1
 
-        assert (
-            not self.model_runner.server_args.enable_lora
-        ), "CPUGraphRunner does not support LoRA yet."
+        assert not get_lora().enable_lora, "CPUGraphRunner does not support LoRA yet."
         assert (
             not self.enable_two_batch_overlap
         ), "CPUGraphRunner does not support two batch overlap yet."
@@ -991,7 +996,7 @@ class CPUGraphRunner:
                     retrieve_next_sibling=None,
                     retrieve_cum_len=None,
                     spec_steps=get_spec().speculative_num_steps,
-                    topk=self.model_runner.server_args.speculative_eagle_topk,
+                    topk=get_spec().speculative_eagle_topk,
                     draft_token_num=get_spec().speculative_num_draft_tokens,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                     seq_lens_sum=None,

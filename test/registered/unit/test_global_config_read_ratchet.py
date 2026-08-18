@@ -107,6 +107,14 @@ _CONFIGURED_SIZE_CALL_SITES = {
     ("srt/managers/scheduler.py", "configured_dcp_size"): (
         "same pre-distributed-init arithmetic in configure_scheduler_process"
     ),
+    ("srt/model_executor/runner/base_runner.py", "configured_pp_size"): (
+        "the runner's layer window is arithmetic over the configured stage "
+        "count; a draft runner shares the target's groups, so the live "
+        "property would answer for the wrong runner"
+    ),
+    ("srt/model_executor/cpu_graph_runner.py", "configured_pp_size"): (
+        "the same window, on the CPU graph path"
+    ),
     ("srt/disaggregation/common/conn.py", "configured_pp_size"): (
         "the bootstrap connection is built by the KV manager on the transfer "
         "path, which the CPU-only conn tests exercise without ever starting "
