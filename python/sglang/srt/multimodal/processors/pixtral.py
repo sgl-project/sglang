@@ -91,7 +91,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
                 )
                 image_nrows.append(nrows)
 
-            mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
                 mm_data, self.mm_tokens
             )
 
@@ -123,7 +123,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
                         ]
                     mm_items.append(new_item)
         else:
-            mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
                 mm_data, self.mm_tokens
             )
 
