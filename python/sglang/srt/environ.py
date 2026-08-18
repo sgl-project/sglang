@@ -1149,7 +1149,7 @@ class Envs:
     # ===================================================================
     SGLANG_VLM_CACHE_SIZE_MB = EnvInt(100)
     # XPU: cap tiles per InternVL ViT forward for stable tp>1 execution.
-    # 0 = off.
+    # 12 = InternVL per-image tile cap (IMAGE_MAX_NUM); 0 = off.
     SGLANG_VIT_MAX_TILES = EnvInt(12)
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
