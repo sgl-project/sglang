@@ -694,14 +694,13 @@ def forward_dsa_prepare_npu(
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
-            k_flat = k_nope.contiguous().reshape(k_nope.shape[0], -1)
-            kr_flat = k_pe.contiguous().reshape(k_pe.shape[0], -1)
-            kv_flat = torch.cat([k_flat, kr_flat], dim=-1)
+            latent_cache[..., : m.kv_lora_rank] = k_nope.squeeze(1)
+            latent_cache[..., m.kv_lora_rank:] = k_pe.squeeze(1)
+            _, cp_hidden_size = input_tensor.shape
             cp_handle, cp_kv_full = cp_all_gather_rerange_kv_cache_launch(
-                kv_flat,
+                latent_cache.contiguous(),
                 m.cp_size,
                 forward_batch,
-                get_current_device_stream_fast(),
             )
 
         q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
@@ -722,12 +721,12 @@ def forward_dsa_prepare_npu(
         topk_indices = prev_topk_indices
     if cp_handle is not None:
         cp_handle.wait()
-        kv_full = cp_all_gather_rerange_kv_cache_finalize(
+        latent_cache_output = cp_all_gather_rerange_kv_cache_finalize(
             cp_kv_full, forward_batch
         )
-        k_feat_size = m.kv_lora_rank
-        k_nope = kv_full[..., :k_feat_size].unsqueeze(1)
-        k_pe = kv_full[..., k_feat_size:].unsqueeze(1)
+        latent_cache_output = latent_cache_output.view(-1, cp_hidden_size)
+        k_nope = latent_cache_output[..., : m.kv_lora_rank].unsqueeze(1)
+        k_pe = latent_cache_output[..., m.kv_lora_rank :].unsqueeze(1)
     return (
         q_pe,
         k_pe,
