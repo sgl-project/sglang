@@ -182,11 +182,16 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
     def apply_mm_reduce_scatter(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         hcom: str,
         world_size: int,
     ) -> torch.Tensor:
-        quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
+        if isinstance(x, tuple):
+            quant_out, dynamic_scale = x
+            output_dtype = torch.bfloat16
+        else:
+            quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
+            output_dtype = x.dtype
         return torch.ops.npu.npu_mm_reduce_scatter_base(
             quant_out,
             layer.weight,
@@ -194,7 +199,7 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             world_size,
             x1_scale=dynamic_scale.flatten(),
             x2_scale=self._collective_weight_scale(layer),
-            output_dtype=x.dtype,
+            output_dtype=output_dtype,
             comm_mode="aiv",
         )
 
@@ -263,7 +268,9 @@ def npu_fused_all_gather_linear(
 
 
 def npu_fused_linear_reduce_scatter(
-    layer: torch.nn.Module, x: torch.Tensor, group
+    layer: torch.nn.Module,
+    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    group,
 ) -> torch.Tensor:
     kernel = _get_w8a8_dynamic_kernel(layer)
     if kernel is None:

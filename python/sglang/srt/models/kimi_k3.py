@@ -389,7 +389,17 @@ class KimiK3MLP(nn.Module):
         gate_up = npu_fused_all_gather_linear(
             self.gate_up_proj, local_hidden_states, group
         )
-        hidden_states = self.act_fn(gate_up)
+        if isinstance(self.act_fn, SituAndMul):
+            from sgl_kernel_npu.activation.situ import situ_and_mul_quant
+
+            hidden_states = situ_and_mul_quant(
+                gate_up,
+                beta=self.act_fn.beta,
+                linear_beta=self.act_fn.linear_beta,
+                need_quant=True,
+            )
+        else:
+            hidden_states = self.act_fn(gate_up)
         return npu_fused_linear_reduce_scatter(
             self.down_proj, hidden_states, group
         )
