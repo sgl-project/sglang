@@ -57,6 +57,13 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     mask_token_id: Optional[int]
     markov_rank: int
     markov_head_type: Optional[str]
+    bonus_anchor: bool
+    # None for the ordinary DSpark checkpoint that samples in the full target
+    # vocab and shares the target lm_head. A speculators-trained checkpoint with
+    # an independent, reduced-vocabulary head (RedHatAI/*-speculator.dspark)
+    # sets this to its draft vocab size (e.g. 32000); the draft then samples in
+    # draft space and maps back to target ids via the checkpoint's d2t table.
+    draft_vocab_size: Optional[int] = None
 
     def resolve_gamma(self, *, default: Optional[int] = None) -> Optional[int]:
         return self.gamma if self.gamma is not None else default
@@ -64,11 +71,17 @@ class DSparkDraftConfig(msgspec.Struct, frozen=True):
     def require_markov(self) -> bool:
         return int(self.markov_rank) > 0
 
+    def uses_reduced_draft_vocab(self, *, target_vocab_size: int) -> bool:
+        return self.draft_vocab_size is not None and int(self.draft_vocab_size) < int(
+            target_vocab_size
+        )
+
 
 class DSparkRuntimeConfig(msgspec.Struct, frozen=True):
     gamma: int
     verify_num_draft_tokens: int
     mask_token_id: int
+    bonus_anchor: bool
 
 
 def resolve_runtime_config(
@@ -121,12 +134,18 @@ def resolve_runtime_config(
         gamma=gamma,
         verify_num_draft_tokens=gamma + 1,
         mask_token_id=mask_token_id,
+        bonus_anchor=draft_config.bonus_anchor,
     )
 
 
-def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
-    """Load the draft checkpoint's hf config and read its DSpark gamma
-    (block_size). Raises on config-load failure; callers pick the fallback."""
+def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfig:
+    """Load and parse the draft checkpoint's hf config.
+
+    Startup needs more than one fact out of this file -- gamma for the verify
+    window, and bonus_anchor for the draft block width that sizes
+    CUDA-graph capture -- so it is parsed once and the caller picks fields off
+    the result. Raises on config-load failure; callers pick the fallback.
+    """
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     draft_hf_config = get_config(
@@ -135,9 +154,7 @@ def read_draft_checkpoint_gamma(*, server_args: ServerArgs) -> Optional[int]:
         revision=server_args.speculative_draft_model_revision,
         model_override_args=json.loads(server_args.json_model_override_args),
     )
-    return parse_dspark_draft_config(draft_hf_config=draft_hf_config).resolve_gamma(
-        default=None
-    )
+    return parse_dspark_draft_config(draft_hf_config=draft_hf_config)
 
 
 def checkpoint_bundles_dspark_draft(hf_config: Any) -> bool:
@@ -182,6 +199,91 @@ def _get_dspark_config(config: Any) -> dict:
         return dict(cfg)
     except Exception:
         return {}
+
+
+def _get_speculators_config(config: Any) -> dict:
+    cfg = _cfg_get(config, "speculators_config", None)
+    if cfg is None:
+        return {}
+    if isinstance(cfg, dict):
+        return cfg
+    try:
+        return dict(cfg)
+    except Exception:
+        return {}
+
+
+def resolve_target_vocab_size(draft_hf_config: Any) -> Optional[int]:
+    """The draft transformer/embedding vocab, i.e. the target vocab the Markov
+    head's markov_w1 and the shared embedding operate in. Read from the same
+    nested/top-level locations as the rest of the draft config."""
+    text_config = _get_text_config(draft_hf_config)
+    raw = _cfg_get(
+        text_config, "vocab_size", _cfg_get(draft_hf_config, "vocab_size", None)
+    )
+    return int(raw) if raw is not None else None
+
+
+def resolve_draft_vocab_size(draft_hf_config: Any) -> Optional[int]:
+    """The reduced draft-head vocab for speculators DSpark checkpoints, or None
+    when the draft shares the full target vocab/head.
+
+    Kept as the single resolution point (used by both parse_dspark_draft_config
+    and the model's head construction) so the two never disagree on geometry.
+    """
+    dspark_cfg = _get_dspark_config(draft_hf_config)
+    text_config = _get_text_config(draft_hf_config)
+    raw = _cfg_get(draft_hf_config, "draft_vocab_size", None)
+    if raw is None:
+        raw = dspark_cfg.get(
+            "draft_vocab_size", _cfg_get(text_config, "draft_vocab_size", None)
+        )
+    if raw is None:
+        return None
+    value = int(raw)
+    if value <= 0:
+        raise ValueError(f"DSpark draft_vocab_size must be positive, got {value}.")
+    target_vocab_size = resolve_target_vocab_size(draft_hf_config)
+    if target_vocab_size is not None and value > target_vocab_size:
+        raise ValueError(
+            f"DSpark draft_vocab_size={value} exceeds the target vocab "
+            f"{target_vocab_size}; a reduced draft head cannot be larger than "
+            "the vocab its d2t table maps into."
+        )
+    return value
+
+
+def _resolve_speculators_proposal_gamma(config: Any) -> Optional[int]:
+    """speculators checkpoints carry their real draft length in
+    speculators_config.proposal_methods[i].speculative_tokens -- prefer this
+    over block_size (which counts the anchor+gamma block width, off by one
+    from gamma for bonus-anchor checkpoints; see the layout resolution in
+    parse_dspark_draft_config below)."""
+    cfg = _get_speculators_config(config)
+    proposal_methods = cfg.get("proposal_methods") or []
+    if not isinstance(proposal_methods, (list, tuple)) or not proposal_methods:
+        return None
+
+    default_method = cfg.get("default_proposal_method")
+    selected = None
+    if default_method is not None:
+        for method in proposal_methods:
+            if _cfg_get(method, "proposal_type", None) == default_method:
+                selected = method
+                break
+    if selected is None:
+        selected = proposal_methods[0]
+
+    speculative_tokens = _cfg_get(selected, "speculative_tokens", None)
+    if speculative_tokens is None:
+        return None
+    gamma = int(speculative_tokens)
+    if gamma < 1:
+        raise ValueError(
+            "DSpark speculators_config speculative_tokens must be positive, "
+            f"got {gamma}."
+        )
+    return gamma
 
 
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
@@ -265,8 +367,65 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
             f"DSpark mask_token_id must be non-negative, got {mask_token_id}."
         )
 
+    # sample_from_anchor determines the draft layout for every DSpark checkpoint:
+    # False uses a separate bonus anchor and gamma + 1 slots; True uses gamma
+    # sampled slots. Legacy Speculators configs omitted the field and defaulted
+    # to False, while native DSpark configs default to True. Checkpoint origin is
+    # therefore only a backward-compatible default, never an override.
+    speculators_model_type = _cfg_get(draft_hf_config, "speculators_model_type", None)
+    is_speculators_dspark = (
+        isinstance(speculators_model_type, str)
+        and speculators_model_type.lower() == "dspark"
+    )
+    raw_sample_from_anchor = _cfg_get(draft_hf_config, "sample_from_anchor", None)
+    if raw_sample_from_anchor is None:
+        sample_from_anchor = not is_speculators_dspark
+    elif isinstance(raw_sample_from_anchor, bool):
+        sample_from_anchor = raw_sample_from_anchor
+    else:
+        raise ValueError(
+            "DSpark sample_from_anchor must be a bool when set, got "
+            f"{raw_sample_from_anchor!r}."
+        )
+    bonus_anchor = not sample_from_anchor
+
+    # Cross-check against the block geometry, which encodes the same fact
+    # independently: a 1+N checkpoint ships block_size == speculative_tokens + 1
+    # (the extra slot is the anchor), a dense one ships them equal. Disagreement
+    # means one of the two fields is wrong, and guessing costs 2-3x acceptance,
+    # so fail loudly instead.
+    declared_block_size = _cfg_get(draft_hf_config, "block_size", None)
+    declared_tokens = _resolve_speculators_proposal_gamma(draft_hf_config)
+    if (
+        raw_sample_from_anchor is not None
+        and declared_block_size is not None
+        and declared_tokens is not None
+    ):
+        geometry_bonus_anchor = int(declared_block_size) == int(declared_tokens) + 1
+        if geometry_bonus_anchor != bonus_anchor:
+            raise ValueError(
+                "DSpark draft config is self-inconsistent: sample_from_anchor="
+                f"{sample_from_anchor} implies a "
+                f"{'gamma + 1' if bonus_anchor else 'gamma'}-slot block, "
+                f"but block_size={int(declared_block_size)} vs "
+                f"speculative_tokens={int(declared_tokens)} implies a "
+                f"{'gamma + 1' if geometry_bonus_anchor else 'gamma'}-slot block. "
+                "Fix the checkpoint config; running either way silently "
+                "misreads every draft slot."
+            )
+
+    # speculators checkpoints ship their authoritative draft length as
+    # speculators_config.proposal_methods[i].speculative_tokens, not as
+    # block_size (which means the full anchor+gamma block width there, off
+    # by one from gamma for exactly the reason above). Prefer this over
+    # base.block_size when present -- it's the checkpoint's own stated
+    # value for "how many real draft tokens", not something inferred by
+    # subtracting one from block_size and hoping the convention holds.
+    speculators_gamma = _resolve_speculators_proposal_gamma(draft_hf_config)
     gamma = (
-        int(prefixed_block_size) if prefixed_block_size is not None else base.block_size
+        int(prefixed_block_size)
+        if prefixed_block_size is not None
+        else speculators_gamma if speculators_gamma is not None else base.block_size
     )
 
     if prefixed_target_layer_ids is not None:
@@ -292,4 +451,6 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
         mask_token_id=mask_token_id,
         markov_rank=markov_rank,
         markov_head_type=markov_head_type,
+        bonus_anchor=bonus_anchor,
+        draft_vocab_size=resolve_draft_vocab_size(draft_hf_config),
     )

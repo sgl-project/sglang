@@ -1078,25 +1078,64 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # passes its own positions (uniform num_draft_tokens per request).
         if seq_positions is None:
             seq_positions = batch.spec_info.positions
-        seq_positions = seq_positions.view(batch_size, -1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
-            mrope_delta_tensor = torch.zeros(
-                (batch_size, 1), dtype=torch.int64, device=device
+            # Text-only speculative tokens have no per-request mRoPE delta.
+            # Keep positions flat so compact ragged verify layouts do not need
+            # to satisfy a rectangular batch_size * width shape.
+            self.mrope_positions = (
+                seq_positions.to(dtype=torch.int64).flatten().unsqueeze(0).repeat(3, 1)
+            )
+            return
+
+        mrope_deltas = [
+            (
+                torch.zeros(1, dtype=torch.int64)
+                if mm_inputs[i] is None
+                else mm_inputs[i].mrope_position_delta.squeeze(0)
+            )
+            for i in range(batch_size)
+        ]
+        mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+        ragged_layout = getattr(
+            getattr(batch, "spec_info", None), "ragged_verify_layout", None
+        )
+        if ragged_layout is not None:
+            flat_positions = seq_positions.to(dtype=torch.int64).flatten()
+            if flat_positions.numel() != ragged_layout.graph_num_tokens:
+                raise ValueError(
+                    "Speculative mRoPE positions must match the ragged CUDA Graph "
+                    f"tier: got {flat_positions.numel()} positions for "
+                    f"graph_num_tokens={ragged_layout.graph_num_tokens}."
+                )
+
+            # Expand each request's scalar mRoPE delta over its actual compact
+            # verify length. CUDA Graph tiers can contain ghost tokens after the
+            # real ragged stream, so append a zero-delta pseudo request whose
+            # repeat count fills the fixed graph shape. Passing output_size keeps
+            # repeat_interleave capture-safe without reading the dynamic sum on
+            # the host.
+            verify_lens = ragged_layout.verify_lens.to(device=device, dtype=torch.int64)
+            ghost_len = verify_lens.new_full(
+                (1,), ragged_layout.graph_num_tokens
+            ) - verify_lens.sum().reshape(1)
+            repeat_counts = torch.cat((verify_lens, ghost_len))
+            delta_values = torch.cat(
+                (mrope_delta_tensor.flatten(), mrope_delta_tensor.new_zeros(1))
+            )
+            per_token_delta = torch.repeat_interleave(
+                delta_values,
+                repeat_counts,
+                output_size=ragged_layout.graph_num_tokens,
+            )
+            next_input_positions = (
+                (flat_positions + per_token_delta).unsqueeze(0).repeat(3, 1)
             )
         else:
-            mrope_deltas = [
-                (
-                    torch.zeros(1, dtype=torch.int64)
-                    if mm_inputs[i] is None
-                    else mm_inputs[i].mrope_position_delta.squeeze(0)
-                )
-                for i in range(batch_size)
-            ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
-        next_input_positions = (
-            (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
-        )
+            seq_positions = seq_positions.view(batch_size, -1)
+            next_input_positions = (
+                (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
+            )
 
         self.mrope_positions = next_input_positions
 

@@ -30,7 +30,14 @@ def _resolve_speculative_algorithm_alias(
     """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
 
     is_gemma4_draft = False
-    if speculative_draft_model_path:
+    # Only EAGLE-family aliases need to inspect the draft architecture. Loading
+    # every draft config here rejects native speculators checkpoints before the
+    # actual model-config parser can normalize them.
+    if speculative_draft_model_path and speculative_algorithm in (
+        "EAGLE",
+        "EAGLE3",
+        "NEXTN",
+    ):
         from sglang.srt.utils.hf_transformers_utils import get_config
 
         cfg = get_config(
@@ -366,26 +373,62 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"got {server_args.speculative_dspark_block_size}."
             )
         gamma = int(server_args.speculative_dspark_block_size)
-    else:
-        from sglang.srt.speculative.dspark_components.dspark_config import (
-            DEFAULT_DSPARK_GAMMA,
-            read_draft_checkpoint_gamma,
+
+    # The block layout has to be resolved here, not lazily in the worker: it
+    # decides whether the draft forward is gamma or gamma + 1 slots wide, and
+    # that width sizes the draft CUDA-graph capture shape
+    # (resolve_num_tokens_per_req), which is fixed before the worker's own
+    # config is available. Resolve it unconditionally -- an explicit
+    # --speculative-dspark-block-size pins gamma but says nothing about the
+    # layout, so the branch above must not be allowed to skip this read.
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        DEFAULT_DSPARK_GAMMA,
+        read_draft_checkpoint_config,
+    )
+
+    draft_checkpoint_config = None
+    try:
+        draft_checkpoint_config = read_draft_checkpoint_config(server_args=server_args)
+    except Exception as e:
+        # Deliberately not fatal: leaving this False is exactly the pre-existing
+        # DeepSpec behaviour, so a config-read failure cannot regress checkpoints
+        # that worked before. For a speculators checkpoint it degrades into the
+        # loud draft-graph capture ValueError rather than silent wrong output,
+        # and DSparkWorkerV2 cross-checks the resolved value against the draft
+        # config it loads itself, before any graph is captured.
+        logger.error(
+            "Failed to read the DSpark draft config%s; assuming the DeepSpec "
+            "gamma-wide layout. A bonus-anchor checkpoint will "
+            "fail draft CUDA-graph capture until this read succeeds. Error: %s",
+            (
+                " (gamma and block layout cannot be resolved)"
+                if gamma is None and server_args.speculative_num_draft_tokens is None
+                else " (block layout cannot be resolved)"
+            ),
+            e,
         )
 
-        try:
-            gamma = read_draft_checkpoint_gamma(server_args=server_args)
-        except Exception as e:
-            logger.warning(
-                "Failed to read DSpark gamma from draft model config; "
-                "cannot cross-check --speculative-num-draft-tokens. Error: %s",
-                e,
-            )
-        if gamma is None and server_args.speculative_num_draft_tokens is None:
-            gamma = DEFAULT_DSPARK_GAMMA
-            logger.warning(
-                "DSpark gamma is not set; defaulting to %d.",
-                gamma,
-            )
+    if gamma is None and draft_checkpoint_config is not None:
+        gamma = draft_checkpoint_config.resolve_gamma(default=None)
+    if gamma is None and server_args.speculative_num_draft_tokens is None:
+        gamma = DEFAULT_DSPARK_GAMMA
+        logger.warning(
+            "DSpark gamma is not set; defaulting to %d.",
+            gamma,
+        )
+
+    # This is an internal no-CLI field derived from the checkpoint being opened
+    # now. Do not preserve an incoming value when that read fails: it may have
+    # been serialized from another checkpoint and would mis-size CUDA graphs.
+    server_args.speculative_dspark_bonus_anchor = bool(
+        draft_checkpoint_config is not None and draft_checkpoint_config.bonus_anchor
+    )
+    if server_args.speculative_dspark_bonus_anchor:
+        logger.info(
+            "DSpark draft checkpoint uses the bonus-anchor layout; "
+            "the draft block is gamma + 1 slots wide (slot 0 is the anchor and "
+            "is not sampled)."
+        )
 
     if gamma is not None:
         verify_window = int(gamma) + 1

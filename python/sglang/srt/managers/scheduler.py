@@ -4262,8 +4262,22 @@ class Scheduler(
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
 
-            if empty_cache:
+            # DSpark's draft CUDA graph can retain allocator-owned addresses
+            # that are not otherwise kept live by Python tensors. Releasing
+            # the allocator cache here invalidates those addresses and makes
+            # the first post-flush replay fail with an illegal memory access.
+            # The logical KV/request pools above are still fully reset.
+            preserve_dspark_graph = self.spec_algorithm.is_dspark() and (
+                self.draft_worker.draft_model_runner.decode_cuda_graph_runner
+                is not None
+            )
+            if empty_cache and not preserve_dspark_graph:
                 current_platform.empty_cache()
+            elif empty_cache and self.metrics_reporter.is_stats_logging_rank:
+                logger.info(
+                    "Skipped emptying the device allocator cache to preserve "
+                    "captured DSpark draft CUDA graphs."
+                )
             # Per-DP-group leader logs once: ranks within a DP group are
             # state-synchronous, but DP groups may diverge.
             if self.metrics_reporter.is_stats_logging_rank:

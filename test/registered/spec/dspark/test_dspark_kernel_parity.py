@@ -260,6 +260,7 @@ def _case_compact_layout(tc):
     gamma, t, bs = 5, 6, 64
     verify_lens = _ri(1, t + 1, (bs,), torch.int32)
     total = int(verify_lens.sum().item())
+    draft_tokens = _ri(0, VOCAB, (bs, gamma))
     for padded_total in (total, bs * t):  # exact and bucket padding
         tc._parity(
             dspark_verify_window.CompactRowIndex,
@@ -267,13 +268,20 @@ def _case_compact_layout(tc):
             padded_total=padded_total,
             device=DEVICE,
         )
-        tc._parity(
-            dspark_verify_window.CompactVerifyIds,
-            draft_block_ids=_ri(0, VOCAB, (bs, gamma)),
-            draft_tokens=_ri(0, VOCAB, (bs, gamma)),
-            layout=_layout(verify_lens, padded_total),
-            device=DEVICE,
-        )
+        # Both draft-block widths: DeepSpec keeps the anchor in a (bs, gamma)
+        # block, the speculators bonus-anchor convention in (bs, gamma + 1).
+        # draft_tokens stays (bs, gamma) either way, so the block-ids row
+        # stride must be read off that tensor -- an implementation that reuses
+        # gamma as the stride lands on the right anchor only for request 0 and
+        # walks back into the previous row for every later request.
+        for block_width in (gamma, gamma + 1):
+            tc._parity(
+                dspark_verify_window.CompactVerifyIds,
+                draft_block_ids=_ri(0, VOCAB, (bs, block_width)),
+                draft_tokens=draft_tokens,
+                layout=_layout(verify_lens, padded_total),
+                device=DEVICE,
+            )
 
 
 def _case_swa_page_indices(tc):

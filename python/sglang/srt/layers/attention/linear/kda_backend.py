@@ -13,6 +13,8 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    gather_ragged_verify_from_dense,
+    scatter_ragged_verify_to_dense,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
@@ -327,29 +329,6 @@ class KDAKernelDispatcher:
             query_start_loc=query_start_loc,
             **kwargs,
         )
-
-
-def ragged_verify_dense_scatter_indices(
-    *,
-    query_start_loc: torch.Tensor,
-    seq_len: int,
-    draft_token_num: int,
-) -> torch.Tensor:
-    """Dense [bs, draft_token_num] slot index per packed ragged-verify token.
-
-    Rows never exceed draft_token_num under either layout variant (cap for
-    graph replay, planner construction for eager -- see
-    RaggedVerifyLayout.padded_to_bucket), so in-row offsets stay in-row;
-    tokens past the layout's coverage collapse into one ghost row at index
-    bs * draft_token_num.
-    """
-    batch_size = query_start_loc.shape[0] - 1
-    token_pos = torch.arange(seq_len, device=query_start_loc.device, dtype=torch.int32)
-    token_slots = torch.searchsorted(query_start_loc[1:], token_pos, right=True)
-    return (
-        token_slots * draft_token_num
-        + (token_pos - query_start_loc[token_slots]).to(torch.int64)
-    ).clamp_(max=batch_size * draft_token_num)
 
 
 class KDAAttnBackend(MambaAttnBackendBase):
@@ -790,20 +769,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # [bs, draft_token_num] layout: scatter ragged tokens to their
             # step slots, gather back after (pad steps are never committed).
             # Uncovered tier-leftover tokens land in the ghost row (see
-            # ragged_verify_dense_scatter_indices); their values are pad
+            # scatter_ragged_verify_to_dense); their values are pad
             # garbage, discarded downstream (ghost collisions are
             # value-irrelevant).
             batch_size = query_start_loc.shape[0] - 1
-            num_dense_tokens = batch_size * draft_token_num
-            dense_token_indices = ragged_verify_dense_scatter_indices(
+            mixed_qkv_dense, dense_token_indices = scatter_ragged_verify_to_dense(
+                mixed_qkv,
                 query_start_loc=query_start_loc,
-                seq_len=seq_len,
                 draft_token_num=draft_token_num,
-            )
-            dense = mixed_qkv.new_zeros(num_dense_tokens + 1, mixed_qkv.shape[-1])
-            dense.index_copy_(0, dense_token_indices, mixed_qkv)
-            mixed_qkv_dense = dense[:num_dense_tokens].view(
-                batch_size, draft_token_num, -1
             )
 
         # causal_conv1d_update expects [.., dim, width]. KDA keeps dense conv-window
@@ -822,18 +795,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
             retrieve_next_sibling=retrieve_next_sibling,
             retrieve_parent_token=retrieve_parent_token,
         )
-        mixed_qkv_flat = mixed_qkv_processed.transpose(1, 2).reshape(
-            batch_size * draft_token_num, -1
-        )
         if dense_token_indices is None:
-            mixed_qkv = mixed_qkv_flat
-        else:
-            # Ghost row (zeros) so uncovered tail tokens gather finite values.
-            padded_flat = mixed_qkv_flat.new_zeros(
-                batch_size * draft_token_num + 1, mixed_qkv_flat.shape[-1]
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).reshape(
+                batch_size * draft_token_num, -1
             )
-            padded_flat[: batch_size * draft_token_num] = mixed_qkv_flat
-            mixed_qkv = padded_flat[dense_token_indices]
+        else:
+            mixed_qkv = gather_ragged_verify_from_dense(
+                mixed_qkv_processed.transpose(1, 2),
+                dense_token_indices=dense_token_indices,
+            )
 
         q, k, v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d

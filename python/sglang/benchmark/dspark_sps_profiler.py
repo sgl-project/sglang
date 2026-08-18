@@ -80,6 +80,11 @@ PROFILE_SEED = 42
 REQUIRED_SIMULATE_ACC_LEN = 1.0
 RANDOM_TOKEN_LOW = 1000
 RANDOM_TOKEN_HIGH_MARGIN = 1000
+# Compact verification changes the token budget in small increments. A 64-token
+# bin collapses most low-batch probes into the same bucket (for example, all
+# gamma=15 budgets for bs=1), so keep the fit resolution at one gamma=7 verify
+# row while still smoothing nearby off-diagonal cells.
+ADDITIVE_M_BIN_WIDTH = 8
 
 STATIC_CONDITIONING_CAVEAT = (
     "Profiled with SGLANG_RAGGED_VERIFY_MODE=static: a verify step of B tokens "
@@ -1160,7 +1165,10 @@ def build_additive_table_from_cells(*, cells: list[dict]) -> SpsAdditiveCostTabl
     )
 
 
-def ols_resid_backfit(cells: list, mbin_w: int = 64):
+def ols_resid_backfit(cells: list, mbin_w: int = ADDITIVE_M_BIN_WIDTH):
+    if mbin_w <= 0:
+        raise ValueError(f"mbin_w must be positive, got {mbin_w}.")
+
     def mbin(m):
         return round(m / mbin_w) * mbin_w
 

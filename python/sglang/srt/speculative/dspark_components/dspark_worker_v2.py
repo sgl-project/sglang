@@ -36,6 +36,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
+    DraftBlockResult,
     make_next_draft_input,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
@@ -74,7 +75,6 @@ _is_npu = is_npu()
 
 
 class DSparkWorkerV2(BaseSpecWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -154,6 +154,37 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.verify_num_draft_tokens = runtime_config.verify_num_draft_tokens
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
+        # Bonus-anchor checkpoints use a gamma+1-wide draft block instead of
+        # the sampled-anchor layout's gamma-wide block -- see the docstring on
+        # DSparkDraftConfig.bonus_anchor (dspark_config.py) and on
+        # DraftBlockProposer (dspark_draft.py). Threaded through to both the
+        # eager (DraftBlockProposer) and CUDA-graph-folded (DsparkDraftSampler)
+        # draft-sampling paths below.
+        self._bonus_anchor = runtime_config.bonus_anchor
+        # The same fact is resolved twice by design: here from the draft config
+        # this worker actually loaded, and at startup onto ServerArgs (see
+        # _handle_dspark) because that is the only copy the CUDA-graph capture
+        # width can see. If they ever disagree the graph is captured at the
+        # wrong width, which surfaces far away as a draft-sampler ValueError
+        # during capture or a permanently eager draft forward. Fail here
+        # instead: this runs before init_attention_backends/init_cuda_graphs.
+        startup_bonus_anchor = bool(self.server_args.speculative_dspark_bonus_anchor)
+        if startup_bonus_anchor != bool(self._bonus_anchor):
+            raise ValueError(
+                "DSpark draft block layout was resolved inconsistently: the "
+                f"draft checkpoint says bonus_anchor={bool(self._bonus_anchor)} "
+                f"but startup resolution produced {startup_bonus_anchor}. The "
+                "CUDA-graph capture width is derived from the startup value, so "
+                "continuing would capture a mis-sized draft graph. Check that "
+                "--speculative-draft-model-path points at the checkpoint whose "
+                "config was read at startup."
+            )
+        if self.ps.tp_rank == 0 and self._bonus_anchor:
+            logger.info(
+                "DSpark draft checkpoint uses the speculators bonus-anchor "
+                "convention (gamma+1-wide draft block, anchor excluded from "
+                "sampling)."
+            )
 
         if self.ps.tp_rank == 0:
             logger.info(
@@ -171,8 +202,13 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.verify_num_draft_tokens, device=self.device
         )
+        # This spec-info width drives the draft attention backend's qo_indptr.
+        # Keep downstream verification at gamma real predictions, but include
+        # the conditioning-only anchor in the draft forward's attention width
+        # for speculators checkpoints.
+        draft_attention_width = self.gamma + int(self._bonus_anchor)
         self._draft_block_spec_info = make_draft_block_spec_info(
-            draft_token_num=int(self.gamma), device=self.device
+            draft_token_num=int(draft_attention_width), device=self.device
         )
 
         if getattr(self.draft_model, "uses_own_vocab_modules", False):
@@ -190,6 +226,20 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.draft_model.attach_shared_modules(
                 embed_tokens=self._resolve_target_embed_tokens(target_model),
                 lm_head=lm_head,
+            )
+
+        # Reduced-vocab speculators checkpoints (independent draft head + d2t)
+        # sample in draft space; the verify/accept and block-accept paths then
+        # lift the markov-corrected block into target-vocab columns. Full-vocab
+        # drafts (the common case) never touch the target-vocab scatter buffer.
+        self._reduced_draft_vocab = self.draft_model.uses_reduced_draft_vocab
+        if self.ps.tp_rank == 0 and self._reduced_draft_vocab:
+            logger.info(
+                "DSpark draft uses an independent reduced-vocab head "
+                "(draft_vocab_size=%s, target_vocab_size=%s); sampling draft-space "
+                "ids and mapping to target ids via the checkpoint d2t table.",
+                int(self.draft_model.markov_head.draft_vocab_size),
+                int(self.draft_model.markov_head.vocab_size),
             )
 
         self._verify_planner = DSparkVerifyPlanner(
@@ -229,6 +279,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
             dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
+            bonus_anchor=self._bonus_anchor,
         )
         self._verify_epilogue = None
         if (
@@ -301,6 +352,33 @@ class DSparkWorkerV2(BaseSpecWorker):
         if hasattr(target_model, "get_input_embeddings"):
             return target_model.get_input_embeddings()
         return target_model.model.get_input_embeddings()
+
+    def _resolve_corrected_vocab_space(
+        self,
+        draft_block: DraftBlockResult,
+        *,
+        target_logits: Optional[torch.Tensor],
+    ) -> DraftBlockResult:
+        """Scatter draft-space markov-corrected block logits into target-vocab
+        columns for a reduced-vocab draft, so the target-space rejection sampler
+        and block-accept estimator index them by the mapped target ids. A no-op
+        for full-vocab drafts and for greedy folded proposals (corrected logits
+        are None there)."""
+        if (
+            not self._reduced_draft_vocab
+            or draft_block.corrected_logits is None
+            or target_logits is None
+        ):
+            return draft_block
+        corrected_target = self.draft_model.scatter_corrected_to_target(
+            draft_block.corrected_logits, target_width=int(target_logits.shape[-1])
+        )
+        return DraftBlockResult(
+            draft_tokens=draft_block.draft_tokens,
+            corrected_logits=corrected_target,
+            greedy_mask=draft_block.greedy_mask,
+            temperatures=draft_block.temperatures,
+        )
 
     @property
     def carries_confidence(self) -> bool:
@@ -398,6 +476,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 if self._verify_epilogue is not None
                 else None
             ),
+            bonus_anchor=self._bonus_anchor,
         )
 
     def clear_cache_pool(self):
@@ -700,6 +779,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             if grammar_mask is not None:
                 grammar_mask.apply(logits_output.next_token_logits)
+
+        # Reduced-vocab drafts: lift the draft-space corrected block into
+        # target-vocab columns once, so both accept_and_finalize and
+        # observe_verify_step below read it in the target space their token ids
+        # already live in. No-op for full-vocab / greedy-folded proposals.
+        draft_block = self._resolve_corrected_vocab_space(
+            draft_block, target_logits=logits_output.next_token_logits
+        )
 
         epilogue = self._verify_executor.verify_epilogue
         folded_accept = fold_eligible and run_compact and can_run_cuda_graph
