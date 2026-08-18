@@ -52,6 +52,64 @@ def test_npu_backend_selection_priority(
     assert backend == expected
 
 
+def test_explicit_backend_without_published_mm_context(monkeypatch, npu_platform):
+    monkeypatch.setattr(
+        vision,
+        "get_mm",
+        Mock(side_effect=ValueError("config namespace 'mm' not published")),
+    )
+    monkeypatch.setattr(
+        vision,
+        "get_context",
+        lambda: SimpleNamespace(is_config_namespace_published=lambda namespace: False),
+    )
+
+    backend = vision.VisionAttention._determine_attention_backend(None, "sdpa")
+
+    assert backend == "sdpa"
+
+
+def test_explicit_backend_keeps_published_context_errors(monkeypatch, npu_platform):
+    monkeypatch.setattr(
+        vision,
+        "get_mm",
+        Mock(side_effect=ValueError("mm namespace is not available for this role")),
+    )
+    monkeypatch.setattr(
+        vision,
+        "get_context",
+        lambda: SimpleNamespace(is_config_namespace_published=lambda namespace: True),
+    )
+
+    with pytest.raises(ValueError, match="not available for this role"):
+        vision.VisionAttention._determine_attention_backend(None, "sdpa")
+
+
+def test_sdpa_preserves_flattened_batch_layout():
+    torch.manual_seed(0)
+    bsz, seq_len, num_heads, head_dim = 3, 5, 2, 8
+    q, k, v = [torch.randn(bsz * seq_len, num_heads, head_dim) for _ in range(3)]
+    backend = vision.VisionSdpaAttention(
+        head_dim=head_dim,
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
+    )
+
+    output = backend(q=q, k=k, v=v, bsz=bsz)
+    q_ref, k_ref, v_ref = [
+        x.reshape(bsz, seq_len, num_heads, head_dim).transpose(1, 2) for x in (q, k, v)
+    ]
+    expected = F.scaled_dot_product_attention(
+        q_ref,
+        k_ref,
+        v_ref,
+        scale=backend.scale,
+    )
+    expected = expected.transpose(1, 2).reshape(bsz * seq_len, num_heads, head_dim)
+
+    torch.testing.assert_close(output, expected)
+
+
 @pytest.mark.parametrize("mask_kind", ["causal", "padding"])
 def test_ascend_attention_masked_inputs_fall_back_to_sdpa(
     monkeypatch,

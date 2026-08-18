@@ -23,6 +23,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_musa,
     _is_npu,
+    _use_aiter_gfx95,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -449,7 +450,6 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _is_cuda:
-            kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )
@@ -482,6 +482,21 @@ class DeepseekMHAForwardMixin:
         assert (
             kv_indices is not None
         ), "page_table_1_flattened should have been generated for FP8 MHA path"
+
+        if _use_aiter_gfx95:
+            # ROCm (gfx950) stores the FP8 MLA KV in the raw
+            # (kv_lora_rank + qk_rope_head_dim) layout, not the scaled 656-byte
+            # layout that dequantize_k_cache_paged expects (it asserts dim==656).
+            # Dequantize the raw layout via the pool's HIP-aware path instead —
+            # the same routine _get_mla_kv_buffer uses for the BF16 MHA path.
+            # Without this, a chunked-prefill split (extend_prefix_lens != 0) that
+            # reads cached prefix KV crashes with "576 != 656".
+            kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
+            kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
+                self.attn_mha, kv_indices, torch.bfloat16
+            )
+            kv_a = kv_a.squeeze(1).contiguous()
+            return kv_a, k_pe
 
         kv_cache_fp8 = get_token_to_kv_pool().get_key_buffer(self.attn_mha.layer_id)
 
