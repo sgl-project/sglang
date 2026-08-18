@@ -2803,6 +2803,16 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
                 ]
             )
+        if any(
+            name.endswith(".indexer.wk_weights_proj.weight")
+            for name, _ in self.named_parameters()
+        ):
+            self.stacked_params_mapping.extend(
+                [
+                    ("indexer.wk_weights_proj", "indexer.wk", 0),
+                    ("indexer.wk_weights_proj", "indexer.weights_proj", 1),
+                ]
+            )
         self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
