@@ -662,11 +662,18 @@ class Qwen3VLModel(nn.Module):
     config: Qwen3VLConfig
     _no_split_modules = ["Qwen3VLTextDecoderLayer", "Qwen3VLVisionBlock"]
 
-    def __init__(self, config, *, use_tensor_parallel: bool = False):
+    def __init__(
+        self,
+        config,
+        *,
+        quant_config: QuantizationConfig | None = None,
+        use_tensor_parallel: bool = False,
+    ):
         super().__init__()
         self.visual = Qwen3VLVisionTransformer(config.vision_config)
         self.language_model = Qwen3VLTextModel(
             config.text_config,
+            quant_config=quant_config,
             use_tensor_parallel=use_tensor_parallel,
         )
         self.rope_deltas = None  # cache rope_deltas here

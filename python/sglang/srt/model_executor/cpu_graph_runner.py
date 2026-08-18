@@ -567,7 +567,7 @@ class CPUGraphRunner:
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker
-            else get_server_return_hidden_states_mode(model_runner.server_args)
+            else get_server_return_hidden_states_mode()
         )
         self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         # bs -> compiled fn (text-only / skip_cross_attention=True)
