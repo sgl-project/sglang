@@ -157,6 +157,10 @@ def test_nvfp4_marlin_dense_matches_dequant_reference(dtype):
     fp4_weight, scales, global_scale, weight_ref = make_nvfp4_weight_and_ref(
         size_n, size_k, dtype, group_size=group_size
     )
+    if dtype == torch.bfloat16:
+        # Exercise checkpoints that store small, unnormalized E4M3 scales.
+        scales = (scales.float() / 4096).to(torch.float8_e4m3fn)
+        global_scale = global_scale * 4096
 
     layer = torch.nn.Module()
     layer.quant_config = SimpleNamespace(group_size=group_size)

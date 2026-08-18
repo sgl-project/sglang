@@ -70,7 +70,7 @@ class DsparkDraftSampler:
             )
             self.corrected_out = torch.empty(
                 (max_bs * self.gamma, vocab),
-                dtype=model.lm_head.weight.dtype,
+                dtype=getattr(model.lm_head, "orig_dtype", model.lm_head.weight.dtype),
                 device=device,
             )
 
@@ -144,7 +144,8 @@ def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
         return True
     vocab = int(model.lm_head.org_vocab_size)
     noise_bytes = max_bs * vocab * 4
-    logits_bytes = max_bs * gamma * vocab * model.lm_head.weight.dtype.itemsize
+    logits_dtype = getattr(model.lm_head, "orig_dtype", model.lm_head.weight.dtype)
+    logits_bytes = max_bs * gamma * vocab * logits_dtype.itemsize
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
     available_gb = get_available_gpu_memory(
         device, torch.get_device_module().current_device()
