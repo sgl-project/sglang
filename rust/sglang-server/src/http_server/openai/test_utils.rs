@@ -56,7 +56,7 @@ pub(super) fn chunk(rid: &str, text: &str, done: bool) -> ResponseItem {
     }
 }
 
-/// A submitted legacy completion choice with its egress channel.
+/// A submitted legacy completion choice.
 pub(super) fn submitted(
     index: usize,
     prompt_index: usize,
@@ -78,8 +78,7 @@ pub(super) fn submitted(
     )
 }
 
-/// A submitted chat choice (the tuple `chat_event_stream` consumes) with its
-/// egress channel.
+/// A submitted chat choice (the tuple `chat_event_stream` consumes).
 pub(super) fn chat_submitted(
     index: usize,
     rid: &str,
@@ -90,13 +89,6 @@ pub(super) fn chat_submitted(
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     ((index, rid.into(), rx), tx)
 }
-
-// ---------------------------------------------------------------------
-// Handler-level tests: full router, real extractors, no scheduler. A
-// request that reaches `submit` with an OPEN tm lane would wait on the
-// egress receiver forever, so submission-reaching cases use `senders_closed`
-// (503) and everything else fails validation before submit.
-// ---------------------------------------------------------------------
 
 pub(super) fn server_args() -> Arc<ServerArgs> {
     Arc::new(ServerArgs {

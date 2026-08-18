@@ -24,15 +24,6 @@ use crate::message::config::RuntimeConfig;
 /// high request-arrival / short-request workload is bounded by that one thread's
 /// per-request cost (kept O(fields), see `sampling::normalize_sampling_params`).
 /// Sharding to-scheduler by rid — like the tokenizer/detok pools — lifts that ceiling.
-///
-/// `from-scheduler` is a head-of-line ceiling of a different kind — it
-/// does a *blocking* send per chunk to the owning detok shard, so one slow shard
-/// stalls the dispatcher and thus every shard (see `Egress::route`). Sharding the
-/// dispatcher alone doesn't fix it: each egress-ring frame is a whole batch fanned
-/// to *all* shards, so any dispatcher still blocks on the slow one. The real fix
-/// is a per-shard egress ring (the scheduler pushing each request's output to its
-/// shard's ring), each drained by its own dispatcher — at which point this needs
-/// one core per to-scheduler/from-scheduler shard rather than a fixed 2.
 const TM_CORES: usize = 2;
 
 /// Partition the machine's cores into four disjoint sets: the I/O-bound API

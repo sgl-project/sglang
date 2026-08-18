@@ -180,7 +180,7 @@ async fn submit_generation(
     }
 }
 
-fn indexed_egress_stream(
+fn indexed_decode_stream(
     index: usize,
     rx: mpsc::Receiver<ResponseItem>,
 ) -> futures::stream::BoxStream<'static, (usize, Option<ResponseItem>)> {

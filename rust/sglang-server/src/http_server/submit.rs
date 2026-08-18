@@ -1,6 +1,6 @@
 //! Request submission into the to_scheduler pipeline, shared by every endpoint
 //! module: mint the client-visible rid (uuid hex, Python-parity), build the
-//! `Request`, and hand it to the TM with an egress receiver for the response.
+//! `Request`, and hand it to the TM with a receiver for the response.
 
 use axum::{http::StatusCode, response::Response};
 use tokio::sync::mpsc;
@@ -13,8 +13,8 @@ use crate::message::response::{ResponseItem, ResponseSink};
 use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::fsm::RequestState;
 
-/// Submit one request; returns the rid, its hashed routing key, and the egress
-/// receiver. Every request arrives with its final rid — a generate request from
+/// Submit one request; returns its rid and the response receiver. Every
+/// request arrives with its final rid — a generate request from
 /// `into_requests` (or the `HEALTH_CHECK_<uuid>` the health probe sets), a
 /// control request from its constructor — so this only echoes it back.
 pub(super) async fn submit(

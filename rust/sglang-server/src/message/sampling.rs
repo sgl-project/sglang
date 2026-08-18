@@ -471,7 +471,7 @@ impl SamplingParams {
                 "Only one of regex, json_schema, or ebnf can be set".into()
             ));
         }
-        // Not a Python restriction: the rust egress maps one rid to one response,
+        // Not a Python restriction: the rust from_scheduler maps one rid to one response,
         // so parallel sampling would drop all but the first sample. This is the
         // only place it is rejected — `n` lives in `sampling_params`, where
         // Python reads it, and the `/generate` body has no `n` of its own.

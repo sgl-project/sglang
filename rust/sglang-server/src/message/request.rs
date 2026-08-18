@@ -553,7 +553,7 @@ pub struct Request {
     /// `meta_info.id` carry.
     pub rid: Rid,
     pub state: RequestState,
-    /// Back-channel to the client connection for egress frames.
+    /// Back-channel to the client connection for response frames.
     pub sink: ResponseSink,
     /// Discriminant + variant body (generate vs control).
     pub kind: RequestKind,
@@ -568,13 +568,13 @@ pub struct SchedulerRequest {
 }
 
 /// Request variant — selects the request branch, scheduler wire message, and
-/// egress shape. Each owns its body, so generate/control fields stay type-separate.
+/// response shape. Each owns its body, so generate/control fields stay type-separate.
 #[derive(Debug)]
 pub enum RequestKind {
     /// `/generate`: tokenize (if needed) then push a `TokenizedGenerateReqInput`.
     Generate(Box<GenerateRequest>),
     /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization, and
-    /// the egress is a single non-streamed JSON result.
+    /// the response is a single non-streamed JSON result.
     Control(Box<ControlRequest>),
     /// Internal service call: decode a complete token-id sequence to text. Walks
     /// the same FSM as every request (validate → register → Queued), but the

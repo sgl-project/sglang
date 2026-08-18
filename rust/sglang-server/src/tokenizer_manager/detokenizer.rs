@@ -17,7 +17,7 @@
 //! `skip_tokenizer_init` is set) the backend is `Skip`: no decoding, the raw
 //! `output_ids` are emitted instead of text.
 //!
-//! Per-chunk egress flow (no FSM state change inside Streaming):
+//! Per-chunk response flow (no FSM state change inside Streaming):
 //!   ChunkEvent{finish:None}  -> step ids -> delta -> Server frame
 //!   ChunkEvent{finish:Some}  -> step ids -> delta -> final frame
 
@@ -36,7 +36,7 @@ use crate::utils::{
 };
 
 /// Default for `skip_special_tokens` (SGLang's SamplingParams default). The
-/// per-request value isn't available on the egress side yet; see the note in
+/// per-request value isn't available on the response yet; see the note in
 /// `DetokenizerBackend::new_decoder`.
 const SKIP_SPECIAL_TOKENS: bool = true;
 
@@ -144,15 +144,14 @@ struct DetokState {
     /// cumulative view where a consumer needs it (every unary response and the
     /// cumulative SGLang `/generate` stream); OpenAI streaming forwards deltas.
     decoder: Option<Box<dyn StreamDecoder>>,
-    /// Egress half of the lifecycle FSM. Lives here because the `Request` (and
+    /// Response half of the lifecycle FSM. Lives here because the `Request` (and
     /// its FSM) was handed to the scheduler when queued; the shard is the sole
-    /// owner of the request's egress state, so no lock.
+    /// owner of the response state, so no lock.
     fsm: RequestState,
 }
 
 /// One detokenizer shard: owns a *local* `rid -> DetokState` map (single accessor,
-/// no lock) and the egress backend. Spawned (pinned) per shard as a [`Runnable`];
-/// a given rid is routed to exactly one shard.
+/// no lock) and the detokenizer backend.
 pub struct DetokenizerWorker {
     shard: usize,
     rx: flume::Receiver<DetokMsg>,
@@ -254,7 +253,7 @@ fn handle_decode(
 fn handle_result(table: &mut HashMap<Rid, DetokState>, rid: &Rid, payload: bytes::Bytes) {
     if let Some(mut st) = table.remove(rid) {
         let _ = st.sink.try_send(ResponseItem::Control(payload));
-        // Egress FSM: a control request goes straight to Completed (no Streaming
+        // Response FSM: a control request goes straight to Completed (no Streaming
         // / Finalizing states — single response, never streamed).
         st.fsm = RequestState::Completed;
     }
@@ -514,11 +513,7 @@ mod tests {
     }
 
     /// A `Decode` job answers through the REGISTERED sink and consumes the
-    /// entry — the `RequestKind::Detokenize` egress contract. Uses the `Skip`
-    /// backend, whose decode error must arrive as an `Error` item (not vanish):
-    /// dropping it leaves the submitter awaiting a reply forever. (Unlike
-    /// `handle_fail` there is deliberately no abort lane in the signature —
-    /// this kind never reached the ring, so there is no scheduler work to stop.)
+    /// entry.
     #[test]
     fn decode_answers_via_registered_sink_and_consumes_the_entry() {
         let (tx, mut rx) = mpsc::channel::<ResponseItem>(4);

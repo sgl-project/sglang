@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use super::super::guard::AbortGuard;
 use super::super::submit::submit;
 use super::{
-    AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_egress_stream,
+    AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::message::finish_reason::Matched;
@@ -537,7 +537,7 @@ pub(super) fn completion_event_stream(
             rids.push(choice.rid);
             prompt_indexes.push(choice.prompt_index);
             echoes.push(choice.echo);
-            streams.push(indexed_egress_stream(index, choice.rx));
+            streams.push(indexed_decode_stream(index, choice.rx));
         }
         let mut events = futures::stream::select_all(streams);
 

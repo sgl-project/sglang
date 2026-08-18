@@ -102,9 +102,8 @@ impl Drop for Runtime {
     }
 }
 
-/// Boot the whole frontend. Returns once threads are spawned (non-blocking),
-/// so the Python caller regains control of the GIL immediately. `Err` on a
-/// startup misconfiguration (e.g. no tokenizer for a non-skip server).
+/// Boot the whole frontend. Returns once threads are spawned (non-blocking).
+/// `Err` on a startup misconfiguration (e.g. no tokenizer for a non-skip server).
 pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let mut threads = Vec::new();
@@ -145,7 +144,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     };
 
     // `skip_tokenizer_init`: clients send token ids and receive token ids — no
-    // tokenizer is loaded, and the egress emits raw `output_ids` (no decode).
+    // tokenizer is loaded, and the server emits raw `output_ids` (no decode).
     let skip_tokenizer_init = cfg.server_args.skip_tokenizer_init;
 
     // The same instance is shared by the tokenizer pool (encode) and the detok
@@ -215,25 +214,25 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         );
     }
 
-    // Egress heartbeat: bumped per drained frame, watched by `/health_generate`.
-    let egress_activity: tokenizer_manager::from_scheduler::ActivityCounter =
+    // Response heartbeat: bumped per drained frame, watched by `/health_generate`.
+    let response_activity: tokenizer_manager::from_scheduler::ActivityCounter =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    // --- Egress dispatcher: drains egress ring → routes chunks to shards ---
+    // --- Response dispatcher: drains from_scheduler channel → routes chunks to shards ---
     {
-        // First TM core; egress is the hotter router (every output token). One
+        // First TM core; from_scheduler is the hotter router (every output token). One
         // worker today via `spawn_pool`, so sharding by `Rid::shard` later (see
         // `TM_CORES`) is just a larger count + per-shard receivers.
         let cores = plan
             .as_ref()
             .and_then(|p| p.tm.first().copied())
             .map(|c| vec![c]);
-        let mut egress_rx = Some(from_scheduler_rx); // moved into the single worker
-        let activity = egress_activity.clone();
+        let mut from_scheduler_rx = Some(from_scheduler_rx); // moved into the single worker
+        let activity = response_activity.clone();
         let shutdown_rx = shutdown_rx.clone();
         spawn_pool("from-scheduler", cores, 1, &mut threads, |_| {
             tokenizer_manager::from_scheduler::Dispatcher::new(
-                egress_rx.take().unwrap(),
+                from_scheduler_rx.take().unwrap(),
                 senders.clone(),
                 activity.clone(),
                 shutdown_rx.clone(),
@@ -276,7 +275,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
         let cfg = cfg.clone();
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let senders = senders.clone();
-        let api_activity = egress_activity.clone();
+        let response_activity = response_activity.clone();
         let shutdown_rx = shutdown_rx.clone();
         // Bind synchronously so an unavailable port (EADDRINUSE) is a hard
         // startup error. The `?` drops `shutdown_tx`/`senders`, which stops the
@@ -306,8 +305,8 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
                     senders,
                     cfg.rust_server_args.channel_cap,
                     cfg.server_args.clone(),
-                    // Egress heartbeat watched by `/health_generate`.
-                    api_activity,
+                    // Response heartbeat watched by `/health_generate`.
+                    response_activity,
                     shutdown_rx,
                 ))
             })
@@ -378,12 +377,7 @@ mod tests {
     }
 
     /// Regression: shutdown must return promptly even with an in-flight
-    /// `/generate`. No scheduler drains the to_scheduler channel or feeds the
-    /// from_scheduler channel here, so the handler parks on its egress channel
-    /// forever. Graceful shutdown would wait for it (deadlock → only the 5s
-    /// bounded-join fallback returns); the non-graceful path cancels the
-    /// handler via the api runtime drop, whose `AbortGuard` releases the last
-    /// `Senders` clone so the workers exit.
+    /// `/generate`.
     #[test]
     fn shutdown_returns_with_in_flight_request() {
         use std::io::Write;
@@ -405,7 +399,7 @@ mod tests {
         let rt = start(cfg).expect("start runtime");
 
         // Fire a request that will block (already-tokenized → valid → pushed to the
-        // ring, then the handler awaits egress frames that never arrive).
+        // ring, then the handler awaits decode frames that never arrive).
         let mut conn = std::net::TcpStream::connect(addr).expect("connect");
         let body = r#"{"input_ids":[1,2,3],"stream":false,"sampling_params":{"max_new_tokens":8}}"#;
         let req = format!(

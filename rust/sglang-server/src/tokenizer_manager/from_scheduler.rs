@@ -9,7 +9,7 @@ use bytes::Bytes;
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
 use crate::message::response::{
-    ChunkEvent, EGRESS_TAG_BATCH, EGRESS_TAG_ERROR, EGRESS_TAG_RESULT, for_each_chunk,
+    ChunkEvent, DISPATCH_TAG_BATCH, DISPATCH_TAG_ERROR, DISPATCH_TAG_RESULT, for_each_chunk,
 };
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::FromSchedulerRx;
@@ -59,7 +59,7 @@ impl Runnable for Dispatcher {
             match tag {
                 // A whole decode batch: bucket each request by the shard owning its
                 // rid, then hand each shard its chunks in one send.
-                EGRESS_TAG_BATCH => {
+                DISPATCH_TAG_BATCH => {
                     for b in buckets.iter_mut() {
                         b.clear();
                     }
@@ -90,13 +90,13 @@ impl Runnable for Dispatcher {
                         // log the same line as the recoverable one.
                         if decoded.rids.is_empty() {
                             tracing::error!(
-                                "egress: bad batch frame named NO rids; any request in \
+                                "from_scheduler: bad batch frame named NO rids; any request in \
                                  it will hang (header undecodable, or empty rid column)"
                             );
                         } else {
                             tracing::warn!(
                                 rids = decoded.rids.len(),
-                                "egress: bad batch frame; failing its requests"
+                                "from_scheduler: bad batch frame; failing its requests"
                             );
                         }
                         for b in buckets.iter_mut() {
@@ -119,23 +119,23 @@ impl Runnable for Dispatcher {
                         }
                         let chunks = DetokMsg::Chunks(std::mem::take(b));
                         if self.senders.detokenizer_tx[i].send(chunks).is_err() {
-                            tracing::error!("egress: detok shard closed");
+                            tracing::error!("from_scheduler: detok shard closed");
                         }
                     }
                     // Any frame off the ring = the scheduler produced output → alive.
                     self.activity.fetch_add(1, Ordering::Relaxed);
                 }
-                EGRESS_TAG_RESULT => {
+                DISPATCH_TAG_RESULT => {
                     if let Some((rid, msg)) = decode_result(body) {
                         self.route(&rid, msg);
                     }
                 }
-                EGRESS_TAG_ERROR => {
+                DISPATCH_TAG_ERROR => {
                     if let Some((rid, msg)) = decode_error(body) {
                         self.route(&rid, msg);
                     }
                 }
-                other => tracing::warn!(tag = other, "egress: unknown frame tag"),
+                other => tracing::warn!(tag = other, "from_scheduler: unknown frame tag"),
             }
         }
     }
@@ -143,11 +143,11 @@ impl Runnable for Dispatcher {
 
 impl Dispatcher {
     /// Route one message to the shard owning `rid`. HOL ceiling: a slow shard stalls
-    /// this thread; the fix is a per-shard egress ring (see `threads::TM_CORES`).
+    /// this thread; the fix is a per-shard from_scheduler channel.
     #[inline]
     fn route(&self, rid: &Rid, msg: DetokMsg) {
         if self.senders.detok_for(rid).send(msg).is_err() {
-            tracing::error!("egress: detok shard closed");
+            tracing::error!("from_scheduler: detok shard closed");
         }
     }
 }
@@ -188,14 +188,14 @@ fn decode_error(body: &[u8]) -> Option<(Rid, DetokMsg)> {
 mod tests {
     use super::*;
     use crate::message::detok::DetokMsg;
-    use crate::message::response::frame_egress_error;
+    use crate::message::response::frame_error;
 
-    /// A framed error round-trips: `frame_egress_error` → tag stripped →
+    /// A framed error round-trips: `frame_error` → tag stripped →
     /// `decode_error` yields the rid + a `Fail` carrying the message.
     #[test]
     fn error_frame_roundtrips_to_fail() {
-        let framed = frame_egress_error("42", "invalid request: bad field");
-        assert_eq!(framed[0], EGRESS_TAG_ERROR);
+        let framed = frame_error("42", "invalid request: bad field");
+        assert_eq!(framed[0], DISPATCH_TAG_ERROR);
         let (rid, msg) = decode_error(&framed[1..]).expect("decodes");
         let want = Rid::from("42");
         assert_eq!(rid, want);

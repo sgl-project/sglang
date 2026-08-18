@@ -1,7 +1,7 @@
-//! The egress (response) direction: the per-request back-channel the API
-//! handler drains ([`ResponseSink`] / [`ResponseItem`]), the egress-ring frame
-//! encodings (batch / control result / error), and the columnar batch decode
-//! into per-request [`ChunkEvent`]s.
+//! The response direction: the per-request back-channel the API handler
+//! drains ([`ResponseSink`] / [`ResponseItem`]), the response frame encodings
+//! (batch / control result / error), and the columnar batch decode into
+//! per-request [`ChunkEvent`]s.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,7 @@ use super::types::TokenIds;
 use crate::message::ids::Rid;
 use crate::utils::error::Error;
 
-/// Per-request back-channel the detok shard writes egress frames to and the API
+/// Per-request back-channel the detok shard writes decode frames to and the API
 /// handler drains for SSE; bounded, and receiver-drop (disconnect) = stream end.
 #[derive(Clone, Debug)]
 pub enum ResponseSink {
@@ -42,7 +42,7 @@ impl ResponseSink {
 #[allow(dead_code)] // the receiver half is created inline in api_server::submit.
 pub type ResponseSource = mpsc::Receiver<ResponseItem>;
 
-/// What the connection handler receives on the egress stream: a detok-decoded
+/// What the connection handler receives on the decode stream: a detok-decoded
 /// [`ChunkEvent`] (handler formats it), a verbatim control payload, or an error.
 #[derive(Debug)]
 pub enum ResponseItem {
@@ -62,15 +62,15 @@ pub enum ResponseItem {
     Error(Error),
 }
 
-/// Egress-ring frame tag (first byte, prepended Rust-side; Python wire unchanged):
+/// Response frame tag (first byte, prepended Rust-side; Python wire unchanged):
 /// a single control-request result payload.
-pub const EGRESS_TAG_RESULT: u8 = 1;
+pub const DISPATCH_TAG_RESULT: u8 = 1;
 /// A whole decode batch: msgpack columnar header + one concatenated raw buffer;
 /// from-scheduler decodes it into per-request [`ChunkEvent`]s (no per-request FFI).
-pub const EGRESS_TAG_BATCH: u8 = 2;
+pub const DISPATCH_TAG_BATCH: u8 = 2;
 /// A per-request failure `[rid, message]`: the Python drain couldn't decode a
 /// header, so it routes a 400 back to that request instead of crashing the loop.
-pub const EGRESS_TAG_ERROR: u8 = 3;
+pub const DISPATCH_TAG_ERROR: u8 = 3;
 
 /// Read `n` little-endian f32s from `data` at `*off`, advancing `*off`. `None` when
 /// the range runs past the buffer (a malformed / positional-ABI-drifted frame): the
@@ -105,11 +105,11 @@ fn take_i32(data: &[u8], off: &mut usize, n: usize) -> Option<Vec<i32>> {
 
 /// Frame a decode batch: `[BATCH tag][u32 header len][header][data cols…]`. The
 /// caller's `data_cols` are concatenated straight into the frame (one copy, no
-/// `b"".join`); `header` is the msgpack [`BatchHeader`]. Runs off the GIL.
+/// `b"".join`); `header` is the msgpack [`BatchHeader`].
 pub fn frame_decode_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
     let data_len: usize = data_cols.iter().map(|c| c.len()).sum();
     let mut buf = Vec::with_capacity(1 + 4 + header.len() + data_len);
-    buf.push(EGRESS_TAG_BATCH);
+    buf.push(DISPATCH_TAG_BATCH);
     buf.extend_from_slice(&(header.len() as u32).to_le_bytes());
     buf.extend_from_slice(header);
     for col in data_cols {
@@ -213,13 +213,13 @@ fn take_hidden(
     Some((take_f32(data, cv, nv)?, lens))
 }
 
-/// Decode a batch egress frame (tag stripped), calling `route` with each request's
+/// Decode a batch frame (tag stripped), calling `route` with each request's
 /// [`ChunkEvent`] as it's decoded — one pass, no intermediate `Vec`, peak memory
 /// one request. Column order matches `push_generation`.
 ///
 /// `ok == false` means the frame was rejected. The caller discards everything it
 /// routed and fails the frame's requests instead of forwarding a partial fan-out
-/// (see `tokenizer_manager::egress`), so a rejected frame delivers nothing —
+/// (see `tokenizer_manager::from_scheduler`), so a rejected frame delivers nothing —
 /// `rids` exists precisely so those requests can be failed rather than left
 /// waiting for a `Done` that no longer exists.
 pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded {
@@ -498,23 +498,23 @@ pub struct Decoded {
     pub rids: Vec<Rid>,
 }
 
-/// Frame a control result `[rid, payload]` for the egress ring (tag prepended).
-pub fn frame_egress_result(rid: &str, payload: &[u8]) -> Bytes {
+/// Frame a control result `[rid, payload]` for the response ring (tag prepended).
+pub fn frame_control_result(rid: &str, payload: &[u8]) -> Bytes {
     use rmpv::Value;
     let arr = Value::Array(vec![Value::from(rid), Value::Binary(payload.to_vec())]);
     let mut buf = Vec::with_capacity(1 + payload.len() + rid.len() + 8);
-    buf.push(EGRESS_TAG_RESULT);
+    buf.push(DISPATCH_TAG_RESULT);
     let _ = rmpv::encode::write_value(&mut buf, &arr);
     Bytes::from(buf)
 }
 
-/// Frame a per-request failure `[rid, message]` for the egress ring — routes a
+/// Frame a per-request failure `[rid, message]` for the response — routes a
 /// terminal error back to the owning request (→ HTTP 400) instead of crashing.
-pub fn frame_egress_error(rid: &str, message: &str) -> Bytes {
+pub fn frame_error(rid: &str, message: &str) -> Bytes {
     use rmpv::Value;
     let arr = Value::Array(vec![Value::from(rid), Value::from(message)]);
     let mut buf = Vec::with_capacity(1 + rid.len() + message.len() + 8);
-    buf.push(EGRESS_TAG_ERROR);
+    buf.push(DISPATCH_TAG_ERROR);
     let _ = rmpv::encode::write_value(&mut buf, &arr);
     Bytes::from(buf)
 }
@@ -622,7 +622,7 @@ mod tests {
         let joined: Vec<u8> = a.iter().chain(&b).copied().collect();
         let single = frame_decode_batch_cols(&header, &[joined.as_slice()]);
         assert_eq!(multi, single);
-        assert_eq!(multi[0], EGRESS_TAG_BATCH);
+        assert_eq!(multi[0], DISPATCH_TAG_BATCH);
         assert_eq!(
             u32::from_le_bytes([multi[1], multi[2], multi[3], multi[4]]),
             3
@@ -665,7 +665,7 @@ mod tests {
             .collect();
 
         let framed = frame_decode_batch_cols(&header, &[&data]);
-        assert_eq!(framed[0], EGRESS_TAG_BATCH);
+        assert_eq!(framed[0], DISPATCH_TAG_BATCH);
         let mut events = Vec::new();
         assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
         assert_eq!(events.len(), 3);
@@ -696,7 +696,7 @@ mod tests {
 
     /// A header whose column lengths exceed the data buffer (a Python/Rust
     /// positional-ABI drift, or a truncated frame) is rejected: `for_each_chunk`
-    /// returns false and routes nothing — it must NOT panic the sole egress thread
+    /// returns false and routes nothing — it must NOT panic the sole from_scheduler thread
     /// on an out-of-bounds slice. Built the way Python emits (positional msgpack
     /// header + concatenated data columns).
     #[test]
@@ -1147,13 +1147,7 @@ mod tests {
     }
 
     /// The common frame must stay small: logprob/hidden columns are boxed behind
-    /// `ChunkExtras`, so the inline decode array is a few KiB — not MiB — even at
-    /// batch 4096. A regression that inlines a rare column would blow this up.
-    ///
-    /// The budget moved 128 → 144 when the rid gained its memoized partition key
-    /// (`String` + `u64`). That costs 8 bytes × batch per decode step and buys not
-    /// re-hashing the rid on every chunk in the egress bucketing loop — a
-    /// deliberate trade, not drift.
+    /// `ChunkExtras`.
     #[test]
     fn chunk_event_frame_stays_small() {
         let sz = std::mem::size_of::<ChunkEvent>();

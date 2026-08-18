@@ -34,7 +34,7 @@ use super::tools::{
     parse_chat_tool_calls,
 };
 use super::{
-    AppState, ChatFormatter, collect_output, contains_media, error_payload, indexed_egress_stream,
+    AppState, ChatFormatter, collect_output, contains_media, error_payload, indexed_decode_stream,
     openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
@@ -543,7 +543,7 @@ pub(super) fn chat_event_stream(
 
         for (index, rid, rx) in submitted {
             rids.push(rid);
-            streams.push(indexed_egress_stream(index, rx));
+            streams.push(indexed_decode_stream(index, rx));
             yield Annotated {
                 data: Some(CreateChatCompletionStreamResponse {
                     id: response_id.clone(),

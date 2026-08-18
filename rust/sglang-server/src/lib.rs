@@ -190,17 +190,14 @@ impl Server {
     fn push_control_result(&self, py: Python<'_>, rid: &str, payload: &[u8]) -> bool {
         self.push_frame(
             py,
-            crate::message::response::frame_egress_result(rid, payload),
+            crate::message::response::frame_control_result(rid, payload),
         )
     }
 
     /// Route a terminal failure back to request `rid`. Blocks for backpressure;
     /// `False` only on shutdown.
     fn push_error(&self, py: Python<'_>, rid: &str, message: &str) -> bool {
-        self.push_frame(
-            py,
-            crate::message::response::frame_egress_error(rid, message),
-        )
+        self.push_frame(py, crate::message::response::frame_error(rid, message))
     }
 
     /// Spawn the MM worker pool for the pipeline in `spec` (built from the
@@ -220,13 +217,13 @@ impl Server {
     }
 
     /// Pop the MM result for `rid` — parked strictly before the request reached
-    /// the to_scheduler channel — or `None` if there is none. The numeric buffers
-    /// become 1-D numpy arrays that take **ownership** of the Rust vectors, no copy.
+    /// the to_scheduler channel — or `None` if there is none. The numeric
+    /// buffers become 1-D numpy arrays that take **ownership** of the Rust
+    /// vectors, no copy.
     ///
-    /// Runs on the scheduler loop (`RustServer.drain`, under the GIL) between
-    /// decode steps, so any per-byte work here — memcpy or hashing, tens of MB
-    /// per image-heavy request — would stall every running request's ITL. Hence
-    /// the worker-precomputed `hashes`.
+    /// Runs on the scheduler loop between decode steps, so any per-byte work
+    /// here — memcpy or hashing, tens of MB per image-heavy request — would
+    /// stall every running request's ITL. Hence the worker-precomputed `hashes`.
     fn take_mm(&self, py: Python<'_>, rid: &str) -> Option<MmEncodeResult> {
         use numpy::IntoPyArray;
 
@@ -260,17 +257,15 @@ impl Server {
 }
 
 impl Server {
-    /// Hand one already-framed egress message to the ring: GIL-held when it fits,
-    /// detaching only to park on a full ring. Shared by every push path — they
-    /// differ solely in how the frame is built. `false` only on shutdown.
+    /// Hand one already-framed message to the ring. Shared by every push path —
+    /// they differ solely in how the frame is built. `false` only on shutdown.
     #[inline]
     fn push_frame(&self, py: Python<'_>, frame: bytes::Bytes) -> bool {
         match self.rt.from_scheduler_tx.try_push(frame) {
             Ok(()) => true,
             // Consumer gone (shutdown): the frame is unavoidably lost.
             Err(None) => false,
-            // Full: the scheduler must block here so backpressure reaches it, and
-            // blocking is exactly when releasing the GIL pays for itself.
+            // Full: the scheduler must block here so backpressure reaches it.
             Err(Some(frame)) => py.detach(|| self.rt.from_scheduler_tx.push(frame)),
         }
     }

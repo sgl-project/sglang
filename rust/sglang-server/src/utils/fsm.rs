@@ -132,7 +132,7 @@ impl RequestState {
             (Tokenizing, TokenizeDone) => PreSendValidating,
             (PreSendValidating, PreSendValidated) => Queued,
             (Queued, SchedulerPicked) => Streaming { chunks_sent: 0 },
-            // egress
+            // response
             (Streaming { chunks_sent }, Chunk { finish: false }) => Streaming {
                 chunks_sent: chunks_sent + 1,
             },

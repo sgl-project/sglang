@@ -1,5 +1,5 @@
 //! The native SGLang data-plane endpoints: `/generate` (submit a request, then
-//! either fold egress frames to one unary JSON response or relay them as SSE
+//! either fold decode frames to one unary JSON response or relay them as SSE
 //! `data: {json}` … `[DONE]`, byte-compatible with Python
 //! `http_server.generate_request`) and `/health` + `/health_generate` (which
 //! round-trip a 1-token generate probe). Frame shaping (`meta_info`, logprob
@@ -117,16 +117,15 @@ fn health_routes() -> Router<Arc<AppState>> {
 const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
 
 /// `GET /health_generate` — deep health: confirm the scheduler → detok path is
-/// producing output. 200 iff the egress heartbeat advances within `timeout`
+/// producing output. 200 if the response heartbeat advances within `timeout`
 /// (from `SGLANG_HEALTH_CHECK_TIMEOUT`, frozen at router build), else 503.
 /// (`/health` uses the same handler when its env gate is on.)
 ///
 /// Fires a pre-tokenized 1-token probe (`input_ids = [0]`, skips the tokenizer) so
 /// an idle pipeline produces a frame, then watches the *global*
-/// [`AppState::egress_activity`] counter (not the probe's own rid) — so a busy
+/// [`AppState::response_activity`] counter (not the probe's own rid) — so a busy
 /// server passes immediately and a backlog never false-503s (the analogue of
-/// Python's `last_receive_tstamp`). The `HEALTH_CHECK` skip + `http_worker_ipc`
-/// ack are irrelevant here: this single-process server owns the egress ring.
+/// Python's `last_receive_tstamp`).
 async fn health_generate(
     State(state): State<Arc<AppState>>,
     timeout: std::time::Duration,

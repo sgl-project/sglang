@@ -471,11 +471,11 @@ class RustServer:
 
         return cls(server, mm_spec=mm_spec)
 
-    def wait_ingress(self, timeout_ms: int) -> None:
+    def wait_request(self, timeout_ms: int) -> None:
         """Block until a request is pushed into the in-process ring or the timeout
         elapses.
         """
-        self.server.wait_ingress(timeout_ms)
+        self.server.wait_request(timeout_ms)
 
     def drain(self, max_recv: int) -> List[Any]:
         """Ingress: non-blocking drain of the in-process ring → list of decoded
@@ -492,7 +492,7 @@ class RustServer:
         never waits: the ring drain is `try_recv` (returns the instant the ring
         is dry, capped at `max_recv`) and the rest is one memcpy per header
         plus one for the concatenated ids — same contract as `zmq.NOBLOCK`.
-        Parking for work is :meth:`wait_ingress`, which does release the GIL.
+        Parking for work is :meth:`wait_request`, which does release the GIL.
         """
         limit = max_recv if max_recv > 0 else self._max_per_poll
         batch = self.server.recv_requests(limit)

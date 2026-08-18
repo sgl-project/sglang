@@ -4,11 +4,6 @@
 //! share one process, so these are in-process `flume` channels — literal
 //! `mpsc`/`mpmc`, no shared memory, no serialization beyond the msgpack bytes
 //! the payload already is.
-//!
-//! GIL note: the Python side only ever calls the *non-blocking* `drain` /
-//! `try_push` methods while holding the GIL, and the Rust worker threads only
-//! ever push/drain raw `Bytes` — neither side touches a `PyObject` off-thread,
-//! so the producer threads never need the GIL.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -81,8 +76,7 @@ impl ToSchedulerTx {
 impl ToSchedulerRx {
     /// Drain up to `max` messages into a columnar [`RequestColumns`], returning
     /// immediately when the ring runs dry — mirrors the scheduler's existing
-    /// `zmq.NOBLOCK` loop in `request_receiver._pull_raw_reqs`. Splitting headers
-    /// from ids here (off the GIL) leaves `recv_requests` a thin marshaling shim.
+    /// `zmq.NOBLOCK` loop in `request_receiver._pull_raw_reqs`.
     ///
     /// Non-blocking by construction: `try_recv` returns `Err(TryRecvError::Empty)`
     /// instantly when the ring is empty, and `Err(_) => break` exits the loop
@@ -131,8 +125,9 @@ fn push_msg(batch: &mut RequestColumns, m: SchedulerRequest) {
     batch.ids.push(m.ids);
 }
 
-/// Egress: scheduler output (`push_decode_result_batch`) → Rust egress dispatcher.
-/// The single producer is the Python thread; the consumer is the dispatcher.
+/// Scheduler output (`Server.push_decode_result_batch` / `push_control_result`
+/// / `push_error`) → Rust response dispatcher. The single producer is the
+/// Python thread; the consumer is the dispatcher.
 #[derive(Clone)]
 pub struct FromSchedulerTx {
     tx: flume::Sender<Bytes>,
@@ -143,25 +138,12 @@ pub struct FromSchedulerRx {
 }
 
 impl FromSchedulerTx {
-    /// Blocking push: parks until the ring has space, so a full ring applies
-    /// backpressure to the scheduler instead of dropping output the scheduler has
-    /// already committed (advanced `send_token_offset` for). The GIL is released
-    /// around the call, so parking here doesn't stall other Python threads.
-    /// `false` only when the consumer is gone (runtime shutdown), where the frame
-    /// is unavoidably lost.
+    /// Blocking push.
     pub fn push(&self, msg: Bytes) -> bool {
         self.tx.send(msg).is_ok()
     }
 
-    /// Non-blocking push, so the pyo3 boundary can try to hand the frame over
-    /// while still holding the GIL and detach only when it would actually park.
-    /// Releasing the GIL is not free: reacquiring it waits out the interpreter's
-    /// switch interval (5 ms by default), which dwarfs the sub-microsecond push
-    /// it was protecting.
-    ///
-    /// Hands the frame BACK on a full ring (`Err(Some(msg))`) so the caller can
-    /// retry it under [`push`](Self::push) without rebuilding it. `Err(None)` is
-    /// the consumer being gone (shutdown), where the frame is unavoidably lost.
+    /// Non-blocking push.
     #[inline]
     pub fn try_push(&self, msg: Bytes) -> Result<(), Option<Bytes>> {
         match self.tx.try_send(msg) {
@@ -239,10 +221,10 @@ mod tests {
         assert_eq!(rx.drain(16).headers.len(), 1);
     }
 
-    /// A full egress ring parks the producer until the consumer drains — the
+    /// A full from_scheduler channel parks the producer until the consumer drains — the
     /// committed frame is delivered in order, never dropped.
     #[test]
-    fn egress_push_blocks_until_drained() {
+    fn response_push_blocks_until_drained() {
         let (tx, rx) = from_scheduler(1);
         assert!(tx.push(Bytes::from_static(b"a"))); // fits; ring now full
         let t = std::thread::spawn(move || tx.push(Bytes::from_static(b"b")));
@@ -257,7 +239,7 @@ mod tests {
     /// A closed ring (consumer gone → shutdown) returns `false` instead of
     /// parking forever, so a scheduler blocked in `push` unblocks on teardown.
     #[test]
-    fn egress_push_returns_false_when_closed() {
+    fn response_push_returns_false_when_closed() {
         let (tx, rx) = from_scheduler(1);
         drop(rx);
         assert!(!tx.push(Bytes::from_static(b"x")));

@@ -344,7 +344,7 @@ impl Intake {
                     self.fail(&mut req, e, registered);
                     return;
                 }
-                // Unreachable (egress states never reach here). Reject via `fail`/
+                // Unreachable (request states never reach here). Reject via `fail`/
                 // return (not apply + continue, which would spin on a terminal state).
                 other => {
                     self.fail(
@@ -358,7 +358,7 @@ impl Intake {
         }
     }
 
-    /// Register the egress sink with the owning detok shard (by id) so the response
+    /// Register the response sink with the owning detok shard (by id) so the response
     /// has a home. Carries the per-request detok flags — `return_text_in_logprobs`
     /// (decode logprob text on this shard) and `no_stop_trim` (keep the matched
     /// stop in the output) — so the shard needs no back-reference to the request.
@@ -412,7 +412,7 @@ impl Intake {
 
     /// Push a bare control request (`[tag, rid, nil]`) onto the to_scheduler channel. The
     /// scheduler dispatches it (e.g. `GetInternalStateReq`) and replies via the
-    /// egress ring as a single `Result`.
+    /// from_scheduler channel as a single `Result`.
     fn push_control_to_ring(&self, mut req: Request) {
         let encode = match &req.kind {
             RequestKind::Control(control) => control.encode(),
@@ -534,7 +534,7 @@ impl Intake {
         {
             self.fail(&mut req, Error::QueueFull, true); // registered
         }
-        // On success the scheduler owns the request (egress arrives by rid); we
+        // On success the scheduler owns the request (response arrives by rid); we
         // drop our `Request` here — the detok shard holds the sink.
     }
 }
@@ -1127,7 +1127,10 @@ mod tests {
             consumer.drain(16).headers.is_empty(),
             "must never reach the scheduler"
         );
-        assert!(rx.try_recv().is_err(), "no egress until the shard answers");
+        assert!(
+            rx.try_recv().is_err(),
+            "no response until the shard answers"
+        );
     }
 
     /// Negative ids cannot decode (the shard's domain is `&[u32]`): rejected by

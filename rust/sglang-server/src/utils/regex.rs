@@ -322,24 +322,6 @@ impl<'a> RegexPattern<'a> {
 
 /// Validate a `stop_regex` before it can reach the scheduler, returning the parsed
 /// AST so the caller can derive its bound without parsing again.
-///
-/// Two independent classes of rejection, for two different reasons:
-///
-/// * **Dialect.** CPython's `re` is the engine that actually runs this pattern, and
-///   `regex-syntax` is neither a superset nor a subset of it. The rows where
-///   `regex-syntax` is *wider* are the dangerous ones — a pattern admitted here but
-///   uncompilable there reaches `re.search` on the decode hot path, where the raised
-///   error is uncaught and takes the scheduler down. Hence the invariant is
-///   one-directional: **anything admitted here must compile in Python**, while
-///   rejecting a pattern Python would have accepted costs one client a 400. The
-///   asymmetry is deliberate, and it is why the checks below only ever add
-///   rejections.
-///
-/// * **Cost.** The scheduler re-matches this against the output tail on *every*
-///   decode step, inside `re`'s C loop with the GIL held, where no timeout or signal
-///   can interrupt it. Repetition counts, nested unbounded repetitions, quantified
-///   assertions and ambiguous alternations are refused on those grounds alone —
-///   they are all valid Python.
 fn validate(pattern: &str) -> Result<regex_syntax::ast::Ast, Error> {
     reject_python_incompatible(pattern)?;
     let ast = regex_syntax::ast::parse::ParserBuilder::new()
@@ -815,14 +797,7 @@ mod tests {
             // ---- AMBIGUITY (rounds 6-8). Every one compiles cleanly on both sides
             // and raises nothing, so the `except (re.error, RecursionError)` seatbelt
             // in `_check_str_based_finish` is irrelevant: the match simply never
-            // returns, inside GIL-holding CPython C that no watchdog can preempt.
-            //
-            // Two distinct kill modes, both represented:
-            //   * unbounded bound -> `_stop_match_tail_len` hands `re.search` the
-            //     WHOLE accumulated output, so cost grows every decode step;
-            //   * finite bound -> a fixed but ruinous cost paid EVERY step forever,
-            //     and `MAX_STOP_REGEX_COUNT` allows 64 patterns per request.
-            // Timings on a matching subject; see the module docs for the method.
+            // returns.
             case(
                 "(?:.|.)*Z",
                 Policy::MustReject,
