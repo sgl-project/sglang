@@ -35,7 +35,7 @@ import json
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from sglang.srt.arg_groups.arg_utils import resolvable_fields
+from sglang.srt.arg_groups.arg_utils import field_names, resolvable_fields
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -167,9 +167,12 @@ def register_post_process(fn: Callable[..., dict]) -> Callable[..., dict]:
 
 
 def _declaration_overlay(server_args: Any) -> Dict[str, Any]:
-    """Accumulated declared values: declarations never mutate
-    ``server_args``, so mid-resolution readers overlay them from the
-    declaration stash (last writer wins, like the gate)."""
+    """What the declarations say so far, last writer wins.
+
+    Passes declare without touching the fields until
+    ``materialize_declarations``, so a mid-resolution reader needs this to see
+    them; handlers and hooks write as they declare, and for those the overlay
+    repeats what the field already holds."""
     overlay: Dict[str, Any] = {}
     for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
         overlay.update(declared)
@@ -217,6 +220,44 @@ def _apply_fields(server_args: Any, fields: Dict[str, Any]) -> None:
             setattr(server_args, field, value)
     finally:
         object.__setattr__(server_args, "_internal_write", False)
+
+
+def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
+    """Record a resolution write in the declaration stash, and apply it now.
+
+    The stash is what the projection reads, so a resolver that only assigns
+    the field leaves that write invisible to it. The immediate write keeps the
+    resolver's successors seeing the value where they read the field directly.
+
+    What it does change is which writer wins. A declaration is appended and
+    replayed last, so a resolver that declares a field a *deferred* writer (a
+    post-process pass, a registry entry) also decides now beats it, where its
+    bare assignment used to be overwritten by that writer's declaration. A
+    resolver that gates on such a field has to read the resolving view rather
+    than the raw field, or it decides from a value that is already stale.
+
+    For resolvers inside ``__post_init__``: the handlers on ``ServerArgs``
+    (through ``self._declare``) and the ``arg_groups`` hooks and hardware
+    defaults they call. Resolution that has to wait for the launcher stage
+    goes through ``declare_late_resolution`` instead.
+
+    Names arrive as keyword arguments, which accept anything; a misspelled one
+    would otherwise become a new attribute that nothing ever reads, so it is
+    rejected here. This is not the model-override whitelist: that one limits
+    which fields a *registry entry* may reach, while a resolver writing the
+    field it owns is the pipeline resolving by construction.
+    """
+    if dataclasses.is_dataclass(type(server_args)):
+        unknown = sorted(set(fields) - field_names(type(server_args)))
+        if unknown:
+            raise AttributeError(f"{source}: {unknown} are not ServerArgs fields")
+    stash = getattr(server_args, "_resolved_overrides", None)
+    if stash is None:
+        stash = []
+        object.__setattr__(server_args, "_resolved_overrides", stash)
+    stash.append((source, dict(fields)))
+    for name, value in fields.items():
+        setattr(server_args, name, value)
 
 
 def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> None:
