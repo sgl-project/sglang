@@ -99,10 +99,10 @@ pub(super) fn chat_submitted(
 // ---------------------------------------------------------------------
 
 pub(super) fn server_args() -> Arc<ServerArgs> {
-    Arc::new(
-        serde_json::from_value(serde_json::json!({ "served_model_name": "model" }))
-            .expect("ServerArgs must deserialize"),
-    )
+    Arc::new(ServerArgs {
+        served_model_name: "model".into(),
+        ..Default::default()
+    })
 }
 
 pub(super) fn app_state(senders: Senders) -> super::AppState {

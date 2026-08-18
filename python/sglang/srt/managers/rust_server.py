@@ -4,7 +4,7 @@ The Rust server replaces the Python api-server + `TokenizerManager` +
 `DetokenizerManager` stack (hence this module sits beside them in `managers/`),
 running them as Rust threads inside the scheduler process. This wrapper keeps
 all `SGLANG_RUST_SERVER` plumbing — startup, CPU-core partitioning, the
-`server_args` blob, and control-response routing — out of `scheduler.py`. The
+typed `server_args` handoff, and control-response routing — out of `scheduler.py`. The
 scheduler holds an `Optional[RustServer]` and delegates to it.
 """
 
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.rust_extensions._server import Server
+    from sglang.srt.rust_extensions._server import Server, ServerArgs
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -405,10 +405,10 @@ class RustServer:
         )
 
         server = Server(
+            cls._build_server_args(scheduler),
             # None -> run unpinned; the list carries the pinning decision.
             cores=server_cores,
             http_addr=http_addr,
-            server_args_json=cls._build_server_args(scheduler),
         )
 
         # Multimodal models must have a native Rust pipeline — there is no Python
@@ -705,31 +705,70 @@ class RustServer:
             )
 
     @staticmethod
-    def _build_server_args(scheduler: Scheduler) -> str:
-        """JSON blob of the scheduler's ``server_args`` for its embedded Rust
-        server (carries the already-resolved ``model_config``)."""
+    def _build_server_args(scheduler: Scheduler) -> ServerArgs:
+        """The typed launch handoff for the scheduler's embedded Rust server:
+        the ``server_args`` fields it reads, the already-resolved
+        ``model_config``, and launch-time facts — as the Rust extension's own
+        ``ServerArgs`` class. Its constructor takes every field as a required
+        keyword (see ``rust/sglang-server/src/message/config.rs``), so a
+        missing, extra or mistyped field fails here at boot rather than
+        running on a silently-defaulted knob."""
+        from sglang.srt.rust_extensions import load_rust_extension
 
-        server_args = dict(vars(scheduler.server_args))
-        model_config = dict(vars(scheduler.model_config))
-        model_config["hf_config"] = None  # HF config is not JSON-serializable
-        # Resolved default sampling params (generation_config.json when
-        # `--sampling-defaults model`, {} otherwise). The rust server consumes
-        # these for omitted temperature/top_p in chat conversions instead of
-        # hard-coding the OpenAI terminal defaults.
-        model_config["default_sampling_params"] = (
-            scheduler.model_config.get_default_sampling_params()
+        ext = load_rust_extension("sglang.srt.rust_extensions._server")
+
+        sa = scheduler.server_args
+        mc = scheduler.model_config
+        disaggregation_mode = {
+            "null": ext.DisaggregationMode.Null,
+            "prefill": ext.DisaggregationMode.Prefill,
+            "decode": ext.DisaggregationMode.Decode,
+        }[sa.disaggregation_mode]
+        return ext.ServerArgs(
+            model_path=sa.model_path,
+            served_model_name=sa.served_model_name,
+            tokenizer_path=sa.tokenizer_path,
+            revision=sa.revision,
+            host=sa.host,
+            port=sa.port,
+            log_level=sa.log_level,
+            log_level_http=sa.log_level_http,
+            chat_template=sa.chat_template,
+            tool_call_parser=sa.tool_call_parser,
+            reasoning_parser=sa.reasoning_parser,
+            stream_response_default_include_usage=sa.stream_response_default_include_usage,
+            tokenizer_worker_num=sa.tokenizer_worker_num,
+            detokenizer_worker_num=sa.detokenizer_worker_num,
+            skip_tokenizer_init=sa.skip_tokenizer_init,
+            incremental_streaming_output=sa.incremental_streaming_output,
+            disaggregation_mode=disaggregation_mode,
+            model_config=ext.ModelConfig(
+                context_len=mc.context_len,
+                vocab_size=mc.vocab_size,
+                is_multimodal=mc.is_multimodal,
+                # Resolved default sampling params (generation_config.json when
+                # `--sampling-defaults model`, {} otherwise). The rust server
+                # consumes these for omitted temperature/top_p in chat
+                # conversions instead of hard-coding the OpenAI terminal
+                # defaults.
+                default_sampling_params=ext.DefaultSamplingParams(
+                    **mc.get_default_sampling_params()
+                ),
+            ),
+            # `preferred_sampling_params` is deliberately absent: `launch`
+            # refuses to start when it is set, so the Rust server never needs it.
+            preferred_sampling_params=sa.preferred_sampling_params,
+            allow_auto_truncate=sa.allow_auto_truncate,
+            enable_return_hidden_states=sa.enable_return_hidden_states,
+            # Not a `server_args` field: `TokenizerManager` derives it, and the
+            # rust ingress needs the same number for its total-token check.
+            num_reserved_tokens=compute_num_reserved_tokens(sa),
+            # Launch-time facts Python's /server_info reports from
+            # scheduler_info / the package — stamped here so the rust endpoint
+            # can serve them statically (no scheduler round-trip).
+            version=__version__,
+            max_total_num_tokens=scheduler.max_total_num_tokens,
         )
-        server_args["model_config"] = model_config
-        # Launch-time facts Python's /server_info reports from scheduler_info /
-        # the package — stamped here so the rust endpoint can serve them
-        # statically (no scheduler round-trip).
-        server_args["version"] = __version__
-        # Not a `server_args` field: `TokenizerManager` derives it, and the rust
-        # ingress needs the same number for its total-token check.
-        server_args["num_reserved_tokens"] = compute_num_reserved_tokens()
-        server_args["max_total_num_tokens"] = scheduler.max_total_num_tokens
-
-        return msgspec.json.encode(server_args, enc_hook=str).decode("utf-8")
 
     @staticmethod
     def _partition_cores(

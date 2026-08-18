@@ -2,12 +2,14 @@
 //! → Tokenizer/Detokenizer) embedded in the Python scheduler process.
 //!
 //! This file is the Python↔Rust boundary: it registers the pyo3 module
-//! (`_server`) and the classes exposed to the scheduler — [`Server`] (boot,
-//! `recv_requests`/`wait_ingress`, `push_*`, MM handoff, shutdown),
+//! (`_server`) and the classes exposed to the scheduler — the boot config
+//! ([`ServerArgs`] and its parts, constructed by keyword from Python; their
+//! `#[pyclass]`es and constructors live in `message::config`), [`Server`]
+//! (boot, `recv_requests`/`wait_ingress`, `push_*`, MM handoff, shutdown),
 //! [`RequestBatch`] and [`MmEncodeResult`]. Everything behind that boundary —
 //! receiving requests, encoding multimodal inputs, tokenizing, detokenizing,
-//! SSE streaming, and so on — is implemented purely in Rust and never touches a
-//! `PyObject`; the only Python-facing code lives in this file.
+//! SSE streaming, and so on — is implemented purely in Rust and never touches
+//! a `PyObject`.
 
 mod http_server;
 mod message;
@@ -21,7 +23,10 @@ use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 
-use crate::message::config::{RuntimeConfig, RustServerServerArgs, ServerArgs};
+use crate::message::config::{
+    DefaultSamplingParams, DisaggregationMode, ModelConfig, RuntimeConfig, RustServerServerArgs,
+    ServerArgs,
+};
 use crate::utils::runtime;
 
 /// One drained MM result (see [`Server::take_mm`]), consumed by
@@ -79,40 +84,37 @@ struct Server {
 #[pymethods]
 impl Server {
     /// Boot the frontend (spawns all threads) and return immediately.
+    /// `server_args` is the scheduler's [`ServerArgs`]; the rest are
+    /// rust-server-only overrides.
     #[new]
     #[pyo3(signature = (
+        server_args,
         http_addr = None,
         to_scheduler_cap = 8192,
         from_scheduler_cap = 8192,
         channel_cap = 8192,
         cores = None,
-        server_args_json = "{}",
     ))]
     // pyo3 `#[new]` constructor: the wide arg list is the Python-facing boot
     // surface (all optional overrides), not a call-site ergonomics problem.
     #[allow(clippy::too_many_arguments)]
     fn start(
+        server_args: ServerArgs,
         http_addr: Option<String>,
         to_scheduler_cap: usize,
         from_scheduler_cap: usize,
         channel_cap: usize,
         cores: Option<Vec<usize>>,
-        server_args_json: &str,
     ) -> PyResult<Self> {
-        // Static server metadata (server_args + model_config) dumped by the
-        // scheduler; parse and validate mandatory fields now so a bad/missing
-        // field is a boot error, not a request-time 500.
-        let server_args: ServerArgs = ServerArgs::from_json(server_args_json).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad server_args_json: {e}"))
-        })?;
-        server_args.validate_mandatory().map_err(|e| {
+        // `server_args` already arrived typed (pyo3 rejected any missing/extra/
+        // mistyped field when Python constructed it); only value checks remain.
+        server_args.validate().map_err(|e| {
             PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("server_args: {e}"))
         })?;
-        // The HTTP listen address, tokenizer source/threads/shards all live in the
-        // `server_args` blob; resolve them from there so the scheduler doesn't
-        // re-pass them. The explicit params stay as optional overrides for
-        // standalone callers (tests) that construct a `Server` without a full
-        // `server_args`.
+        // The HTTP listen address, tokenizer source/threads/shards all live in
+        // `server_args`; resolve them from there so the scheduler doesn't re-pass
+        // them. The explicit params stay as optional overrides (per-DP-rank port,
+        // pinning) and for standalone callers.
         let http_addr: SocketAddr = http_addr
             .unwrap_or_else(|| server_args.bind())
             .parse()
@@ -304,6 +306,10 @@ fn _server(m: &Bound<'_, PyModule>) -> PyResult<()> {
         )
         .with_writer(writer)
         .try_init();
+    m.add_class::<DisaggregationMode>()?;
+    m.add_class::<DefaultSamplingParams>()?;
+    m.add_class::<ModelConfig>()?;
+    m.add_class::<ServerArgs>()?;
     m.add_class::<Server>()?;
     m.add_class::<RequestBatch>()?;
     m.add_class::<MmEncodeResult>()?;

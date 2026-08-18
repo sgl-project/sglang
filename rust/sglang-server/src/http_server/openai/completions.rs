@@ -125,11 +125,7 @@ async fn completions(
     };
     if let Err(error) = sampling.normalize(
         state.server_args.skip_tokenizer_init,
-        state
-            .server_args
-            .model_config
-            .vocab_size
-            .unwrap_or(u64::MAX),
+        state.server_args.model_config.vocab_size,
     ) {
         return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false);
     }

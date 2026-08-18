@@ -217,8 +217,13 @@ mod tests {
         let mut msgpack = Vec::new();
         rmpv::encode::write_value(&mut msgpack, &outer).unwrap();
 
-        let sa =
-            ServerArgs::from_json(r#"{"model_path": "/m", "api_key": "secret-token"}"#).unwrap();
+        // `api_key` is deliberately NOT a `ServerArgs` field — the typed schema
+        // cannot carry it — so the only place it could leak from is the raw
+        // scheduler dump shaped above.
+        let sa = ServerArgs {
+            model_path: "/m".into(),
+            ..Default::default()
+        };
         let out = shape_server_info(&msgpack, &sa).unwrap();
         let text = String::from_utf8(out.clone()).unwrap();
         // No secret leaks anywhere in the serialized response.

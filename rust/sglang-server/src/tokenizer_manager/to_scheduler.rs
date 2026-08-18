@@ -61,12 +61,10 @@ const MAX_RID_LEN: usize = 128;
 pub struct Limits {
     /// Token-ids-in mode: a generate request must arrive already tokenized.
     pub skip_tokenizer_init: bool,
-    /// `model_config.vocab_size`; bounds client-supplied token ids. Mandatory —
-    /// [`ServerArgs::validate_mandatory`](crate::runtime::ServerArgs) rejects a
-    /// boot without it, so intake can check unconditionally.
+    /// `model_config.vocab_size`; bounds client-supplied token ids. A required
+    /// field of the `ServerArgs` schema, so intake can check unconditionally.
     pub vocab_size: u64,
     /// `model_config.context_len`, the ceiling for input + `max_new_tokens`.
-    /// Mandatory, as above.
     pub context_len: u64,
     /// Output slots reserved on top of the input (eagle draft tokens).
     pub num_reserved_tokens: u64,
@@ -76,24 +74,16 @@ pub struct Limits {
     pub enable_return_hidden_states: bool,
 }
 
-impl TryFrom<&ServerArgs> for Limits {
-    type Error = Error;
-
-    fn try_from(sa: &ServerArgs) -> Result<Self, Self::Error> {
-        Ok(Self {
+impl From<&ServerArgs> for Limits {
+    fn from(sa: &ServerArgs) -> Self {
+        Self {
             skip_tokenizer_init: sa.skip_tokenizer_init,
-            vocab_size: sa
-                .model_config
-                .vocab_size
-                .ok_or_else(|| Error::Validation("vocab_size missing".into()))?,
-            context_len: sa
-                .model_config
-                .context_len
-                .ok_or_else(|| Error::Validation("context_len missing".into()))?,
+            vocab_size: sa.model_config.vocab_size,
+            context_len: sa.model_config.context_len,
             num_reserved_tokens: sa.num_reserved_tokens,
             allow_auto_truncate: sa.allow_auto_truncate,
             enable_return_hidden_states: sa.enable_return_hidden_states,
-        })
+        }
     }
 }
 

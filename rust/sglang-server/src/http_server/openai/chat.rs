@@ -303,7 +303,7 @@ pub(super) fn chat_sampling(
     sampling
         .normalize(
             server_args.skip_tokenizer_init,
-            server_args.model_config.vocab_size.unwrap_or(u64::MAX),
+            server_args.model_config.vocab_size,
         )
         .map_err(|error| error.to_string())?;
     Ok(sampling)
