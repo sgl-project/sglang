@@ -105,6 +105,13 @@ _UNREAD_ENTRIES: dict = {
     ("multimodal_gen/test/unit/test_disagg_trace.py", "_srt_trace_server_args"): (
         "a trace fixture publishing its own context"
     ),
+    (
+        "multimodal_gen/runtime/managers/gpu_worker.py",
+        "init_device_and_model",
+    ): (
+        "a worker installing a placeholder when its process has nothing "
+        "published; it reads its own config, not the srt bags"
+    ),
 }
 
 # `publish` itself and its named wrappers live here; a call inside them is the

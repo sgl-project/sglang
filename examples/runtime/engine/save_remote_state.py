@@ -44,6 +44,7 @@ parser.add_argument(
 
 def main(args):
     engine_args = ServerArgs.from_cli_args(args)
+    engine_args.resolve_once()
     model_path = engine_args.model_path
     if not Path(model_path).is_dir():
         raise ValueError("model path must be a local directory")

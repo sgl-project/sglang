@@ -259,15 +259,15 @@ class TestPublishInstallsSlot(_IsolatedPublish):
             set_global_server_args_for_scheduler,
         )
 
-        sa = ServerArgs(model_path="dummy")  # __post_init__ early-returns
-        # A dummy path short-circuits the pipeline, but the handlers ahead of
-        # that point still declare; whatever they left in the stash is on the
-        # object by the time publish sees it.
+        sa = ServerArgs(model_path="dummy")  # construction resolves nothing
+        self.assertFalse(hasattr(sa, "_resolved_overrides"))
+        set_global_server_args_for_scheduler(sa)
+        self.assertIs(get_server_args(), sa)
+        # Publishing is what resolved it; the handlers ahead of the dummy
+        # short-circuit still declare.
         for source, declared in sa._resolved_overrides:
             for field, value in declared.items():
                 self.assertEqual(getattr(sa, field), value, f"{source}: {field}")
-        set_global_server_args_for_scheduler(sa)
-        self.assertIs(get_server_args(), sa)
 
 
 class TestGoldenModelOverrides(_IsolatedPublish):
@@ -306,7 +306,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
         with open(os.path.join(config_dir, "config.json"), "w") as f:
             json.dump(config, f)
-        return ServerArgs(model_path=config_dir, **server_kwargs)
+        server_args = ServerArgs(model_path=config_dir, **server_kwargs)
+        server_args.resolve_once()
+        return server_args
 
     def _publish(self, server_args):
         from sglang.srt.server_args import (
