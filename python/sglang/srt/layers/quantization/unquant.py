@@ -877,10 +877,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
         moe_runner_config = self.moe_runner_config
 
-        assert (
-            moe_runner_config.activation == "silu"
-        ), f"activation = {moe_runner_config.activation} is not supported."
-
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
 
@@ -906,6 +902,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 layer.moe_runner_config.gemm1_alpha,
                 layer.moe_runner_config.gemm1_clamp_limit,
                 True,  # is_vnni
+                moe_runner_config.activation,  # activation
             )
             return StandardCombineInput(hidden_states=output)
         else:
