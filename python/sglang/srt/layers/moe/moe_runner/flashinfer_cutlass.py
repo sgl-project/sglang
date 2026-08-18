@@ -134,8 +134,11 @@ def _activation_type(runner_config: MoeRunnerConfig):
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import get_activation_type
 
     _, ActivationType = _flashinfer_cutlass_fused_moe()
+    situ_type = getattr(ActivationType, "Situ", None)
     if runner_config.activation == "situ" and runner_config.is_gated:
-        activation = ActivationType.Situ
+        if situ_type is None:
+            raise RuntimeError("FlashInfer CUTLASS SiTU support is not available.")
+        activation = situ_type
     else:
         activation = ActivationType(
             get_activation_type(
@@ -148,8 +151,9 @@ def _activation_type(runner_config: MoeRunnerConfig):
         ActivationType.Geglu,
         ActivationType.Relu2,
         ActivationType.Identity,
-        ActivationType.Situ,
     }
+    if situ_type is not None:
+        supported.add(situ_type)
     assert activation in supported, (
         f"Activation {runner_config.activation!r} "
         f"(is_gated={runner_config.is_gated}) maps to {activation.name}, "

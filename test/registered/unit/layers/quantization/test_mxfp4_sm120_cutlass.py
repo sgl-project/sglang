@@ -6,6 +6,7 @@ import builtins
 import importlib
 import sys
 from contextlib import nullcontext
+from enum import IntEnum
 from types import SimpleNamespace
 
 import pytest
@@ -126,6 +127,31 @@ def test_kimi_k3_sm120_situ_requires_flashinfer_cutlass_situ_api(monkeypatch):
     config = MoeRunnerConfig(activation="situ", is_gated=True)
     with pytest.raises(RuntimeError, match="--moe-runner-backend marlin"):
         method.create_moe_runner(SimpleNamespace(), config)
+
+
+def test_non_situ_activation_supports_legacy_flashinfer(monkeypatch):
+    import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as runner_module
+    import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm as trtllm_module
+
+    class LegacyActivationType(IntEnum):
+        Swiglu = 0
+        Geglu = 1
+        Relu2 = 2
+        Identity = 3
+
+    monkeypatch.setattr(
+        runner_module,
+        "_flashinfer_cutlass_fused_moe",
+        lambda: (object(), LegacyActivationType),
+    )
+    monkeypatch.setattr(
+        trtllm_module,
+        "get_activation_type",
+        lambda *args, **kwargs: LegacyActivationType.Swiglu.value,
+    )
+
+    config = SimpleNamespace(activation="silu", is_gated=True)
+    assert runner_module._activation_type(config) == LegacyActivationType.Swiglu
 
 
 def test_dsv4_sm120_matches_direct_flashinfer(monkeypatch):
