@@ -745,6 +745,11 @@ class Envs:
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_AG = EnvBool(True)
+    # Route TARGET_VERIFY through moonmath_attention's A16W8 multi-query MLA
+    # kernel (--attention-backend moonmath_mla). On by default: aiter's asm MLA
+    # has no kernel past qseqlen 4, so a larger draft window aborts without it.
+    # Set false to force the aiter path for A/B.
+    SGLANG_MOONMATH_MLA_MULTIQ_VERIFY = EnvBool(True)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override

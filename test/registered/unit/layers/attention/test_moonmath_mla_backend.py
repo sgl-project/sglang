@@ -1,14 +1,22 @@
 """Unit tests for the moonmath MLA attention backend.
 
 Two layers of testing:
-  1. Eligibility: _decode_eligible() gate routing (no GPU, mocked kernel).
+  1. Eligibility: _decode_eligible() / _verify_eligible() gate routing. Pure
+     Python -- head counts, KV dtype, forward mode, draft-window bounds -- so it
+     runs anywhere, including where moonmath_attention is absent: the kernel
+     package is stubbed into sys.modules for the construction. No GPU.
   2. Correctness: real A16W8 kernel output vs fp32 reference on dequantized
-     fp8 KV (requires ROCm GPU + moonmath_attention installed).
+     fp8 KV. Skipped unless a ROCm GPU and moonmath_attention are both present.
 
-Requires: moonmath_attention installed (the backend imports it at __init__).
-Requires: AMD ROCm (torch.float8_e4m3fnuz is a ROCm-only dtype).
+Only (2) needs moonmath_attention, which is not on PyPI. (1) must stay runnable
+without it, so a CI lane that cannot install the kernel package still covers the
+routing decisions -- which is where a regression would silently change which
+kernel serves a shape.
 """
 
+import contextlib
+import sys
+import types
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -61,6 +69,39 @@ def _fake_aiter_init(self, model_runner):
     self.token_to_kv_pool = model_runner.token_to_kv_pool
 
 
+def _has_moonmath():
+    try:
+        import moonmath_attention.mla  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+@contextlib.contextmanager
+def _mocked_mla_module():
+    """Yield a mock standing in for ``moonmath_attention.mla``.
+
+    ``patch`` cannot patch a module that does not exist, so where the kernel
+    package is absent (it is not on PyPI) a stub package is installed into
+    ``sys.modules`` for the duration instead. The backend imports it inside
+    ``__init__`` -- "fail fast if not installed" -- so that is the only thing
+    the stub has to satisfy for the gating tests.
+    """
+    if _has_moonmath():
+        with patch("moonmath_attention.mla") as mock_mla:
+            yield mock_mla
+        return
+    pkg = types.ModuleType("moonmath_attention")
+    mock_mla = MagicMock()
+    pkg.mla = mock_mla
+    with patch.dict(
+        sys.modules,
+        {"moonmath_attention": pkg, "moonmath_attention.mla": mock_mla},
+    ):
+        yield mock_mla
+
+
 def _make_backend(kv_cache_dtype=None, use_mla=True):
     """Construct a real MoonmathMLABackend with the aiter base __init__ stubbed.
 
@@ -78,9 +119,9 @@ def _make_backend(kv_cache_dtype=None, use_mla=True):
     runner.token_to_kv_pool.size = 8192
     runner.model_config.context_len = 131072
 
-    with patch.object(AiterAttnBackend, "__init__", _fake_aiter_init), patch(
-        "moonmath_attention.mla"
-    ) as mock_mla:
+    with patch.object(
+        AiterAttnBackend, "__init__", _fake_aiter_init
+    ), _mocked_mla_module() as mock_mla:
         mock_mla.mla_decode_a16w8_plan_parts_capped.return_value = 1
         backend = MoonmathMLABackend(runner)
 
@@ -179,15 +220,6 @@ class TestMoonmathMLAVerifyGate(unittest.TestCase):
         layer = _make_layer(q_head_num=12)
         q = torch.zeros(1, dtype=torch.bfloat16)
         self.assertFalse(backend._decode_eligible(q, layer, self._fb(8)))
-
-
-def _has_moonmath():
-    try:
-        import moonmath_attention.mla  # noqa: F401
-
-        return True
-    except Exception:
-        return False
 
 
 class TestMoonmathMLAKernelCorrectness(unittest.TestCase):
