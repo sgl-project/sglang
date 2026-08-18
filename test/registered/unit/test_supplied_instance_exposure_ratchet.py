@@ -162,10 +162,6 @@ _EXPOSED = {
     ("entrypoints/engine.py", "enable_symm_mem"),
     ("entrypoints/engine.py", "moe_dp_size"),
     ("entrypoints/engine.py", "reasoning_parser"),
-    (
-        "entrypoints/engine.py",
-        "remote_instance_weight_loader_start_seed_via_transfer_engine",
-    ),
     ("entrypoints/engine.py", "tool_call_parser"),
     ("eplb/eplb_manager.py", "ep_dispatch_algorithm"),
     ("eplb/eplb_manager.py", "expert_distribution_recorder_buffer_size"),

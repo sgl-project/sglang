@@ -1407,6 +1407,81 @@ def set_global_dwdp_manager(manager: Any) -> None:
     _GLOBAL_DWDP_MANAGER = manager
 
 
+def _group_leaves(group: _FlagGroupBase) -> dict[str, Any]:
+    """The leaf values of a flag group, recursively."""
+    leaves: dict[str, Any] = {}
+    for name in type(group).__dataclass_fields__:
+        value = getattr(group, name)
+        if isinstance(value, _FlagGroupBase):
+            leaves[name] = _group_leaves(value)
+        elif isinstance(value, (dict, list)):
+            leaves[name] = type(value)(value)
+        else:
+            leaves[name] = value
+    return leaves
+
+
+def _restore_leaves(group: _FlagGroupBase, leaves: dict[str, Any]) -> None:
+    for name, value in leaves.items():
+        current = getattr(group, name)
+        if isinstance(current, _FlagGroupBase):
+            _restore_leaves(current, value)
+        elif isinstance(current, dict):
+            current.clear()
+            current.update(value)
+        elif isinstance(current, list):
+            current[:] = value
+        else:
+            setattr(group, name, value)
+
+
+def snapshot_context() -> dict[str, Any]:
+    """Everything a publish replaces, so a failed launch can put it back.
+
+    Enumerated from ``__slots__`` rather than listed by hand: a hand-picked copy
+    of context state is one field behind the day a slot is added, and the copy
+    that silently drops one is worse than none. Flag groups are snapshotted by
+    leaf, not by reference: publish writes *into* the same ``Flags`` object
+    (``capture.enable_torch_compile``), so a reference held here would already
+    carry the failed launch's value by the time it is put back.
+    """
+    state: dict[str, Any] = {}
+    for name in RuntimeContext.__slots__:
+        if name == "parallel":
+            continue
+        value = getattr(_CONTEXT, name)
+        if isinstance(value, _FlagGroupBase):
+            state[name] = (value, _group_leaves(value))
+        elif isinstance(value, list):
+            state[name] = list(value)
+        else:
+            state[name] = value
+    state["__parallel__"] = {
+        name: getattr(_CONTEXT.parallel, name)
+        for name in type(_CONTEXT.parallel).__slots__
+    }
+    state["__dwdp__"] = get_global_dwdp_manager()
+    return state
+
+
+def restore_context(state: dict[str, Any]) -> None:
+    """Put back what ``snapshot_context`` captured."""
+    for name in RuntimeContext.__slots__:
+        if name == "parallel":
+            continue
+        value = state[name]
+        if isinstance(value, tuple) and isinstance(value[0], _FlagGroupBase):
+            group, leaves = value
+            setattr(_CONTEXT, name, group)
+            _restore_leaves(group, leaves)
+        else:
+            setattr(_CONTEXT, name, value)
+    for name, value in state["__parallel__"].items():
+        setattr(_CONTEXT.parallel, name, value)
+    _adaptive_draft_token_bound.cache_clear()
+    set_global_dwdp_manager(state["__dwdp__"])
+
+
 def reset_context() -> None:
     """Clear the context-owned store (unit-test teardown): drop the published
     ``server_args`` and install fresh ``Flags`` and ``Resources``.
