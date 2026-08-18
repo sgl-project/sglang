@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from collections.abc import Iterable
 
 import torch
@@ -22,6 +23,28 @@ _HEADS = 12
 _DIM = 128
 _CONV_CHANNELS = 3 * _HEADS * _DIM
 _CONV_WIDTH = 4
+
+
+def _fb_build_options(batch: int) -> dict[str, int | bool]:
+    """C2-only experiment hook; defaults preserve the upstream #4495 kernel."""
+    force = os.environ.get("SGLANG_K3_KDA_FB_FORCE_OPTIONS", "0") == "1"
+    if batch != 2 and not force:
+        return {}
+    return {
+        "waves_per_eu": int(os.environ.get("SGLANG_K3_KDA_FB_C2_WPE", "2")),
+        "cooperative_f_a": os.environ.get("SGLANG_K3_KDA_FB_C2_COOP_FA", "0")
+        == "1",
+        "parallel_front": os.environ.get("SGLANG_K3_KDA_FB_C2_PARALLEL_FRONT", "0")
+        == "1",
+        "fused_norm_reduce": os.environ.get(
+            "SGLANG_K3_KDA_FB_C2_FUSED_NORM_REDUCE", "0"
+        )
+        == "1",
+        "projection_fdot2": os.environ.get(
+            "SGLANG_K3_KDA_FB_C2_PROJECTION_FDOT2", "0"
+        )
+        == "1",
+    }
 
 
 @functools.cache
@@ -417,6 +440,7 @@ def flydsl_kimi_k3_kda_decode_with_f_b(
     executable = create_kimi_k3_kda_decode_fb_kernel(
         float(norm_eps),
         float(lower_bound),
+        **_fb_build_options(batch),
     )
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device)

@@ -10,14 +10,21 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import gpu as mlir_gpu
+from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import scf
 from flydsl._mlir.dialects import vector as mlir_vector
-from flydsl.expr import range_constexpr
+from flydsl.expr import arith, const_expr, range_constexpr
+from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import vector
 
-from aiter.ops.flydsl.kernels.tensor_shim import GTensor, _to_raw
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    GTensor,
+    _to_raw,
+)
 
 _HEADS = 12
 _DIM = 128
@@ -35,24 +42,64 @@ _V_GROUP_TILE = _NUM_WARPS * _WARP_THREADS_V
 _V_ITERS = _DIM // _V_GROUP_TILE
 _PROJECTION_VECTOR = 4
 _PROJECTION_ITERS = _DIM // _PROJECTION_VECTOR
-_WAVES_PER_EU = 2
+_DEFAULT_WAVES_PER_EU = 2
 
 
 @functools.cache
-def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
+def create_kimi_k3_kda_decode_fb_kernel(
+    norm_eps: float,
+    lower_bound: float,
+    *,
+    waves_per_eu: int = _DEFAULT_WAVES_PER_EU,
+    cooperative_f_a: bool = False,
+    parallel_front: bool = False,
+    fused_norm_reduce: bool = False,
+    projection_fdot2: bool = False,
+):
     """Build the fixed gfx950 BF16 f_b plus KDA decode specialization."""
+    conv_tid_offset = _DIM if parallel_front else 0
+    conv_tid_upper = 2 * _DIM if parallel_front else _DIM
 
-    @fx.struct
-    class SharedStorage:
-        q: fx.Array[fx.BFloat16, _DIM, 16]
-        k: fx.Array[fx.BFloat16, _DIM, 16]
-        v: fx.Array[fx.BFloat16, _DIM, 16]
-        gate: fx.Array[fx.BFloat16, _DIM, 16]
-        recurrent_out: fx.Array[fx.BFloat16, _DIM, 16]
-        norm_partial: fx.Array[fx.Float32, 2, 16]
+    if cooperative_f_a:
+
+        @fx.struct
+        class SharedStorage:
+            f_a: fx.Array[fx.BFloat16, _DIM, 16]
+            q: fx.Array[fx.BFloat16, _DIM, 16]
+            k: fx.Array[fx.BFloat16, _DIM, 16]
+            v: fx.Array[fx.BFloat16, _DIM, 16]
+            gate: fx.Array[fx.BFloat16, _DIM, 16]
+            recurrent_out: fx.Array[fx.BFloat16, _DIM, 16]
+            norm_partial: fx.Array[fx.Float32, 4, 16]
+
+    else:
+
+        @fx.struct
+        class SharedStorage:
+            q: fx.Array[fx.BFloat16, _DIM, 16]
+            k: fx.Array[fx.BFloat16, _DIM, 16]
+            v: fx.Array[fx.BFloat16, _DIM, 16]
+            gate: fx.Array[fx.BFloat16, _DIM, 16]
+            recurrent_out: fx.Array[fx.BFloat16, _DIM, 16]
+            norm_partial: fx.Array[fx.Float32, 4, 16]
+
+    kernel_name = "kimi_k3_kda_decode_fb_bf16_gfx950"
+    if (
+        cooperative_f_a
+        or parallel_front
+        or fused_norm_reduce
+        or projection_fdot2
+        or waves_per_eu != _DEFAULT_WAVES_PER_EU
+    ):
+        kernel_name += (
+            f"_wpe{waves_per_eu}_cfa{int(cooperative_f_a)}"
+            f"_pf{int(parallel_front)}"
+            f"_fnr{int(fused_norm_reduce)}"
+            f"_fd2{int(projection_fdot2)}"
+        )
 
     @flyc.kernel(
-        name="kimi_k3_kda_decode_fb_bf16_gfx950",
+        name=kernel_name,
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
     def kernel(
@@ -103,6 +150,7 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
         out = GTensor(out_mem, dtype=T.bf16, shape=(-1,))
 
         shared = fx.SharedAllocator().allocate(SharedStorage).peek()
+        f_a_lds = shared.f_a.ptr if cooperative_f_a else shared.q.ptr
         q_lds = shared.q.ptr
         k_lds = shared.k.ptr
         v_lds = shared.v.ptr
@@ -123,6 +171,20 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
 
         valid_if = scf.IfOp(_to_raw(valid), results_=[], has_else=True)
         with ir.InsertionPoint(valid_if.then_block):
+            if const_expr(cooperative_f_a):
+                f_a_load_if = scf.IfOp(
+                    _to_raw(tid < fx.Int32(_DIM)),
+                    results_=[],
+                    has_else=False,
+                )
+                with ir.InsertionPoint(f_a_load_if.then_block):
+                    fx.ptr_store(
+                        fx.BFloat16(f_a[batch * stride_f_a_token + tid]),
+                        f_a_lds + tid,
+                    )
+                    scf.YieldOp([])
+                fx.gpu.barrier()
+
             # Threads 0..127 own one output each. Accumulation is FP32 and the
             # single BF16 store is the same numerical boundary as F.linear.
             projection_if = scf.IfOp(
@@ -131,34 +193,99 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
                 has_else=False,
             )
             with ir.InsertionPoint(projection_if.then_block):
+                i1 = ir.IntegerType.get_signless(1)
                 vec_f32_projection = T.vec(_PROJECTION_VECTOR, T.f32)
+                vec2_bf16 = T.vec(2, T.bf16)
                 accum = fx.full(
                     _PROJECTION_VECTOR,
                     0.0,
                     fx.Float32,
                 )
+                local_dot = fx.Float32(0.0)
                 f_a_base = batch * stride_f_a_token
                 f_b_base = head * stride_f_b_head + tid * stride_f_b_output
                 for projection_iter in range_constexpr(_PROJECTION_ITERS):
-                    projection_offset = fx.Int32(projection_iter * _PROJECTION_VECTOR)
-                    f_a_values = f_a.vec_load(
-                        (f_a_base + projection_offset,),
-                        _PROJECTION_VECTOR,
-                    ).extf(vec_f32_projection)
+                    projection_offset = fx.Int32(
+                        projection_iter * _PROJECTION_VECTOR
+                    )
+                    if const_expr(cooperative_f_a):
+                        f_a_values = fx.ptr_load(
+                            f_a_lds + projection_offset,
+                            result_type=T.vec(_PROJECTION_VECTOR, T.bf16),
+                        ).extf(vec_f32_projection)
+                    else:
+                        f_a_values = f_a.vec_load(
+                            (f_a_base + projection_offset,),
+                            _PROJECTION_VECTOR,
+                        ).extf(vec_f32_projection)
                     weight_values = f_b_weight.vec_load(
                         (f_b_base + projection_offset,),
                         _PROJECTION_VECTOR,
                     ).extf(vec_f32_projection)
-                    accum = mlir_vector.FMAOp(
-                        f_a_values,
-                        weight_values,
+                    if const_expr(projection_fdot2):
+                        f_a_bf16 = f_a_values.truncf(T.vec(_PROJECTION_VECTOR, T.bf16))
+                        weight_bf16 = weight_values.truncf(
+                            T.vec(_PROJECTION_VECTOR, T.bf16)
+                        )
+                        for pair_index in range_constexpr(_PROJECTION_VECTOR // 2):
+                            f_a_pair = vector.from_elements(
+                                vec2_bf16,
+                                [
+                                    vector.extract(
+                                        f_a_bf16,
+                                        static_position=[pair_index * 2],
+                                        dynamic_position=[],
+                                    ),
+                                    vector.extract(
+                                        f_a_bf16,
+                                        static_position=[pair_index * 2 + 1],
+                                        dynamic_position=[],
+                                    ),
+                                ],
+                            )
+                            weight_pair = vector.from_elements(
+                                vec2_bf16,
+                                [
+                                    vector.extract(
+                                        weight_bf16,
+                                        static_position=[pair_index * 2],
+                                        dynamic_position=[],
+                                    ),
+                                    vector.extract(
+                                        weight_bf16,
+                                        static_position=[pair_index * 2 + 1],
+                                        dynamic_position=[],
+                                    ),
+                                ],
+                            )
+                            local_dot = ArithValue(
+                                llvm.call_intrinsic(
+                                    T.f32,
+                                    "llvm.amdgcn.fdot2.f32.bf16",
+                                    [
+                                        f_a_pair,
+                                        weight_pair,
+                                        _to_raw(local_dot),
+                                        arith.constant(False, type=i1),
+                                    ],
+                                    [],
+                                    [],
+                                )
+                            )
+                    else:
+                        accum = mlir_vector.FMAOp(
+                            f_a_values,
+                            weight_values,
+                            accum,
+                        ).result
+                if const_expr(projection_fdot2):
+                    projected = local_dot
+                else:
+                    projected = mlir_vector.ReductionOp(
+                        T.f32,
+                        vector.CombiningKind.ADD,
                         accum,
-                    ).result
-                projected = mlir_vector.ReductionOp(
-                    T.f32,
-                    vector.CombiningKind.ADD,
-                    accum,
-                ).dest
+                    ).dest
                 fx.ptr_store(
                     fx.BFloat16(projected),
                     gate_lds + tid,
@@ -168,12 +295,15 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
             # A workgroup exclusively owns all three convolution channels for
             # its (batch, head), so every cache entry is shifted exactly once.
             conv_if = scf.IfOp(
-                _to_raw(tid < fx.Int32(_DIM)),
+                _to_raw(
+                    (tid >= fx.Int32(conv_tid_offset))
+                    & (tid < fx.Int32(conv_tid_upper))
+                ),
                 results_=[],
                 has_else=False,
             )
             with ir.InsertionPoint(conv_if.then_block):
-                channel_local = tid
+                channel_local = tid - fx.Int32(conv_tid_offset)
                 q_channel = head * fx.Int32(_DIM) + channel_local
                 k_channel = (
                     fx.Int32(_HEADS * _DIM) + head * fx.Int32(_DIM) + channel_local
@@ -222,9 +352,9 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
                 q_conv = convolve_channel(q_channel)
                 k_conv = convolve_channel(k_channel)
                 v_conv = convolve_channel(v_channel)
-                fx.ptr_store(q_conv, q_lds + tid)
-                fx.ptr_store(k_conv, k_lds + tid)
-                fx.ptr_store(v_conv, v_lds + tid)
+                fx.ptr_store(q_conv, q_lds + channel_local)
+                fx.ptr_store(k_conv, k_lds + channel_local)
+                fx.ptr_store(v_conv, v_lds + channel_local)
                 scf.YieldOp([])
 
             # Both projection and convolution LDS values must be visible
@@ -375,27 +505,13 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
                 _DIM * _DIM
             )
 
-            state_vecs = []
-            for vi in range_constexpr(_V_ITERS):
-                global_v = global_v_start + fx.Int32(vi * _V_GROUP_TILE)
-                for ki in range_constexpr(_K_ITERS):
-                    k_base = k_vec_start + fx.Int32(ki * _WARP_TILE_K)
-                    state_off = state_head_base + global_v * fx.Int32(_DIM) + k_base
-                    state_vecs.append(
-                        state.vec_load(
-                            (state_off,),
-                            _VALUES_PER_THREAD_K,
-                        )
-                    )
-
-            for vi in range_constexpr(_V_ITERS):
+            def process_state_row(vi, row_state_vecs):
                 global_v = global_v_start + fx.Int32(vi * _V_GROUP_TILE)
                 sum_hk_vec = zero_vec
                 sum_hq_vec = zero_vec
                 for ki in range_constexpr(_K_ITERS):
-                    state_pos = vi * _K_ITERS + ki
-                    decayed = state_vecs[state_pos] * decay_vecs[ki]
-                    state_vecs[state_pos] = decayed
+                    decayed = row_state_vecs[ki] * decay_vecs[ki]
+                    row_state_vecs[ki] = decayed
                     sum_hk_vec = mlir_vector.FMAOp(
                         decayed,
                         k_vecs[ki],
@@ -454,11 +570,10 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
                 ).vector
 
                 for ki in range_constexpr(_K_ITERS):
-                    state_pos = vi * _K_ITERS + ki
                     updated = mlir_vector.FMAOp(
                         k_vecs[ki],
                         v_new_vec,
-                        state_vecs[state_pos],
+                        row_state_vecs[ki],
                     ).result
                     k_base = k_vec_start + fx.Int32(ki * _WARP_TILE_K)
                     state_off = state_head_base + global_v * fx.Int32(_DIM) + k_base
@@ -473,34 +588,71 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
                         fx.BFloat16(recurrent_value),
                         out_lds + global_v,
                     )
+                rounded = fx.BFloat16(recurrent_value)
+                rounded_f32 = fx.Float32(rounded)
+                return rounded_f32 * rounded_f32
 
-            fx.gpu.barrier()
+            norm_accum = fx.Float32(0.0)
+            state_vecs = []
+            for vi in range_constexpr(_V_ITERS):
+                global_v = global_v_start + fx.Int32(vi * _V_GROUP_TILE)
+                for ki in range_constexpr(_K_ITERS):
+                    k_base = k_vec_start + fx.Int32(ki * _WARP_TILE_K)
+                    state_off = (
+                        state_head_base + global_v * fx.Int32(_DIM) + k_base
+                    )
+                    state_vecs.append(state.vec_load((state_off,), 4))
+            for vi in range_constexpr(_V_ITERS):
+                norm_accum = norm_accum + process_state_row(
+                    vi,
+                    state_vecs[vi * _K_ITERS : (vi + 1) * _K_ITERS],
+                )
 
-            # Preserve the model's BF16 boundary before RMSNorm and gating.
-            output_if = scf.IfOp(
-                _to_raw(tid < fx.Int32(_DIM)),
-                results_=[],
-                has_else=False,
-            )
-            with ir.InsertionPoint(output_if.then_block):
-                recurrent_bf16 = fx.ptr_load(out_lds + tid)
-                recurrent_f32 = fx.Float32(recurrent_bf16)
-                square = recurrent_f32 * recurrent_f32
+            if const_expr(fused_norm_reduce):
                 for offset in (32, 16, 8, 4, 2, 1):
-                    square = (
-                        square
+                    norm_accum = (
+                        norm_accum
                         + mlir_gpu.ShuffleOp(
-                            _to_raw(square),
+                            _to_raw(norm_accum),
                             _to_raw(fx.Int32(offset)),
                             _to_raw(width),
                             mode="xor",
                         ).shuffleResult
                     )
                 if lane == fx.Int32(0):
-                    fx.ptr_store(square, norm_lds + warp)
-                scf.YieldOp([])
+                    fx.ptr_store(
+                        norm_accum * fx.Float32(1.0 / _WARP_THREADS_K),
+                        norm_lds + warp,
+                    )
 
             fx.gpu.barrier()
+
+            # Preserve the model's BF16 boundary before RMSNorm and gating.
+            if const_expr(not fused_norm_reduce):
+                output_if = scf.IfOp(
+                    _to_raw(tid < fx.Int32(_DIM)),
+                    results_=[],
+                    has_else=False,
+                )
+                with ir.InsertionPoint(output_if.then_block):
+                    recurrent_bf16 = fx.ptr_load(out_lds + tid)
+                    recurrent_f32 = fx.Float32(recurrent_bf16)
+                    square = recurrent_f32 * recurrent_f32
+                    for offset in (32, 16, 8, 4, 2, 1):
+                        square = (
+                            square
+                            + mlir_gpu.ShuffleOp(
+                                _to_raw(square),
+                                _to_raw(fx.Int32(offset)),
+                                _to_raw(width),
+                                mode="xor",
+                            ).shuffleResult
+                        )
+                    if lane == fx.Int32(0):
+                        fx.ptr_store(square, norm_lds + warp)
+                    scf.YieldOp([])
+
+                fx.gpu.barrier()
 
             output_store_if = scf.IfOp(
                 _to_raw(tid < fx.Int32(_DIM)),
@@ -510,6 +662,13 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
             with ir.InsertionPoint(output_store_if.then_block):
                 norm_sum = fx.Float32(fx.ptr_load(norm_lds))
                 norm_sum = norm_sum + fx.Float32(fx.ptr_load(norm_lds + fx.Int32(1)))
+                if const_expr(fused_norm_reduce):
+                    norm_sum = norm_sum + fx.Float32(
+                        fx.ptr_load(norm_lds + fx.Int32(2))
+                    )
+                    norm_sum = norm_sum + fx.Float32(
+                        fx.ptr_load(norm_lds + fx.Int32(3))
+                    )
                 inv_rms = fx.math.rsqrt(
                     norm_sum * fx.Float32(1.0 / _DIM) + fx.Float32(norm_eps)
                 )
@@ -614,9 +773,11 @@ def create_kimi_k3_kda_decode_fb_kernel(norm_eps: float, lower_bound: float):
         )
 
     launch.compile_hints = {
-        "waves_per_eu": _WAVES_PER_EU,
+        "waves_per_eu": waves_per_eu,
         "llvm_options": {
             "amdgpu-expert-scheduling-mode": True,
+            "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+            "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
         },
     }
     return launch

@@ -14,6 +14,7 @@ import torch.nn.functional as F
 pytest.importorskip("flydsl")
 from aiter.jit.utils.chip_info import get_gfx
 from sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_kda_decode import (
+    _fb_build_options,
     flydsl_kimi_k3_kda_decode,
     flydsl_kimi_k3_kda_decode_with_f_b,
     is_flydsl_kimi_k3_kda_decode_supported,
@@ -364,6 +365,19 @@ def test_f_b_public_api() -> None:
     )
 
 
+def test_f_b_batch_two_dispatch_is_guarded(monkeypatch) -> None:
+    for name in (
+        "SGLANG_K3_KDA_FB_C2_WPE",
+        "SGLANG_K3_KDA_FB_C2_COOP_FA",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert _fb_build_options(1) == {}
+    assert _fb_build_options(4) == {}
+    options = _fb_build_options(2)
+    assert options["waves_per_eu"] == 2
+    assert options["cooperative_f_a"] is False
+
+
 @pytest.mark.parametrize("batch", [1, 8, 16])
 def test_kimi_k3_kda_decode_matches_reference(batch: int) -> None:
     seed = _make_inputs(batch)
@@ -418,6 +432,49 @@ def test_kimi_k3_kda_decode_with_f_b_matches_reference(batch: int) -> None:
     assert _relative_rmse(reference, actual) < 1e-3
     assert _relative_rmse(reference_inputs.state, actual_inputs.state) < 1e-3
     assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
+
+
+def test_kimi_k3_kda_decode_with_f_b_recurrent_sequence() -> None:
+    f_a, f_b_weight, seed = _make_fb_inputs(batch=2)
+    reference_inputs = _copy_inputs(seed)
+    actual_inputs = _copy_inputs(seed)
+    for _ in range(32):
+        reference = _reference(reference_inputs)
+        actual = _run_with_f_b(f_a, f_b_weight, actual_inputs)
+    torch.cuda.synchronize()
+    assert _relative_rmse(reference, actual) < 1e-3
+    assert _relative_rmse(reference_inputs.state, actual_inputs.state) < 1e-3
+    assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
+
+
+def test_kimi_k3_kda_decode_with_f_b_graph_replay() -> None:
+    f_a, f_b_weight, inputs = _make_fb_inputs(batch=2)
+    out = torch.empty((1, 2, _HEADS, _DIM), dtype=torch.bfloat16, device=_DEVICE)
+    _run_with_f_b(f_a, f_b_weight, inputs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flydsl_kimi_k3_kda_decode_with_f_b(
+            f_a=f_a,
+            f_b_weight=f_b_weight,
+            x=inputs.x,
+            conv_weight=inputs.conv_weight,
+            conv_bias=None,
+            conv_state=inputs.conv_state,
+            raw_beta=inputs.raw_beta,
+            A_log=inputs.A_log,
+            dt_bias=inputs.dt_bias,
+            lower_bound=_LOWER_BOUND,
+            state=inputs.state,
+            state_indices=inputs.state_indices,
+            output_gate=inputs.output_gate,
+            norm_weight=inputs.norm_weight,
+            norm_eps=_NORM_EPS,
+            out=out,
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not torch.isnan(out).any()
 
 
 def test_f_b_non_positive_slots_do_not_modify_caches() -> None:
