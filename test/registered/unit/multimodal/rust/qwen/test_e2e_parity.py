@@ -50,7 +50,9 @@ class TestQwenE2eParity(CustomTestCase):
         import transformers.models.qwen2_vl as qwen2_vl
 
         self.processor = make_processor(
-            PROCESSOR_CONFIGS["qwen2_5_vl"], getattr(qwen2_vl, self.image_processor)
+            self,
+            PROCESSOR_CONFIGS["qwen2_5_vl"],
+            getattr(qwen2_vl, self.image_processor),
         )
 
     def tearDown(self):
