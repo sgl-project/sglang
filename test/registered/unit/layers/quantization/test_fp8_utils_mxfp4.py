@@ -18,9 +18,7 @@ class TestFp8UtilsMxfp4(CustomTestCase):
     def test_fake_flashinfer_mxfp8_quantize_linear_scale_shape(self):
         input = torch.empty((3, 60), dtype=torch.bfloat16)
 
-        quantized, scale = _fake_flashinfer_mxfp8_quantize(
-            input, False, alignment=64
-        )
+        quantized, scale = _fake_flashinfer_mxfp8_quantize(input, False, alignment=64)
 
         self.assertEqual(quantized.shape, torch.Size([3, 64]))
         self.assertEqual(quantized.dtype, torch.float8_e4m3fn)
@@ -30,9 +28,7 @@ class TestFp8UtilsMxfp4(CustomTestCase):
     def test_fake_flashinfer_mxfp8_quantize_swizzled_scale_shape(self):
         input = torch.empty((3, 64), dtype=torch.bfloat16)
 
-        quantized, scale = _fake_flashinfer_mxfp8_quantize(
-            input, True, alignment=64
-        )
+        quantized, scale = _fake_flashinfer_mxfp8_quantize(input, True, alignment=64)
 
         self.assertEqual(quantized.shape, torch.Size([3, 64]))
         self.assertEqual(scale.shape, torch.Size([512]))
