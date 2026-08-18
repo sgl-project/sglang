@@ -492,17 +492,20 @@ class WaveAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
+        if forward_batch.forward_mode.is_target_verify():
+            # The Wave extend kernel has no custom-mask input, so draft-tree
+            # verification cannot be masked here. This combination previously
+            # crashed inside a max_extend_len consistency check (torch.max on
+            # a host list); keep the combination unsupported, but explicitly.
+            raise NotImplementedError(
+                "wave attention backend does not support target-verify "
+                "(draft-tree mask) execution"
+            )
+
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, v
             )
-
-        max_extend_len = self.forward_metadata.max_extend_len
-        computed_max_ext_seq_len = torch.max(forward_batch.extend_seq_lens)
-        if computed_max_ext_seq_len != max_extend_len:
-            assert len(forward_batch.extend_seq_lens) == 1
-            forward_batch.extend_seq_lens[0] = max_extend_len
-            forward_batch.seq_lens = max_extend_len
 
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
