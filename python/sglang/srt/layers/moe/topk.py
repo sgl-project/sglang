@@ -1043,6 +1043,12 @@ def grouped_topk_gpu(
     return topk_weights, topk_ids
 
 
+def _ensure_cpu_router_logits_fp32(gating_output: torch.Tensor) -> torch.Tensor:
+    if gating_output.dtype != torch.float32:
+        return gating_output.to(torch.float32)
+    return gating_output
+
+
 def grouped_topk_cpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1061,7 +1067,7 @@ def grouped_topk_cpu(
 
     return torch.ops.sgl_kernel.grouped_topk_cpu(
         hidden_states,
-        gating_output,
+        _ensure_cpu_router_logits_fp32(gating_output),
         topk,
         renormalize,
         num_expert_group,
@@ -1801,7 +1807,7 @@ def biased_grouped_topk_cpu(
 ):
     return torch.ops.sgl_kernel.biased_grouped_topk_cpu(
         hidden_states,
-        gating_output,
+        _ensure_cpu_router_logits_fp32(gating_output),
         correction_bias,
         topk,
         renormalize,

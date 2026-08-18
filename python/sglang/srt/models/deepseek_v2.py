@@ -499,6 +499,9 @@ class MoEGate(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         forward_batch: ForwardBatch = None,
     ):
+        if _is_cpu and _is_cpu_amx_available:
+            return F.linear(hidden_states.float(), self.weight.float(), None)
+
         if use_intel_amx_backend(self):
             return torch.ops.sgl_kernel.weight_packed_linear(
                 hidden_states,

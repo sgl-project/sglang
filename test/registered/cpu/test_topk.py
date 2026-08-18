@@ -5,10 +5,14 @@ import torch
 
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.moe.topk import (
+    biased_grouped_topk_cpu as cpu_biased_grouped_topk,
+)
+from sglang.srt.layers.moe.topk import (
     biased_grouped_topk_impl as native_biased_grouped_topk,
 )
 from sglang.srt.layers.moe.topk import biased_topk_impl as native_biased_topk
 from sglang.srt.layers.moe.topk import fused_topk_torch_native as native_fused_topk
+from sglang.srt.layers.moe.topk import grouped_topk_cpu as cpu_grouped_topk
 from sglang.srt.layers.moe.topk import grouped_topk_gpu as native_grouped_topk
 from sglang.srt.models.llama4 import Llama4MoE
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -37,16 +41,13 @@ class TestGroupedTopK(CustomTestCase):
         )
 
         # fused version
-        topk_weights, topk_ids = torch.ops.sgl_kernel.grouped_topk_cpu(
+        topk_weights, topk_ids = cpu_grouped_topk(
             hidden_states,
             gating_output,
             topk,
             renormalize,
             G,
             topk_group,
-            0,
-            None,
-            None,
         )
 
         res = torch.zeros(M, E, dtype=torch.float)
@@ -64,6 +65,58 @@ class TestGroupedTopK(CustomTestCase):
             self._run_single_test(123, 64, 1, 6, 1, renormalize, torch.bfloat16)
             self._run_single_test(123, 256, 8, 4, 8, renormalize, torch.bfloat16)
             self._run_single_test(123, 160, 8, 6, 2, renormalize, torch.bfloat16)
+
+    def test_grouped_topk_cpu_direct_op_requires_fp32_logits(self):
+        hidden_states = torch.randn((17, 16), dtype=torch.bfloat16)
+        gating_output = torch.randn((17, 128), dtype=torch.bfloat16)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "grouped_topk_cpu expects float32 gating_output"
+        ):
+            torch.ops.sgl_kernel.grouped_topk_cpu(
+                hidden_states,
+                gating_output,
+                8,
+                True,
+                8,
+                2,
+                0,
+                None,
+                None,
+            )
+
+    def test_grouped_topk_cpu_direct_op_accepts_mixed_hidden_and_logits_dtypes(self):
+        torch.manual_seed(0)
+        hidden_states = torch.randn((17, 16), dtype=torch.bfloat16)
+        gating_output = torch.randn((17, 128), dtype=torch.float32)
+
+        topk_weights, topk_ids = torch.ops.sgl_kernel.grouped_topk_cpu(
+            hidden_states,
+            gating_output,
+            8,
+            True,
+            8,
+            2,
+            0,
+            None,
+            None,
+        )
+
+        expected_weights, expected_ids = native_grouped_topk(
+            hidden_states.float(),
+            gating_output,
+            8,
+            True,
+            8,
+            2,
+        )
+        self.assertEqual(topk_weights.dtype, torch.float32)
+        self.assertEqual(topk_ids.dtype, torch.int32)
+        actual = torch.zeros_like(gating_output)
+        expected = torch.zeros_like(gating_output)
+        actual.scatter_(1, topk_ids.to(torch.int64), topk_weights)
+        expected.scatter_(1, expected_ids.to(torch.int64), expected_weights)
+        torch.testing.assert_close(actual, expected)
 
 
 # DeepSeek V2/V3/R1 uses biased_grouped_top
@@ -102,7 +155,7 @@ class TestBiasedGroupedTopK(CustomTestCase):
             else ref_topk_weights
         )
         # fused version
-        topk_weights, topk_ids = torch.ops.sgl_kernel.biased_grouped_topk_cpu(
+        topk_weights, topk_ids = cpu_biased_grouped_topk(
             hidden_states,
             gating_output,
             correction_bias,
@@ -110,9 +163,9 @@ class TestBiasedGroupedTopK(CustomTestCase):
             renormalize,
             G,
             topk_group,
-            0,
-            routed_scaling_factor,
-            None,
+            num_fused_shared_experts=0,
+            routed_scaling_factor=routed_scaling_factor,
+            apply_routed_scaling_factor_on_output=routed_scaling_factor is not None,
         )
 
         res = torch.zeros(M, E, dtype=torch.float)
@@ -138,6 +191,65 @@ class TestBiasedGroupedTopK(CustomTestCase):
                                 bias_dtype,
                                 routed_scaling_factor,
                             )
+
+    def test_biased_grouped_topk_cpu_direct_op_requires_fp32_logits(self):
+        hidden_states = torch.randn((17, 16), dtype=torch.bfloat16)
+        gating_output = torch.randn((17, 128), dtype=torch.bfloat16)
+        correction_bias = torch.randn(128, dtype=torch.float32)
+
+        with self.assertRaisesRegex(
+            RuntimeError, "biased_grouped_topk_cpu expects float32 gating_output"
+        ):
+            torch.ops.sgl_kernel.biased_grouped_topk_cpu(
+                hidden_states,
+                gating_output,
+                correction_bias,
+                8,
+                False,
+                8,
+                2,
+                0,
+                None,
+                None,
+            )
+
+    def test_biased_grouped_topk_cpu_direct_op_accepts_mixed_hidden_and_logits_dtypes(
+        self,
+    ):
+        torch.manual_seed(0)
+        hidden_states = torch.randn((17, 16), dtype=torch.bfloat16)
+        gating_output = torch.randn((17, 128), dtype=torch.float32)
+        correction_bias = torch.randn(128, dtype=torch.float32)
+
+        topk_weights, topk_ids = torch.ops.sgl_kernel.biased_grouped_topk_cpu(
+            hidden_states,
+            gating_output,
+            correction_bias,
+            8,
+            False,
+            8,
+            2,
+            0,
+            None,
+            None,
+        )
+
+        expected_weights, expected_ids = native_biased_grouped_topk(
+            hidden_states.float(),
+            gating_output,
+            correction_bias,
+            8,
+            False,
+            8,
+            2,
+        )
+        self.assertEqual(topk_weights.dtype, torch.float32)
+        self.assertEqual(topk_ids.dtype, torch.int32)
+        actual = torch.zeros_like(gating_output)
+        expected = torch.zeros_like(gating_output)
+        actual.scatter_(1, topk_ids.to(torch.int64), topk_weights)
+        expected.scatter_(1, expected_ids.to(torch.int64), expected_weights)
+        torch.testing.assert_close(actual, expected)
 
 
 class TestBiasedTopK(CustomTestCase):
