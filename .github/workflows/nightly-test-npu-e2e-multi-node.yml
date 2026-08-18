@@ -6,7 +6,12 @@ on:
       runner:
         required: false
         type: string
-        default: linux-amd64-cpu-8
+        default: linux-amd64-cpu-4
+      ref:
+        required: false
+        type: string
+        default: ''
+        description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the git ref inherited from the caller.'
       test_type:
         required: false
         type: string
@@ -50,6 +55,11 @@ on:
         type: boolean
         default: true
         description: use sglang from source code or from docker image
+      trouble_shotting:
+        required: false
+        type: boolean
+        default: false
+        description: 'Keep pods and sglang processes alive after the test finishes for debugging.'
       prefill_decode_deployment:
         required: true
         type: string
@@ -92,6 +102,8 @@ jobs:
 
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Prepare code for testing
         run: |
@@ -200,6 +212,12 @@ jobs:
             echo "Use default transformers version in image."
           fi
 
+          trouble_shotting="${{ inputs.trouble_shotting }}"
+          if [ "$trouble_shotting" = "true" ] || [ "$trouble_shotting" = "True" ];then
+            echo "Trouble shotting enabled, pods will be kept alive."
+            CMD="${CMD} --trouble-shotting"
+          fi
+
           echo "Run command: ${CMD}"
           eval "${CMD}"
 
@@ -212,7 +230,7 @@ jobs:
           retention-days: 7
 
       - name: Post process
-        if: always()
+        if: ${{ always() && inputs.trouble_shotting != true }}
         run: |
           cd ${ASCEND_E2E_TEST_CONFIG_PATH}
           kubectl get pods -n $NAMESPACE | grep $KUBE_JOB_NAME
