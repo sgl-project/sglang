@@ -65,6 +65,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     EvictLayer,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     DecSwaLockOnlyResult,
@@ -6704,7 +6705,7 @@ class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
     def test_enabling_storage_backfills_the_tree(self):
         """The tree is hashed by the time `enable_storage` flips on."""
         cache = self._build_two_level_tree(storage_on_from_the_start=False)
-        cache._apply_storage_runtime_config(
+        StorageAttachment(cache).apply_runtime_config(
             storage_backend="file",
             prefetch_threshold=64,
             prefetch_timeout_base=1.0,
