@@ -33,7 +33,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from sglang.benchmark.serving import run_benchmark
-from sglang.global_config import global_config
+from sglang.lang.global_config import global_config
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     get_bool_env_var,

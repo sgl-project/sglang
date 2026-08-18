@@ -26,7 +26,6 @@ QWEN3_235B_ENVS = {
     "SGLANG_NPU_PROFILING": "0",
     "SGLANG_NPU_PROFILING_BS": "27",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "188416",
-    "SGLANG_NPU_FUSED_MOE_MODE": "2",
 }
 
 QWEN3_235B_OTHER_ARGS = [
@@ -60,6 +59,8 @@ QWEN3_235B_OTHER_ARGS = [
     "--disable-radix-cache",
     "--moe-a2a-backend",
     "ascend_fuseep",
+    "--fuseep-mode",
+    2,
     "--speculative-algorithm",
     "EAGLE3",
     "--speculative-draft-model-path",

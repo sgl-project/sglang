@@ -213,9 +213,18 @@ class _FusedQKVIndexProj(nn.Module):
                 "weight_scale_inv", nn.Parameter(weight_scale_inv, requires_grad=False)
             )
             self.weight_scale_inv.format_ue8m0 = True
-            # Must derive the backend scale layout here: the loader skips this
-            # module (see ``_qm``), so it won't run process_weights_after_loading.
-            quant_method._process_mxfp8_linear_weight_scale(self)
+            # The loader skips this module (see ``_qm``), so run the weight
+            # post-process here instead of process_weights_after_loading.
+            if getattr(quant_method, "convert_mxfp8_to_block", False):
+                # Block-fp8 (gfx942/gfx950): convert the concatenated MXFP8 weight
+                # to block-fp8 [128,128] and run the same fnuz/scale/preshuffle
+                # steps as the per-linear path (this also flips quant_method into
+                # block-fp8 state). q/kv and index output sizes are 128-aligned, so
+                # converting the concatenation equals converting each proj alone.
+                quant_method.process_weights_after_loading_block_quant(self)
+            else:
+                # Derive the backend scale layout for the native MXFP8 GEMM.
+                quant_method._process_mxfp8_linear_weight_scale(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._qm.apply(self, x, None)
@@ -885,11 +894,6 @@ class MiniMaxM3Attention(nn.Module):
         qp, ip = self.qkv_proj, self.index_qkv_proj
         qm = qp.quant_method
         if type(ip.quant_method) is not type(qm):
-            return
-
-        # gfx942 converts MXFP8->block-fp8 in process_weights_after_loading; the
-        # fused module skips that pass, so keep two separate (converted) GEMMs.
-        if getattr(qm, "convert_mxfp8_to_block", False):
             return
 
         is_unquant = isinstance(qm, UnquantizedLinearMethod)
