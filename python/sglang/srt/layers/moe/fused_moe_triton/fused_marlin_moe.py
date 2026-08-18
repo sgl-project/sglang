@@ -10,6 +10,12 @@ from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
+_MARLIN_MOE_BLOCK_SIZES = (8, 16, 32, 48, 64)
+_H200_MARLIN_MOE_BLOCK_SIZE_CONFIGS = {
+    # Kimi-K3 TP16/EP16 and TP32/EP32.
+    (896, 56, 16): ((128, 8), (512, 16), (1024, 32), (4096, 48)),
+    (896, 28, 16): ((64, 8), (256, 16), (512, 32), (2048, 48)),
+}
 
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
@@ -131,6 +137,29 @@ def swiglu_gpt_oss_sigmoid_alpha_contiguous(
     output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
 
 
+def _select_moe_block_size(
+    num_tokens: int,
+    num_experts: int,
+    top_k: int,
+    global_num_experts: int = -1,
+    device_name: str = "",
+) -> int:
+    if device_name.startswith("NVIDIA H200"):
+        config = _H200_MARLIN_MOE_BLOCK_SIZE_CONFIGS.get(
+            (global_num_experts, num_experts, top_k)
+        )
+        if config is not None:
+            for max_tokens, block_size_m in config:
+                if num_tokens <= max_tokens:
+                    return block_size_m
+            return _MARLIN_MOE_BLOCK_SIZES[-1]
+
+    for block_size_m in _MARLIN_MOE_BLOCK_SIZES:
+        if num_tokens * top_k / num_experts / block_size_m < 0.9:
+            return block_size_m
+    return _MARLIN_MOE_BLOCK_SIZES[-1]
+
+
 @register_custom_op(out_shape="hidden_states")
 def fused_marlin_moe(
     hidden_states: torch.Tensor,
@@ -235,14 +264,15 @@ def fused_marlin_moe(
     topk = topk_ids.shape[1]
     gemm1_n = 2 * N if is_gated else N
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
-
     if global_num_experts == -1:
         global_num_experts = E
+    block_size_m = _select_moe_block_size(
+        M,
+        E,
+        topk,
+        global_num_experts=global_num_experts,
+        device_name=torch.cuda.get_device_name(hidden_states.device),
+    )
     if (
         M == 1
         and topk <= 32
