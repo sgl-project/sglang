@@ -23,19 +23,27 @@ class SampleStepTokens:
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
         exp_noise: torch.Tensor,
+        corrected_logits_out: Optional[torch.Tensor] = None,
+        write_corrected_logits: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if step_logits.is_cuda:
+        # The Ascend Triton backend accepts PrivateUse1/NPU tensors even
+        # though PyTorch's ``Tensor.is_cuda`` is false for them.
+        if step_logits.is_cuda or step_logits.device.type == "npu":
             return cls.triton(
                 step_logits=step_logits,
                 temperatures=temperatures,
                 greedy_mask=greedy_mask,
                 exp_noise=exp_noise,
+                corrected_logits_out=corrected_logits_out,
+                write_corrected_logits=write_corrected_logits,
             )
         return cls.torch(
             step_logits=step_logits,
             temperatures=temperatures,
             greedy_mask=greedy_mask,
             exp_noise=exp_noise,
+            corrected_logits_out=corrected_logits_out,
+            write_corrected_logits=write_corrected_logits,
         )
 
     @classmethod
@@ -46,12 +54,16 @@ class SampleStepTokens:
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
         exp_noise: torch.Tensor,
+        corrected_logits_out: Optional[torch.Tensor] = None,
+        write_corrected_logits: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return sample_step_tokens(
             step_logits=step_logits,
             temperatures=temperatures,
             greedy_mask=greedy_mask,
             exp_noise=exp_noise,
+            corrected_logits_out=corrected_logits_out,
+            write_corrected_logits=write_corrected_logits,
         )
 
     @classmethod
@@ -62,12 +74,16 @@ class SampleStepTokens:
         temperatures: torch.Tensor,
         greedy_mask: torch.Tensor,
         exp_noise: torch.Tensor,
+        corrected_logits_out: Optional[torch.Tensor] = None,
+        write_corrected_logits: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return sample_step_tokens_triton(
             step_logits=step_logits,
             temperatures=temperatures,
             greedy_mask=greedy_mask,
             exp_noise=exp_noise,
+            corrected_logits_out=corrected_logits_out,
+            write_corrected_logits=write_corrected_logits,
         )
 
 
@@ -77,10 +93,28 @@ def sample_step_tokens(
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
     exp_noise: torch.Tensor,
+    corrected_logits_out: Optional[torch.Tensor] = None,
+    write_corrected_logits: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    probs = torch.softmax(step_logits.float() / temperatures[:, None], dim=-1)
+    # Exponential-race sampling can be evaluated in log space:
+    #
+    #   argmax(softmax(logits / temperature) / Exp(1))
+    #     == argmax(logits - temperature * log(Exp(1))).
+    #
+    # Besides avoiding a full softmax, selecting unit noise for greedy rows
+    # leaves their keys equal to the original logits.  This is important for
+    # proposal parity: softmax can round two distinct, nearly tied logits to
+    # the same probability and change argmax's tie break.
+    if corrected_logits_out is not None:
+        if write_corrected_logits is None:
+            raise ValueError(
+                "write_corrected_logits is required with corrected_logits_out"
+            )
+        if bool(write_corrected_logits.item()):
+            corrected_logits_out.copy_(step_logits)
     noise = torch.where(greedy_mask[:, None], 1.0, exp_noise)
-    return probs.div_(noise).argmax(dim=-1)
+    keys = step_logits.float() - temperatures[:, None] * noise.log()
+    return keys.argmax(dim=-1)
 
 
 @triton.jit
@@ -89,13 +123,17 @@ def _online_partial_kernel(
     temperatures_ptr,
     greedy_mask_ptr,
     exp_noise_ptr,
-    tile_max_ptr,
     partial_key_ptr,
     partial_idx_ptr,
+    corrected_logits_out_ptr,
+    write_corrected_logits_ptr,
     V,
     stride_row,
+    corrected_stride_row,
     n_tiles,
     BLOCK_V: tl.constexpr,
+    STORE_CORRECTED: tl.constexpr,
+    ASCEND_RUNTIME_BRANCH: tl.constexpr,
 ):
     row = tl.program_id(0)
     tile = tl.program_id(1)
@@ -104,24 +142,45 @@ def _online_partial_kernel(
     logits = tl.load(
         logits_ptr + row * stride_row + offs, mask=mask, other=float("-inf")
     ).to(tl.float32)
-    temperature = tl.load(temperatures_ptr + row)
-    s = logits / temperature
-    tile_max = tl.max(s, axis=0)
+    if STORE_CORRECTED:
+        write_corrected = tl.load(write_corrected_logits_ptr) != 0
+        if ASCEND_RUNTIME_BRANCH:
+            if write_corrected:
+                tl.store(
+                    corrected_logits_out_ptr + row * corrected_stride_row + offs,
+                    logits,
+                    mask=mask,
+                )
+        else:
+            tl.store(
+                corrected_logits_out_ptr + row * corrected_stride_row + offs,
+                logits,
+                mask=mask & write_corrected,
+            )
     greedy = tl.load(greedy_mask_ptr + row) != 0
-    noise = tl.load(exp_noise_ptr + row * V + offs, mask=mask, other=1.0)
-    denom = tl.where(greedy, 1.0, noise)
-    key = tl.exp(s - tile_max) / denom
-    key = tl.where(mask, key, -1.0)
+    if ASCEND_RUNTIME_BRANCH:
+        if greedy:
+            # Avoid a full-vocabulary noise read and logarithm for the
+            # overwhelmingly common greedy request while keeping one graph.
+            key = logits
+        else:
+            temperature = tl.load(temperatures_ptr + row)
+            noise = tl.load(exp_noise_ptr + row * V + offs, mask=mask, other=1.0)
+            key = logits - temperature * tl.log(noise)
+    else:
+        temperature = tl.load(temperatures_ptr + row)
+        noise = tl.load(exp_noise_ptr + row * V + offs, mask=mask, other=1.0)
+        noise = tl.where(greedy, 1.0, noise)
+        key = logits - temperature * tl.log(noise)
+    key = tl.where(mask, key, float("-inf"))
     tile_best = tl.max(key, axis=0)
     idx = tl.where(key == tile_best, offs, _IDX_SENTINEL)
-    tl.store(tile_max_ptr + row * n_tiles + tile, tile_max)
     tl.store(partial_key_ptr + row * n_tiles + tile, tile_best)
     tl.store(partial_idx_ptr + row * n_tiles + tile, tl.min(idx, axis=0))
 
 
 @triton.jit
 def _online_combine_kernel(
-    tile_max_ptr,
     partial_key_ptr,
     partial_idx_ptr,
     next_tokens_ptr,
@@ -131,18 +190,16 @@ def _online_combine_kernel(
     row = tl.program_id(0)
     offs = tl.arange(0, BLOCK_TILES)
     mask = offs < n_tiles
-    tile_max = tl.load(
-        tile_max_ptr + row * n_tiles + offs, mask=mask, other=float("-inf")
+    keys = tl.load(
+        partial_key_ptr + row * n_tiles + offs,
+        mask=mask,
+        other=float("-inf"),
     )
-    keys = tl.load(partial_key_ptr + row * n_tiles + offs, mask=mask, other=-1.0)
     idxs = tl.load(
         partial_idx_ptr + row * n_tiles + offs, mask=mask, other=_IDX_SENTINEL
     )
-    global_max = tl.max(tile_max, axis=0)
-    rescaled = keys * tl.exp(tile_max - global_max)
-    rescaled = tl.where(mask, rescaled, -1.0)
-    best = tl.max(rescaled, axis=0)
-    cand = tl.where(rescaled == best, idxs, _IDX_SENTINEL)
+    best = tl.max(keys, axis=0)
+    cand = tl.where(keys == best, idxs, _IDX_SENTINEL)
     next_token = tl.min(cand, axis=0)
     # Degenerate rows (e.g. all -inf logits) leave cand all-sentinel; clamp to 0
     # so a valid token id is emitted instead of an out-of-range 2147483647.
@@ -156,6 +213,8 @@ def sample_step_tokens_triton(
     temperatures: torch.Tensor,
     greedy_mask: torch.Tensor,
     exp_noise: torch.Tensor,
+    corrected_logits_out: Optional[torch.Tensor] = None,
+    write_corrected_logits: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     bs, V = step_logits.shape
     device = step_logits.device
@@ -165,10 +224,24 @@ def sample_step_tokens_triton(
     greedy_mask = greedy_mask.to(torch.int32).contiguous()
     exp_noise = exp_noise.to(torch.float32).contiguous()
 
+    store_corrected = corrected_logits_out is not None
+    if store_corrected:
+        if write_corrected_logits is None:
+            raise ValueError(
+                "write_corrected_logits is required with corrected_logits_out"
+            )
+        assert corrected_logits_out.shape == step_logits.shape
+        assert corrected_logits_out.stride(1) == 1
+        corrected_stride_row = corrected_logits_out.stride(0)
+    else:
+        # Triton still requires pointer arguments for constexpr-disabled paths.
+        corrected_logits_out = step_logits
+        write_corrected_logits = greedy_mask
+        corrected_stride_row = stride_row
+
     n_tiles = triton.cdiv(V, _BLOCK_V)
     block_tiles = triton.next_power_of_2(n_tiles)
 
-    tile_max = torch.empty((bs, n_tiles), dtype=torch.float32, device=device)
     partial_key = torch.empty((bs, n_tiles), dtype=torch.float32, device=device)
     partial_idx = torch.empty((bs, n_tiles), dtype=torch.int32, device=device)
     next_tokens = torch.empty((bs,), dtype=torch.int64, device=device)
@@ -181,16 +254,19 @@ def sample_step_tokens_triton(
         temperatures,
         greedy_mask,
         exp_noise,
-        tile_max,
         partial_key,
         partial_idx,
+        corrected_logits_out,
+        write_corrected_logits,
         V,
         stride_row,
+        corrected_stride_row,
         n_tiles,
         BLOCK_V=_BLOCK_V,
+        STORE_CORRECTED=store_corrected,
+        ASCEND_RUNTIME_BRANCH=step_logits.device.type == "npu",
     )
     _online_combine_kernel[row_grid](
-        tile_max,
         partial_key,
         partial_idx,
         next_tokens,
