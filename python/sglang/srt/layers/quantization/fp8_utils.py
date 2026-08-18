@@ -385,6 +385,27 @@ if flashinfer_per_tensor_fp8_supported():
         ).view(m, n)
 
 
+def _fake_flashinfer_mxfp8_quantize(
+    input: torch.Tensor,
+    _is_sf_swizzled_layout: bool = True,
+    alignment: int = 32,
+    backend: str = "cute-dsl",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    k_aligned = ((input.shape[1] + alignment - 1) // alignment) * alignment
+    q_input = input.new_empty(
+        (input.shape[0], k_aligned), dtype=torch.float8_e4m3fn
+    )
+    sf_columns = k_aligned // 32
+    if _is_sf_swizzled_layout:
+        padded_rows = ((input.shape[0] + 127) // 128) * 128
+        padded_sf_columns = ((sf_columns + 3) // 4) * 4
+        scale_size = padded_rows * padded_sf_columns
+    else:
+        scale_size = input.shape[0] * sf_columns
+    scale = input.new_empty((scale_size,), dtype=torch.uint8)
+    return q_input, scale
+
+
 if is_blackwell_supported() and is_flashinfer_available():
     from flashinfer import SfLayout
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
@@ -446,26 +467,6 @@ if is_blackwell_supported() and is_flashinfer_available():
 
     # Wrap MXFP8 ops as custom ops so torch.compile does not trace into
     # flashinfer's JIT compilation path (filesystem checks/cubin loader).
-    def _fake_flashinfer_mxfp8_quantize(
-        input: torch.Tensor,
-        _is_sf_swizzled_layout: bool = True,
-        alignment: int = 32,
-        backend: str = "cute-dsl",
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        k_aligned = ((input.shape[1] + alignment - 1) // alignment) * alignment
-        q_input = input.new_empty(
-            (input.shape[0], k_aligned), dtype=torch.float8_e4m3fn
-        )
-        sf_columns = k_aligned // 32
-        if _is_sf_swizzled_layout:
-            padded_rows = ((input.shape[0] + 127) // 128) * 128
-            padded_sf_columns = ((sf_columns + 3) // 4) * 4
-            scale_size = padded_rows * padded_sf_columns
-        else:
-            scale_size = input.shape[0] * sf_columns
-        scale = input.new_empty((scale_size,), dtype=torch.uint8)
-        return q_input, scale
-
     @register_custom_op(
         op_name="flashinfer_mxfp8_quantize",
         mutates_args=[],
