@@ -33,7 +33,7 @@ def _has_supported_mlx() -> bool:
         installed = Version(version("mlx"))
     except (PackageNotFoundError, ValueError):
         return False
-    return not installed.is_prerelease and installed.release[:2] == (0, 32)
+    return not installed.is_prerelease and installed >= Version("0.32.0")
 
 
 class TestMlxRuntime(unittest.TestCase):
@@ -62,20 +62,27 @@ assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
             msg=f"stdout={completed.stdout}\nstderr={completed.stderr}",
         )
 
-    def test_version_gate(self):
-        self.assertTrue(runtime._is_stable_series("0.32.7", (0, 32)))
-        self.assertFalse(runtime._is_stable_series("0.31.9", (0, 32)))
-        self.assertFalse(runtime._is_stable_series("0.33.0", (0, 32)))
-        self.assertFalse(runtime._is_stable_series("0.32.1rc1", (0, 32)))
-        self.assertFalse(runtime._is_stable_series("0.32.1.dev1", (0, 32)))
-        self.assertFalse(runtime._is_stable_series("unknown", (0, 32)))
+    def test_version_gates(self):
+        self.assertTrue(runtime._is_stable_series("2.13.7", (2, 13)))
+        self.assertFalse(runtime._is_stable_series("2.14.0", (2, 13)))
+        self.assertFalse(runtime._is_stable_series("2.13.1rc1", (2, 13)))
+
+        minimum = Version("0.32.0")
+        self.assertTrue(runtime._is_stable_at_least("0.32.0", minimum))
+        self.assertTrue(runtime._is_stable_at_least("0.32.0+local", minimum))
+        self.assertTrue(runtime._is_stable_at_least("0.32.1.post1", minimum))
+        self.assertTrue(runtime._is_stable_at_least("0.33.0", minimum))
+        self.assertFalse(runtime._is_stable_at_least("0.31.9", minimum))
+        self.assertFalse(runtime._is_stable_at_least("0.33.0rc1", minimum))
+        self.assertFalse(runtime._is_stable_at_least("0.33.0.dev1", minimum))
+        self.assertFalse(runtime._is_stable_at_least("unknown", minimum))
 
     def test_unvalidated_runtime_pairs_are_rejected(self):
         cases = (
-            ("2.14.0", "0.32.0", "tested stable Torch 2.13.x"),
-            ("2.13.0", "0.33.0", "tested stable Torch 2.13.x"),
-            ("2.13.1rc1", "0.32.0", "tested stable Torch 2.13.x"),
-            ("2.13.0", "0.32.1.dev1", "tested stable Torch 2.13.x"),
+            ("2.14.0", "0.32.0", "stable Torch 2.13.x"),
+            ("2.13.0", "0.31.9", "MLX >= 0.32.0"),
+            ("2.13.1rc1", "0.32.0", "stable Torch 2.13.x"),
+            ("2.13.0", "0.33.0rc1", "MLX >= 0.32.0"),
             ("2.13.0", None, "MLX unknown"),
         )
         for torch_version, mlx_version, message in cases:
@@ -97,20 +104,24 @@ assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
                 finally:
                     runtime._validate_runtime.cache_clear()
 
-    def test_validated_runtime_accepts_patch_releases(self):
-        fake_mlx, fake_core = _fake_mlx("0.32.9")
-        runtime._validate_runtime.cache_clear()
-        try:
-            with (
-                mock.patch.dict(sys.modules, {"mlx": fake_mlx, "mlx.core": fake_core}),
-                mock.patch.object(torch, "__version__", "2.13.7"),
-                mock.patch.object(
-                    torch.backends.mps, "is_available", return_value=True
-                ),
-            ):
-                self.assertIsNone(runtime._validate_runtime())
-        finally:
-            runtime._validate_runtime.cache_clear()
+    def test_validated_runtime_accepts_supported_stable_releases(self):
+        for mlx_version in ("0.32.9", "0.33.0", "1.0.0"):
+            with self.subTest(mlx=mlx_version):
+                fake_mlx, fake_core = _fake_mlx(mlx_version)
+                runtime._validate_runtime.cache_clear()
+                try:
+                    with (
+                        mock.patch.dict(
+                            sys.modules, {"mlx": fake_mlx, "mlx.core": fake_core}
+                        ),
+                        mock.patch.object(torch, "__version__", "2.13.7"),
+                        mock.patch.object(
+                            torch.backends.mps, "is_available", return_value=True
+                        ),
+                    ):
+                        self.assertIsNone(runtime._validate_runtime())
+                finally:
+                    runtime._validate_runtime.cache_clear()
 
     def test_missing_mlx_has_an_actionable_error(self):
         runtime._validate_runtime.cache_clear()
@@ -173,7 +184,7 @@ assert not any(name == "mlx" or name.startswith("mlx.") for name in sys.modules)
                 runtime.use_mlx.cache_clear()
                 runtime._validate_runtime.cache_clear()
                 with mock.patch.object(mx, "__version__", "0.31.0"):
-                    with self.assertRaisesRegex(RuntimeError, "MLX 0.32.x"):
+                    with self.assertRaisesRegex(RuntimeError, "MLX >= 0.32.0"):
                         ServerArgs(model_path="dummy")
         finally:
             runtime.use_mlx.cache_clear()

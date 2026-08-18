@@ -11,10 +11,10 @@ If you encounter issues or have questions, please [open an issue](https://github
 
 ## Prerequisites
 
-The MLX runtime requires Apple Silicon with macOS 14 or newer and the tested
-stable PyTorch 2.13.x and MLX 0.32.x runtime pair. The `srt_mps` extra installs
-PyTorch 2.13.0 and an MLX 0.32.x release; startup also accepts stable patch
-releases from those same minor series.
+The MLX runtime requires Apple Silicon with macOS 14 or newer, stable PyTorch
+2.13.x, and stable MLX 0.32.0 or newer. The `srt_mps` extra installs PyTorch
+2.13.0 and MLX 0.32.0 or newer; startup accepts stable PyTorch 2.13 patch
+releases and newer stable MLX releases.
 
 With `SGLANG_USE_MLX=1`, SGLang validates both framework versions and Metal
 availability during argument initialization and stops before resolving or

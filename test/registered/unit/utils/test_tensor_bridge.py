@@ -24,15 +24,15 @@ from sglang.test.ci.ci_register import register_mlx_ci
 register_mlx_ci(est_time=2, suite="stage-a-unit-test-mlx")
 
 
-def _has_stable_series(distribution: str, series: tuple[int, int]) -> bool:
+def _has_stable_version_at_least(distribution: str, minimum: Version) -> bool:
     try:
         installed = Version(version(distribution))
     except (PackageNotFoundError, ValueError):
         return False
-    return not installed.is_prerelease and installed.release[:2] == series
+    return not installed.is_prerelease and installed >= minimum
 
 
-_HAS_MLX = _has_stable_series("mlx", (0, 32))
+_HAS_MLX = _has_stable_version_at_least("mlx", Version("0.32.0"))
 _HAS_SUPPORTED_RUNTIME = (
     _HAS_MLX
     and torch.backends.mps.is_available()
