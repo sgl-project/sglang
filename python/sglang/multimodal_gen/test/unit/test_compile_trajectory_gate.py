@@ -10,6 +10,8 @@ decision against genuinely eager vs. compiled trajectories, not mocked
 tensors.
 """
 
+import json
+
 import pytest
 import torch
 import torch.nn as nn
@@ -20,6 +22,7 @@ from sglang.multimodal_gen.runtime.utils.compile_trajectory_gate import (
     CompileWorkloadSignature,
     TrajectoryGate,
     compute_tensor_metrics,
+    load_manifests,
     run_trajectory_gate,
     select_validated_plan,
 )
@@ -405,3 +408,80 @@ class TestSelectValidatedPlan:
             checkpoint_metrics={},
         )
         assert select_validated_plan([rejected], sig) is None
+
+
+class TestManifestSerialization:
+    """Covers CompiledPlanManifest.to_dict/from_dict and load_manifests --
+    the "machine-readable promotion manifest" artifact the RFC requires,
+    and the exact real code path DenoisingStage._is_covered_by_compile_
+    trajectory_gate uses to load --compile-trajectory-gate-manifest."""
+
+    def _make_manifest(self, status="validated"):
+        sig = _make_signature()
+        return CompiledPlanManifest(
+            signature=sig,
+            regions=("transformer_blocks.0",),
+            compile_options={"mode": "max-autotune-no-cudagraphs"},
+            gate_digest=sig.digest(),
+            status=status,
+            checkpoint_metrics={
+                "step_0": {"cosine_similarity": 0.9995, "max_abs": 1e-4}
+            },
+            decision_trace_matched=True,
+        )
+
+    def test_to_dict_round_trips_through_from_dict(self):
+        manifest = self._make_manifest()
+        restored = CompiledPlanManifest.from_dict(manifest.to_dict())
+        assert restored == manifest
+
+    def test_to_dict_is_json_serializable(self):
+        manifest = self._make_manifest()
+        # Must not raise -- every field has to be a plain JSON type.
+        encoded = json.dumps(manifest.to_dict())
+        restored = CompiledPlanManifest.from_dict(json.loads(encoded))
+        assert restored == manifest
+
+    def test_load_manifests_reads_a_real_file(self, tmp_path):
+        validated = self._make_manifest(status="validated")
+        rejected = self._make_manifest(status="rejected")
+        path = tmp_path / "manifest.json"
+        path.write_text(json.dumps([validated.to_dict(), rejected.to_dict()]))
+
+        loaded = load_manifests(str(path))
+
+        assert len(loaded) == 2
+        assert loaded[0] == validated
+        assert loaded[1] == rejected
+
+    def test_load_manifests_select_validated_plan_end_to_end(self, tmp_path):
+        # The exact composition DenoisingStage._is_covered_by_compile_
+        # trajectory_gate performs: load a manifest file, then look up the
+        # current request's signature against it.
+        validated = self._make_manifest(status="validated")
+        path = tmp_path / "manifest.json"
+        path.write_text(json.dumps([validated.to_dict()]))
+
+        loaded = load_manifests(str(path))
+        plan = select_validated_plan(loaded, validated.signature)
+        assert plan is not None
+        assert plan.is_validated
+
+        other_signature = _make_signature(num_inference_steps=999)
+        assert select_validated_plan(loaded, other_signature) is None
+
+    def test_load_manifests_missing_file_raises_compile_gate_error(self, tmp_path):
+        with pytest.raises(CompileGateError):
+            load_manifests(str(tmp_path / "does_not_exist.json"))
+
+    def test_load_manifests_malformed_json_raises_compile_gate_error(self, tmp_path):
+        path = tmp_path / "bad.json"
+        path.write_text("{not valid json")
+        with pytest.raises(CompileGateError):
+            load_manifests(str(path))
+
+    def test_load_manifests_non_array_json_raises_compile_gate_error(self, tmp_path):
+        path = tmp_path / "not_array.json"
+        path.write_text(json.dumps({"oops": "this should be a list"}))
+        with pytest.raises(CompileGateError):
+            load_manifests(str(path))

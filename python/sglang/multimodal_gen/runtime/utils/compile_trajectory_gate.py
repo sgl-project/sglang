@@ -143,6 +143,85 @@ class CompiledPlanManifest:
     def is_validated(self) -> bool:
         return self.status == "validated"
 
+    def to_dict(self) -> dict:
+        """Machine-readable form for the offline/CI manifest artifact."""
+        sig = self.signature
+        return {
+            "signature": {
+                "model_revision": sig.model_revision,
+                "dtype": sig.dtype,
+                "backend": sig.backend,
+                "parallel_signature": sig.parallel_signature,
+                "latent_shape_regime": list(sig.latent_shape_regime),
+                "num_inference_steps": sig.num_inference_steps,
+                "cfg_mode": sig.cfg_mode,
+                "cache_mode": sig.cache_mode,
+                "state_schema_version": sig.state_schema_version,
+            },
+            "regions": list(self.regions),
+            "compile_options": dict(self.compile_options),
+            "gate_digest": self.gate_digest,
+            "status": self.status,
+            "checkpoint_metrics": {
+                name: dict(metrics) for name, metrics in self.checkpoint_metrics.items()
+            },
+            "decision_trace_matched": self.decision_trace_matched,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> CompiledPlanManifest:
+        sig_data = data["signature"]
+        signature = CompileWorkloadSignature(
+            model_revision=sig_data["model_revision"],
+            dtype=sig_data["dtype"],
+            backend=sig_data["backend"],
+            parallel_signature=sig_data["parallel_signature"],
+            latent_shape_regime=tuple(sig_data["latent_shape_regime"]),
+            num_inference_steps=sig_data["num_inference_steps"],
+            cfg_mode=sig_data["cfg_mode"],
+            cache_mode=sig_data["cache_mode"],
+            state_schema_version=sig_data["state_schema_version"],
+        )
+        return cls(
+            signature=signature,
+            regions=tuple(data["regions"]),
+            compile_options=dict(data["compile_options"]),
+            gate_digest=data["gate_digest"],
+            status=data["status"],
+            checkpoint_metrics={
+                name: dict(metrics)
+                for name, metrics in data["checkpoint_metrics"].items()
+            },
+            decision_trace_matched=data.get("decision_trace_matched"),
+        )
+
+
+def load_manifests(path: str) -> list:
+    """Load a JSON file of CompiledPlanManifest records.
+
+    The file is a JSON array of objects produced by
+    ``CompiledPlanManifest.to_dict()``. Raises ``CompileGateError`` (not a
+    bare JSON/OS error) if the file is missing or malformed, so a
+    misconfigured ``--compile-trajectory-gate-manifest`` path fails clearly
+    instead of silently falling back to eager for every request.
+    """
+    import json
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise CompileGateError(
+            f"failed to load compile-trajectory-gate manifest {path!r}: {exc}"
+        ) from exc
+
+    if not isinstance(raw, list):
+        raise CompileGateError(
+            f"manifest file {path!r} must contain a JSON array, got {type(raw).__name__}"
+        )
+
+    return [CompiledPlanManifest.from_dict(entry) for entry in raw]
+
 
 def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
     flat_a, flat_b = a.reshape(-1), b.reshape(-1)
