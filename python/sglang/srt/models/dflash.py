@@ -266,9 +266,15 @@ class DFlashAttention(nn.Module):
 
     def apply_k_rope(self, positions: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
         # Match K shape so RoPE kernel head-count check passes on all backends.
+        original_shape = k.shape
+        if _is_npu and k.ndim == 2:
+            # Ascend's fused_rope_qk_mqa contract is [tokens, heads, dim],
+            # while the KV-only projection naturally produces a flattened 2D
+            # tensor. The regular attention path already uses the 3D contract.
+            k = k.view(k.shape[0], -1, self.head_dim)
         dummy_q = k.new_empty(k.shape)
         _, k = self.rotary_emb(positions, dummy_q, k)
-        return k
+        return k.reshape(original_shape)
 
 
 class DFlashMLP(nn.Module):

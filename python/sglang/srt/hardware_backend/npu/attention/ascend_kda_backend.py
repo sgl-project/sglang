@@ -20,6 +20,10 @@ from sgl_kernel_npu.mamba.causal_conv1d import (
 from sgl_kernel_npu.mamba.causal_conv1d_verify import (
     causal_conv1d_linear_verify_npu,
 )
+from sgl_kernel_npu.mamba.kda_state_commit import (
+    move_kda_temporal_snapshot,
+    scatter_kda_conv_snapshot,
+)
 
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
@@ -554,14 +558,21 @@ class AscendKDAHybridLinearAttnBackend:
                 )
                 last_steps = last_correct_step_indices.to(torch.int32)
 
-                move_intermediate_cache_kda(
+                if not move_kda_temporal_snapshot(
                     ssm_states,
                     intermediate_state_cache,
                     dst_indices_tensor,
                     src_indices_tensor,
                     last_steps,
-                    h_block_size=1,
-                )
+                ):
+                    move_intermediate_cache_kda(
+                        ssm_states,
+                        intermediate_state_cache,
+                        dst_indices_tensor,
+                        src_indices_tensor,
+                        last_steps,
+                        h_block_size=1,
+                    )
                 draft_token_num = intermediate_state_cache.shape[2]
                 has_conv_snapshots = getattr(
                     self.linear_attn_backend,
@@ -572,35 +583,56 @@ class AscendKDAHybridLinearAttnBackend:
                     intermediate_conv_window_cache = (
                         mamba_caches.intermediate_conv_window[0]
                     )
-                    speculative_state_scatter_npu(
+                    if not scatter_kda_conv_snapshot(
                         conv_states,
                         intermediate_conv_window_cache,
                         dst_indices_tensor,
                         src_indices_tensor,
                         last_steps,
-                    )
+                    ):
+                        speculative_state_scatter_npu(
+                            conv_states,
+                            intermediate_conv_window_cache,
+                            dst_indices_tensor,
+                            src_indices_tensor,
+                            last_steps,
+                        )
                 if mamba_track_indices is not None:
                     assert mamba_steps_to_track is not None
                     mamba_track_indices = mamba_track_indices.to(torch.int32)
                     mamba_steps_to_track = mamba_steps_to_track.to(torch.int32)
 
-                    move_intermediate_cache_kda(
+                    if not move_kda_temporal_snapshot(
                         ssm_states,
                         intermediate_state_cache,
                         mamba_track_indices,
                         src_indices_tensor,
                         mamba_steps_to_track,
-                        h_block_size=1,
-                    )
+                    ):
+                        move_intermediate_cache_kda(
+                            ssm_states,
+                            intermediate_state_cache,
+                            mamba_track_indices,
+                            src_indices_tensor,
+                            mamba_steps_to_track,
+                            h_block_size=1,
+                        )
 
                     if has_conv_snapshots:
-                        speculative_state_scatter_npu(
+                        if not scatter_kda_conv_snapshot(
                             conv_states,
                             intermediate_conv_window_cache,
                             mamba_track_indices,
                             src_indices_tensor,
                             mamba_steps_to_track,
-                        )
+                        ):
+                            speculative_state_scatter_npu(
+                                conv_states,
+                                intermediate_conv_window_cache,
+                                mamba_track_indices,
+                                src_indices_tensor,
+                                mamba_steps_to_track,
+                            )
                     else:
                         track_mask = mamba_steps_to_track >= 0
                         track_indices = mamba_track_indices[track_mask]
