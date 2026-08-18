@@ -136,10 +136,13 @@ class _MockTokenizerManager:
             if self._fail:
                 raise ValueError("synthetic failure")
             if transcript is not None:
+                finish_reason = self._finish_reasons.pop(0)
+                if not isinstance(finish_reason, dict):
+                    finish_reason = {"type": finish_reason}
                 yield {
                     "text": transcript,
                     "meta_info": {
-                        "finish_reason": {"type": self._finish_reasons.pop(0)}
+                        "finish_reason": finish_reason,
                     },
                 }
 
@@ -326,6 +329,37 @@ def _append_seconds(connection, seconds):
 
 
 class TestStreamingASR(CustomTestCase):
+    def test_decoder_stream_rejects_abort_before_publishing_terminal_text(self):
+        async def collect(text):
+            updates.append(text)
+
+        for status_code in (None, 400, 500, 503):
+            with self.subTest(status_code=status_code):
+                updates = []
+                finish_reason = {
+                    "type": "abort",
+                    "message": "synthetic backend abort",
+                    "status_code": status_code,
+                }
+                tokenizer_manager = _MockTokenizerManager(
+                    "partial transcript",
+                    finish_reasons=[finish_reason],
+                )
+
+                with self.assertRaisesRegex(RuntimeError, "synthetic backend abort"):
+                    _run(
+                        generate_asr_transcript(
+                            tokenizer_manager=tokenizer_manager,
+                            adapter=_adapter(),
+                            audio_data=_AUDIO,
+                            sampling_params={},
+                            prompt="PROMPT:",
+                            on_update=collect,
+                        )
+                    )
+
+                self.assertEqual(updates, [])
+
     def test_decoder_stream_hides_qwen_prefix_and_reconstructs_text(self):
         tokenizer_manager = _StreamingTokenizerManager(
             ["language en<asr", "_text>Hello", " world"]
@@ -1045,6 +1079,42 @@ class TestStreamingASR(CustomTestCase):
         self.assertNotIn(
             "conversation.item.input_audio_transcription.completed", sent_event_types
         )
+
+    def test_streaming_abort_does_not_commit_audio_or_transcript(self):
+        for encoder_windows in (False, True):
+            with self.subTest(encoder_windows=encoder_windows):
+                _, connection = _realtime_connection(
+                    "partial transcript",
+                    [
+                        {
+                            "type": "abort",
+                            "message": "synthetic backend abort",
+                            "status_code": 500,
+                        }
+                    ],
+                    encoder_windows=encoder_windows,
+                )
+
+                with self.assertLogs(level="ERROR"):
+                    self.assertFalse(_run(connection._run_inference(is_last=False)))
+
+                self.assertEqual(
+                    connection.asr_state.audio.last_processed_offset_bytes, 0
+                )
+                self.assertIsNone(connection.asr_state.decoder_suffix)
+                self.assertEqual(connection.asr_state.transcript.full_transcript, "")
+                sent_event_types = [
+                    call.args[0].type for call in connection._send.call_args_list
+                ]
+                self.assertNotIn(
+                    "conversation.item.input_audio_transcription.delta",
+                    sent_event_types,
+                )
+                self.assertNotIn(
+                    "conversation.item.input_audio_transcription.completed",
+                    sent_event_types,
+                )
+                connection.websocket.close.assert_awaited_with(code=1011)
 
     def test_cumulative_length_keeps_existing_reconciliation_behavior(self):
         _, connection = _realtime_connection(

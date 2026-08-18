@@ -225,6 +225,9 @@ async def generate_asr_transcript(
             raw_request,
             audio_encoder_window_config=audio_encoder_window_config,
         ):
+            # Streaming requests receive scheduler aborts as terminal responses.
+            # Reject them before publishing partial text or committing audio.
+            _raise_for_aborted_response(ret)
             if not stream:
                 break
             chunk_text = ret.get("text", "")
@@ -257,6 +260,14 @@ def _finish_reason_type(response: Dict[str, Any]) -> Optional[str]:
     if isinstance(finish_reason, dict):
         finish_reason = finish_reason.get("type")
     return finish_reason
+
+
+def _raise_for_aborted_response(response: Dict[str, Any]) -> None:
+    if _finish_reason_type(response) != "abort":
+        return
+    finish_reason = response.get("meta_info", {}).get("finish_reason")
+    message = finish_reason.get("message") if isinstance(finish_reason, dict) else None
+    raise RuntimeError(message or "ASR backend request aborted")
 
 
 async def generate_cumulative_transcript(
