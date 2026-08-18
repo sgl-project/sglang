@@ -49,7 +49,6 @@ from sglang.srt.utils.common import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
-    is_gfx95_supported,
     is_hip,
     is_mnnvl_fabric_device,
     is_mps,
@@ -2489,11 +2488,17 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     if view.quantization == "mxfp8" and not is_npu():
         from sglang.srt.server_args import MXFP8_MOE_RUNNER_BACKEND_CHOICES
 
-        is_gfx95_mxfp8 = is_hip() and is_gfx95_supported()
+        # Every entry in MXFP8_MOE_RUNNER_BACKEND_CHOICES is CUDA-only, so on ROCm
+        # the whitelist has no viable member and the default below selects a
+        # backend whose kernels and Python package are absent. gfx942 has a
+        # working path: mxfp8_block_convert_required() converts MXFP8 to
+        # block-fp8 [128, 128] at load and runs it through the native block-fp8
+        # triton kernels. Allow triton on all of ROCm, not only gfx95.
+        is_rocm_mxfp8 = is_hip()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
-        if is_gfx95_mxfp8:
+        if is_rocm_mxfp8:
             allowed.append("triton")
-        mxfp8_default = "triton" if is_gfx95_mxfp8 else "flashinfer_trtllm"
+        mxfp8_default = "triton" if is_rocm_mxfp8 else "flashinfer_trtllm"
         if moe_runner_backend == "auto":
             moe_runner_backend = mxfp8_default
         elif moe_runner_backend not in allowed:
