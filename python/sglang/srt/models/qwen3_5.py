@@ -803,7 +803,15 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
+        # The fused AR+RMSNorm+per-group-quant path hands down a
+        # ``(bf16, fp8, scale)`` tuple, so read the token count off the bf16
+        # element. ``linear_attn`` consumes the tuple itself further down.
+        num_tokens = (
+            hidden_states[0].shape[0]
+            if isinstance(hidden_states, tuple)
+            else hidden_states.shape[0]
+        )
+        if not forward_batch.forward_mode.is_idle() and num_tokens > 0:
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
