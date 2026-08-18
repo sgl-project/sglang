@@ -8,6 +8,9 @@ diffusion transformer (DiT) inference:
 - TeaCache: Temporal similarity-based caching for diffusion models
 - Spectrum: Chebyshev spectral feature forecasting for step skipping
 - cache-dit integration: Block-level caching with DBCache and TaylorSeer
+- Step-reuse contract: framework-level policy for reusing a denoising
+  prediction across steps while keeping scheduler updates and side effects
+  explicit (see ``step_reuse``)
 
 """
 
@@ -18,6 +21,13 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     get_scm_mask,
 )
 from sglang.multimodal_gen.runtime.cache.spectrum import SpectrumMixin
+from sglang.multimodal_gen.runtime.cache.step_reuse import (
+    StepReuseController,
+    StepReuseError,
+    StepReusePolicy,
+    StepReuseState,
+    StepSideEffectContract,
+)
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheContext, TeaCacheMixin
 
 __all__ = [
@@ -31,4 +41,10 @@ __all__ = [
     "enable_cache_on_transformer",
     "enable_cache_on_dual_transformer",
     "get_scm_mask",
+    # Step-reuse contract (always available, no external deps)
+    "StepReuseController",
+    "StepReuseError",
+    "StepReusePolicy",
+    "StepReuseState",
+    "StepSideEffectContract",
 ]
