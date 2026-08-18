@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.layers.attention import (
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     _attn_mask_meta_local_pad,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages import (
+    denoising as denoising_module,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
@@ -23,6 +26,7 @@ from sglang.multimodal_gen.runtime.server_args import (
     BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS,
     BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import _print_warning_once
 
 
 class QwenImageTransformer2DModel(torch.nn.Module):
@@ -384,6 +388,20 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         ):
             self.assertIn(config_name, BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS)
 
+    def test_ltx_models_are_registered_as_bcg_supported(self):
+        for model_id in (
+            "lightricks/ltx-2",
+            "lightricks/ltx-2.3",
+        ):
+            self.assertIn(model_id, BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
+
+        self.assertIn(
+            "LTX2PipelineConfig", BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
+        )
+        self.assertIn(
+            "LTX23PipelineConfig", BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
+        )
+
     def test_dynamic_varlen_mask_meta_rebuilds_once_per_replay_token(self):
         builder = DynamicVarlenMaskMeta()
         mask = torch.tensor([[True, True, False, False]])
@@ -427,6 +445,38 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         self.stage._maybe_torch_compile(self.qwen_model)
         self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=True))
         self.assertEqual(self.stage._bcg_runners, {})
+
+    def test_bcg_warns_when_cache_dit_is_requested(self):
+        self.stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=True)
+        _print_warning_once.cache_clear()
+        self.addCleanup(_print_warning_once.cache_clear)
+
+        with (
+            patch.object(self.stage, "_cache_dit_requested", return_value=True),
+            patch.object(denoising_module.logger, "warning") as warning,
+        ):
+            self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=True))
+            self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=False))
+
+        warning.assert_called_once_with(
+            "Cache-DiT was requested but is disabled because breakable CUDA "
+            "graphs are enabled.",
+            stacklevel=2,
+        )
+
+    def test_bcg_does_not_warn_when_cache_dit_is_not_requested(self):
+        self.stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=True)
+
+        with (
+            patch.object(self.stage, "_cache_dit_requested", return_value=False),
+            patch(
+                "sglang.multimodal_gen.runtime.pipelines_core.stages.denoising."
+                "logger.warning_once"
+            ) as warning_once,
+        ):
+            self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=True))
+
+        warning_once.assert_not_called()
 
     def test_bcg_runner_cache_is_per_model_module(self):
         self.stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=True)

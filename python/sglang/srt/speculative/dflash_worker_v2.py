@@ -17,7 +17,7 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
-from sglang.srt.layers.logprob_processor import compute_spec_v2_logprobs
+from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -28,7 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_exec, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -189,7 +189,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self._need_mamba_verify_commit = False
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = (
             server_args.speculative_draft_window_size
@@ -673,7 +673,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self,
         *,
         batch_seq_lens_cpu: Optional[torch.Tensor],
-        reserved_seq_lens_cpu: Optional[torch.Tensor],
+        nxt_kv_lens_cpu: Optional[torch.Tensor],
         draft_prefix_lens: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
@@ -682,8 +682,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         (same contract as the non-compact path in forward_batch_generation)."""
         if batch_seq_lens_cpu is not None:
             self._compute_compact_draft_seq_lens_host(batch_seq_lens_cpu, out=out)
-        elif reserved_seq_lens_cpu is not None:
-            self._compute_compact_draft_seq_lens_host(reserved_seq_lens_cpu, out=out)
+        elif nxt_kv_lens_cpu is not None:
+            self._compute_compact_draft_seq_lens_host(nxt_kv_lens_cpu, out=out)
         else:
             # Last resort: the legacy blocking D2H copy.
             out.copy_(draft_prefix_lens)
@@ -1637,7 +1637,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
             self._fill_compact_seq_lens_cpu_bound(
                 batch_seq_lens_cpu=batch.seq_lens_cpu,
-                reserved_seq_lens_cpu=draft_input.reserved_seq_lens_cpu,
+                nxt_kv_lens_cpu=draft_input.nxt_kv_lens_cpu,
                 draft_prefix_lens=draft_prefix_lens,
                 out=seq_lens_cpu,
             )
@@ -1661,10 +1661,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_cpu.copy_(batch.seq_lens_cpu)
                 seq_lens_cpu.add_(block_size)
                 draft_seq_lens_sum = int(seq_lens_cpu.sum())
-            elif draft_input.reserved_seq_lens_cpu is not None:
+            elif draft_input.nxt_kv_lens_cpu is not None:
                 # GPU-only backend: reserved is a safe over-estimate.
-                seq_lens_cpu.copy_(draft_input.reserved_seq_lens_cpu)
-                draft_seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+                seq_lens_cpu.copy_(draft_input.nxt_kv_lens_cpu)
+                draft_seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
             else:
                 seq_lens_cpu.copy_(prefix_lens.to("cpu", dtype=torch.int32))
                 draft_seq_lens_sum = int(prefix_lens.sum().item())
@@ -1740,9 +1740,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             verify_host_seq_lens = seq_lens_cpu_backup + block_size
             batch.seq_lens_cpu = verify_host_seq_lens
             batch.seq_lens_sum = int(verify_host_seq_lens.sum())
-        elif draft_input.reserved_seq_lens_cpu is not None:
-            batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-            batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+        elif draft_input.nxt_kv_lens_cpu is not None:
+            batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+            batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
@@ -1897,15 +1897,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens = None
 
         if batch.return_logprob:
-            output_indices = torch.arange(
-                bs * block_size, dtype=torch.int64, device=device
-            ).view(bs, block_size)
-            compute_spec_v2_logprobs(
+            compute_spec_logprobs(
                 batch,
                 logits_output,
                 out_tokens.reshape(-1),
-                output_indices,
-                block_size - 1,
+                chain_stride=block_size,
             )
 
         if self._need_mamba_verify_commit:

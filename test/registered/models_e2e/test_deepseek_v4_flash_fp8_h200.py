@@ -140,9 +140,6 @@ class TestDSV4FlashFP8H200MegaMoE(
             ],
             env={
                 "SGLANG_DSV4_FP4_EXPERTS": "0",
-                "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE": "1",
-                "SGLANG_OPT_FIX_MEGA_MOE_MEMORY": "1",
-                "SGLANG_OPT_USE_JIT_EP_ACTIVATION": "1",
                 # INVARIANT: this per-rank cap MUST equal
                 # chunked_prefill_size / dp_size (= 8192 / 4 = 2048), the per-rank
                 # prefill bound under --enable-dp-attention. If you change
