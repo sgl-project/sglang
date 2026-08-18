@@ -101,9 +101,9 @@ class RemoteInstanceWeightTransporter:
             "tp_rank": self.tp_rank,
             "parallelism_config": self.parallelism_config.to_dict(),
         }
-        for attempt in range(60):
+        for attempt in range(24):
             try:
-                resp = http_requests.put(url, json=payload, timeout=30)
+                resp = http_requests.put(url, json=payload, timeout=10)
                 if resp.status_code == 200:
                     logger.info(
                         f"Registered parallelism config for tp_rank={self.tp_rank} "
@@ -118,9 +118,10 @@ class RemoteInstanceWeightTransporter:
                 logger.warning(
                     f"Register parallelism config attempt {attempt} for tp_rank={self.tp_rank}: {e}"
                 )
-            time.sleep(5)
+            if attempt < 23:
+                time.sleep(5)
         raise RuntimeError(
-            f"Failed to register parallelism config for tp_rank={self.tp_rank} after 60 attempts"
+            f"Failed to register parallelism config for tp_rank={self.tp_rank} after 24 attempts"
         )
 
     def _register_to_engine_info_bootstrap(self: RemoteInstanceWeightTransporter):
@@ -152,9 +153,9 @@ class RemoteInstanceWeightTransporter:
             },
         }
 
-        for attempt in range(60):
+        for attempt in range(24):
             try:
-                resp = http_requests.put(url, json=payload, timeout=30)
+                resp = http_requests.put(url, json=payload, timeout=10)
                 if resp.status_code == 200:
                     logger.info(
                         f"Registered transfer engine info for tp_rank={self.tp_rank} "
@@ -169,7 +170,8 @@ class RemoteInstanceWeightTransporter:
                 logger.warning(
                     f"Register transfer engine info attempt {attempt} for tp_rank={self.tp_rank}: {e}"
                 )
-            time.sleep(5)
+            if attempt < 23:
+                time.sleep(5)
         raise RuntimeError(
-            f"Failed to register transfer engine info for tp_rank={self.tp_rank} after 60 attempts"
+            f"Failed to register transfer engine info for tp_rank={self.tp_rank} after 24 attempts"
         )

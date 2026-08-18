@@ -61,6 +61,7 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
+from sglang.srt.layers.attention.dsa import dsa_indexer as dsa_indexer_module
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
@@ -2803,14 +2804,16 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     ("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa", 1),
                 ]
             )
-        if any(
-            name.endswith(".indexer.wk_weights_proj.weight")
-            for name, _ in self.named_parameters()
+        if (
+            is_deepseek_dsa(self.config)
+            and dsa_indexer_module._is_cuda
+            and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
+            and getattr(self.config, "indexer_rope_interleave", False)
         ):
             self.stacked_params_mapping.extend(
                 [
-                    ("indexer.wk_weights_proj", "indexer.wk", 0),
-                    ("indexer.wk_weights_proj", "indexer.weights_proj", 1),
+                    ("indexer.wk_weights_proj.", "indexer.wk.", 0),
+                    ("indexer.wk_weights_proj.", "indexer.weights_proj.", 1),
                 ]
             )
         self.expert_params_mapping = FusedMoE.make_expert_params_mapping(
