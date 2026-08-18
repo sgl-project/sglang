@@ -7,7 +7,7 @@ license.workspace = true
 
 # Consumed by python/setup.py: registers this crate as a PyO3 extension module.
 [package.metadata.sglang]
-python-module = "sglang.srt.server._core"
+python-module = "sglang.srt.rust_extensions._server"
 # Always build optimized, even for an editable install.
 debug = false
 
