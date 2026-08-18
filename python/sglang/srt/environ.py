@@ -933,6 +933,9 @@ class Envs:
     SGLANG_CRASH_ON_TRITON_LOAD_AFTER_READY = EnvBool(False)
     SGLANG_TRITON_SLOW_COMPILE_THRESHOLD_SECS = EnvFloat(1.0)
     SGLANG_TRITON_LOAD_WARNING_THRESHOLD_GB = EnvFloat(1.0)
+    # gfx950 MLA decode stage-1: pick the launch geometry and split count per batch.
+    # Reorders the fp32 accumulation, so off by default.
+    SGLANG_MLA_DECODE_TUNE = EnvBool(False)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
@@ -1262,7 +1265,7 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
-    SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(False)
+    SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
