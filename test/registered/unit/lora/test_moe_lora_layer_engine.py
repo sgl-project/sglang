@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from sglang.srt.lora.moe.moe_lora_runner import MoeLoraLayerEngine
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
@@ -70,7 +71,11 @@ def _engine(monkeypatch, *, capability=(9, 0), created=None, runner_cls=_FakeRun
         "sglang.srt.lora.moe.moe_lora_runner.MoeLoraRunner.from_layer",
         staticmethod(fake_from_layer),
     )
-    return MoeLoraLayerEngine(_base_layer(), workspace=object())
+    # The engine reads --moe-lora-base-gemm at construction. Publish a context
+    # so it reads the shipped default, rather than having production carry a
+    # no-server fallback for tests' benefit.
+    with get_context().override_server_args():
+        return MoeLoraLayerEngine(_base_layer(), workspace=object())
 
 
 def _batch(**overrides):

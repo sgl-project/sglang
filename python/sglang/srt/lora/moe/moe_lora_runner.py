@@ -89,6 +89,7 @@ from sglang.srt.lora.moe.route_factory import (
 )
 from sglang.srt.lora.moe.routing import RouteView
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace, run_parallel
+from sglang.srt.runtime_context import get_lora
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -1219,19 +1220,6 @@ class MoeLoraRunner:
         return output
 
 
-def _base_gemm_vendor() -> str:
-    """The ``--moe-lora-base-gemm`` choice, defaulting when no server is up.
-
-    Kernel tests and offline tools build engines with no published context.
-    """
-    try:
-        from sglang.srt.server_args import get_global_server_args
-
-        return get_global_server_args().moe_lora_base_gemm
-    except Exception:  # no published context (tests, offline tooling)
-        return "cutedsl"
-
-
 class MoeLoraLayerEngine:
     """Everything one MoE layer needs to run LoRA behind ``run_moe_core``.
 
@@ -1262,7 +1250,7 @@ class MoeLoraLayerEngine:
         self.hidden_size = int(base_layer.w2_weight.shape[1])
         self.num_local_experts = int(base_layer.num_local_experts)
         # Server-lifetime constant, so nothing vendor-shaped reaches a forward.
-        self.base_gemm_vendor = _base_gemm_vendor()
+        self.base_gemm_vendor = get_lora().moe_lora_base_gemm
         self.workspace = workspace
         self._selected: dict[Phase, SelectedPlan] | None = None
         self._tiles: dict[Phase, TileTable] = {}
