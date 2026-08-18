@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from sglang.srt.speculative.triton_ops.tree_query_kv_layout import (
+from sglang.kernels.ops.speculative.tree_query_kv_layout import (
     build_tree_query_kv_layout,
 )
 from sglang.test.ci.ci_register import register_cuda_ci

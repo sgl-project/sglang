@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
+from sglang.srt.speculative.ngram_precompute import extract_local_accept_path_nodes
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
@@ -170,15 +171,30 @@ class RelayPayload:
     # ngram delays the draft extend (ngram update)
     accept_tokens: Optional[torch.Tensor] = None
     accept_lens: Optional[torch.Tensor] = None
+    accept_index: Optional[torch.Tensor] = None
 
     @classmethod
-    def from_ngram(cls, draft_input: NgramVerifyInput) -> RelayPayload:
+    def from_ngram(
+        cls,
+        draft_input: NgramVerifyInput,
+        relay_accept_index: bool = False,
+    ) -> RelayPayload:
+        accept_index = (
+            extract_local_accept_path_nodes(
+                draft_input.accept_index,
+                draft_input.accept_lens,
+                draft_input.draft_token_num,
+            )
+            if relay_accept_index
+            else None
+        )
         return cls(
             bonus_tokens=None,
             accept_tokens=draft_input.accept_tokens.reshape(
                 -1, draft_input.draft_token_num
             ),
             accept_lens=draft_input.accept_lens,
+            accept_index=accept_index,
         )
 
     @classmethod
@@ -329,6 +345,7 @@ class FutureMap:
         # ngram-only relay bufs
         self.accept_tokens_buf: Optional[torch.Tensor] = None
         self.accept_lens_buf: Optional[torch.Tensor] = None
+        self.accept_index_buf: Optional[torch.Tensor] = None
 
         self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
         # Debug consume-once state: armed by a recording publish, consumed by
@@ -411,6 +428,13 @@ class FutureMap:
             dtype=payload.accept_lens.dtype,
             device=self.device,
         )
+        if payload.accept_index is not None:
+            self.accept_index_buf = torch.full(
+                (self.req_pool_size,),
+                -1,
+                dtype=payload.accept_index.dtype,
+                device=self.device,
+            )
 
     def resolve_confidence_cpu(
         self, batch: ScheduleBatch
@@ -433,6 +457,11 @@ class FutureMap:
                 return
             draft_input.accept_tokens = self.accept_tokens_buf[indices].flatten()
             draft_input.accept_lens = self.accept_lens_buf[indices]
+            # FutureMap stores one batch-independent local path node per
+            # request. This replaces the sampler's flattened batch-global
+            # accept_index after filter/merge has finalized request ordering.
+            if self.accept_index_buf is not None:
+                draft_input.accept_index = self.accept_index_buf[indices]
             return
         draft_input: EagleDraftInput = batch.spec_info
         if draft_input is None:
@@ -577,6 +606,9 @@ class FutureMap:
             self._maybe_init_ngram_bufs(payload)
             self.accept_tokens_buf[indices] = payload.accept_tokens
             self.accept_lens_buf[indices] = payload.accept_lens
+            if self.accept_index_buf is not None:
+                assert payload.accept_index is not None
+                self.accept_index_buf[indices] = payload.accept_index
             return
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(payload)

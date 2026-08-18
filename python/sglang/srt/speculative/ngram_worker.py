@@ -23,6 +23,9 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWo
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
+from sglang.srt.speculative.ngram_precompute import (
+    apply_precomputed_drafts_for_rows,
+)
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
@@ -517,20 +520,18 @@ class NGRAMWorker(BaseSpecWorker):
         ):
             return False
 
-        bs = len(batch.reqs)
-        d = self.draft_token_num
         cache = self._gpu_precomputed_cache
         req_id_to_row = cache["req_id_to_row"]
         cache_rows = [req_id_to_row.get(req.rid, -1) for req in batch.reqs]
 
         prev_accept_tokens = batch.spec_info.accept_tokens
         prev_accept_lens = batch.spec_info.accept_lens
-        prev_accept_index = batch.spec_info.accept_index
+        accept_path_nodes = batch.spec_info.accept_index
         if (
-            prev_accept_index is None
+            accept_path_nodes is None
             or not prev_accept_tokens.is_cuda
             or not prev_accept_lens.is_cuda
-            or not prev_accept_index.is_cuda
+            or not accept_path_nodes.is_cuda
         ):
             return False
 
@@ -538,69 +539,18 @@ class NGRAMWorker(BaseSpecWorker):
         device_module.current_stream().wait_event(cache["copy_event"])
         self._stage_prev_accept_cpu_copy(prev_accept_tokens, prev_accept_lens)
 
-        req_indices = torch.arange(bs, device=prev_accept_tokens.device)
-        cache_rows_cpu = torch.tensor(
-            cache_rows, dtype=torch.long, device="cpu", pin_memory=True
+        cache_hits = apply_precomputed_drafts_for_rows(
+            cache_rows,
+            prev_accept_tokens,
+            prev_accept_lens,
+            accept_path_nodes,
+            cache["bonus_tokens"],
+            cache["draft_tokens"],
+            cache["tree_mask"],
+            self.fallback_tree_mask,
+            draft_tokens,
+            tree_mask,
         )
-        cache_rows_gpu = cache_rows_cpu.to(prev_accept_tokens.device, non_blocking=True)
-        has_precomputed_row = cache_rows_gpu >= 0
-        safe_cache_rows = torch.clamp(cache_rows_gpu, min=0)
-        req_offsets = req_indices * d
-        accept_lens = prev_accept_lens.to(dtype=torch.long)
-        last_slots = torch.clamp(accept_lens - 1, min=0, max=d - 1)
-        accept_tokens_2d = prev_accept_tokens.view(bs, d)
-        accept_index_2d = prev_accept_index.view(bs, d).to(dtype=torch.long)
-        slot_indices = torch.arange(d, device=prev_accept_tokens.device)
-        accepted_slot_mask = slot_indices[None, :] < accept_lens[:, None]
-        valid_index_mask = accepted_slot_mask & (accept_index_2d >= 0)
-        path_slots = (
-            torch.where(
-                valid_index_mask,
-                slot_indices[None, :],
-                torch.full(
-                    (bs, d), -1, dtype=torch.long, device=prev_accept_tokens.device
-                ),
-            )
-            .max(dim=1)
-            .values
-        )
-        safe_path_slots = torch.clamp(path_slots, min=0, max=d - 1)
-        path_global = accept_index_2d[req_indices, safe_path_slots]
-        path_nodes = path_global - req_offsets
-        valid_path = (
-            has_precomputed_row
-            & (accept_lens > 0)
-            & (accept_lens <= d)
-            & (path_slots >= 0)
-            & (path_global >= 0)
-            & (path_nodes >= 0)
-            & (path_nodes < d)
-        )
-        safe_path_nodes = torch.clamp(path_nodes, min=0, max=d - 1)
-        bonus_tokens = accept_tokens_2d[req_indices, last_slots].to(dtype=torch.int32)
-
-        bonus_candidates = cache["bonus_tokens"][safe_cache_rows, safe_path_nodes]
-        slot_matches = (bonus_candidates == bonus_tokens[:, None]) & valid_path[:, None]
-        cache_hits = torch.any(slot_matches, dim=1)
-        bonus_slots = torch.argmax(slot_matches.to(torch.int32), dim=1).to(torch.long)
-
-        cached_drafts = cache["draft_tokens"][
-            safe_cache_rows, safe_path_nodes, bonus_slots
-        ]
-        cached_masks = cache["tree_mask"][safe_cache_rows, safe_path_nodes, bonus_slots]
-
-        fallback_drafts = torch.zeros_like(cached_drafts)
-        fallback_drafts[:, 0] = bonus_tokens.to(dtype=fallback_drafts.dtype)
-        fallback_masks = self.fallback_tree_mask.expand(bs, -1, -1)
-
-        selected_drafts = torch.where(
-            cache_hits[:, None], cached_drafts, fallback_drafts
-        )
-        selected_masks = torch.where(
-            cache_hits[:, None, None], cached_masks, fallback_masks
-        )
-        draft_tokens.copy_(selected_drafts.reshape(-1), non_blocking=True)
-        tree_mask.copy_(selected_masks.reshape(-1), non_blocking=True)
         self._stage_selected_drafts_cpu_copy(draft_tokens, tree_mask, cache_hits)
         self._gpu_precomputed_cache = None
         return True
@@ -700,7 +650,7 @@ class NGRAMWorker(BaseSpecWorker):
             # Pre-sync: only needs seq_lens_cpu, so build before the blocking
             # accept sync inside _prepare_draft_tokens.
             ones_masks = None
-            if USE_FULL_MASK and not _is_cpu:
+            if USE_FULL_MASK and not _is_cpu and not self.enable_precompute:
                 ones_masks = [
                     torch.ones(
                         (self.draft_token_num, batch.seq_lens_cpu[i]),
@@ -710,6 +660,11 @@ class NGRAMWorker(BaseSpecWorker):
                 ]
 
             req_drafts, mask = self._prepare_draft_tokens(batch)
+            if self.enable_precompute:
+                # Bootstrap (or whole-cache miss): this batch_get tree becomes
+                # the phase-1 input for precomputing the next iteration.
+                self._precomputed_draft_tokens_np = req_drafts.copy()
+                self._precomputed_tree_mask_np = mask.copy()
             tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
             draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
 
@@ -886,7 +841,6 @@ class NGRAMWorker(BaseSpecWorker):
             dense_draft_tokens,
             dense_tree_mask,
         ) = self.ngram_corpus.precompute_drafts_dense(
-            req_ids,
             base_tokens_batch,
             base_total_lens,
             cur_draft_tokens,

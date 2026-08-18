@@ -42,6 +42,9 @@ class NgramVerifyInput(SpecInput):
         self.new_seq_lens = new_seq_lens
         self.accept_tokens = accept_tokens
         self.accept_lens = accept_lens
+        # Sampler output uses flattened batch-global indices. In NGRAM
+        # precompute overlap mode, FutureMap resolves this field to one local
+        # accepted path node per request after batch filter/merge.
         self.accept_index = accept_index
 
         self.device = (
@@ -151,11 +154,9 @@ class NgramVerifyInput(SpecInput):
             )  # (new_bs, 1)
             self.accept_index = torch.where(
                 accept_2d != -1, accept_2d + shift, accept_2d
-            )
+            ).flatten()
 
     def merge_batch(self, spec_info: NgramVerifyInput):
-        self_bs = self.accept_lens.shape[0]
-        d = self.draft_token_num
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
             self.future_indices = torch.cat(
@@ -163,6 +164,8 @@ class NgramVerifyInput(SpecInput):
             )
             return
 
+        self_bs = self.accept_lens.shape[0]
+        d = self.draft_token_num
         if self.new_seq_lens is not None:
             assert spec_info.new_seq_lens is not None
             self.new_seq_lens = torch.cat(

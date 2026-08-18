@@ -3872,7 +3872,10 @@ class Scheduler(
         """Stash this iter's relay payload for next iter's resolve_forward_inputs."""
         if self.spec_algorithm.is_ngram():
             if batch_result.next_draft_input is not None:
-                payload = RelayPayload.from_ngram(batch_result.next_draft_input)
+                payload = RelayPayload.from_ngram(
+                    batch_result.next_draft_input,
+                    relay_accept_index=not self.future_map.needs_cpu_seq_lens,
+                )
                 self.future_map.stash(future_indices, payload)
             return
         if batch_result.next_draft_input is not None:

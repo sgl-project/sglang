@@ -3,9 +3,7 @@
 #include "trie.h"
 #include <algorithm>
 #include <cmath>
-#include <functional>
 #include <limits>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -15,10 +13,6 @@ namespace sglang {
 namespace ngram {
 
 namespace {
-
-size_t hashCombine(size_t seed, size_t value) {
-  return seed ^ (value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
-}
 
 std::vector<int32_t>
 appendAndTrim(const std::vector<int32_t>& base, const std::vector<int32_t>& extra, size_t max_len) {
@@ -97,23 +91,6 @@ size_t wideBonusTokenCount(size_t draft_token_num, double wide_bonus_ratio) {
 }
 
 }  // namespace
-
-size_t Ngram::PathKeyHash::operator()(const PathKey& key) const {
-  size_t seed = std::hash<int64_t>{}(key.state_id);
-  for (const auto col : key.path_cols) {
-    seed = hashCombine(seed, std::hash<int32_t>{}(col));
-  }
-  return seed;
-}
-
-size_t Ngram::PathBonusKeyHash::operator()(const PathBonusKey& key) const {
-  size_t seed = std::hash<int64_t>{}(key.state_id);
-  seed = hashCombine(seed, std::hash<int32_t>{}(key.bonus_token));
-  for (const auto col : key.path_cols) {
-    seed = hashCombine(seed, std::hash<int32_t>{}(col));
-  }
-  return seed;
-}
 
 Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
   if (!(param_.max_trie_depth > 1)) {
@@ -358,8 +335,7 @@ Result Ngram::batchMatch(
   return merged;
 }
 
-PrecomputeDraftsStats Ngram::precomputeDrafts(
-    const std::vector<int64_t>& state_ids,
+PrecomputeDraftsStats Ngram::precomputeDraftsDense(
     const std::vector<std::vector<int32_t>>& base_tokens,
     const std::vector<size_t>& base_total_lens,
     const std::vector<int32_t>& draft_tokens,
@@ -367,38 +343,30 @@ PrecomputeDraftsStats Ngram::precomputeDrafts(
     size_t bonus_topk,
     size_t max_trie_depth,
     double wide_bonus_ratio,
-    PrecomputeDraftsDenseCache* dense_cache) {
-  if (state_ids.size() != base_tokens.size() || state_ids.size() != base_total_lens.size()) {
-    throw std::runtime_error("precomputeDrafts expects state_ids, base_tokens, and base_total_lens to match in size");
+    PrecomputeDraftsDenseCache& dense_cache) {
+  if (base_tokens.size() != base_total_lens.size()) {
+    throw std::runtime_error("precomputeDraftsDense expects base_tokens and base_total_lens to match in size");
   }
-  const size_t bs = state_ids.size();
+  const size_t bs = base_tokens.size();
   const size_t d = param_.draft_token_num;
   if (draft_tokens.size() != bs * d) {
-    throw std::runtime_error("precomputeDrafts received draft_tokens with unexpected size");
+    throw std::runtime_error("precomputeDraftsDense received draft_tokens with unexpected size");
   }
   if (tree_mask.size() != bs * d * d) {
-    throw std::runtime_error("precomputeDrafts received tree_mask with unexpected size");
+    throw std::runtime_error("precomputeDraftsDense received tree_mask with unexpected size");
   }
 
   std::unique_lock<std::mutex> lock(mutex_);
-  precomputed_cache_.clear();
-  precomputed_bonus_candidates_.clear();
   const auto wide_bonus_token_count = wideBonusTokenCount(d, wide_bonus_ratio);
   const auto max_phase2_entries = bs * (wide_bonus_token_count * bonus_topk + (d - wide_bonus_token_count));
-  if (dense_cache != nullptr) {
-    dense_cache->bonus_tokens.assign(bs * d * bonus_topk, -1);
-    dense_cache->draft_tokens.assign(bs * d * bonus_topk * d, 0);
-    dense_cache->tree_mask.assign(bs * d * bonus_topk * d * d, 0);
-  } else {
-    precomputed_cache_.reserve(max_phase2_entries);
-    precomputed_bonus_candidates_.reserve(bs);
-  }
+  dense_cache.bonus_tokens.assign(bs * d * bonus_topk, -1);
+  dense_cache.draft_tokens.assign(bs * d * bonus_topk * d, 0);
+  dense_cache.tree_mask.assign(bs * d * bonus_topk * d * d, 0);
 
   struct Phase2Entry {
     size_t req_idx;
     size_t path_node;
     size_t bonus_slot;
-    std::optional<PathBonusKey> legacy_cache_key;
     std::vector<int32_t> tokens;
     size_t total_len;
     MatchState state;
@@ -408,7 +376,6 @@ PrecomputeDraftsStats Ngram::precomputeDrafts(
   PrecomputeDraftsStats stats;
 
   for (size_t req_idx = 0; req_idx < bs; ++req_idx) {
-    const auto state_id = state_ids[req_idx];
     const auto row_token_offset = req_idx * d;
     const auto row_mask_offset = req_idx * d * d;
 
@@ -440,8 +407,6 @@ PrecomputeDraftsStats Ngram::precomputeDrafts(
 
       auto current_child_tokens =
           directChildTokens(draft_tokens, tree_mask, row_token_offset, row_mask_offset, d, node);
-      const bool keep_root_bonus_candidates = dense_cache == nullptr && path_cols.size() == 1;
-      std::vector<int32_t> root_bonus_candidates;
       size_t num_bonus_candidates = 0;
       const auto path_bonus_topk = node < wide_bonus_token_count ? bonus_topk : std::min<size_t>(bonus_topk, 1);
       if (path_bonus_topk == 0) {
@@ -460,34 +425,14 @@ PrecomputeDraftsStats Ngram::precomputeDrafts(
           continue;
         }
         const auto bonus_slot = num_bonus_candidates++;
-        if (dense_cache != nullptr) {
-          const auto dense_bonus_offset = (req_idx * d + node) * bonus_topk + bonus_slot;
-          dense_cache->bonus_tokens[dense_bonus_offset] = bonus_token;
-        }
-        if (keep_root_bonus_candidates) {
-          root_bonus_candidates.emplace_back(bonus_token);
-        }
+        const auto dense_bonus_offset = (req_idx * d + node) * bonus_topk + bonus_slot;
+        dense_cache.bonus_tokens[dense_bonus_offset] = bonus_token;
         auto draft_check_tokens = appendTokenAndTrim(check_tokens, bonus_token, max_trie_depth);
-        std::optional<PathBonusKey> legacy_cache_key;
-        if (dense_cache == nullptr) {
-          legacy_cache_key.emplace(PathBonusKey{state_id, path_cols, bonus_token});
-        }
         phase2_entries.emplace_back(
-            Phase2Entry{
-                req_idx,
-                node,
-                bonus_slot,
-                std::move(legacy_cache_key),
-                std::move(draft_check_tokens),
-                check_total_len + 1,
-                path_state});
+            Phase2Entry{req_idx, node, bonus_slot, std::move(draft_check_tokens), check_total_len + 1, path_state});
         if (num_bonus_candidates >= path_bonus_topk) {
           break;
         }
-      }
-
-      if (!root_bonus_candidates.empty()) {
-        precomputed_bonus_candidates_[PathKey{state_id, path_cols}] = std::move(root_bonus_candidates);
       }
     }
   }
@@ -496,131 +441,19 @@ PrecomputeDraftsStats Ngram::precomputeDrafts(
   const auto phase2_batch_size = std::max<size_t>(phase2_entries.size(), 1);
   for (auto& entry : phase2_entries) {
     auto res = buildMatchUnlocked(entry.tokens, entry.total_len, entry.state, phase2_batch_size);
-    if (dense_cache != nullptr) {
-      const auto dense_token_offset = ((entry.req_idx * d + entry.path_node) * bonus_topk + entry.bonus_slot) * d;
-      const auto dense_mask_offset = dense_token_offset * d;
-      const auto result_size = std::min(d, res.token.size());
-      std::copy_n(res.token.begin(), result_size, dense_cache->draft_tokens.begin() + dense_token_offset);
-      for (size_t row = 0; row < result_size; ++row) {
-        std::copy_n(
-            res.mask.begin() + row * res.token.size(),
-            result_size,
-            dense_cache->tree_mask.begin() + dense_mask_offset + row * d);
-      }
-    }
-    if (entry.legacy_cache_key.has_value()) {
-      precomputed_cache_.try_emplace(std::move(*entry.legacy_cache_key), std::move(res));
+    const auto dense_token_offset = ((entry.req_idx * d + entry.path_node) * bonus_topk + entry.bonus_slot) * d;
+    const auto dense_mask_offset = dense_token_offset * d;
+    const auto result_size = std::min(d, res.token.size());
+    std::copy_n(res.token.begin(), result_size, dense_cache.draft_tokens.begin() + dense_token_offset);
+    for (size_t row = 0; row < result_size; ++row) {
+      std::copy_n(
+          res.mask.begin() + row * res.token.size(),
+          result_size,
+          dense_cache.tree_mask.begin() + dense_mask_offset + row * d);
     }
   }
-  stats.num_cache_entries =
-      static_cast<int64_t>(dense_cache != nullptr ? phase2_entries.size() : precomputed_cache_.size());
+  stats.num_cache_entries = static_cast<int64_t>(phase2_entries.size());
   return stats;
-}
-
-SelectPrecomputedDraftsResult Ngram::selectPrecomputedDrafts(
-    const std::vector<int64_t>& state_ids,
-    const std::vector<int32_t>& accept_tokens,
-    const std::vector<int64_t>& accept_lens,
-    const std::vector<int64_t>& accept_index,
-    const std::vector<std::vector<int32_t>>& fallback_tokens,
-    const std::vector<size_t>& fallback_total_lens) {
-  if (state_ids.size() != accept_lens.size() || state_ids.size() != fallback_tokens.size() ||
-      state_ids.size() != fallback_total_lens.size()) {
-    throw std::runtime_error(
-        "selectPrecomputedDrafts expects state_ids, accept_lens, fallback_tokens, and fallback_total_lens to match");
-  }
-  const size_t bs = state_ids.size();
-  const size_t d = param_.draft_token_num;
-  if (accept_tokens.size() != bs * d) {
-    throw std::runtime_error("selectPrecomputedDrafts received accept_tokens with unexpected size");
-  }
-  if (accept_index.size() != bs * d) {
-    throw std::runtime_error("selectPrecomputedDrafts received accept_index with unexpected size");
-  }
-
-  std::unique_lock<std::mutex> lock(mutex_);
-  SelectPrecomputedDraftsResult out;
-  out.result.token.assign(bs * d, 0);
-  out.result.mask.assign(bs * d * d, 0);
-  out.bonus_prediction_hit.assign(bs, 0);
-  out.precomputed_cache_hit.assign(bs, 0);
-  out.bonus_prediction_total_ct = static_cast<int64_t>(bs);
-  out.precomputed_cache_total_ct = static_cast<int64_t>(bs);
-
-  std::vector<size_t> miss_indices;
-  miss_indices.reserve(bs);
-  for (size_t i = 0; i < bs; ++i) {
-    const auto accept_len = accept_lens[i];
-    if (accept_len <= 0 || accept_len > static_cast<int64_t>(d)) {
-      miss_indices.emplace_back(i);
-      continue;
-    }
-
-    std::vector<int32_t> path_cols;
-    const auto num_path_slots = std::min<size_t>(static_cast<size_t>(accept_len), d);
-    path_cols.reserve(num_path_slots);
-    bool valid_path = true;
-    for (size_t j = 0; j < num_path_slots; ++j) {
-      const auto global_idx = accept_index[i * d + j];
-      if (global_idx != -1) {
-        const auto local_idx = global_idx - static_cast<int64_t>(i * d);
-        if (local_idx < 0 || local_idx >= static_cast<int64_t>(d)) {
-          valid_path = false;
-          break;
-        }
-        path_cols.emplace_back(static_cast<int32_t>(local_idx));
-      }
-    }
-    if (!valid_path) {
-      miss_indices.emplace_back(i);
-      continue;
-    }
-
-    const auto bonus_token = accept_tokens[i * d + static_cast<size_t>(accept_len - 1)];
-    const PathBonusKey cache_key{state_ids[i], path_cols, bonus_token};
-    auto cache_iter = precomputed_cache_.find(cache_key);
-    if (cache_iter != precomputed_cache_.end()) {
-      out.bonus_prediction_hit[i] = 1;
-      out.precomputed_cache_hit[i] = 1;
-      ++out.bonus_prediction_hit_ct;
-      ++out.precomputed_cache_hit_ct;
-      std::copy(cache_iter->second.token.begin(), cache_iter->second.token.end(), out.result.token.begin() + i * d);
-      std::copy(cache_iter->second.mask.begin(), cache_iter->second.mask.end(), out.result.mask.begin() + i * d * d);
-    } else {
-      miss_indices.emplace_back(i);
-    }
-  }
-
-  const auto miss_batch_size = std::max<size_t>(miss_indices.size(), 1);
-  for (const auto i : miss_indices) {
-    if (fallback_tokens[i].empty()) {
-      throw std::runtime_error("selectPrecomputedDrafts received an empty fallback token tail");
-    }
-    auto& state = match_state_[state_ids[i]];
-    auto res = buildMatchUnlocked(fallback_tokens[i], fallback_total_lens[i], state, miss_batch_size);
-    std::copy(res.token.begin(), res.token.end(), out.result.token.begin() + i * d);
-    std::copy(res.mask.begin(), res.mask.end(), out.result.mask.begin() + i * d * d);
-  }
-
-  return out;
-}
-
-std::vector<int32_t> Ngram::precomputedRootBonusTokens(const std::vector<int64_t>& state_ids) const {
-  std::unique_lock<std::mutex> lock(mutex_);
-  std::vector<int32_t> out;
-  out.reserve(state_ids.size());
-  const std::vector<int32_t> root_path_cols{0};
-
-  for (const auto state_id : state_ids) {
-    const PathKey key{state_id, root_path_cols};
-    auto iter = precomputed_bonus_candidates_.find(key);
-    if (iter == precomputed_bonus_candidates_.end() || iter->second.empty()) {
-      out.emplace_back(-1);
-    } else {
-      out.emplace_back(iter->second.front());
-    }
-  }
-  return out;
 }
 
 void Ngram::eraseMatchState(const std::vector<int64_t>& state_ids) {

@@ -16,6 +16,9 @@ from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
+from sglang.kernels.ops.speculative.tree_query_kv_layout import (
+    build_tree_query_kv_layout,
+)
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
@@ -41,9 +44,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.ragged_verify import build_ragged_target_verify_geometry
 from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
-from sglang.srt.speculative.triton_ops.tree_query_kv_layout import (
-    build_tree_query_kv_layout,
-)
 from sglang.srt.utils import get_compiler_backend
 from sglang.srt.utils.common import get_device_capability
 
@@ -266,7 +266,9 @@ class FlashAttentionBackend(AttentionBackend):
         # NGRAM uses FA's two-stage cascade path: prefix attention followed by
         # per-query tree attention. All metadata is built from GPU seq_lens.
         # Local/SWA/MLA variants need separate tree-attention handling and stay
-        # on the guarded unsupported path for now.
+        # on the guarded unsupported path for now. FA4's expand pass presents
+        # physical token slots as page-size-1 pages, which FA4 cannot run when
+        # startup selected its page-size-128 cache mode.
         self.supports_ngram_gpu_only_seq_lens = self.is_ngram and not any(
             (
                 self.use_mla,
@@ -274,6 +276,7 @@ class FlashAttentionBackend(AttentionBackend):
                 self.has_local_attention,
                 self.has_swa,
                 self.use_sliding_window_kv_pool,
+                fa_impl_ver == 4 and self.page_size != 1,
             )
         )
         self.needs_cpu_seq_lens = not self.supports_ngram_gpu_only_seq_lens
