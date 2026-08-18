@@ -7,7 +7,7 @@ SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are 
 # Fetch tags from origin to ensure we have the latest
 if git fetch --tags origin; then
   # Use the shared helper so stable/post releases sort above rc tags.
-  VERSION_FROM_TAG=$(python3 python/tools/get_version_tag.py --tag-only || true)
+  VERSION_FROM_TAG=$(python3 scripts/release/get_version_tag.py --tag-only || true)
   if [ -n "$VERSION_FROM_TAG" ]; then
     SGLANG_VERSION="$VERSION_FROM_TAG"
     echo "Using SGLang version from git tags: $SGLANG_VERSION"
