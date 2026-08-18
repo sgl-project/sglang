@@ -479,10 +479,6 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
 
-        # EAGLE/STANDALONE draft KV pool inherits max_total tokens with its
-        # full-attn layers; budget into the full term. A banded MTP depth
-        # (Inkling mtp_local_layer_ids) instead allocates an swa-geometry ring
-        # at FULL draft capacity, so budget those depths at swa_per_token.
         self._draft_full_layers_num = 0
         self._draft_swa_full_layers_num = 0
         if (
@@ -491,18 +487,12 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
             draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
             if draft_layers is not None and int(draft_layers) > 0:
                 draft_layers = int(draft_layers)
-                banded_depths = 0
-                if (
-                    model_config.hf_config.architectures[0]
-                    == "InklingForConditionalGeneration"
-                ):
-                    banded_depths = len(
-                        [
-                            i
-                            for i in model_config.hf_text_config.mtp_local_layer_ids
-                            if i < draft_layers
-                        ]
-                    )
+                local_layer_ids = set(
+                    getattr(model_config.hf_text_config, "mtp_local_layer_ids", [])
+                )
+                banded_depths = sum(
+                    layer_id in local_layer_ids for layer_id in range(draft_layers)
+                )
                 self._draft_swa_full_layers_num = banded_depths
                 self._draft_full_layers_num = draft_layers - banded_depths
 
