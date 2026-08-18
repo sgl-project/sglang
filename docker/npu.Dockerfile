@@ -110,7 +110,7 @@ RUN mkdir cann-custom-ops && \
 
 # Install Deep-ep
 # pin wheel to 0.45.1 ref: https://github.com/pypa/wheel/issues/662
-RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil \
+RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil tabulate \
     && mkdir sgl-kernel-npu \
     && cd sgl-kernel-npu \
     && wget https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-py311-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip \
