@@ -1769,7 +1769,8 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        if logits_output.tp_sharded_greedy_token_ids is None:
+            self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens
         next_token_ids = self.sampler(
