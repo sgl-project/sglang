@@ -80,7 +80,7 @@ class TestBadInputIsClientError(CustomTestCase):
 
 
 class TestServerFaultStaysServerError(CustomTestCase):
-    """``load_video`` catches the decoder broadly; these are the exclusions."""
+    """Non-payload failures must stay server errors."""
 
     def _assert_server_error(self, side_effect):
         with patch(
@@ -94,6 +94,14 @@ class TestServerFaultStaysServerError(CustomTestCase):
 
     def test_decoder_oom(self):
         self._assert_server_error(MemoryError("out of memory"))
+
+    def test_non_pil_oserror(self):
+        with patch(
+            "sglang.srt.multimodal.processors.base_processor.load_audio",
+            side_effect=OSError("too many open files"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "too many open files"):
+                _StubProcessor._load_single_item(b"payload", Modality.AUDIO)
 
 
 class TestDecodeTimeCorruptionIsClientError(CustomTestCase):
@@ -140,11 +148,14 @@ class TestClientMediaExceptions(CustomTestCase):
             requests.exceptions.ConnectionError,
             requests.exceptions.Timeout,
             binascii.Error,  # invalid base64
-            SyntaxError,  # PIL: corrupt PNG chunk structure during lazy decode
-            OSError,  # PIL: truncated image bytes during lazy decode
         ):
             with self.subTest(exc_type=exc_type.__name__):
                 self.assertTrue(issubclass(exc_type, CLIENT_MEDIA_EXCEPTIONS))
+
+        # PIL's broad built-in failures are translated at the image decode site;
+        # globally classifying them would hide unrelated loader/system faults.
+        self.assertNotIn(OSError, CLIENT_MEDIA_EXCEPTIONS)
+        self.assertNotIn(SyntaxError, CLIENT_MEDIA_EXCEPTIONS)
 
 
 if __name__ == "__main__":
