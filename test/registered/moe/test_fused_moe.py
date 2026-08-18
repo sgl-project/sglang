@@ -253,14 +253,39 @@ class TestFusedMOE(CustomTestCase):
                                             empty_gpu_cache()
                                         pbar.update(1)
 
+    @staticmethod
+    def poison_route_major_intermediate(m, k, topk, dtype):
+        """Leave NaN-filled blocks shaped like the route-major intermediate on
+        the caching allocator's free list.
+
+        The topk == 1 path has the second kernel write straight into the output
+        and never fills that intermediate, so a combine that reduces it anyway
+        reads whichever block the allocator happened to hand back. The reference
+        values here are ~1e-8 while the bf16 tolerance is 1e-2, so small garbage
+        (a freshly zeroed block) passes and the bug only surfaces when the block
+        holds something large -- which is why it stayed hidden on CUDA and
+        flapped on MI300. Poisoning makes that read a NaN instead. Poisoning
+        that misses is harmless: correct code never reads the buffer.
+        """
+        junk = [
+            torch.empty((m, topk, k), dtype=dtype, device=get_device()).fill_(
+                float("nan")
+            )
+            for _ in range(8)
+        ]
+        del junk
+
     def test_single_expert_routing(self):
         # Cover the topk == 1 fast path (e.g. Llama-4-Scout num_experts_per_tok=1),
-        # where the second kernel writes directly into the output when
-        # routed_scaling_factor == 1.0 and the reduction is otherwise applied.
+        # where the second kernel writes the combined rows directly into the
+        # output and the route-major intermediate is left uninitialized.
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         for routed_scaling_factor in [1.0, 1.5]:
             for m in [1, 33]:
                 with self.subTest(m=m, routed_scaling_factor=routed_scaling_factor):
+                    self.poison_route_major_intermediate(
+                        m=m, k=128, topk=1, dtype=torch.bfloat16
+                    )
                     self._test_case(
                         m,
                         n=128,

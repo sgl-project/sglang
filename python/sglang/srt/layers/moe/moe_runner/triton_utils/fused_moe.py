@@ -798,24 +798,24 @@ def _fused_moe_kernel_sequence(
     # hooks.after_down can inspect/modify it before reduction.
     _use_intermediate = not no_combine and (topk != 1 or hooks)
 
-    out_slice = None
     if use_fused_moe_sum_all_reduce:
-        out_slice = out_hidden_states
-        out_slice.zero_()
+        # The kernel accumulates every route into the output in place.
+        out_hidden_states.zero_()
+        down_out = out_hidden_states
+    elif _use_intermediate:
+        down_out = intermediate_cache3
+    else:
+        # Single-expert routing (and no_combine) keep out_hidden_states'
+        # layout, so the kernel writes the finished rows straight into it and
+        # intermediate_cache3 is left uninitialized. The combine below keys off
+        # ``down_out`` so it never reduces a buffer the kernel did not write.
+        down_out = out_hidden_states.unsqueeze(0)
 
     invoke_fused_moe_kernel(
         intermediate_cache2,
         w2,
         b2,
-        (
-            out_slice
-            if use_fused_moe_sum_all_reduce
-            else (
-                intermediate_cache3
-                if _use_intermediate
-                else out_hidden_states.unsqueeze(0)
-            )
-        ),
+        down_out,
         a2_scale,
         w2_scale,
         w2_zp,
@@ -853,14 +853,13 @@ def _fused_moe_kernel_sequence(
 
     if no_combine:
         pass
+    elif down_out is not intermediate_cache3:
+        # The kernel wrote (or accumulated) the finished rows into
+        # out_hidden_states, so only the routed scaling is left to apply.
+        if routed_scaling_factor != 1.0:
+            out_hidden_states.mul_(routed_scaling_factor)
     elif _is_cuda or _is_musa:
-        if use_fused_moe_sum_all_reduce:
-            if routed_scaling_factor != 1.0:
-                assert out_slice is not None
-                out_slice.mul_(routed_scaling_factor)
-        elif topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
-            pass  # we wrote directly into out_hidden_states
-        elif topk == 2 and routed_scaling_factor == 1.0:
+        if topk == 2 and routed_scaling_factor == 1.0:
             torch.add(
                 intermediate_cache3[:, 0],
                 intermediate_cache3[:, 1],
@@ -901,14 +900,11 @@ def _fused_moe_kernel_sequence(
                     routed_scaling_factor,
                 )
     elif _is_xpu:
-        if topk == 1 and routed_scaling_factor == 1.0 and not _use_intermediate:
-            pass  # we wrote directly into out_hidden_states
-        else:
-            moe_sum_reduce(
-                intermediate_cache3.view(*intermediate_cache3.shape),
-                out_hidden_states,
-                routed_scaling_factor,
-            )
+        moe_sum_reduce(
+            intermediate_cache3.view(*intermediate_cache3.shape),
+            out_hidden_states,
+            routed_scaling_factor,
+        )
     else:
         if _has_vllm_ops:
             vllm_ops.moe_sum(
