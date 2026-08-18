@@ -61,7 +61,6 @@ dependencies = [
   "tiktoken",
   "timm==1.0.16",
   "torch==2.12.0",
-  "torchao==0.17.0",
   "torchaudio==2.11.0",
   "torchvision==0.27.0",
   "tqdm",
@@ -152,6 +151,6 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["python3", "python/tools/get_version_tag.py"]
+git_describe_command = ["python3", "scripts/release/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
