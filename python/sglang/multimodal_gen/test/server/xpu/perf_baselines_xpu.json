@@ -1,0 +1,34 @@
+{
+  "metadata": {
+    "model": "Diffusion Server",
+    "hardware": "Intel Arc Pro B60 (22.71 GiB per card)",
+    "description": "Reference numbers captured on XPU; these override the CUDA baselines only when running on XPU, since XPU reuses the shared case ids"
+  },
+  "scenarios": {
+    "fsdp-inference": {
+      "stages_ms": {
+        "InputValidationStage": 0.04,
+        "TextEncodingStage": 822.67,
+        "LatentPreparationStage": 0.21,
+        "TimestepPreparationStage": 34933.02,
+        "DenoisingStage": 9091.12,
+        "DecodingStage": 17.8
+      },
+      "denoise_step_ms": {
+        "0": 285.12,
+        "1": 1096.41,
+        "2": 1091.69,
+        "3": 1098.41,
+        "4": 1124.7,
+        "5": 1099.74,
+        "6": 1100.13,
+        "7": 1095.65,
+        "8": 1094.18
+      },
+      "expected_e2e_ms": 44870.65,
+      "expected_avg_denoise_ms": 1009.56,
+      "expected_median_denoise_ms": 1096.41,
+      "estimated_full_test_time_s": 157.0
+    }
+  }
+}

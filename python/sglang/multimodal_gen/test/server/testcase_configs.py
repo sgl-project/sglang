@@ -951,4 +951,5 @@ BASELINE_CONFIG = (
     BaselineConfig.load(get_perf_baseline_path())
     .update(Path(__file__).parent / "ascend" / "perf_baselines_npu.json")
     .update(Path(__file__).parent / "musa" / "perf_baselines_musa.json")
+    .update(Path(__file__).parent / "xpu" / "perf_baselines_xpu.json")
 )
