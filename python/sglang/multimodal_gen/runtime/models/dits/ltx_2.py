@@ -213,7 +213,15 @@ def _ltx2_rms_norm_modulate(
         x, scale, shift
     ):
         return fused_ltx2_rms_norm_modulate(x, scale, shift, eps)
-    return rms_norm(x, eps) * (1 + scale) + shift
+    normed = rms_norm(x, eps)
+    if torch.compiler.is_compiling():
+        # Let Inductor fuse this chain into its surrounding graph. Routing a
+        # compiled call through the opaque custom op would be a regression.
+        return normed * (1 + scale) + shift
+    # Reuse the bit-exact first-sight-verified eager modulate kernel. This
+    # removes two large broadcast pointwise launches without changing the
+    # reference rounding.
+    return _ltx2_modulate(normed, scale, shift)
 
 
 def _ltx2_disable_fused_ada_values(exc: Exception) -> None:
@@ -1050,6 +1058,7 @@ class LTX2FeedForward(nn.Module):
         dim: int,
         dim_out: int | None = None,
         mult: int = 4,
+        bias: bool = True,
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
@@ -1058,13 +1067,13 @@ class LTX2FeedForward(nn.Module):
         inner_dim = int(dim * mult)
 
         self.proj_in = ColumnParallelLinear(
-            dim, inner_dim, bias=True, gather_output=False, quant_config=quant_config
+            dim, inner_dim, bias=bias, gather_output=False, quant_config=quant_config
         )
         self.act = nn.GELU(approximate="tanh")
         self.proj_out = RowParallelLinear(
             inner_dim,
             dim_out,
-            bias=True,
+            bias=bias,
             input_is_parallel=True,
             quant_config=quant_config,
         )
@@ -1096,6 +1105,8 @@ class LTX2TransformerBlock(nn.Module):
         norm_eps: float = 1e-6,
         apply_gated_attention: bool = False,
         cross_attention_adaln: bool = False,
+        ff_bias: bool = True,
+        audio_ff_bias: bool = True,
         use_local_av_cross_attention: bool = False,
         force_sdpa_v2a_cross_attention: bool = False,
         enable_packed_qkv_input_a2a: bool = False,
@@ -1202,10 +1213,13 @@ class LTX2TransformerBlock(nn.Module):
         )
 
         # 4. Feedforward layers
-        self.ff = LTX2FeedForward(dim, dim_out=dim, quant_config=quant_config)
+        # LTX-2.5: `ff_bias: false`, `audio_ff_bias: true`.
+        self.ff = LTX2FeedForward(
+            dim, dim_out=dim, bias=ff_bias, quant_config=quant_config
+        )
         mark_ltx2_rms_norm_modulate_site(self)
         self.audio_ff = LTX2FeedForward(
-            audio_dim, dim_out=audio_dim, quant_config=quant_config
+            audio_dim, dim_out=audio_dim, bias=audio_ff_bias, quant_config=quant_config
         )
 
         # 5. Modulation Parameters
@@ -1562,6 +1576,8 @@ class LTX2TransformerBlock(nn.Module):
 class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_blocks_or_transformer_blocks]
     _compile_conditions = [is_blocks_or_transformer_blocks]
+    # Class-level defaults satisfy BaseDiT's `__init_subclass__` contract;
+    # `__init__` overrides them per instance so variants can extend the mapping.
     param_names_mapping = LTX2ArchConfig().param_names_mapping
     reverse_param_names_mapping = LTX2ArchConfig().reverse_param_names_mapping
     lora_param_names_mapping = LTX2ArchConfig().lora_param_names_mapping
@@ -1639,6 +1655,10 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         super().__init__(config=config, hf_config=hf_config)
 
         arch = self.config
+        # Checkpoint naming is arch-config metadata, not a runtime capability.
+        self.param_names_mapping = arch.param_names_mapping
+        self.reverse_param_names_mapping = arch.reverse_param_names_mapping
+        self.lora_param_names_mapping = arch.lora_param_names_mapping
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.audio_hidden_size = arch.audio_hidden_size
@@ -1664,6 +1684,15 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             gather_output=True,
             quant_config=quant_config,
         )
+
+        # Marks single-pixel-frame keyframe tokens. Zero-initialized upstream
+        # and unused by the denoising forward; held so the checkpoint
+        # round-trips.
+        self.keyframes_abs_pos_embedding: nn.Parameter | None = None
+        if arch.use_keyframes_abs_pos_embedding:
+            self.keyframes_abs_pos_embedding = nn.Parameter(
+                torch.zeros(1, self.hidden_size)
+            )
 
         # 2. Prompt embeddings
         self.caption_projection: LTX2TextProjection | None = None
@@ -1841,6 +1870,8 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     qk_norm=True,  # Always True in LTX2
                     apply_gated_attention=arch.apply_gated_attention,
                     cross_attention_adaln=arch.cross_attention_adaln,
+                    ff_bias=arch.ff_bias,
+                    audio_ff_bias=arch.audio_ff_bias,
                     use_local_av_cross_attention=bool(
                         getattr(arch, "use_local_av_cross_attention", False)
                     ),

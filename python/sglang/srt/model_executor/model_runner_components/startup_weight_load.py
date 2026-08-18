@@ -20,6 +20,7 @@ from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
 )
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -81,7 +82,6 @@ class StartupWeightLoadOptions:
     offload_group_size: int
     enable_memory_saver: bool
     enable_weights_cpu_backup: bool
-    torchao_config: str
     enable_lora: bool
     has_lora_paths: bool
     weight_loader_disable_mmap: bool
@@ -113,13 +113,12 @@ class StartupWeightLoadOptions:
             attn_cp_size=server_args.attn_cp_size,
             dcp_size=server_args.dcp_size,
             pp_size=server_args.pp_size,
-            dp_size=server_args.dp_size,
-            ep_size=server_args.ep_size,
+            dp_size=get_parallel().dp_size,
+            ep_size=get_parallel().ep_size,
             cpu_offload_gb=server_args.cpu_offload_gb,
             offload_group_size=server_args.offload_group_size,
             enable_memory_saver=server_args.enable_memory_saver,
             enable_weights_cpu_backup=server_args.enable_weights_cpu_backup,
-            torchao_config=server_args.torchao_config,
             enable_lora=server_args.enable_lora,
             has_lora_paths=bool(server_args.lora_paths),
             weight_loader_disable_mmap=server_args.weight_loader_disable_mmap,
@@ -374,7 +373,6 @@ class StartupWeightLoadManager:
                 options.enable_weights_cpu_backup,
                 "CPU weight backup is not supported",
             ),
-            (bool(options.torchao_config), "TorchAO is not supported"),
             (
                 options.enable_lora or options.has_lora_paths,
                 "LoRA is not supported",

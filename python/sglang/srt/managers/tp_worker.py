@@ -82,7 +82,7 @@ class BaseTpWorker(ABC):
         pass
 
     @property
-    def war_fastpath_runner(self):
+    def last_shared_read_runner(self):
         # The runner that runs the step's LAST shared-buffer-reading phase --
         # it owns the read-done event the scheduler's WAR barrier waits on.
         # For a plain worker that's its own runner.

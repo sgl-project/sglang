@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from abc import ABC
-from enum import Enum, auto
-from typing import TYPE_CHECKING, Optional
+from enum import Enum
+from typing import TYPE_CHECKING, Iterable, Optional
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -19,15 +19,18 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
-class SharedReadBoundary(Enum):
-    """Where a backend's scheduler-shared reads end, relative to the replay;
-    the WAR read-done record must land at or after this point. IN_REPLAY
-    means at the captured (in-graph) metadata init."""
+class SharedReadEnds(Enum):
+    """Where an attention backend finishes reading the shared data"""
 
-    PRE_REPLAY = auto()
-    IN_REPLAY = auto()
-    POST_REPLAY = auto()
-    UNKNOWN = auto()  # not audited -> coarse whole-forward fence
+    PRE_REPLAY = 1  # After the init_forward_metadata_out_graph
+    IN_REPLAY = 2  # After the init_forward_metadata_in_graph
+    POST_REPLAY = 3  # Metadata snapshot not implemented
+    UNKNOWN = 4  # not audited -> coarse whole-forward fence
+
+    @staticmethod
+    def max_of(items: Iterable[SharedReadEnds]) -> SharedReadEnds:
+        # Ordered by lateness: the latest end covers every child.
+        return max(items, key=lambda x: x.value)
 
 
 class AttentionBackend(ABC):
@@ -125,16 +128,12 @@ class AttentionBackend(ABC):
     # object during capture, and refresh its dynamic fields before each replay.
     use_captured_forward_metadata_for_breakable_cuda_graph: bool = False
 
-    def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         """Declare where this backend's scheduler-shared reads end per mode.
-
-        Decode/verify default to IN_REPLAY: the out-graph/in-graph init
-        contract above makes it a safe upper bound for any backend honoring
-        the contract. Override for audited deviations.
-        """
-        if forward_mode.is_decode() or forward_mode.is_target_verify():
-            return SharedReadBoundary.IN_REPLAY
-        return SharedReadBoundary.UNKNOWN
+        Override only for audited deviations from this conservative default."""
+        if fm.is_decode() or fm.is_target_verify():
+            return SharedReadEnds.IN_REPLAY
+        return SharedReadEnds.UNKNOWN
 
     # Chunked-prefix FullCG capture has a second model topology and stable
     # prefix buffers. Backends must opt in explicitly so the runner does not
