@@ -2,6 +2,7 @@ import sys
 
 import pytest
 import torch
+import sgl_kernel
 
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
