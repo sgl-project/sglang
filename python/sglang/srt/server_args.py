@@ -380,7 +380,7 @@ MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
     "extra_buffer_lazy",
 ]
 
-MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
+MAMBA_BACKEND_CHOICES = ["triton", "flashinfer", "flashinfer_ssd", "cake"]
 
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "triton",
@@ -1870,7 +1870,7 @@ class ServerArgs:
     mamba_backend: A[
         str,
         Arg(
-            help="Choose the kernel backend for Mamba SSM operations. Default is 'triton'. Options: 'triton' (default), 'flashinfer' (requires FlashInfer with Mamba support).",
+            help="Choose the Mamba prefill/decode kernel backend. Default is 'triton'. Options: 'triton' (default), 'flashinfer' (Triton prefill and FlashInfer decode), 'flashinfer_ssd' (FlashInfer CuTe SSDCombined prefill and FlashInfer decode), 'cake' (Cake SSDCombined prefill and FlashInfer decode).",
             choices=MAMBA_BACKEND_CHOICES,
         ),
         NS("exec.mamba"),
@@ -6254,7 +6254,7 @@ class ServerArgs:
                     "--enable-mamba-cache-stochastic-rounding."
                 )
 
-        if self.mamba_backend == "flashinfer":
+        if self.mamba_backend in ("flashinfer", "flashinfer_ssd", "cake"):
             flashinfer_error = (
                 "FlashInfer mamba module not available, please check the "
                 "FlashInfer installation."
@@ -6273,6 +6273,20 @@ class ServerArgs:
                     raise ValueError(flashinfer_error)
             else:
                 raise ValueError(flashinfer_error)
+            if self.mamba_backend == "flashinfer_ssd" and not (
+                is_sm100_or_sm110_supported() and get_device_sm() in (100, 103, 110)
+            ):
+                raise ValueError(
+                    "--mamba-backend flashinfer_ssd requires datacenter "
+                    "Blackwell SM100/SM103/SM110."
+                )
+            if self.mamba_backend == "cake" and not (
+                is_sm100_supported() and get_device_sm() in (100, 103)
+            ):
+                raise ValueError(
+                    "--mamba-backend cake requires datacenter Blackwell "
+                    "SM100/SM103."
+                )
 
     def _handle_int8_mamba_checkpoint(self):
         # The int8 mamba checkpoint pool is only wired into the built-in
