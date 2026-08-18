@@ -131,6 +131,7 @@ class CompiledPlanManifest:
     gate_digest: str
     status: str  # "validated" or "rejected"
     checkpoint_metrics: Mapping[str, Mapping[str, float]]
+    decision_trace_matched: bool | None = None
 
     def __post_init__(self) -> None:
         if self.status not in ("validated", "rejected"):
@@ -214,6 +215,8 @@ def run_trajectory_gate(
     checkpoint_schedule: Sequence[Tuple[int, str]],
     regions: Tuple[str, ...] = (),
     compile_options: Mapping[str, object] = None,  # type: ignore[assignment]
+    reference_decision_trace: Sequence[object] = None,  # type: ignore[assignment]
+    candidate_decision_trace: Sequence[object] = None,  # type: ignore[assignment]
 ) -> CompiledPlanManifest:
     """Warm and validate a compiled candidate against an eager reference.
 
@@ -223,9 +226,25 @@ def run_trajectory_gate(
     called for every ``(step_index, checkpoint_name)`` pair in the
     schedule; this is the "complete warmup rollout" the RFC requires,
     rather than a single isolated forward.
+
+    When ``gate.require_decision_trace_match`` is set, ``reference_decision_trace``
+    and ``candidate_decision_trace`` (e.g. per-step cache/skip decisions) must
+    both be supplied and must compare equal, in addition to the tensor
+    thresholds, for the plan to be promoted.
     """
     if compile_options is None:
         compile_options = {}
+
+    decision_trace_matched: bool | None = None
+    if gate.require_decision_trace_match:
+        if reference_decision_trace is None or candidate_decision_trace is None:
+            raise CompileGateError(
+                "gate.require_decision_trace_match is True but "
+                "reference_decision_trace/candidate_decision_trace were not supplied"
+            )
+        decision_trace_matched = list(reference_decision_trace) == list(
+            candidate_decision_trace
+        )
 
     checkpoint_metrics: Dict[str, Dict[str, float]] = {}
     for step_index, checkpoint_name in checkpoint_schedule:
@@ -261,6 +280,10 @@ def run_trajectory_gate(
             )
             break
 
+    if decision_trace_matched is False:
+        status = "rejected"
+        logger.info("compile trajectory gate rejected: decision trace mismatch")
+
     return CompiledPlanManifest(
         signature=signature,
         regions=regions,
@@ -268,6 +291,7 @@ def run_trajectory_gate(
         gate_digest=signature.digest(),
         status=status,
         checkpoint_metrics=checkpoint_metrics,
+        decision_trace_matched=decision_trace_matched,
     )
 
 

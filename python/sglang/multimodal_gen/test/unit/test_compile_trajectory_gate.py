@@ -288,6 +288,85 @@ class TestRunTrajectoryGateWithRealTorchCompile:
             )
 
 
+class TestDecisionTraceMatching:
+    """require_decision_trace_match must actually be enforced, not just
+    declared -- these tests fail against a version of run_trajectory_gate
+    that accepts the field but never reads it."""
+
+    def _gate_with_trace_requirement(self):
+        return TrajectoryGate(
+            checkpoints=("step_0",),
+            tensor_thresholds={"step_0": {"cosine_similarity": 0.0}},
+            require_decision_trace_match=True,
+        )
+
+    def test_matching_traces_are_validated(self):
+        gate = self._gate_with_trace_requirement()
+        signature = _make_signature()
+        t = torch.randn(8, device=DEVICE)
+
+        manifest = run_trajectory_gate(
+            signature=signature,
+            gate=gate,
+            reference_step_fn=lambda i, name: t,
+            candidate_step_fn=lambda i, name: t,
+            checkpoint_schedule=[(0, "step_0")],
+            reference_decision_trace=["real", "reuse", "real"],
+            candidate_decision_trace=["real", "reuse", "real"],
+        )
+
+        assert manifest.status == "validated"
+        assert manifest.decision_trace_matched is True
+
+    def test_mismatched_traces_are_rejected_even_if_tensors_match(self):
+        gate = self._gate_with_trace_requirement()
+        signature = _make_signature()
+        t = torch.randn(8, device=DEVICE)
+
+        manifest = run_trajectory_gate(
+            signature=signature,
+            gate=gate,
+            reference_step_fn=lambda i, name: t,
+            candidate_step_fn=lambda i, name: t,
+            checkpoint_schedule=[(0, "step_0")],
+            reference_decision_trace=["real", "reuse"],
+            candidate_decision_trace=["real", "real"],
+        )
+
+        assert manifest.status == "rejected"
+        assert manifest.decision_trace_matched is False
+
+    def test_missing_traces_raise_when_required(self):
+        gate = self._gate_with_trace_requirement()
+        signature = _make_signature()
+        t = torch.randn(8, device=DEVICE)
+
+        with pytest.raises(CompileGateError):
+            run_trajectory_gate(
+                signature=signature,
+                gate=gate,
+                reference_step_fn=lambda i, name: t,
+                candidate_step_fn=lambda i, name: t,
+                checkpoint_schedule=[(0, "step_0")],
+                # No decision traces supplied even though the gate requires them.
+            )
+
+    def test_decision_trace_matched_is_none_when_not_required(self):
+        gate = _make_gate(checkpoints=("step_0",))
+        signature = _make_signature()
+        t = torch.randn(8, device=DEVICE)
+
+        manifest = run_trajectory_gate(
+            signature=signature,
+            gate=gate,
+            reference_step_fn=lambda i, name: t,
+            candidate_step_fn=lambda i, name: t,
+            checkpoint_schedule=[(0, "step_0")],
+        )
+
+        assert manifest.decision_trace_matched is None
+
+
 class TestSelectValidatedPlan:
     def test_returns_manifest_matching_requested_signature(self):
         sig = _make_signature()
