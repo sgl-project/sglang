@@ -804,6 +804,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             if poll == KVPoll.Bootstrapping:
                 pass
+            elif poll == KVPoll.Transferring:
+                # A backend can defer a terminal transition while it releases
+                # ownership of the request's KV pages; keep waiting.
+                pass
             elif poll == KVPoll.WaitingForInput:
                 decode_req.waiting_for_input = True
                 decode_req.req.time_stats.set_bootstrap_done_time()
@@ -2032,6 +2036,21 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 continue
 
             hicache_restore_status = decode_req.hicache_restore_status
+            if (
+                hicache_restore_status == HiCacheRestoreResult.FAILED
+                and poll != KVPoll.Failed
+            ):
+                # The restore failed, but that says nothing about the KV transfer:
+                # a prefill rank may still be writing into this request's pages.
+                # Fail it through the same ownership barrier as a transfer failure
+                # instead of releasing the pages here, and pick it up below once
+                # the barrier reports Failed.
+                decode_req.kv_receiver.abort()
+                decode_req.kv_receiver.kv_mgr.record_failure(
+                    decode_req.req.bootstrap_room,
+                    "HiCache restore failed for this request",
+                )
+                continue
             if (
                 poll == KVPoll.Failed
                 or hicache_restore_status == HiCacheRestoreResult.FAILED

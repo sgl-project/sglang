@@ -458,6 +458,10 @@ class PrefillBootstrapQueue:
                 bootstrapped_reqs.append(req)
                 indices_to_remove.add(i)
                 req.time_stats.set_wait_queue_entry_time()
+            elif poll == KVPoll.Transferring:
+                # A backend can defer a terminal transition while it releases
+                # ownership of the request's KV pages; keep waiting.
+                continue
             else:
                 raise RuntimeError(
                     f"Unexpected poll state {poll} for req {req.rid} in pop_bootstrapped"
@@ -1016,7 +1020,10 @@ class SchedulerDisaggregationPrefillMixin:
             release_kv_cache(req, self.tree_cache)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
-        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        if not isinstance(req.finished_reason, FINISH_ABORT):
+            prepare_abort(
+                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            )
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
@@ -1028,7 +1035,9 @@ class SchedulerDisaggregationPrefillMixin:
         if poll == KVPoll.Failed:
             self.handle_bootstrap_failure(req)
             return False
-        elif poll == KVPoll.Bootstrapping:
+        elif poll in (KVPoll.Bootstrapping, KVPoll.Transferring):
+            # Transferring here means the backend is still releasing ownership of
+            # a failed request's KV pages; it will report Failed once done.
             return False
         elif poll == KVPoll.WaitingForInput:
             if should_force_retry(req):  # test hook

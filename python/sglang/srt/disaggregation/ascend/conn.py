@@ -8,7 +8,10 @@ import numpy.typing as npt
 
 from sglang.srt.disaggregation.ascend.transfer_engine import AscendTransferEngine
 from sglang.srt.disaggregation.base.conn import StateType
-from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
+from sglang.srt.disaggregation.common.utils import (
+    group_concurrent_contiguous,
+    submit_transfer_calls,
+)
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVBootstrapServer,
     MooncakeKVManager,
@@ -217,27 +220,17 @@ class AscendKVManager(MooncakeKVManager):
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         if self.enable_custom_mem_pool:
-            futures = [
-                executor.submit(
-                    process_layer,
-                    src_ptr,
-                    dst_ptr,
-                    item_len,
-                )
-                for (src_ptr, dst_ptr, item_len) in layers_params
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for f in futures:
-                        f.cancel()
-                    return status
+            return submit_transfer_calls(
+                executor,
+                [
+                    (process_layer, (src_ptr, dst_ptr, item_len))
+                    for (src_ptr, dst_ptr, item_len) in layers_params
+                ],
+            )
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
             return process_layers(layers_params)
-
-        return 0
 
     def _is_generic_kvcache_state_type(self, st) -> bool:
         # DSV4 per-pool components also use the page-indexed send path.

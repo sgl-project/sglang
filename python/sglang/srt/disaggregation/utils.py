@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import random
 from collections import deque
@@ -22,8 +23,11 @@ import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base.conn import KVTransferBarrierEscalation
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -170,11 +174,19 @@ def _get_failure_prob() -> float:
 
 def _poll_with_failure_injection(pollers) -> List[int]:
     if (failure_prob := _get_failure_prob()) > 0:
-        return [
+        polls = [
             int(KVPoll.Failed) if random.random() < failure_prob else int(poller.poll())
             for poller in pollers
         ]
-    return [int(poller.poll()) for poller in pollers]
+    else:
+        polls = [int(poller.poll()) for poller in pollers]
+    # A request whose ownership barrier has closed is logically failed even if
+    # its backend still reports an earlier state, so every rank agrees to fail
+    # it (and therefore to release it together).
+    return [
+        int(KVPoll.Failed) if poller.is_failure_quiescing() else poll
+        for poller, poll in zip(pollers, polls)
+    ]
 
 
 def _is_fake_transfer(req: Req, server_args: ServerArgs) -> bool:
@@ -202,6 +214,84 @@ def _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args) -> N
                 polls[i] = int(KVPoll.Transferring)
 
 
+def _reduce_polls(polls: List[int], groups) -> List[int]:
+    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    for group in groups:
+        dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=group)
+    return tensor_to_reduce.tolist()
+
+
+def _advance_quiescence(poller) -> int:
+    """Ask one poller whether its KV pages are safe to release.
+
+    Backend faults are contained here on purpose. This runs inside the scheduler
+    loop, and the barrier is a safety optimisation: letting a bug in it take the
+    whole engine down, or pin a request forever, is worse than releasing one
+    request's pages early and saying so.
+
+    A KVTransferBarrierEscalation is not such a fault. It is the barrier
+    reporting that pages cannot be proven idle and must not be reused, so it is
+    propagated: swallowing it here would silently release exactly the pages the
+    barrier refused to.
+    """
+    try:
+        return int(poller.advance_failure_quiescence())
+    except KVTransferBarrierEscalation:
+        raise
+    except Exception:
+        logger.exception(
+            "Transfer quiescence check failed; releasing the request's KV pages"
+        )
+        return 1
+
+
+def _gate_failures_on_quiescence(pollers, polls: List[int], groups) -> List[int]:
+    """Hold back ``KVPoll.Failed`` until the KV pages are safe to release.
+
+    A failed transfer may still have native work reading or writing its KV
+    pages (see ``BaseKVSender.advance_failure_quiescence``). Reporting the
+    failure lets the scheduler return those pages to the allocator, so the
+    terminal state is deferred -- as ``Transferring`` -- while any rank in the
+    group is still holding ownership.
+
+    Both collectives are entered on exactly the same iterations on every rank,
+    because the decision is made from the already-reduced poll values.
+    """
+    failed = [poll == int(KVPoll.Failed) for poll in polls]
+    if not any(failed):
+        return polls
+
+    # Three ordered states let MIN carry both ownership and escalation through
+    # the same collective:
+    #   0 = a rank requires worker teardown, 1 = still owns pages, 2 = quiesced.
+    # In particular, a local KVTransferBarrierEscalation must not escape before
+    # peers enter this collective or they will wait forever.
+    local_escalation = None
+    quiescence_states = []
+    for poller, is_failed in zip(pollers, failed):
+        if not is_failed:
+            quiescence_states.append(2)
+            continue
+        try:
+            quiescence_states.append(1 + _advance_quiescence(poller))
+        except KVTransferBarrierEscalation as exc:
+            local_escalation = exc
+            quiescence_states.append(0)
+
+    quiescence_states = _reduce_polls(quiescence_states, groups)
+    if any(state == 0 for state in quiescence_states):
+        if local_escalation is not None:
+            raise local_escalation
+        raise KVTransferBarrierEscalation(
+            "A peer cannot prove that KV transfers are quiesced; escalating on "
+            "every participant after transfer-barrier coordination."
+        )
+    return [
+        int(KVPoll.Transferring) if is_failed and state == 1 else poll
+        for poll, is_failed, state in zip(polls, failed, quiescence_states)
+    ]
+
+
 def poll_and_all_reduce(
     pollers,
     gloo_group: dist.ProcessGroup,
@@ -219,9 +309,8 @@ def poll_and_all_reduce(
         and server_args is not None
     ):
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args)
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
-    return tensor_to_reduce.tolist()
+    groups = [gloo_group]
+    return _gate_failures_on_quiescence(pollers, _reduce_polls(polls, groups), groups)
 
 
 def poll_and_all_reduce_attn_cp_tp_group(
@@ -229,19 +318,12 @@ def poll_and_all_reduce_attn_cp_tp_group(
     attn_cp_cpu_group: dist.ProcessGroup,
     attn_tp_cpu_group: dist.ProcessGroup,
 ):
+    polls = _poll_with_failure_injection(pollers)
     # First sync across attn-tp ranks so all TP participants for a given (dp, cp)
-    # shard observe the same status transitions.
-    polls = poll_and_all_reduce(pollers, attn_tp_cpu_group)
-
-    # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
-    # converge to the same global status.
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(
-        tensor_to_reduce,
-        op=dist.ReduceOp.MIN,
-        group=attn_cp_cpu_group,
-    )
-    return tensor_to_reduce.tolist()
+    # shard observe the same status transitions, then across attn-cp ranks so all
+    # TPxCP participants in one DP shard converge to the same global status.
+    groups = [attn_tp_cpu_group, attn_cp_cpu_group]
+    return _gate_failures_on_quiescence(pollers, _reduce_polls(polls, groups), groups)
 
 
 def poll_and_all_reduce_with_staging(
@@ -252,6 +334,7 @@ def poll_and_all_reduce_with_staging(
     server_args: Optional[ServerArgs] = None,
 ):
     """Staging-aware polling: advance scatter, demote incomplete transfers, all_reduce."""
+    staging_handler.retry_pending_watermarks()
     for decode_req in decode_reqs:
         if decode_req.kv_receiver.require_staging and not staging_handler.is_done(
             decode_req
@@ -277,9 +360,10 @@ def poll_and_all_reduce_with_staging(
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if metadata_buffers is not None and server_args is not None:
         _apply_metadata_gate(raw_polls, decode_reqs, metadata_buffers, server_args)
-    poll_tensor = torch.tensor(raw_polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(poll_tensor, op=dist.ReduceOp.MIN, group=gloo_group)
-    return poll_tensor.tolist()
+    groups = [gloo_group]
+    return _gate_failures_on_quiescence(
+        receivers, _reduce_polls(raw_polls, groups), groups
+    )
 
 
 #########################
