@@ -104,6 +104,20 @@ _CONFIGURED_SIZE_CALL_SITES = {
     ("srt/managers/scheduler.py", "configured_attn_cp_size"): (
         "same pre-distributed-init arithmetic in configure_scheduler_process"
     ),
+    ("srt/disaggregation/common/conn.py", "configured_pp_size"): (
+        "the bootstrap connection is built by the KV manager on the transfer "
+        "path, which the CPU-only conn tests exercise without ever starting "
+        "torch.distributed"
+    ),
+    ("srt/elastic_ep/elastic_ep.py", "configured_tp_size"): (
+        "the joiner's rank window is computed against the size the process was "
+        "configured with, not the size of the group it is about to join"
+    ),
+    ("srt/elastic_ep/expert_backup_manager.py", "configured_tp_size"): (
+        "the backup server counts the clients it expects to report in, which "
+        "is how many the launch configured -- the live group is what they are "
+        "still joining"
+    ),
     (
         "srt/model_executor/model_runner_components/startup_weight_load.py",
         "configured_tp_size",
