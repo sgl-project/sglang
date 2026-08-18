@@ -34,10 +34,10 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.runtime_context import (
     get_disagg,
-    get_exec,
     get_memory,
     get_observability,
     mamba_extra_buffer_lazy_enabled,
+    mamba_track_grid,
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -1131,7 +1131,7 @@ class SchedulerBatchResultProcessor:
         if known_boundary:
             self._mamba_assert_committed_len_lookahead(req)
             track_seqlen = req.kv_committed_len
-            assert track_seqlen % get_exec().mamba.mamba_track_interval == 0
+            assert track_seqlen % mamba_track_grid(batch.tree_cache.page_size) == 0
             at_boundary = True
         else:
             at_boundary, track_seqlen = self._mamba_check_track_boundary(
@@ -1191,7 +1191,7 @@ class SchedulerBatchResultProcessor:
                 other_idx
             ].item() == -1 and mamba_lazy_spec_in_window(
                 req,
-                get_exec().mamba.mamba_track_interval,
+                mamba_track_grid(batch.tree_cache.page_size),
                 max_speculative_num_draft_tokens(),
             )
             if (
@@ -1244,7 +1244,7 @@ class SchedulerBatchResultProcessor:
         For spec decode, the boundary is detected by comparing the
         accepted seq_len range against interval boundaries.
         """
-        interval = get_exec().mamba.mamba_track_interval
+        interval = mamba_track_grid(batch.tree_cache.page_size)
 
         if batch.spec_algorithm.is_none():
             lookahead = req.decode_batch_idx - batch.mamba_decode_batch_idx_cpu[i]
