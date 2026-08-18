@@ -270,3 +270,47 @@ When deploying with PD Disaggregation, the prefill node can choose to enable [La
 --cp-strategy interleave \
 ```
 With LayerSplit, the kv cache on each rank can be sharded over the CP attention group, and prefetched when necessary. This can reduce kv cache memory by up to 75%, thus increasing the throughput on prefill side.
+
+### 3.6 Agentic Long-Context with HiCache DRAM Offload (NVFP4, MTP)
+
+For agentic coding workloads on the 1M-token corpus, HBM-only KV capacity saturates past a few concurrent sessions and the radix hit rate collapses, so every turn re-prefills its whole history. Enable HiCache to spill cold KV to a pinned host pool. GLM-5.2 is DSA: every TP rank holds complete per-token KV, so host capacity is sized directly with `--hicache-size` (GB per rank) rather than `--hicache-ratio`.
+
+**B300 (TP8):**
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path nvidia/GLM-5.2-NVFP4 \
+  --trust-remote-code \
+  --tp 8 \
+  --ep-size 1 \
+  --quantization modelopt_fp4 \
+  --kv-cache-dtype fp8_e4m3 \
+  --bf16-gemm-backend cutedsl \
+  --max-prefill-tokens 8192 \
+  --chunked-prefill-size 8192 \
+  --mem-fraction-static 0.85 \
+  --tool-call-parser glm47 \
+  --reasoning-parser glm45 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --enable-hierarchical-cache \
+  --hicache-size 270 \
+  --hicache-write-policy write_back \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct
+```
+
+**B200 (TP8):** same command, with `--mem-fraction-static 0.83` (180 GB HBM3e vs B300's 288 GB leaves less non-static headroom). Only the two highest-concurrency points need the full 270 GB/rank pool; lower concurrency keeps the smaller ratio-based pool:
+
+```bash
+# c1 / c4 / c8
+--hicache-ratio 0.75
+
+# c12 / c16
+--hicache-size 270
+```
+
+<Note>
+  This MTP shape (3-1-4) is tuned for the AgentX host-cache regime and differs from the general low-latency NVFP4 recipe above (5-1-6), which targets HBM-only single-turn latency.
+</Note>
