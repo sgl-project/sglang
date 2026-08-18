@@ -117,6 +117,25 @@ class TestDeepseekV2Gate(_FusionGateCase):
             self._reason(DeepseekV2ForCausalLM, self._config(), moe_ep_size=2)
         )
 
+    def test_mixed_precision_quant_vetoes_even_when_enforced(self):
+        """A precision mismatch causes crash when shared expert fusion is enabled,
+        so --enforce-shared-experts-fusion must not override it. Guards the gap
+        where the enforce early-return skipped the quant check entirely."""
+        from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+        self._seed(enforce_shared_experts_fusion=True)
+        mixed = SimpleNamespace(
+            get_name=lambda: "quark", can_fuse_shared_expert=lambda: False
+        )
+        self.assertIn(
+            "higher precision",
+            self._reason(DeepseekV2ForCausalLM, self._config(), mixed),
+        )
+        matched = SimpleNamespace(
+            get_name=lambda: "quark", can_fuse_shared_expert=lambda: True
+        )
+        self.assertIsNone(self._reason(DeepseekV2ForCausalLM, self._config(), matched))
+
 
 class TestGlmMoeLiteGate(_FusionGateCase):
     def _config(self, **kw):

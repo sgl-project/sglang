@@ -29,6 +29,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
     minimax_h3_resolve_plan,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+    MiniMaxH3DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     partition_for_task,
 )
@@ -253,6 +256,29 @@ def _quality_server_args():
         tp_size=1,
         ulysses_degree=4,
         use_fsdp_inference=False,
+    )
+
+
+def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=True)
+    stage._cache_dit_enabled = False
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            quality="high",
+            _explicit_fields={"quality"},
+        )
+    )
+
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.denoising."
+        "logger.warning_once"
+    ) as warning_once:
+        stage._maybe_enable_cache_dit(50, batch)
+
+    warning_once.assert_called_once_with(
+        "Cache-DiT was requested but is disabled because breakable CUDA graphs "
+        "are enabled."
     )
 
 
