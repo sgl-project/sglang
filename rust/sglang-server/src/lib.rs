@@ -141,7 +141,7 @@ impl Server {
     /// msgpack (see the field docs for the layout).
     #[pyo3(signature = (max = 256))]
     fn recv_requests(&self, py: Python<'_>, max: usize) -> PyResult<RequestBatch> {
-        let cols = self.rt.ingress.drain(max);
+        let cols = self.rt.to_scheduler_rx.drain(max);
         let headers = cols
             .headers
             .iter()
@@ -167,7 +167,7 @@ impl Server {
     fn wait_ingress(&self, py: Python<'_>, timeout_ms: u64) -> bool {
         py.detach(|| {
             self.rt
-                .ingress
+                .to_scheduler_rx
                 .wait(std::time::Duration::from_millis(timeout_ms))
         })
     }
@@ -268,13 +268,13 @@ impl Server {
     /// differ solely in how the frame is built. `false` only on shutdown.
     #[inline]
     fn push_frame(&self, py: Python<'_>, frame: bytes::Bytes) -> bool {
-        match self.rt.egress.try_push(frame) {
+        match self.rt.from_scheduler_tx.try_push(frame) {
             Ok(()) => true,
             // Consumer gone (shutdown): the frame is unavoidably lost.
             Err(None) => false,
             // Full: the scheduler must block here so backpressure reaches it, and
             // blocking is exactly when releasing the GIL pays for itself.
-            Err(Some(frame)) => py.detach(|| self.rt.egress.push(frame)),
+            Err(Some(frame)) => py.detach(|| self.rt.from_scheduler_tx.push(frame)),
         }
     }
 }

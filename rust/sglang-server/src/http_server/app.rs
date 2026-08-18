@@ -17,19 +17,19 @@ use crate::tokenizer_manager::wiring::Senders;
 #[derive(Clone)]
 pub(super) struct AppState {
     pub(super) senders: Senders,
-    pub(super) egress_buf: usize,
+    pub(super) response_buf: usize,
     pub(super) server_args: Arc<ServerArgs>,
     pub(super) chat_formatter: Option<openai::ChatFormatter>,
     /// Egress heartbeat (bumped per drained ring frame).
-    pub(super) egress_activity: ActivityCounter,
+    pub(super) response_activity: ActivityCounter,
 }
 
 pub async fn serve(
     listener: std::net::TcpListener,
     senders: Senders,
-    egress_buf: usize,
+    response_buf: usize,
     server_args: Arc<ServerArgs>,
-    egress_activity: ActivityCounter,
+    response_activity: ActivityCounter,
     // The SAME set ingress releases from — see `Ingress::on_abort`. Constructing a
     // local one here would leave the api server admitting rids that nothing ever
     // releases.
@@ -38,10 +38,10 @@ pub async fn serve(
     let chat_formatter = openai::load_chat_support(&server_args);
     let state = AppState {
         senders,
-        egress_buf,
+        response_buf,
         server_args: server_args.clone(),
         chat_formatter,
-        egress_activity,
+        response_activity,
     };
     // Each endpoint module registers its own routes and merges here.
     let router = Router::new()

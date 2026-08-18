@@ -49,7 +49,7 @@ impl Dispatcher {
 impl Runnable for Dispatcher {
     fn run(self) {
         // Reused across frames (`clear` keeps capacity) — steady state allocates nothing.
-        let shards = self.senders.detok.len();
+        let shards = self.senders.detokenizer_tx.len();
         let mut buckets: Vec<Vec<ChunkEvent>> = (0..shards).map(|_| Vec::new()).collect();
 
         while let Some(bytes) = recv(self.from_scheduler_rx.receiver(), &self.shutdown) {
@@ -106,7 +106,7 @@ impl Runnable for Dispatcher {
                             // 500, not 400: the client's request was fine — the
                             // scheduler's own output frame was not.
                             let shard = rid.shard(shards);
-                            let _ = self.senders.detok[shard].send(DetokMsg::Fail {
+                            let _ = self.senders.detokenizer_tx[shard].send(DetokMsg::Fail {
                                 rid,
                                 message: "internal error: malformed scheduler output frame".into(),
                             });
@@ -118,7 +118,7 @@ impl Runnable for Dispatcher {
                             continue;
                         }
                         let chunks = DetokMsg::Chunks(std::mem::take(b));
-                        if self.senders.detok[i].send(chunks).is_err() {
+                        if self.senders.detokenizer_tx[i].send(chunks).is_err() {
                             tracing::error!("egress: detok shard closed");
                         }
                     }

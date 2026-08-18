@@ -39,14 +39,19 @@ pub(super) async fn submit(
     // sent for `meta_info.id`.
     // Async-aware send so a full TM inbox yields (backpressure) instead of parking
     // a thread; Err only when the inbox is closed (shutdown).
-    let (tx, rx) = mpsc::channel::<ResponseItem>(state.egress_buf);
+    let (tx, rx) = mpsc::channel::<ResponseItem>(state.response_buf);
     let request = Request {
         rid: rid.clone(),
         state: RequestState::Received,
         sink: ResponseSink::Local(tx),
         kind,
     };
-    match state.senders.tm.send_async(TmEvent::Intake(request)).await {
+    match state
+        .senders
+        .tok_manager_tx
+        .send_async(TmEvent::Intake(request))
+        .await
+    {
         Ok(()) => Ok((rid, rx)),
         // `SendError` has a single meaning — the channel is disconnected.
         Err(_) => {

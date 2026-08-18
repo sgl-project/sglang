@@ -26,10 +26,10 @@ use crate::tokenizer_manager::wiring::Senders;
 
 pub(super) fn senders() -> Senders {
     Senders {
-        tm: flume::unbounded().0,
-        abort: flume::unbounded().0,
-        tok: flume::unbounded().0,
-        detok: vec![],
+        tok_manager_tx: flume::unbounded().0,
+        abort_tx: flume::unbounded().0,
+        tokenizer_tx: flume::unbounded().0,
+        detokenizer_tx: vec![],
     }
 }
 
@@ -108,10 +108,10 @@ pub(super) fn server_args() -> Arc<ServerArgs> {
 pub(super) fn app_state(senders: Senders) -> super::AppState {
     super::AppState {
         senders,
-        egress_buf: 8,
+        response_buf: 8,
         server_args: server_args(),
         chat_formatter: None,
-        egress_activity: Default::default(),
+        response_activity: Default::default(),
     }
 }
 
@@ -126,10 +126,10 @@ pub(super) fn senders_closed() -> Senders {
     let (tok_tx, tok_rx) = flume::unbounded();
     drop(tok_rx);
     Senders {
-        tm: tm_tx,
-        abort: abort_tx,
-        tok: tok_tx,
-        detok: vec![],
+        tok_manager_tx: tm_tx,
+        abort_tx,
+        tokenizer_tx: tok_tx,
+        detokenizer_tx: vec![],
     }
 }
 

@@ -64,7 +64,7 @@ impl Drop for AbortGuard {
         // The lane is unbounded, so this send only fails at shutdown, when the loop
         // is gone and nothing is generating anyway.
         for rid in self.rids.drain() {
-            let _ = self.senders.abort.send(AbortSource::Guard(rid));
+            let _ = self.senders.abort_tx.send(AbortSource::Guard(rid));
         }
     }
 }
@@ -75,10 +75,10 @@ mod tests {
 
     fn senders_with_abort(abort: flume::Sender<AbortSource>) -> Senders {
         Senders {
-            tm: flume::unbounded().0,
-            abort,
-            tok: flume::unbounded().0,
-            detok: vec![],
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: abort,
+            tokenizer_tx: flume::unbounded().0,
+            detokenizer_tx: vec![],
         }
     }
 

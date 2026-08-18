@@ -22,7 +22,7 @@ use crate::utils::{
 /// runtime spawns it as a [`Runnable`] rather than calling a free `run_*` fn
 /// with positional arguments.
 pub struct Intake {
-    rx: flume::Receiver<TmEvent>,
+    tok_manager_rx: flume::Receiver<TmEvent>,
     /// Unbounded abort lane (see [`Senders::abort`]). Selected against `rx` so an
     /// abort is handled promptly even while the bounded inbox is saturated.
     abort_rx: flume::Receiver<AbortSource>,
@@ -89,7 +89,7 @@ impl From<&ServerArgs> for Limits {
 
 impl Intake {
     pub fn new(
-        rx: flume::Receiver<TmEvent>,
+        tok_manager_rx: flume::Receiver<TmEvent>,
         abort_rx: flume::Receiver<AbortSource>,
         senders: Senders,
         to_scheduler_tx: ToSchedulerTx,
@@ -98,7 +98,7 @@ impl Intake {
         shutdown: flume::Receiver<()>,
     ) -> Self {
         Self {
-            rx,
+            tok_manager_rx,
             abort_rx,
             senders,
             to_scheduler_tx,
@@ -123,7 +123,7 @@ impl Runnable for Intake {
             // idle must still be handled at once.
             let next = flume::Selector::new()
                 .recv(&self.abort_rx, |r| r.ok().map(Lane::Abort))
-                .recv(&self.rx, |r| r.ok().map(Lane::Event))
+                .recv(&self.tok_manager_rx, |r| r.ok().map(Lane::Event))
                 .recv(&self.shutdown, |_| None)
                 .wait();
             match next {
@@ -300,7 +300,7 @@ impl Intake {
                 // `Tokenized` event (PreSendValidating, or Failed on error).
                 // Doesn't loop.
                 RequestState::Tokenizing => {
-                    if let Err(err) = self.senders.tok.send(req) {
+                    if let Err(err) = self.senders.tokenizer_tx.send(req) {
                         // Pool gone (workers exited); flume hands the request back.
                         let mut req = err.into_inner();
                         // Past `Received`, so registration happened.
@@ -751,10 +751,10 @@ mod tests {
         let (tok_tx, _tok_rx) = flume::unbounded();
         let (detok_tx, detok_rx) = flume::unbounded();
         let senders = Senders {
-            tm: flume::unbounded().0,
-            abort: flume::unbounded().0,
-            tok: tok_tx,
-            detok: vec![detok_tx],
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: flume::unbounded().0,
+            tokenizer_tx: tok_tx,
+            detokenizer_tx: vec![detok_tx],
         };
         let (to_scheduler_tx, consumer) = to_scheduler(16);
         let (tm_tx, tm_rx) = flume::unbounded();
@@ -807,10 +807,10 @@ mod tests {
                 flume::unbounded().1,
                 flume::unbounded().1,
                 Senders {
-                    tm: flume::unbounded().0,
-                    abort: flume::unbounded().0,
-                    tok: flume::unbounded().0,
-                    detok: vec![detok_tx],
+                    tok_manager_tx: flume::unbounded().0,
+                    abort_tx: flume::unbounded().0,
+                    tokenizer_tx: flume::unbounded().0,
+                    detokenizer_tx: vec![detok_tx],
                 },
                 to_scheduler_tx,
                 test_limits(),
@@ -1170,10 +1170,10 @@ mod tests {
         let (detok_tx, detok_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
         let senders = Senders {
-            tm: flume::unbounded().0,
-            abort: abort_tx,
-            tok: tok_tx,
-            detok: vec![detok_tx],
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx,
+            tokenizer_tx: tok_tx,
+            detokenizer_tx: vec![detok_tx],
         };
         let (producer, _consumer) = to_scheduler(1);
         let (_tm_tx, tm_rx) = flume::unbounded();
@@ -1536,10 +1536,10 @@ mod tests {
         let (tok_tx, tok_rx) = flume::unbounded();
         let (detok_tx, _detok_rx) = flume::unbounded();
         let senders = Senders {
-            tm: flume::unbounded().0,
-            abort: flume::unbounded().0,
-            tok: tok_tx,
-            detok: vec![detok_tx],
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: flume::unbounded().0,
+            tokenizer_tx: tok_tx,
+            detokenizer_tx: vec![detok_tx],
         };
         let (to_scheduler_tx, _consumer) = to_scheduler(16);
         let (_tm_tx, tm_rx) = flume::unbounded();

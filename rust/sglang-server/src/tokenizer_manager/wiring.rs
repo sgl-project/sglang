@@ -60,28 +60,19 @@ impl AbortSource {
 /// Producer-side handles, cloned into every stage that needs to emit.
 #[derive(Clone)]
 pub struct Senders {
-    /// → TokenizerManager ingress loop.
-    pub tm: flume::Sender<TmEvent>,
+    /// → TokenizerManager loop.
+    pub tok_manager_tx: flume::Sender<TmEvent>,
     /// → the same loop, but UNBOUNDED and abort-only.
-    ///
-    /// Aborts cannot share the bounded inbox. `try_send` there drops them exactly
-    /// when they matter most — under overload — leaving the scheduler generating
-    /// for a dead connection; and the caller then faces a false choice between
-    /// releasing the rid (a live entry can be overwritten by a resubmit) and
-    /// holding it (a permanent leak). An unbounded lane removes the dilemma: an
-    /// abort is a small `String` and is always accepted, so releases can be
-    /// unconditional again. It cannot grow without bound in practice — one entry
-    /// per in-flight request, each already bounded by the inbox that admitted it.
-    pub abort: flume::Sender<AbortSource>,
+    pub abort_tx: flume::Sender<AbortSource>,
     /// → Tokenizer pool (CPU-bound, pinned threads).
-    pub tok: flume::Sender<Request>,
+    pub tokenizer_tx: flume::Sender<Request>,
     /// → Detokenizer shards, indexed by `Rid::shard(detok.len())`.
-    pub detok: Vec<flume::Sender<DetokMsg>>,
+    pub detokenizer_tx: Vec<flume::Sender<DetokMsg>>,
 }
 
 impl Senders {
     #[inline]
     pub fn detok_for(&self, rid: &Rid) -> &flume::Sender<DetokMsg> {
-        &self.detok[rid.shard(self.detok.len())]
+        &self.detokenizer_tx[rid.shard(self.detokenizer_tx.len())]
     }
 }

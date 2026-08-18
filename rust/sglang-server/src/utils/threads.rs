@@ -8,6 +8,7 @@
 //!   3. one [`spawn_pool`] (N pinned workers) or [`spawn_stage`] (singleton) call.
 
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use core_affinity::CoreId;
 
@@ -140,4 +141,19 @@ pub(super) fn spawn_pool<R, F>(
         let core = pool_core(&cores, i);
         spawn_stage(&format!("{name}-{i}"), core, build(i), threads);
     }
+}
+
+/// Join every handle, giving up after `timeout`.
+pub(super) fn join_all_with_timeout(handles: Vec<JoinHandle<()>>, timeout: Duration) -> bool {
+    if handles.is_empty() {
+        return true;
+    }
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        for h in handles {
+            let _ = h.join();
+        }
+        let _ = done_tx.send(());
+    });
+    done_rx.recv_timeout(timeout).is_ok()
 }
