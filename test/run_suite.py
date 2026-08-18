@@ -245,9 +245,7 @@ def filter_tests(
     ci_tests = [
         t
         for t in ci_tests
-        if t.backend == hw
-        and t.effective_suite in suite_set
-        and t.nightly == nightly
+        if t.backend == hw and t.effective_suite in suite_set and t.nightly == nightly
     ]
 
     # Union of all three dicts, not just the per-commit or nightly half:
