@@ -431,6 +431,7 @@ class GroupCoordinator:
             self.pymscclpp_comm = PyMscclppCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+                group_name=group_name,
             )
 
         self.ca_comm: Optional[Any] = None
@@ -1017,6 +1018,13 @@ class GroupCoordinator:
             else:
                 ca_comm.all_gather_unreg(input, out=output, dim=0)
                 return
+
+        pymscclpp_comm = self.pymscclpp_comm
+        if pymscclpp_comm is not None and pymscclpp_comm.should_mscclpp_allgather(
+            output, input
+        ):
+            pymscclpp_comm.all_gather(output, input)
+            return
 
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (

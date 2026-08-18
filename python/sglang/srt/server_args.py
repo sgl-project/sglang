@@ -1629,7 +1629,7 @@ class ServerArgs:
     ] = False
     enable_mscclpp: A[
         bool,
-        "Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
+        "Enable MSCCL++ for tuned AllReduce and AllGather messages, with NCCL fallback.",
     ] = False
     enable_torch_symm_mem: A[
         bool,
