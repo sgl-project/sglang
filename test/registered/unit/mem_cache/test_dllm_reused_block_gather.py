@@ -62,7 +62,11 @@ class TestGatherReusedBlockLocs(CustomTestCase):
         self.assertTrue(torch.equal(got, want))
         self.assertEqual(
             got.tolist(),
-            [[1004, 1005, 1006, 1007], [3008, 3009, 3010, 3011], [5000, 5001, 5002, 5003]],
+            [
+                [1004, 1005, 1006, 1007],
+                [3008, 3009, 3010, 3011],
+                [5000, 5001, 5002, 5003],
+            ],
         )
 
     def test_preserves_row_order_when_pool_indices_are_unsorted(self):
