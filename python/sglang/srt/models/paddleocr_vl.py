@@ -89,6 +89,40 @@ def build_packed_2d_position_ids(
     return pids, max_grid_size
 
 
+def merge_patch_neighbourhoods(
+    hidden_states: torch.Tensor,
+    grid_thws: List[GridTHW],
+    merge_kernel_size: Tuple[int, int],
+) -> torch.Tensor:
+    """Group each image's ``m1 x m2`` patch neighbourhoods into single tokens.
+
+    Takes the packed ``[total_patches, dim]`` batch and returns
+    ``[total_patches / (m1 * m2), m1 * m2 * dim]``. Only this step depends on an
+    image's ``h``/``w``, which is why it is separated from the projections that
+    follow: those are row-wise and run once for the whole batch.
+    """
+    m1, m2 = merge_kernel_size
+    dim = hidden_states.shape[-1]
+    merged = hidden_states.new_empty(hidden_states.shape[0] // (m1 * m2), m1 * m2 * dim)
+
+    in_offset = out_offset = 0
+    for t, h, w in grid_thws:
+        num_patches = t * h * w
+        num_merged = num_patches // (m1 * m2)
+        # Row-major patches (t, h, w) regroup as (t, h/m1, m1, w/m2, m2, d); the
+        # merged token concatenates the m1*m2 neighbours along `d`.
+        merged[out_offset : out_offset + num_merged].view(
+            t, h // m1, w // m2, m1, m2, dim
+        ).copy_(
+            hidden_states[in_offset : in_offset + num_patches]
+            .view(t, h // m1, m1, w // m2, m2, dim)
+            .permute(0, 1, 3, 2, 4, 5)
+        )
+        in_offset += num_patches
+        out_offset += num_merged
+    return merged
+
+
 class Projector(nn.Module):
     """Merge 2x2 patch neighbourhoods, then project into the language space."""
 
@@ -128,30 +162,10 @@ class Projector(nn.Module):
         image contributes a single strided copy into the merged buffer, so an
         N-image batch costs N copies plus 3 kernels rather than 4N kernels.
         """
-        m1, m2 = self.merge_kernel_size
-        dim = image_features.shape[-1]
-
         hidden_states = self.pre_norm(image_features)
-        merged = hidden_states.new_empty(
-            hidden_states.shape[0] // (m1 * m2), self.hidden_size
+        merged = merge_patch_neighbourhoods(
+            hidden_states, grid_thws, self.merge_kernel_size
         )
-
-        in_offset = out_offset = 0
-        for t, h, w in grid_thws:
-            num_patches = t * h * w
-            num_merged = num_patches // (m1 * m2)
-            # Row-major patches (t, h, w) regroup as (t, h/m1, m1, w/m2, m2, d);
-            # the merged token concatenates the m1*m2 neighbours along `d`.
-            merged[out_offset : out_offset + num_merged].view(
-                t, h // m1, w // m2, m1, m2, dim
-            ).copy_(
-                hidden_states[in_offset : in_offset + num_patches]
-                .view(t, h // m1, m1, w // m2, m2, dim)
-                .permute(0, 1, 3, 2, 4, 5)
-            )
-            in_offset += num_patches
-            out_offset += num_merged
-
         hidden_states = self.linear_1(merged)
         hidden_states = self.act(hidden_states)
         return self.linear_2(hidden_states)

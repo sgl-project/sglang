@@ -14,6 +14,7 @@ from sglang.srt.models.paddleocr_vl import (
     Projector,
     SiglipVisionEmbeddings,
     build_packed_2d_position_ids,
+    merge_patch_neighbourhoods,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -34,6 +35,14 @@ class _VisionConfig:
 
 class _TextConfig:
     hidden_size = 48
+
+
+def _grid_offsets():
+    """Start row of each image inside the packed batch."""
+    offset = 0
+    for t, h, w in GRIDS:
+        yield offset
+        offset += t * h * w
 
 
 def _packed_features(dtype=torch.float64) -> torch.Tensor:
@@ -71,6 +80,46 @@ def _build_projector() -> Projector:
     return projector
 
 
+# The merge is pure data movement, so it must be bit-exact. The projections that
+# follow are not: batching N per-image GEMMs into one changes the blocking, and
+# with it the summation order, so the results differ in the last bits (observed
+# up to 3e-14 relative in fp64, and it is BLAS-implementation dependent -- equal
+# on Apple silicon, unequal on x86). A permutation bug would move values by
+# order 1, so this tolerance still catches one decisively.
+_GEMM_REORDER_RTOL = 1e-12
+_GEMM_REORDER_ATOL = 1e-12
+
+
+def test_projector_merge_permutation_is_exact():
+    """The 2x2 regroup moves data without arithmetic, so it must be bit-exact."""
+    torch.manual_seed(1)
+    projector = _build_projector()
+    packed = _packed_features()
+    normed = projector.pre_norm(packed)
+
+    actual = merge_patch_neighbourhoods(normed, GRIDS, projector.merge_kernel_size)
+
+    m1, m2 = projector.merge_kernel_size
+    expected = torch.cat(
+        [
+            rearrange(
+                normed[offset : offset + t * h * w],
+                "(t h p1 w p2) d -> (t h w) (p1 p2 d)",
+                t=t,
+                h=h // m1,
+                p1=m1,
+                w=w // m2,
+                p2=m2,
+            )
+            for offset, (t, h, w) in zip(_grid_offsets(), GRIDS)
+        ],
+        dim=0,
+    )
+
+    assert actual.shape == expected.shape
+    assert torch.equal(actual, expected)
+
+
 def test_projector_packed_merge_matches_per_image_reference():
     torch.manual_seed(1)
     projector = _build_projector()
@@ -82,7 +131,9 @@ def test_projector_packed_merge_matches_per_image_reference():
     assert actual.shape == expected.shape
     assert actual.shape[0] == sum(t * h * w for t, h, w in GRIDS) // 4
     assert actual.shape[1] == _TextConfig.hidden_size
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual, expected, rtol=_GEMM_REORDER_RTOL, atol=_GEMM_REORDER_ATOL
+    )
 
 
 def test_projector_is_batch_invariant():
@@ -101,7 +152,9 @@ def test_projector_is_batch_invariant():
         offset += num_patches
     apart = torch.cat(apart, dim=0)
 
-    torch.testing.assert_close(together, apart, rtol=0, atol=0)
+    torch.testing.assert_close(
+        together, apart, rtol=_GEMM_REORDER_RTOL, atol=_GEMM_REORDER_ATOL
+    )
 
 
 def _build_embeddings() -> SiglipVisionEmbeddings:
