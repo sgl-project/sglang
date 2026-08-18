@@ -485,13 +485,18 @@ if is_blackwell_supported() and is_flashinfer_available():
         alignment: int = 32,
         backend: str = "cute-dsl",
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Fake mode only needs dtypes and output rank to propagate compile graph.
-        # The scale tensor shape is not consumed before the following fake mm op.
         k_aligned = ((input.shape[1] + alignment - 1) // alignment) * alignment
         q_input = input.new_empty(
             (input.shape[0], k_aligned), dtype=torch.float8_e4m3fn
         )
-        scale = input.new_empty((1,), dtype=torch.uint8)
+        sf_columns = k_aligned // 32
+        if _is_sf_swizzled_layout:
+            padded_rows = ((input.shape[0] + 127) // 128) * 128
+            padded_sf_columns = ((sf_columns + 3) // 4) * 4
+            scale_size = padded_rows * padded_sf_columns
+        else:
+            scale_size = input.shape[0] * sf_columns
+        scale = input.new_empty((scale_size,), dtype=torch.uint8)
         return q_input, scale
 
     @register_custom_op(
