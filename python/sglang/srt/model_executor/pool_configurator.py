@@ -30,6 +30,9 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
+    NVFP4_BYTES_PER_TOKEN as DSA_NVFP4_BYTES_PER_TOKEN,
+)
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
@@ -344,7 +347,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         effective_num_layers = (
             num_layers
-            if kvc.server_args.enable_hisparse
+            if get_memory().enable_hisparse
             else get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
         )
 
@@ -372,15 +375,26 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim,
             )
 
-            cell_size = (
-                calculate_mla_kv_cache_dim(
-                    model_config=model_config,
-                    kv_cache_dtype=kv_cache_dtype,
-                )
-                * effective_num_layers
-                * kv_size
+            is_dsa_model = is_deepseek_dsa(model_config.hf_config)
+            is_dsa_packed_fp4 = (
+                is_dsa_model
+                and is_float4_e2m1fn_x2(kv_cache_dtype)
+                and get_model().kv_cache_dtype == "nvfp4"
             )
-            if is_float4_e2m1fn_x2(kv_cache_dtype):
+            if is_dsa_packed_fp4:
+                # The DSA row is already expressed in raw bytes.  Do not
+                # apply the generic FP4 half-byte adjustment a second time.
+                cell_size = DSA_NVFP4_BYTES_PER_TOKEN * effective_num_layers
+            else:
+                cell_size = (
+                    calculate_mla_kv_cache_dim(
+                        model_config=model_config,
+                        kv_cache_dtype=kv_cache_dtype,
+                    )
+                    * effective_num_layers
+                    * kv_size
+                )
+            if is_float4_e2m1fn_x2(kv_cache_dtype) and not is_dsa_model:
                 # kv_scale_buffer
                 scale_block_size = 16
                 cell_size = (cell_size // 2) + (
@@ -570,7 +584,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         if (
             allocate_all_layers
-            or kvc.server_args.enable_hisparse
+            or get_memory().enable_hisparse
             or not _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
         ):
             num_indexer_layers = num_layers

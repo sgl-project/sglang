@@ -296,6 +296,7 @@ def handle_kv4_compatibility(server_args: Any) -> None:
             else:
                 if uses_mla:  # !FA4 + MLA
                     KV4_ATTENTION_MLA_BACKEND_CHOICES = [
+                        "dsa",
                         "flashinfer",
                         "trtllm_mla",
                     ]

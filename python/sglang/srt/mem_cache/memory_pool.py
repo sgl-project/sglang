@@ -58,6 +58,11 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
+    NVFP4_BYTES_PER_TOKEN as DSA_NVFP4_BYTES_PER_TOKEN,
+    dequantize_nvfp4_k_cache_paged,
+    quantize_nvfp4_k_cache_into,
+)
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -86,6 +91,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
+    is_float4_e2m1fn_x2,
     is_gfx95_supported,
     is_hip,
     is_npu,
@@ -4795,11 +4801,35 @@ class MLATokenToKVPool(KVCache):
             and dtype == torch.float8_e4m3fn
             and override_kv_cache_dim is not None
         )
+        self.dsa_kv_cache_store_nvfp4 = (
+            use_dsa
+            and is_float4_e2m1fn_x2(dtype)
+            and override_kv_cache_dim == DSA_NVFP4_BYTES_PER_TOKEN
+        )
+        self.dsa_kv_cache_store_packed_fp4 = self.dsa_kv_cache_store_nvfp4
+        if (
+            use_dsa
+            and is_float4_e2m1fn_x2(dtype)
+            and override_kv_cache_dim is not None
+            and not self.dsa_kv_cache_store_packed_fp4
+        ):
+            raise ValueError(
+                "Unsupported DSA packed FP4 cache row: "
+                f"override_kv_cache_dim={override_kv_cache_dim}"
+            )
+        if self.dsa_kv_cache_store_packed_fp4:
+            if kv_lora_rank != 512 or qk_rope_head_dim != 64:
+                raise ValueError(
+                    "DSA packed FP4 requires kv_lora_rank=512 and "
+                    f"qk_rope_head_dim=64, got {kv_lora_rank=} and "
+                    f"{qk_rope_head_dim=}"
+                )
+            self.store_dtype = torch.uint8
         # When override_kv_cache_dim is provided with dsa model, we assume the
         # override kv cache dim is correct and use it directly.
         self.kv_cache_dim = (
             override_kv_cache_dim
-            if self.dsa_kv_cache_store_fp8
+            if self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_packed_fp4
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
@@ -4876,6 +4906,13 @@ class MLATokenToKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
+        if self.dsa_kv_cache_store_nvfp4 and not hasattr(self, "mla_kv_global_scale"):
+            # CUDA graphs capture this address and every encoded row depends on
+            # its value, so keep the per-layer scales outside discardable KV
+            # allocation regions.
+            self.mla_kv_global_scale = torch.ones(
+                self.layer_num, dtype=torch.float32, device=self.device
+            )
 
     def _clear_buffers(self):
         del self.kv_buffer
@@ -4885,6 +4922,8 @@ class MLATokenToKVPool(KVCache):
         kv_size_bytes = 0
         for kv_cache in self.kv_buffer:
             kv_size_bytes += get_tensor_size_bytes(kv_cache)
+        if hasattr(self, "mla_kv_global_scale"):
+            kv_size_bytes += get_tensor_size_bytes(self.mla_kv_global_scale)
         return kv_size_bytes
 
     # for disagg
@@ -4901,6 +4940,8 @@ class MLATokenToKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        if self.dsa_kv_cache_store_packed_fp4:
+            return self.kv_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
 
@@ -4910,6 +4951,10 @@ class MLATokenToKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        if self.dsa_kv_cache_store_packed_fp4:
+            # MLA aliases K and V in one latent row.  The fused consumer reads
+            # the same packed row for QK and PV.
+            return self.kv_buffer[layer_id - self.start_layer]
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer][
                 ..., : self.kv_lora_rank
@@ -4946,6 +4991,40 @@ class MLATokenToKVPool(KVCache):
                 dst_buffer, loc, cache_k_nope, cache_k_rope
             )
 
+    def get_mla_kv_global_scale(self, layer_id: int) -> torch.Tensor:
+        if not self.dsa_kv_cache_store_nvfp4:
+            raise RuntimeError("NVFP4 global scale requested from a non-NVFP4 pool")
+        index = layer_id - self.start_layer
+        if not 0 <= index < self.layer_num:
+            raise IndexError(
+                f"layer_id={layer_id} is outside [{self.start_layer}, "
+                f"{self.start_layer + self.layer_num})"
+            )
+        return self.mla_kv_global_scale[index : index + 1]
+
+    def set_mla_kv_global_scale(
+        self, layer_id: int, scale: Union[float, torch.Tensor]
+    ) -> None:
+        dst = self.get_mla_kv_global_scale(layer_id)
+        value = (
+            float(scale.detach().float().item())
+            if isinstance(scale, torch.Tensor)
+            else float(scale)
+        )
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"DSA NVFP4 global scale must be finite and positive, got {value}"
+            )
+        dst.fill_(value)
+
+    def get_raw_mla_kv_buffer(self, layer_id: int) -> dict[str, torch.Tensor]:
+        if self.dsa_kv_cache_store_nvfp4:
+            return {
+                "kv": self.get_key_buffer(layer_id),
+                "global_scale": self.get_mla_kv_global_scale(layer_id),
+            }
+        raise RuntimeError("raw packed FP4 row requested from an unpacked pool")
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -4961,6 +5040,7 @@ class MLATokenToKVPool(KVCache):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         assert not self.dsa_kv_cache_store_fp8
+        assert not self.dsa_kv_cache_store_packed_fp4
         # No DCP-aware variant is possible: the two backends reaching this door
         # disagree on the loc space (flashinfer-MLA widened, Triton collapsed).
         assert (
@@ -4986,6 +5066,7 @@ class MLATokenToKVPool(KVCache):
 
     def _write_mla_kv_buffer(
         self,
+        layer_id: int,
         dst_buffer: torch.Tensor,
         loc: torch.Tensor,
         cache_k_nope: torch.Tensor,
@@ -4995,9 +5076,16 @@ class MLATokenToKVPool(KVCache):
             self.write_loc_is_dcp_resolved
             and (self.use_dsa or self.dsa_kv_cache_store_fp8)
         ), "the DSA write paths have no resolved-loc variant"
-        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
-            # HIP TileLang FP8 consumes the model's raw MLA layout
-            # (NoPE + optional RoPE) without per-block scales.
+        if self.dsa_kv_cache_store_nvfp4:
+            quantize_nvfp4_k_cache_into(
+                cache_k_nope,
+                cache_k_rope,
+                dst_buffer,
+                loc,
+                self.get_mla_kv_global_scale(layer_id),
+            )
+        elif _is_hip and self.use_dsa and self.dtype == fp8_dtype:
+            # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
             set_mla_kv_buffer_triton_fp8_quant(
                 dst_buffer,
@@ -5051,6 +5139,7 @@ class MLATokenToKVPool(KVCache):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         self._write_mla_kv_buffer(
+            layer_id,
             self.kv_buffer[layer_id - self.start_layer],
             loc,
             cache_k_nope,
@@ -5065,6 +5154,17 @@ class MLATokenToKVPool(KVCache):
     ):
         # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
         layer_id = layer.layer_id
+        if self.dsa_kv_cache_store_nvfp4:
+            decoded = dequantize_nvfp4_k_cache_paged(
+                self.get_key_buffer(layer_id),
+                loc,
+                self.get_mla_kv_global_scale(layer_id),
+                dtype=dst_dtype or torch.bfloat16,
+            )
+            return (
+                decoded[..., : self.kv_lora_rank],
+                decoded[..., self.kv_lora_rank :],
+            )
         kv_buffer = self.get_key_buffer(layer_id)
         dst_dtype = dst_dtype or self.dtype
         cache_k_nope = torch.empty(

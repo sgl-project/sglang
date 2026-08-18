@@ -2680,6 +2680,27 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
                     self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
 
 
+class TestDsaKV4Compatibility(unittest.TestCase):
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_dsa_nvfp4_is_allowed_by_generic_mla_gate(self):
+        args = ServerArgs(
+            model_path="dummy",
+            attention_backend="dsa",
+            kv_cache_dtype="nvfp4",
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.use_mla_backend",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.arg_groups.kv_cache_hook.attention_backends_of",
+                return_value=("dsa", "dsa"),
+            ),
+        ):
+            handle_kv4_compatibility(args)
+
+
 class TestPipelineParallelCompat(CustomTestCase):
     """Features supported with `pipeline-parallel-size > 1`."""
 
