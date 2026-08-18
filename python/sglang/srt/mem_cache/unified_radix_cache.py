@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import logging
 import threading
 import time
@@ -57,6 +58,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
 from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
+from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     NodeId,
@@ -216,6 +218,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
         self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
+        # Owns the runtime attach/detach of the L3 backend; built by init_hicache.
+        self._storage_attachment: Optional[StorageAttachment] = None
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
@@ -380,6 +384,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
+
+        # Runtime attach/detach of the L3 backend (admin API + atexit shutdown).
+        self._storage_attachment = StorageAttachment(self)
+        atexit.register(self.shutdown)
 
         if storage_backend is not None:
             self._apply_storage_runtime_config(
@@ -1583,7 +1591,7 @@ class UnifiedRadixCache(BasePrefixCache):
         n_storage_hit: Optional[int],
         n_backup: Optional[int],
         n_release: Optional[int],
-        extra_release_counts: Optional[dict[PoolName, int]],
+        extra_release_counts: Optional[dict[PoolName, Optional[int]]],
         log_metrics: bool,
     ) -> None:
         cc = self.cache_controller
@@ -1725,6 +1733,54 @@ class UnifiedRadixCache(BasePrefixCache):
             log_metrics=True,
         )
 
+    def drain_storage_control_queues_local(self) -> None:
+        """Drain the storage control queues without cross-rank synchronization."""
+        cc = self.cache_controller
+        extra_queues = (
+            getattr(cc, "extra_host_mem_release_queues", {}) if cc is not None else {}
+        )
+        self._drain_storage_control_queues_impl(
+            n_storage_hit=0,
+            n_backup=None,
+            n_release=None,
+            extra_release_counts={pool_name: None for pool_name in extra_queues},
+            log_metrics=False,
+        )
+
+    def attach_storage_backend(
+        self,
+        storage_backend: str,
+        storage_backend_extra_config_json: Optional[str] = None,
+        served_model_name: Optional[str] = None,
+        hicache_storage_prefetch_policy: Optional[str] = None,
+        hicache_write_policy: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        """Attach (enable) the HiCache storage backend at runtime."""
+        if self._storage_attachment is None:
+            return (
+                False,
+                "HiCache is not initialized; launch with "
+                "--enable-hierarchical-cache to attach a storage backend.",
+            )
+        return self._storage_attachment.attach(
+            storage_backend=storage_backend,
+            storage_backend_extra_config_json=storage_backend_extra_config_json,
+            served_model_name=served_model_name,
+            hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
+            hicache_write_policy=hicache_write_policy,
+        )
+
+    def detach_storage_backend(self) -> tuple[bool, str]:
+        """Detach (disable) the HiCache storage backend at runtime."""
+        if self._storage_attachment is None:
+            return False, "HiCache storage backend is not initialized."
+        return self._storage_attachment.detach()
+
+    def shutdown(self) -> None:
+        """Best-effort auto-detach of the storage backend on process shutdown."""
+        if self._storage_attachment is not None:
+            self._storage_attachment.shutdown()
+
     def _apply_storage_runtime_config(
         self,
         *,
@@ -1781,27 +1837,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         else:
             self.storage_metrics_collector = None
-
-    def attach_storage_backend(
-        self,
-        storage_backend: str,
-        storage_backend_extra_config_json: Optional[str] = None,
-        served_model_name: Optional[str] = None,
-        hicache_storage_prefetch_policy: Optional[str] = None,
-        hicache_write_policy: Optional[str] = None,
-    ) -> tuple[bool, str]:
-        return (
-            False,
-            "UnifiedRadixCache does not support runtime HiCache storage attach yet. "
-            "Configure hicache_storage_backend at startup instead.",
-        )
-
-    def detach_storage_backend(self) -> tuple[bool, str]:
-        return (
-            False,
-            "UnifiedRadixCache does not support runtime HiCache storage detach yet. "
-            "Restart without hicache_storage_backend to disable it.",
-        )
 
     def clear_storage_backend(self) -> bool:
         try:
