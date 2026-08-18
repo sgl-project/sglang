@@ -25,7 +25,13 @@ class PaddleOCRVLImageProcessor(QwenVLImageProcessor):
     # milliseconds, so a single worker caps request throughput at
     # 1 / preprocess_time regardless of how much GPU is left idle. Overlap it
     # across workers; the work itself is unchanged.
-    auto_mm_processor_worker_num = 4
+    #
+    # Two, not more: measured on an H200 at 32-way concurrency, two workers beat
+    # both one and four on every shape tried (1080p pages 6.72 -> 9.55 req/s at
+    # two, 8.92 at four; 360p pages with 512-token outputs 22.38 -> 25.20 at
+    # two, 25.06 at four). Past two, spreading request arrivals fragments the
+    # GPU prefill batches faster than the extra overlap pays for itself.
+    auto_mm_processor_worker_num = 2
     auto_mm_io_worker_num = 16
     supports_mm_processor_concurrency = True
 

@@ -34,6 +34,14 @@ def test_processor_opts_into_concurrency():
     assert PaddleOCRVLImageProcessor.auto_mm_io_worker_num > 1
 
 
+def test_worker_count_stays_at_the_measured_optimum():
+    """Two beat both one and four at 32-way concurrency on an H200, on document
+    pages and on small images with long outputs alike. Past two, spreading
+    request arrivals fragments GPU prefill batches faster than the extra overlap
+    pays for itself."""
+    assert PaddleOCRVLImageProcessor.auto_mm_processor_worker_num == 2
+
+
 def test_concurrency_opt_in_is_not_inherited_by_accident():
     """The base class must stay conservative; this model opts in explicitly."""
     assert BaseMultimodalProcessor.supports_mm_processor_concurrency is False
