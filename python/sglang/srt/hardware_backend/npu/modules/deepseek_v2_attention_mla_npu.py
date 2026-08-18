@@ -728,12 +728,6 @@ def forward_dsa_prepare_npu(
         k_feat_size = m.kv_lora_rank
         k_nope = kv_full[..., :k_feat_size].unsqueeze(1)
         k_pe = kv_full[..., k_feat_size:].unsqueeze(1)
-        get_token_to_kv_pool().set_kv_buffer(
-            m.attn_mqa,
-            forward_batch.out_cache_loc,
-            k_nope,
-            k_pe,
-        )
     return (
         q_pe,
         k_pe,
