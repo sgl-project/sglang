@@ -44,10 +44,6 @@ on:
         description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
         type: boolean
         default: false
-      install_sglang_deps:
-        description: 'Install sglang dependencies (NPU/CANN packages, datasets, sglang_router). Set false for pre-built images that already ship the runtime and datasets.'
-        type: boolean
-        default: true
       github-token:
         description: 'GitHub token for API calls'
         type: string
@@ -185,7 +181,8 @@ jobs:
             }
 
       - name: Install dependencies
-        if: ${{ inputs.install_sglang_deps == true }}
+        # Only PR jobs install dependencies
+        if: ${{ inputs.is_nightly_pipeline_job != true }}
         env:
           TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"

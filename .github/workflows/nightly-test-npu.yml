@@ -150,7 +150,6 @@ jobs:
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
       is_nightly_pipeline_job: true
-      install_sglang_deps: false
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
@@ -166,7 +165,6 @@ jobs:
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
       is_nightly_pipeline_job: true
-      install_sglang_deps: false
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
@@ -184,7 +182,6 @@ jobs:
       timeout_per_file: '3600'
       partitions: '{"size":2,"arr":[0,1]}'
       is_nightly_pipeline_job: true
-      install_sglang_deps: false
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
@@ -200,7 +197,6 @@ jobs:
       run_timeout_minutes: '60'
       timeout_per_file: '3600'
       is_nightly_pipeline_job: true
-      install_sglang_deps: false
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
@@ -216,7 +212,6 @@ jobs:
       run_timeout_minutes: '120'
       timeout_per_file: '3600'
       is_nightly_pipeline_job: true
-      install_sglang_deps: false
       skip_pr_test_health_check: 'true'
     secrets: inherit
 
