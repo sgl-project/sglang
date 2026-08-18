@@ -868,6 +868,20 @@ def _install_framework(fw_name: str, dry_run: bool = False) -> bool:
     return True
 
 
+def _get_checkout_commit_sha() -> str:
+    fallback = os.environ.get("GITHUB_SHA", "unknown")
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return fallback
+    return result.stdout.strip() or fallback
+
+
 def run_comparison(
     config: dict,
     case_ids: list[str] | None = None,
@@ -882,7 +896,7 @@ def run_comparison(
     Each non-sglang framework is installed right before its cases run.
     """
     timestamp = datetime.now(timezone.utc).isoformat()
-    commit_sha = os.environ.get("GITHUB_SHA", "unknown")
+    commit_sha = _get_checkout_commit_sha()
     run_id = os.environ.get("GITHUB_RUN_ID", "local")
 
     log_dir = Path("comparison-logs")

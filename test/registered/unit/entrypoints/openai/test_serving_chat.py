@@ -32,6 +32,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
+from sglang.srt.environ import envs
 from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
@@ -74,7 +75,9 @@ class _MockTokenizerManager:
         self.model_path = self.server_args.model_path
         # The manager tracks the served name itself; a weight update rewrites it.
         self.served_model_name = "test-model"
-        self._config_updates = []
+        # Stands in for the context's resolved leaves: an override replaces the
+        # field's one live value, the seed stays on server_args.
+        self._config_overrides = {}
 
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
@@ -100,6 +103,7 @@ class _MockTokenizerManager:
                     "prompt_tokens": 10,
                     "completion_tokens": 5,
                     "cached_tokens": 0,
+                    "weight_version": "test-version",
                     "finish_reason": {"type": "stop", "matched": None},
                     "output_token_logprobs": [(0.1, 1, "Test"), (0.2, 2, "response")],
                     "output_top_logprobs": None,
@@ -109,12 +113,12 @@ class _MockTokenizerManager:
 
         self.generate_request = Mock(return_value=_mock_generate())
         self.create_abort_task = Mock()
+        self.request_logger = Mock(log_requests=False, log_requests_level=0)
 
     def config_value(self, name: str):
-        """The manager's overlay accessor: no control-plane update recorded."""
-        for _source, fields in reversed(self._config_updates):
-            if name in fields:
-                return fields[name]
+        """The value in effect for one config field."""
+        if name in self._config_overrides:
+            return self._config_overrides[name]
         return getattr(self.server_args, name)
 
 
@@ -157,15 +161,12 @@ class ServingChatTestCase(unittest.TestCase):
         self.fastapi_request.headers = {}
 
     def test_parsers_follow_the_control_plane_overlay(self):
-        """Template detection records the parsers on the manager, not on its
-        ServerArgs — the instance keeps what the launcher passed."""
+        """Template detection records the parsers through `override`, so they
+        answer from the bags; `ServerArgs` keeps the launcher's seed."""
         self.tm.server_args.tool_call_parser = "auto"
         self.tm.server_args.reasoning_parser = "auto"
-        self.tm._config_updates.append(
-            (
-                "template-detection",
-                {"tool_call_parser": "qwen25", "reasoning_parser": None},
-            )
+        self.tm._config_overrides.update(
+            {"tool_call_parser": "qwen25", "reasoning_parser": None}
         )
 
         chat = OpenAIServingChat(self.tm, self.template_manager)
@@ -177,9 +178,7 @@ class ServingChatTestCase(unittest.TestCase):
     def test_the_xgrammar_gate_follows_the_overlay(self):
         """A detected `reasoning_parser` must gate xgrammar, not the seed's "auto"."""
         self.tm.server_args.reasoning_parser = "auto"
-        self.tm._config_updates.append(
-            ("template-detection", {"reasoning_parser": "qwen3"})
-        )
+        self.tm._config_overrides["reasoning_parser"] = "qwen3"
         chat = OpenAIServingChat(self.tm, self.template_manager)
         self.assertEqual(chat.reasoning_parser, "qwen3")
         # the gate reads the same value the parser was built from
@@ -278,11 +277,61 @@ class ServingChatTestCase(unittest.TestCase):
                 None,
             )
 
+            self.basic_req.return_sampling_mask = True
+            self.basic_req.return_meta_info = True
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
+            self.assertTrue(adapted.return_sampling_mask)
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
+
+    def test_chat_applies_pd_header_overrides(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            rid="body-rid",
+            routed_dp_rank=3,
+            disagg_prefill_dp_rank=4,
+            priority=5,
+        )
+        self.fastapi_request.headers = {
+            "x-override-rid": "header-rid",
+            "x-override-bootstrap-host": "header-host",
+            "x-override-bootstrap-port": "8998",
+            "x-override-bootstrap-room": "456",
+            "x-override-conversation-id": "conversation-1",
+            "x-override-routed-dp-rank": "6",
+            "x-override-disagg-prefill-dp-rank": "7",
+            "x-override-priority": "8",
+        }
+        body = request.model_dump()
+
+        processed_messages = MessageProcessingResult(
+            "Test prompt", [1, 2, 3], None, None, [], [], None
+        )
+        with (
+            envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.override(True),
+            patch.object(
+                self.chat, "_process_messages", return_value=processed_messages
+            ),
+        ):
+            response = get_or_create_event_loop().run_until_complete(
+                self.chat.handle_request(request, self.fastapi_request)
+            )
+
+        self.assertEqual(response.choices[0].message.content, "Test response")
+        adapted_request = self.tm.generate_request.call_args.args[0]
+        self.assertEqual(adapted_request.bootstrap_room, 456)
+        self.assertEqual(adapted_request.bootstrap_host, "header-host")
+        self.assertEqual(adapted_request.bootstrap_port, 8998)
+        self.assertEqual(adapted_request.rid, "header-rid")
+        self.assertEqual(adapted_request.conversation_id, "conversation-1")
+        self.assertEqual(adapted_request.routed_dp_rank, 6)
+        self.assertEqual(adapted_request.disagg_prefill_dp_rank, 7)
+        self.assertEqual(adapted_request.priority, 8)
+        self.assertEqual(request.model_dump(), body)
+        self.assertFalse(hasattr(request, "conversation_id"))
 
     def test_convert_to_internal_request_rejects_stream_token_ids(self):
         for field in ("return_prompt_token_ids", "return_token_ids"):
@@ -294,6 +343,18 @@ class ServingChatTestCase(unittest.TestCase):
             )
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
                 self.chat._convert_to_internal_request(req, self.fastapi_request)
+
+    def test_validate_request_rejects_sampling_mask_without_meta_info(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_sampling_mask=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_sampling_mask requires return_meta_info=true.",
+        )
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
@@ -2276,11 +2337,11 @@ class ServingChatTestCase(unittest.TestCase):
         choice = response.choices[0]
 
         self.assertEqual(choice.prompt_token_ids, [11, 12, 13])
-        self.assertEqual(choice.token_ids, [21, 22])
+        self.assertEqual(choice.response_token_ids, [21, 22])
         self.assertEqual(choice.meta_info, ret[0]["meta_info"])
         dumped_choice = response.model_dump()["choices"][0]
         self.assertEqual(dumped_choice["prompt_token_ids"], [11, 12, 13])
-        self.assertEqual(dumped_choice["token_ids"], [21, 22])
+        self.assertEqual(dumped_choice["response_token_ids"], [21, 22])
         self.assertEqual(dumped_choice["meta_info"], ret[0]["meta_info"])
 
     def test_streaming_cached_tokens_details_emits_sglext(self):

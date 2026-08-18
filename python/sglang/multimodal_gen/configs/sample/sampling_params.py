@@ -180,6 +180,16 @@ class SamplingParams:
     width: int | None = None
     fps: int = 24
 
+    # LTX-2.5 duration head. Ignored by other models, so the flags stay
+    # universally accepted.
+    # Decode with the diffusion decoder instead of the VAE one. Ignored by
+    # models that ship no such decoder.
+    use_diffusion_decoder: bool = False
+
+    auto_duration: bool = False
+    auto_duration_min_seconds: float = 1.0
+    auto_duration_max_seconds: float = 20.0
+
     # Resolution validation
     supported_resolutions: list[tuple[int, int]] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
@@ -885,6 +895,11 @@ class SamplingParams:
             return parser.add_argument(*name_or_flags, **kwargs)
 
         add_argument("--data-type", type=str, nargs="+")
+        # Predict the shot length from the caption, overriding `--num-frames`.
+        add_argument("--use-diffusion-decoder", action="store_true")
+        add_argument("--auto-duration", action="store_true")
+        add_argument("--auto-duration-min-seconds", type=float)
+        add_argument("--auto-duration-max-seconds", type=float)
         add_argument(
             "--num-frames-round-down",
             action="store_true",
