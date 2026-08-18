@@ -71,9 +71,10 @@ on:
           - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
           - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720
           - nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720
-          # 8-GPU Kimi-K2.6 (MI30x + MI35x)
+          # 8-GPU Kimi-K2.6 (MI30x)
           - nightly-8-gpu-kimi-k26-rocm720
-          - nightly-8-gpu-mi35x-kimi-k26-rocm720
+          # 8-GPU Kimi-K3 (MI35x only - native MXFP4 needs gfx95x)
+          - nightly-8-gpu-mi35x-kimi-k3-rocm720
           # 8-GPU Qwen3-235B (MI30x + MI35x MXFP4)
           - nightly-8-gpu-qwen3-235b-rocm720
           - nightly-8-gpu-mi35x-qwen3-235b-mxfp4-rocm720
@@ -1498,7 +1499,10 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
   # ==============================================================================
-  # 8-GPU Kimi-K2.6 (MI30x + MI35x)
+  # 8-GPU Kimi-K2.6 (MI30x)
+  #
+  # Kept on MI30x: Kimi-K3 needs gfx95x for its native MXFP4 weights, so it
+  # cannot take over here the way it does on MI35x.
   # ==============================================================================
 
   nightly-8-gpu-kimi-k26-rocm720:
@@ -1534,8 +1538,12 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  nightly-8-gpu-mi35x-kimi-k26-rocm720:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-kimi-k26-rocm720,'))
+  # ==============================================================================
+  # 8-GPU Kimi-K3 (MI35x only - native MXFP4 needs gfx95x)
+  # ==============================================================================
+
+  nightly-8-gpu-mi35x-kimi-k3-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-kimi-k3-rocm720,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
@@ -1560,13 +1568,15 @@ jobs:
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU Kimi-K2.6)
-        timeout-minutes: 180
+      # The 2.8T MXFP4 checkpoint is ~1.56 TB, so weight download and load
+      # dominate wall time well before the eval itself starts.
+      - name: Accuracy Test MI35x ROCm 7.2 (8-GPU Kimi-K3)
+        timeout-minutes: 300
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-kimi-k26 --nightly --timeout-per-file 7200 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-kimi-k3 --nightly --timeout-per-file 14400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -2137,9 +2147,10 @@ jobs:
       - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
       - nightly-8-gpu-mi35x-deepseek-v4-pro-mtp-rocm720
       - nightly-8-gpu-mi35x-deepseek-v4-pro-dspark-rocm720
-      # 8-GPU Kimi-K2.6 (MI30x + MI35x)
+      # 8-GPU Kimi-K2.6 (MI30x)
       - nightly-8-gpu-kimi-k26-rocm720
-      - nightly-8-gpu-mi35x-kimi-k26-rocm720
+      # 8-GPU Kimi-K3 (MI35x only - native MXFP4 needs gfx95x)
+      - nightly-8-gpu-mi35x-kimi-k3-rocm720
       # 8-GPU Qwen3-235B (MI30x + MI35x MXFP4)
       - nightly-8-gpu-qwen3-235b-rocm720
       - nightly-8-gpu-mi35x-qwen3-235b-mxfp4-rocm720

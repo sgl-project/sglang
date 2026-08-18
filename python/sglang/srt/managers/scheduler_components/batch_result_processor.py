@@ -566,7 +566,7 @@ class SchedulerBatchResultProcessor:
         return get_required_capture_hidden_mode(
             max(
                 batch.return_hidden_states_mode,
-                get_server_return_hidden_states_mode(server_args),
+                get_server_return_hidden_states_mode(),
             ),
             batch.spec_info,
         )
