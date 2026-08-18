@@ -310,6 +310,23 @@ def collect_promotion_candidates(
     return candidates
 
 
+def rank_candidates_by_h2d_savings(
+    candidates: Iterable[PromotionCandidate],
+) -> list[PromotionCandidate]:
+    """Biggest per-request H2D savings first; name breaks ties deterministically.
+
+    Shared by the promotion plan and the post-request residency hint so the
+    hint always lists components in the order auto mode would promote them.
+    """
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            -candidate.h2d_bytes_per_request,
+            candidate.component_name,
+        ),
+    )
+
+
 def _skip_plan(reason: str) -> AutoResidencyPlan:
     return AutoResidencyPlan(skip_reason=reason)
 
@@ -369,14 +386,7 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     if not candidates:
         return _skip_plan("no implicitly offloaded components to promote")
 
-    # Biggest per-request H2D savings first; name breaks ties deterministically.
-    ordered = sorted(
-        candidates,
-        key=lambda candidate: (
-            -candidate.h2d_bytes_per_request,
-            candidate.component_name,
-        ),
-    )
+    ordered = rank_candidates_by_h2d_savings(candidates)
     promotions = []
     promoted_bytes = 0
     for candidate in ordered:

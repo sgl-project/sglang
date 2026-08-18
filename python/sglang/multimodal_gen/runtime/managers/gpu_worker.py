@@ -13,7 +13,6 @@ from typing import Any, Callable, Iterator, List, Union
 
 import numpy as np
 import torch
-import torch.nn as nn
 from setproctitle import setproctitle
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import (  # isort: skip
@@ -62,21 +61,17 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     WarmupMemoryRecord,
     apply_promotions,
     collect_promotion_candidates,
-    component_resident_size_bytes,
     estimate_default_workload_peak_bytes,
     format_applied_changes,
     format_plan_summary,
     plan_auto_residency,
     plan_summary_payload,
+    rank_candidates_by_h2d_savings,
     resolve_default_workload,
     rollback_promotions,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     peek_global_component_residency_manager,
-)
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
-    COMPONENT_OFFLOAD,
-    LAYERWISE_OFFLOAD,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     configure_layerwise_offload_modules,
@@ -122,14 +117,6 @@ from sglang.srt.environ import third_party_cache_defaults
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
-
-OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
-    "vae",
-    "image_encoder",
-    "text_encoder",
-    "text_encoder_2",
-    "transformer",
-)
 
 
 @dataclass
@@ -371,8 +358,9 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         logger.debug(
             "GPU memory: peak=%.2f GB, allocated=%.2f GB, pool=%.2f GB (%.1f%%), "
             "headroom=%.2f GB. Components that can remain on GPU: %s. "
-            "Adjust --cpu-offload-components or --layerwise-offload-components "
-            "to change residency.",
+            "Make it explicit with --component-residency <name>=resident; "
+            "--performance-mode auto with server warmup applies safe "
+            "promotions automatically.",
             peak_reserved_gb,
             peak_allocated_gb,
             pool_overhead_gb,
@@ -1022,35 +1010,35 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float
     ) -> List[str]:
+        """Which currently offloaded components would fit in the headroom.
+
+        Reuses the auto-residency candidate collection and its H2D-savings
+        greedy order, so this post-request hint names the same components,
+        in the same order, that ``--performance-mode auto`` would promote.
+        Unlike the promotion plan it applies no reserve or margin: it reports
+        raw capacity after this request, not a placement decision.
         """
-        Calculate which components can stay resident on GPU without being offloaded.
-        """
-        can_stay_resident = []
         if not self.pipeline:
-            return can_stay_resident
+            return []
 
-        # Size from the live modules, not pipeline.memory_usages: the loader
-        # records the GPU-load delta, which is ~0 for exactly the offloaded
-        # components this recommendation is about.
-        modules = self.pipeline.modules
-        ordered_names = [
-            name for name in OFFLOAD_DISABLE_RECOMMENDATION_ORDER if name in modules
-        ]
-        ordered_names.extend(
-            name for name in modules if name not in OFFLOAD_DISABLE_RECOMMENDATION_ORDER
+        workload = resolve_default_workload(self.server_args)
+        candidates = collect_promotion_candidates(
+            modules=self.pipeline.modules,
+            residency_mode_of=self.server_args.residency_mode,
+            # The hint also covers explicitly offloaded components: the user
+            # chose offload and should learn when the headroom no longer
+            # requires it (promotion itself never touches explicit ones).
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=self.pipeline.component_residency_strategies,
+            num_inference_steps=workload.num_inference_steps,
         )
-        for name in ordered_names:
-            module = modules[name]
-            if not isinstance(module, nn.Module):
-                continue
-            residency_mode = self.server_args.residency_mode(name)
-            if residency_mode not in (COMPONENT_OFFLOAD, LAYERWISE_OFFLOAD):
-                continue
-            usage_gb = component_resident_size_bytes(module, residency_mode) / GIB_BYTES
-            if 0 < usage_gb <= remaining_gpu_mem_gb:
-                can_stay_resident.append(name)
-                remaining_gpu_mem_gb -= usage_gb
 
+        can_stay_resident = []
+        for candidate in rank_candidates_by_h2d_savings(candidates):
+            usage_gb = candidate.promoted_weight_bytes / GIB_BYTES
+            if usage_gb <= remaining_gpu_mem_gb:
+                can_stay_resident.append(candidate.component_name)
+                remaining_gpu_mem_gb -= usage_gb
         return can_stay_resident
 
     def apply_auto_residency(self) -> OutputBatch:
