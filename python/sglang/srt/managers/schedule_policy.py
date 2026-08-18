@@ -520,6 +520,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        num_mixed_decode_swa_tokens: int = 0,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -572,7 +573,10 @@ class PrefillAdder:
         )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
 
-        self.rem_swa_token_offset = 0
+        # Mixed chunk prefill runs the existing decode batch immediately after
+        # admission. Reserve the exact page-aligned SWA demand for that decode
+        # step so prefill admission cannot consume its pages.
+        self.rem_swa_token_offset = num_mixed_decode_swa_tokens
 
         # Unified-pool joint budget: a new mamba state consumes shared-gap bytes
         # that `rem_total_tokens` (full KV) otherwise counts as free, so reserve

@@ -3254,6 +3254,12 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        mixed_decode_swa_tokens = (
+            running_batch.new_tokens_required_next_decode()
+            if self.is_mixed_chunk and self.tree_cache.supports_swa()
+            else 0
+        )
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -3271,6 +3277,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            num_mixed_decode_swa_tokens=mixed_decode_swa_tokens,
         )
 
         if self.chunked_req is not None:

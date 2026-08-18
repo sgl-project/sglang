@@ -292,6 +292,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,  # last_loc for full layers
     ):
         assert self.page_size > 1
+
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            decode=True,
+        )
+        if not self.new_pages_available(num_new_pages, num_new_pages):
+            return None
+
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
         alloc_full_indices = self.full_attn_allocator.alloc_decode(
