@@ -432,8 +432,6 @@ class TestDecodePrebuiltPriority(unittest.TestCase):
         scheduler.enable_overlap = False
         scheduler.spec_algorithm = MagicMock()
         scheduler.max_running_requests = 1
-        # Passed whole into the (mocked) batch's process_prebuilt; never read.
-        scheduler.server_args = SimpleNamespace()
         scheduler.future_map = MagicMock()
         scheduler.policy = MagicMock()
         scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: (
