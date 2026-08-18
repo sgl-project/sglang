@@ -691,7 +691,6 @@ class HybridCacheController(BaseHiCacheController):
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
             results = self.storage_backend.batch_set_v2(backup_transfers)
-            operation.pool_storage_result.update_extra_pool_hit_pages(results)
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
