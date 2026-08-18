@@ -35,7 +35,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
             enable_metrics=False,
             enable_hisparse=False,
         ),
-        model_config=SimpleNamespace(think_end_ids=None),
+        model_config=SimpleNamespace(think_start_ids=None, think_end_ids=None),
         token_to_kv_pool_allocator=Mock(),
         tree_cache=None,
         hisparse_coordinator=None,
