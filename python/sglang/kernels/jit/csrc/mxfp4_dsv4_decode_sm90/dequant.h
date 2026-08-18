@@ -110,8 +110,9 @@ __device__ __forceinline__ bf16x16 dequant_e2m1x16(uint64_t packed, float scale)
 
 namespace sm90::mxfp4 {
 
-// MXFP4 rows carry one E8M0 block scale byte per 32 NoPE dims. The byte is a
-// plain FP32 exponent pattern (bias 127, value 0 encodes zero).
+// MXFP4 rows carry one E8M0 block scale byte per 32 NoPE dims. Per the
+// E8M0 (FP8 8-bit exponent) encoding, bytes 0..254 are 2^-127..2^127 and
+// 255 is reserved as NaN — there is no zero encoding.
 __device__ __forceinline__ uint8_t load_scale_bits(const void* address) {
   uint32_t value;
   asm volatile("ld.global.nc.L1::evict_last.L2::128B.u8 %0, [%1];" : "=r"(value) : "l"(address));
@@ -119,8 +120,9 @@ __device__ __forceinline__ uint8_t load_scale_bits(const void* address) {
 }
 
 __device__ __forceinline__ float e8m0_bits_to_float(uint8_t bits) {
-  if (bits == 0) return 0.0f;
-  return __int_as_float(static_cast<uint32_t>(bits) << 23);
+  if (bits == 0) return __int_as_float(0x400000u);           // 2^-127: below the FP32 normal range, a denormal
+  if (bits == 255) return __int_as_float(0x7fffffffu);       // reserved NaN
+  return __int_as_float(static_cast<uint32_t>(bits) << 23);  // 2^(bits-127)
 }
 
 }  // namespace sm90::mxfp4

@@ -9,6 +9,8 @@ Verifies:
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
@@ -34,6 +36,84 @@ def _pool(page_size: int, num_pages: int = 4) -> torch.Tensor:
         dtype=torch.uint8,
         device="cuda",
     )
+
+
+def test_scale_is_ceil_never_saturates_group_amax():
+    """The E8M0 byte must follow ceil(log2(amax / 6)) (MX convention).
+
+    The original round(log2(amax / 6)) picked a scale one octave too small
+    for every group whose amax lands in (6·2^k, 6·2^k·2^0.5]: the max
+    element then saturated to the largest E2M1 code (6), returning up to
+    29% short after dequantization (amax 8 decoded as 6).  ceil guarantees
+    the group amax stays representable.
+    """
+    dev = torch.device("cuda")
+    page_size = 128
+    # All values are exact in bf16.  Entries whose log2(amax/6) is an
+    # integer sit exactly on a rounding boundary — the kernel's fp32
+    # log2(amax) - log2(6) may land a ulp on either side, so either
+    # adjacent byte is accepted there (both keep the amax representable).
+    # The other entries pin the exact ceil byte, including the (6, 8.49]
+    # band the old round scale saturated.
+    amaxes = [6.0, 12.0, 0.75, 1.5, 3.0, 7.0, 8.0, 15.0, 4.0, 0.5]
+    k = torch.zeros(1, MXFP4_TOTAL_DIM, dtype=torch.bfloat16, device=dev)
+    for group, amax in enumerate(amaxes):
+        k[0, group * 32 : (group + 1) * 32] = amax / 4.0
+        k[0, group * 32] = amax  # the group's max element
+    pool = _pool(page_size, num_pages=1)
+    loc = torch.zeros(1, dtype=torch.int32, device=dev)
+
+    quantize_dsv4_mxfp4_k_cache_into(k, pool, loc, page_size)
+    out = dequantize_dsv4_mxfp4_k_cache_paged(pool, loc, page_size)[:, 0, :].float()
+
+    grid = (0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+    for group, amax in enumerate(amaxes):
+        byte = int(pool[0, 224 + group])
+        ratio = math.log2(amax / 6.0)
+        s_low = math.ceil(ratio)
+        on_boundary = ratio == math.floor(ratio)
+        if on_boundary:
+            assert byte in (s_low + 127, s_low + 128), (
+                f"group {group} amax {amax}: byte {byte} escaped the "
+                f"({s_low + 127}, {s_low + 128}) boundary pair"
+            )
+        else:
+            assert (
+                byte == s_low + 127
+            ), f"group {group} amax {amax}: byte {byte} != {s_low + 127}"
+        s = byte - 127
+        recovered = out[0, group * 32].item()
+        scaled = amax / 2.0**s
+        if scaled in grid:
+            # amax/2^s on the E2M1 grid: the max element roundtrips exactly.
+            assert recovered == amax, f"group {group}: {amax} -> {recovered}"
+        else:
+            # scaled ∈ (3, 6) off-grid (7/2 = 3.5 tie, 15/4 = 3.75): RNE
+            # lands on the 4 code — never on the 6·2^(s-1) clamp the round
+            # scale produced.
+            assert (
+                recovered == 4.0 * 2.0**s
+            ), f"group {group}: amax {amax} recovered as {recovered}"
+
+
+def test_e8m0_byte_zero_decodes_as_2_pow_minus_127():
+    """E8M0 has no zero encoding: byte 0 is 2^-127 (bytes 0..254 = 2^-127
+    .. 2^127, 255 reserved NaN), matching the fused decode kernel's
+    e8m0_bits_to_float.  The dequantizer must apply that exact exponent
+    rather than treating the byte as a zero scale."""
+    dev = torch.device("cuda")
+    page_size = 128
+    k = torch.zeros(1, MXFP4_TOTAL_DIM, dtype=torch.bfloat16, device=dev)
+    pool = _pool(page_size, num_pages=1)
+    loc = torch.zeros(1, dtype=torch.int32, device=dev)
+    quantize_dsv4_mxfp4_k_cache_into(k, pool, loc, page_size)
+    # Hand-craft the first group: E2M1 code 0b101 (=3.0) in every nibble
+    # with scale byte 0 — the byte lives at row offset 224.
+    pool[0, 0:16] = torch.full((16,), 0x55, dtype=torch.uint8, device=dev)
+    pool[0, 224] = 0
+    out = dequantize_dsv4_mxfp4_k_cache_paged(pool, loc, page_size)[:, 0, :].float()
+    expected = torch.full((32,), 3.0 * 2.0**-127, device=dev)
+    assert torch.equal(out[0, :32], expected)
 
 
 def test_roundtrip_quality():

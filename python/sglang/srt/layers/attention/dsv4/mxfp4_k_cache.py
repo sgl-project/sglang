@@ -266,14 +266,18 @@ def _quantize_mxfp4_k_cache_into_kernel(
         other=0.0,
     ).to(tl.float32)
 
-    # E8M0 scale: byte = round(log2(amax / 6)) + 127
+    # E8M0 scale: byte = ceil(log2(amax / 6)) + 127.  ceil (the MX-format
+    # convention, cf. the NVFP4 paths) guarantees the group amax stays
+    # representable: the largest E2M1 code is 6, so scale = 2^round(log2
+    # ratio) clamps every element of groups whose amax lands in
+    # (6·2^k, 6·2^k·√2] — up to 29% off the max element.
     amax = tl.max(tl.abs(x), axis=1)
     log2_ratio = tl.math.log2(tl.maximum(amax, 1e-40)) - 2.584962500721156  # log₂6
-    # tl.math.round/rint are unavailable in Triton 3.6; floor(x+0.5) gives
-    # round-to-nearest (ties go up, negligible for E8M0).
-    scale_byte_raw = tl.math.floor(log2_ratio + 0.5).to(tl.int32) + 127
-    # tl.clamp(·, 0, 255) on int32 is unsupported; use min/max.
-    scale_byte = tl.minimum(tl.maximum(scale_byte_raw, 0), 255).to(tl.uint8)
+    scale_byte_raw = tl.math.ceil(log2_ratio).to(tl.int32) + 127
+    # tl.clamp(·, 0, 255) on int32 is unsupported; use min/max.  255 is the
+    # reserved NaN encoding and is unreachable for finite inputs, but clamp
+    # below it anyway so a stray byte can never decode as NaN.
+    scale_byte = tl.minimum(tl.maximum(scale_byte_raw, 0), 254).to(tl.uint8)
 
     # E2M1 RNE: compare original values against scaled midpoints (no division)
     scale_float = tl.math.exp2((scale_byte.to(tl.float32) - 127.0))
@@ -361,7 +365,13 @@ def _dequantize_mxfp4_k_cache_paged_kernel(
         mask=valid_src & (scale_offsets < NOPE_DIM // GROUP_SIZE),
         other=127,  # scale = 2^(127-127) = 1.0 (harmless for masked groups)
     ).to(tl.uint8)
-    scale = tl.math.exp2((scale_byte.to(tl.float32) - 127.0))
+    # E8M0 bytes 0..254 are 2^-127..2^127 (no zero encoding; 255 is the
+    # reserved NaN).  Build the value from the FP32 exponent pattern instead
+    # of exp2: 2^-127 lies below the normal range and ex2.approx flushes the
+    # denormal to zero.  Byte 0 is built from the 2^-126 pattern halved.
+    sb = scale_byte.to(tl.int32)
+    scale_normal = (tl.where(sb == 0, 1, sb) << 23).to(tl.float32, bitcast=True)
+    scale = tl.where(sb == 0, scale_normal * 0.5, scale_normal)
 
     # Unpack nibbles → decode E2M1 → apply scale
     low = _decode_e2m1_triton(packed & 0x0F) * scale[:, None]  # [16, 16]
@@ -409,7 +419,9 @@ def _quantize_mxfp4_reference(
     blocks = k_nope.float().reshape(-1, MXFP4_NUM_GROUPS, MXFP4_GROUP_SIZE)
     amax = blocks.abs().amax(dim=-1)  # [N, 14]
     log2_ratio = torch.log2(amax.clamp(min=1e-40)) - 2.584962500721156
-    scale_byte = (log2_ratio.round().long() + 127).clamp(0, 255).to(torch.uint8)
+    # ceil matches the Triton kernel and the MX convention (never saturate
+    # the group amax); 255 is the reserved NaN encoding.
+    scale_byte = (torch.ceil(log2_ratio).long() + 127).clamp(0, 254).to(torch.uint8)
     scale_float = torch.pow(2.0, (scale_byte.float() - 127.0))
     denominator = scale_float.unsqueeze(-1)
     codes = _e2m1_rne_scaled_torch(blocks, denominator).reshape(-1, MXFP4_NOPE_DIM)
