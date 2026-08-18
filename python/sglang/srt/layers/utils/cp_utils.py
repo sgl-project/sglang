@@ -392,6 +392,7 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     )
     # No need to reshape - output_tensor already has the correct shape [seq_len, ...]
     return output_tensor
+
 def cp_all_gather_rerange_kv_cache_launch(input_tensor, cp_size, forward_batch):
     """Launch async all-gather for KV cache. Returns (handle, input_tensor_full).
 
@@ -400,14 +401,14 @@ def cp_all_gather_rerange_kv_cache_launch(input_tensor, cp_size, forward_batch):
     max_len = forward_batch.attn_cp_metadata.max_rank_len[0]
     pad_size = max_len - input_tensor.shape[0]
     if pad_size > 0:
-        padding = [0, 0] * (input_tensor.ndim - 1) + [0, pad_size]
-        input_tensor = F.pad(input_tensor, padding, mode="constant", value=0)
-
+        input_tensor = F.pad(
+            input_tensor, (0, 0, 0, pad_size), mode="constant", value=0
+        )
     group = get_parallel().attn_cp_group
     with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
         input_tensor_full = torch.empty(
             max_len * cp_size,
-            *input_tensor.shape[1:],
+            input_tensor.shape[1],
             device=input_tensor.device,
             dtype=input_tensor.dtype,
             )
@@ -417,7 +418,6 @@ def cp_all_gather_rerange_kv_cache_launch(input_tensor, cp_size, forward_batch):
         group=group.device_group, async_op=True,
     )
     return handle, input_tensor_full
-
 
 def cp_all_gather_rerange_kv_cache_finalize(input_tensor_full, forward_batch):
     """Finalize async all-gather: remove padding + rearrange."""
