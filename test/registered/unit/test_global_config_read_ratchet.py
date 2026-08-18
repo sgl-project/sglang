@@ -137,6 +137,10 @@ _CONFIGURED_SIZE_CALL_SITES = {
     ("srt/speculative/frozen_kv_mtp_cuda_graph_runner.py", "configured_pp_size"): (
         "the same draft window, frozen-KV MTP"
     ),
+    ("srt/entrypoints/v1_loads.py", "configured_pp_size"): (
+        "the /v1/loads accelerator count is arithmetic over the launch shape, "
+        "reported from the tokenizer process, which holds no model groups"
+    ),
     ("srt/disaggregation/common/conn.py", "configured_pp_size"): (
         "the bootstrap connection is built by the KV manager on the transfer "
         "path, which the CPU-only conn tests exercise without ever starting "
