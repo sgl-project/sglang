@@ -131,6 +131,7 @@ class FlashInferSSUBackend(MambaSSUBackend):
         cache_philox_rounds: int = 0,
     ) -> None:
         from flashinfer.mamba import selective_state_update
+
         from sglang.kernels.ops.mamba.triton_ops.ssd_combined import (
             mamba_chunk_scan_combined,
         )
@@ -340,18 +341,28 @@ class FlashInferSSUBackend(MambaSSUBackend):
             )
         # SGLang only consumes the packed-varlen form below. Refuse other
         # combinations instead of silently changing their return semantics.
-        if not return_varlen_states or return_final_states or not return_intermediate_states:
+        if (
+            not return_varlen_states
+            or return_final_states
+            or not return_intermediate_states
+        ):
             raise ValueError(
                 f"Mamba backend '{self.name}' only supports SGLang's "
                 "return_intermediate_states=True, return_varlen_states=True, "
                 "return_final_states=False prefill form"
             )
         if cu_seqlens is None or seq_idx is None:
-            raise ValueError(f"Mamba backend '{self.name}' requires packed sequence metadata")
+            raise ValueError(
+                f"Mamba backend '{self.name}' requires packed sequence metadata"
+            )
         if chunk_indices is None or chunk_offsets is None:
-            raise ValueError(f"Mamba backend '{self.name}' requires logical chunk metadata")
+            raise ValueError(
+                f"Mamba backend '{self.name}' requires logical chunk metadata"
+            )
         if x.shape[0] != 1:
-            raise ValueError(f"Mamba backend '{self.name}' requires packed batch=1 input")
+            raise ValueError(
+                f"Mamba backend '{self.name}' requires packed batch=1 input"
+            )
         if float(dt_limit[0]) != 0.0:
             raise ValueError(
                 f"Mamba backend '{self.name}' requires dt_limit[0]=0 so "
