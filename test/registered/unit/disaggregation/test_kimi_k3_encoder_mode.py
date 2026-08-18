@@ -42,7 +42,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
     materialize_kimi_k3_cpu_features,
     prepare_kimi_k3_encoder_inputs,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import resolve_encoder_transfer_backend
 from sglang.srt.utils import ImageData
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -78,29 +78,32 @@ def test_kimi_k3_encoder_transfer_backend_auto_avoids_tp_fanout():
 
 
 def test_epd_language_only_rejects_missing_dispatched_embedding():
-    server_args = SimpleNamespace(
+    override = get_context().override_server_args(
         language_only=True,
         encoder_transfer_backend="zmq_to_tokenizer",
     )
-    request = SimpleNamespace(need_wait_for_mm_inputs=True)
+    override.install()
+    try:
+        request = SimpleNamespace(need_wait_for_mm_inputs=True)
 
-    with pytest.raises(HTTPException) as exc_info:
-        _reject_missing_dispatched_encoder_embedding(server_args, request, None)
+        with pytest.raises(HTTPException) as exc_info:
+            _reject_missing_dispatched_encoder_embedding(request, None)
 
-    assert getattr(exc_info.value, "status_code", None) == 503
+        assert getattr(exc_info.value, "status_code", None) == 503
+    finally:
+        override.restore()
 
 
 def test_epd_rejection_reads_the_resolved_transfer_backend():
-    """Tripwire for step 12: this guard fires on the *resolved* backend.
+    """This guard fires on the *resolved* backend.
 
     The record is produced by actual resolution -- a language-only Kimi-K3
     launch at TP2, whose `encoder_transfer_backend` starts at the argument
     default `"auto"` (`ENCODER_TRANSFER_BACKEND_CHOICES[0]`) and is filled in
-    by `resolve_encoder_transfer_backend` to `"zmq_to_tokenizer"`. Today the
-    guard therefore rejects. When step 12 makes the instance raw, this same
-    launch hands the guard a record still at `"auto"`, the rejection silently
-    stops, and *this test fails* -- which is the signal to give this reader
-    the resolved value (per-engine overlay or bag) rather than the record.
+    by `resolve_encoder_transfer_backend` to `"zmq_to_tokenizer"`. The guard
+    reads that resolved value out of the published bags, so the rejection
+    survives the record going raw: what a reader must never do is go back to
+    the record for this field.
     Fixed doubles cannot trip on that change, so the record here must come
     from resolution, not a SimpleNamespace.
     """
@@ -188,20 +191,30 @@ def test_epd_rejection_reads_the_resolved_transfer_backend():
         shutil.rmtree(config_dir, ignore_errors=True)
 
     assert resolved.encoder_transfer_backend == "zmq_to_tokenizer"
-    request = SimpleNamespace(need_wait_for_mm_inputs=True)
-    with pytest.raises(HTTPException) as exc_info:
-        _reject_missing_dispatched_encoder_embedding(resolved, request, None)
-    assert getattr(exc_info.value, "status_code", None) == 503
+    # Publish that record: the guard reads the resolved value out of the bags,
+    # so a raw record does not silently disable the rejection.
+    publish(resolved, role="tokenizer")
+    try:
+        request = SimpleNamespace(need_wait_for_mm_inputs=True)
+        with pytest.raises(HTTPException) as exc_info:
+            _reject_missing_dispatched_encoder_embedding(request, None)
+        assert getattr(exc_info.value, "status_code", None) == 503
+    finally:
+        reset_context()
 
 
 def test_epd_allows_local_processing_when_request_was_not_dispatched():
-    server_args = SimpleNamespace(
+    override = get_context().override_server_args(
         language_only=True,
         encoder_transfer_backend="zmq_to_tokenizer",
     )
-    request = SimpleNamespace(need_wait_for_mm_inputs=False)
+    override.install()
+    try:
+        request = SimpleNamespace(need_wait_for_mm_inputs=False)
 
-    _reject_missing_dispatched_encoder_embedding(server_args, request, None)
+        _reject_missing_dispatched_encoder_embedding(request, None)
+    finally:
+        override.restore()
 
 
 def _encoder(model_type="kimi_k3"):
