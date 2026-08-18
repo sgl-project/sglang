@@ -107,8 +107,8 @@ def test_dsv4_sm120_load_contract(monkeypatch):
 
 
 def test_kimi_k3_sm120_situ_requires_flashinfer_cutlass_situ_api(monkeypatch):
-    import sglang.srt.layers.quantization.mxfp4 as mxfp4_module
     import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as runner_module
+    import sglang.srt.layers.quantization.mxfp4 as mxfp4_module
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
     from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
@@ -590,8 +590,7 @@ def test_kimi_k3_sm120_situ_layout_and_noncontiguous_input(monkeypatch):
             dtype=torch.bfloat16,
             device="cuda",
             generator=generator,
-        )
-        .t()
+        ).t()
         * 0.1
     )
     assert not x.is_contiguous()

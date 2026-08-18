@@ -5,6 +5,9 @@ from unittest.mock import patch
 import pytest
 
 import sglang.srt.layers.attn_residual as attn_residual
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 
 @pytest.mark.parametrize(
