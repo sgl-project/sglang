@@ -1,8 +1,8 @@
 """Qwen3.5-9B GSM8K accuracy on Intel XPU (TP=4).
 
-Scored by ``simple_eval_gsm8k.GSM8KEval``. Covers both the default fused GDN
-SYCL kernel path (``SGLANG_XPU_FUSED_GDN`` defaults to True) and the Triton
-GDN fallback path (``SGLANG_XPU_FUSED_GDN=False``).
+Scored by ``simple_eval_gsm8k.GSM8KEval``. Covers both the opt-in fused GDN
+SYCL kernel path (``--linear-attn-backend intel_xpu``) and the default Triton
+GDN path (``triton``, unchanged from other platforms).
 """
 
 import unittest
@@ -39,19 +39,22 @@ class Qwen3_5_9BXPUBase(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     ]
 
 
+class TestQwen3_5_9BXPUDefault(Qwen3_5_9BXPUBase):
+    """Default path: Triton GDN kernels (unchanged from other platforms)."""
+
+
 class TestQwen3_5_9BXPUFusedGDN(Qwen3_5_9BXPUBase):
-    """Default path: fused SYCL GDN kernel from sgl-kernel-xpu."""
+    """Opt-in fused SYCL GDN kernel path (``--linear-attn-backend intel_xpu``).
 
-
-class TestQwen3_5_9BXPUGDNFallback(Qwen3_5_9BXPUBase):
-    """Triton GDN fallback path (``SGLANG_XPU_FUSED_GDN=False``).
-
-    Small ``num_examples`` since this is a smoke check of the fallback
+    Small ``num_examples`` since this is a smoke check of the fused-kernel
     dispatch, not a full accuracy regression test (already covered by the
-    fused-path class above); accuracy threshold is left at 0 accordingly.
+    default Triton path above); accuracy threshold is left at 0 accordingly.
     """
 
-    env = {"SGLANG_XPU_FUSED_GDN": "False"}
+    other_args = Qwen3_5_9BXPUBase.other_args + [
+        "--linear-attn-backend",
+        "intel_xpu",
+    ]
     num_examples = 8
     accuracy = 0.0
 

@@ -1,7 +1,6 @@
 import torch
 from sgl_kernel import gdn_attention as sgl_kernel_gdn_attention
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -12,19 +11,31 @@ class XpuGDNAttnBackend(GDNAttnBackend):
 
     Adds an optional fused path that dispatches the whole conv1d + gating +
     delta-rule pipeline to the vendored vLLM SYCL kernel exposed as
-    ``torch.ops.sgl_kernel.gdn_attention`` (``SGLANG_XPU_FUSED_GDN``, default
-    ON; set to False to fall back to the Triton path). The inherited Triton
-    path is unchanged and remains the default for all other backends.
+    ``torch.ops.sgl_kernel.gdn_attention``. This is opt-in via
+    ``--linear-attn-backend intel_xpu`` (the default remains ``triton``, same
+    as other platforms).
     """
 
     def supports_fused_gdn(self, layer, forward_batch: ForwardBatch) -> bool:
         """Conservative guard: only the plain decode / non-prefix-cached,
         non-speculative extend cases are handled by the fused kernel."""
-        if not envs.SGLANG_XPU_FUSED_GDN.get():
+        mode = forward_batch.forward_mode
+        backends = self.linear_attn_backends
+        selected = (
+            backends.verify
+            if mode.is_target_verify()
+            else (backends.decode if mode.is_decode_or_idle() else backends.prefill)
+        )
+        if not selected.is_intel_xpu():
             return False
         if not hasattr(torch.ops.sgl_kernel, "gdn_attention"):
-            return False
-        mode = forward_batch.forward_mode
+            # User explicitly asked for intel_xpu but the op isn't built.
+            raise RuntimeError(
+                "--linear-attn-backend intel_xpu requires the "
+                "torch.ops.sgl_kernel.gdn_attention op, but it is not "
+                "available. Rebuild sgl-kernel-xpu or use "
+                "--linear-attn-backend triton."
+            )
         if mode.is_target_verify() or mode.is_draft_extend_v2():
             return False
         fm = self.forward_metadata
