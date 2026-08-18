@@ -100,6 +100,13 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
                 layer.weight = Parameter(
                     shuffle_weight(weight, (16, 16)).t(), requires_grad=False
                 )
+                # Explicit layout marker: the per-channel fp8 weight is now
+                # preshuffled for gemm_a8w8_bpreshuffle, so a folded per-token
+                # (fp8, scale[M, 1]) activation tuple may feed it directly. Read
+                # by _is_per_channel_dynamic_fp8 instead of inferring preshuffle
+                # from a global capability flag. Set on the aiter preshuffle path
+                # regardless of ``per_token`` (which only controls scale layout).
+                layer._fp8_weight_preshuffled = True
             else:
                 layer.weight = Parameter(weight.t(), requires_grad=False)
             # required by torch.compile to be torch.nn.Parameter
@@ -125,6 +132,10 @@ class QuarkW8A8Fp8(QuarkLinearScheme):
     ):
         output_size_per_partition = sum(output_partition_sizes)
         layer.logical_widths = output_partition_sizes
+        # Set True in process_weights_after_loading only when the per-channel fp8
+        # weight is preshuffled for the per-token bpreshuffle GEMM (aiter path);
+        # gates the fused-quant fold in _is_per_channel_dynamic_fp8.
+        layer._fp8_weight_preshuffled = False
 
         # WEIGHT
         weight = ModelWeightParameter(

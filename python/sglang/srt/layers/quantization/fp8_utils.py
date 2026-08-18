@@ -1779,6 +1779,11 @@ def apply_fp8_linear(
             qinput, x_scale = input
             orig_dtype = pre_quant_output_dtype or torch.bfloat16
         input_2d = qinput.view(-1, qinput.shape[-1])
+        # This path is only valid for a whole-row per-token scale [M, 1].
+        assert x_scale.shape == (input_2d.shape[0], 1), (
+            f"per-token bpreshuffle path requires x_scale [M, 1], got "
+            f"{tuple(x_scale.shape)} for M={input_2d.shape[0]}"
+        )
         output_shape = [*qinput.shape[:-1], weight.shape[1]]
         output = gemm_a8w8_bpreshuffle(
             XQ=input_2d,
@@ -1830,13 +1835,16 @@ def apply_fp8_linear(
         qinput = input_2d
         # A per-token [M, 1] activation scale (folded upstream for per-channel
         # fp8, e.g. fused RMSNorm+quant) arrives here when a quant method unwraps
-        # its (fp8, scale, dtype) tuple before apply_fp8_linear. Keep it as-is:
-        # per_tensor_activations is False for a 2-D scale, so it flows to the
-        # per-channel bpreshuffle / rowwise GEMM below (or the safe unfused
-        # fallback when the weight is not per-channel). Per-tensor static scales
-        # (numel == 1) keep the existing scaled_mm path.
+        # its (fp8, scale, dtype) tuple before apply_fp8_linear. This producer
+        # exists ONLY on the ROCm/aiter path (consumed by gemm_a8w8_bpreshuffle),
+        # so the relaxation is gated on ``_use_aiter``; on CUDA (and any other
+        # backend) the scalar-only per-tensor protection is kept, since a
+        # non-scalar prequant scale there is unsupported and indicates a bug.
+        # When accepted: per_tensor_activations is False for a 2-D scale, so it
+        # flows to the per-channel bpreshuffle / rowwise GEMM below (or the safe
+        # unfused fallback when the weight is not per-channel).
         is_per_token_scale = (
-            input_scale.dim() == 2 and input_scale.shape[0] == input_2d.shape[0]
+            _use_aiter and input_scale.shape == (input_2d.shape[0], 1)
         )
         if is_per_token_scale:
             x_scale = input_scale

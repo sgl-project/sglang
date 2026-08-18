@@ -2440,7 +2440,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             # / non-preshuffled fp8 must keep the bf16 + separate-quant path.
             if _is_per_channel_dynamic_fp8(proj):
                 return "fp8_per_token"
-            return ""
+            # Not yet eligible. Part of the layout contract (the preshuffled-
+            # weight marker) is set in process_weights_after_loading, which runs
+            # AFTER this proj is first inspected at __init__. Return "fp8_pending"
+            # (not "") so _resolve_gfx95_quant_format re-checks on first forward,
+            # once the marker is set; a genuinely ineligible proj re-resolves to
+            # "" there (see _resolve_gfx95_quant_format).
+            return "fp8_pending"
         return ""
 
     def _resolve_gfx95_quant_format(self) -> str:
