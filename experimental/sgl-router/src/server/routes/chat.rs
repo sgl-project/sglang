@@ -417,6 +417,7 @@ async fn chat_completions_inner(
             &t.ids,
             &derived_request_id,
             tee_attr.slug.as_deref(),
+            tee_attr.key_id.as_deref(),
         );
     }
     if let Some(p) = &phase {
@@ -617,6 +618,7 @@ async fn chat_completions_inner(
         let prompt = extend_prompt.clone();
         let request_id = derived_request_id.clone();
         let slug = tee_attr.slug.clone();
+        let key_id = tee_attr.key_id.clone();
         move || -> Option<StreamCapture> {
             if !armed {
                 return None;
@@ -658,6 +660,7 @@ async fn chat_completions_inner(
             let prompt = prompt.clone();
             let request_id = request_id.clone();
             let slug = slug.clone();
+            let key_id = key_id.clone();
             Some(StreamCapture {
                 max_bytes: cache_sim_extend::MAX_EXTEND_CAPTURE_BYTES,
                 _permit: permit,
@@ -670,6 +673,7 @@ async fn chat_completions_inner(
                         prompt,
                         ReplySource::Sse(buf),
                         slug,
+                        key_id,
                     );
                 }),
             })
@@ -1349,6 +1353,7 @@ async fn chat_completions_inner(
                     extend_prompt,
                     ReplySource::Json(bytes.clone()),
                     tee_attr.slug.clone(),
+                    tee_attr.key_id.clone(),
                 );
             }
         }
