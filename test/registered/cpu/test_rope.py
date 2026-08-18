@@ -1,5 +1,6 @@
 import unittest
 
+import sgl_kernel  # noqa: F401
 import torch
 
 from sglang.srt.layers.rotary_embedding import (
