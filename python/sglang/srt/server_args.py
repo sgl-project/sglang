@@ -3608,6 +3608,7 @@ class ServerArgs:
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
+        self._validate_prefill_decode_interval()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -8514,10 +8515,11 @@ class ServerArgs:
                 f"(got {self.asr_max_concurrent_sessions})."
             )
 
-    def _handle_other_validations(self):
+    def _validate_prefill_decode_interval(self):
         if self.prefill_decode_interval < 0:
             raise ValueError("--prefill-decode-interval must be non-negative.")
 
+    def _handle_other_validations(self):
         if self.default_chat_template_kwargs is not None and not isinstance(
             self.default_chat_template_kwargs, dict
         ):
