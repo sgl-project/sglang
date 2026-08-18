@@ -122,6 +122,102 @@ python -m sglang.launch_server \
 
 **Important**: `--dp-size` must be greater than 1 for DPA to work. When `dp_size == 1` (default), `--enable-dp-attention` is automatically disabled. The constraint `tp_size % dp_size == 0` must also be satisfied.
 
+### TP-sharded LM head with all-to-all
+
+Large-vocabulary models can spend a significant fraction of each decode step in the LM head. Under pure DPA, `--enable-dp-lm-head` keeps a full LM-head weight on every DP rank and computes only the local rows:
+
+```text
+[B, H] x [H, V] -> [B, V]
+```
+
+Here, `B` is the decode batch size per DP rank, `H` is the hidden size, and `V` is the vocabulary size. This path avoids vocabulary communication, but the GEMM can be inefficient when `B` is small. For example, a DeepSeek-V4-Pro decode deployment with `dp_size=8` commonly has only about 30–60 rows per rank. In the benchmark from [PR #32313](https://github.com/sgl-project/sglang/pull/32313), the full DP LM-head GEMM took 320 µs at `B=36`.
+
+A TP-sharded LM head instead keeps `1 / P` of the vocabulary weights on each of the `P` ranks. DPA first gathers the hidden-state rows, and each rank computes:
+
+```text
+[P * B, H] x [H, V / P] -> [P * B, V / P]
+```
+
+The larger row dimension and narrower vocabulary shard make this GEMM more efficient for small per-rank decode batches. The previous TP LM-head path, however, followed the GEMM with a vocabulary all-gather and then discarded non-local row blocks in a DP scatter. This introduced substantial redundant communication on the vocabulary dimension.
+
+#### How the all-to-all path works
+
+After the TP LM-head GEMM, rank `r` owns `[P * B, V / P]`: all DP row blocks for vocabulary shard `r`. The optimized path splits this tensor into `P` row blocks of shape `[B, V / P]` and sends row block `d` directly to destination DP rank `d` with all-to-all.
+
+Each destination rank then has one vocabulary shard from every source rank:
+
+```text
+All-to-all output: [P, B, V / P]  (source-major)
+Permute:           [B, P, V / P]  (row-major)
+Reshape:           [B, V]         (full vocabulary for local rows)
+```
+
+This directly produces the logits needed by the local sampler, eliminating both the full vocabulary all-gather and the subsequent DP scatter.
+
+Let `S` be the number of bytes per communicated logit. Excluding the local self-copy, each rank sends and receives the following amount in each direction:
+
+| Path | Elements sent per rank | Elements received per rank | Bytes per direction |
+| --- | ---: | ---: | ---: |
+| TP all-gather + DP scatter | `B * V * (P - 1)` | `B * V * (P - 1)` | `B * V * (P - 1) * S` |
+| TP all-to-all | `B * V * (P - 1) / P` | `B * V * (P - 1) / P` | `B * V * (P - 1) * S / P` |
+
+The all-to-all path therefore reduces the remote vocabulary-logit traffic by a factor of `P`. If send and receive traffic are summed together, multiply the last column by two; the reduction factor is unchanged.
+
+For the DeepSeek-V4-Pro example in PR #32313 (`P=8`, `B=36`, `V=129280`):
+
+```text
+All-gather, send or receive:
+  36 * 129280 * 7     = 32,578,560 elements
+
+All-to-all, send or receive:
+  36 * 16160 * 7      =  4,072,320 elements
+```
+
+This is an 8x reduction. For a one-byte communicated representation, these volumes are approximately 31.1 MiB and 3.88 MiB per direction, respectively; multiply both by the actual element size for other dtypes.
+
+#### Supported deployment and defaults
+
+This optimization is designed for a **decode-only worker in a PD-disaggregated deployment using pure DPA**. In this context, pure DPA means one attention rank per DP rank: the global TP and DP sizes are equal, while the derived attention-TP size is one.
+
+The optimized path requires all of the following:
+
+- Linux with NVIDIA CUDA and an available PyNCCL communicator
+- `--enable-dp-attention`
+- `tp_size == dp_size > 1`
+- `attn_cp_size == 1` (no attention context parallelism)
+- `--enable-dp-lm-head` is disabled, so the LM head remains TP-sharded
+
+It does not currently support hybrid DP + attention-TP topologies such as `tp_size=8, dp_size=2`, nor can it be combined with DP LM head or attention CP.
+
+On a qualifying `--disaggregation-mode decode` worker, SGLang enables the optimization by default. On Linux with NVIDIA CUDA, replace `MODEL_PATH` with a Hugging Face model ID or local model path and launch the decode worker with the pure-DPA topology:
+
+```bash NVIDIA CUDA
+python -m sglang.launch_server \
+    --model-path MODEL_PATH \
+    --disaggregation-mode decode \
+    --tp 8 \
+    --dp-size 8 \
+    --enable-dp-attention
+```
+
+Use `--no-enable-tp-lm-head-all-to-all` to opt out, or `--enable-tp-lm-head-all-to-all` to request it explicitly on another qualifying topology.
+
+Prefill-only and colocated workers keep this optimization disabled by default. LM-head weight sharding is fixed when the model is loaded, so enabling the TP path on a colocated worker would also route long prefills through TP LM head and all-to-all. Large-prefill GEMMs are already efficient, and the communication can be slower than the communication-free DP LM head in that phase.
+
+The runtime uses all-to-all only when every rank has an equal (or equally padded CUDA Graph) row count and the LM-head weight is actually TP-sharded. Other batch layouts, including uneven eager batches, fall back to the existing all-gather path.
+
+#### Performance
+
+PR #32313 profiled DeepSeek-V4-Pro on an 8-GPU B200 PD-disaggregated decode worker with pure DPA and `B=36` per rank:
+
+| LM-head path | GEMM | Communication | End-to-end LM head |
+| --- | ---: | ---: | ---: |
+| DP LM head | 320 µs | None | 320 µs |
+| TP LM head + all-gather/scatter | 71 µs | 151 µs | 278 µs |
+| TP LM head + all-to-all | 71 µs | 46 µs | 169 µs |
+
+In this profile, all-to-all reduced the measured communication time from 151 µs to 46 µs and the end-to-end LM-head latency from 278 µs to 169 µs relative to the previous TP path. Compared with DP LM head, it reduced the measured end-to-end latency from 320 µs to 169 µs. Results depend on per-rank batch size, vocabulary size, dtype, topology, and interconnect; this optimization is most useful for large-vocabulary models with small decode batches per DP rank.
+
 ### Standard DP for MLA models
 
 Note that MLA models, of course, also support DP. Suppose you want to enable standard DP for MLA models. First, launch each MLA model's replica independently. You may launch these replicas one by one with DPA enabled. After launching each MLA model's replica, launch an SMG and connect all the replicas to the SMG. A detailed explanation of SMG is as follows.
