@@ -295,11 +295,11 @@ class AiterAttnBackend(AttentionBackend):
         self.forward_metadata: ForwardMetadata = None
 
         if self.use_mla:
-            _valid_heads = self.num_head in (4, 8) or (
+            _valid_heads = 1 <= self.num_head < 16 or (
                 self.num_head % 16 == 0 and 16 <= self.num_head <= 128
             )
             assert _valid_heads, (
-                f"Aiter MLA supports num_head of 4, 8, or multiples of 16 "
+                f"Aiter MLA supports num_head below 16 or multiples of 16 "
                 f"in [16, 128].\n"
                 f"Provided {self.num_head} number of heads.\n"
                 "Try adjusting tensor_parallel_size value."
@@ -760,22 +760,28 @@ class AiterAttnBackend(AttentionBackend):
     ):
         """Wrap mla_decode_fwd with head-dimension padding for num_head < 16.
 
-        When head_repeat_factor > 1 (i.e. num_head is 4 or 8), q is
-        repeat-interleaved to reach num_head_padded (16) before the kernel
-        call, and the corresponding output columns are sliced back afterward.
+        Head counts that divide 16 (e.g. 4 or 8) retain the historical
+        repeat-interleave path. Other counts (e.g. Kimi-K3 TP8's 12 heads) are
+        zero-padded to 16 and sliced back after the kernel call.
         q / o must already be shaped (..., num_head, head_dim).
         """
-        if self.head_repeat_factor > 1:
-            q_in = q.repeat_interleave(self.head_repeat_factor, dim=1)
+        n_heads = layer.tp_q_head_num
+        if n_heads < 16:
+            if 16 % n_heads == 0:
+                q_in = q.repeat_interleave(16 // n_heads, dim=1)
+                select = slice(None, None, 16 // n_heads)
+            else:
+                q_in = torch.nn.functional.pad(q, (0, 0, 0, 16 - n_heads))
+                select = slice(0, n_heads)
             o = q.new_empty(
-                (q.shape[0], self.num_head_padded, layer.v_head_dim),
+                (q.shape[0], 16, layer.v_head_dim),
                 dtype=self.input_dtype,
             )
             mla_decode_fwd(q_in, k_buffer_flat, o, **kwargs)
-            return o[:, :: self.head_repeat_factor, :]
+            return o[:, select, :]
         else:
             o = q.new_empty(
-                (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                (q.shape[0], n_heads, layer.v_head_dim),
                 dtype=self.input_dtype,
             )
             mla_decode_fwd(q, k_buffer_flat, o, **kwargs)
