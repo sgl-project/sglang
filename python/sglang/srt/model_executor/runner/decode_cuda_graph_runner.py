@@ -97,6 +97,9 @@ from sglang.srt.model_executor.runner_utils.capture_mode import (
 from sglang.srt.model_executor.runner_utils.deepep_adapter import (
     DeepEPCudaGraphRunnerAdapter,
 )
+from sglang.srt.model_executor.runner_utils.pool import (
+    get_or_create_global_graph_capture_stream,
+)
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
@@ -1034,7 +1037,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # can reuse the memory pool allocated for the large shapes.
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             if not self.enable_pdmux:
-                with graph_capture() as graph_capture_context, profile_context as prof:
+                # Share one capture stream across every pass (see
+                # get_or_create_global_graph_capture_stream): the allocator
+                # partitions the graph pool's segments by stream, so a per-pass
+                # stream re-reserves its MoE / DeepEP scratch instead of reusing
+                # what an earlier pass already left inactive.
+                with (
+                    graph_capture(
+                        stream=get_or_create_global_graph_capture_stream()
+                    ) as graph_capture_context,
+                    profile_context as prof,
+                ):
                     self.stream = graph_capture_context.stream
                     with self.backend.capture_session(self.stream):
                         self._capture_one_stream()
@@ -1212,8 +1225,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     variant_label,
                     dsa_variant,
                 )
+                # NOTE (Deleter-D)
+                # Reset warmup-mutated state on the backend this capture ran
+                # against (`attn_backend` from capture_prepare), NOT
+                # model_runner.attn_backend. They are the same object for the
+                # runner the model_runner owns, but adaptive speculative
+                # decoding builds extra runners bound to their own freshly
+                # created backend while model_runner still points at the active
+                # one; hooking the wrong backend leaves this capture's
+                # warmup-upgraded metadata (raw->full, FlashMLA scheduler meta)
+                # frozen into the graph and produces an IMA on first replay.
                 post_warmup_hook = getattr(
-                    self.model_runner.attn_backend,
+                    attn_backend,
                     "on_after_cuda_graph_warmup",
                     None,
                 )

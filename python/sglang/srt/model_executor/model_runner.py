@@ -792,7 +792,9 @@ class ModelRunner:
 
     def max_decode_logits_rows(self) -> int:
         """Rows the shared logits buffer needs."""
-        num_tokens_per_req = self.decode_num_tokens_per_req()
+        num_tokens_per_req = self.decode_num_tokens_per_req(
+            num_draft_tokens=self.server_args.max_speculative_num_draft_tokens
+        )
         capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
         return max(capture_bs) * num_tokens_per_req
 

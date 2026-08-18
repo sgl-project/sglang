@@ -11,9 +11,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Process-wide CUDA graph memory pool shared across the prefill and
-decode graph backends. The two phases never replay concurrently, so
-sharing one pool reserves only the larger phase's capture footprint.
+"""Process-wide CUDA graph capture resources — the memory pool and the
+capture stream — shared across the prefill and decode graph backends.
+
+The phases never replay concurrently, so one pool reserves only the larger
+phase's capture footprint. Sharing the *stream* matters for the same reason:
+the caching allocator partitions segments by stream, so a per-pass stream would
+re-reserve the pool's scratch instead of reusing it.
 """
 
 from __future__ import annotations
@@ -26,7 +30,11 @@ import torch
 
 from sglang.srt.cuda_vmm_utils import BumpArenaStub
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_resources
+from sglang.srt.runtime_context import get_resources, get_stream
+
+# Named slot for the one capture stream (see
+# ``get_or_create_global_graph_capture_stream``).
+_CAPTURE_STREAM_NAME = "cuda_graph_capture"
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
@@ -79,6 +87,25 @@ def get_or_create_global_graph_memory_pool(device_module: Any) -> Any:
     if resources.graph_memory_pool is None:
         resources.graph_memory_pool = device_module.graph_pool_handle()
     return resources.graph_memory_pool
+
+
+def get_or_create_global_graph_capture_stream() -> Any:
+    """The one CUDA stream every graph-capture pass captures on.
+
+    The caching allocator partitions segments **by stream**, so a fresh stream
+    per pass leaves the graph pool's scratch (MoE / DeepEP workspaces — ~3.6GB
+    per pass on DeepSeek-V4) reserved once per stream instead of reused: with
+    adaptive speculative decoding that is one pass per candidate step times
+    three runners, i.e. tens of GB of segments that all read back ``inactive``.
+
+    Captures are strictly serial (``Scheduler.init_all_cuda_graphs`` runs the
+    target and draft workers in turn, and the adaptive controller builds one
+    runtime state at a time), so a single shared stream is safe and reserves
+    that scratch exactly once.
+
+    CUDA only — the NPU / XPU / CPU graph runners keep their own streams.
+    """
+    return get_stream(_CAPTURE_STREAM_NAME)
 
 
 def graph_pool_borrow_enabled() -> bool:
