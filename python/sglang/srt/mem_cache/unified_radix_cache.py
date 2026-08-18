@@ -364,6 +364,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.host_memory_mode == "buffer_only":
             # FULL and FULL+SWA only: Mamba has no state-handoff channel on
             # the admission-time load-back read path and is not layer-gated.
+            # Lifting the fence also needs the admission charge: a staged
+            # state slot is request-pinned at consumption and must ride
+            # req.mamba_host_hit_length the way the SWA window does.
             supported = {ComponentType.FULL, ComponentType.SWA}
             if not set(self.tree_components) <= supported:
                 raise ValueError(
@@ -1924,6 +1927,13 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.buffer_pipeline is None:
             return 0
         return self.buffer_pipeline.staged_prefetch_tokens(req_id)
+
+    def staged_prefetch_swa_tokens(self, req_id: str) -> int:
+        """SWA device tokens consuming a staged buffer-mode prefetch will
+        allocate; surfaced as the request's swa_host_hit_length."""
+        if self.buffer_pipeline is None:
+            return 0
+        return self.buffer_pipeline.staged_prefetch_swa_tokens(req_id)
 
     def release_aborted_request(self, rid: str) -> None:
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)

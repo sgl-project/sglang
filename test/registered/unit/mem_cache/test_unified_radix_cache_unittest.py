@@ -2911,6 +2911,120 @@ class UnifiedRadixCacheSuite:
         self.assertIn("occupancy_ratio", cons.prefetch_outcome_stats_snapshot())
         cons.sanity_check()
 
+    def test_buffer_load_back_swa_window_charged_at_admission(self):
+        """Admission contract: a request the SWA budget gate accepts must be
+        allocatable at batch time (_swa_reserved_tokens: "an admitted request
+        cannot OOM"). Regression: buffer mode surfaced a staged prefetch as
+        host_hit_length only, so the gate never charged the SWA window that
+        consumption (init_load_back -> cc.load) allocates and the request
+        lock pins; with the rest of the SWA pool batch-held, the batch alloc
+        fell short by up to one window and raised the fail-loud prefill OOM
+        (prod scheduler crash, 2026-08-17)."""
+        self._skip_unsupported_hicache_test()
+        if not self.cfg.has_swa:
+            self.skipTest("SWA-specific admission accounting")
+        from sglang.srt.mem_cache.allocation import (
+            alloc_paged_token_slots_extend,
+            alloc_token_slots,
+        )
+        from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
+
+        storage_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, storage_dir, ignore_errors=True)
+        ps = self.cfg.page_size
+        window = self.cfg.sliding_window_size
+        seq = self._buffer_swa_seq()  # one full window + 1 page
+        self._produce_buffer_l3(storage_dir, seq)
+
+        cons, cons_alloc, _ = build_fixture(self.cfg)
+        self._init_buffer_hicache(cons, storage_dir)
+        req_id = "buffer-swa-admission-oom"
+        cons.prefetch_from_storage(
+            req_id, cons.root_node.id, array("q", seq), None, None
+        )
+        self._pump_hicache_until(
+            cons,
+            lambda: cons.check_prefetch_progress(req_id)
+            and cons.buffer_pipeline.has_staged(req_id),
+            "prefetch did not stage",
+        )
+
+        # Batch-held SWA (chunk allocs, decode windows) is neither free nor
+        # evictable: leave one token less than window + extend_need, enough
+        # for an un-charged gate to accept.
+        extend_need = 2 * ps + 1
+        max_new = 8
+        self.assertIsNotNone(
+            cons_alloc.swa_attn_allocator.alloc(
+                cons_alloc.swa_available_size() - (window + extend_need - 1)
+            )
+        )
+
+        # The adder's SWA gate for this request (_swa_budget_for_req).
+        surfaced_swa_hit = cons.staged_prefetch_swa_tokens(req_id)
+        reserved = (
+            max(extend_need - window, 0)
+            + min(extend_need + max_new, window)
+            + ps
+            + (surfaced_swa_hit + ps - 1) // ps * ps
+        )
+        budget = cons_alloc.swa_available_size() + cons.swa_evictable_size()
+
+        # Consume at admission (init_load_back + request lock).
+        held = cons.buffer_pipeline.staged_prefetches[req_id]
+        req = mock.Mock()
+        req.rid = req_id
+        req.last_node = cons.root_node.id
+        req.prefix_indices = torch.zeros(
+            held.matched_len,
+            dtype=torch.int64,
+            device=cons.tree_core.empty_match_result.device_indices.device,
+        )
+        spliced, last_node = cons.init_load_back(
+            InitLoadBackParams(
+                best_match_node=None, host_hit_length=held.num_tokens, req=req
+            )
+        )
+        self.assertEqual(int(spliced.numel()), len(seq), "load-back degraded")
+        cons.ready_to_load_host_cache()
+        cons.inc_lock_ref(last_node)  # _req_inc_lock_ref
+
+        self.assertEqual(cons.swa_evictable_size(), 0)  # window is protected
+        # FULL stays roomy: only SWA can fail below.
+        self.assertGreaterEqual(cons_alloc.full_available_size(), extend_need + ps)
+
+        if reserved <= budget:
+            try:
+                if ps == 1:
+                    alloc_token_slots(cons, extend_need)
+                else:  # paged batch path — the production crash site
+                    prefix_len = int(spliced.numel())
+                    prefix_t = torch.tensor(
+                        [prefix_len], dtype=torch.int64, device=spliced.device
+                    )
+                    seq_t = torch.tensor(
+                        [prefix_len + extend_need],
+                        dtype=torch.int64,
+                        device=spliced.device,
+                    )
+                    alloc_paged_token_slots_extend(
+                        cons,
+                        prefix_t,
+                        prefix_t.cpu(),
+                        seq_t,
+                        seq_t.cpu(),
+                        spliced[-1:],
+                        extend_need,
+                    )
+            except RuntimeError as e:
+                self.fail(
+                    f"gate admitted (reserved={reserved} <= budget={budget}) "
+                    f"but the batch alloc OOMed: {e}"
+                )
+        else:
+            # Rejection must come from the surfaced window charge.
+            self.assertGreaterEqual(surfaced_swa_hit, window)
+
     def test_buffer_only_swa_window_semantics(self):
         """SWA window handling across the three partial-window cases:
         root-anchored sub-window sequence (the sequence IS its window),
