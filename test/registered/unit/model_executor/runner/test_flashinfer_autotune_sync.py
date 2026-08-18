@@ -1,10 +1,9 @@
 """FlashInfer autotune must reach the same tactics on every TP rank.
 
 Without a cross-rank reduction each rank's ``argmin`` follows local timing noise
-(observed: 20/20 tuned MoE shapes diverged across 4 ranks on gpt-oss-120b). The
-reduction only holds if the ranks also enter tuning with the same cache, since a
-cache hit skips a profile and desyncs it -- so the gate that enforces that, and
-the digest it decides on, are what these tests cover.
+(measured: 20/20 tuned MoE shapes diverged across 4 ranks on gpt-oss-120b). The
+reduction holds only if ranks also enter tuning with the same cache, so these
+cover that gate and the digest it decides on.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -55,8 +54,7 @@ def _gate_worker(rank, world_size, master_port, cache_path, writer):
 
 class TestAutotuneTacticSyncGroup(CustomTestCase):
     def test_single_rank_has_nobody_to_agree_with(self):
-        # The only case that tunes without a group; a 1-rank group would add a
-        # collective per tactic for no agreement.
+        # A 1-rank group would add a collective per tactic for no agreement.
         tp_group = SimpleNamespace(world_size=1, cpu_group=object())
         self.assertIsNone(_autotune_tactic_sync_group(tp_group))
 
@@ -76,38 +74,31 @@ class TestAutotuneCacheDigest(CustomTestCase):
         return _autotune_cache_digest(path, env)
 
     def test_unusable_caches_read_as_empty(self):
-        # Every shape a cache file can take that yields no loadable entries has
-        # to digest alike, or ranks holding different flavours of "nothing"
-        # would drop a cache they both agree on.
+        # Files yielding no loadable entries must digest alike, whichever way
+        # they are unusable; a non-dict also has to not raise.
         self.assertEqual(self._digest(self.dir / "absent.json"), "")
         corrupt = self.dir / "corrupt.json"
         corrupt.write_text("{not json")
         self.assertEqual(self._digest(corrupt), "")
-        # Valid JSON, wrong type: FlashInfer's own reader guards this, and
-        # `configs.pop` would raise on it.
         self.assertEqual(self._digest(self._write("null.json", None)), "")
         self.assertEqual(self._digest(self._write("list.json", [])), "")
 
     def test_metadata_stamp_decides_whether_entries_load(self):
-        # load_configs ignores every entry when the stamp mismatches the
-        # environment, so ranks with identical tactics but different stamps
-        # would enter tuning with different caches.
+        # Equal tactics, different stamps: one rank loads them, the other
+        # ignores the file.
         rank0 = self._write("rank0.json", {"_metadata": {"cublas": "12.8"}, "op": 7})
         rank1 = self._write("rank1.json", {"_metadata": {"cublas": "12.9"}, "op": 7})
         self.assertNotEqual(self._digest(rank0), self._digest(rank1))
 
     def test_environment_is_part_of_the_load_decision(self):
-        # Same file, drifted environment on one rank (e.g. a driver upgrade
-        # applied to one node): that rank loads nothing while its peer loads
-        # everything.
+        # Same file, drifted environment on one rank: that rank loads nothing.
         cache = self._write("rank.json", {"_metadata": {"cublas": "12.8"}, "op": 7})
         self.assertNotEqual(
             self._digest(cache), self._digest(cache, {**ENV, "gpu": "NVIDIA B200"})
         )
 
     def test_key_order_does_not_matter(self):
-        # Pins sort_keys: two ranks that tuned the same tactics must agree
-        # regardless of the order json.dump happened to write them in.
+        # Pins sort_keys: the same tactics must digest alike in any order.
         rank0 = self._write("rank0.json", {"a": 1, "b": 2})
         rank1 = self._write("rank1.json", {"b": 2, "a": 1})
         self.assertEqual(self._digest(rank0), self._digest(rank1))
@@ -150,16 +141,14 @@ class TestDropDivergedAutotuneCache(CustomTestCase):
         self.assertEqual(self._run_gate([entries, entries]), [True, True])
 
     def test_diverged_caches_are_dropped_on_every_rank(self):
-        # A rank that kept its cache would skip profiles its peer still runs,
-        # and the per-tactic all-reduce would deadlock.
+        # A rank that kept its cache would skip profiles its peer still runs.
         meta = {"_metadata": {"cublas": "12.8"}}
         self.assertEqual(
             self._run_gate([{**meta, "op": 7}, {**meta, "op": 8}]), [False, False]
         )
 
     def test_caches_diverging_only_in_metadata_are_dropped(self):
-        # Identical tactics, different stamps: one rank would load them and the
-        # other would ignore the file, which is the same desync.
+        # Same desync, reached through the stamp instead of the tactics.
         self.assertEqual(
             self._run_gate(
                 [

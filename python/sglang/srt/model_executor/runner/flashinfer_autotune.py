@@ -177,17 +177,13 @@ def _autotune_tactic_sync_group(
     """CPU group over the ranks that must agree on the tuned tactics.
 
     Per-rank timing noise alone makes each rank's ``argmin`` pick a different
-    tactic for the same shape, which costs performance and can deadlock NCCL
-    symmetric-memory allocation. FlashInfer all-reduces the timings over this
-    group so every rank minimizes over the same numbers. TP is the right scope:
-    those ranks run the same dummy forward in lockstep, as FlashInfer's caller
-    contract requires; PP stages are already in separate TP groups.
+    tactic for the same shape. FlashInfer all-reduces the timings over this
+    group so every rank minimizes over the same numbers. TP is the scope: those
+    ranks run the same dummy forward, and PP stages are already separate groups.
     """
     if tp_group.world_size <= 1:
         return None
-    # A CPU-side group (gloo, or mooncake-cpu under the elastic backend) keeps
-    # the reduction of these host-side scalars off the profiled stream:
-    # FlashInfer reduces on a CPU tensor for any backend that is not NCCL.
+    # The CPU group keeps the reduction of these scalars off the profiled stream.
     return tp_group.cpu_group
 
 
@@ -210,11 +206,9 @@ def _autotune_process_group(group: Optional[torch.distributed.ProcessGroup]):
 def _autotune_cache_digest(cache_path: Path, env: dict[str, str]) -> str:
     """Hash of what this rank would load from ``cache_path`` ("" for nothing).
 
-    Covers the file as a whole *and* the rank's current environment, because
-    ``load_configs`` ignores every entry when the file's ``_metadata`` stamp
-    disagrees with the environment it is read in. Hashing only the tuned
-    entries would let two ranks holding the same tactics still enter tuning
-    with different caches -- one loading them, one loading nothing.
+    Includes the environment: ``load_configs`` ignores the whole file when its
+    ``_metadata`` stamp disagrees with the environment reading it, so equal
+    tactics alone do not mean two ranks load the same thing.
     """
     if not cache_path.is_file():
         return ""
@@ -233,9 +227,7 @@ def _drop_diverged_autotune_cache(
 ) -> None:
     """Enter tuning with the same cache on every rank, or with none at all.
 
-    A cache hit skips a profile, so caches that disagree desync the reduction
-    and hang. Synced runs leave identical caches, so a mismatch means they
-    predate the sync or a rank died mid-tune.
+    A cache hit skips a profile, so caches that disagree desync the reduction.
     """
     digests: list[str] = [""] * torch.distributed.get_world_size(group)
     torch.distributed.all_gather_object(
@@ -253,8 +245,7 @@ def _drop_diverged_autotune_cache(
 
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
-    # _collect_metadata is the environment stamp load_configs compares a cache
-    # file against; the entry gate below has to see the same inputs it does.
+    # The gate below decides on the same inputs load_configs does.
     from flashinfer.autotuner import _collect_metadata, autotune
 
     mr = model_runner
@@ -403,12 +394,9 @@ def maybe_flashinfer_autotune_extend(
         run_flashinfer_autotune_forward(mr, forward_fn, run_lm_head=False)
     except torch.OutOfMemoryError:
         if _autotune_tactic_sync_group(mr.tp_group) is not None:
-            # Tuning is collective across the TP group, and OOM here (unlike
-            # OOM inside a tactic measurement, which FlashInfer disqualifies in
-            # lockstep) already stopped this rank from reducing while its peers
-            # wait on the next tactic. Skipping the pass would leave them
-            # blocked until the group's timeout -- 2h for the default gloo one
-            # -- so surface the failure instead of degrading alone.
+            # Tuning is collective: this rank has stopped reducing while its
+            # peers wait on the next tactic, so skipping the pass would hang
+            # them. Fail instead of degrading alone.
             raise
         # The pass is an optimization; without headroom for the extend-shaped
         # forward, fall back to untuned extend buckets instead of failing.
