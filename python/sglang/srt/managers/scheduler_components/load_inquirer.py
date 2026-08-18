@@ -43,6 +43,8 @@ class SchedulerLoadInquirer:
     spec_algorithm: SpeculativeAlgorithm
     get_running_batch: Callable
     get_waiting_queue: Callable
+    waiting_queue_prefix_matched: Callable
+    get_recent_cache_hit_rate: Callable
     get_stats: Callable
     get_chunked_req: Callable
     get_disagg_prefill_bootstrap_queue: Callable
@@ -76,13 +78,17 @@ class SchedulerLoadInquirer:
         return num_pending_tokens
 
     def get_num_waiting_uncached_tokens(self) -> int:
-        """Get uncached input tokens waiting for prefill compute."""
+        """Estimate input tokens waiting for prefill compute."""
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             return 0
+        waiting_queue_prefix_matched = self.waiting_queue_prefix_matched()
+        cache_miss_rate = 1.0 - self.get_recent_cache_hit_rate()
         num_tokens = 0
         for req in self.get_waiting_queue():
-            # if match-in-waiting-queue disabled, this metric returns seq_lens
-            num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
+            if waiting_queue_prefix_matched:
+                num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
+            else:
+                num_tokens += int(req.seqlen * cache_miss_rate)
         cr = self.get_chunked_req()
         if cr is not None:
             num_tokens += max(0, cr.seqlen - len(cr.prefix_indices))

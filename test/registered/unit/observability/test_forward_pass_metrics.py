@@ -13,6 +13,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
+    _CacheHitRateWindow,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -135,6 +136,12 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.scheduler.disaggregation_mode = DisaggregationMode.NULL
         self.reporter = _make_reporter(self, self.scheduler)
         self.scheduler.enable_fpm = True
+
+    def test_cache_hit_rate_window_keeps_last_15s_of_tokens(self):
+        window = _CacheHitRateWindow()
+        self.assertEqual(window.add(hit_tokens=20, total_tokens=100, now=0.0), 0.2)
+        self.assertEqual(window.add(hit_tokens=80, total_tokens=100, now=10.0), 0.5)
+        self.assertEqual(window.add(hit_tokens=90, total_tokens=100, now=15.0), 0.85)
 
     def _make_batch(self, **overrides):
         defaults = dict(
