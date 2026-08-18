@@ -494,7 +494,7 @@ class Cosmos3TokenizationStage(PipelineStage):
         negative_prompt = batch.negative_prompt or COSMOS3_DEFAULT_NEGATIVE_PROMPT
 
         # Get parameters
-        max_sequence_length = getattr(batch, "max_sequence_length", None) or 512
+        max_sequence_length = getattr(batch, "max_sequence_length", None) or 4096
         use_duration_template = getattr(batch, "use_duration_template", None)
         if use_duration_template is None:
             use_duration_template = getattr(
