@@ -434,7 +434,7 @@ class MoeLoraRunner:
 
     # ---- forward --------------------------------------------------------
 
-    def run(
+    def run_plan(
         self,
         dispatch_output: StandardDispatchOutput,
         batch: MoeLoraBatch,
@@ -1327,7 +1327,7 @@ class MoeLoraLayerEngine:
             dispatch_output.hidden_states.shape[0]
         )
         assert self._runner is not None
-        return self._runner.run(
+        return self._runner.run_plan(
             dispatch_output,
             batch,
             plan=sel.plan,

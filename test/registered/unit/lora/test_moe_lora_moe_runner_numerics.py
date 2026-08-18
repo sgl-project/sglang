@@ -280,7 +280,7 @@ def test_config_chosen_per_expert_swiglu_matches_fp32_reference(
             is_prefill=mode is Phase.PREFILL,
             has_active_lora=True,
         )
-        actual = runner.run(
+        actual = runner.run_plan(
             dispatch, batch, output_dtype=torch.float32, **runner._test_execution
         )
         torch.testing.assert_close(
@@ -372,14 +372,14 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
     )
 
     for _ in range(2):  # JIT + workspace graph-buffer retention before capture
-        runner.run(
+        runner.run_plan(
             dispatch, batch, output_dtype=torch.float32, **runner._test_execution
         )
     torch.cuda.synchronize(device)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = runner.run(
+        captured = runner.run_plan(
             dispatch, batch, output_dtype=torch.float32, **runner._test_execution
         )
     output = captured.hidden_states

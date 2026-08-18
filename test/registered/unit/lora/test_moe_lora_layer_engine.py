@@ -31,7 +31,7 @@ class _FakeRunner:
     def validate_plan(self, _plan, *, base_gemm_rows):
         self.prepared.append(base_gemm_rows)
 
-    def run(
+    def run_plan(
         self,
         _dispatch_output,
         _batch,
