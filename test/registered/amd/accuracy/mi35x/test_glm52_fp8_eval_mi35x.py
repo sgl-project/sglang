@@ -33,9 +33,9 @@ setup, so the two are not directly comparable, but it does mean a ~1 point
 regression trips this test. Treat a marginal failure as worth reading rather
 than as noise to retry away.
 
-Accuracy only: the cookbook already publishes MI355X FP8 speed numbers, and an
-8-GPU MI35x runner is scarce enough that a second long job should wait until
-this one is reliably green.
+Accuracy runs before the companion performance benchmark in the same workflow
+job. A correctness failure therefore skips performance, while a green result
+lets the benchmark reuse the cached checkpoint and the same scarce runner slot.
 
 Registry: nightly-amd-8-gpu-mi35x-glm52-fp8 suite
 """
