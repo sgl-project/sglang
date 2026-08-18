@@ -31,6 +31,8 @@ the caller falls back to ``extend_attention_fwd``. Supported case: causal
 sliding-window / logit-cap / xai-temperature. Correctness is never violated.
 """
 
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
@@ -90,9 +92,58 @@ def block_config(head_dim):
 ADAPTIVE_SPLITS = True
 MAX_N_SPLITS = 16
 MIN_N_SPLITS = 4
+# MAX_N_SPLITS is a floor rather than a ceiling when the base grid cannot fill
+# the device -- see _cu_aware_max_splits. HARD_MAX bounds that raise, and the
+# workgroups-per-CU target is conservative enough to leave the tuned case at
+# exactly MAX_N_SPLITS.
+HARD_MAX_N_SPLITS = 128
+_WGS_PER_CU_TARGET = 4
+# att_out/att_lse are sized by max_bs for graph address stability, so n_splits
+# multiplies a max_bs-sized allocation even when only bs=1 is live. Bound it.
+_SPLIT_SCRATCH_BUDGET_BYTES = 512 << 20
 
 
-def choose_n_splits(avg_seqlen):
+@lru_cache(maxsize=8)
+def _device_cu_count(device_index):
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _cu_aware_max_splits(base_programs, device_index):
+    """Raise the split cap when the (bs, h_q) base grid cannot fill the device.
+
+    The stage1 grid is (bs, h_q, N_SPLITS), so bs*h_q fixes how many workgroups
+    exist before splitting. A per-TP-rank speculative draft shard is tiny, and
+    the flat cap then leaves most of the device idle. Scale the cap by the
+    shortfall instead; never below MAX_N_SPLITS, so shapes that already fill the
+    device keep their tuned value. Host-side property read only, so it stays
+    graph-capture safe.
+    """
+    n_cu = _device_cu_count(device_index)
+    if n_cu <= 0 or base_programs <= 0:
+        return MAX_N_SPLITS
+    want = triton.next_power_of_2(max(1, (_WGS_PER_CU_TARGET * n_cu) // base_programs))
+    return max(MAX_N_SPLITS, min(want, HARD_MAX_N_SPLITS))
+
+
+def _scratch_capped_splits(n_splits, max_bs, h_q, l_pad, v_head_dim):
+    """Largest power-of-two split count <= n_splits fitting the scratch budget.
+    Never below MAX_N_SPLITS: that is the pre-existing footprint, so this only
+    claws back what the CU-aware raise asked for."""
+    per_split = max_bs * h_q * l_pad * (v_head_dim + 1) * 4
+    if per_split <= 0:
+        return n_splits
+    while (
+        n_splits > MAX_N_SPLITS and n_splits * per_split > _SPLIT_SCRATCH_BUDGET_BYTES
+    ):
+        n_splits //= 2
+    return n_splits
+
+
+# `base_programs` (= bs * h_q) is the stage1 base grid before splitting. When it
+# cannot fill the device the cap is raised by the shortfall and the whole ladder
+# scales with it; passing None keeps the flat cap, i.e. exactly the behaviour
+# documented below.
+def choose_n_splits(avg_seqlen, base_programs=None, device_index=0):
     """Pick N_SPLITS (power of two, in [MIN_N_SPLITS, MAX_N_SPLITS]) from the
     average prefix length. Tuned by the real-shape sweep (head_dim=256, BS*H_Q
     =128 base programs on ~132 CUs):
@@ -106,6 +157,11 @@ def choose_n_splits(avg_seqlen):
     so it is HIP-graph-capture safe (no device->host sync)."""
     if not ADAPTIVE_SPLITS:
         return DEFAULT_N_SPLITS
+    max_splits = (
+        MAX_N_SPLITS
+        if base_programs is None
+        else _cu_aware_max_splits(base_programs, device_index)
+    )
     s = int(avg_seqlen)
     if s < 4096:
         n = 4
@@ -113,10 +169,15 @@ def choose_n_splits(avg_seqlen):
         n = 8
     else:
         n = 16
+    # The ladder was tuned at a base grid that already fills the device; when it
+    # does not, every rung is short by the same factor, not just the long one.
+    # boost == 1 whenever max_splits == MAX_N_SPLITS, so tuned shapes are
+    # bit-identical.
+    n *= max(1, max_splits // MAX_N_SPLITS)
     if n < MIN_N_SPLITS:
         n = MIN_N_SPLITS
-    if n > MAX_N_SPLITS:
-        n = MAX_N_SPLITS
+    if n > max_splits:
+        n = max_splits
     return n
 
 
@@ -823,12 +884,17 @@ def verify_splitkv_fwd(
     # mixed-length batches stay correct -- shorter seqs simply write fewer
     # active splits (the rest emit the -inf lse sentinel, ignored in stage2).
     avg_seqlen = kv_indices.shape[0] / max(1, bs)
-    n_splits = choose_n_splits(avg_seqlen)
+    n_splits = choose_n_splits(
+        avg_seqlen, base_programs=bs * h_q, device_index=q_extend.device.index or 0
+    )
 
     # Size scratch by the stable max_bs (backend passes req_to_token_pool size);
     # fall back to this call's bs if not provided / smaller.
     if max_bs is None or max_bs < bs:
         max_bs = bs
+    n_splits = _scratch_capped_splits(
+        n_splits, max_bs, h_q, triton.next_power_of_2(l_ext), v_head_dim
+    )
     vk = _get_vk(
         max_bs,
         h_q,
