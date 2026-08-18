@@ -58,6 +58,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW8A8Int8DynamicMoE,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    check_equal_or_regex_match,
     find_matched_target,
     is_activation_quantization_format,
     should_ignore_layer,
@@ -175,6 +176,17 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
+
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        if isinstance(layer, ParallelLMHead):
+            scheme = self.get_lm_head_scheme(layer=layer, layer_name=prefix)
+            if scheme is None:
+                # Unquantized head: fall back to the embedding default.
+                return None
+            layer.scheme = scheme
+            return CompressedTensorsLinearMethod(self)
+
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):
@@ -897,6 +909,32 @@ class CompressedTensorsConfig(QuantizationConfig):
             self._check_scheme_supported(scheme.get_min_capability())
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
+
+    def get_lm_head_scheme(
+        self, layer: torch.nn.Module, layer_name: Optional[str] = None
+    ) -> Optional[CompressedTensorsLinearScheme]:
+        """Resolve the scheme for a ParallelLMHead, or None if the checkpoint
+        stores the head unquantized.
+
+        The head is treated as quantized only when a config target names it by
+        layer name (exact or ``re:`` regex, e.g. ``re:.*lm_head``). Module-type
+        targets like ``Linear`` are not consulted: llm-compressor emits those
+        for decoder linears, and checkpoints following the common convention
+        leave the head out of both ``targets`` and ``ignore`` — matching by
+        name keeps such heads on the unquantized path instead of tripping
+        ``find_matched_target``'s unmatched-layer error.
+        """
+        if layer_name is None or not self.target_scheme_map:
+            return None
+        if should_ignore_layer(
+            layer_name, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
+        ):
+            return None
+        if not check_equal_or_regex_match(
+            layer_name=layer_name, targets=self.target_scheme_map.keys()
+        ):
+            return None
+        return self.get_linear_scheme(layer=layer, layer_name=layer_name)
 
     def get_scheme_dict(
         self, layer: torch.nn.Module, layer_name: str | None = None
