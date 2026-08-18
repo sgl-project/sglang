@@ -1,3 +1,4 @@
+import functools
 import itertools
 import math
 
@@ -198,7 +199,17 @@ def scaled_weight(weight, scales):
     return weight_scaled
 
 
-def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize):
+def _activation_fn(activation):
+    """Reference gate-and-multiply for the activation fused_experts_cpu applies."""
+    if activation == "silu":
+        return SiluAndMul
+    if activation == "gelu":
+        # matches the erf gelu the kernel computes
+        return functools.partial(GeluAndMul, approximate="none")
+    raise ValueError(f"Unsupported activation: {activation}")
+
+
+def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize, activation="silu"):
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
     out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
@@ -208,14 +219,14 @@ def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize):
     if renormalize:
         topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
 
+    act_fn = _activation_fn(activation)
+
     topk_weight = topk_weight.view(-1)
     topk_ids = topk_ids.view(-1)
     for i in range(w1.shape[0]):
         mask = topk_ids == i
         if mask.sum():
-            out[mask] = SiluAndMul(a[mask] @ w1[i].transpose(0, 1)) @ w2[i].transpose(
-                0, 1
-            )
+            out[mask] = act_fn(a[mask] @ w1[i].transpose(0, 1)) @ w2[i].transpose(0, 1)
     return (
         out.view(B, -1, w2.shape[1]) * topk_weight.view(B, -1, 1).to(out.dtype)
     ).sum(dim=1)
@@ -372,10 +383,12 @@ def torch_w8a8_per_column_fused_moe(a, w1, w2, w1_s, w2_s, topk_weight, topk_ids
     )
 
 
-def native_fp8_fused_moe(a, w1, w2, topk_weight, topk_ids, topk):
+def native_fp8_fused_moe(a, w1, w2, topk_weight, topk_ids, topk, activation="silu"):
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D).float()
     out = torch.zeros(B * topk, w2.shape[1], dtype=torch.float32, device=a.device)
+
+    act_fn = _activation_fn(activation)
 
     # Calculate routing
     topk_weight = topk_weight.view(-1)
@@ -385,7 +398,7 @@ def native_fp8_fused_moe(a, w1, w2, topk_weight, topk_ids, topk):
         mask = topk_ids == i
         if mask.sum():
             ic0 = torch.matmul(a[mask], w1[i].transpose(0, 1))
-            ic1 = SiluAndMul(ic0)
+            ic1 = act_fn(ic0)
             out[mask] = torch.matmul(ic1, w2[i].transpose(0, 1))
 
     return (
