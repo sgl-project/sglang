@@ -930,9 +930,15 @@ def _register_configs():
         sampling_param_cls=BooguImageSamplingParams,
         pipeline_config_cls=BooguImagePipelineConfig,
         hf_model_paths=[
-            "boogu-project/Boogu-Image-0.1-Base",
+            "Boogu/Boogu-Image-0.1-Base",
         ],
-        model_detectors=[lambda hf_id: "boogu-image" in hf_id.lower()],
+        model_detectors=[
+            lambda hf_id: (
+                "boogu-image" in hf_id.lower()
+                and "base" in hf_id.lower()
+                and "fp8" not in hf_id.lower()
+            )
+        ],
     )
     register_configs(
         sampling_param_cls=ZImageSamplingParams,

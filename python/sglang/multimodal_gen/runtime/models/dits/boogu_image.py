@@ -404,7 +404,7 @@ class BooguJointAttention(nn.Module):
                     dim,
                     dim,
                     bias=False,
-                    input_is_parallel=True,
+                    input_is_parallel=False,
                     quant_config=quant_config,
                     prefix=f"{prefix}.to_out.0",
                 )
