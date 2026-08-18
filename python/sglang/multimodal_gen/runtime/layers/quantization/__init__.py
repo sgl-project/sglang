@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_int8_conf
     KitchenInt8Config,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8 import (
     ModelOptFp8Config as ModelOptFp8DiffusionConfig,
 )
@@ -28,6 +29,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.mxfp8_npu import MXFP8Con
 
 QuantizationMethods = Literal[
     "fp8",
+    "gguf",
     "modelopt",
     "modelopt_fp8",
     "modelopt_fp4",
@@ -49,6 +51,7 @@ _CUSTOMIZED_METHOD_TO_QUANT_CONFIG = {
     "bitsandbytes": BitsAndBytesConfig,
     "modelslim": ModelSlimConfig,
     "fp8": Fp8Config,
+    "gguf": GGUFConfig,
     "mxfp4": Mxfp4Config,
     "mxfp8": MXFP8Config,
     "mxfp4_npu": NPUMXFP4Config,

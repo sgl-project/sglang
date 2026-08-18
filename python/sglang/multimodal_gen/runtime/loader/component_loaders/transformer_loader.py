@@ -16,8 +16,10 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
+from sglang.multimodal_gen.runtime.loader.gguf_weights import gguf_weights_iterator
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     TransformerQuantLoadSpec,
+    resolve_transformer_gguf_to_load,
     resolve_transformer_quant_load_spec,
     resolve_transformer_safetensors_to_load,
 )
@@ -161,9 +163,17 @@ class TransformerLoader(ComponentLoader):
         # 1. hf config
         config = get_diffusers_component_config(component_path=component_model_path)
 
-        safetensors_list = resolve_transformer_safetensors_to_load(
-            component_server_args, component_model_path
+        gguf_file = resolve_transformer_gguf_to_load(
+            component_server_args, component_name
         )
+        if gguf_file is not None:
+            # A GGUF file holds the whole transformer; the remaining components
+            # still load from the base model path.
+            safetensors_list = []
+        else:
+            safetensors_list = resolve_transformer_safetensors_to_load(
+                component_server_args, component_model_path
+            )
 
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
@@ -193,6 +203,7 @@ class TransformerLoader(ComponentLoader):
             model_cls=model_cls,
             cls_name=cls_name,
             component_name=component_name,
+            gguf_file=gguf_file,
         )
         # Quantization adapters may require resident weights, so placement must
         # be resolved after they have validated the component configuration.
@@ -201,13 +212,21 @@ class TransformerLoader(ComponentLoader):
         )
         use_fsdp = server_args.should_use_fsdp_for_component(component_name)
 
-        logger.info(
-            "Loading %s from %s safetensors file(s) %s, param_dtype: %s",
-            cls_name,
-            len(safetensors_list),
-            f": {safetensors_list}" if get_log_level() == logging.DEBUG else "",
-            quant_spec.param_dtype,
-        )
+        if quant_spec.gguf_file is not None:
+            logger.info(
+                "Loading %s from GGUF file %s, param_dtype: %s",
+                cls_name,
+                quant_spec.gguf_file,
+                quant_spec.param_dtype,
+            )
+        else:
+            logger.info(
+                "Loading %s from %s safetensors file(s) %s, param_dtype: %s",
+                cls_name,
+                len(safetensors_list),
+                f": {safetensors_list}" if get_log_level() == logging.DEBUG else "",
+                quant_spec.param_dtype,
+            )
         # prepare init_param
         init_params: dict[str, Any] = {
             "config": dit_config,
@@ -319,6 +338,15 @@ class TransformerLoader(ComponentLoader):
                 strict=False,
                 weight_load_plan=weight_load_plan,
                 checkpoint_key_filter=checkpoint_key_filter,
+                weights_iterator=(
+                    gguf_weights_iterator(
+                        quant_spec.gguf_file,
+                        quant_spec.quant_config.tensor_meta,
+                        key_filter=checkpoint_key_filter,
+                    )
+                    if quant_spec.gguf_file is not None
+                    else None
+                ),
             )
 
         # post-hooks (e.g., patch scales (nunchaku))
