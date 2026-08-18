@@ -21,11 +21,8 @@ import os
 import socket
 import struct
 import unittest
-from dataclasses import MISSING, fields
 from types import SimpleNamespace
 
-from sglang.srt.runtime_context import publish
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.weight_cache.protocol import (
     IPC_QUANT_ALLOWLIST,
     CacheConfig,
@@ -232,42 +229,30 @@ class TestDaemonLaunchConfiguration(CustomTestCase):
     def test_builder_projects_complex_server_layout(self):
         from sglang.srt.weight_cache.daemon import build_weight_cache_daemon_command
 
-        # The builder consumes the published, resolved config. A minimal
-        # ServerArgs keeps this projection test CPU-only and model-independent.
-        # Bypass ServerArgs.__post_init__ so constructing the fixture does not
-        # resolve a real model configuration.
-        server_args = object.__new__(ServerArgs)
-        for field in fields(ServerArgs):
-            if field.default is not MISSING:
-                value = field.default
-            elif field.default_factory is not MISSING:
-                value = field.default_factory()
-            else:
-                value = None
-            object.__setattr__(server_args, field.name, value)
-        for name, value in {
-            "model_path": "/models/demo",
-            "tp_size": 8,
-            "pp_size": 1,
-            "dp_size": 8,
-            "ep_size": 8,
-            "moe_dp_size": 2,
-            "enable_dp_attention": True,
-            "enable_dp_lm_head": True,
-            "attn_cp_size": 2,
-            "moe_dense_tp_size": 1,
-            "moe_a2a_backend": "mooncake",
-            "deepep_mode": "low_latency",
-            "load_format": "safetensors",
-            "dtype": "bfloat16",
-            "quantization": "fp8",
-            "model_loader_extra_config": '{"key": "value"}',
-            "trust_remote_code": True,
-            "revision": "test-revision",
-        }.items():
-            object.__setattr__(server_args, name, value)
-        publish(server_args, role="test")
+        # The builder consumes Engine's already-resolved ServerArgs. A minimal
+        # namespace keeps this projection test CPU-only and model-independent.
+        server_args = SimpleNamespace(
+            model_path="/models/demo",
+            tp_size=8,
+            pp_size=1,
+            dp_size=8,
+            ep_size=8,
+            moe_dp_size=2,
+            enable_dp_attention=True,
+            enable_dp_lm_head=True,
+            attn_cp_size=2,
+            moe_dense_tp_size=1,
+            moe_a2a_backend="mooncake",
+            deepep_mode="low_latency",
+            load_format="safetensors",
+            dtype="bfloat16",
+            quantization="fp8",
+            model_loader_extra_config='{"key": "value"}',
+            trust_remote_code=True,
+            revision="test-revision",
+        )
         command = build_weight_cache_daemon_command(
+            server_args,
             gpu_id=3,
             tp_rank=3,
             pp_rank=0,

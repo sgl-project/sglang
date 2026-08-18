@@ -48,17 +48,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import (
-    configured_attn_cp_size,
-    configured_moe_dp_size,
-    configured_pp_size,
-    configured_tp_size,
-    get_device,
-    get_exec,
-    get_model,
-    get_parallel,
-    publish,
-)
+from sglang.srt.runtime_context import get_parallel, publish
 from sglang.srt.utils import MultiprocessingSerializer
 
 from .protocol import (
@@ -142,6 +132,7 @@ class WeightCacheDaemonArgs:
 
 
 def build_weight_cache_daemon_command(
+    server_args: "ServerArgs",
     *,
     gpu_id: int,
     tp_rank: int,
@@ -151,58 +142,58 @@ def build_weight_cache_daemon_command(
     """Build the sole subprocess command used by Engine and the standalone launcher."""
     import sys
 
-    model = get_model()
-    parallel = get_parallel()
-    moe = get_exec().moe
     cmd = [
         sys.executable,
         "-m",
         "sglang.srt.weight_cache.daemon",
         "--model-path",
-        model.model_path,
+        server_args.model_path,
         "--gpu-id",
         str(gpu_id),
         "--tp-size",
-        str(configured_tp_size()),
+        str(server_args.tp_size),
         "--tp-rank",
         str(tp_rank),
         "--pp-size",
-        str(configured_pp_size()),
+        str(server_args.pp_size),
         "--pp-rank",
         str(pp_rank),
         "--dp-size",
-        str(parallel.dp_size),
+        str(server_args.dp_size),
         "--ep-size",
-        str(parallel.ep_size),
+        str(server_args.ep_size),
         "--moe-dp-size",
-        str(configured_moe_dp_size()),
+        str(server_args.moe_dp_size),
         "--attn-cp-size",
-        str(configured_attn_cp_size()),
+        str(server_args.attn_cp_size),
         "--load-format",
-        model.load_format,
+        server_args.load_format,
         "--dtype",
-        model.dtype,
+        server_args.dtype,
         "--dist-init-method",
         dist_init_method,
     ]
-    if parallel.enable_dp_attention:
+    if server_args.enable_dp_attention:
         cmd.append("--enable-dp-attention")
-    if parallel.enable_dp_lm_head:
+    if server_args.enable_dp_lm_head:
         cmd.append("--enable-dp-lm-head")
-    if parallel.moe_dense_tp_size is not None:
-        cmd += ["--moe-dense-tp-size", str(parallel.moe_dense_tp_size)]
-    if moe.moe_a2a_backend != "none":
-        cmd += ["--moe-a2a-backend", moe.moe_a2a_backend]
-    if moe.deepep_mode != "auto":
-        cmd += ["--deepep-mode", moe.deepep_mode]
-    if model.quantization:
-        cmd += ["--quantization", model.quantization]
-    if model.model_loader_extra_config and model.model_loader_extra_config != "{}":
-        cmd += ["--model-loader-extra-config", model.model_loader_extra_config]
-    if model.trust_remote_code:
+    if server_args.moe_dense_tp_size is not None:
+        cmd += ["--moe-dense-tp-size", str(server_args.moe_dense_tp_size)]
+    if server_args.moe_a2a_backend != "none":
+        cmd += ["--moe-a2a-backend", server_args.moe_a2a_backend]
+    if server_args.deepep_mode != "auto":
+        cmd += ["--deepep-mode", server_args.deepep_mode]
+    if server_args.quantization:
+        cmd += ["--quantization", server_args.quantization]
+    if (
+        server_args.model_loader_extra_config
+        and server_args.model_loader_extra_config != "{}"
+    ):
+        cmd += ["--model-loader-extra-config", server_args.model_loader_extra_config]
+    if server_args.trust_remote_code:
         cmd += ["--trust-remote-code"]
-    if model.revision:
-        cmd += ["--revision", model.revision]
+    if server_args.revision:
+        cmd += ["--revision", server_args.revision]
     return cmd
 
 
@@ -222,12 +213,35 @@ class WeightCacheDaemon:
         dist_init_method: Optional[str] = None,
     ):
         self.server_args = server_args
+        self.model_path = server_args.model_path
         self.gpu_id = gpu_id
+        self.tp_size = server_args.tp_size
         self.tp_rank = tp_rank
+        self.pp_size = server_args.pp_size
         self.pp_rank = pp_rank
+        self.dp_size = server_args.dp_size
+        self.ep_size = server_args.ep_size
+        self.moe_dp_size = server_args.moe_dp_size
+        self.enable_dp_attention = server_args.enable_dp_attention
+        self.enable_dp_lm_head = server_args.enable_dp_lm_head
+        self.attn_cp_size = server_args.attn_cp_size
+        self.moe_dense_tp_size = server_args.moe_dense_tp_size
+        self.moe_a2a_backend = server_args.moe_a2a_backend
+        self.deepep_mode = server_args.deepep_mode
+        self.load_format = server_args.load_format
+        self.dtype = server_args.dtype
+        self.quantization = server_args.quantization
+        self.model_loader_extra_config = server_args.model_loader_extra_config
+        self.trust_remote_code = server_args.trust_remote_code
+        self.revision = server_args.revision
         self.dist_init_method = dist_init_method
-        self.socket_path: Optional[str] = None
-        self.ready_path: Optional[str] = None
+
+        self.socket_path = get_socket_path(
+            compute_global_rank(self.tp_size, pp_rank, tp_rank)
+        )
+        self.ready_path = get_ready_path(
+            compute_global_rank(self.tp_size, pp_rank, tp_rank)
+        )
 
         self.model = None
         self.config: Optional[CacheConfig] = None
@@ -273,7 +287,7 @@ class WeightCacheDaemon:
                 distributed_init_method=self.dist_init_method,
                 local_rank=self.gpu_id,
                 backend=current_platform.get_torch_distributed_backend_str(),
-                moe_a2a_backend=get_exec().moe.moe_a2a_backend,
+                moe_a2a_backend=server_args.moe_a2a_backend,
             )
 
         initialize_model_parallel(
@@ -328,32 +342,6 @@ class WeightCacheDaemon:
 
         server_args = self.server_args
         publish(server_args, role="weight_cache_daemon")
-
-        model = get_model()
-        parallel = get_parallel()
-        moe = get_exec().moe
-        self.model_path = model.model_path
-        self.tp_size = configured_tp_size()
-        self.pp_size = configured_pp_size()
-        self.dp_size = parallel.dp_size
-        self.ep_size = parallel.ep_size
-        self.moe_dp_size = configured_moe_dp_size()
-        self.enable_dp_attention = parallel.enable_dp_attention
-        self.enable_dp_lm_head = parallel.enable_dp_lm_head
-        self.attn_cp_size = configured_attn_cp_size()
-        self.moe_dense_tp_size = parallel.moe_dense_tp_size
-        self.moe_a2a_backend = moe.moe_a2a_backend
-        self.load_format = model.load_format
-        self.dtype = model.dtype
-        self.quantization = model.quantization
-        self.model_loader_extra_config = model.model_loader_extra_config
-        self.trust_remote_code = model.trust_remote_code
-        self.revision = model.revision
-        global_rank = compute_global_rank(self.tp_size, self.pp_rank, self.tp_rank)
-        if self.socket_path is None:
-            self.socket_path = get_socket_path(global_rank)
-        if self.ready_path is None:
-            self.ready_path = get_ready_path(global_rank)
 
         from sglang.srt.layers.moe import initialize_moe_config
 
@@ -713,6 +701,7 @@ def run_weight_cache_daemon(
 
 
 def launch_weight_cache_daemons(
+    server_args: "ServerArgs",
     dist_init_method: Optional[str] = None,
     timeout: int = 1800,
     force: bool = False,
@@ -747,28 +736,21 @@ def launch_weight_cache_daemons(
     import socket as sock_mod
     import subprocess
 
-    parallel = get_parallel()
-    device = get_device()
-    tp_size = configured_tp_size()
-    pp_size = configured_pp_size()
-    nnodes = parallel.nnodes
-    node_rank = parallel.node_rank
-
     # Replicate _calculate_rank_ranges logic from engine.py
-    pp_size_per_node = max(pp_size // nnodes, 1)
-    nnodes_per_pp_rank = max(nnodes // pp_size, 1)
+    pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+    nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
     pp_rank_range = range(
-        pp_size_per_node * (node_rank // nnodes_per_pp_rank),
-        pp_size_per_node * (node_rank // nnodes_per_pp_rank + 1),
+        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
+        pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
     )
     nnodes_per_tp_group = nnodes_per_pp_rank
-    tp_size_per_node = tp_size // nnodes_per_tp_group
+    tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
     tp_rank_range = range(
-        tp_size_per_node * (node_rank % nnodes_per_tp_group),
-        tp_size_per_node * (node_rank % nnodes_per_tp_group + 1),
+        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+        tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
     )
 
-    if nnodes > 1 and dist_init_method is None:
+    if server_args.nnodes > 1 and dist_init_method is None:
         raise ValueError(
             "dist_init_method is required for multi-node weight cache daemons. "
             "Use --dist-init-method tcp://<node0-ip>:<port> to specify the "
@@ -785,7 +767,7 @@ def launch_weight_cache_daemons(
     # Validate and clean up stale .ready/.sock files from prior runs.
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
+            global_rank = compute_global_rank(server_args.tp_size, pp_rank, tp_rank)
             cleanup_stale_daemon_files(global_rank, force=force)
 
     procs = []
@@ -796,10 +778,11 @@ def launch_weight_cache_daemons(
                 tp_rank,
                 pp_size_per_node,
                 tp_size_per_node,
-                base_gpu_id=device.base_gpu_id,
-                gpu_id_step=device.gpu_id_step,
+                base_gpu_id=server_args.base_gpu_id,
+                gpu_id_step=server_args.gpu_id_step,
             )
             cmd = build_weight_cache_daemon_command(
+                server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
                 pp_rank=pp_rank,
@@ -819,7 +802,7 @@ def launch_weight_cache_daemons(
     start_time = time.time()
     for pp_rank in pp_rank_range:
         for tp_rank in tp_rank_range:
-            global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
+            global_rank = compute_global_rank(server_args.tp_size, pp_rank, tp_rank)
             ready_path = get_ready_path(global_rank)
             while not os.path.exists(ready_path):
                 time.sleep(check_interval)
@@ -854,7 +837,7 @@ def launch_weight_cache_daemons(
             )
 
     logger.info(
-        f"All {num_daemons} weight cache daemons on node {node_rank} are ready "
+        f"All {num_daemons} weight cache daemons on node {server_args.node_rank} are ready "
         f"(pp_ranks={pp_rank_range.start}..{pp_rank_range.stop - 1}, "
         f"tp_ranks={tp_rank_range.start}..{tp_rank_range.stop - 1}, "
         f"dist_init_method={dist_init_method})"
@@ -902,7 +885,6 @@ if __name__ == "__main__":
     from sglang.srt.server_args import prepare_server_args
 
     server_args = prepare_server_args(server_argv)
-    publish(server_args, role="weight_cache_daemon")
     daemon_args = WeightCacheDaemonArgs.from_cli_args(worker_ns)
     if daemon_args.gpu_id is not None or daemon_args.tp_rank is not None:
         gpu_id = (
@@ -916,7 +898,7 @@ if __name__ == "__main__":
             else daemon_args.gpu_id
         )
         cleanup_stale_daemon_files(
-            compute_global_rank(configured_tp_size(), daemon_args.pp_rank, tp_rank),
+            compute_global_rank(server_args.tp_size, daemon_args.pp_rank, tp_rank),
             force=daemon_args.force,
         )
         run_weight_cache_daemon(
@@ -928,6 +910,7 @@ if __name__ == "__main__":
         )
     else:
         launch_weight_cache_daemons(
+            server_args,
             dist_init_method=daemon_args.dist_init_method,
             timeout=daemon_args.timeout,
             force=daemon_args.force,
