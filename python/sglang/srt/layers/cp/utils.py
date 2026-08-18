@@ -52,7 +52,7 @@ CP_V2_DEFAULT_MODEL_CLASSES = frozenset(
     }
 )
 
-
+# MTP层不开layersplit呗
 def is_glm_dsa_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
     """Whether DSA GPU KV/indexer cache layers are sharded across CP ranks.
 
