@@ -603,3 +603,99 @@ Larger blocks can improve decode latency when acceptance stays high, but they al
 For every candidate, compare with the same recipe without `--speculative-algorithm DSPARK`. Restart the server between the DSpark and non-speculative legs, keep the request corpus, sampling, concurrency, and warmup identical, and give each `bench_serving` leg its own `--flush-cache`. Leave `--speculative-draft-attention-backend` unset unless a separate profiling run justifies an override.
 
 DSpark currently requires CUDA, `pp_size == 1`, and DP Attention disabled. It is not compatible with PD disaggregation on current SGLang releases; selecting a prefill or decode role in the Playground automatically removes the inherited DSpark flags. The DP-Attention and MI355X Flash Official recipes therefore run target-only. If a larger draft block or concurrency causes graph-capture OOM, lower `--mem-fraction-static`, the draft block size, or the configured maximum running requests, then rerun both performance and accuracy gates.
+
+### 3.5 Agentic Coding with HiCache DRAM Offload (B200 FP4 Pro, MTP)
+
+**TP8, HiCache**
+
+```bash Command
+export SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1
+export SGLANG_OPT_USE_JIT_NORM=1
+export SGLANG_OPT_USE_JIT_INDEXER_METADATA=1
+export SGLANG_OPT_USE_TOPK_V2=1
+export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1
+
+sglang serve \
+  --trust-remote-code \
+  --model-path deepseek-ai/DeepSeek-V4-Pro \
+  --tp 8 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --disable-flashinfer-autotune \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --chunked-prefill-size 8192 \
+  --swa-full-tokens-ratio 0.1 \
+  --mem-fraction-static 0.88 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 8 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+**TP8/EP8, DP-Attention, HiCache**
+
+```bash Command
+export SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1
+export SGLANG_OPT_USE_JIT_NORM=1
+export SGLANG_OPT_USE_JIT_INDEXER_METADATA=1
+export SGLANG_OPT_USE_TOPK_V2=1
+export SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1
+export SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1
+export SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1
+export SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1
+export SGLANG_OPT_FIX_HASH_MEGA_MOE=1
+export SGLANG_OPT_USE_FAST_MASK_EP=1
+export SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1
+export SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8192
+export SGLANG_OPT_FIX_NEXTN_MEGA_MOE=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0
+
+sglang serve \
+  --trust-remote-code \
+  --model-path deepseek-ai/DeepSeek-V4-Pro \
+  --tp 8 \
+  --dp 8 \
+  --ep-size 8 \
+  --enable-dp-attention \
+  --enable-dp-attention-local-control-broadcast \
+  --enable-deepseek-v4-fp4-indexer \
+  --tokenizer-worker-num 8 \
+  --moe-a2a-backend deepep \
+  --deepep-config '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}' \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --chunked-prefill-size 65536 \
+  --swa-full-tokens-ratio 0.02 \
+  --mem-fraction-static 0.88 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 8 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+`--chunked-prefill-size 65536` is the global budget shared across all eight DP-attention ranks.
+
+Front the DP-attention deployment with the SGLang router:
+
+```bash Command
+python3 -m sglang_router.launch_router \
+  --worker-urls http://localhost:30001 \
+  --policy consistent_hashing \
+  --dp-aware \
+  --host 0.0.0.0 \
+  --port 30000
+```
