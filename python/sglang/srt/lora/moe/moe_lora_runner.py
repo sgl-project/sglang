@@ -444,7 +444,6 @@ class MoeLoraRunner:
         plan: MoeLoraExecutionPlan,
         launch_config: MoeLoraLaunchConfig,
         base_gemm_rows: str,
-        output_dtype: torch.dtype | None = None,
     ) -> StandardCombineInput:
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
@@ -455,7 +454,6 @@ class MoeLoraRunner:
         assert TopKOutputChecker.format_is_standard(topk_output)
         topk_ids = topk_output.topk_ids
 
-        output_dtype = hidden_states.dtype if output_dtype is None else output_dtype
         num_tokens = self._checked_token_count(hidden_states, batch)
         self.workspace.begin_forward(graph_mode=batch.use_cuda_graph)
         routes = build_routes(
@@ -495,7 +493,7 @@ class MoeLoraRunner:
         # no allocator activity between its producer and dependent launch.
         output = self._allocate_output(
             num_tokens=num_tokens,
-            dtype=output_dtype,
+            dtype=hidden_states.dtype,
             device=act_out.device,
         )
         down_out, down_rank, down_delta = self._run_late(
@@ -1288,8 +1286,6 @@ class MoeLoraLayerEngine:
         self,
         dispatch_output: StandardDispatchOutput,
         batch: MoeLoraBatch,
-        *,
-        output_dtype: torch.dtype | None = None,
     ) -> StandardCombineInput:
         if not self.is_bound:
             raise RuntimeError("MoE LoRA weights must be bound before running")
@@ -1305,5 +1301,4 @@ class MoeLoraLayerEngine:
             plan=sel.plan,
             launch_config=launch_config,
             base_gemm_rows=sel.base_gemm_rows,
-            output_dtype=output_dtype,
         )

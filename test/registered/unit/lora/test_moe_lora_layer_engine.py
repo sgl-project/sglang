@@ -39,11 +39,10 @@ class _FakeRunner:
         plan,
         launch_config,
         base_gemm_rows,
-        output_dtype=None,
     ):
         del plan
         self.runs += 1
-        return base_gemm_rows, launch_config, output_dtype
+        return base_gemm_rows, launch_config
 
 
 def _base_layer(*, hidden_size=2048, num_local_experts=256):
@@ -118,18 +117,15 @@ def test_run_routes_by_phase_and_buckets_by_batch_size(monkeypatch) -> None:
     engine = _engine(monkeypatch, capability=(10, 0))
     engine.ensure_bound(is_shared_outer=False, physical_rank=64)
 
-    decode_rows, tiny_launch, dtype = engine.run(
-        _dispatch(4), _batch(), output_dtype=torch.bfloat16
-    )
+    decode_rows, tiny_launch = engine.run(_dispatch(4), _batch())
     assert decode_rows == "expert_major"
-    assert dtype == torch.bfloat16
-    prefill_rows, _, _ = engine.run(_dispatch(4096), _batch(is_prefill=True))
+    prefill_rows, _ = engine.run(_dispatch(4096), _batch(is_prefill=True))
     assert prefill_rows == "route_major"
 
     # the M-bucket pick is per forward: the gb300 decode ladder at rank 64
     # serves different tiles at 4 and 17 tokens
-    _, mse_launch, _ = engine.run(_dispatch(16), _batch())
-    _, large_launch, _ = engine.run(_dispatch(17), _batch())
+    _, mse_launch = engine.run(_dispatch(16), _batch())
+    _, large_launch = engine.run(_dispatch(17), _batch())
     assert tiny_launch.gate_up_b["BLOCK_SIZE_N"] == 128
     assert mse_launch.gate_up_b["BLOCK_SIZE_N"] == 512
     assert large_launch.gate_up_b["BLOCK_SIZE_N"] == 256

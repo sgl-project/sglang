@@ -280,11 +280,9 @@ def test_config_chosen_per_expert_swiglu_matches_fp32_reference(
             is_prefill=mode is Phase.PREFILL,
             has_active_lora=True,
         )
-        actual = runner.run_plan(
-            dispatch, batch, output_dtype=torch.float32, **runner._test_execution
-        )
+        actual = runner.run_plan(dispatch, batch, **runner._test_execution)
         torch.testing.assert_close(
-            actual.hidden_states.detach().cpu(),
+            actual.hidden_states.detach().float().cpu(),
             references[traffic],
             atol=0.018,
             rtol=0.06,
@@ -372,23 +370,19 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
     )
 
     for _ in range(2):  # JIT + workspace graph-buffer retention before capture
-        runner.run_plan(
-            dispatch, batch, output_dtype=torch.float32, **runner._test_execution
-        )
+        runner.run_plan(dispatch, batch, **runner._test_execution)
     torch.cuda.synchronize(device)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = runner.run_plan(
-            dispatch, batch, output_dtype=torch.float32, **runner._test_execution
-        )
+        captured = runner.run_plan(dispatch, batch, **runner._test_execution)
     output = captured.hidden_states
     output_ptr = output.data_ptr()
 
     graph.replay()
     torch.cuda.synchronize(device)
     torch.testing.assert_close(
-        output.detach().cpu(),
+        output.detach().float().cpu(),
         _fp32_reference(cpu, _token_slots("active", num_tokens)),
         atol=0.018,
         rtol=0.06,
@@ -401,7 +395,7 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
     torch.cuda.synchronize(device)
     assert output.data_ptr() == output_ptr
     torch.testing.assert_close(
-        output.detach().cpu(),
+        output.detach().float().cpu(),
         _fp32_reference(cpu, _token_slots("base_only", num_tokens)),
         atol=0.018,
         rtol=0.06,
@@ -418,7 +412,7 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
     torch.cuda.synchronize(device)
     assert output.data_ptr() == output_ptr
     torch.testing.assert_close(
-        output.detach().cpu(),
+        output.detach().float().cpu(),
         _fp32_reference(cpu, _token_slots("mixed", num_tokens)),
         atol=0.018,
         rtol=0.06,

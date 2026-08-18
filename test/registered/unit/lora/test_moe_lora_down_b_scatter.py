@@ -733,9 +733,7 @@ def _run_once(runner, gpu, token_slots, *, use_cuda_graph=False):
         is_prefill=True,
         has_active_lora=True,
     )
-    return runner.run_plan(
-        dispatch, batch, output_dtype=torch.float32, **runner._test_execution
-    )
+    return runner.run_plan(dispatch, batch, **runner._test_execution)
 
 
 def _workspace_buffer_names(runner) -> set[str]:

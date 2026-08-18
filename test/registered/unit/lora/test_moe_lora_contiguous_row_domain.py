@@ -811,9 +811,7 @@ def _run_once(
         is_prefill=is_prefill,
         has_active_lora=True,
     )
-    return runner.run_plan(
-        dispatch, batch, output_dtype=torch.float32, **runner._test_execution
-    )
+    return runner.run_plan(dispatch, batch, **runner._test_execution)
 
 
 # The one intended divergence: the masked and contiguous S2/S4 kernel
