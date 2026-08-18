@@ -983,6 +983,17 @@ class TestModuleLevelHelpers(unittest.TestCase):
         MoeRunner(MoeRunnerBackend.TRITON, config)
         self.assertEqual(config.runner_backend, MoeRunnerBackend.TRITON)
 
+    def test_moe_runner_does_not_record_failed_backend(self):
+        """A failed construction should leave the shared config unchanged."""
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        config = MoeRunnerConfig()
+        with self.assertRaises(NotImplementedError):
+            MoeRunner(MoeRunnerBackend.AUTO, config)
+        self.assertIsNone(config.runner_backend)
+
 
 class TestPoolInitPicksUpEpContext(unittest.TestCase):
     """`LoRAMemoryPool.__init__` should read EP context from the module-
