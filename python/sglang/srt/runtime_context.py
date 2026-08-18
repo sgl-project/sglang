@@ -1662,6 +1662,10 @@ def configured_attn_cp_size() -> int:
     return _configured_parallel("attn_cp_size")
 
 
+def configured_dcp_size() -> int:
+    return _configured_parallel("dcp_size")
+
+
 def is_ep_joiner() -> bool:
     """True in a process launched as an elastic-EP joiner (scale or recover).
 
