@@ -194,7 +194,9 @@ class SchedulerRequestReceiver:
                             getattr(_g, "rank_in_group", -1),
                         )
                     except Exception as _e:
-                        logger.warning("[DEBUG-CI work_reqs attn_tp] log failed: %s", _e)
+                        logger.warning(
+                            "[DEBUG-CI work_reqs attn_tp] log failed: %s", _e
+                        )
                 work_reqs = broadcast_pyobj(
                     work_reqs,
                     self.attn_tp_group.rank,
@@ -231,7 +233,9 @@ class SchedulerRequestReceiver:
                             getattr(_g, "rank_in_group", -1),
                         )
                     except Exception as _e:
-                        logger.warning("[DEBUG-CI work_reqs attn_cp] log failed: %s", _e)
+                        logger.warning(
+                            "[DEBUG-CI work_reqs attn_cp] log failed: %s", _e
+                        )
                 work_reqs = broadcast_pyobj(
                     work_reqs,
                     self.attn_cp_group.rank,

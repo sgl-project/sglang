@@ -386,7 +386,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       ref: ${{ needs.set-image-config.outputs.ref }}
       install_sglang_from_source: true
-      trouble_shotting: ${{ needs.set-image-config.outputs.trouble_shotting }}
+      trouble_shotting: ${{ needs.set-image-config.outputs.trouble_shotting == 'true' }}
       prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
       transformers_version: ''
 
