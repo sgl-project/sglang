@@ -152,10 +152,16 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "DFLASH speculative decoding only supports CUDA and NPU devices."
         )
 
-    if resolved_view(server_args).enable_dp_attention:
-        raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp attention."
-        )
+    if resolved_view(server_args).enable_dp_attention and server_args.dp_size > 1:
+        if not server_args.enable_dp_lm_head:
+            raise ValueError("DFLASH with dp attention requires --enable-dp-lm-head.")
+        if server_args.attn_cp_size > 1:
+            raise ValueError(
+                "DFLASH with dp attention does not support context parallel "
+                f"(--attn-cp-size {server_args.attn_cp_size}); the attention-TP "
+                "group degenerates under prefill CP while the target lm_head "
+                "still shards over the full TP group."
+            )
 
     if server_args.pp_size != 1:
         raise ValueError(

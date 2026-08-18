@@ -310,6 +310,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture mode + tokens-per-bs ------------------------------
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = self.return_hidden_states_mode
+        self.capture_spec_custom_mask: Optional[torch.Tensor] = None
         # Static capture width.
         self.captured_req_width = model_runner.decode_num_tokens_per_req(
             num_draft_tokens=self.speculative_num_draft_tokens
@@ -578,12 +579,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     @staticmethod
     def _forward_is_dp_local(model_runner) -> bool:
-        """The DSpark dense draft runs attn-TP-local (draft_tp_context): each
-        DP rank drafts independently with no cross-DP collective, so its
-        hand-built batches carry no dp-global metadata and must key graphs by
-        local batch size. Everything else keeps the dp-global padding path."""
+        """A dense draft runs attn-TP-local (draft_tp_context): each DP rank
+        drafts independently with no cross-DP collective, so its hand-built
+        batches carry no dp-global metadata and must key graphs by local batch
+        size. Everything else keeps the dp-global padding path."""
         if not model_runner.is_draft_worker:
             return False
+        if model_runner.spec_algorithm.is_dflash():
+            return True
         if not model_runner.spec_algorithm.is_dspark():
             return False
         from sglang.srt.speculative.dspark_components.dspark_config import (
@@ -1345,7 +1348,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and forward_batch.forward_mode.is_idle()
             and forward_batch.spec_info is not None
         ):
-            forward_batch.spec_info.custom_mask = buffers.custom_mask
+            forward_batch.spec_info.custom_mask = self.capture_spec_custom_mask
 
         attn_backend = self._replay_attn_backend()
         fb_view = build_replay_fb_view(
@@ -1529,4 +1532,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
+        self.capture_spec_custom_mask = (
+            None if spec_info is None else spec_info.custom_mask
+        )
         return spec_info
