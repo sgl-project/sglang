@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -227,11 +227,12 @@ def register_attn_tp_sequence_sharded_predicate(
     _attn_tp_sequence_sharded_predicate = predicate
 
 
-def get_server_return_hidden_states_mode(server_args: Any) -> CaptureHiddenMode:
-    mode = getattr(server_args, "return_hidden_states_mode", None)
+def get_server_return_hidden_states_mode() -> CaptureHiddenMode:
+    features = get_exec().features
+    mode = features.return_hidden_states_mode
     if mode == "last":
         return CaptureHiddenMode.LAST
-    if mode == "full" or getattr(server_args, "enable_return_hidden_states", False):
+    if mode == "full" or features.enable_return_hidden_states:
         return CaptureHiddenMode.FULL
     return CaptureHiddenMode.NULL
 
@@ -715,7 +716,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if model_runner.is_draft_worker
                 else max(
                     batch.return_hidden_states_mode,
-                    get_server_return_hidden_states_mode(model_runner.server_args),
+                    get_server_return_hidden_states_mode(),
                 )
             )
             capture_hidden_mode = get_required_capture_hidden_mode(

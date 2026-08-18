@@ -336,29 +336,6 @@ class QuarkConfig(QuantizationConfig):
         if isinstance(self.dequantization_config, Fp8Config):
             self.weight_block_size = self.dequantization_config.weight_block_size
 
-        self._maybe_disable_shared_experts_fusion()
-
-    def _maybe_disable_shared_experts_fusion(self) -> None:
-        """Turn off shared-expert fusion when the producer keeps shared experts
-        in a higher precision than the routed experts.
-        """
-        if self.can_fuse_shared_expert():
-            return
-
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
-
-        declare_load_time_override(
-            "QuarkConfig._maybe_disable_shared_experts_fusion",
-            {"disable_shared_experts_fusion": True},
-        )
-        logger.info(
-            "Quark: shared experts are excluded from quantization (kept in "
-            "a higher precision) while routed experts are quantized; "
-            "disabling shared experts fusion to avoid loading "
-            "higher-precision shared experts through the quantized "
-            "routed-expert path."
-        )
-
     @property
     def quantized_layers(self) -> tuple[list[str], int]:
         # Consumed by `report_online_quantization` in model_runner. Returns the

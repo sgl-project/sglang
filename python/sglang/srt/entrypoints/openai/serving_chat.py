@@ -2006,7 +2006,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
                 hidden_states=hidden_states,
                 prompt_token_ids=choice_prompt_token_ids,
-                token_ids=choice_token_ids,
+                response_token_ids=choice_token_ids,
                 meta_info=choice_meta_info,
             )
             choices.append(choice_data)

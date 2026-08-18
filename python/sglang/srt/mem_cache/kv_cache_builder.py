@@ -245,11 +245,11 @@ def build_kv_cache(
 
     bypass_dsa_cp_prefix_cache = should_bypass_dsa_cp_prefix_cache(server_args)
     disable_radix_cache = (
-        server_args.disable_radix_cache
+        get_memory().disable_radix_cache
         or (model_config.is_multimodal and uses_transformers_backend)
         or bypass_dsa_cp_prefix_cache
     )
-    if disable_radix_cache and not server_args.disable_radix_cache:
+    if disable_radix_cache and not get_memory().disable_radix_cache:
         if bypass_dsa_cp_prefix_cache:
             logger.warning(
                 "Radix cache is disabled on this PD Prefill worker because DSA "
@@ -266,8 +266,8 @@ def build_kv_cache(
     # these use specialized memory pools incompatible with the
     # prefix-match-and-lock allocation path.
     if (
-        server_args.disaggregation_decode_enable_radix_cache
-        and server_args.disaggregation_mode == "decode"
+        get_disagg().disaggregation_decode_enable_radix_cache
+        and get_disagg().disaggregation_mode == "decode"
     ):
         if is_hybrid_swa:
             raise ValueError(
@@ -298,15 +298,15 @@ def build_kv_cache(
         ),
         is_eagle=spec_algorithm.is_eagle(),
         tp_cache_group=(
-            attn_tp_cpu_group if server_args.enable_dp_attention else tp_cpu_group
+            attn_tp_cpu_group if get_parallel().enable_dp_attention else tp_cpu_group
         ),
         attn_cp_cache_group=attn_cp_cpu_group,
         attn_tp_cache_group=attn_tp_cpu_group,
         pp_cache_group=pp_group.cpu_group,
-        eviction_policy=server_args.radix_eviction_policy,
+        eviction_policy=get_memory().radix_eviction_policy,
         enable_metrics=enable_metrics,
         enable_kv_cache_events=enable_kv_cache_events,
-        enable_session_radix_cache=server_args.enable_session_radix_cache,
+        enable_session_radix_cache=get_memory().enable_session_radix_cache,
         enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
         enable_mamba_extra_buffer_lazy=server_args.enable_mamba_extra_buffer_lazy(),
         pp_rank=ps.pp_rank,

@@ -2205,6 +2205,7 @@ class TestGrpcServerArgs(CustomTestCase):
                 tokenizer_manager=MagicMock(),
                 template_manager=MagicMock(),
                 scheduler_info={},
+                grpc_port=server_args.grpc_port,
             )
 
         self.assertEqual(handle, "handle")

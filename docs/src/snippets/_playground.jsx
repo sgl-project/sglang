@@ -909,10 +909,6 @@ export const Playground = ({ config }) => {
           "--disaggregation-mode", "--disaggregation-transfer-backend",
           "--disaggregation-ib-device", "--disaggregation-bootstrap-port",
         ]);
-        const specAlgorithm = (h.findFlagArg(flags, "--speculative-algorithm") || "").toUpperCase();
-        if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
-          return { flags, env };
-        }
         const backends = fc.transferBackends || [];
         // A config that omits `modes` has the role on the Deploy panel instead;
         // this card then only tunes the transport for whatever role is selected.
@@ -921,6 +917,16 @@ export const Playground = ({ config }) => {
           : ((sel && sel.pdMode) || "off");
 
         if (mode === "prefill" || mode === "decode") {
+          // PD and some speculative algorithms cannot run together. Keep the
+          // PD card reachable for a speculative base recipe, then make the
+          // user's explicit PD-role selection win by removing the whole
+          // speculative flag family before composing the role command.
+          const specAlgorithm = (h.findFlagArg(
+            flags, "--speculative-algorithm") || "").toUpperCase();
+          if ((fc.incompatibleSpeculativeAlgorithms || []).includes(specAlgorithm)) {
+            flags = flags.filter((flag) =>
+              !flag.split(/[\s=]/)[0].startsWith("--speculative-"));
+          }
           const backend = value.transferBackend || (backends[0] || {}).id || "mooncake";
           const adds = [
             `--disaggregation-mode ${mode}`,

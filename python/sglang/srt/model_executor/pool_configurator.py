@@ -43,7 +43,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
-    max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils.common import (
     ceil_align,
@@ -665,10 +664,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         else:
             # spec-v2: the overlap allocator keeps 2 * alloc_len outstanding
             # (eagle_utils.eagle_prepare_for_decode: kv_committed_len + 2 * alloc_len).
-            decode_alloc = 2 * get_alloc_len_per_decode(
-                kvc.server_args,
-                max_draft_tokens=max_speculative_num_draft_tokens(),
-            )
+            decode_alloc = 2 * get_alloc_len_per_decode()
         per_request = trailing_tokens + decode_alloc
 
         num_reqs = get_schedule().max_running_requests // kvc.ps.attn_dp_size
