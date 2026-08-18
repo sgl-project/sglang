@@ -26,10 +26,7 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.quantization.base_config import (
-    QuantizationConfig,
-    SupportsWeightBlockSize,
-)
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     block_quant_to_tensor_quant,
@@ -84,10 +81,7 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
 def _get_indexer_weight_block_size(
     quant_config: Optional[QuantizationConfig],
 ) -> List[int]:
-    if (
-        isinstance(quant_config, SupportsWeightBlockSize)
-        and quant_config.weight_block_size is not None
-    ):
+    if quant_config is not None and quant_config.weight_block_size is not None:
         return quant_config.weight_block_size
     return [128, 128]
 
@@ -145,7 +139,7 @@ def _load_fused_indexer_wk(
     )
     if "weight" in entry and "scale" in entry:
         pending.pop(fused_name)
-        block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
+        block_size = _get_indexer_weight_block_size(quant_config)
         wk_bf16 = block_quant_dequant(
             entry["weight"], entry["scale"], block_size, torch.bfloat16
         )
@@ -576,8 +570,10 @@ class DeepseekV2WeightLoaderMixin:
                 )
                 if selected_quant_config is None:
                     selected_quant_config = self.quant_config
-                weight_block_size = getattr(
-                    selected_quant_config, "weight_block_size", None
+                weight_block_size = (
+                    selected_quant_config.weight_block_size
+                    if selected_quant_config is not None
+                    else None
                 )
                 if weight_block_size is not None:
                     assert hasattr(self_attn.kv_b_proj, "weight_scale_inv") or hasattr(
@@ -600,8 +596,10 @@ class DeepseekV2WeightLoaderMixin:
                     # In multiple weight loading scenarios (e.g. RL), we need to inverse the scale of the weights after the requantization happened at the first loading.
                     if (
                         should_deepgemm_weight_requant_ue8m0(
-                            weight_block_size=getattr(
-                                self.quant_config, "weight_block_size", None
+                            weight_block_size=(
+                                self.quant_config.weight_block_size
+                                if self.quant_config is not None
+                                else None
                             )
                         )
                         and weight_scale.format_ue8m0
@@ -653,16 +651,19 @@ class DeepseekV2WeightLoaderMixin:
                     self_attn.w_scale = scale
 
             if w.dtype == torch.int8:
-                if hasattr(self.quant_config, "weight_block_size"):
+                weight_block_size = (
+                    self.quant_config.weight_block_size
+                    if self.quant_config is not None
+                    else None
+                )
+                if weight_block_size is not None:
                     # block-wise int8 need it
-                    weight_block_size = self.quant_config.weight_block_size
-                    if weight_block_size is not None:
-                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
-                        weight = w
-                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
-                        w = int8_block_dequant(
-                            weight, weight_scale, weight_block_size
-                        ).to(torch.bfloat16)
+                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                    weight = w
+                    weight_scale = self_attn.kv_b_proj.weight_scale_inv
+                    w = int8_block_dequant(weight, weight_scale, weight_block_size).to(
+                        torch.bfloat16
+                    )
                 else:
                     # channel-wise int8 need it
                     w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(

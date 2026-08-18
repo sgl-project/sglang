@@ -5,16 +5,7 @@ from __future__ import annotations
 
 import inspect
 from abc import ABC, abstractmethod
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Dict,
-    List,
-    Optional,
-    Protocol,
-    Type,
-    runtime_checkable,
-)
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 import torch
 from torch import nn
@@ -24,13 +15,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.models.utils import WeightsMapper
-
-
-@runtime_checkable
-class SupportsWeightBlockSize(Protocol):
-    """Quantization configs that expose a two-dimensional weight block size."""
-
-    weight_block_size: Optional[List[int]]
 
 
 class QuantizeMethodBase(ABC):
@@ -141,6 +125,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
 
 class QuantizationConfig(ABC):
     """Base class for quantization configs."""
+
+    weight_block_size: Optional[List[int]] = None
 
     def __init__(self):
         super().__init__()

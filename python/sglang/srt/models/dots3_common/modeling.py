@@ -84,10 +84,7 @@ from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
-from sglang.srt.layers.quantization.base_config import (
-    QuantizationConfig,
-    SupportsWeightBlockSize,
-)
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     requant_weight_ue8m0_inplace,
@@ -162,10 +159,7 @@ class _SupportsWeightLoader(Protocol):
 def _get_scale_block_n(
     quant_config: Optional[QuantizationConfig],
 ) -> int:
-    if (
-        isinstance(quant_config, SupportsWeightBlockSize)
-        and quant_config.weight_block_size is not None
-    ):
+    if quant_config is not None and quant_config.weight_block_size is not None:
         return quant_config.weight_block_size[0]
     return 1
 
@@ -2045,7 +2039,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
 
             if w.dtype == torch.float8_e4m3fn:
                 assert (
-                    isinstance(self.quant_config, SupportsWeightBlockSize)
+                    self.quant_config is not None
                     and self.quant_config.weight_block_size is not None
                 ), "Dots3 MLA kv_b_proj only supports FP8 block quantization with weight_block_size=(128, 128)."
                 weight_block_size = tuple(self.quant_config.weight_block_size)
@@ -2100,7 +2094,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            and isinstance(self.quant_config, SupportsWeightBlockSize)
+            and self.quant_config is not None
             and self.quant_config.weight_block_size is not None
         ):
             self._weight_requant_ue8m0(is_nextn)
