@@ -313,10 +313,6 @@ class MultiToolCallStreamingOrderTestCase(CustomTestCase):
         self.assertEqual(items[0]["arguments"], '{"city": "Beijing"}')
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class CustomToolStreamingTestCase(CustomTestCase):
     """Wire-level regression for custom (freeform) tool streaming: the wrapped
     {"input": ...} JSON buffers across deltas (it cannot be unwrapped
@@ -426,3 +422,7 @@ class CustomToolStreamingTestCase(CustomTestCase):
         self.assertEqual(len(ctc_items), 1)
         self.assertEqual(ctc_items[0]["name"], "apply_patch")
         self.assertEqual(ctc_items[0]["input"], patch_text)
+
+
+if __name__ == "__main__":
+    unittest.main()
