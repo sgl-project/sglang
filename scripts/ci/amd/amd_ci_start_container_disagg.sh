@@ -121,32 +121,6 @@ if [[ -n "${DOCKERHUB_AMD_USERNAME:-}" && -n "${DOCKERHUB_AMD_TOKEN:-}" ]]; then
   fi
 fi
 
-# Point a single custom image at the arch this runner actually has. Only the tag
-# encodes the GPU arch, so leave the repository alone: a registry host can carry
-# a port, and its path may contain anything.
-rewrite_custom_image_arch() {
-  local image=$1 gpu_arch=$2
-  local repo tag new_tag
-
-  case "${image##*/}" in
-    *:*) repo="${image%:*}"; tag="${image##*:}" ;;
-    *)   repo="${image}";    tag="" ;;
-  esac
-
-  case "${gpu_arch}" in
-    mi35x) new_tag="${tag//mi30x/mi35x}" ;;
-    mi30x) new_tag="${tag//mi35x/mi30x}" ;;
-    *)     new_tag="${tag}" ;;
-  esac
-
-  if [[ "${new_tag}" == "${tag}" ]]; then
-    echo "${image}"
-    return 0
-  fi
-  echo "Retargeted custom image tag at ${gpu_arch}: ${tag} -> ${new_tag}" >&2
-  echo "${repo}:${new_tag}"
-}
-
 # Find the latest image
 find_latest_image() {
   local gpu_arch=$1
@@ -242,10 +216,7 @@ find_latest_image() {
 
 # Determine which image to use
 if [[ -n "${CUSTOM_IMAGE}" ]]; then
-  # Use explicitly provided custom image. amd_ci_image carries a single value for
-  # the whole run, so rewrite the arch marker in its tag to match this runner;
-  # otherwise mi35x jobs silently run an mi30x image and report green.
-  IMAGE="$(rewrite_custom_image_arch "${CUSTOM_IMAGE}" "${GPU_ARCH}")"
+  IMAGE="${CUSTOM_IMAGE}"
   echo "Using custom image: ${IMAGE}"
   if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
     docker pull "${IMAGE}"
