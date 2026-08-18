@@ -104,8 +104,6 @@ class MoeLoraWorkspace:
         # overlap window forks from the same consumer stream.  Key them by
         # consumer stream once dense LoRA can be invoked from a model alt stream.
         resolved_device = torch.device(device)
-        if resolved_device.type != "cuda":
-            raise ValueError("a CUDA side stream requires a CUDA device")
         stream = self._streams.get(resolved_device)
         if stream is None:
             if self._capturing(resolved_device):

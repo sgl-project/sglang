@@ -107,7 +107,6 @@ from sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle import (
     _validate_b_inputs,
 )
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
-from sglang.srt.lora.moe.routing import ROUTE_ALIGNED
 
 if TYPE_CHECKING:
     from sglang.srt.lora.moe.routing import RouteView
@@ -739,11 +738,6 @@ def fused_b_act_contiguous(
     """
     if family not in MASKED_MIDDLE_FAMILIES:
         raise ValueError(f"family={family!r} is not one of {MASKED_MIDDLE_FAMILIES}")
-    if routing.view != ROUTE_ALIGNED:
-        raise ValueError(
-            f"contiguous fused middle needs route view {ROUTE_ALIGNED!r}, got "
-            f"{routing.view!r}"
-        )
     ActivationFn.parse(activation)
     pairs = routing.topk_ids.numel()
     if src2dst.dtype != torch.int32 or src2dst.numel() != pairs:
@@ -1285,8 +1279,6 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         token_rank: torch.Tensor,
         config: Mapping[str, Mapping[str, int]],
     ) -> None:
-        if set(config) != {"reduce", "tail"}:
-            raise ValueError("shared-rank config must contain exactly reduce and tail")
         self.run_shared_rank_reduce(
             ws,
             implementation=implementation,
@@ -1322,12 +1314,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         token_rank: torch.Tensor,
         config: Mapping[str, int],
     ) -> None:
-        try:
-            invoke = self._shared_reduce_impls[implementation]
-        except KeyError as exc:
-            raise NotImplementedError(
-                f"{self.contract.key} has no {implementation!r} shared-rank reduction"
-            ) from exc
+        invoke = self._shared_reduce_impls[implementation]
         # `ws` is deliberately opaque and unused by this pair-domain launch;
         # retaining it in the provider ABI lets every scheduled stage be
         # invoked uniformly.
@@ -1359,12 +1346,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         # domain it is the compact 2-D [m_pad_ceiling, hidden] down output,
         # and the verbatim tail kernel addresses its rows only through
         # src2dst (compact rows seg_offsets[e] + slot).
-        try:
-            invoke = self._shared_tail_impls[implementation]
-        except KeyError as exc:
-            raise NotImplementedError(
-                f"{self.contract.key} has no {implementation!r} shared B tail"
-            ) from exc
+        invoke = self._shared_tail_impls[implementation]
         invoke(
             down_masked=down_masked,
             src2dst=ws.src2dst,

@@ -408,7 +408,6 @@ class MoeLoraRunner:
         if plan.finalize.family is not FinalizeFamily.MATERIALIZED:
             family, implementation = self._finalize_implementation(plan)
             consumed_down_b = plan.finalize.consumed_down_b
-            assert consumed_down_b is not None
             ownership_name = (
                 "shared" if consumed_down_b.is_shared_outer else "per_expert"
             )
@@ -564,21 +563,14 @@ class MoeLoraRunner:
     ) -> torch.Tensor:
         route = self._route_for_a(spec, routes)
         if input_row_map is not None:
-            if not (spec.site is Site.DOWN and spec.family is LoraAFamily.GROUPED):
+            # Only the count: grouped_lora_a masks pair loads by
+            # `pair_ids < num_pairs`, so an undersized map reads out of bounds
+            # and the row mask silently substitutes zeros. Shape, dtype, device
+            # and contiguity come from the producers' own workspace allocation.
+            if input_row_map.numel() != route.topk_ids.numel():
                 raise ValueError(
-                    "mapped provider rows are supported only by standalone "
-                    "grouped down-A"
-                )
-            if (
-                input_row_map.ndim != 1
-                or input_row_map.dtype != torch.int32
-                or input_row_map.device != input.device
-                or not input_row_map.is_contiguous()
-                or input_row_map.numel() != route.topk_ids.numel()
-            ):
-                raise ValueError(
-                    "mapped down-A pair_to_row must be one contiguous int32 "
-                    "entry per canonical routed pair on the input device"
+                    "mapped down-A pair_to_row must have one entry per "
+                    "canonical routed pair"
                 )
         num_tokens = (
             input.shape[0]
@@ -674,8 +666,6 @@ class MoeLoraRunner:
         batch: MoeLoraBatch,
         num_tokens: int,
     ) -> torch.Tensor:
-        if plan.gate_up_b is None:
-            raise ValueError("the selected middle owns gate/up B")
         delta = self.workspace.tensor(
             "gate_up_b:delta",
             (
@@ -740,8 +730,6 @@ class MoeLoraRunner:
             )
 
         def gate_up_b() -> None:
-            if state.rank is None:
-                raise RuntimeError("gate/up B ran before gate/up A")
             state.delta = self._run_gate_up_b(
                 plan,
                 launch_config,
@@ -827,9 +815,6 @@ class MoeLoraRunner:
             else None
         )
         if plan.middle.family is MiddleFamily.MATERIALIZED:
-            assert act_pairs is not None
-            if gate_up.delta is None:
-                raise RuntimeError("materialized middle requires gate/up delta")
             provider.act_with_delta(
                 ws,
                 gateup_out,
@@ -846,7 +831,6 @@ class MoeLoraRunner:
             return act_out, _DownAInput(act_pairs)
 
         consumed_route = plan.middle.consumed_gate_up_b
-        assert consumed_route is not None
         route = routes.aligned(consumed_route.is_shared_outer)
         family, implementation = self._middle_implementation(plan)
         provider.run_fused_middle(
@@ -904,8 +888,6 @@ class MoeLoraRunner:
         rank: torch.Tensor,
         batch: MoeLoraBatch,
     ) -> torch.Tensor:
-        if plan.down_b is None:
-            raise ValueError("the selected finalizer owns down B")
         delta = self.workspace.tensor(
             "down_b:delta",
             (rank.shape[0], self.hidden_size),
@@ -942,8 +924,6 @@ class MoeLoraRunner:
         the ``down_b:delta`` workspace buffer is never allocated.
         """
         spec = plan.down_b
-        if spec is None:
-            raise ValueError("down-B scatter requires the standalone down-B stage")
         provider.run_down_b_scatter(
             ws,
             down_out=down_out,
@@ -994,8 +974,6 @@ class MoeLoraRunner:
             )
 
         def down_b() -> None:
-            if state.rank is None:
-                raise RuntimeError("down B ran before down A")
             state.delta = self._run_down_b(
                 plan,
                 launch_config,
@@ -1067,8 +1045,6 @@ class MoeLoraRunner:
                 side=down_a_b,
             )
 
-        if state.rank is None:
-            raise RuntimeError("execution plan did not produce down-A output")
         return down_out, state.rank, state.delta
 
     def _allocate_output(
@@ -1110,10 +1086,6 @@ class MoeLoraRunner:
     ) -> torch.Tensor:
         if plan.finalize.family is FinalizeFamily.MATERIALIZED:
             if plan.down_b_scatter:
-                if down_delta is not None:
-                    raise RuntimeError(
-                        "the down-B scatter path materializes no LoRA delta"
-                    )
                 # No-pair-delta mode: the unweighted delta was already
                 # scatter-added into the base down rows.  NUMERICS: the delta
                 # is rounded to BF16 JOINTLY with the base row before this
@@ -1132,10 +1104,6 @@ class MoeLoraRunner:
                     lora_delta=None,
                 )
                 return output
-            if down_delta is None:
-                raise RuntimeError(
-                    "materialized finalize requires a pair-major down delta"
-                )
             provider.finalize(
                 ws,
                 down_out,
@@ -1148,7 +1116,6 @@ class MoeLoraRunner:
             return output
 
         consumed = plan.finalize.consumed_down_b
-        assert consumed is not None
         route = routes.raw(consumed.is_shared_outer)
         b_down = batch.down_lora_b.flatten(0, 1)
         _, implementation = self._finalize_implementation(plan)

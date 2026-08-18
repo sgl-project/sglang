@@ -79,7 +79,9 @@ def fused_masked_preprocess(
     of ``moe_ep_deepgemm_preprocess`` so ``prepare()`` binds it unchanged."""
     if block_shape is not None:
         raise ValueError("fused masked preprocess takes no quantization block shape")
-    if output_dtype != torch.bfloat16 or hidden_states.dtype != torch.bfloat16:
+    # output_dtype is a literal at every call site; the ACTIVATION dtype is
+    # the one that matters -- the fill kernel would silently downcast it.
+    if hidden_states.dtype != torch.bfloat16:
         raise ValueError("fused masked preprocess is BF16-only")
     if hidden_states.ndim != 2 or not hidden_states.is_contiguous():
         raise ValueError("hidden_states must be contiguous [num_tokens, hidden]")

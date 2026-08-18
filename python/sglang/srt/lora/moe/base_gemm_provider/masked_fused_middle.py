@@ -37,7 +37,7 @@ from sglang.srt.lora.moe.activation import ActivationFn
 from sglang.srt.lora.moe.base_gemm_provider.masked_activation import (
     apply_activation,
 )
-from sglang.srt.lora.moe.routing import ROUTE_ALIGNED, RouteView
+from sglang.srt.lora.moe.routing import RouteView
 
 MASKED_MIDDLE_FAMILIES = ("b_activation",)
 MASKED_MIDDLE_TRITON = "triton"
@@ -91,11 +91,6 @@ def _validate_common(
     num_local_experts: int,
 ) -> tuple[int, int, int]:
     """Validate the semantic ABI and return ``(slices, pairs, width)``."""
-    if routing.view != ROUTE_ALIGNED:
-        raise ValueError(
-            f"masked fused middle needs route view {ROUTE_ALIGNED!r}, got "
-            f"{routing.view!r}"
-        )
     ActivationFn.parse(activation)
     pairs = routing.topk_ids.numel()
     if src2dst.dtype != torch.int32 or src2dst.numel() != pairs:
@@ -423,8 +418,6 @@ def run_masked_fused_middle(
     consume_base_pdl: bool = False,
 ) -> None:
     """Run the production masked-middle family with fail-closed arguments."""
-    if family not in MASKED_MIDDLE_FAMILIES:
-        raise ValueError(f"family={family!r} is not one of {MASKED_MIDDLE_FAMILIES}")
     slices, pairs, width = _validate_common(
         activation=activation,
         base_gateup=base_gateup,

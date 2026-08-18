@@ -312,10 +312,9 @@ class MoeLoraExecutionPlan:
     def _gate_up_b_contract(self) -> StageContract:
         if self.gate_up_b is not None:
             return self.gate_up_b.contract
-        consumed = self.middle.consumed_gate_up_b
-        if consumed is None:
-            raise ValueError("the execution plan has no gate/up-B owner")
-        return consumed
+        # The exactly-one-owner parity check runs first, so falling past
+        # the branch above means the middle consumed it.
+        return self.middle.consumed_gate_up_b
 
     def _down_a_contract(self) -> StageContract:
         return self.down_a.contract
@@ -323,10 +322,7 @@ class MoeLoraExecutionPlan:
     def _down_b_contract(self) -> StageContract:
         if self.down_b is not None:
             return self.down_b.contract
-        consumed = self.finalize.consumed_down_b
-        if consumed is None:
-            raise ValueError("the execution plan has no down-B owner")
-        return consumed
+        return self.finalize.consumed_down_b
 
     def validate(self) -> MoeLoraExecutionPlan:
         if self.gate_up_a.site is not Site.GATE_UP:

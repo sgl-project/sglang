@@ -410,13 +410,7 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
         import cuda.bindings.driver as cuda_driver
         from cutlass.cute.runtime import from_dlpack
 
-        try:
-            call = self._compiled[ws.token_width][stage]
-        except KeyError as exc:
-            raise RuntimeError(
-                f"CuTeDSL {stage} token width {ws.token_width} was not "
-                "compiled at plan attach"
-            ) from exc
+        call = self._compiled[ws.token_width][stage]
 
         def dyn(tensor: torch.Tensor, leading_dim: int):
             return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(
@@ -846,13 +840,7 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
         schedule: torch.Tensor,
         tiles: torch.Tensor,
     ) -> None:
-        try:
-            call = self._compiled[ws.token_width][stage]
-        except KeyError as exc:
-            raise RuntimeError(
-                f"CuTeDSL contiguous {stage} token width {ws.token_width} "
-                "was not compiled at plan attach"
-            ) from exc
+        call = self._compiled[ws.token_width][stage]
         self._invoke(call, a, c, ws.seg_offsets, schedule, tiles)
 
     def gateup(

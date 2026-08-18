@@ -273,8 +273,6 @@ def run_lora_a(
     family = _spec_value(spec, "family")
     site = _spec_value(spec, "site")
     pair_input = site == "down"
-    if site not in ("gate_up", "down"):
-        raise ValueError(f"unknown LoRA-A site {site!r}")
     if input_row_map is not None and not (family == "grouped" and site == "down"):
         raise ValueError(
             "a provider input_row_map is supported only by standalone grouped down-A"
@@ -282,8 +280,6 @@ def run_lora_a(
 
     if family in ("grouped", "token_dedup_grouped"):
         if family == "token_dedup_grouped":
-            if pair_input:
-                raise ValueError("token-deduplicated A exists only at gate_up")
             token_dedup_grouped_lora_a(
                 input,
                 weight,

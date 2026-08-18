@@ -450,8 +450,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         token_rank: torch.Tensor,
         config: Mapping[str, Mapping[str, int]],
     ) -> None:
-        if set(config) != {"reduce", "tail"}:
-            raise ValueError("shared-rank config must contain exactly reduce and tail")
         self.run_shared_rank_reduce(
             ws,
             implementation=implementation,

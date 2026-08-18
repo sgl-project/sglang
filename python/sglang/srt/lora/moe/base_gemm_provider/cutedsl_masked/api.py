@@ -353,11 +353,6 @@ def prepare_contiguous(
     """
     if not config.contiguous_segments:
         raise ValueError("prepare_contiguous requires config.contiguous_segments")
-    if not config.swap_ab or not config.direct_schedule:
-        raise ValueError(
-            "the contiguous row domain is only representable with swap_ab "
-            "and a host-built direct schedule"
-        )
     validate_contiguous_tile_geometry(config.mma_tiler_mn[1], m_alignment)
     experts, m_ceil, n, k = _validate_contiguous(
         a, b, c, seg_offsets, m_alignment=m_alignment

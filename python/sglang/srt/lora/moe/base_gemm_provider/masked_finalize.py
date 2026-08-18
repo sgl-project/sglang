@@ -103,8 +103,6 @@ def _validate_output_boundary(
         )
     if output.dtype not in _OUTPUT_DTYPES:
         raise TypeError(f"output dtype must be one of {_OUTPUT_DTYPES}")
-    if down_masked.dtype != torch.bfloat16:
-        raise TypeError("the shared-rank BF16 finalizer requires BF16 base down rows")
     tensors = (
         down_masked,
         src2dst,

@@ -360,11 +360,7 @@ def _build_virtual_topk_ids(
     lora_expert_map: torch.Tensor | None,
     shared_outer_local_expert_count: int | None = None,
 ) -> torch.Tensor:
-    validate_shared_outer(
-        shared_outer_local_expert_count=shared_outer_local_expert_count,
-        lora_expert_map=lora_expert_map,
-        lora_experts_per_adapter=lora_experts_per_adapter,
-    )
+    # The sole caller validated these same three objects before branching.
     virtual_topk_ids = torch.empty_like(topk_ids)
     if topk_ids.numel() == 0:
         return virtual_topk_ids
@@ -443,18 +439,12 @@ def _align_virtual_topk_ids(
         return _align_block_size_torch(
             virtual_topk_ids, block_size, num_virtual_experts
         )
-    if num_virtual_experts <= _JIT_ALIGN_MAX_VIRTUAL_EXPERTS:
-        return _align_block_size_jit(virtual_topk_ids, block_size, num_virtual_experts)
-    # Past the JIT kernel's capability ceiling. Our own fused kernel is the only
-    # CUDA-speed option here -- measured ~60 us against the torch path's
-    # ~4700 us at V = 32768 -- so route to it rather than to torch. It needs the
-    # SOURCE tensors, which this signature does not carry, so the caller with
-    # them does the dispatch; see `build_virtual_expert_routing`.
-    raise NotImplementedError(
-        f"align over {num_virtual_experts} virtual experts exceeds the JIT "
-        f"kernel's {_JIT_ALIGN_MAX_VIRTUAL_EXPERTS}; callers holding the source "
-        "tensors must use lora.moe.fused_align.fused_align_block_size"
-    )
+    # Reaching here means the aligned view did NOT dispatch to the fused
+    # builder, i.e. V < FUSED_ALIGN_MIN_VIRTUAL_EXPERTS, which is identically
+    # V <= _JIT_ALIGN_MAX_VIRTUAL_EXPERTS since the two are adjacent. Past that
+    # ceiling the caller holding the SOURCE tensors routes to
+    # fused_align.fused_align_block_size instead; this signature cannot.
+    return _align_block_size_jit(virtual_topk_ids, block_size, num_virtual_experts)
 
 
 def build_virtual_expert_routing(
