@@ -217,6 +217,29 @@ jobs:
         run: |
           # Fail fast on any command error, undefined variable, or pipe failure.
           set -euo pipefail
+
+          # Install missing python deps (skip if already importable).
+          PYTHON_FOR_SGLANG="python"
+          PIP_INDEXES=("https://pypi.org/simple/" "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple" "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple")
+          PIP_TRUSTED_HOST=cache-service.nginx-pypi-cache.svc.cluster.local
+          install_pkg() {
+            local pkg="$1"
+            ok=0
+            for index in "${PIP_INDEXES[@]}"; do
+              echo "${pkg}: try via ${index}"
+              if ${PYTHON_FOR_SGLANG} -m pip install "${pkg}" --retries 3 --timeout 60 \
+                  -i "${index}" --trusted-host "${PIP_TRUSTED_HOST}"; then
+                ok=1; break
+              fi
+            done
+            [ "${ok}" = "1" ] || { echo "ERROR: failed to install ${pkg}"; exit 1; }
+          }
+          REQUIRED_PIP_PKGS=(tabulate)
+          for pkg in "${REQUIRED_PIP_PKGS[@]}"; do
+            ${PYTHON_FOR_SGLANG} -c "import ${pkg}" 2>/dev/null && { echo "${pkg}: available, skip"; continue; }
+            install_pkg "${pkg}"
+          done
+
           cd test
           # Append `--nightly` and `--continue-on-error` when the job belongs to the nightly pipeline.
           # --nightly: Collect test cases registered for nightly runs.
