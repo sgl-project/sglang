@@ -9,6 +9,7 @@ import torch
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -214,14 +215,18 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         manager._send_kvcache_generic = MagicMock(return_value=0)
         executor = MagicMock()
 
-        manager.send_kvcache(
-            "session",
-            np.array([1], dtype=np.int32),
-            [10000, 20000, 30000],
-            np.array([7], dtype=np.int32),
-            executor,
-            dst_device_kv_indices=np.array([21], dtype=np.int32),
-        )
+        # send_kvcache reads the memory bag (the unified-memory envelope-layout
+        # check), so the context has to be published. This is the non-unified
+        # path -- pin that explicitly rather than leaning on the default.
+        with get_context().override_server_args(enable_unified_memory=False):
+            manager.send_kvcache(
+                "session",
+                np.array([1], dtype=np.int32),
+                [10000, 20000, 30000],
+                np.array([7], dtype=np.int32),
+                executor,
+                dst_device_kv_indices=np.array([21], dtype=np.int32),
+            )
 
         kwargs = manager._send_kvcache_generic.call_args.kwargs
         self.assertEqual(kwargs["dst_device_data_ptrs"], {20000, 30000})

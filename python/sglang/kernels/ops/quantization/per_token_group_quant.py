@@ -4,19 +4,19 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-_SUPPORTED_INPUT_DTYPES = (torch.bfloat16, torch.float16)
+_SUPPORTED_INPUT_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 _SUPPORTED_OUTPUT_DTYPES = (torch.float8_e4m3fn, torch.int8)
 _SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256)
 

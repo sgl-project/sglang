@@ -212,6 +212,23 @@ class StageProfiler:
     def _should_record_as_step(self) -> bool:
         return self.record_as_step or self.stage_name.startswith("denoising_step_")
 
+    def _maybe_sync_device(self):
+        """Drain the device queue when SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1.
+
+        Called at BOTH the timing start and end, for stage records as well as
+        step records. Historically only step records synced, so a stage that
+        merely launches kernels (e.g. DenoisingStage's tail) leaked its queued
+        GPU work into whichever later stage blocked first — DecodingStage
+        readings came out 2-3x too high. The entry sync attributes queued work
+        to the stage that launched it; the exit sync includes this stage's own
+        queued work. Opt-in diagnostics only: the flag defaults off.
+        """
+        if (
+            os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+            and torch.get_device_module().is_available()
+        ):
+            torch.get_device_module().synchronize()
+
     def __enter__(self):
         if self.log_stage_start_end:
             msg = f"[{self.stage_name}] started..."
@@ -226,12 +243,7 @@ class StageProfiler:
             self.logger.info(msg)
 
         if (self.log_timing and self.metrics) or self.log_stage_start_end:
-            if (
-                os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-                and self._should_record_as_step()
-                and torch.get_device_module().is_available()
-            ):
-                torch.get_device_module().synchronize()
+            self._maybe_sync_device()
             self.start_time = time.perf_counter()
 
         return self
@@ -240,12 +252,7 @@ class StageProfiler:
         if not ((self.log_timing and self.metrics) or self.log_stage_start_end):
             return False
 
-        if (
-            os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-            and self._should_record_as_step()
-            and torch.get_device_module().is_available()
-        ):
-            torch.get_device_module().synchronize()
+        self._maybe_sync_device()
         execution_time_s = time.perf_counter() - self.start_time
 
         if exc_type:
