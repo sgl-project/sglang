@@ -95,6 +95,23 @@ def test_flashinfer_router_gemm_kill_switch(monkeypatch):
         )
 
 
+def test_flashinfer_router_gemm_requires_cake_source_backend(monkeypatch):
+    router_gemm._get_flashinfer_router_gemm_ops.cache_clear()
+    monkeypatch.setattr(router_gemm, "get_device_sm", lambda: 103)
+    monkeypatch.setattr(router_gemm, "is_flashinfer_available", lambda: True)
+
+    def missing_cake_source_backend(_name):
+        raise ModuleNotFoundError("flashinfer.jit.cake_router_gemm")
+
+    monkeypatch.setattr(
+        router_gemm.importlib, "import_module", missing_cake_source_backend
+    )
+    try:
+        assert router_gemm._get_flashinfer_router_gemm_ops() == {}
+    finally:
+        router_gemm._get_flashinfer_router_gemm_ops.cache_clear()
+
+
 @pytest.mark.parametrize(
     "gate_cls,module",
     [

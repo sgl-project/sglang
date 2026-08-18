@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import importlib
 from typing import Callable, NamedTuple, Optional
 
 import torch
@@ -39,6 +40,7 @@ def _get_flashinfer_router_gemm_ops() -> dict[str, Callable]:
         return {}
 
     try:
+        importlib.import_module("flashinfer.jit.cake_router_gemm")
         from flashinfer import gemm as flashinfer_gemm
     except ImportError:
         return {}
