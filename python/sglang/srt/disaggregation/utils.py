@@ -1064,17 +1064,7 @@ def setup_state_kv_args(
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
 
-    if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
-        # Pool ships each sub-pool as its own page-indexed component (fixed order
-        # so prefill and decode register identically); skips get_state_buf_infos.
-        for (
-            st,
-            comp_ptrs,
-            comp_lens,
-            comp_item_lens,
-        ) in token_to_kv_pool.get_pd_state_components():
-            append_state_component(kv_args, st, comp_ptrs, comp_lens, comp_item_lens)
-    elif isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
+    if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
             raise NotImplementedError(
                 "PD disaggregation for MiniMax sparse layers with index value "
@@ -1175,15 +1165,25 @@ def setup_state_kv_args(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
                 )
 
+    if is_npu() and isinstance(token_to_kv_pool, DSV4NPUTokenToKVPool):
+        from sglang.srt.disaggregation.ascend.conn import AscendStateType
+
+        c128_ptrs, c128_lens, c128_item_lens = token_to_kv_pool.get_c128_kv_buf_infos()
+        if c128_ptrs:
+            append_state_component(
+                kv_args,
+                AscendStateType.DSV4_C128,
+                c128_ptrs,
+                c128_lens,
+                c128_item_lens,
+            )
+
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component
     # to avoid mixing them into the target's heterogeneous state layout, while
-    # reusing the existing SWA transport dispatch. NPU has a different paged
-    # state layout and is intentionally left unchanged.
-    if (
-        not is_npu()
-        and isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        and isinstance(draft_token_to_kv_pool, DeepSeekV4TokenToKVPool)
+    # reusing the existing SWA transport dispatch on both GPU and NPU.
+    if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool) and isinstance(
+        draft_token_to_kv_pool, DeepSeekV4TokenToKVPool
     ):
         if not draft_token_to_kv_pool.compression_ratios or not all(
             ratio == 0 for ratio in draft_token_to_kv_pool.compression_ratios
