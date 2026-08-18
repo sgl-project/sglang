@@ -98,9 +98,7 @@ def _prepare_flashinfer_mxfp8_activations(
         )
 
         prepared_packed_topk = None
-        x_quant, x_scale = flashinfer_mxfp8_quantize(
-            x, False, alignment=hidden_size
-        )
+        x_quant, x_scale = flashinfer_mxfp8_quantize(x, False, alignment=hidden_size)
         x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
     else:
         from sglang.kernels.ops.quantization.per_token_group_quant import (
@@ -108,9 +106,7 @@ def _prepare_flashinfer_mxfp8_activations(
         )
 
         prepared_packed_topk = None
-        x_quant, x_scale = per_token_group_quant(
-            x, group_size=32, scale_ue8m0=True
-        )
+        x_quant, x_scale = per_token_group_quant(x, group_size=32, scale_ue8m0=True)
         x_scale = x_scale.view(torch.float8_e4m3fn)
 
     return x, prepared_packed_topk, x_quant, x_scale

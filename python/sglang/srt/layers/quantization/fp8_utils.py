@@ -392,9 +392,7 @@ def _fake_flashinfer_mxfp8_quantize(
     backend: str = "cute-dsl",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     k_aligned = ((input.shape[1] + alignment - 1) // alignment) * alignment
-    q_input = input.new_empty(
-        (input.shape[0], k_aligned), dtype=torch.float8_e4m3fn
-    )
+    q_input = input.new_empty((input.shape[0], k_aligned), dtype=torch.float8_e4m3fn)
     sf_columns = k_aligned // 32
     if _is_sf_swizzled_layout:
         padded_rows = ((input.shape[0] + 127) // 128) * 128
