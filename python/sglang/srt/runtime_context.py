@@ -216,6 +216,14 @@ class ParallelContext:
         return self._v("moe_tp_rank", _ps().get_moe_tensor_parallel_rank)
 
     @property
+    def lmhead_tp_size(self) -> int:
+        return self._v("lmhead_tp_size", _ps().get_lm_head_tensor_parallel_world_size)
+
+    @property
+    def lmhead_tp_rank(self) -> int:
+        return self._v("lmhead_tp_rank", _ps().get_lm_head_tensor_parallel_rank)
+
+    @property
     def attn_tp_size(self) -> int:
         return self._v("attn_tp_size", _ps().get_attn_tensor_model_parallel_world_size)
 
