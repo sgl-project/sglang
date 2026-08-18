@@ -738,6 +738,29 @@ The picker exposes this option only on the B200 and B300 topologies used for
 real H3 validation runs.
 </Warning>
 
+The Qwen3-VL text encoder can be replaced independently of the DiT. To reduce
+its resident memory, point the text-encoder component at the serialized FP8
+checkpoint used in validation:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --component-paths.text_encoder Qwen/Qwen3-VL-32B-Instruct-FP8 \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --ulysses-degree 2 \
+  --performance-mode speed \
+  --port 30010
+```
+
+`--text-encoder-path` is accepted as a shorter alias. No separate quantization
+flag is required: SGLang reads the checkpoint's `quantization_config` and
+fails closed if the native encoder does not support that format. The language
+linear layers use FP8 while embeddings, normalization, and the vision tower
+remain BF16. This is an approximate serve-time choice and is incompatible with
+the strict `quality="high"` deployment contract.
+
 </Tab>
 
 </Tabs>
