@@ -3446,6 +3446,7 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
                 raise ValueError("MXFP8 KV cache requires K and V scale tensors.")
             from sglang.kernels.ops.quantization.mxfp8_quant import quant_store_kv_mxfp8
 
+            # The kernel skips writes to the reserved padding slot 0.
             quant_store_kv_mxfp8(
                 cache_k,
                 cache_v,
@@ -3458,20 +3459,32 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
             )
             return
 
-        from sglang.srt.model_executor.runner import get_is_capture_mode
-
-        if get_is_capture_mode() and self.alt_stream is not None:
-            current_stream = self.device_module.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            self.k_buffer[idx][loc] = cache_k
-            self._write_scales(idx, loc, k_scale, v_scale)
-            with self.device_module.stream(self.alt_stream):
-                self.v_buffer[idx][loc] = cache_v
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            self.k_buffer[idx][loc] = cache_k
-            self.v_buffer[idx][loc] = cache_v
-            self._write_scales(idx, loc, k_scale, v_scale)
+        # Single write path: the store_cache jit kernel scatters the fp8 K/V
+        # payload and skips the reserved CUDA-graph padding slot 0 in-kernel
+        # (reserved_skip_index default), matching the bf16 pool;
+        # store_sf_interleaved does the same for the scales. This pool is
+        # CUDA-only (e8m0 + triton + FA4) and head_dim % 32 == 0 guarantees
+        # store_cache-compatible row widths.
+        row_bytes = self.head_num * self.head_dim * self.store_dtype.itemsize
+        v_row_bytes = self.head_num * self.v_head_dim * self.store_dtype.itemsize
+        assert _is_cuda and can_use_store_cache(row_bytes, v_row_bytes), (
+            f"MXFP8 KV cache requires CUDA and store_cache-compatible rows, "
+            f"got _is_cuda={_is_cuda}, {row_bytes=}, {v_row_bytes=}"
+        )
+        assert (
+            self.mxfp8_sf_interleaved
+        ), "MXFP8 KV cache requires the page_size=128 interleaved scale layout"
+        store_cache(
+            cache_k.reshape(loc.shape[0], -1),
+            cache_v.reshape(loc.shape[0], -1),
+            self.k_buffer[idx].view(-1, row_bytes // self.store_dtype.itemsize),
+            self.v_buffer[idx].view(-1, v_row_bytes // self.store_dtype.itemsize),
+            loc,
+            row_bytes=row_bytes,
+            v_row_bytes=v_row_bytes,
+            size_limit=self.size + self.page_size,
+        )
+        self._write_scales(idx, loc, k_scale, v_scale)
 
     def _write_scales(self, idx, loc, k_scale, v_scale):
         """Write per-token UE8M0 K/V scales — interleaved into the FA4
