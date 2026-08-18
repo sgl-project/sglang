@@ -115,7 +115,7 @@ class TargetHiddenKvInjector:
                 final_pos=final_pos,
             )
         else:
-            swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)
+            swa_loc = pool.translate_draft_committed_loc(cache_loc).to(torch.int32)
             if commit_lens is not None and cache_loc_2d is not None:
                 # Verify candidates are step-scoped. Only the committed prefix
                 # is materialized into the content-scoped draft SWA sidecar.

@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
     get_compress_state_write_pad,
     get_dsv4_packed_kv_bytes_per_token,
+    use_dsv4_dspark_draft_swa_sidecar,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import (
@@ -50,7 +51,6 @@ from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
     is_float4_e2m1fn_x2,
-    is_npu,
     spec_decode_alloc_len_per_request,
 )
 
@@ -799,11 +799,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             get_disagg().disaggregation_decode_extra_slots or 0
         )
         self.use_draft_swa_scratch = (
-            kvc.spec_algorithm.is_dspark()
-            and not kvc.is_draft_worker
-            and not is_npu()
-            and getattr(
-                kvc.server_args, "speculative_dspark_draft_swa_sidecar", False
+            not kvc.is_draft_worker
+            and use_dsv4_dspark_draft_swa_sidecar(
+                kvc.server_args, kvc.spec_algorithm
             )
         )
         self.draft_swa_scratch_width = max(
@@ -1012,9 +1010,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             return 0
         num_req_slots = self._get_num_req_slots(max_running_requests)
         scratch_rows = num_req_slots * self.draft_swa_scratch_width
-        scratch_pages = (
-            ceil_div(scratch_rows, self.draft_swa_storage_page_size) + 1
-        )
+        scratch_pages = ceil_div(scratch_rows, self.draft_swa_storage_page_size)
         bytes_per_page = ceil_align(
             self.draft_swa_storage_page_size * self.swa_kv_bytes_per_token, 576
         )
