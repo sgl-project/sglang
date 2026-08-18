@@ -299,6 +299,15 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Moonmath MLA (ROCm)**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ (aiter)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅ (aiter)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+    </tr>
   </tbody>
 </table>
 
@@ -694,6 +703,18 @@ python3 -m sglang.launch_server \
   --attention-backend wave
 ```
 
+- Moonmath MLA (AMD ROCm, MI300X)
+  - Requires `moonmath-attention` from [github.com/moonmath-ai/amd-kernels](https://github.com/moonmath-ai/amd-kernels) (branch `mla-decode-a16w8-multiq`), and `--kv-cache-dtype fp8_e4m3`
+  - Serves absorbed MLA decode with A16W8 (bf16 Q / fp8 KV) at H≤16.
+  - Prefill falls back to aiter, with Q zero-padded to aiter's 16-head minimum at head counts it cannot serve (Kimi-K3 has 12 per rank at TP8).
+```bash Command
+python3 -m sglang.launch_server \
+  --tp 8 \
+  --model deepseek-ai/DeepSeek-V3 \
+  --attention-backend moonmath_mla \
+  --kv-cache-dtype fp8_e4m3 \
+  --trust-remote-code
+```
 - FlexAttention
 ```bash Command
 python3 -m sglang.launch_server \

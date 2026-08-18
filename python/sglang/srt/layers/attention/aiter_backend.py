@@ -135,6 +135,7 @@ class AiterAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
+    skip_mla_head_count_assert: bool = False
 
     def __init__(
         self,
@@ -298,7 +299,7 @@ class AiterAttnBackend(AttentionBackend):
             _valid_heads = self.num_head in (4, 8) or (
                 self.num_head % 16 == 0 and 16 <= self.num_head <= 128
             )
-            assert _valid_heads, (
+            assert _valid_heads or self.skip_mla_head_count_assert, (
                 f"Aiter MLA supports num_head of 4, 8, or multiples of 16 "
                 f"in [16, 128].\n"
                 f"Provided {self.num_head} number of heads.\n"
