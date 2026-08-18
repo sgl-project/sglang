@@ -129,6 +129,15 @@ class StepSideEffectContract:
 
 # decide_reuse(state, observation) -> True if the just-recorded real
 # prediction is similar enough to warrant opening a reuse window.
+#
+# Under tensor/sequence parallelism this callable is also where
+# distributed agreement belongs: every rank must reach the same skip/real
+# decision for a shared step, so a parallel-aware adapter should
+# all_reduce its local similarity signal *inside* decide_reuse before
+# returning -- the same pattern cache_dit_integration.py's
+# ``patched_similarity`` already uses for its own similarity check. The
+# controller itself stays parallelism-agnostic; it just trusts whatever
+# boolean decide_reuse returns.
 DecideReuseFn = Callable[[StepReuseState, Any], bool]
 
 
