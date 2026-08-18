@@ -90,14 +90,29 @@ and the shared route serves down-A, gate/up-B and down-B. Gate/up-A may take
 a SECOND route at its own block, and on the shipped rows it does. Both values
 are measured, and they are NOT the same knob:
 
-- the SHARED route's block also decides how many rows get padded onto the
-  route, and the fused middle and the base GEMM walk every one of them.
-  Raising it buys faster LoRA kernels and charges everything downstream.
-- gate/up-A's route is free of that. It writes by ORIGINAL PAIR ID, so the
-  shared B route consumes its bridge without a layout conversion and its
-  padding never reaches another stage. Its build is nearly free too: past
-  16k pairs (any real prefill chunk) the fused dual builder produces both
-  granularities in one hist/scan/expand pass.
+- the route block is the ROW TILE of the LoRA kernels that ride the route,
+  and of nothing else. The base GEMMs never read it: they lay out their flat
+  buffer at their own segment alignment (`m_alignment`, 128 on CuteDSL —
+  DeepGEMM's contiguous m-alignment) and tile it with their own token widths
+  (8/64/128) from the `base_gemm/` tables. The fused middle and the finalize
+  address rows through `src2dst`, pair-domain. No activation buffer's size
+  depends on the route block; only the route's own int32 slot list grows
+  (316 KB at 16 vs 508 KB at 64 for an 8k-token chunk).
+- a padded slot is paid INSIDE whichever LoRA kernel tiles over it: a masked
+  `tl.dot` lane still burns its full K-deep tile FLOPs. So each block trades
+  weight refetches (fewer when bigger) against masked lanes (more), privately
+  per kernel.
+- the shared route's riders (down-A, down-B, standalone gate/up-B) carry
+  weight panels of 2-32 KB, so a bigger block saves them little, while their
+  masked lanes scale with each kernel's K x N. Measured end-to-end, 16 -> 64
+  is ~0 on Qwen and negative on Inkling, whose wider rows make every masked
+  lane dearer. The floor — 16, the tensor-core minimum — wins.
+- gate/up-A's panel is 128 KB (K = hidden), so at prefill occupancy the
+  refetch savings dominate its masked lanes: 64 wins. It writes by ORIGINAL
+  PAIR ID, so the shared route consumes its bridge with no conversion, and
+  past 16k pairs (any real prefill chunk) the fused dual builder emits both
+  granularities in one hist/scan/expand pass — the second route is nearly
+  free.
 
 That asymmetry is why the shipped `prefill.serial` rows run 16 on the shared
 route and 64 for gate/up-A, and why collapsing them onto one block is a
@@ -112,9 +127,9 @@ against that shipped split:
 | 64  | +0.2% | +0.3% | +0.2% | +0.4% |
 | 256 | −21.3% | −28.0% | −28.6% | −28.6% |
 
-Uniform 64 looks free there, but it is not: on Inkling-Small, whose hidden is
-4096 against Qwen's 2048, so every padded row costs twice as much downstream,
-uniform 64 loses 1.0-4.4% on B200 and 4.8-8.5% on GB300 (bs 1-16, one round
+Uniform 64 looks free there, but it is not: on Inkling-Small, whose wider
+rows (hidden 4096 vs Qwen's 2048) make every masked lane in its LoRA kernels
+cost more, uniform 64 loses 1.0-4.4% on B200 and 4.8-8.5% on GB300 (bs 1-16, one round
 per arm, decode controls flat; bs32 flat). The shipped split is the best
 configuration measured on both models.
 
@@ -142,10 +157,13 @@ One caution for anyone re-deriving this. A kernel-level sweep that times only
 the four LoRA stages gets the route STRUCTURE wrong in both directions, while
 looking rigorous:
 
-- it never times the stages that pay for a bigger shared block -- the fused
-  middle and the base GEMM walk the padded rows -- which is how one block of
-  64 for everything scored +15-21% at the kernel level and measures ~0 on
-  Qwen and negative on Inkling end-to-end;
+- its geometry lied. An E=32 harness (128 virtual experts) put the measured
+  cells at 128-512 pairs per group; production is ~32-128 over 1024 groups,
+  where a big block's masked lanes eat most of what its fewer weight fetches
+  save. Its +15-21% for one block of 64 was real at its own occupancy and
+  converts to ~0 on Qwen / negative on Inkling at production's — and a
+  LoRA-only percentage must be scaled by LoRA's share of the layer before it
+  means anything end-to-end;
 - it cannot price the split's second route. Charged as a standalone build it
   scored one block of 16 as ~10% better than the shipped split at 1k tokens,
   when end-to-end that collapse LOSES 2.5% -- in production the fused dual

@@ -241,10 +241,11 @@ def _set_route_block(sites: dict, block: int, key: str, *, lockstep: bool) -> No
     """Move one route granularity to ``block`` without fabricating a split.
 
     The two keys are independent knobs and have to be swept that way: the
-    SHARED route's block also decides how many padded rows the fused middle
-    and the base GEMM walk, while gate/up-A's own route writes by original
-    pair id, so its padding reaches nobody. Collapsing them was worth -2.5%
-    at 4k tokens on the shipped H200 row.
+    shared block is the row tile of every LoRA kernel riding the shared
+    route, so raising it adds masked lanes to three kernels at once, while
+    gate/up-A's block pads only its own kernel (its writes land by original
+    pair id). Collapsing them measured -2.5% end-to-end at 4k tokens on the
+    shipped H200 row.
 
     ``lockstep`` moves both keys together. It is REQUIRED for rows whose plan
     cannot run a split (shared layout, non-grouped gate/up-A -- the bind
