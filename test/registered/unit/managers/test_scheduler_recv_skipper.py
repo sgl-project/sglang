@@ -1,6 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
@@ -14,11 +15,15 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E4
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def _server_args(interval, enable_dp_attention=False):
-    return SimpleNamespace(
+def _publish(case, interval, enable_dp_attention=False):
+    """Publish the config the skipper reads; the double is a published config,
+    not an injected object."""
+    override = get_context().override_server_args(
         scheduler_recv_interval=interval,
         enable_dp_attention=enable_dp_attention,
     )
+    override.install()
+    case.addCleanup(override.restore)
 
 
 def _batch(forward_mode, recv_skipper_forward_mode=None):
@@ -31,22 +36,24 @@ def _batch(forward_mode, recv_skipper_forward_mode=None):
 class TestSchedulerRecvSkipper(CustomTestCase):
     def test_disabled_at_default_interval(self):
         # interval <= 1 disables the skipper entirely.
-        self.assertIsNone(SchedulerRecvSkipper.maybe_create(_server_args(1)))
+        _publish(self, 1)
+        self.assertIsNone(SchedulerRecvSkipper.maybe_create())
 
     def test_enabled_under_dp_attention(self):
         # Regression: the constructor used to assert `not enable_dp_attention`.
-        skipper = SchedulerRecvSkipper.maybe_create(
-            _server_args(50, enable_dp_attention=True)
-        )
+        _publish(self, 50, enable_dp_attention=True)
+        skipper = SchedulerRecvSkipper.maybe_create()
         self.assertIsNotNone(skipper)
 
     def test_no_last_batch_accumulates_slowly(self):
-        skipper = SchedulerRecvSkipper.maybe_create(_server_args(50))
+        _publish(self, 50)
+        skipper = SchedulerRecvSkipper.maybe_create()
         self.assertFalse(skipper.handle(None))
 
     def test_decode_accumulates_until_threshold(self):
         # DECODE weight = 1: recv only every `interval` decode steps.
-        skipper = SchedulerRecvSkipper.maybe_create(_server_args(3))
+        _publish(self, 3)
+        skipper = SchedulerRecvSkipper.maybe_create()
         decode = _batch(ForwardMode.DECODE)
         self.assertFalse(skipper.handle(decode))  # counter 1
         self.assertFalse(skipper.handle(decode))  # counter 2
@@ -55,21 +62,20 @@ class TestSchedulerRecvSkipper(CustomTestCase):
 
     def test_prefill_triggers_recv_immediately(self):
         # Non-decode passes use the large default weight: recv right away.
-        skipper = SchedulerRecvSkipper.maybe_create(_server_args(50))
+        _publish(self, 50)
+        skipper = SchedulerRecvSkipper.maybe_create()
         self.assertTrue(skipper.handle(_batch(ForwardMode.EXTEND)))
 
     def test_dp_uses_synced_mode_not_local(self):
         # Local EXTEND (weight 1000) must be ignored in favor of the synced
         # DECODE (weight 1); a recv here would mean the local mode leaked in.
-        skipper = SchedulerRecvSkipper.maybe_create(
-            _server_args(50, enable_dp_attention=True)
-        )
+        _publish(self, 50, enable_dp_attention=True)
+        skipper = SchedulerRecvSkipper.maybe_create()
         self.assertFalse(skipper.handle(_batch(ForwardMode.EXTEND, ForwardMode.DECODE)))
 
     def test_dp_synced_extend_triggers_recv(self):
-        skipper = SchedulerRecvSkipper.maybe_create(
-            _server_args(50, enable_dp_attention=True)
-        )
+        _publish(self, 50, enable_dp_attention=True)
+        skipper = SchedulerRecvSkipper.maybe_create()
         self.assertTrue(skipper.handle(_batch(ForwardMode.IDLE, ForwardMode.EXTEND)))
 
     def test_derive_forward_mode(self):

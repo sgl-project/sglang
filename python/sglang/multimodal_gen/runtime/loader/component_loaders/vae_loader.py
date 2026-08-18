@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 
-from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -99,11 +98,6 @@ class VAELoader(ComponentLoader):
     component_names = ["vae", "audio_vae", "video_vae"]
     expected_library = "diffusers"
 
-    def should_offload(
-        self, server_args: ServerArgs, model_config: ModelConfig | None = None
-    ):
-        return server_args.vae_cpu_offload
-
     def customized_load_kwargs_for_component(
         self, server_args: ServerArgs, component_name: str
     ) -> dict[str, bool]:
@@ -155,12 +149,11 @@ class VAELoader(ComponentLoader):
             # NOTE: some post init logics are only available after updated with config
             vae_config.post_init()
 
-        should_offload = self.should_offload(server_args)
-        target_device = (
-            torch.device("cpu")
-            if cpu_offload_flag
-            else self.target_device(should_offload)
+        component_starts_on_cpu = (
+            server_args.should_start_component_on_cpu(component_name)
+            or cpu_offload_flag
         )
+        target_device = self.target_device(component_starts_on_cpu)
 
         native_only = component_name in getattr(
             server_args.pipeline_config, "native_only_components", ()

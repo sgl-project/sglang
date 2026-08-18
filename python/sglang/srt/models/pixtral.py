@@ -73,6 +73,16 @@ class VisionEncoderArgs:
 class PixtralForConditionalGeneration(nn.Module):
     merge_by_field_config = True
 
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        text_config = hf_config.text_config
+        if getattr(text_config, "model_type", "") != "deepseek_v3":
+            # The GQA text config builds the dense Mistral backbone.
+            return None
+        return MistralLarge3ForCausalLM.shared_experts_fusion_disable_reason(
+            text_config, quant_config
+        )
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
