@@ -25,9 +25,6 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
-from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
-)
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -770,7 +767,7 @@ class DeepseekV4AttnBackend(
         # trtllm + speculative + DP attention prepares metadata on the host:
         # in-graph prep degrades draft acceptance under DP's padded/idle-rank
         # batches. Otherwise prep metadata in-graph.
-        self._prep_in_cuda_graph: bool = envs.SGLANG_PREP_IN_CUDA_GRAPH.get() and not (
+        self._prep_in_cuda_graph: bool = not (
             self.trtllm_attn
             and self.mtp_enabled
             and model_runner.server_args.enable_dp_attention
@@ -1344,11 +1341,8 @@ class DeepseekV4AttnBackend(
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # Upgrade Raw->Full so the c4/c128 compress + core_attn + indexer
-        # materialization is recorded inside the cuda graph; a no-op (Full
-        # already) when PREP_IN_CUDA_GRAPH=0.
-        was_raw = isinstance(
-            self.forward_metadata, (DSV4RawDecodeMetadata, DSV4RawVerifyMetadata)
-        )
+        # materialization is recorded inside the cuda graph; this is a no-op
+        # when the trtllm+MTP+DP exception prepared Full metadata on the host.
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
             self.forward_metadata = self.make_forward_metadata_from_raw_verify(
                 raw_metadata=self.forward_metadata,
@@ -1367,8 +1361,7 @@ class DeepseekV4AttnBackend(
         # page_table, which also feeds the indexer, turning the corruption
         # into silently wrong top-k KV selection). Holding one reference per
         # captured graph prevents the pool from ever reusing these blocks.
-        # Pin regardless of was_raw: under host-side prep (PREP_IN_CUDA_GRAPH
-        # off / the trtllm+MTP+DP exception) the metadata reaching capture is
+        # Under the trtllm+MTP+DP host-side exception, the metadata reaching capture is
         # already Full, but tensors created below (swa_out_cache_loc) still
         # come from the capture pool and are reference-replaced on the pinned
         # object by copy_'s assign_fields on every replay-prep.
@@ -1838,8 +1831,8 @@ class DeepseekV4AttnBackend(
             core.c4_flashmla_metadata = _create_flashmla_metadata()
             core.c128_flashmla_metadata = _create_flashmla_metadata()
 
-        # PREP_IN_CUDA_GRAPH=True: warmup upgraded raw->full on the host;
-        # restore raw so capture re-runs the upgrade inside the graph.
+        # If warmup upgraded raw->full on the host, restore raw so capture
+        # re-runs the upgrade inside the graph.
         current_raw = getattr(self, "_current_capture_raw", None)
         if current_raw is not None:
             self.forward_metadata = current_raw
@@ -1874,22 +1867,11 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
-        # On the uniform-FP8 (trtllm) pool the fused setter dispatches to
-        # a plain e4m3 cast+scatter (swa_k is already normed + roped and the
-        # per-tensor scale is 1.0).
-        if self.trtllm_attn or envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
-                layer_id=layer_id,
-                swa_loc=swa_loc,
-                cache_k=swa_k,
-            )
-        else:
-            swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
-            self.token_to_kv_pool.set_swa_key_buffer_radix(
-                layer_id=layer_id,
-                swa_loc=swa_loc,
-                cache_nope_fp8_rope_bf16_pack=swa_k_pack,
-            )
+        self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
+            layer_id=layer_id,
+            swa_loc=swa_loc,
+            cache_k=swa_k,
+        )
 
     def forward(
         self,

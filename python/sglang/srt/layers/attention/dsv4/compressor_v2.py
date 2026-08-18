@@ -246,15 +246,7 @@ class CompressorBackendMixin:
             is_unified_kv_triton,
         )
 
-        if _is_hip and not envs.SGLANG_OPT_USE_JIT_NORM.get():
-            self._forward_unified_hip(
-                token_to_kv_pool=token_to_kv_pool,
-                kv_score_input=kv_score_input,
-                state_pool=state_pool,
-                compressor=compressor,
-                layer_id=layer_id,
-            )
-        elif token_to_kv_pool.uniform_fp8 and not compressor.is_in_indexer:
+        if token_to_kv_pool.uniform_fp8 and not compressor.is_in_indexer:
             # The fused JIT epilogue only writes the packed layout; the
             # uniform-FP8 pool goes through the unfused pipeline. The indexer
             # compressor keeps its own (blockwise-FP8) path above.
@@ -396,11 +388,7 @@ class CompressorBackendMixin:
         layer_id: int,
     ) -> None:
         """HIP-specific forward path: the shared unfused pipeline + HIP stores."""
-        from sglang.srt.layers.attention.dsv4.quant_k_cache import (
-            quant_to_nope_fp8_rope_bf16_pack_triton,
-        )
         from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
-        from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
         result = self._compress_norm_rope_unfused(
             kv_score_input=kv_score_input,
@@ -415,32 +403,18 @@ class CompressorBackendMixin:
         if compressor.rotate:
             kv_to_store = rotate_activation(kv_to_store)
 
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            # fused kernel: BF16 in -> FP8 quant + paged scatter in one launch
-            if is_indexer:
-                token_to_kv_pool.set_index_k_fused(
-                    layer_id=layer_id,
-                    loc=out_loc_to_store,
-                    cache_k=kv_to_store,
-                )
-            else:
-                token_to_kv_pool.set_extra_key_buffer_fused(
-                    layer_id=layer_id,
-                    loc=out_loc_to_store,
-                    cache_k=kv_to_store,
-                )
+        if is_indexer:
+            token_to_kv_pool.set_index_k_fused(
+                layer_id=layer_id,
+                loc=out_loc_to_store,
+                cache_k=kv_to_store,
+            )
         else:
-            if is_indexer:
-                kv_fp8, kv_scale = act_quant(kv_to_store)
-                token_to_kv_pool.set_index_k_scale_buffer(
-                    layer_id=layer_id,
-                    loc=out_loc_to_store,
-                    index_k=kv_fp8,
-                    index_k_scale=kv_scale,
-                )
-            else:
-                pack = quant_to_nope_fp8_rope_bf16_pack_triton(kv_to_store.bfloat16())
-                token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc_to_store, pack)
+            token_to_kv_pool.set_extra_key_buffer_fused(
+                layer_id=layer_id,
+                loc=out_loc_to_store,
+                cache_k=kv_to_store,
+            )
 
     def _forward_compress_uniform_fp8(
         self,

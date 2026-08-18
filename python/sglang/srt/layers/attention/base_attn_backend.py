@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Iterable, Optional
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
