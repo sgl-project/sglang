@@ -51,6 +51,7 @@ CONFIGS = {
     128: dict(page_size=64, bf16_store=False, store="fp8"),
 }
 
+
 def _make_ctx(mode: str, head_dim: int) -> Context:
     if mode == "legacy":
         return make_legacy_context(bs=1, compress_ratio=RATIO, head_dim=head_dim)
@@ -135,9 +136,7 @@ def _assert_cache_close(
 @pytest.mark.parametrize("head_dim", list(CONFIGS))
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 @pytest.mark.parametrize("prefix_len", [0, 6, 256])
-def test_fused_matches_chain_decode(
-    head_dim: int, mode: str, prefix_len: int
-) -> None:
+def test_fused_matches_chain_decode(head_dim: int, mode: str, prefix_len: int) -> None:
     """Fused compress+norm+rope+store must match compress_forward + store.
 
     A prefix that is not a multiple of the ratio (6) forces a partial first
@@ -154,9 +153,7 @@ def test_fused_matches_chain_decode(
     pool_fused = make_state_pool(ctx.num_pages, RATIO, head_dim)
 
     seq_len_total = prefix_len + N_DECODE_STEPS
-    kv_full_cpu, ape_cpu = _make_inputs(
-        seq_len_total, head_dim, seed=seq_len_total
-    )
+    kv_full_cpu, ape_cpu = _make_inputs(seq_len_total, head_dim, seed=seq_len_total)
     ape = ape_cpu.to(device)
     norm_weight = torch.randn(head_dim, dtype=torch.float32, device=device)
     freqs_cis = precompute_freqs_cis(

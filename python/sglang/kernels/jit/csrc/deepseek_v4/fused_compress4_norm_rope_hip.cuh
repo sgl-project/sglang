@@ -170,8 +170,8 @@ FUSED_C4_KERNEL void flash_c4_decode_norm_rope(const __grid_constant__ FusedComp
   if (plan.seq_len % params.compress_ratio != 0) return;
 
   const auto need_overlap = plan.seq_len > 4;
-  Float2 data = c4_compress_core<Trait, BufferFloat, InputFloat>(
-      kv_buf_0, kv_buf_1, kv_src, score_bias, need_overlap, 8);
+  Float2 data =
+      c4_compress_core<Trait, BufferFloat, InputFloat>(kv_buf_0, kv_buf_1, kv_src, score_bias, need_overlap, 8);
 
   const auto position = static_cast<int32_t>(plan.seq_len - params.compress_ratio);
   const auto out_loc = params.out_loc[token_id];
@@ -393,8 +393,8 @@ FUSED_C4_KERNEL void flash_c4_decode_norm_rope_indexer(const __grid_constant__ F
   // Warp-uniform, so the cross-lane butterflies below still see a full warp.
   if (plan.seq_len % params.compress_ratio != 0) return;
 
-  Float4 data = c4_compress_core<Trait, BufferFloat, InputFloat>(
-      kv_buf_0, kv_buf_1, kv_src, score_bias, plan.seq_len > 4, 8);
+  Float4 data =
+      c4_compress_core<Trait, BufferFloat, InputFloat>(kv_buf_0, kv_buf_1, kv_src, score_bias, plan.seq_len > 4, 8);
 
   const auto position = static_cast<int32_t>(plan.seq_len - params.compress_ratio);
   const auto out_loc = params.out_loc[token_id];
@@ -588,8 +588,8 @@ flash_c4_decode_norm_rope_indexer_w64(const __grid_constant__ FusedCompress4Norm
   // Wave-uniform: all 64 lanes of this token take the same branch.
   if (plan.seq_len % params.compress_ratio != 0) return;
 
-  Float2 data = c4_compress_core<Trait, BufferFloat, InputFloat>(
-      kv_buf_0, kv_buf_1, kv_src, score_bias, plan.seq_len > 4, 8);
+  Float2 data =
+      c4_compress_core<Trait, BufferFloat, InputFloat>(kv_buf_0, kv_buf_1, kv_src, score_bias, plan.seq_len > 4, 8);
 
   const auto position = static_cast<int32_t>(plan.seq_len - params.compress_ratio);
   const auto out_loc = params.out_loc[token_id];
@@ -701,23 +701,13 @@ struct FusedCompress4NormRopeIndexerKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
   static constexpr int64_t kPageBytes = 132 * kPageSize;
 #ifdef USE_ROCM
-  static constexpr auto kernel = flash_c4_decode_norm_rope_indexer_w64<
-      BufferFloat,
-      InputFloat,
-      DType,
-      kLogPageSize,
-      kUsePDL,
-      kPreshuffleSize>;
+  static constexpr auto kernel =
+      flash_c4_decode_norm_rope_indexer_w64<BufferFloat, InputFloat, DType, kLogPageSize, kUsePDL, kPreshuffleSize>;
   static constexpr uint32_t kTokensPerBlock = kFusedBlockSize / kWaveThreads;
   using Trait = FusedC4Trait<kHeadDim, 2>;
 #else
-  static constexpr auto kernel = flash_c4_decode_norm_rope_indexer<
-      BufferFloat,
-      InputFloat,
-      DType,
-      kLogPageSize,
-      kUsePDL,
-      kPreshuffleSize>;
+  static constexpr auto kernel =
+      flash_c4_decode_norm_rope_indexer<BufferFloat, InputFloat, DType, kLogPageSize, kUsePDL, kPreshuffleSize>;
   static constexpr uint32_t kTokensPerBlock = kFusedNumWarps;
   using Trait = FusedC4Trait<kHeadDim, 4>;
 #endif
