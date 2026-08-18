@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
     )
-    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.hisparse_protocol import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.logprob_result_processor import (
         SchedulerLogprobResultProcessor,
     )
@@ -274,12 +274,23 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
                         self._maybe_collect_indexer_topk(req)
+                        if get_memory().enable_hisparse:
+                            self.hisparse_coordinator.on_prefill_finished_early(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:
-                            self.hisparse_coordinator.admit_request_into_staging(req)
+                            if not self.hisparse_coordinator.on_prefill_complete(req):
+                                # Routine on a backing that rations admission (a
+                                # short prefix gains nothing from eviction); the
+                                # coordinator warns for the declines that are not.
+                                logger.debug(
+                                    "HiSparse declined req %s (%s backing); it "
+                                    "will run as a standard request.",
+                                    req.rid,
+                                    self.hisparse_coordinator.backing,
+                                )
 
                     self._maybe_collect_customized_info(i, req, logits_output)
 
@@ -363,6 +374,13 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
         self.token_to_kv_pool_allocator.free_group_end()
+        if get_memory().enable_hisparse:
+            # After the free group, deliberately: a backing that has to allocate
+            # (and evict) to take a request over cannot do it above, where this
+            # pass parks its frees out of the allocator's sight. Before the next
+            # scheduling round, also deliberately: otherwise the next prefill
+            # takes the pages the eviction just freed.
+            self.hisparse_coordinator.admit_pending()
         self.output_streamer.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req
         )
