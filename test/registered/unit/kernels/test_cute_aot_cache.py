@@ -182,3 +182,7 @@ def test_failed_load_discards_invalid_object(monkeypatch, tmp_path):
 
     assert key not in cache
     assert not object_path.exists()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
