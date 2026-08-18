@@ -1338,10 +1338,13 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     shared_id_base,  # runtime scalar: ep_rank * num_local_experts + num_local_routed
     num_local_routed,  # runtime scalar: routed experts per rank (for gap-insertion)
     scale_factor,  # runtime scalar: shared-expert weight
+    num_token_non_padded_ptr,  # 1-elem int tensor; only read when HAS_PADDING
+    pad_fill_id,  # runtime scalar: routed-id fill for padded rows
     K: tl.constexpr,
     S: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_S: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
 ):
     """Append shared experts AND apply the DeepEP interleaved remap in one pass.
 
@@ -1377,6 +1380,16 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     # routed ids collide with an earlier rank's shared slots.
     ids = ids + (ids // num_local_routed) * S
 
+    if HAS_PADDING:
+        # Fold the padded-topk_ids fill (previously a separate _fill_padded_rows
+        # launch): rows >= num_token_non_padded get pad_fill_id in every routed
+        # slot. Matches the old fill(topk_ids=0) -> remap(0)=0 when pad_fill_id==0.
+        # ids is a BLOCK_K-wide register tile (K need not be pow2), so fill the
+        # whole tile and let the masked store below drop the tail.
+        n_valid = tl.load(num_token_non_padded_ptr)
+        if pid >= n_valid:
+            ids = tl.full((BLOCK_K,), pad_fill_id, dtype=ids.dtype)
+
     tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids, mask=mask_k)
     tl.store(out_weights_ptr + out_ids_row_ptr + offs_k, ws, mask=mask_k)
 
@@ -1396,6 +1409,8 @@ def fused_append_remap_shared_experts_deepep(
     scale_factor,
     shared_id_base,
     num_local_routed,
+    num_token_non_padded=None,
+    pad_fill_id=0,
 ):
     """Fused append + DeepEP remap (see kernel docstring).
 
@@ -1413,6 +1428,9 @@ def fused_append_remap_shared_experts_deepep(
         (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
     )
 
+    has_padding = num_token_non_padded is not None
+    # Placeholder pointer when no padding (never dereferenced: HAS_PADDING False).
+    ntnp_ptr = num_token_non_padded if has_padding else topk_ids
     _fused_append_remap_shared_experts_deepep_kernel[(m,)](
         topk_ids,
         topk_weights,
@@ -1421,10 +1439,13 @@ def fused_append_remap_shared_experts_deepep(
         shared_id_base,
         num_local_routed,
         scale_factor,
+        ntnp_ptr,
+        pad_fill_id,
         K=k,
         S=s,
         BLOCK_K=triton.next_power_of_2(k),
         BLOCK_S=triton.next_power_of_2(s),
+        HAS_PADDING=has_padding,
         num_warps=1,
     )
     return out_ids, out_weights
