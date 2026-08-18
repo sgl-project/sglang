@@ -21,10 +21,6 @@ register_cuda_ci(est_time=1800, stage="base-c", runner_config="4-gpu-gb300")
 NCCL_PORT_BASE = DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 100
 
 
-@unittest.skipIf(
-    True,
-    "Skipping since the current DeepEP doesn't accept the --enable-single-batch-overlap flag. To be fixed after https://github.com/sgl-project/DeepEP/pull/10",
-)
 class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -97,6 +93,10 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
         self.assertGreater(metrics["score"], 0.92)
 
 
+@unittest.skipIf(
+    True,
+    "Skipping since the current DeepEP doesn't accept the --enable-single-batch-overlap flag. To be fixed after https://github.com/sgl-project/DeepEP/pull/10",
+)
 class TestDummyWithSBO(CustomTestCase):
     @classmethod
     def setUpClass(cls):
