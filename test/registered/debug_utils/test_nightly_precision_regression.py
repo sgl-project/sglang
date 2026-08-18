@@ -9,6 +9,8 @@ Env knobs:
   SGLANG_PRECISION_COMMIT         override sglang sha (7-40 hex) tagged on push
   SGLANG_PRECISION_HF_REPO        required HF dataset repo for cross-runner
                                   baseline storage; see precision_baseline_store
+  SGLANG_PRECISION_HF_TOKEN       write token for that repo (not HF_TOKEN, which
+                                  carries the runner's gated-model read token)
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ try:
 except Exception:  # pragma: no cover
     _hfs = None
 
-register_cuda_ci(est_time=3600, suite="nightly-precision-8-gpu-h200", nightly=True)
+register_cuda_ci(est_time=3600, stage="nightly", runner_config="8-gpu-h200")
 
 DEFAULT_MODELS_FOR_NIGHTLY_PRECISION = "zai-org/GLM-5.2-FP8"
 DEFAULT_DIFF_THRESHOLD = 1e-3
