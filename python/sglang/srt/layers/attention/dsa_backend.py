@@ -175,6 +175,41 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
+def _join_split_q_as_view(
+    q_nope: torch.Tensor, q_rope: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """Rejoin a Q that was only ever split into views, without copying it.
+
+    On gfx95 ``fused_qk_rope_cat_and_cache_mla`` emits Q already concatenated as
+    one contiguous ``[..., kv_lora_rank + qk_rope_head_dim]`` tensor;
+    ``forward_absorb_rocm_core`` then hands ``forward_extend`` two slice views of
+    it, because most prefill kernels consume nope and rope separately. A backend
+    that needs the joined form back would otherwise rebuild bytes that are
+    already laid out correctly -- a full copy of Q per layer.
+
+    Returns a view spanning both halves, or ``None`` when they are independent
+    tensors and a real concatenation is unavoidable.
+    """
+    if q_nope.dtype != q_rope.dtype or q_nope.device != q_rope.device:
+        return None
+    if q_nope.dim() < 2 or q_nope.shape[:-1] != q_rope.shape[:-1]:
+        return None
+    # Both halves must be unit-stride in the last dim and share one row stride,
+    # and that stride must equal the joined width: anything else means the span
+    # between them covers padding or interleaved data, not just rope.
+    if q_nope.stride() != q_rope.stride() or q_nope.stride(-1) != 1:
+        return None
+    width = q_nope.shape[-1] + q_rope.shape[-1]
+    if q_nope.stride(-2) != width:
+        return None
+    if q_nope.untyped_storage().data_ptr() != q_rope.untyped_storage().data_ptr():
+        return None
+    if q_rope.storage_offset() != q_nope.storage_offset() + q_nope.shape[-1]:
+        return None
+    return q_nope.as_strided(
+        (*q_nope.shape[:-1], width), q_nope.stride(), q_nope.storage_offset()
+    )
+
 @dataclass(frozen=True)
 class DSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
@@ -2396,7 +2431,12 @@ class DeepseekSparseAttnBackend(
             )
         elif dsa_impl == "aiter":
             if q_rope is not None:
-                q_all = torch.cat([q_nope, q_rope], dim=-1)
+                # The fused rope path already produced these two as adjacent
+                # views of one joined Q, so prefer the view over a rebuild:
+                # copying Q per layer costs more than the kernel saves.
+                q_all = _join_split_q_as_view(q_nope, q_rope)
+                if q_all is None:
+                    q_all = torch.cat([q_nope, q_rope], dim=-1)
             return self._forward_aiter_extend(
                 q_all=q_all,
                 kv_cache=kv_cache,
