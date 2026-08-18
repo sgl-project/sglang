@@ -200,6 +200,18 @@ def _agree_across_ranks(fits: bool) -> bool:
     return bool(tensor.item())
 
 
+def _kv_pool_bytes(pool: object) -> int:
+    """Total bytes held by a KV pool, across both shapes of the accessor.
+
+    ``get_kv_size_bytes`` is not a uniform contract: MHA and SWA pools return a
+    ``(k, v)`` pair while MLA, DSA, and Mamba pools return a scalar. Callers that
+    see pools of every class have to normalise, so keep that knowledge in one
+    place rather than assuming the tuple shape.
+    """
+    size = pool.get_kv_size_bytes()
+    return sum(size) if isinstance(size, tuple) else int(size)
+
+
 def _host_pool_retraction_fits(
     kv_cache: object, mtp_draft_device_pools: Sequence[object]
 ) -> tuple[bool, int, int]:
@@ -223,9 +235,9 @@ def _host_pool_retraction_fits(
     per-rank gate, which stays authoritative. The purpose is to turn the
     arithmetically-unsatisfiable case into a fallback rather than a crash.
     """
-    per_rank_bytes = sum(kv_cache.get_kv_size_bytes())
+    per_rank_bytes = _kv_pool_bytes(kv_cache)
     for draft_pool in mtp_draft_device_pools or ():
-        per_rank_bytes += sum(draft_pool.get_kv_size_bytes())
+        per_rank_bytes += _kv_pool_bytes(draft_pool)
 
     required_bytes = per_rank_bytes * _local_scheduler_count()
     available_bytes = (
@@ -264,16 +276,21 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             schedule.enable_priority_scheduling
             and not schedule.disable_priority_preemption
         )
-        backend = (
-            "host_pool"
-            if disagg.disaggregation_mode == "decode"
+        # Split the eligibility test by where its inputs come from. These five
+        # read the config bags, so every rank evaluates them identically and
+        # they can gate a collective. ``supports_host_pool`` cannot: pool class
+        # and full-token capacity are per-rank, and gating the all-reduce on
+        # per-rank state lets one rank skip it and hang its peers.
+        host_pool_eligible = (
+            disagg.disaggregation_mode == "decode"
             and not get_parallel().dcp_enabled
             and not disagg.disaggregation_decode_enable_radix_cache
             # KV offload already owns a host pool; a second one double-books host memory.
             and not disagg.disaggregation_decode_enable_offload_kvcache
             and not priority_preemption
-            and supports_host_pool
-            else "cpu_tensor"
+        )
+        backend = (
+            "host_pool" if host_pool_eligible and supports_host_pool else "cpu_tensor"
         )
         ratio_backend = backend
         # Supported is not the same as affordable: a large device pool mirrored
@@ -282,18 +299,19 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         # --disaggregation-decode-retraction-backup=host_pool should hard-fail
         # on that; an inferred default degrades instead of refusing to start.
         #
-        # Estimate and reduce on every rank that reaches here, not just the
-        # ranks that chose host_pool. ``backend is None`` is pure config so all
-        # ranks enter this branch, whereas ``supports_host_pool`` above is
-        # per-rank state (pool class, full-token capacity). Gating the
-        # all-reduce on that predicate would make any future divergence in it a
-        # startup hang rather than a mismatch; reducing unconditionally removes
-        # the deadlock precondition instead of relying on it holding.
-        local_schedulers = _local_scheduler_count()
-        local_fits, required_bytes, available_bytes = _host_pool_retraction_fits(
-            kv_cache, tp_worker.model_runner.mtp_draft_device_pools
-        )
-        fits = _agree_across_ranks(local_fits)
+        # Keyed off the config-uniform half of the eligibility test, so a rank
+        # whose pool cannot host the mirror still reaches the reduction and
+        # cannot strand its peers in the all-reduce. Every other server --
+        # prefill, embedding, non-PD -- skips the estimate entirely rather than
+        # paying a psutil read and a world-group all-reduce it has no use for.
+        if host_pool_eligible:
+            local_schedulers = _local_scheduler_count()
+            local_fits, required_bytes, available_bytes = _host_pool_retraction_fits(
+                kv_cache, tp_worker.model_runner.mtp_draft_device_pools
+            )
+            fits = _agree_across_ranks(local_fits)
+        else:
+            local_schedulers, required_bytes, available_bytes, fits = 0, 0, 0, True
         if backend == "host_pool" and not fits:
             logger.warning(
                 "Falling back to cpu_tensor retraction backup: host-pool "

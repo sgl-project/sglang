@@ -13,6 +13,7 @@ from unittest.mock import patch
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.kv_cache_builder import (
     _host_pool_retraction_fits,
+    _kv_pool_bytes,
     _local_scheduler_count,
 )
 from sglang.srt.mem_cache.pool_host.base import HICACHE_HOST_MEMORY_RESERVE_BYTES
@@ -26,10 +27,20 @@ GB = 1024**3
 
 
 def _fake_pool(total_bytes: int) -> SimpleNamespace:
-    """A stand-in exposing only what the estimate reads."""
+    """An MHA/SWA-shaped stand-in: ``get_kv_size_bytes`` returns a ``(k, v)`` pair."""
     return SimpleNamespace(
         get_kv_size_bytes=lambda: (total_bytes // 2, total_bytes // 2)
     )
+
+
+def _scalar_pool(total_bytes: int) -> SimpleNamespace:
+    """An MLA/DSA/Mamba-shaped stand-in: ``get_kv_size_bytes`` returns a scalar.
+
+    The accessor is not a uniform contract, and a tuple-only fixture hides the
+    shape that reaches the estimate on every DeepSeek-class and Mamba-hybrid
+    server.
+    """
+    return SimpleNamespace(get_kv_size_bytes=lambda: total_bytes)
 
 
 class TestLocalSchedulerCount(CustomTestCase):
@@ -167,7 +178,10 @@ class TestCapacityReductionIsUnconditional(CustomTestCase):
 
     def _resolve_with_pool(self, pool):
         override = get_context().override_server_args(
-            disaggregation_mode="decode", tp_size=1, nnodes=1
+            disaggregation_mode="decode",
+            tp_size=1,
+            nnodes=1,
+            disaggregation_decode_retraction_backup=None,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -190,9 +204,12 @@ class TestCapacityReductionIsUnconditional(CustomTestCase):
         return backend, agree
 
     def test_reduced_even_when_the_pool_cannot_use_host_pool(self):
-        # An unsupported pool resolves to cpu_tensor without consulting the
-        # capacity gate -- but the reduction still has to happen.
-        backend, agree = self._resolve_with_pool(_fake_pool(8 * GB))
+        # A scalar-shaped pool (MLA/DSA/Mamba) is config-eligible but cannot host
+        # the mirror: it resolves to cpu_tensor, and the reduction still runs so
+        # the rank cannot strand peers that did choose host_pool. Uses the scalar
+        # fixture because a tuple-only stand-in hides the shape that actually
+        # reaches the estimate here.
+        backend, agree = self._resolve_with_pool(_scalar_pool(8 * GB))
         self.assertEqual(backend, "cpu_tensor")
         agree.assert_called_once()
 
@@ -208,6 +225,93 @@ class TestCapacityReductionIsUnconditional(CustomTestCase):
         ):
             _host_pool_retraction_fits(_fake_pool(8 * GB), ())
         agree.assert_not_called()
+
+
+class TestKvPoolBytesShapes(CustomTestCase):
+    """``get_kv_size_bytes`` returns a pair for MHA/SWA and a scalar elsewhere."""
+
+    def test_tuple_shape_is_summed(self):
+        self.assertEqual(_kv_pool_bytes(_fake_pool(64 * GB)), 64 * GB)
+
+    def test_scalar_shape_is_accepted(self):
+        # MLA, DSA, and Mamba pools return a scalar; assuming the pair shape
+        # raises TypeError: 'int' object is not iterable.
+        self.assertEqual(_kv_pool_bytes(_scalar_pool(64 * GB)), 64 * GB)
+
+    def test_estimate_accepts_a_scalar_pool(self):
+        override = get_context().override_server_args(tp_size=1, nnodes=1)
+        override.install()
+        self.addCleanup(override.restore)
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_builder.psutil.virtual_memory",
+            return_value=SimpleNamespace(available=1024 * GB),
+        ):
+            fits, required, _ = _host_pool_retraction_fits(
+                _scalar_pool(16 * GB), (_scalar_pool(4 * GB),)
+            )
+        self.assertTrue(fits)
+        self.assertEqual(required, 20 * GB)
+
+
+class TestNonDecodeServersSkipTheEstimate(CustomTestCase):
+    """Only a config-eligible decode server should pay for the capacity check.
+
+    ``resolve_decode_retraction_backup`` runs from ``init_memory_pools`` on every
+    scheduler, so a prefill, embedding, or non-PD server reaches this code too.
+    It must not read host memory, reduce over the world group, or hand its pool
+    to the estimate.
+    """
+
+    def _resolve(self, pool, **fields):
+        # Pin the inputs the gate reads rather than inheriting whatever a
+        # previous case left published: the retraction backup must be unset for
+        # the inference branch to run at all, and the mode decides eligibility.
+        fields.setdefault("disaggregation_mode", "null")
+        override = get_context().override_server_args(
+            tp_size=1,
+            nnodes=1,
+            disaggregation_decode_retraction_backup=None,
+            **fields,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        get_context().override("test.reset_ratio", hicache_ratio=None)
+
+        tp_worker = SimpleNamespace(
+            get_memory_pool=lambda: (None, SimpleNamespace(get_kvcache=lambda: pool)),
+            is_hybrid_swa=False,
+            model_runner=SimpleNamespace(mtp_draft_device_pools=()),
+        )
+        with patch.object(
+            kv_cache_builder, "_agree_across_ranks", side_effect=lambda v: v
+        ) as agree, patch.object(
+            kv_cache_builder,
+            "_host_pool_retraction_fits",
+            return_value=(True, 0, 0),
+        ) as fits:
+            backend = kv_cache_builder.resolve_decode_retraction_backup(
+                tp_worker=tp_worker
+            )
+        return backend, agree, fits
+
+    def test_non_pd_server_never_estimates_or_reduces(self):
+        backend, agree, fits = self._resolve(_scalar_pool(8 * GB))
+        self.assertEqual(backend, "cpu_tensor")
+        fits.assert_not_called()
+        agree.assert_not_called()
+
+    def test_prefill_server_never_estimates_or_reduces(self):
+        backend, agree, fits = self._resolve(
+            _fake_pool(8 * GB), disaggregation_mode="prefill"
+        )
+        self.assertEqual(backend, "cpu_tensor")
+        fits.assert_not_called()
+        agree.assert_not_called()
+
+    def test_decode_server_does_estimate(self):
+        _, agree, fits = self._resolve(_fake_pool(8 * GB), disaggregation_mode="decode")
+        fits.assert_called_once()
+        agree.assert_called_once()
 
 
 if __name__ == "__main__":
