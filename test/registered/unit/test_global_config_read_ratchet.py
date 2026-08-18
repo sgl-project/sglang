@@ -126,6 +126,17 @@ _CONFIGURED_SIZE_CALL_SITES = {
         "the draft runner's window over the target's stages: its own groups are "
         "the target's, so the configured count is the one that describes it"
     ),
+    (
+        "srt/speculative/eagle_draft_extend_cuda_graph_runner.py",
+        "configured_pp_size",
+    ): ("the same draft window, on the extend path"),
+    (
+        "srt/speculative/multi_layer_eagle_draft_extend_cuda_graph_runner.py",
+        "configured_pp_size",
+    ): ("the same draft window, multi-layer extend"),
+    ("srt/speculative/frozen_kv_mtp_cuda_graph_runner.py", "configured_pp_size"): (
+        "the same draft window, frozen-KV MTP"
+    ),
     ("srt/disaggregation/common/conn.py", "configured_pp_size"): (
         "the bootstrap connection is built by the KV manager on the transfer "
         "path, which the CPU-only conn tests exercise without ever starting "
