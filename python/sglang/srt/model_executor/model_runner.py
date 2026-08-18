@@ -446,7 +446,7 @@ class ModelRunner:
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
 
-        if self.ps.pp_size > 1:
+        if self.ps.pp_size > 1 and not self.is_draft_worker:
             assert (
                 self.support_pp
             ), "Pipeline Parallel is not compatible with this model."
@@ -771,6 +771,14 @@ class ModelRunner:
     def get_pp_proxy_residual_num_blocks(self) -> Optional[int]:
         return misc_utils.resolve_pp_proxy_residual_num_blocks(
             model_config=self.model_config,
+            pp_size=self.ps.pp_size,
+            pp_rank=self.ps.pp_rank,
+            start_layer=self.layer_info.start_layer,
+        )
+
+    def get_pp_proxy_dspark_num_layers(self) -> Optional[int]:
+        return misc_utils.resolve_pp_proxy_dspark_num_layers(
+            model_runner=self,
             pp_size=self.ps.pp_size,
             pp_rank=self.ps.pp_rank,
             start_layer=self.layer_info.start_layer,

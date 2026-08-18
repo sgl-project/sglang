@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Optional
+from dataclasses import asdict, dataclass
+from typing import Dict, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -15,6 +16,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     SelectMixedAccept,
     SoftmaxTemp,
     accept_greedy_triton,
+    accept_target_only_sampling,
     finalize_accept_lens_triton,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
@@ -30,7 +32,10 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
-from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_info_v2 import (
+    DFlashDecodePrepareMixin,
+    DFlashDraftInputV2,
+)
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
@@ -41,6 +46,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     apply_logits_adjustments_strided,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     sample_simulated_acc_len,
@@ -75,6 +81,229 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    # PP non-last rank: the proxy hidden relayed downstream via the PP ring.
+    pp_hidden_states_proxy_tensors: Optional[object] = None
+
+
+@dataclass
+class DSparkPPLocalSamplingCache:
+    """PP-last-only proposal distributions owned by one scheduler microbatch."""
+
+    corrected_logits: torch.Tensor
+    request_keys: List[Tuple[str, int]]
+
+    @classmethod
+    def from_proposal(
+        cls,
+        corrected_logits: torch.Tensor,
+        reqs,
+        seq_lens,
+    ) -> DSparkPPLocalSamplingCache:
+        # Folded CUDA graph proposals alias a replay output buffer.
+        request_keys = cls._request_keys(reqs, seq_lens)
+        return cls(
+            corrected_logits=corrected_logits.detach().clone(),
+            request_keys=request_keys,
+        )
+
+    @staticmethod
+    def _request_keys(reqs, seq_lens) -> List[Tuple[str, int]]:
+        return [(req.rid, int(seq_len)) for req, seq_len in zip(reqs, seq_lens)]
+
+    def match(
+        self,
+        reqs,
+        seq_lens,
+        *,
+        device: torch.device,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        expected_keys = self._request_keys(reqs, seq_lens)
+        cached_rows = {key: row for row, key in enumerate(self.request_keys)}
+        matched_rows = [cached_rows.get(key) for key in expected_keys]
+        ready = [row is not None for row in matched_rows]
+        if not any(ready):
+            return None, None
+        if all(ready) and matched_rows == list(range(len(self.request_keys))):
+            return self.corrected_logits, None
+
+        corrected_logits = torch.zeros(
+            (len(expected_keys), *self.corrected_logits.shape[1:]),
+            dtype=self.corrected_logits.dtype,
+            device=self.corrected_logits.device,
+        )
+        dst_rows = [row for row, is_ready in enumerate(ready) if is_ready]
+        src_rows = [row for row in matched_rows if row is not None]
+        corrected_logits[dst_rows] = self.corrected_logits[src_rows]
+        ready_mask = (
+            None if all(ready) else torch.tensor(ready, dtype=torch.bool, device=device)
+        )
+        return corrected_logits, ready_mask
+
+
+class DSparkPPMicroBatchSamplingCache:
+    """Process-local corrected logits keyed by the stable PP microbatch slot."""
+
+    def __init__(self):
+        self._slots: Dict[int, DSparkPPLocalSamplingCache] = {}
+
+    def publish(self, mb_id: int, cache: DSparkPPLocalSamplingCache) -> None:
+        self._slots[mb_id] = cache
+
+    def consume(
+        self,
+        mb_id: int,
+        reqs,
+        seq_lens,
+        *,
+        device: torch.device,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        cache = self._slots.pop(mb_id, None)
+        if cache is None:
+            return None, None
+        return cache.match(reqs, seq_lens, device=device)
+
+    def clear(self) -> None:
+        self._slots.clear()
+
+
+@dataclass
+class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
+    """DSpark PP relay data carrier.
+
+    Carries the draft / confidence / accounting information produced by the
+    last PP rank each iter and relays it to every verify rank via the PP ring,
+    so that all ranks rebuild an identical verify context for the next iter.
+    Linear (non-tree) verify reuses the formal ``req_to_token`` slots, so
+    ``accept_index`` is always ``None`` and ``batch_result_processor`` skips
+    the token-move step automatically.
+    """
+
+    # Draft info for rebuilding the next iter's verify candidates on every
+    # rank. GPU tensors so the PP ring relays them over the GPU channel.
+    bonus_tokens: torch.Tensor  # [bs]
+    draft_tokens: torch.Tensor  # [bs, gamma]
+    # Kept as a CPU list: consumed only by the last rank's sampling cache,
+    # whose keys are Python ints; GPU-izing it would add a second D2H copy.
+    new_seq_lens: List[int]
+
+    # Result / accounting for batch_result_processor and stats. Required: always
+    # populated by the last rank (even build_dummy_for_decode sets [1]*bs).
+    accept_lens: torch.Tensor  # [bs]
+
+    # Optional placeholders mirroring DFlashDraftInputV2 so that run_non_compact's
+    # elif branch (reading reserved_seq_lens_cpu when batch.seq_lens_cpu is None)
+    # never AttributeErrors under PP. Steady-state decode does not trigger it.
+    reserved_seq_lens_cpu: Optional[List] = None
+    reserved_seq_lens_sum: Optional[int] = None
+
+    # Confidence produced by last rank's propose; all ranks recompute an
+    # identical verify budget from the same source each iter.
+    confidence: Optional[torch.Tensor] = None  # [bs] float32
+
+    cap_trim_lens: Optional[torch.Tensor] = None  # [bs] int32
+    verify_lens: Optional[torch.Tensor] = None  # [bs] int64
+
+    # Linear verify: always None so batch_result_processor skips the token move.
+    accept_index: Optional[List] = None
+
+    def __post_init__(self):
+        super().__init__(SpecInputType.DFLASH_PP_VERIFY_INPUT_RAW)
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        return (1, 1)
+
+    def prepare_local_sampling_metadata(self, reqs) -> None:
+        """Build PP-last-only sampling hints without adding them to PP raw."""
+        top_ks = [int(req.sampling_params.top_k) for req in reqs]
+        self.max_top_k = max(max(top_ks, default=1), 1)
+        self.uniform_top_k_value = (
+            top_ks[0]
+            if top_ks and all(top_k == top_ks[0] for top_k in top_ks)
+            else None
+        )
+
+    def to_tensor_dict(self) -> dict:
+        # Nested tensors are flattened by _split_tensor_dict, so the whole
+        # dataclass dict still travels over the GPU channel.
+        return {"pp_spec_output": asdict(self)}
+
+    @classmethod
+    def from_pp_outputs(cls, pp_outputs):
+        return cls(**pp_outputs["pp_spec_output"])
+
+    @classmethod
+    def build_dummy_for_decode(cls, batch, num_draft: int) -> DSparkPPVerifyInputRaw:
+        # First decode step: the last PP rank has not proposed real drafts yet.
+        bs = len(batch.reqs)
+        gamma = max(num_draft - 1, 0)
+        device = batch.input_ids.device
+        bonus = batch.input_ids.to(torch.int64)
+        return cls(
+            bonus_tokens=bonus,
+            draft_tokens=bonus.unsqueeze(1).repeat(1, gamma),
+            new_seq_lens=batch.seq_lens.tolist(),
+            confidence=torch.zeros(bs, dtype=torch.float32, device=device),
+            accept_lens=torch.ones(bs, dtype=torch.int64, device=device),
+            cap_trim_lens=torch.zeros(bs, dtype=torch.int32, device=device),
+            verify_lens=torch.full((bs,), num_draft, dtype=torch.int64, device=device),
+            accept_index=None,
+        )
+
+    def filter_batch(self, new_indices, new_indices_cpu: Optional[List[int]] = None):
+        self.bonus_tokens = self.bonus_tokens[new_indices]
+        if self.draft_tokens is not None:
+            self.draft_tokens = self.draft_tokens[new_indices]
+        if self.new_seq_lens is not None:
+            idx = (
+                new_indices.tolist()
+                if torch.is_tensor(new_indices)
+                else list(new_indices)
+            )
+            self.new_seq_lens = [self.new_seq_lens[i] for i in idx]
+        if self.confidence is not None:
+            self.confidence = self.confidence[new_indices]
+        if self.accept_lens is not None:
+            self.accept_lens = self.accept_lens[new_indices]
+        if self.cap_trim_lens is not None:
+            self.cap_trim_lens = self.cap_trim_lens[new_indices]
+        if self.verify_lens is not None:
+            self.verify_lens = self.verify_lens[new_indices]
+        if self.accept_index is not None:
+            idx = (
+                new_indices.tolist()
+                if torch.is_tensor(new_indices)
+                else list(new_indices)
+            )
+            self.accept_index = [self.accept_index[i] for i in idx]
+
+    def merge_batch(self, other: DSparkPPVerifyInputRaw):
+        if other.bonus_tokens.numel() == 0:
+            return
+        if self.bonus_tokens.numel() == 0:
+            self.bonus_tokens = other.bonus_tokens
+            self.draft_tokens = other.draft_tokens
+            self.new_seq_lens = other.new_seq_lens
+            self.confidence = other.confidence
+            self.accept_lens = other.accept_lens
+            self.cap_trim_lens = other.cap_trim_lens
+            self.verify_lens = other.verify_lens
+            self.accept_index = other.accept_index
+            return
+        self.bonus_tokens = torch.cat([self.bonus_tokens, other.bonus_tokens])
+        if other.draft_tokens is not None:
+            self.draft_tokens = torch.cat([self.draft_tokens, other.draft_tokens])
+        if other.new_seq_lens is not None:
+            self.new_seq_lens = self.new_seq_lens + other.new_seq_lens
+        if self.confidence is not None and other.confidence is not None:
+            self.confidence = torch.cat([self.confidence, other.confidence])
+        if self.accept_lens is not None and other.accept_lens is not None:
+            self.accept_lens = torch.cat([self.accept_lens, other.accept_lens])
+        if self.cap_trim_lens is not None and other.cap_trim_lens is not None:
+            self.cap_trim_lens = torch.cat([self.cap_trim_lens, other.cap_trim_lens])
+        if self.verify_lens is not None and other.verify_lens is not None:
+            self.verify_lens = torch.cat([self.verify_lens, other.verify_lens])
+        if self.accept_index is not None and other.accept_index is not None:
+            self.accept_index = self.accept_index + other.accept_index
 
 
 class TargetVerifyExecutor:
@@ -236,6 +465,7 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        pp_proxy_tensors=None,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -265,9 +495,14 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        if sampling_info is not None:
+        # Logits adjustments are sampling-time corrections (penalizer / vocab
+        # mask / logit bias). Only the PP last rank produces logits; non-last
+        # ranks relay hidden states downstream and never sample, so their
+        # result.logits_output is None and must skip this.
+        if result.logits_output is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -283,6 +518,7 @@ class TargetVerifyExecutor:
         verify_input: DFlashVerifyInput,
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
+        pp_proxy_tensors=None,
     ) -> TargetVerifyResult:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
@@ -295,10 +531,14 @@ class TargetVerifyExecutor:
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            pp_hidden_states_proxy_tensors=getattr(
+                target_out, "pp_hidden_states_proxy_tensors", None
+            ),
         )
 
     def commit_hidden(
@@ -715,6 +955,15 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
         )
+    if draft_block.corrected_logits is None:
+        # PP first-decode dummy drafts have no proposal distribution. Keep the
+        # full verify layout stable across PP/CUDA graph, but accept none of
+        # those drafts and sample exactly one token from the target instead.
+        return accept_target_only_sampling(
+            target_logits=target_logits,
+            sampling_info=sampling_info,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+        )
     bs, gamma_rows, vocab = draft_block.corrected_logits.shape
     draft_probs = SoftmaxTemp.execute(
         logits=draft_block.corrected_logits.reshape(bs * gamma_rows, vocab),
@@ -723,7 +972,7 @@ def accept_draft_tokens(
     ).view(bs, gamma_rows, vocab)
     expect(_VERIFY_DRAFT_PROBS, draft_probs)
     if not sampling_info.is_any_greedy:
-        return AcceptSampling.execute(
+        normal_len, normal_bonus, normal_trim = AcceptSampling.execute(
             candidates=candidates,
             target_logits=target_logits,
             draft_probs=draft_probs,
@@ -733,29 +982,56 @@ def accept_draft_tokens(
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
         )
-    greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
-        candidates=candidates,
+    else:
+        greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
+            candidates=candidates,
+            target_logits=target_logits,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=cutoff_verify_lens,
+        )
+        sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
+            candidates=candidates,
+            target_logits=target_logits,
+            draft_probs=draft_probs,
+            sampling_info=sampling_info,
+            draft_input=draft_input,
+            gamma=gamma,
+            verify_num_draft_tokens=verify_num_draft_tokens,
+            cutoff_verify_lens=cutoff_verify_lens,
+        )
+        normal = SelectMixedAccept.execute(
+            greedy_mask=greedy_mask,
+            greedy_len=greedy_len,
+            greedy_bonus=greedy_bonus,
+            greedy_trim=greedy_trim,
+            sampling_len=sampling_len,
+            sampling_bonus=sampling_bonus,
+            sampling_trim=sampling_trim,
+        )
+        normal_len, normal_bonus, normal_trim = (
+            normal.correct_len,
+            normal.bonus,
+            normal.cap_trim_lens,
+        )
+
+    corrected_ready = draft_block.corrected_logits_ready
+    if corrected_ready is None:
+        return normal_len, normal_bonus, normal_trim
+
+    target_len, target_bonus, target_trim = accept_target_only_sampling(
         target_logits=target_logits,
-        verify_num_draft_tokens=verify_num_draft_tokens,
-        cutoff_verify_lens=cutoff_verify_lens,
-    )
-    sampling_len, sampling_bonus, sampling_trim = AcceptSampling.execute(
-        candidates=candidates,
-        target_logits=target_logits,
-        draft_probs=draft_probs,
         sampling_info=sampling_info,
-        draft_input=draft_input,
-        gamma=gamma,
         verify_num_draft_tokens=verify_num_draft_tokens,
-        cutoff_verify_lens=cutoff_verify_lens,
     )
     selected = SelectMixedAccept.execute(
-        greedy_mask=greedy_mask,
-        greedy_len=greedy_len,
-        greedy_bonus=greedy_bonus,
-        greedy_trim=greedy_trim,
-        sampling_len=sampling_len,
-        sampling_bonus=sampling_bonus,
-        sampling_trim=sampling_trim,
+        # Greedy rows never need corrected logits; sampling rows use the
+        # speculative result only when their PP-last cache lookup succeeded.
+        greedy_mask=greedy_mask | corrected_ready,
+        greedy_len=normal_len,
+        greedy_bonus=normal_bonus,
+        greedy_trim=normal_trim,
+        sampling_len=target_len,
+        sampling_bonus=target_bonus,
+        sampling_trim=target_trim,
     )
     return selected.correct_len, selected.bonus, selected.cap_trim_lens

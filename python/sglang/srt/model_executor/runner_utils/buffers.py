@@ -106,6 +106,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
+        pp_proxy_dspark_num_layers: Optional[int] = None,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -133,15 +134,17 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 is_mhc = hc_hidden_size is not None
                 hs = hc_hidden_size if is_mhc else hidden_size
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+                    "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
                 }
                 if not is_mhc:
                     # Only Kimi K3 supplies num_blocks: its PP bank is token-major
-                    # [T, blocks, H]. Other models keep the legacy [max_bs, H].
+                    # [T, blocks, H]. Other models keep the legacy token-major
+                    # [max_num_token, H] (token dim, not max_bs: spec decoding
+                    # runs more tokens than requests per step).
                     residual_shape = (
                         (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
                         if pp_proxy_residual_num_blocks is not None
-                        else (max_bs, hidden_size)
+                        else (max_num_token, hidden_size)
                     )
                     pp_proxy_tensors["residual"] = torch.zeros(
                         residual_shape, dtype=dtype
@@ -149,6 +152,14 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 if pp_proxy_topk_size is not None:
                     pp_proxy_tensors["topk_indices"] = torch.zeros(
                         (max_num_token, pp_proxy_topk_size), dtype=torch.int32
+                    )
+                if pp_proxy_dspark_num_layers is not None:
+                    # DSpark aux: [num_tokens, L, hidden], token-major to match
+                    # the PP proxy buffer slice (buffer[:src.shape[0]] on dim 0).
+                    # Allocated for both mHC and non-mHC targets (DSV4 is mHC).
+                    pp_proxy_tensors["dspark_aux"] = torch.zeros(
+                        (max_num_token, pp_proxy_dspark_num_layers, hidden_size),
+                        dtype=dtype,
                     )
             else:
                 pp_proxy_tensors = None

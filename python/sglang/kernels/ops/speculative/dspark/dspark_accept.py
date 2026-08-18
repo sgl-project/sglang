@@ -174,6 +174,30 @@ def accept_sampling(
     return correct_len, bonus, cap_trim_lens
 
 
+def accept_target_only_sampling(
+    *,
+    target_logits: torch.Tensor,
+    sampling_info,
+    verify_num_draft_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample one target token when no draft distribution is available."""
+    bs = sampling_info.temperatures.shape[0]
+    vocab = target_logits.shape[-1]
+    first_target_logits = target_logits.view(bs, verify_num_draft_tokens, vocab)[
+        :, 0, :
+    ]
+    target_probs = build_dflash_verify_target_probs(
+        next_token_logits=first_target_logits,
+        sampling_info=sampling_info,
+        draft_token_num=1,
+        bs=bs,
+    )[:, 0, :]
+    bonus = torch.multinomial(target_probs.float(), num_samples=1).squeeze(1)
+    correct_len = torch.zeros(bs, dtype=torch.int32, device=target_logits.device)
+    cap_trim_lens = torch.zeros_like(correct_len)
+    return correct_len, bonus.to(torch.int64), cap_trim_lens
+
+
 @triton.jit
 def _gather_two_level_bonus_kernel(
     accept_index_ptr,

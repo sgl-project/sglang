@@ -341,6 +341,7 @@ def commit_kda_replayssm_after_verify(
     last_correct_step_indices: torch.Tensor,  # [B] conv rollback target step
     mamba_track_indices: torch.Tensor | None = None,
     mamba_steps_to_track: torch.Tensor | None = None,
+    conv_source_indices: torch.Tensor | None = None,
     null_block_id: int = -1,
 ) -> None:
     """Fold each layer's accepted window into `temporal` and roll back conv.
@@ -378,9 +379,17 @@ def commit_kda_replayssm_after_verify(
         spec_state.conv, spec_state.intermediate_conv_window
     ):
         fused_conv_window_scatter_with_mask(
-            conv_states, interm_conv, state_batch_indices, last_correct_step_indices
+            conv_states,
+            interm_conv,
+            state_batch_indices,
+            last_correct_step_indices,
+            src_indices_raw=conv_source_indices,
         )
         if mamba_track_indices is not None and mamba_steps_to_track is not None:
             fused_conv_window_scatter_with_mask(
-                conv_states, interm_conv, mamba_track_indices, mamba_steps_to_track
+                conv_states,
+                interm_conv,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                src_indices_raw=conv_source_indices,
             )

@@ -116,12 +116,17 @@ class P2PWork:
 
 
 def _split_tensor_dict(
-    tensor_dict: Dict[str, Union[torch.Tensor, Any]],
+    tensor_dict: Dict[str, Union[torch.Tensor, Any]], prefix: str = ""
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
     """Split the tensor dictionary into two parts:
     1. A list of (key, value) pairs. If the value is a tensor, it is replaced
          by its metadata.
     2. A list of tensors.
+
+    If the tensor is nested under ``tensor_dict["key1"]["key2"]``, the key of
+    its metadata is flattened to "key1%key2" (see ``_update_nested_dict`` for
+    the reverse), so nested tensors also travel over the GPU channel instead
+    of being pickled through CPU.
     """
     metadata_list: List[Tuple[str, Any]] = []
     tensor_list: List[torch.Tensor] = []
@@ -133,12 +138,31 @@ def _split_tensor_dict(
             # receiving side will set the device index.
             device = value.device.type
             metadata_list.append(
-                (key, TensorMetadata(device, value.dtype, value.size()))
+                (prefix + key, TensorMetadata(device, value.dtype, value.size()))
             )
             tensor_list.append(value)
+        elif isinstance(value, dict):
+            if len(value) == 0:
+                metadata_list.append((prefix + key, value))
+            inner_metadata_list, inner_tensor_list = _split_tensor_dict(
+                value, prefix + key + "%"
+            )
+            metadata_list.extend(inner_metadata_list)
+            tensor_list.extend(inner_tensor_list)
         else:
-            metadata_list.append((key, value))
+            metadata_list.append((prefix + key, value))
     return metadata_list, tensor_list
+
+
+def _update_nested_dict(nested_dict, flattened_key, value):
+    """Rebuild a nested dict from a "%"-flattened key (see _split_tensor_dict)."""
+    key_splits = flattened_key.split("%")
+    cur_dict = nested_dict
+    for k in key_splits[:-1]:
+        if k not in cur_dict:
+            cur_dict[k] = {}
+        cur_dict = cur_dict[k]
+    cur_dict[key_splits[-1]] = value
 
 
 _group_name_counter: Dict[str, int] = {}
@@ -1663,7 +1687,7 @@ class GroupCoordinator:
                     )
                     if tensor.numel() == 0:
                         # Skip broadcasting empty tensors.
-                        tensor_dict[key] = tensor
+                        _update_nested_dict(tensor_dict, key, tensor)
                         continue
                     if tensor.is_cpu:
                         # use metadata_group for CPU tensors
@@ -1679,9 +1703,9 @@ class GroupCoordinator:
                             tensor, src=self.ranks[src], group=group, async_op=True
                         )
                     async_handles.append(handle)
-                    tensor_dict[key] = tensor
+                    _update_nested_dict(tensor_dict, key, tensor)
                 else:
-                    tensor_dict[key] = value
+                    _update_nested_dict(tensor_dict, key, value)
             for async_handle in async_handles:
                 async_handle.wait()
         return tensor_dict
@@ -1771,8 +1795,8 @@ class GroupCoordinator:
             if isinstance(value, TensorMetadata):
                 tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
                 if tensor.numel() == 0:
-                    # Skip broadcasting empty tensors.
-                    tensor_dict[key] = tensor
+                    # Skip receiving empty tensors.
+                    _update_nested_dict(tensor_dict, key, tensor)
                     continue
 
                 # send-allgather: send only a slice, then do allgather.
@@ -1796,9 +1820,9 @@ class GroupCoordinator:
                     tensor = all_gather_group.all_gather(tensor, dim=0)
                     tensor = tensor.reshape(orig_shape)
 
-                tensor_dict[key] = tensor
+                _update_nested_dict(tensor_dict, key, tensor)
             else:
-                tensor_dict[key] = value
+                _update_nested_dict(tensor_dict, key, value)
         return tensor_dict
 
     def barrier(self):

@@ -65,7 +65,6 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
-    configured_pp_size,
     get_context,
     get_disagg,
     get_exec,
@@ -1768,8 +1767,7 @@ class KVCacheConfigurator:
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
+            distributed=False,
         )
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
@@ -1858,8 +1856,10 @@ class KVCacheConfigurator:
                 )
             token_capacity = min(token_capacity, user_limit)
 
-        # Sync across PP ranks (each may have different layer counts)
-        if configured_pp_size() > 1:
+        # Sync the locally resolved capacity across every model rank. This is
+        # required for PP (different layer costs) and also keeps pure TP/DP
+        # workers on one shared token capacity.
+        if get_world_group().world_size > 1:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,

@@ -312,6 +312,7 @@ class TpModelWorker(BaseTpWorker):
         is_multi_layer_eagle: bool = False,
         context_length: Optional[int] = None,
         draft_attention_backend: Optional[str] = None,
+        pp_global_random_seed: Optional[int] = None,
     ):
         # Parse args
         self.server_args = server_args
@@ -371,8 +372,16 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Sync random seed across TP workers.
+        # Under PP the draft worker's TP worker is created on only one PP rank
+        # (the last), so it cannot join the launch-time WORLD broadcast; reuse
+        # the target worker's resolved seed directly.
         # Elastic joiners cannot enter the launch-time WORLD broadcast.
-        if server_args.is_ep_joiner:
+        if self.is_draft_worker and server_args.pp_size > 1:
+            assert (
+                pp_global_random_seed is not None
+            ), "pp_global_random_seed must be provided for the draft worker under PP"
+            self.random_seed = pp_global_random_seed
+        elif server_args.is_ep_joiner:
             self.random_seed = server_args.random_seed
         else:
             self.random_seed = broadcast_pyobj(

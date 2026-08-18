@@ -39,7 +39,7 @@ from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module, is_xpu
+from sglang.srt.utils.common import get_device_module
 
 logger = logging.getLogger(__name__)
 
@@ -1026,6 +1026,14 @@ class SchedulerPPMixin:
                 **tensor_dict,
                 **logprob_dict,
             }
+
+        # PP + spec: the last PP rank serializes the draft tree so non-last ranks
+        # can rebuild EagleVerifyInput on the next iter. Nested under
+        # 'pp_spec_output' and flattened by _split_tensor_dict so the tensors
+        # travel over the GPU channel.
+        if result.pp_verify_input_raw:
+            tensor_dict.update(result.pp_verify_input_raw.to_tensor_dict())
+
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -1139,6 +1147,17 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
+        from sglang.srt.speculative.dspark_components.dspark_verify import (
+            DSparkPPVerifyInputRaw,
+        )
+        from sglang.srt.speculative.eagle_info import EaglePPVerifyInputRaw
+
+        def _pp_raw_cls():
+            # Dispatch the PP relay carrier class by algorithm so the non-last
+            # ranks rebuild the correct spec_info type from pp_outputs.
+            if self.spec_algorithm.is_dspark():
+                return DSparkPPVerifyInputRaw
+            return EaglePPVerifyInputRaw
 
         logits_output = None
         extend_input_len_per_req = None
@@ -1151,13 +1170,33 @@ class SchedulerPPMixin:
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
-        # PP rank 0 also relays into output_tokens_buf so the next iter's
-        # resolve_forward_inputs finds these tokens for the decode portion
-        # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(
-            batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
-        )
-        batch.input_ids = None
+        batch.input_ids = next_token_ids
+
+        if not self.spec_algorithm.is_none() and "pp_spec_output" in pp_outputs.tensors:
+            # Spec-v2 decode path: extract next iter's draft info from pp_outputs.
+            batch.spec_info = _pp_raw_cls().from_pp_outputs(pp_outputs)
+        elif not self.spec_algorithm.is_none() and batch.forward_mode.is_extend():
+            if batch.contains_last_prefill_chunk:
+                # The last PP rank produces no draft tokens for prefill batches;
+                # build a dummy draft for the first decode step.
+                batch.spec_info = _pp_raw_cls().build_dummy_for_decode(
+                    batch, self.server_args.speculative_num_draft_tokens
+                )
+            else:
+                # Chunked prefill middle chunk: its next_token_ids is a
+                # placeholder that no consumer reads (the next iter is another
+                # extend and resolve_forward_inputs sources input_ids from the
+                # prefill staging copy). Do nothing here.
+                pass
+        else:
+            # PP rank 0 also relays into output_tokens_buf so the next iter's
+            # resolve_forward_inputs finds these tokens for the decode portion
+            # of mixed-chunk batches (which gather via mix_running_indices).
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
+            )
+            batch.input_ids = None
+
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
@@ -1166,6 +1205,21 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
+
+        if isinstance(batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)):
+            output_result.accept_lens = batch.spec_info.accept_lens.to(torch.int64)
+            output_result.speculative_num_draft_tokens = (
+                self.server_args.speculative_num_draft_tokens
+            )
+
+        # Async copy the CPU-bound fields ahead of time; d2h_event in the
+        # caller guarantees completion before the result is consumed.
+        output_result.copy_done = self.device_module.Event()
+        output_result.copy_to_cpu(
+            return_logprob=batch.return_logprob,
+            return_hidden_states=False,
+        )
+
         return output_result
 
     def _pp_process_batch_result(
@@ -1227,18 +1281,13 @@ class SchedulerPPMixin:
         batch_result = None
         send_output_work = []
 
-        # On CUDA, isend is async: it enqueues to the stream and returns,
-        # so every rank can send first safely. On some backends isend is
-        # effectively blocking and does not return until the peer posts a
-        # matching recv; if every PP rank sends first, all ranks block
-        # waiting for a receiver and the ring deadlocks. Order send/recv
-        # by pp_rank parity (even: send->recv, odd: recv->send) so each
-        # adjacent pair has one sender and one receiver posted at the
-        # same time.
-
-        # CUDA: send first
-        # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
+        # isend only makes the CPU call asynchronous. Device P2P work is still
+        # ordered on the CUDA stream, so enqueueing several sends before any
+        # recv on every PP rank can form a ring wait. This happens when output
+        # metadata contains multiple GPU tensors (for example speculative
+        # verify state). Pair adjacent stages by parity so one side posts recv
+        # while the other posts send.
+        send_first = (self.ps.pp_rank % 2) == 0
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
@@ -1288,6 +1337,7 @@ class SchedulerPPMixin:
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
+                cur_batch.pp_mb_id = mb_id
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_start_time",

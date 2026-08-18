@@ -1,13 +1,19 @@
+from __future__ import annotations
+
 import logging
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
 from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +230,7 @@ class EagleDraftInput(SpecInput):
         if self.dsa_topk_indices is not None:
             self.dsa_topk_indices = self.dsa_topk_indices[new_indices]
 
-    def merge_batch(self, spec_info: "EagleDraftInput"):
+    def merge_batch(self, spec_info: EagleDraftInput):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
             self.future_indices = torch.cat(
@@ -333,7 +339,7 @@ class EagleDraftExtendInput(SpecInput):
         hidden_size: Optional[int],
         dtype: Optional[torch.dtype],
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST,
-    ) -> "EagleDraftExtendInput":
+    ) -> EagleDraftExtendInput:
         return cls(
             hidden_states=(
                 torch.empty((0, hidden_size), device=device, dtype=dtype)
@@ -387,3 +393,124 @@ class EagleDraftExtendInput(SpecInput):
             req_to_token.size(1),
         )
         return kv_indices, cum_kv_seq_len, qo_indptr, None
+
+
+@dataclass
+class EaglePPVerifyInputRaw(SpecInput):
+    """Draft tree produced by the PP last rank and relayed across PP
+    stages so non-last ranks can rebuild an EagleVerifyInput on the next iter.
+
+    Carries the raw (pre-tree-mask) fields rather than a built EagleVerifyInput
+    because the tree mask / positions must be rebuilt against each rank's own
+    attention backend buffers.
+
+    All fields are GPU tensors so the PP ring relays them over the GPU
+    channel instead of pickling Python lists through CPU.
+    """
+
+    draft_tokens: torch.Tensor  # [bs, num_draft], col 0 is the bonus token
+    bonus_tokens: torch.Tensor  # [bs]
+    top_scores_index: torch.Tensor  # [bs, num_draft - 1]
+    parent_list: torch.Tensor  # [bs, num_draft - 1]
+    accept_lens: Optional[torch.Tensor] = None  # [bs]
+    # Accepted tree path, [bs, max_tree_depth]; None when topk == 1.
+    accept_index: Optional[torch.Tensor] = None
+
+    def __post_init__(self):
+        super().__init__(SpecInputType.EAGLE_PP_VERIFY_INPUT_RAW)
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        num_draft = self.draft_tokens.shape[1] if self.draft_tokens.dim() == 2 else 1
+        return num_draft, num_draft
+
+    def to_tensor_dict(self) -> dict:
+        # Nested tensors are flattened by _split_tensor_dict, so the whole
+        # dataclass dict still travels over the GPU channel.
+        return {"pp_spec_output": asdict(self)}
+
+    @classmethod
+    def from_pp_outputs(cls, pp_outputs):
+        return cls(**pp_outputs["pp_spec_output"])
+
+    @classmethod
+    def build_dummy_for_decode(
+        cls, batch: ScheduleBatch, num_draft: int
+    ) -> EaglePPVerifyInputRaw:
+        """Build a dummy draft spec for the first decode step after prefill.
+
+        The last PP rank produces no draft tokens for prefill batches, so a
+        placeholder tree (each req's bonus token replicated num_draft times)
+        is constructed here.
+        """
+        bs = len(batch.reqs)
+        parent_width = max(num_draft - 1, 0)
+        device = batch.input_ids.device
+
+        # repeat (not expand): the relayed tensors must stay contiguous.
+        bonus_tokens = batch.input_ids.to(torch.int64)
+        draft_tokens = bonus_tokens.unsqueeze(1).repeat(1, num_draft)
+        parent_list = torch.arange(-1, parent_width - 1, device=device).repeat(bs, 1)
+        top_scores_index = torch.arange(parent_width, device=device).repeat(bs, 1)
+
+        return cls(
+            draft_tokens=draft_tokens,
+            bonus_tokens=bonus_tokens,
+            top_scores_index=top_scores_index,
+            parent_list=parent_list,
+            accept_lens=torch.ones(bs, dtype=torch.int64, device=device),
+            accept_index=None,
+        )
+
+    def filter_batch(
+        self, new_indices: torch.Tensor, new_indices_cpu: Optional[List[int]] = None
+    ):
+        try:
+            self.bonus_tokens = self.bonus_tokens[new_indices]
+            if self.draft_tokens is not None:
+                self.draft_tokens = self.draft_tokens[new_indices]
+            if self.top_scores_index is not None:
+                self.top_scores_index = self.top_scores_index[new_indices]
+            if self.parent_list is not None:
+                self.parent_list = self.parent_list[new_indices]
+            if self.accept_lens is not None:
+                self.accept_lens = self.accept_lens[new_indices]
+            if self.accept_index is not None:
+                self.accept_index = self.accept_index[new_indices]
+        except TypeError as e:
+            raise RuntimeError(
+                "EaglePPVerifyInputRaw.filter_batch: a required field was None. "
+                "Under PP + EAGLE, every batch must carry the draft tree relayed "
+                "via pp_outputs, or be given a dummy tree for its first decode."
+            ) from e
+
+    def merge_batch(self, other: EaglePPVerifyInputRaw):
+        try:
+            if other.bonus_tokens.numel() == 0:
+                return
+            if self.bonus_tokens.numel() == 0:
+                self.draft_tokens = other.draft_tokens
+                self.bonus_tokens = other.bonus_tokens
+                self.top_scores_index = other.top_scores_index
+                self.parent_list = other.parent_list
+                self.accept_lens = other.accept_lens
+                self.accept_index = other.accept_index
+                return
+            if other.draft_tokens is not None:
+                self.draft_tokens = torch.cat([self.draft_tokens, other.draft_tokens])
+            self.bonus_tokens = torch.cat([self.bonus_tokens, other.bonus_tokens])
+            if other.top_scores_index is not None:
+                self.top_scores_index = torch.cat(
+                    [self.top_scores_index, other.top_scores_index]
+                )
+            if self.parent_list is not None and other.parent_list is not None:
+                self.parent_list = torch.cat([self.parent_list, other.parent_list])
+            if self.accept_lens is not None and other.accept_lens is not None:
+                self.accept_lens = torch.cat([self.accept_lens, other.accept_lens])
+            if self.accept_index is not None and other.accept_index is not None:
+                self.accept_index = torch.cat([self.accept_index, other.accept_index])
+        except TypeError as e:
+            raise RuntimeError(
+                "EaglePPVerifyInputRaw.merge_batch: a required field was None. "
+                "Under PP + EAGLE, every batch must carry the draft tree relayed "
+                "via pp_outputs, or be given a dummy tree for its first decode."
+            ) from e

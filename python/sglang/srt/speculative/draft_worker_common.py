@@ -71,6 +71,7 @@ def build_draft_tp_worker(
     target_model_config: ModelConfig,
     algo_label: str,
     attention_backend_override: Optional[str] = None,
+    pp_global_random_seed: Optional[int] = None,
 ) -> DraftWorkerBundle:
     # An override names a draft-specific backend the caller has already
     # validated (e.g. a self-drafting architecture); it skips the generic
@@ -97,6 +98,7 @@ def build_draft_tp_worker(
             # The draft runs at absolute target positions.
             context_length=target_model_config.context_len,
             draft_attention_backend=draft_backend,
+            pp_global_random_seed=pp_global_random_seed,
         )
 
     draft_model_runner = draft_worker.model_runner

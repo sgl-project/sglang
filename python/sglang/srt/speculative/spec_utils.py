@@ -787,7 +787,7 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
 def _verify_commit_step_indices(
     *,
     batch: ScheduleBatch,
-    accept_index: torch.Tensor,
+    accept_index: Optional[torch.Tensor],
     accept_lens: torch.Tensor,
     draft_token_num: int,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -804,9 +804,18 @@ def _verify_commit_step_indices(
         device=accept_lens.device,
     )
     req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
-    last_correct_step_indices = (
-        accept_index[req_idx, (accept_lens - 1).to(torch.int64)] - accept_indices_offset
-    )
+
+    def resolve_step_indices(path_positions: torch.Tensor) -> torch.Tensor:
+        # Linear-chain (topk == 1) verify carries no accept_index; the step
+        # positions are already per-req draft steps.
+        if accept_index is None:
+            return path_positions
+        return (
+            accept_index[req_idx, path_positions.to(torch.int64)]
+            - accept_indices_offset
+        )
+
+    last_correct_step_indices = resolve_step_indices(accept_lens - 1)
     if batch.mamba_track_indices is None:
         return last_correct_step_indices, None
     seq_lens_pre_verify = batch.seq_lens
@@ -820,7 +829,7 @@ def _verify_commit_step_indices(
     to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0).to(
         torch.int64
     )
-    candidate_track_steps = accept_index[req_idx, to_track_ith] - accept_indices_offset
+    candidate_track_steps = resolve_step_indices(to_track_ith)
     mamba_steps_to_track = torch.where(
         to_track_mask,
         candidate_track_steps,
@@ -833,8 +842,10 @@ def commit_mamba_states_after_verify(
     target_worker: TpModelWorker,
     batch: ScheduleBatch,
     accept_lens: torch.Tensor,
-    accept_index: torch.Tensor,
+    accept_index: Optional[torch.Tensor],
     draft_token_num: int,
+    state_indices_tensor: Optional[torch.Tensor] = None,
+    scratch_source_indices_tensor: Optional[torch.Tensor] = None,
 ) -> None:
     """Commit accepted per-step mamba states into the persistent caches.
 
@@ -870,7 +881,11 @@ def commit_mamba_states_after_verify(
         and getattr(mamba_pool, "replayssm_spec_fold", False)
         and not getattr(mamba_pool, "replayssm_is_kda", False)
     ):
-        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+        if (
+            batch.forward_mode.is_idle()
+            or accept_index is None
+            or accept_index.numel() == 0
+        ):
             return
         from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
             commit_gdn_replayssm_fold_after_verify,
@@ -900,7 +915,11 @@ def commit_mamba_states_after_verify(
         and getattr(mamba_pool, "replayssm_cache_base", None) is not None
         and not getattr(mamba_pool, "replayssm_is_kda", False)
     ):
-        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+        if (
+            batch.forward_mode.is_idle()
+            or accept_index is None
+            or accept_index.numel() == 0
+        ):
             return
         from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
             commit_gdn_replayssm_spec,
@@ -956,7 +975,11 @@ def commit_mamba_states_after_verify(
         and getattr(mamba_pool, "replayssm_spec_fold", False)
         and getattr(mamba_pool, "replayssm_is_kda", False)
     ):
-        if batch.forward_mode.is_idle() or accept_index.numel() == 0:
+        if (
+            batch.forward_mode.is_idle()
+            or accept_index is None
+            or accept_index.numel() == 0
+        ):
             return
         from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
             commit_kda_replayssm_after_verify,
@@ -1011,7 +1034,7 @@ def commit_mamba_states_after_verify(
 
     bs = accept_lens.shape[0]
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
-    if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
+    if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:
         last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
             batch=batch,
             accept_index=accept_index,
@@ -1020,11 +1043,27 @@ def commit_mamba_states_after_verify(
         )
 
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
-            attn_backend.update_mamba_state_after_mtp_verify(
+            if scratch_source_indices_tensor is not None:
+                scratch_source_indices_tensor = scratch_source_indices_tensor[:bs]
+            commit_kwargs = dict(
                 last_correct_step_indices=last_correct_step_indices,
                 mamba_track_indices=batch.mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=model_runner.model,
+                req_pool_indices=batch.req_pool_indices[:bs],
+            )
+            if state_indices_tensor is not None:
+                commit_kwargs["state_indices_tensor"] = state_indices_tensor
+            if scratch_source_indices_tensor is not None:
+                commit_kwargs["conv_source_indices_tensor"] = (
+                    scratch_source_indices_tensor
+                )
+            attn_backend.update_mamba_state_after_mtp_verify(**commit_kwargs)
+        elif hasattr(model_runner.model, "update_conv_state_after_mtp_verify"):
+            # Models whose conv layers bypass the attention-backend wrapper
+            # (Inkling) own the commit themselves.
+            model_runner.model.update_conv_state_after_mtp_verify(
+                req_to_token_pool=model_runner.req_to_token_pool,
                 req_pool_indices=batch.req_pool_indices[:bs],
             )
 

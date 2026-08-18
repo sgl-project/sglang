@@ -17,9 +17,11 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     CommitKvProj,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -33,7 +35,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4DecoderLayer,
@@ -552,10 +553,11 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
                 raise ValueError(
                     "DSpark needs target layers for the target-hidden projection."
                 )
-            self.main_proj = ReplicatedLinear(
+            self.main_proj = ColumnParallelLinear(
                 config.hidden_size * num_target_layers,
                 config.hidden_size,
                 bias=False,
+                gather_output=True,
                 quant_config=quant_config,
                 prefix=add_prefix("main_proj", prefix),
             )
@@ -742,6 +744,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.norm_eps = float(config.rms_norm_eps)
         self.hc_eps = float(config.hc_eps)
 
+        self.pp_group = get_pp_group()
         if self.uses_own_vocab_modules:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -756,7 +759,17 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 use_attn_tp_group=get_parallel().enable_dp_lm_head,
             )
         else:
-            self.embed_tokens: Optional[nn.Module] = None
+            if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
+                # Under PP the draft runs only on the last rank while the
+                # target's embed_tokens lives on the first rank; build a local
+                # copy here and load it from the draft checkpoint.
+                self.embed_tokens = VocabParallelEmbedding(
+                    config.vocab_size,
+                    config.hidden_size,
+                    enable_tp=not is_dp_attention_enabled(),
+                )
+            else:
+                self.embed_tokens: Optional[nn.Module] = None
             self.lm_head: Optional[nn.Module] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
         self._opt_markov_w2_tp_shard = envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
@@ -768,12 +781,22 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         return self.confidence_head is not None
 
     def attach_shared_modules(
-        self, *, embed_tokens: nn.Module, lm_head: nn.Module
+        self,
+        *,
+        embed_tokens: Optional[nn.Module],
+        lm_head: nn.Module,
     ) -> None:
-        if not self.uses_own_vocab_modules:
-            self.embed_tokens = embed_tokens
-            self.lm_head = lm_head
+        # lm_head is always shared from the target (real ParallelLMHead with
+        # shard attributes on every supported path).
+        self.lm_head = lm_head
         self.markov_head.configure_tp_shard(lm_head=self.lm_head)
+        if embed_tokens is not None:
+            # Non-PP: replace the draft-built embed with the shared target embed
+            # and release the draft-built weight to avoid holding two copies.
+            del self.embed_tokens
+            self.embed_tokens = embed_tokens
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     def project_target_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
         stage0 = self.stages[0]
@@ -997,7 +1020,11 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             )
 
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:
-        if name.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
+        if name.startswith(("head.", "lm_head.")):
+            return None
+        if name.startswith(("embed.", "embed_tokens.")):
+            if self.pp_group.world_size > 1 and self.pp_group.is_last_rank:
+                return "embed_tokens.weight"
             return None
         if "rotary_emb.inv_freq" in name:
             return None

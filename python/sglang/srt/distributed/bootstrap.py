@@ -129,11 +129,17 @@ def init_torch_distributed(
         ):
             _prewarm_tp_lm_head_all_to_all()
 
+    # When pipeline parallelism is enabled, the draft model should use the TP
+    # communication group of its PP rank rather than the world group.
+    if is_draft_worker and ps.pp_size > 1:
+        sync_group = get_tp_group()
+    else:
+        sync_group = get_world_group()
     pre_model_load_memory = get_available_gpu_memory(
         device,
         ps.gpu_id,
-        distributed=get_world_group().world_size > 1,
-        cpu_group=get_world_group().cpu_group,
+        distributed=sync_group.world_size > 1,
+        cpu_group=sync_group.cpu_group,
     )
     tp_group = get_tp_group()
     pp_group = get_pp_group()
