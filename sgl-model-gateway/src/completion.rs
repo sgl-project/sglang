@@ -101,8 +101,9 @@ fn format_token_ids(token_ids: &[i32]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn accepts_and_round_trips_all_completion_prompt_shapes() {
