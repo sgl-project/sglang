@@ -345,6 +345,14 @@ def build_routes(
             num_local_experts=num_local_experts,
             max_loras=max_loras,
             block_size=gate_up_a_block_size,
+            # PDL edges are positional: gdc_wait pairs with whatever grid
+            # launched previously on the stream, so an armed chain is only
+            # as correct as its launch order. Under the joint builder this
+            # build is an insertion right behind the joint triple's own
+            # armed chain -- a neighbor pairing no off/on twin has measured
+            # -- so it runs fully ordered. Under the standard builder it is
+            # part of the measured sequence and takes the architecture
+            # default.
             use_pdl=(
                 use_pdl if plan.route_builder is RouteBuilderFamily.STANDARD else False
             ),
@@ -388,6 +396,7 @@ def build_routes(
             num_local_experts=num_local_experts,
             max_loras=max_loras,
             block_size=block_size,
+            # Same positional-pairing rule as the gate/up-A build above.
             use_pdl=(
                 use_pdl if plan.route_builder is RouteBuilderFamily.STANDARD else False
             ),
