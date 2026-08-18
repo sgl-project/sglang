@@ -3,14 +3,9 @@ shrink.
 
 ``models/`` and ``layers/`` read parallel topology through
 ``get_parallel().<dim>`` (the read-through wrapper in ``runtime_context``),
-which gives one import, one naming scheme, and the scoped ``override()``
-test primitive. Direct calls to the ``parallel_state`` size/rank getters in
-these directories are regressions against that sweep.
-
-Exemptions, pinned by path: ``runtime_context.py`` and
-``layers/dp_attention.py`` are delegation substrate, while
-``layers/dcp/comm.py`` retains deprecated DCP compatibility shims for
-out-of-tree callers. Sweeping an exempt path must remove it from the pin.
+which gives one import, one naming scheme, and the scoped ``override()`` test
+primitive. Exemptions are pinned in ``_EXEMPT``, each with its reason; sweeping
+one must remove it from there.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
