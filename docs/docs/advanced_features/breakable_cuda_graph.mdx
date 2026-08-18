@@ -30,10 +30,10 @@ This mode is intended for debugging only — it eliminates the performance benef
 
 ### Selective Graph Breaks in Model Code
 
-For production use, you can mark specific functions as "non-graphable" using the `@no_graph` decorator from the upstream [`piecewise_cuda_graphs`](https://github.com/meta-pytorch/piecewise-cuda-graphs) package. During CUDA graph capture, these functions run eagerly between captured graph segments. Outside of capture, they behave normally.
+For production use, you can mark specific functions as "non-graphable" using the `@no_graph` decorator from the upstream [`breakable_cuda_graphs`](https://github.com/meta-pytorch/breakable-cuda-graphs) package. During CUDA graph capture, these functions run eagerly between captured graph segments. Outside of capture, they behave normally.
 
 ```python
-from piecewise_cuda_graphs import no_graph
+from breakable_cuda_graphs import no_graph
 
 @no_graph(enable=True)
 def my_dynamic_op(x, out):
@@ -45,7 +45,7 @@ def my_dynamic_op(x, out):
 You can also insert a bare graph break (no computation) using the `force_no_graph()` helper:
 
 ```python
-from piecewise_cuda_graphs import force_no_graph
+from breakable_cuda_graphs import force_no_graph
 
 def forward(self, x):
     x = self.layer1(x)
@@ -93,7 +93,7 @@ python -m sglang.launch_server \
 
 ## How It Works
 
-> The segmented capture/replay engine described below now lives in the PyTorch upstream [`piecewise_cuda_graphs`](https://github.com/meta-pytorch/piecewise-cuda-graphs) package; SGLang calls into it rather than maintaining its own copy. The mechanics are analogous.
+> The segmented capture/replay engine described below now lives in the PyTorch upstream [`breakable_cuda_graphs`](https://github.com/meta-pytorch/breakable-cuda-graphs) package; SGLang calls into it rather than maintaining its own copy. The mechanics are analogous.
 
 ### Capture
 
@@ -172,8 +172,8 @@ For typical use cases with a small number of graph breaks, the overhead is negli
   </thead>
   <tbody>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>piecewise_cuda_graphs</code> (<a href="https://github.com/meta-pytorch/piecewise-cuda-graphs">PyPI package</a>)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Core segmented capture/replay engine: <code>CUDAGraphSequence</code>, <code>piecewise_graph</code>, <code>no_graph</code></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>breakable_cuda_graphs</code> (<a href="https://github.com/meta-pytorch/breakable-cuda-graphs">PyPI package</a>)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Core segmented capture/replay engine: <code>CUDAGraphSequence</code>, <code>breakable_graph</code>, <code>no_graph</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/context.py</code></td>

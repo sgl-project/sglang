@@ -4,7 +4,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
-from piecewise_cuda_graphs import no_graph
+from breakable_cuda_graphs import no_graph
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs

@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 import torch
 import torch.nn as nn
-from piecewise_cuda_graphs import no_graph
+from breakable_cuda_graphs import no_graph
 from safetensors.torch import safe_open
 
 from sglang.kernels.ops.activation.activation import (

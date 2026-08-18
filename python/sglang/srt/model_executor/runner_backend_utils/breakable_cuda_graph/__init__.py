@@ -1,7 +1,7 @@
 """Breakable CUDA graph runtime state.
 
 The segmented-capture engine now lives in the PyTorch upstream
-``piecewise_cuda_graphs`` package (CUDAGraphSequence / piecewise_graph /
+``breakable_cuda_graphs`` package (CUDAGraphSequence / breakable_graph /
 no_graph / force_no_graph); this package only carries sglang's breakable
 backend-routing flag:
   - enable_breakable_cuda_graph — context that flips the Breakable runtime flag

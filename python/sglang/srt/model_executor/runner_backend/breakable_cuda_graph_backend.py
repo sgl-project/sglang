@@ -15,7 +15,7 @@
 markers (``no_graph`` decorators on attention / mamba layers), no torch.compile.
 
 Segment capture/replay is delegated to the PyTorch upstream
-``piecewise_cuda_graphs`` package (``CUDAGraphSequence`` + ``piecewise_graph``).
+``breakable_cuda_graphs`` package (``CUDAGraphSequence`` + ``breakable_graph``).
 The session-wide ``enable_breakable_cuda_graph`` routing flag is sglang's own;
 see its docstring in ``runner_backend_utils/breakable_cuda_graph/context.py``.
 """
@@ -26,7 +26,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
-from piecewise_cuda_graphs import CUDAGraphSequence, no_graph, piecewise_graph
+from breakable_cuda_graphs import CUDAGraphSequence, breakable_graph, no_graph
 
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
@@ -121,7 +121,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         size = shape_key.size
         if self._shared_output_buffer is None:
             self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
-        with piecewise_graph(graph, stream=self._capture_stream):
+        with breakable_graph(graph, stream=self._capture_stream):
             out = captured_fn()
             out_rows = self._output_rows(out, size)
             self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)

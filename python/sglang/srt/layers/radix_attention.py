@@ -21,7 +21,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from piecewise_cuda_graphs import no_graph
+from breakable_cuda_graphs import no_graph
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op

@@ -21,7 +21,7 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from piecewise_cuda_graphs import no_graph
+from breakable_cuda_graphs import no_graph
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.kernels.ops.attention.dsv4 import (

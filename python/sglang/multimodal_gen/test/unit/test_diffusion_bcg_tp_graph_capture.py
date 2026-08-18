@@ -182,7 +182,7 @@ class TestBCGTPGraphCapture(CustomTestCase):
             _recording_context(events, "bcg_enable"),
         ), patch.object(
             runner_mod,
-            "piecewise_graph",
+            "breakable_graph",
             _recording_context(events, "bcg_capture"),
         ):
             runner._capture(kwargs, key=runner_mod._signature_kwargs(kwargs))

@@ -6,7 +6,7 @@ import re
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
-from piecewise_cuda_graphs import no_graph
+from breakable_cuda_graphs import no_graph
 from torch import nn
 
 from sglang.srt.configs.inkling import (

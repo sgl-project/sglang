@@ -4,7 +4,7 @@ Subpackages:
   - breakable_cuda_graph: sglang's breakable backend-routing flag
     (enable_breakable_cuda_graph / is_in_breakable_cuda_graph) plus the
     generic cuda_utils helper. The segment-capture engine itself is the
-    PyTorch upstream ``piecewise_cuda_graphs`` package.
+    PyTorch upstream ``breakable_cuda_graphs`` package.
   - tc_piecewise_cuda_graph: shared piecewise context manager
     (set_tc_piecewise_forward_context, is_in_tc_piecewise_cuda_graph).
 

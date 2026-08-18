@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
-from piecewise_cuda_graphs import no_graph
+from breakable_cuda_graphs import no_graph
 
 from sglang.kernels.ops.kvcache.trtllm_mha_graph_metadata import (
     update_trtllm_mha_graph_metadata,

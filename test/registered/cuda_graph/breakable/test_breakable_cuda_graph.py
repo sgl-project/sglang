@@ -4,7 +4,7 @@ TestBreakableCudaGraph: integration test — spin up Qwen3-8B with
 --cuda-graph-backend-prefill=breakable and check mgsm_en accuracy.
 
 The capture/replay mechanism itself now lives in the upstream
-piecewise_cuda_graphs library (CUDAGraphSequence / piecewise_graph / no_graph);
+breakable_cuda_graphs library (CUDAGraphSequence / breakable_graph / no_graph);
 its internals are covered by that library's own tests, not here.
 """
 

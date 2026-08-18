@@ -36,7 +36,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from piecewise_cuda_graphs import CUDAGraphSequence, piecewise_graph
+from breakable_cuda_graphs import CUDAGraphSequence, breakable_graph
 
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     replay_token_scope,
@@ -481,7 +481,7 @@ class BaseBreakableCudaGraphRunner:
         graph = CUDAGraphSequence(pool=self._pool)
         with self._tp_graph_capture():
             with enable_breakable_cuda_graph():
-                with piecewise_graph(graph, stream=self._capture_stream):
+                with breakable_graph(graph, stream=self._capture_stream):
                     output = self.transformer(**static_kwargs)
         self.device_module.synchronize()
 

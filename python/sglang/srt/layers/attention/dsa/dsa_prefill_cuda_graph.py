@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from piecewise_cuda_graphs import no_graph
+from breakable_cuda_graphs import no_graph
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.model_executor.forward_context import get_attn_backend

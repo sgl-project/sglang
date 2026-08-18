@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from piecewise_cuda_graphs import no_graph
+from breakable_cuda_graphs import no_graph
 
 from sglang.kernels.ops.kvcache.cache_ops import absorbed_bmm_concat_cast_q_fp8
 from sglang.kernels.ops.quantization.fp8_kernel import (

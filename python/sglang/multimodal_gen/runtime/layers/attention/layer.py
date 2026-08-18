@@ -9,7 +9,7 @@ from typing import Type
 
 import torch
 import torch.nn as nn
-from piecewise_cuda_graphs import no_graph
+from breakable_cuda_graphs import no_graph
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
