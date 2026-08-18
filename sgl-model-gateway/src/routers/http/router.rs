@@ -198,9 +198,29 @@ impl Router {
         route: &'static str,
         model_id: Option<&str>,
     ) -> Response {
+        let request_text = Some(typed_req.extract_text_for_routing());
+        self.route_typed_request_with_routing_text(
+            headers,
+            typed_req,
+            route,
+            model_id,
+            request_text,
+        )
+        .await
+    }
+
+    async fn route_typed_request_with_routing_text<
+        T: GenerationRequest + serde::Serialize + Clone,
+    >(
+        &self,
+        headers: Option<&HeaderMap>,
+        typed_req: &T,
+        route: &'static str,
+        model_id: Option<&str>,
+        request_text: Option<String>,
+    ) -> Response {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
-        let text = typed_req.extract_text_for_routing();
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
         let endpoint = route_to_endpoint(route);
 
@@ -219,7 +239,14 @@ impl Router {
             // operation per attempt
             |_: u32| async {
                 let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .route_typed_request_once(
+                        headers,
+                        typed_req,
+                        route,
+                        model_id,
+                        is_stream,
+                        request_text.as_deref(),
+                    )
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
@@ -277,10 +304,10 @@ impl Router {
         route: &'static str,
         model_id: Option<&str>,
         is_stream: bool,
-        text: &str,
+        request_text: Option<&str>,
     ) -> Response {
         let worker = match self
-            .select_worker_for_model(model_id, Some(text), headers)
+            .select_worker_for_model(model_id, request_text, headers)
             .await
         {
             Some(w) => w,
@@ -772,8 +799,14 @@ impl RouterTrait for Router {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
-            .await
+        self.route_typed_request_with_routing_text(
+            headers,
+            body,
+            "/v1/completions",
+            model_id,
+            body.first_prompt_for_routing(),
+        )
+        .await
     }
 
     async fn route_responses(

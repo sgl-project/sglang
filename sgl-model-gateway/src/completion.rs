@@ -65,10 +65,10 @@ impl CompletionRequest {
                 StringOrArray::String(prompt) => Some(prompt.clone()),
                 StringOrArray::Array(prompts) => prompts.first().cloned(),
             },
-            Self::TokenIds(request) => match &request.prompt {
-                InputIds::Single(token_ids) => Some(format_token_ids(token_ids)),
-                InputIds::Batch(prompts) => prompts.first().map(|ids| format_token_ids(ids)),
-            },
+            // The current cache-aware policy matches character prefixes. Rendering
+            // token IDs as text would create false matches between unrelated token
+            // sequences, so token-ID requests use the no-request-text fallback.
+            Self::TokenIds(_) => None,
         }
     }
 }
@@ -88,15 +88,6 @@ impl GenerationRequest for CompletionRequest {
     fn extract_text_for_routing(&self) -> String {
         self.first_prompt_for_routing().unwrap_or_default()
     }
-}
-
-fn format_token_ids(token_ids: &[i32]) -> String {
-    let mut rendered = String::from("token_ids:");
-    for token_id in token_ids {
-        rendered.push(' ');
-        rendered.push_str(&token_id.to_string());
-    }
-    rendered
 }
 
 #[cfg(test)]
@@ -143,5 +134,42 @@ mod tests {
 
         assert_eq!(single.batch_size(), None);
         assert_eq!(batch.batch_size(), Some(2));
+    }
+
+    #[test]
+    fn preserves_text_prompt_routing_behavior() {
+        let single: CompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "prompt": "shared text prefix"
+        }))
+        .unwrap();
+        let batch: CompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "prompt": ["first prompt", "second prompt"]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            single.first_prompt_for_routing().as_deref(),
+            Some("shared text prefix")
+        );
+        assert_eq!(
+            batch.first_prompt_for_routing().as_deref(),
+            Some("first prompt")
+        );
+    }
+
+    #[test]
+    fn token_id_prompts_do_not_create_text_routing_keys() {
+        for prompt in [json!([1]), json!([2]), json!([[1, 2], [3, 4]])] {
+            let request: CompletionRequest = serde_json::from_value(json!({
+                "model": "test-model",
+                "prompt": prompt
+            }))
+            .unwrap();
+
+            assert_eq!(request.first_prompt_for_routing(), None);
+            assert_eq!(request.extract_text_for_routing(), "");
+        }
     }
 }

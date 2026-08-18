@@ -1782,6 +1782,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_completion_token_id_batch_semantics() {
+        let single: CompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "prompt": [1, 2, 3]
+        }))
+        .expect("valid single token-ID prompt");
+        let batch: CompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "prompt": [[1, 2], [3, 4]]
+        }))
+        .expect("valid batched token-ID prompt");
+
+        assert_eq!(PDRouter::get_completion_batch_size(&single), None);
+        assert_eq!(PDRouter::get_completion_batch_size(&batch), Some(2));
+        assert_eq!(single.first_prompt_for_routing(), None);
+        assert_eq!(batch.first_prompt_for_routing(), None);
+    }
+
     #[tokio::test]
     async fn test_select_healthy_prefill_worker() {
         let router = create_test_pd_router();
