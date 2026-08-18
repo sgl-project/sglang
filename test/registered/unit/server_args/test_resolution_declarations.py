@@ -15,6 +15,7 @@ see.
 """
 
 import ast
+import copy
 import dataclasses
 import json
 import os
@@ -22,8 +23,11 @@ import pathlib
 import shutil
 import tempfile
 import unittest
+import unittest.mock
 
 import sglang
+from sglang.srt import server_args as server_args_module
+from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -203,6 +207,36 @@ def _stash_overlay(server_args):
     return overlay
 
 
+def _live_topology_leaves():
+    """Names `ParallelContext` serves from the live topology, not the config.
+
+    Read out of the class: each shadowed name arrives as `self._v("<name>",
+    <getter>)`. Inferring them from "did the read raise" is wrong -- it only
+    raises while the process groups are missing, so in a process where an
+    earlier test built them the property answers the *live* size and a leaf
+    check reads it as a config mismatch (`parallel.tp_size: bag=1
+    resolution=2`). Whether they are shadowed is a property of the class, not
+    of the process.
+    """
+    tree = ast.parse((_SRT / "runtime_context.py").read_text(encoding="utf-8-sig"))
+    parallel = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "ParallelContext"
+    )
+    names = set()
+    for node in ast.walk(parallel):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_v"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        ):
+            names.add(node.args[0].value)
+    return frozenset(names)
+
+
 class TestResolutionDeclarations(CustomTestCase):
     def setUp(self):
         # Resolution writes environment variables, and those outlive the
@@ -274,6 +308,224 @@ class TestResolutionDeclarations(CustomTestCase):
             "projection would answer with the unresolved value:\n  "
             + "\n  ".join(unexplained),
         )
+
+    def test_the_projection_input_is_the_resolved_configuration(self):
+        """What the bags are built from equals what the record ends up holding.
+
+        The projection reads `raw input + declarations` rather than the
+        fields, so that it keeps working when the declarations stop
+        materializing. While they still do, the two have to agree leaf for
+        leaf -- a difference means the projection would publish something the
+        record does not say, which is the failure this whole transition is
+        meant to avoid.
+        """
+        from sglang.srt.arg_groups.arg_utils import namespace_of
+        from sglang.srt.arg_groups.overrides import resolution_result
+
+        differences = []
+        for shape in _SHAPES:
+            server_args = self._resolve(shape)
+            for field in namespace_of(type(server_args)):
+                projected = resolution_result(server_args, field)
+                on_record = getattr(server_args, field)
+                if projected != on_record:
+                    differences.append(
+                        f"{shape} -> {field}: projection={projected!r} "
+                        f"record={on_record!r}"
+                    )
+        self.assertEqual(
+            differences,
+            [],
+            "the projection and the record disagree about a config leaf:\n  "
+            + "\n  ".join(differences),
+        )
+
+    def test_every_published_leaf_is_what_resolution_decided(self):
+        """One hop further than the check above: the leaf a reader reads.
+
+        The projection's *input* agreeing with the record says nothing about
+        the last hop: whether the leaf is reachable through the path the
+        metadata declares, and whether it carries the resolved value once it
+        is. Both sides here come from that metadata, so this cannot tell that
+        a field is assigned to the *wrong* group -- the readers are the
+        independent source for that, and
+        `test_server_args_namespaces.py::test_the_readers_agree_with_the_namespace_metadata`
+        is where the two are compared.
+        """
+        import sglang.srt.runtime_context as runtime_context
+        from sglang.srt.arg_groups.arg_utils import namespace_of
+        from sglang.srt.arg_groups.overrides import resolution_result
+        from sglang.srt.runtime_context import publish, reset_context
+
+        mapping = namespace_of(ServerArgs)
+        self.assertGreater(len(mapping), 400, "the namespace mapping collapsed")
+
+        shadowed = _live_topology_leaves()
+        self.assertGreaterEqual(
+            shadowed
+            & {
+                "tp_size",
+                "pp_size",
+                "moe_dp_size",
+                "attn_cp_size",
+                "dcp_size",
+            },
+            {"tp_size", "pp_size", "moe_dp_size", "attn_cp_size", "dcp_size"},
+            "a parallel size stopped being served from the live topology; if it "
+            "is a plain config leaf now, it belongs in the comparison below",
+        )
+
+        compared = 0
+        unreachable, mismatched = [], []
+        for shape in _SHAPES:
+            self.addCleanup(reset_context)
+            server_args = self._resolve(shape)
+            publish(server_args, role="scheduler")
+            for field, path in mapping.items():
+                if field in shadowed:
+                    # Served from the process groups by design; `configured_*()`
+                    # is what answers with the configured value, and
+                    # test_launch_path_reads_configured_sizes pins that.
+                    continue
+                groups = path.split(".")
+                accessor = getattr(runtime_context, f"get_{groups[0]}", None)
+                if accessor is None:
+                    unreachable.append(f"no get_{groups[0]}() for {path}.{field}")
+                    continue
+                node = accessor()
+                try:
+                    for group in groups[1:]:
+                        node = getattr(node, group)
+                    leaf = getattr(node, field)
+                except Exception as exc:
+                    unreachable.append(f"{path}.{field}: {type(exc).__name__}: {exc}")
+                    continue
+                decided = resolution_result(server_args, field)
+                compared += 1
+                if leaf is not decided and leaf != decided:
+                    mismatched.append(
+                        f"{shape} -> {path}.{field}: bag={leaf!r} resolution={decided!r}"
+                    )
+            reset_context()
+        self.assertEqual(
+            unreachable,
+            [],
+            "these leaves are mapped to a namespace that cannot serve them, so "
+            "a reader following the mapping raises:\n  " + "\n  ".join(unreachable),
+        )
+        self.assertEqual(
+            mismatched,
+            [],
+            "the published leaf and the resolution result disagree:\n  "
+            + "\n  ".join(mismatched),
+        )
+        self.assertGreater(
+            compared, 2000, f"only {compared} leaves were compared; the walk broke"
+        )
+
+    def test_a_child_that_received_the_record_publishes_the_same_bags(self):
+        """A forked worker gets the record by pickle, and re-projects from it.
+
+        Every process publishes, so a child's bags are only right if the
+        declarations travelled with the object -- and the gate has to hold on
+        the far side, or the child re-runs handlers over their own output. The
+        parent's bags are the reference: this is the multi-process half of the
+        projection, and nothing else exercises it.
+        """
+        import pickle
+
+        import sglang.srt.runtime_context as runtime_context
+        from sglang.srt.arg_groups.arg_utils import namespace_of
+        from sglang.srt.runtime_context import publish, reset_context
+
+        mapping = namespace_of(ServerArgs)
+
+        def leaves():
+            out = {}
+            for field, path in mapping.items():
+                groups = path.split(".")
+                accessor = getattr(runtime_context, f"get_{groups[0]}", None)
+                if accessor is None:
+                    continue
+                node = accessor()
+                try:
+                    for group in groups[1:]:
+                        node = getattr(node, group)
+                    out[f"{path}.{field}"] = repr(getattr(node, field))
+                except Exception:
+                    continue
+            return out
+
+        for shape in _SHAPES:
+            self.addCleanup(reset_context)
+            parent = self._resolve(shape)
+            publish(parent, role="scheduler")
+            expected = leaves()
+
+            blob = pickle.dumps(parent)
+            reset_context()
+            child = pickle.loads(blob)
+            entered = []
+            original = ServerArgs._run_resolution_pipeline
+
+            def counted(self, _original=original):
+                entered.append(1)
+                return _original(self)
+
+            with unittest.mock.patch.object(
+                ServerArgs, "_run_resolution_pipeline", counted
+            ):
+                publish(child, role="scheduler")
+            self.assertEqual(
+                entered,
+                [],
+                f"{shape}: the child resolved again, so its handlers ran over "
+                "the parent's output",
+            )
+            differences = {
+                key: (expected[key], value)
+                for key, value in leaves().items()
+                if expected.get(key) != value
+            }
+            self.assertEqual(
+                differences,
+                {},
+                f"{shape}: the child published different values than the "
+                f"parent: {differences}",
+            )
+            reset_context()
+
+    def test_late_resolution_reaches_the_projection(self):
+        """Resolution staged after `__post_init__` is still resolution.
+
+        The parser detection and the LoRA normalization run at launcher stage --
+        they need a tokenizer, a chat template, an adapter directory -- and they
+        write through `declare_late_resolution`. If those writes only reached
+        the fields, the bags would describe the *unresolved* value: a server
+        launched with `--reasoning-parser auto` would advertise and apply
+        `auto` after detection had already replaced it.
+
+        A real model path, not the dummy one: a dummy record never materializes,
+        so its `resolve_once` re-runs and re-snapshots the raw input from
+        already-late-resolved fields, which hides exactly this.
+        """
+        from sglang.srt.arg_groups.overrides import declare_late_resolution
+        from sglang.srt.runtime_context import get_serving, publish, reset_context
+
+        server_args = self._resolve({"reasoning_parser": "auto"})
+        self.addCleanup(reset_context)
+        declare_late_resolution(
+            server_args, "template-detection", reasoning_parser="qwen3"
+        )
+        self.assertEqual(
+            resolution_result(server_args, "reasoning_parser"),
+            "qwen3",
+            "the projection still reports what the caller asked for, so the "
+            "bags would publish an unresolved parser",
+        )
+        publish(server_args, role="tokenizer")
+        self.assertEqual(get_serving().reasoning_parser, "qwen3")
+        self.assertEqual(server_args.reasoning_parser, get_serving().reasoning_parser)
 
     def test_the_stash_agrees_with_the_fields_it_declared(self):
         mismatches = []
@@ -362,6 +614,90 @@ class TestResolutionDeclarations(CustomTestCase):
             + "\n  ".join(inversions),
         )
 
+    def test_a_nested_resolution_decision_reaches_the_bags(self):
+        """Resolution also decides *inside* a declared object.
+
+        The graph sizing writes `cuda_graph_config.decode.max_bs` through the
+        object the parse step declared -- no field is assigned, so nothing
+        records it. It reaches the bags because the stash holds that same
+        object; a copy taken when it was declared would publish the `None` the
+        parse step declared while the process runs with a real batch size.
+        """
+        from sglang.srt.runtime_context import get_exec, publish, reset_context
+
+        server_args = self._resolve({"disaggregation_mode": "prefill"})
+        self.addCleanup(reset_context)
+        # Snapshot before publishing: the bag serves the very object the record
+        # holds, so comparing them after the fact compares an object with
+        # itself and passes however the projection behaves.
+        expected = copy.deepcopy(server_args.cuda_graph_config)
+        publish(server_args, role="scheduler")
+        published = get_exec().graph.cuda_graph_config
+        resolved = expected
+        self.assertIsNotNone(
+            published.decode.max_bs,
+            "the published graph config carries the batch size the parse step "
+            "declared, not the one the sizing handler decided",
+        )
+        self.assertEqual(
+            (
+                published.decode.max_bs,
+                published.decode.backend,
+                published.prefill.max_bs,
+                published.prefill.backend,
+            ),
+            (
+                resolved.decode.max_bs,
+                resolved.decode.backend,
+                resolved.prefill.max_bs,
+                resolved.prefill.backend,
+            ),
+            "the bags and the record disagree about the graph configuration, "
+            "so a decision made inside the declared object was dropped",
+        )
+
+    def test_every_platform_hook_that_takes_the_record_is_captured(self):
+        """A second out-of-tree config hook must not arrive uncaptured.
+
+        `apply_server_args_defaults` is the one method on the platform
+        interface that is handed the record, and its implementations live in
+        other distributions -- no source scan of this tree can see what they
+        write, so the pipeline diffs the record across the call instead. A new
+        hook of the same shape would be invisible again, and this is what
+        notices. Derived from the interface rather than listed: a rename keeps
+        working, an addition fails.
+        """
+        interface = _SRT / "platforms" / "interface.py"
+        tree = ast.parse(interface.read_text(encoding="utf-8-sig"))
+        taking_the_record = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            arguments = node.args
+            names = [
+                arg.arg
+                for arg in arguments.posonlyargs + arguments.args + arguments.kwonlyargs
+            ]
+            if any(name == "server_args" or name.endswith("_args") for name in names):
+                taking_the_record.add(node.name)
+        self.assertEqual(
+            taking_the_record,
+            {"apply_server_args_defaults"},
+            "the platform interface hands the startup record to a method this "
+            "test does not know about; either it only reads, or its writes need "
+            "capturing like apply_server_args_defaults",
+        )
+
+        pipeline = (_SRT / "server_args.py").read_text(encoding="utf-8-sig")
+        for hook in sorted(taking_the_record):
+            self.assertIn(
+                f"current_platform.{hook},",
+                pipeline,
+                f"{hook} is called directly instead of through the write "
+                "capture, so an out-of-tree plugin's defaults would be dropped "
+                "by the projection",
+            )
+
     def test_the_shapes_reach_the_fields_they_are_meant_to(self):
         """A green agreement check over an empty stash would prove nothing."""
         declared = set()
@@ -374,6 +710,41 @@ class TestResolutionDeclarations(CustomTestCase):
             "the shapes no longer reach these converted fields, so the "
             "agreement check silently stopped covering them:\n  "
             + "\n  ".join(missing),
+        )
+
+    def test_a_platform_plugin_default_reaches_the_projection(self):
+        """An out-of-tree platform writes the fields; the diff declares them.
+
+        The plugin interface is not ours to convert -- implementations live in
+        other distributions -- so its writes are captured rather than declared.
+        Without the capture the projection falls through to the raw snapshot,
+        which was taken before the plugin ran, and publishes the value the
+        plugin overrode.
+        """
+
+        # The pipeline asks the platform other questions on the way through
+        # (whether it is out of tree, whether it supports piecewise capture),
+        # and which of those it reaches depends on the host.
+        class _Plugin(type(server_args_module.current_platform)):
+            device_name = "oot"
+
+            def apply_server_args_defaults(self, server_args):
+                server_args.attention_backend = "triton"
+                server_args.schedule_conservativeness = 0.5
+
+        with unittest.mock.patch.object(
+            server_args_module, "current_platform", _Plugin()
+        ):
+            server_args = self._resolve({})
+        self.assertEqual(
+            (
+                resolution_result(server_args, "attention_backend"),
+                resolution_result(server_args, "schedule_conservativeness"),
+            ),
+            ("triton", 0.5),
+            "the platform plugin's defaults did not reach the resolution "
+            "result, so the projection publishes what the operator passed "
+            "instead of what the platform decided",
         )
 
 
