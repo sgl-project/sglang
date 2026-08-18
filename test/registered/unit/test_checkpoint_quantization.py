@@ -2,7 +2,7 @@
 
 import unittest
 
-from sglang.checkpoint_quantization import (
+from sglang.srt.model_loader.checkpoint_quantization import (
     CheckpointQuantSpec,
     canonicalize_modelopt_quant_algo,
     resolve_checkpoint_quant_spec,
