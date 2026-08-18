@@ -71,6 +71,22 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _ordered_gguf_shard_ids(shard_ids: list) -> list:
+    """Return checkpoint shards in the fused layer's logical output order."""
+    if not shard_ids:
+        return []
+    if all(isinstance(shard_id, int) for shard_id in shard_ids):
+        expected = set(range(len(shard_ids)))
+        if len(set(shard_ids)) != len(shard_ids) or set(shard_ids) != expected:
+            raise ValueError(f"Invalid GGUF merged shard IDs: {shard_ids}")
+        return sorted(shard_ids)
+    if "q" in shard_ids:
+        if len(shard_ids) != 3 or set(shard_ids) != {"q", "k", "v"}:
+            raise ValueError(f"Invalid GGUF QKV shard IDs: {shard_ids}")
+        return ["q", "k", "v"]
+    return list(shard_ids)
+
+
 class GGUFConfig(QuantizationConfig):
     """Config class for GGUF."""
 
@@ -417,16 +433,20 @@ class GGUFLinearMethod(LinearMethodBase):
             )
             # (dim0_start, dim0_end, dim1_size)
             shard_offset_map = dict[str, tuple[int, int, int]]()
-            for idx in shard_id:
+            ordered_shard_ids = _ordered_gguf_shard_ids(shard_id)
+            cursor = 0
+            for idx in ordered_shard_ids:
                 id_in_container = shard_id_map[idx]
-                start = sum(x.size(0) for x in data_container[:id_in_container])
+                start = cursor
                 end = start + data_container[id_in_container].size(0)
                 size = data_container[id_in_container].size(1)
                 padded_data[start:end, :size] = data_container[id_in_container]
                 shard_offset_map[idx] = (start, end, size)
+                cursor = end
             qweight.data_container.clear()
             padded_param = Parameter(padded_data, requires_grad=False)
             set_weight_attrs(padded_param, vars(qweight))
+            padded_param.shard_id = ordered_shard_ids
             set_weight_attrs(padded_param, {"shard_offset_map": shard_offset_map})
             layer.register_parameter("qweight", padded_param)
 
@@ -440,7 +460,7 @@ class GGUFLinearMethod(LinearMethodBase):
 
         if shard_id:
             # dequantize shard weights respectively
-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+            shard_id = _ordered_gguf_shard_ids(shard_id)
             qweight = layer.qweight
             result = []
             for idx in shard_id:

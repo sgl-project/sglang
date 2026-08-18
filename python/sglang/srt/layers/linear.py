@@ -267,6 +267,14 @@ class ReplicatedLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            param.weight_type = loaded_weight.item()
+
+        if is_gguf_weight and isinstance(param, UninitializedParameter):
+            param.materialize(tuple(loaded_weight.shape), dtype=loaded_weight.dtype)
+
         # The per-tensor quant-scale must be 1 dimension
         if _is_npu:
             if param.size() != loaded_weight.size() and param.size(0) == 1:

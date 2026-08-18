@@ -123,6 +123,7 @@ LOAD_FORMAT_CHOICES = [
     "sharded_state",
     "presharded",
     "gguf",
+    "expert_pack",
     "bitsandbytes",
     "mistral",
     "layered",

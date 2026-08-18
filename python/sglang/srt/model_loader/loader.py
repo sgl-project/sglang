@@ -4347,6 +4347,11 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.GGUF:
         return GGUFModelLoader(load_config)
 
+    if load_config.load_format == LoadFormat.EXPERT_PACK:
+        from sglang.srt.model_loader.expert_pack_loader import ExpertPackModelLoader
+
+        return ExpertPackModelLoader(load_config)
+
     if load_config.load_format == LoadFormat.LAYERED:
         return LayeredModelLoader(load_config)
 

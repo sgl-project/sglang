@@ -409,6 +409,10 @@ def compress_forward(
     else:
         fn = module.decode if plan.is_decode else module.prefill
 
+    # The CUDA C4/C128 kernels use BF16 APE values; keep the model parameter
+    # in FP32 but convert at the fused-kernel boundary.
+    if ape.dtype != torch.bfloat16:
+        ape = ape.to(dtype=torch.bfloat16)
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out
 
@@ -448,6 +452,8 @@ def compress_norm_rope_store(
             kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
         )
         fn = module.forward_fp4 if use_fp4 else module.forward
+        if norm_weight.dtype != torch.bfloat16:
+            norm_weight = norm_weight.to(dtype=torch.bfloat16)
         fn(
             kv,
             plan[1],

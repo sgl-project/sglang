@@ -99,6 +99,9 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
+from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
+    AttnForwardMethod,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, MoEGate
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
@@ -633,7 +636,9 @@ class KimiK3MoE(nn.Module):
             self.fuse_ar_norm
             and self.tp_size == 8
             and self.routed_expert_up_proj is not None
-            and isinstance(self.routed_expert_up_proj.weight, torch.Tensor)
+            and isinstance(
+                getattr(self.routed_expert_up_proj, "weight", None), torch.Tensor
+            )
             and self.routed_expert_up_proj.weight.dtype == torch.bfloat16
             and self.routed_expert_up_proj.weight.is_contiguous()
         )
@@ -673,6 +678,8 @@ class KimiK3MoE(nn.Module):
             # well; folded into the 3584-row down-proj it comes almost free.
             mods = [self.gate, self.routed_expert_down_proj]
         else:
+            return
+        if any(getattr(module, "weight", None) is None for module in mods):
             return
         dtypes = {m.weight.dtype for m in mods}
         if len(dtypes) != 1 or dtypes.pop() not in (torch.bfloat16, torch.float16):
@@ -1667,6 +1674,11 @@ class KimiK3DeltaAttention(nn.Module):
             return
         if _is_npu:
             return
+        if (
+            getattr(self.f_a_proj, "weight", None) is None
+            or getattr(self.b_proj, "weight", None) is None
+        ):
+            return
         self._bfa_w, sizes = _merge_weights_as_views(
             [self.f_a_proj, self.b_proj], pad_rows_to=8
         )
@@ -1847,6 +1859,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         alt_stream: Optional[torch.cuda.Stream] = None,
         gate_alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
+        split_gguf_kv_b = getattr(
+            quant_config, "supports_kimi_k3_quantized_latent_projections", False
+        )
         self.all_reduce_fusion = all_reduce_fusion
         self.use_output_gate = getattr(config, "mla_use_output_gate", False)
         # The fused Ascend split+RMSNorm path is not numerically equivalent for
@@ -1868,6 +1883,51 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             reduce_results=not self.all_reduce_fusion,
             alt_stream=alt_stream,
         )
+        if split_gguf_kv_b:
+            del self.fused_qkv_a_proj_with_mqa
+            del self.kv_b_proj
+            self.q_a_proj = ReplicatedLinear(
+                config.hidden_size,
+                config.q_lora_rank,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.q_a_proj",
+            )
+            self.kv_a_proj_with_mqa = ReplicatedLinear(
+                config.hidden_size,
+                config.kv_lora_rank + config.qk_rope_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.kv_a_proj_with_mqa",
+            )
+            self.has_fused_proj = False
+
+            from sglang.srt.layers.quantization.gguf import GGUFUninitializedParameter
+
+            for role in ("k", "v"):
+                qweight = GGUFUninitializedParameter(requires_grad=False)
+                set_weight_attrs(
+                    qweight,
+                    {
+                        "is_gguf_weight": True,
+                        "weight_loader": self._split_kv_b_weight_loader,
+                    },
+                )
+                self.register_parameter(f"{role}_b_qweight", qweight)
+                qweight_type = nn.Parameter(
+                    torch.empty(1, dtype=torch.uint8), requires_grad=False
+                )
+                set_weight_attrs(
+                    qweight_type,
+                    {
+                        "is_gguf_weight_type": True,
+                        "weight_type": 0,
+                        "ignore_warning": True,
+                        "weight_loader": self._split_kv_b_weight_loader,
+                    },
+                )
+                self.register_parameter(f"{role}_b_qweight_type", qweight_type)
+            self._kimi_split_gguf_kv_b = True
         # Installed before the output-gate wrap below so the gate multiply is
         # applied to x before the fused GEMM+AR sees it.
         if self.all_reduce_fusion and not _o_proj_takes_output(self.o_proj):
@@ -1971,6 +2031,24 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 return _orig_o_proj_forward(x, *args, **kwargs)
 
             self.o_proj.forward = _gated_o_proj_forward
+
+    @staticmethod
+    def _split_kv_b_weight_loader(param, loaded_weight) -> None:
+        from torch.nn.parameter import UninitializedParameter
+
+        if getattr(param, "is_gguf_weight_type", False):
+            param.weight_type = int(loaded_weight.item())
+            param.data.copy_(loaded_weight.reshape_as(param))
+            return
+        if isinstance(param, UninitializedParameter):
+            param.materialize(tuple(loaded_weight.shape), dtype=loaded_weight.dtype)
+        param.data.copy_(loaded_weight)
+
+    def dispatch_attn_forward_method(self, forward_batch) -> AttnForwardMethod:
+        method = super().dispatch_attn_forward_method(forward_batch)
+        if getattr(self, "_kimi_split_gguf_kv_b", False):
+            return AttnForwardMethod.MLA
+        return method
 
     def _precompute_output_gate(self, hidden_states: torch.Tensor) -> None:
         """Issue the output-gate GEMM on the alt stream so it overlaps the
@@ -2498,9 +2576,15 @@ class KimiK3LinearModel(nn.Module):
         self._trim_padded_attn = require_mlp_sync(get_server_args())
 
         if self.pp_group.is_first_rank:
+            embedding_quant_config = (
+                quant_config
+                if quant_config is not None and quant_config.get_name() == "expert_pack"
+                else None
+            )
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
+                quant_config=embedding_quant_config,
                 prefix=f"{prefix}.embed_tokens",
                 # Under DP attention each rank embeds only its local tokens:
                 # reduce within the attention-TP group, not the full TP group.
@@ -2993,6 +3077,7 @@ class KimiK3LinearForCausalLM(nn.Module):
             loaded_params.add(name)
 
         self.post_load_weights()
+        return loaded_params
 
     def post_load_weights(self):
         # Also invoked by loader post-load hooks (DummyModelLoader,
@@ -3007,6 +3092,13 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer, PPMissingLayer):
                 continue
             self_attn = layer.self_attn
+            if getattr(self_attn, "_kimi_split_gguf_kv_b", False):
+                if int(self_attn.k_b_qweight_type.weight_type) != 2:
+                    raise ValueError("Kimi-K3 MLA K projection must remain GGUF Q4_0")
+                if int(self_attn.v_b_qweight_type.weight_type) != 10:
+                    raise ValueError("Kimi-K3 MLA V projection must remain GGUF Q2_K")
+                self_attn.use_deep_gemm_bmm = False
+                continue
             w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
@@ -3063,9 +3155,12 @@ class KimiK3LinearForCausalLM(nn.Module):
                 precompile_k3_recompute_w_u_kernel,
             )
 
+            o_proj_weight = getattr(layer.self_attn.o_proj, "weight", None)
+            if o_proj_weight is None:
+                o_proj_weight = layer.self_attn.o_proj.qweight
             if precompile_k3_recompute_w_u_kernel(
                 num_heads=layer.self_attn.local_num_heads,
-                dtype=layer.self_attn.o_proj.weight.dtype,
+                dtype=o_proj_weight.dtype,
                 device=layer.self_attn.dt_bias.device,
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
@@ -3474,4 +3569,4 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 pass
 
 
-EntryClass = [KimiK3ForConditionalGeneration]
+EntryClass = [KimiK3ForConditionalGeneration, KimiK3LinearForCausalLM]

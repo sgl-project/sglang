@@ -33,15 +33,19 @@ _FAST_SUPPORTED = None
 _HIP_SHAPE_GATE = None
 
 
+def _supports_attn_res_tma(capability: tuple[int, int]) -> bool:
+    """Return whether the device implements the SM10x tcgen05/TMEM ISA."""
+    major, _ = capability
+    return major == 10
+
+
 def _use_fast(hidden_size: int) -> bool:
-    """The TMA kernel needs SM100+ (tcgen05, cp.async.bulk) and its H=7168
-    template instantiation; everything else takes the triton pipeline."""
+    """Use the TMA kernel only on SM10x; SM120 lacks tcgen05/TMEM."""
     global _FAST_SUPPORTED
     if is_npu():
         return False
     if _FAST_SUPPORTED is None:
-        major, _ = torch.cuda.get_device_capability()
-        _FAST_SUPPORTED = major >= 10
+        _FAST_SUPPORTED = _supports_attn_res_tma(torch.cuda.get_device_capability())
     return _FAST_SUPPORTED and hidden_size == 7168
 
 
