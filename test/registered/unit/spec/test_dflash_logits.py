@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -111,3 +112,7 @@ def test_grouped_conv_supports_runtime_block_sizes():
                     value += coefficient * hidden_3d[batch, position - tap]
                 expected[batch * block_size + position] = value.flatten()
         torch.testing.assert_close(actual, expected)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

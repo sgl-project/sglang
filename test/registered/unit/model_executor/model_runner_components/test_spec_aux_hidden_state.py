@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -31,3 +32,7 @@ def test_muse_target_layer_id_mapping(target_model_type, draft_architecture, exp
         )
         == expected
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
