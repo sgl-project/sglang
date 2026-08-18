@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 import torch
 import torch.nn as nn
+from breakable_cuda_graphs import no_graph
 from safetensors.torch import safe_open
 
 from sglang.kernels.ops.activation.activation import (
@@ -68,9 +69,6 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
-    eager_on_graph,
-)
 
 logger = init_logger(__name__)
 
@@ -512,7 +510,7 @@ def _minimax_h3_attention_core_impl(
     return out
 
 
-_minimax_h3_attention_core_bcg = eager_on_graph(True)(_minimax_h3_attention_core_impl)
+_minimax_h3_attention_core_bcg = no_graph(_minimax_h3_attention_core_impl, enable=True)
 
 
 class MiniMaxH3Attention(nn.Module):
@@ -1706,7 +1704,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             ),
         )
 
-    @eager_on_graph(True)
+    @no_graph(enable=True)
     def _embed(
         self,
         *,

@@ -45,6 +45,7 @@ runtime_base = [
   "orjson",
   "packaging",
   "partial_json_parser",
+  "breakable_cuda_graphs==0.1.0rc0",
   "pillow",
   "prometheus-client>=0.20.0",
   "psutil",

@@ -92,7 +92,7 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
             (False, False): "unified_attention_with_output",
             (False, True): "unified_attention_with_output_and_lse",
             (True, False): "breakable_unified_attention_with_output",
-            (True, True): "breakable_unified_attention_with_output_and_lse",
+            (True, True): "breakable_unified_attention_with_output_into_lse",
         }
 
         for breakable in (False, True):
@@ -112,6 +112,12 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                         args[3].fill_(5)
                         calls.append(kwargs)
                         return torch.full((4, 2), 11, dtype=torch.float32)
+
+                    def output_into_lse(*args, **kwargs):
+                        # (query, key, value, output, lse_out, ...)
+                        args[3].fill_(5)
+                        args[4].fill_(11)
+                        calls.append(kwargs)
 
                     with ExitStack() as stack:
                         stack.enter_context(
@@ -136,9 +142,13 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                                     radix_attention_module,
                                     name,
                                     side_effect=(
-                                        output_and_lse
-                                        if name.endswith("and_lse")
-                                        else output_only
+                                        output_into_lse
+                                        if name.endswith("into_lse")
+                                        else (
+                                            output_and_lse
+                                            if name.endswith("and_lse")
+                                            else output_only
+                                        )
                                     ),
                                 )
                             )
@@ -220,6 +230,43 @@ class TestRadixAttentionGraphInterface(CustomTestCase):
                     self.assertTrue(torch.all(lse[:2] == 7))
                     self.assertTrue(torch.all(lse[2:] == 0))
                     self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
+
+    def test_impl_writes_lse_into_caller_buffer(self):
+        attention_layer = SimpleNamespace()
+        context = self._new_impl_context([attention_layer])
+        backend = _RecordingAttentionBackend()
+        query = torch.zeros((4, 2, 3))
+        output = torch.empty_like(query)
+        # Pre-filled with a sentinel so the padded tail is asserted to be zeroed
+        # rather than merely left untouched.
+        lse_out = torch.full((4, 2), -1.0, dtype=torch.float32)
+
+        with (
+            patch.object(
+                radix_attention_module,
+                "get_tc_piecewise_forward_context",
+                return_value=context,
+            ),
+            patch.object(
+                radix_attention_module, "get_attn_backend", return_value=backend
+            ),
+        ):
+            returned = radix_attention_module._unified_attention_with_output_impl(
+                query,
+                query,
+                query,
+                output,
+                False,
+                0,
+                False,
+                True,
+                lse_out=lse_out,
+            )
+
+        # Nothing is returned: a BCG eager break may not hand back CUDA tensors.
+        self.assertIsNone(returned)
+        self.assertTrue(torch.all(lse_out[:2] == 7))
+        self.assertTrue(torch.all(lse_out[2:] == 0))
 
     def test_impl_uses_independent_query_and_key_value_extents(self):
         attention_layer = SimpleNamespace()
