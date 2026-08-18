@@ -458,7 +458,7 @@ def test_gpt_oss_sm120_padding_layout_and_kernel(monkeypatch):
     assert torch.equal(actual, expected[:, :hidden].contiguous())
 
 
-def test_kimi_k3_sm120_contiguous_situ_layout_and_kernel(monkeypatch):
+def test_kimi_k3_sm120_situ_layout_and_noncontiguous_input(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     if torch.cuda.get_device_capability() != (12, 0):
@@ -559,14 +559,16 @@ def test_kimi_k3_sm120_contiguous_situ_layout_and_kernel(monkeypatch):
 
     x = (
         torch.randn(
-            8,
             hidden,
+            8,
             dtype=torch.bfloat16,
             device="cuda",
             generator=generator,
         )
+        .t()
         * 0.1
     )
+    assert not x.is_contiguous()
     logits = torch.randn(
         8,
         num_experts,
@@ -583,8 +585,10 @@ def test_kimi_k3_sm120_contiguous_situ_layout_and_kernel(monkeypatch):
     )
     actual = method._apply_sm120_cutlass(layer, dispatch_output).hidden_states
 
-    x_quant, x_scale = mxfp8_quantize(x, is_sf_swizzled_layout=True, alignment=32)
-    expected = torch.empty_like(x)
+    x_quant, x_scale = mxfp8_quantize(
+        x.contiguous(), is_sf_swizzled_layout=True, alignment=32
+    )
+    expected = torch.empty_like(x, memory_format=torch.contiguous_format)
     cutlass_fused_moe(
         input=x_quant,
         token_selected_experts=topk_ids.to(torch.int32),

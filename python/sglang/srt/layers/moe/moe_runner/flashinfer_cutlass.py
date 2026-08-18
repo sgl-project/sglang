@@ -346,6 +346,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
     if weight_global_scale is not None:
         from flashinfer import mxfp8_quantize
 
+        x = x.contiguous()
         x, input_sf = mxfp8_quantize(
             x,
             is_sf_swizzled_layout=True,
