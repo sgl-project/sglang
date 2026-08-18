@@ -11,10 +11,13 @@ Three steps, each usable alone:
    model (the shipped ``<arch>.tiles.json`` is copied through unchanged).
    This serves correctly immediately (all rows still pass plan validation);
    it is a starting point for step 3, not a certified optimum.
-3. ``--sweep``: e2e-tune, one server relaunch per arm, the two axes the
+3. ``--sweep``: e2e-tune, one server relaunch per arm, the axes the
    2026-08 campaign found can move with geometry:
    - LoRA config: shared-decode overlap windows (variant config dirs served
      through SGLANG_LORA_MOE_CONFIG_DIR; winner written back into the seed);
+   - LoRA config: the route block size, separately for decode and for
+     prefill, since occupancy decides it (winner written into the tiles
+     file; scored on decode tok/s and prefill tok/s respectively);
    - base GEMM: the masked-GEMM M-bucket tiles, by delegating to
      ``sweep_masked_gemm_configs.py`` on this device (output lands in
      ``<out>/base_gemm``, so SGLANG_LORA_MOE_CONFIG_DIR=<out> serves both).
@@ -47,6 +50,8 @@ from datetime import date
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 PACKAGED = os.path.join(REPO, "python/sglang/srt/lora/moe/configs")
+
+ROUTING_BLOCK_CANDIDATES = [16, 32, 64, 128]
 
 SHARED_WINDOW_CANDIDATES = [
     ("gate_up_a_b", "down_a_b"),  # shipped winner
@@ -154,8 +159,15 @@ def emit_seed(args, geometry) -> str:
     return dst
 
 
-def bench_once(args, env_extra: dict, tag: str) -> dict[int, float]:
-    """One server launch + protocol bench; returns bs -> decode tok/s."""
+def bench_once(
+    args, env_extra: dict, tag: str, metric: str = "output_throughput"
+) -> dict[int, float]:
+    """One server launch + protocol bench; returns bs -> tok/s for ``metric``.
+
+    ``output_throughput`` is decode, ``input_throughput`` is prefill. Score
+    each axis on the side it moves: a prefill-only tile barely shifts decode
+    tok/s, so scoring it on the default reads as noise and picks at random.
+    """
     out = os.path.join(args.out, f"arm_{tag}")
     os.makedirs(out, exist_ok=True)
     env = os.environ.copy()
@@ -218,8 +230,87 @@ def bench_once(args, env_extra: dict, tag: str) -> dict[int, float]:
         time.sleep(10)
     by_bs: dict[int, list] = {}
     for r in rows:
-        by_bs.setdefault(r["batch_size"], []).append(r["output_throughput"])
+        by_bs.setdefault(r["batch_size"], []).append(r[metric])
     return {bs: statistics.median(v[1:] or v) for bs, v in sorted(by_bs.items())}
+
+
+ROUTE_BLOCK_KEYS = ("routing_block_size", "gate_up_a_routing_block_size")
+
+
+def _set_route_block(sites: dict, block: int, key: str) -> None:
+    """Move ONE of the two route granularities to ``block``.
+
+    They are independent knobs and have to be swept that way. The SHARED
+    route's block also decides how many padded rows the fused middle and the
+    base GEMM walk, so raising it buys faster LoRA kernels and charges
+    everything downstream; gate/up-A's own route writes by original pair id,
+    so a big tile there costs nothing downstream. Moving them together hides
+    that trade -- it was worth 2.5% at 4k tokens on the shipped H200 row.
+    """
+    sites[key] = block
+    if key == "routing_block_size":
+        # tripwires on the B sites are checked against the shared route
+        for name in ("gate_up_b", "down_b"):
+            site = sites.get(name)
+            if site is not None and "BLOCK_SIZE_M" in site:
+                site["BLOCK_SIZE_M"] = block
+
+
+def sweep_route_block(args, seed_path: str, arch: str, variant_dir: str) -> dict:
+    """Pick each route block per phase and write the winners into the tiles.
+
+    Occupancy decides these -- routed pairs per virtual expert, i.e.
+    tokens x top_k / virtual experts -- so decode and prefill get their own
+    sweep and their own metric, and the shared route and gate/up-A's get
+    theirs (see ``_set_route_block`` for why they cannot be swept together).
+    Four arms per candidate, so this is the expensive axis; it earns that on a
+    geometry whose occupancy is far from the campaign's, where the packing
+    trade lands somewhere else entirely.
+    """
+    tiles_path = os.path.join(args.out, f"{arch}.tiles.json")
+    if not os.path.isfile(tiles_path):
+        return {}
+    plans = json.load(open(seed_path))
+    rows = plans["scenarios"] + plans.get("fallback", [])
+    phase_of = {row["name"]: row.get("phase") for row in rows}
+    tiles = json.load(open(tiles_path))
+    all_results = {}
+    axes = [
+        (phase, metric, key)
+        for phase, metric in (
+            ("decode", "output_throughput"),
+            ("prefill", "input_throughput"),
+        )
+        for key in ROUTE_BLOCK_KEYS
+    ]
+    for phase, metric, key in axes:
+        names = [n for n in tiles["rules"] if phase_of.get(n) == phase]
+        if not names:
+            continue
+        results = {}
+        for block in ROUTING_BLOCK_CANDIDATES:
+            candidate = copy.deepcopy(tiles)
+            for name in names:
+                for rule in candidate["rules"][name]:
+                    _set_route_block(rule["sites"], block, key)
+            os.makedirs(variant_dir, exist_ok=True)
+            json.dump(
+                candidate, open(os.path.join(variant_dir, f"{arch}.tiles.json"), "w")
+            )
+            json.dump(plans, open(os.path.join(variant_dir, f"{arch}.plans.json"), "w"))
+            tag = f"route_{phase}_{key.split('_route')[0]}_{block}"
+            results[block] = bench_once(
+                args, {"SGLANG_LORA_MOE_CONFIG_DIR": variant_dir}, tag, metric
+            )
+            print(tag, results[block])
+        winner = max(results, key=lambda b: sum(results[b].values()))
+        print(f"{key} winner ({phase}, scored on {metric}): {winner}")
+        for name in names:
+            for rule in tiles["rules"][name]:
+                _set_route_block(rule["sites"], winner, key)
+        all_results.update({f"{phase}-{key}-{b}": v for b, v in results.items()})
+    json.dump(tiles, open(tiles_path, "w"), indent=1)
+    return all_results
 
 
 def sweep(args, seed_path: str) -> None:
@@ -265,8 +356,12 @@ def sweep(args, seed_path: str) -> None:
                 row["plan"]["late_overlap"] = late
             row["provenance"] = f"swept:{date.today()} ({args.model_path})"
     json.dump(table, open(seed_path, "w"), indent=1)
+    scored = {f"window-{e}-{l}": v for (e, l), v in results.items()}
+    # Axis: route block size, one value per phase. Swept after the window
+    # winner is in the seed, so it is measured against the plan that ships.
+    scored.update(sweep_route_block(args, seed_path, arch, variant_dir))
     json.dump(
-        {f"{e}-{l}": v for (e, l), v in results.items()},
+        scored,
         open(os.path.join(args.out, "sweep_results.json"), "w"),
         indent=1,
     )
