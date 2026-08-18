@@ -17,6 +17,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     CommitKvProj,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.distributed.parallel_state import model_parallel_is_initialized
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -785,11 +786,17 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         self.start_layer = 0
         self.end_layer = self.num_stages
-        parallel = get_parallel()
+        if model_parallel_is_initialized():
+            parallel = get_parallel()
+            pp_rank = parallel.pp_rank
+            pp_size = parallel.pp_size
+        else:
+            pp_rank = 0
+            pp_size = 1
         self.is_lifecycle_only = use_lifecycle_only_draft_model(
             disaggregation_mode=get_disagg().disaggregation_mode,
-            pp_rank=parallel.pp_rank,
-            pp_size=parallel.pp_size,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
             target_layer_ids=[
                 int(layer_id) for layer_id in (dspark_config.target_layer_ids or [])
             ],
@@ -880,7 +887,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         self.markov_head.configure_tp_shard(lm_head=self.lm_head)
 
     def prune_to_ctx_projection(self) -> None:
-        if self.is_lifecycle_only:
+        if vars(self).get("is_lifecycle_only", False):
             return
         stage0 = self.stages[0]
         projection_stage = nn.Module()
