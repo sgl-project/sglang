@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from contextlib import AsyncExitStack
 from http import HTTPStatus
@@ -865,6 +866,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         is_required = request.tool_choice == "required"
         custom_tool_names = self._custom_tool_names(request)
+        namespace_names = self._namespace_names(request)
         tool_call_items: list[ResponseFunctionToolCall | ResponseCustomToolCall] = []
         parsed_via_native = False
         if (
@@ -890,6 +892,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 call_info.name,
                                 call_info.parameters or "",
                                 custom_tool_names,
+                                namespace_names,
                             )
                         )
                     parsed_via_native = bool(call_info_list)
@@ -910,7 +913,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                         )
                         tool_call_items.append(
                             self._build_tool_call_item(
-                                tool["name"], arguments, custom_tool_names
+                                tool["name"],
+                                arguments,
+                                custom_tool_names,
+                                namespace_names,
                             )
                         )
                     content = ""
@@ -990,6 +996,36 @@ class OpenAIServingResponses(OpenAIServingChat):
                     )
                 )
                 continue
+            if tool.type == "namespace":
+                # A namespace groups a family of function tools under one
+                # model-visible name. Flatten each inner tool to a function
+                # named ``f"{namespace}.{inner}"``; the emitted call item
+                # splits the pair back apart (see _split_namespaced_name).
+                # OpenAI defers inner schemas until tool search loads them;
+                # exposing them up front is a deliberate simplification that
+                # costs prompt tokens but keeps this a stateless translation.
+                if not tool.name:
+                    continue
+                for inner in tool.tools or []:
+                    if not isinstance(inner, dict):
+                        continue
+                    if inner.get("type", "function") != "function":
+                        continue
+                    inner_name = inner.get("name")
+                    if not inner_name:
+                        continue
+                    chat_tools.append(
+                        Tool(
+                            type="function",
+                            function=Function(
+                                name=f"{tool.name}.{inner_name}",
+                                description=inner.get("description")
+                                or tool.description,
+                                parameters=inner.get("parameters"),
+                            ),
+                        )
+                    )
+                continue
             if tool.type != "function":
                 continue
             chat_tools.append(
@@ -1014,6 +1050,33 @@ class OpenAIServingResponses(OpenAIServingChat):
         }
 
     @staticmethod
+    def _namespace_names(request: ResponsesRequest) -> set[str]:
+        return {
+            tool.name
+            for tool in (request.tools or [])
+            if tool.type == "namespace" and tool.name
+        }
+
+    @staticmethod
+    def _split_namespaced_name(
+        name: str, namespace_names: set[str]
+    ) -> tuple[str, Optional[str]]:
+        """Split a flattened ``namespace.tool`` chat name back into its parts.
+
+        Namespace tools are exposed to the model as functions named
+        ``f"{namespace}.{inner}"``; on emission the call item carries
+        ``name=inner`` plus a ``namespace`` field so clients (e.g. Codex)
+        can dispatch on the pair. Only prefixes that were actually declared
+        as namespaces split — an ordinary function whose name contains a dot
+        passes through untouched.
+        """
+        if "." in name:
+            prefix, _, suffix = name.partition(".")
+            if suffix and prefix in namespace_names:
+                return suffix, prefix
+        return name, None
+
+    @staticmethod
     def _custom_tool_input_from_arguments(arguments: str) -> str:
         """Unwrap the {"input": ...} JSON produced by the synthetic custom-tool
         schema back into the freeform string; fall back to the raw arguments
@@ -1030,11 +1093,16 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @classmethod
     def _build_tool_call_item(
-        cls, name: str, arguments: str, custom_tool_names: set[str]
+        cls,
+        name: str,
+        arguments: str,
+        custom_tool_names: set[str],
+        namespace_names: Optional[set[str]] = None,
     ):
         """Build the Responses output item for one parsed tool call: a
         ``custom_tool_call`` when the tool was declared ``custom``, else a
-        ``function_call``."""
+        ``function_call``. Calls to flattened namespace tools carry
+        ``name=inner`` plus a ``namespace`` field."""
         if name in custom_tool_names:
             return ResponseCustomToolCall(
                 input=cls._custom_tool_input_from_arguments(arguments),
@@ -1044,14 +1112,26 @@ class OpenAIServingResponses(OpenAIServingChat):
                 id=f"ctc_{random_uuid()[:8]}",
                 status="completed",
             )
+        local_name, namespace = cls._split_namespaced_name(
+            name, namespace_names or set()
+        )
+        extra = {"namespace": namespace} if namespace else {}
         return ResponseFunctionToolCall(
             arguments=arguments,
             call_id=f"call_{random_uuid()[:24]}",
             type="function_call",
-            name=name,
+            name=local_name,
             id=f"fc_{random_uuid()[:8]}",
             status="completed",
+            **extra,
         )
+
+    @staticmethod
+    def _looks_like_encrypted_blob(text: str) -> bool:
+        """Heuristic for ciphertext in an ``encrypted_content`` part: one long
+        unbroken base64-ish token. Plaintext prose (spaces, punctuation)
+        never matches."""
+        return len(text) > 256 and re.fullmatch(r"[A-Za-z0-9+/=_\-]+", text) is not None
 
     @staticmethod
     def _normalize_response_content_part_for_chat(content_part: Any) -> Any:
@@ -1146,6 +1226,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                 raw = orjson.dumps(raw).decode("utf-8")
             else:
                 raw = "{}"
+            # Calls to flattened namespace tools were emitted with
+            # ``name=inner`` + ``namespace``; re-qualify to the dotted chat
+            # name the model saw declared before replaying.
+            name = message.get("name")
+            namespace = message.get("namespace")
+            if namespace and name and not name.startswith(f"{namespace}."):
+                name = f"{namespace}.{name}"
             return {
                 "role": "assistant",
                 "tool_calls": [
@@ -1153,7 +1240,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         "id": message.get("call_id") or message.get("id"),
                         "type": "function",
                         "function": {
-                            "name": message.get("name"),
+                            "name": name,
                             "arguments": raw,
                         },
                     }
@@ -1161,15 +1248,64 @@ class OpenAIServingResponses(OpenAIServingChat):
             }
         if msg_type in ("function_call_output", "custom_tool_call_output"):
             # ``output`` may be a string or an array of content parts (OpenAI
-            # allows both); the chat tool message needs a string, so flatten.
+            # allows both). Text-only arrays flatten to a plain string (the
+            # shape every chat template accepts); arrays carrying non-text
+            # parts (e.g. ``input_image`` from Codex's view_image) pass
+            # through as normalized chat content parts so images reach the
+            # model instead of being dropped (issues #33867 / #34927).
             out = message.get("output", "")
             if isinstance(out, list):
-                out = "".join(p.get("text", "") for p in out if isinstance(p, dict))
+                parts = [
+                    cls._normalize_response_content_part_for_chat(p) for p in out
+                ]
+                parts = [p for p in parts if isinstance(p, dict)]
+                if any(p.get("type") != "text" for p in parts):
+                    out = parts
+                else:
+                    out = "".join(p.get("text", "") for p in parts)
             return {
                 "role": "tool",
                 "tool_call_id": message.get("call_id"),
                 "content": out,
             }
+        if msg_type == "agent_message":
+            # Inter-agent message from a Codex multi-agent thread. Against a
+            # non-OpenAI provider both part shapes carry plaintext (the
+            # client's ``new_encrypted`` merely relocates the string; real
+            # ciphertext only travels via ``encrypted_function_args``, which
+            # Codex strips for non-OpenAI providers), so render the message
+            # as text with its routing as a header. Stateless translation —
+            # hosted ``multi_agent_call`` actions stay unsupported.
+            texts: list[str] = []
+            for part in message.get("content") or []:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "input_text":
+                    text = part.get("text") or ""
+                elif part.get("type") == "encrypted_content":
+                    text = part.get("encrypted_content") or ""
+                    if cls._looks_like_encrypted_blob(text):
+                        # A thread that originated against OpenAI can carry
+                        # real ciphertext; a visible placeholder beats
+                        # feeding the model base64 noise.
+                        text = "[encrypted agent message content unavailable]"
+                else:
+                    continue
+                if text:
+                    texts.append(text)
+            if not texts:
+                return None
+            author = message.get("author") or (message.get("agent") or {}).get(
+                "agent_name"
+            )
+            recipient = message.get("recipient")
+            header = "[agent message"
+            if author:
+                header += f" from {author}"
+            if recipient:
+                header += f" to {recipient}"
+            header += "]"
+            return {"role": "user", "content": header + "\n" + "\n".join(texts)}
         # Reasoning items render as {role: assistant, reasoning_content};
         # empty ones drop instead of injecting an empty assistant block.
         if msg_type == "reasoning":
@@ -2093,6 +2229,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         }
         tool_call_states: dict[int, dict[str, Any]] = {}
         custom_tool_names = self._custom_tool_names(request)
+        namespace_names = self._namespace_names(request)
         # Items closed during the stream, in wire order. Feeds the final
         # ``response.completed`` snapshot and the stored response.
         emitted_items: list = []
@@ -2311,6 +2448,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 type="function_call",
                 id=state["item_id"],
                 status="completed",
+                **(
+                    {"namespace": state["namespace"]}
+                    if state.get("namespace")
+                    else {}
+                ),
             )
             events = [
                 _send_event(
@@ -2488,11 +2630,19 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 else f"fc_{random_uuid()[:8]}"
                             )
                             call_id = f"call_{random_uuid()[:24]}"
+                            local_name, call_namespace = (
+                                (call.name or "", None)
+                                if is_custom
+                                else self._split_namespaced_name(
+                                    call.name or "", namespace_names
+                                )
+                            )
                             state = {
                                 "item_id": item_id,
                                 "call_id": call_id,
                                 "output_index": current_output_index,
-                                "name": call.name or "",
+                                "name": local_name,
+                                "namespace": call_namespace,
                                 "arguments": "",
                                 "is_custom": is_custom,
                                 "added": False,
@@ -2518,6 +2668,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                                     type="function_call",
                                     id=state["item_id"],
                                     status="in_progress",
+                                    **(
+                                        {"namespace": state["namespace"]}
+                                        if state.get("namespace")
+                                        else {}
+                                    ),
                                 )
                             yield _send_event(
                                 openai_responses_types.ResponseOutputItemAddedEvent(
