@@ -168,6 +168,7 @@ fn request_has_extension_unsafe_shape(request: &Value) -> bool {
 /// `request_id` is the join key shared with this request's ingress tee, so the
 /// oracle can pair the two records and report the response's output tokens
 /// against the prompt they extend.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_extend_tee(
     ctx: Arc<AppContext>,
     model: String,
@@ -176,6 +177,7 @@ pub(crate) fn spawn_extend_tee(
     prompt: Option<IngressPrompt>,
     source: ReplySource,
     slug: Option<String>,
+    key_id: Option<String>,
 ) {
     if ctx.cache_sim_tee.is_none() && ctx.s3_export_sink.is_none() {
         return;
@@ -275,6 +277,7 @@ pub(crate) fn spawn_extend_tee(
                         choice.as_ref().map(|c| c.index),
                         choice.as_ref().map(|c| c.count),
                         slug.as_deref(),
+                        key_id.as_deref(),
                     );
                 }
             } else {
@@ -958,6 +961,7 @@ mod spawn_tests {
             }),
             ReplySource::Json(body_with(1, 9)),
             None,
+            None,
         );
 
         let got = wait_for(&cap, 1).await;
@@ -1000,6 +1004,7 @@ mod spawn_tests {
             None,
             ReplySource::Json(body_with(1, 5)),
             None,
+            None,
         );
         let got = wait_for(&cap, 1).await;
         let v = &got[0];
@@ -1028,6 +1033,7 @@ mod spawn_tests {
                 opts,
             }),
             ReplySource::Json(body_with(1, 5)),
+            None,
             None,
         );
         let got = wait_for(&cap, 1).await;
@@ -1063,6 +1069,7 @@ mod spawn_tests {
                 opts,
             }),
             ReplySource::Json(body_with(3, 30)),
+            None,
             None,
         );
 
@@ -1134,6 +1141,7 @@ mod spawn_tests {
             }),
             ReplySource::Json(resp),
             None,
+            None,
         );
         let got = wait_for(&cap, 1).await;
         let v = &got[0];
@@ -1194,6 +1202,7 @@ mod spawn_tests {
             }),
             ReplySource::Json(resp),
             None,
+            None,
         );
         let got = wait_for(&cap, 2).await;
         let mut idx: Vec<u64> = got
@@ -1234,6 +1243,7 @@ mod spawn_tests {
                 opts,
             }),
             ReplySource::Json(body_with(1, 12)),
+            None,
             None,
         );
         let got = wait_for(&cap, 1).await;

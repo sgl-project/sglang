@@ -32,6 +32,13 @@ pub(crate) struct ExportRecord {
     pub choice_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub choice_count: Option<usize>,
+    /// The upstream gateway's key identifier, read from `x-radixark-key-id`
+    /// (the same attribution the cache-sim tee carries — see
+    /// `cache_sim_tee::Attribution::key_id`). Lets downstream partition export
+    /// records by client key without a separate lookup. Absent for requests
+    /// with no gateway-resolved key (shared-bearer or direct-to-router).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
     pub ts: String,
 }
 
@@ -561,6 +568,7 @@ impl S3ExportSink {
         input_ids: &[u32],
         request_id: &str,
         slug: Option<&str>,
+        key_id: Option<&str>,
     ) {
         if input_ids.is_empty() {
             return;
@@ -571,10 +579,14 @@ impl S3ExportSink {
             slug: safe_slug(slug),
             model: model.to_string(),
             input_ids: input_ids.to_vec(),
-            prompt_len: None,
+            // An ingest record's `input_ids` is the whole prompt, so the
+            // boundary is its length. Emitted (rather than left for downstream
+            // to compute) so ingest and extend records share one schema.
+            prompt_len: Some(input_ids.len()),
             output_tokens: None,
             choice_index: None,
             choice_count: None,
+            key_id: key_id.map(str::to_owned),
             ts: chrono::Utc::now().to_rfc3339(),
         });
     }
@@ -590,6 +602,7 @@ impl S3ExportSink {
         choice_index: Option<usize>,
         choice_count: Option<usize>,
         slug: Option<&str>,
+        key_id: Option<&str>,
     ) {
         if input_ids.is_empty() {
             return;
@@ -604,6 +617,7 @@ impl S3ExportSink {
             output_tokens,
             choice_index,
             choice_count,
+            key_id: key_id.map(str::to_owned),
             ts: chrono::Utc::now().to_rfc3339(),
         });
     }
@@ -900,6 +914,7 @@ mod tests {
             output_tokens: None,
             choice_index: None,
             choice_count: None,
+            key_id: None,
             ts: "2026-08-10T00:00:00Z".into(),
         };
         let line = r.to_ndjson_line();
@@ -912,6 +927,7 @@ mod tests {
         assert!(v.get("output_tokens").is_none());
         assert!(v.get("choice_index").is_none());
         assert!(v.get("choice_count").is_none());
+        assert!(v.get("key_id").is_none());
     }
 
     #[test]
@@ -926,6 +942,7 @@ mod tests {
             output_tokens: None,
             choice_index: Some(0),
             choice_count: Some(3),
+            key_id: None,
             ts: "2026-08-10T00:00:00Z".into(),
         };
         let v: serde_json::Value = serde_json::from_str(r.to_ndjson_line().trim_end()).unwrap();
@@ -945,12 +962,14 @@ mod tests {
             output_tokens: Some(9),
             choice_index: None,
             choice_count: None,
+            key_id: Some("key-123".into()),
             ts: "2026-08-10T00:00:00Z".into(),
         };
         let v: serde_json::Value = serde_json::from_str(r.to_ndjson_line().trim_end()).unwrap();
         assert_eq!(v["kind"], "extend");
         assert_eq!(v["prompt_len"], 2);
         assert_eq!(v["output_tokens"], 9);
+        assert_eq!(v["key_id"], "key-123");
     }
 
     #[test]
@@ -1144,7 +1163,7 @@ mod tests {
         let up = Uploader::Fake(Arc::clone(&store));
         let sink =
             S3ExportSink::spawn_with_uploader(up, "pfx".into(), "pod-1".into(), test_metrics());
-        sink.offer_ingest("m", &[1, 2, 3], "rid", Some("slugA"));
+        sink.offer_ingest("m", &[1, 2, 3], "rid", Some("slugA"), Some("key-abc"));
         sink.offer_extend(
             "m",
             &[1, 2, 3, 4],
@@ -1154,6 +1173,7 @@ mod tests {
             None,
             None,
             Some("slugA"),
+            Some("key-abc"),
         );
         sink.drain().await;
 
@@ -1165,6 +1185,10 @@ mod tests {
         assert_eq!(body.lines().count(), 2, "ingest + extend");
         assert!(body.contains("\"kind\":\"ingest\""));
         assert!(body.contains("\"kind\":\"extend\""));
+        // Both records carry the gateway key_id; the ingest record now emits
+        // its prompt_len (= input_ids.len()) so it shares the extend schema.
+        assert_eq!(body.matches("\"key_id\":\"key-abc\"").count(), 2);
+        assert!(body.contains("\"prompt_len\":3"));
     }
 
     #[tokio::test]
@@ -1176,7 +1200,7 @@ mod tests {
             "pod-1".into(),
             test_metrics(),
         );
-        sink.offer_ingest("m", &[7], "rid", None); // missing slug
+        sink.offer_ingest("m", &[7], "rid", None, None); // missing slug
         sink.drain().await;
         let puts = store.puts.lock().unwrap();
         assert_eq!(puts.len(), 1);
@@ -1201,7 +1225,7 @@ mod tests {
         // Offer several records for a single slug.
         const N: usize = 8;
         for i in 0..N {
-            sink.offer_ingest("m", &[i as u32, i as u32 + 1], "rid", Some("slugA"));
+            sink.offer_ingest("m", &[i as u32, i as u32 + 1], "rid", Some("slugA"), None);
         }
         sink.drain().await;
 
