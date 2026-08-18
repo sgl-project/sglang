@@ -1325,6 +1325,7 @@ def publish(server_args, *, role: str, hf_config: Any = None) -> RuntimeContext:
             f"publish role {role!r} has no ROLE_NAMESPACE_SETS entry; declare "
             "its namespace set (None for the full tree)."
         )
+    server_args.resolve_once()
     discarded = _CONTEXT.overrides_log()
     _CONTEXT.set_server_args(server_args)
     if discarded:

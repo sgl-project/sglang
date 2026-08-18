@@ -3642,7 +3642,36 @@ class ServerArgs:
     ] = None
 
     def __post_init__(self):
-        self._run_resolution_pipeline()
+        self.resolve_once()
+
+    def resolve_once(self) -> None:
+        """Run the resolution pipeline, unless this record has been through it.
+
+        Resolution is a deterministic function of the raw inputs -- two records
+        built from the same arguments declare the same things -- but the
+        handlers do not survive a second pass over their own output: DP
+        attention halves ``chunked_prefill_size`` again on every re-entry.
+
+        The publishing entry of every process calls this. In a child the record
+        arrived by pickle and brought its declarations along, so the child has
+        nothing left to derive and projects what the parent decided.
+        """
+        if getattr(self, "_declarations_materialized", False):
+            return
+        if getattr(self, "_resolution_failed", False):
+            raise RuntimeError(
+                "resolution already failed on this ServerArgs; the handlers that "
+                "ran left their writes on the record, and a second pass would "
+                "read that partial output as fresh input. Build a new record "
+                "from the corrected arguments."
+            )
+        try:
+            self._run_resolution_pipeline()
+        except BaseException:
+            # The handlers that ran already wrote to the record, and they are
+            # not idempotent over their own output.
+            object.__setattr__(self, "_resolution_failed", True)
+            raise
 
     def _declare(self, source: str, **fields: Any) -> None:
         """This record's handlers declaring their resolution writes.
