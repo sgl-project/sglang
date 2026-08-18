@@ -10,9 +10,8 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-# Every collective is mocked (_FakeFlashInferComm / _FakeWorkspace) and
-# `world_size` is a plain int, so this needs one CUDA device for tensor
-# allocation, not a 4-GPU runner.
+# Collectives are mocked and world_size is a plain int, so the world_size=4
+# cases need one real CUDA device.
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
 
 

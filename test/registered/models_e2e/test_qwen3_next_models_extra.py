@@ -1,10 +1,3 @@
-"""Mamba lazy-alloc fault injection for Qwen3-Next (extra-b).
-
-Split out of `test_qwen3_next_models.py`: both classes force
-`SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL`, a test-only fault-injection path, while
-the mainline page_size=1/2 coverage stays per-commit in the parent file.
-"""
-
 import os
 import unittest
 

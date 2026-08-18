@@ -1,11 +1,3 @@
-"""DeepEP small-model combinations kept off the per-commit path (extra-b).
-
-Split out of `test_deepep_small.py`, which keeps one class per dimension
-(pure DP, pure TP, TBO, MTP+TBO). These three are further crossings of
-those same dimensions -- hybrid DP/TP, and TBO with attention-TP with and
-without dense-DP.
-"""
-
 import os
 import unittest
 from types import SimpleNamespace

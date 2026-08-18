@@ -1,10 +1,6 @@
 """PD disaggregation logprob parity for kimi-linear (MLA hybrid-Mamba).
 
-Two schemes share this file's fixture and parity assertion: heterogeneous
-TP / PP prefill against a matching non-PD reference, and
-`--enable-unified-memory` on both sides.
-
-## Unified memory
+The rationale below applies to the --enable-unified-memory classes.
 
 Guards the unified-memory PD transfer scheme end to end: whole page-envelope
 KV registration (`UnifiedMLATokenToKVPool.get_contiguous_buf_infos`), whole
@@ -50,7 +46,6 @@ register_cuda_ci(est_time=1380, stage="base-c", runner_config="4-gpu-h100")
 KIMI_LINEAR_MODEL = "yujiepan/kimi-linear-tiny-random"
 SERVER_ENV = {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"}
 
-# Deterministic-inference scheme: heterogeneous TP / PP prefill.
 DETERMINISTIC_ARGS = [
     "--skip-tokenizer-init",
     "--random-seed",
@@ -66,7 +61,6 @@ DETERMINISTIC_ARGS = [
     "disabled",
 ]
 
-# Unified-memory scheme (see module docstring for the pinning rationale).
 UNIFIED_MEMORY_ARGS = [
     "--skip-tokenizer-init",
     "--random-seed",
@@ -88,10 +82,6 @@ UNIFIED_MEMORY_ARGS = [
 
 
 class _KimiLinearPDParityBase(PDDisaggregationServerBase):
-    """Launch a non-PD reference, then the same config as P+D, and require the
-    output logprobs to match. `reference_parallel_args` shapes the reference to
-    the scheme's parallel layout; `baseline_args` carries the scheme's flags."""
-
     reference_parallel_args = []
     baseline_args = []
     extra_prefill_env = SERVER_ENV
