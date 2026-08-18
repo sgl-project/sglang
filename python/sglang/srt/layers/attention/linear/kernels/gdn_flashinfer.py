@@ -185,6 +185,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self._cake_gdn_arch = None
         self._cake_gdn_entries = {}
         self._cake_gdn_outputs = {}
+        self._cake_gdn_dt_bias_fp32 = {}
         self._cake_gdn_logged_routes = set()
 
         if self.use_state_pool:
@@ -319,6 +320,27 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             self._cake_gdn_outputs[key] = output
         return output
 
+    def _cake_fp32_dt_bias(
+        self,
+        dt_bias: torch.Tensor,
+        *,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Return persistent FP32 model storage prepared before graph capture."""
+
+        if dt_bias.dtype == torch.float32:
+            return dt_bias
+        key = (dt_bias.device.index, layer_id, dt_bias.data_ptr())
+        converted = self._cake_gdn_dt_bias_fp32.get(key)
+        if converted is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Cake GDN FP32 dt_bias was not prepared before CUDA Graph capture"
+                )
+            converted = dt_bias.detach().float()
+            self._cake_gdn_dt_bias_fp32[key] = converted
+        return converted
+
     def _try_cake_decode(
         self,
         *,
@@ -349,7 +371,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             or any(tensor.device != q.device for tensor in tensors)
             or any(tensor.dtype != torch.bfloat16 for tensor in (q, k, v, state, a, b))
             or A_log.dtype != torch.float32
-            or dt_bias.dtype != torch.float32
+            or dt_bias.dtype not in (torch.bfloat16, torch.float32)
             or tuple(A_log.shape) != (num_v_heads,)
             or tuple(dt_bias.shape) != (num_v_heads,)
             or not A_log.is_contiguous()
@@ -410,6 +432,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             )
         except self._cake_gdn_api.CakeGDNUnsupportedError:
             return None
+
+        dt_bias = self._cake_fp32_dt_bias(dt_bias, layer_id=layer_id)
 
         entry = self._cake_gdn_entries.get(route.variant_name)
         if entry is None:
