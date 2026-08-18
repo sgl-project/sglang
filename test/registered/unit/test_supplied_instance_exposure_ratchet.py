@@ -702,6 +702,12 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         A write site that can never fire is a dead branch to delete upstream,
         not a census exemption. Only names that are declared dataclass fields
         count; underscore bookkeeping does not.
+
+        Two spellings write: an assignment, and ``self._declare(source,
+        field=value)``, which records the write in the declaration stash on
+        its way to the field. Counting only assignments would read a handler's
+        conversion to a declaration as the field having stopped being written,
+        which would quietly retire every pinned pair that reads it.
         """
         tree = ast.parse(
             (_PACKAGE_ROOT / "server_args.py").read_text(encoding="utf-8-sig")
@@ -722,6 +728,17 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                 tgts = node.targets
             elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
                 tgts = [node.target]
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_declare"
+            ):
+                targets |= {
+                    kw.arg
+                    for kw in node.keywords
+                    if kw.arg in declared and not kw.arg.startswith("_")
+                }
+                continue
             else:
                 continue
             for tgt in tgts:

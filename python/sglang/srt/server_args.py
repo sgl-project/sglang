@@ -32,7 +32,13 @@ from functools import cached_property
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
 from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
-from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
+from sglang.srt.arg_groups.arg_utils import (
+    NS,
+    A,
+    Arg,
+    add_cli_args_from_dataclass,
+    field_names,
+)
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -3643,6 +3649,31 @@ class ServerArgs:
     def __post_init__(self):
         self._run_resolution_pipeline()
 
+    def _declare(self, source: str, **fields: Any) -> None:
+        """Record a resolution write in the declaration stash, and apply it now.
+
+        The stash is what the projection reads; the immediate write keeps this
+        handler's successors seeing the value where they read the field
+        directly, so routing a write through here changes nothing about
+        ordering. When the projection replaces field materialization, the
+        immediate write is what goes away -- the stash entry stays.
+
+        Names arrive as keyword arguments, which accept anything; a misspelled
+        one would otherwise become a new attribute that nothing ever reads, so
+        it is rejected here. This is not the model-override whitelist: that one
+        limits which fields a *registry entry* may reach, while a handler
+        writing its own field is the pipeline resolving by construction.
+        """
+        unknown = sorted(set(fields) - field_names(type(self)))
+        if unknown:
+            raise AttributeError(f"{source}: {unknown} are not ServerArgs fields")
+        stash = getattr(self, "_resolved_overrides", None)
+        if stash is None:
+            stash = self._resolved_overrides = []
+        stash.append((source, dict(fields)))
+        for name, value in fields.items():
+            setattr(self, name, value)
+
     def _run_resolution_pipeline(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
@@ -3859,9 +3890,15 @@ class ServerArgs:
             )
         if self.return_hidden_states_mode is None:
             if self.enable_return_hidden_states:
-                self.return_hidden_states_mode = "full"
+                self._declare(
+                    "_handle_return_hidden_states_mode",
+                    return_hidden_states_mode="full",
+                )
         else:
-            self.enable_return_hidden_states = True
+            self._declare(
+                "_handle_return_hidden_states_mode",
+                enable_return_hidden_states=True,
+            )
 
     def _handle_model_capability_adjustments(self):
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
@@ -3943,7 +3980,10 @@ class ServerArgs:
             # Submit a list-valued embeddings request atomically so BCG can
             # replay its full prefill batch instead of starting item zero
             # while the remaining texts are still being tokenized.
-            self.enable_tokenizer_batch_encode = True
+            self._declare(
+                "_handle_model_capability_adjustments",
+                enable_tokenizer_batch_encode=True,
+            )
             requested_prefill_backend = (
                 self.prefill_attention_backend or self.attention_backend
             )
@@ -4184,7 +4224,7 @@ class ServerArgs:
                 "--disable-fast-image-processor is deprecated; use "
                 "--image-processor-backend=pil instead."
             )
-            self.image_processor_backend = "pil"
+            self._declare("_handle_deprecated_args", image_processor_backend="pil")
 
         # Handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
@@ -4192,7 +4232,10 @@ class ServerArgs:
             logger.warning(
                 f"The tool_call_parser '{self.tool_call_parser}' is deprecated. Please use '{deprecated_tool_call_parsers[self.tool_call_parser]}' instead."
             )
-            self.tool_call_parser = deprecated_tool_call_parsers[self.tool_call_parser]
+            self._declare(
+                "_handle_deprecated_args",
+                tool_call_parser=deprecated_tool_call_parsers[self.tool_call_parser],
+            )
 
         # When user passes --enable-flashinfer-allreduce-fusion, enable with auto backend
         if (
@@ -4204,7 +4247,10 @@ class ServerArgs:
                 "Please use --flashinfer-allreduce-fusion-backend=auto instead."
             )
             self.flashinfer_allreduce_fusion_backend = "auto"
-        self.enable_flashinfer_allreduce_fusion = False
+        self._declare(
+            "_handle_deprecated_args",
+            enable_flashinfer_allreduce_fusion=False,
+        )
         # Deprecated attention-backend alias: "compressed" -> "dsv4".
         for attr in (
             "attention_backend",
@@ -4298,25 +4344,40 @@ class ServerArgs:
 
     def _handle_prefill_delayer_env_compat(self):
         if envs.SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE.get():
-            self.enable_prefill_delayer = True
+            self._declare(
+                "_handle_prefill_delayer_env_compat",
+                enable_prefill_delayer=True,
+            )
         if x := envs.SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES.get():
-            self.prefill_delayer_max_delay_passes = x
+            self._declare(
+                "_handle_prefill_delayer_env_compat",
+                prefill_delayer_max_delay_passes=x,
+            )
         if x := envs.SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK.get():
-            self.prefill_delayer_token_usage_low_watermark = x
+            self._declare(
+                "_handle_prefill_delayer_env_compat",
+                prefill_delayer_token_usage_low_watermark=x,
+            )
 
     def _handle_missing_default_values(self):
         if self.tokenizer_path is None:
             self.tokenizer_path = self.model_path
         if self.served_model_name is None:
-            self.served_model_name = self.model_path
+            self._declare(
+                "_handle_missing_default_values",
+                served_model_name=self.model_path,
+            )
         if self.device is None:
             self.device = get_device()
         # strip device index from user if any (e.g. "cuda:0" -> "cuda")
         self.device = self.device.split(":")[0]
         if self.random_seed is None:
-            self.random_seed = random.randint(0, 1 << 30)
+            self._declare(
+                "_handle_missing_default_values",
+                random_seed=random.randint(0, 1 << 30),
+            )
         if self.mm_process_config is None:
-            self.mm_process_config = {}
+            self._declare("_handle_missing_default_values", mm_process_config={})
 
         # Handle ModelScope model downloads
         if envs.SGLANG_USE_MODELSCOPE.get():
@@ -4326,8 +4387,10 @@ class ServerArgs:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
         # - Otherwise, the draft model defaults to the same quantization as the target model.
         if self._speculative_draft_quantization_explicitly_set is None:
-            self._speculative_draft_quantization_explicitly_set = (
-                self.speculative_draft_model_quantization is not None
+            self._declare(
+                "_handle_missing_default_values",
+                _speculative_draft_quantization_explicitly_set=self.speculative_draft_model_quantization
+                is not None,
             )
         if self.speculative_draft_model_quantization is None:
             self.speculative_draft_model_quantization = self.quantization
@@ -5297,11 +5360,18 @@ class ServerArgs:
         )
 
         if self.enable_deterministic_inference:
-            self.enforce_disable_flashinfer_allreduce_fusion = True
+            self._declare(
+                "_handle_model_specific_adjustments",
+                enforce_disable_flashinfer_allreduce_fusion=True,
+            )
 
-        self.uses_mamba_radix_cache = False
+        self._declare(
+            "_handle_model_specific_adjustments",
+            uses_mamba_radix_cache=False,
+        )
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
-            self._resolved_overrides = []
+            # No model overrides for an instance connector: no hf_config to
+            # key them on.
             return
 
         model_config = self.get_model_config()
@@ -5352,10 +5422,11 @@ class ServerArgs:
             validate_declarations,
         )
 
-        self._resolved_overrides = collect_model_override_declarations(
+        model_overrides = collect_model_override_declarations(
             model_arch, self, hf_config
         )
-        validate_declarations(self, self._resolved_overrides)
+        validate_declarations(self, model_overrides)
+        self._resolved_overrides.extend(model_overrides)
 
         if model_arch in (
             "KimiLinearForCausalLM",
@@ -6221,7 +6292,7 @@ class ServerArgs:
 
     def _handle_amd_specifics(self):
         if is_hip():
-            self.triton_attention_num_kv_splits = 16
+            self._declare("_handle_amd_specifics", triton_attention_num_kv_splits=16)
 
     def _handle_nccl_pre_warm(self):
         # pre_warm_nccl is only used with CUDA or HIP hardware or NPU hardware
@@ -6230,11 +6301,11 @@ class ServerArgs:
                 "pre_warm_nccl is only applicable for CUDA or HIP hardware or NPU hardware. "
                 "Ignoring pre_warm_nccl setting on current hardware."
             )
-            self.pre_warm_nccl = False
+            self._declare("_handle_nccl_pre_warm", pre_warm_nccl=False)
 
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:
-            self.grammar_backend = "xgrammar"
+            self._declare("_handle_grammar_backend", grammar_backend="xgrammar")
 
     def _handle_mamba_backend(self):
         if self.mamba_cache_philox_rounds < 0:
@@ -6703,7 +6774,7 @@ class ServerArgs:
 
         self.dp_size = self.dwdp_size
         self.enable_dp_attention = True
-        self.enable_dp_attention_local_control_broadcast = True
+        self._declare("_handle_dwdp", enable_dp_attention_local_control_broadcast=True)
         self.enable_dp_lm_head = True
         self.moe_dense_tp_size = 1
         self.ep_size = self.dwdp_size
@@ -6753,7 +6824,10 @@ class ServerArgs:
                 )
 
         if self._resolved().enable_dp_attention:
-            self.schedule_conservativeness = self.schedule_conservativeness * 0.3
+            self._declare(
+                "_handle_data_parallelism",
+                schedule_conservativeness=self.schedule_conservativeness * 0.3,
+            )
             assert self.tp_size % self.dp_size == 0
             original_chunked_prefill_size = self.chunked_prefill_size
             self.chunked_prefill_size = self.chunked_prefill_size // self.dp_size
@@ -6974,7 +7048,7 @@ class ServerArgs:
 
         a2a_backend = resolved_view(self).moe_a2a_backend
         if self.enable_waterfill:
-            self.enforce_shared_experts_fusion = True
+            self._declare("_handle_a2a_moe", enforce_shared_experts_fusion=True)
             logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
 
         if a2a_backend == "deepep":
@@ -7208,7 +7282,10 @@ class ServerArgs:
                 "Elastic EP runtime scale-up does not support "
                 "--enable-elastic-expert-backup."
             )
-            self.enable_dp_attention_local_control_broadcast = True
+            self._declare(
+                "_handle_elastic_ep",
+                enable_dp_attention_local_control_broadcast=True,
+            )
             if self.ep_join_mode == "scale":
                 assert self.elastic_ep_initial_size is not None, (
                     "Elastic EP scale joiners require --elastic-ep-initial-size "
@@ -7321,9 +7398,15 @@ class ServerArgs:
 
         if self.expert_distribution_recorder_buffer_size is None:
             if (x := self.eplb_rebalance_num_iterations) is not None:
-                self.expert_distribution_recorder_buffer_size = x
+                self._declare(
+                    "_handle_expert_distribution_metrics",
+                    expert_distribution_recorder_buffer_size=x,
+                )
             elif self.expert_distribution_recorder_mode is not None:
-                self.expert_distribution_recorder_buffer_size = 1000
+                self._declare(
+                    "_handle_expert_distribution_metrics",
+                    expert_distribution_recorder_buffer_size=1000,
+                )
 
     def _handle_pipeline_parallelism(self):
         # Moved to the resolution pipeline (arg_groups/overrides.py:
@@ -7448,8 +7531,11 @@ class ServerArgs:
         it against the retraction-backup backend (1.0 for host_pool, else 2.0).
         """
         if self.hicache_ratio is None and self.disaggregation_mode != "decode":
-            self.hicache_ratio = (
-                1.2 if self.hicache_host_memory_mode == "buffer_only" else 2.0
+            self._declare(
+                "_handle_hicache_ratio_default",
+                hicache_ratio=(
+                    1.2 if self.hicache_host_memory_mode == "buffer_only" else 2.0
+                ),
             )
 
     def _handle_hicache(self):
@@ -7663,10 +7749,13 @@ class ServerArgs:
             and is_runai_obj_uri(self.speculative_draft_model_path)
             and self.speculative_draft_load_format is None
         ):
-            self.speculative_draft_load_format = "runai_streamer"
+            self._declare(
+                "_handle_load_format",
+                speculative_draft_load_format="runai_streamer",
+            )
 
         if self.custom_weight_loader is None:
-            self.custom_weight_loader = []
+            self._declare("_handle_load_format", custom_weight_loader=[])
 
         if self.load_format == "remote_instance":
             if self.remote_instance_weight_loader_backend != "modelexpress" and (
@@ -7696,8 +7785,9 @@ class ServerArgs:
 
         # Check whether TransferEngine can be used when users want to start seed service that supports TransferEngine backend.
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
-            self.remote_instance_weight_loader_start_seed_via_transfer_engine = (
-                self.validate_transfer_engine()
+            self._declare(
+                "_handle_load_format",
+                remote_instance_weight_loader_start_seed_via_transfer_engine=self.validate_transfer_engine(),
             )
 
         # "ipc_cache" is an internal-only load format: ModelRunner sets it
@@ -7973,19 +8063,25 @@ class ServerArgs:
                     "skip_tokenizer_init=True leaves no decode work for detokenizer workers; "
                     f"forcing detokenizer_worker_num=1 (requested {self.detokenizer_worker_num})."
                 )
-                self.detokenizer_worker_num = 1
+                self._declare("_handle_tokenizer_batching", detokenizer_worker_num=1)
 
             if self.enable_tokenizer_batch_encode:
                 logger.warning(
                     "skip_tokenizer_init=True ignores --enable-tokenizer-batch-encode; disabling it."
                 )
-                self.enable_tokenizer_batch_encode = False
+                self._declare(
+                    "_handle_tokenizer_batching",
+                    enable_tokenizer_batch_encode=False,
+                )
 
             if self.enable_dynamic_batch_tokenizer:
                 logger.warning(
                     "skip_tokenizer_init=True ignores --enable-dynamic-batch-tokenizer; disabling it."
                 )
-                self.enable_dynamic_batch_tokenizer = False
+                self._declare(
+                    "_handle_tokenizer_batching",
+                    enable_dynamic_batch_tokenizer=False,
+                )
 
             logger.info(
                 "skip_tokenizer_init=True: string-based stop conditions (stop, stop_regex) "
@@ -8152,10 +8248,16 @@ class ServerArgs:
                 ),
             )
 
-        self.mm_feature_transport = requested_transport
+        self._declare(
+            "_handle_multimodal_feature_transport",
+            mm_feature_transport=requested_transport,
+        )
         # The bounded IPC pool owns device residency. Do not retain unpooled
         # tensors after a pool miss, which would make HBM use request-dependent.
-        self.keep_mm_feature_on_device = False
+        self._declare(
+            "_handle_multimodal_feature_transport",
+            keep_mm_feature_on_device=False,
+        )
         envs.SGLANG_USE_CUDA_IPC_TRANSPORT.set(
             "1" if requested_transport == "cuda_ipc" else "0"
         )
@@ -8179,7 +8281,7 @@ class ServerArgs:
                     "--debug-cuda-graph is not supported on non CUDA/HIP devices. "
                     "Disabling breakable CUDA graph."
                 )
-                self.debug_cuda_graph = False
+                self._declare("_handle_environment_variables", debug_cuda_graph=False)
             else:
                 envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.set("1")
                 logger.warning(
@@ -8366,11 +8468,17 @@ class ServerArgs:
                 else:
                     # CUDA: use NCCL tree algorithm
                     os.environ["NCCL_ALGO"] = "allreduce:tree"
+                    # Not declared: set_default_server_args() writes this field
+                    # too, through its `args` parameter, so a declaration here
+                    # would be a second source for one field.
                     self.disable_custom_all_reduce = True
                     # should_torch_symm_mem_allreduce() takes the
                     # symmetric-memory path only below a byte threshold, so
                     # which reduce runs would follow the token count.
-                    self.enable_torch_symm_mem = False
+                    self._declare(
+                        "_handle_deterministic_inference",
+                        enable_torch_symm_mem=False,
+                    )
                     # Each channel carries a differently shaped tree and the
                     # channel count is picked from the message size, so a
                     # token's reduction order would follow the token count.
@@ -8582,12 +8690,12 @@ class ServerArgs:
                 logger.warning(
                     "LMCache is disabled because of using diffusion LLM inference"
                 )
-                self.enable_lmcache = False
+                self._declare("_handle_dllm_inference", enable_lmcache=False)
             if self.enable_flexkv:
                 logger.warning(
                     "FlexKV is disabled because of using diffusion LLM inference"
                 )
-                self.enable_flexkv = False
+                self._declare("_handle_dllm_inference", enable_flexkv=False)
 
         if self.pp_size > 1:
             logger.warning(
@@ -8599,7 +8707,7 @@ class ServerArgs:
             logger.warning(
                 "Currently LoRA is not supported by diffusion LLM inference."
             )
-            self.enable_lora = False
+            self._declare("_handle_dllm_inference", enable_lora=False)
 
         if self.disaggregation_mode != "null":
             logger.warning(
@@ -8645,7 +8753,10 @@ class ServerArgs:
         ):
             if self.pp_size > 1:
                 logger.warning("Optimistic prefill does not support pp_size > 1")
-                self.optimistic_prefill_attempts = 0
+                self._declare(
+                    "_handle_other_validations",
+                    optimistic_prefill_attempts=0,
+                )
             elif self.enable_hierarchical_cache and (
                 self.hicache_storage_backend is not None
                 or self.hicache_write_policy != "write_back"
@@ -8654,13 +8765,19 @@ class ServerArgs:
                     "Optimistic prefill only supports L2 hierarchical cache "
                     "with write-back policy"
                 )
-                self.optimistic_prefill_attempts = 0
+                self._declare(
+                    "_handle_other_validations",
+                    optimistic_prefill_attempts=0,
+                )
             elif resolved_view(self).uses_mamba_radix_cache:
                 logger.warning(
                     "Optimistic prefill does not support models that use "
                     "mamba radix cache."
                 )
-                self.optimistic_prefill_attempts = 0
+                self._declare(
+                    "_handle_other_validations",
+                    optimistic_prefill_attempts=0,
+                )
 
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
@@ -8669,7 +8786,7 @@ class ServerArgs:
             )
             self.cuda_graph_config.decode.backend = Backend.DISABLED
             self.cuda_graph_config.prefill.backend = Backend.DISABLED
-            self.skip_server_warmup = True
+            self._declare("_handle_other_validations", skip_server_warmup=True)
 
         if self.msprobe_dump_config is not None:
             logger.warning(
@@ -8679,7 +8796,7 @@ class ServerArgs:
             )
             self.cuda_graph_config.decode.backend = Backend.DISABLED
             self.cuda_graph_config.prefill.backend = Backend.DISABLED
-            self.skip_server_warmup = True
+            self._declare("_handle_other_validations", skip_server_warmup=True)
 
         # Validate limit_mm_per_prompt modalities
         if self.limit_mm_data_per_request:
@@ -8755,7 +8872,7 @@ class ServerArgs:
     def _handle_debug_utils(self):
         if is_in_ci() and self.soft_watchdog_timeout is None:
             logger.info("Set soft_watchdog_timeout since in CI")
-            self.soft_watchdog_timeout = 300
+            self._declare("_handle_debug_utils", soft_watchdog_timeout=300)
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
