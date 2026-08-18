@@ -13,6 +13,7 @@ import torch
 
 from sglang.benchmark.serving import run_benchmark
 from sglang.srt.managers.prefill_delayer import PrefillDelayer
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -76,6 +77,9 @@ def _run_negotiate_test(rank, test_cases):
     cpu_group = torch.distributed.new_group(backend="gloo")
 
     for case in test_cases:
+        # The DP-attention gate is a published config leaf.
+        override = get_context().override_server_args(enable_dp_attention=True)
+        override.install()
         delayer = PrefillDelayer(
             dp_size=world_size,
             attn_tp_size=1,
@@ -126,6 +130,8 @@ def _run_negotiate_test(rank, test_cases):
                 assert (
                     result.wait_seconds > 0.0
                 ), f"Case {case.name} rank {rank}: wait_seconds not surfaced"
+
+        override.restore()
 
 
 _NEGOTIATE_TEST_CASES = [

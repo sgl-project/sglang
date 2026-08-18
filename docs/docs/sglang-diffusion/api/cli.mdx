@@ -129,6 +129,12 @@ For quantized transformer checkpoints, prefer:
 - `--quantization` for online quantization (apply quantization to unquantized models at load time, activations are quantized dynamically)
 - `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
 
+Component checkpoint paths are selected separately, so changing DiT precision
+never silently changes prompt embeddings. For a native text encoder:
+
+- `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias
+- Quantization metadata is auto-detected from that checkpoint. Each native encoder must explicitly support the serialized format; this is not blanket quantization support for every component, and unsupported combinations fail before weight loading.
+
 For supported realtime causal video models, `--kv-cache-quant {off|int4|int2}`
 compresses completed KV-cache chunks independently of transformer weight
 quantization. It is lossy and disabled by default.
