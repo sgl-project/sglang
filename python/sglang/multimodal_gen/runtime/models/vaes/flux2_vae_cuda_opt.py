@@ -8,9 +8,8 @@ decoder module family (``ResnetBlock2D`` GroupNorm+SiLU chains,
 
 All rewrites are mathematically exact re-associations of the original
 operators. Wrappers are installed once at VAE load and dispatch on a
-request-scoped :class:`VaeFastPathGate` (published as
-``_sgl_vae_fast_path_gate``): ``quality == "high"`` runs the fast paths, the
-``"lossless"`` default runs the original module path bit-for-bit.
+decode-scoped :class:`VaeFastPathGate`: ``quality == "high"`` runs the fast
+paths, the ``"lossless"`` default runs the original module path bit-for-bit.
 
 - channels_last: run the decoder in NHWC so cuDNN convs skip the transpose
   kernels; parameter layout is swapped at decode entry to match the gate.
@@ -28,12 +27,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    VaeFastPathGate,
+    register_vae_fast_path_gate,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
 try:
-    from sglang.kernels.ops.diffusion.triton.group_norm_silu_twopass import (
+    from sglang.kernels.ops.diffusion import (
+        can_use_group_norm_silu_4d,
+        can_use_group_norm_silu_rows,
         group_norm_silu_4d,
         group_norm_silu_rows,
     )
@@ -41,19 +46,6 @@ try:
     _HAS_TRITON = True
 except ImportError:  # pragma: no cover
     _HAS_TRITON = False
-
-
-class VaeFastPathGate:
-    """Mutable fast-path flag shared by every wrapper of one VAE; enabled by
-    ``DecodingStage`` while decoding a ``quality == "high"`` request."""
-
-    __slots__ = ("enabled",)
-
-    def __init__(self) -> None:
-        self.enabled = False
-
-
-GATE_ATTR = "_sgl_vae_fast_path_gate"
 
 
 # ---------------------------------------------------------------------------
@@ -80,8 +72,12 @@ class FusedGroupNormSiLU(nn.Module):
         self._sgl_gate = gate
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._sgl_gate.enabled and x.dim() == 4:
-            y = group_norm_silu_4d(
+        if (
+            self._sgl_gate.enabled
+            and x.dim() == 4
+            and can_use_group_norm_silu_4d(x, self.weight, self.bias, self.num_groups)
+        ):
+            return group_norm_silu_4d(
                 x,
                 self.weight,
                 self.bias,
@@ -89,8 +85,6 @@ class FusedGroupNormSiLU(nn.Module):
                 self.eps,
                 apply_silu=True,
             )
-            if y is not None:
-                return y
         return F.silu(
             F.group_norm(x, self.num_groups, self.weight, self.bias, self.eps)
         )
@@ -267,10 +261,12 @@ def _attn_fast_forward(
 
     if self.group_norm is not None:
         gn = self.group_norm
-        y = group_norm_silu_rows(
-            hs, gn.weight, gn.bias, gn.num_groups, gn.eps, apply_silu=False
-        )
-        hs = y if y is not None else gn(hs.transpose(1, 2)).transpose(1, 2)
+        if can_use_group_norm_silu_rows(hs, gn.weight, gn.bias, gn.num_groups):
+            hs = group_norm_silu_rows(
+                hs, gn.weight, gn.bias, gn.num_groups, gn.eps, apply_silu=False
+            )
+        else:
+            hs = gn(hs.transpose(1, 2)).transpose(1, 2)
 
     query = self.to_q(hs)
     key = self.to_k(hs)
@@ -330,7 +326,7 @@ def _decoder_layout_forward(self, *args, **kwargs):
             memory_format=(torch.channels_last if want_cl else torch.contiguous_format)
         )
         self._sgl_channels_last = want_cl
-        logger.info(
+        logger.debug(
             "%s: decoder switched to %s layout.",
             self._sgl_label,
             "channels_last (NHWC)" if want_cl else "contiguous (NCHW)",
@@ -396,7 +392,7 @@ def _install_decoder_fast_paths(vae: nn.Module, label: str) -> nn.Module:
         m._sgl_folded_v = None
         m.forward = MethodType(_attn_fast_forward, m)
     n_norm = _install_norm_silu(decoder, ResnetBlock2D, gate)
-    setattr(vae, GATE_ATTR, gate)
+    register_vae_fast_path_gate(vae, gate)
     logger.info(
         "%s: installed quality-gated decoder fast paths "
         "(channels_last dispatch, %d fused upsamplers, %d fast attention "
