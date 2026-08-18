@@ -81,6 +81,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
     MOVA720PConfig,
@@ -157,6 +158,7 @@ from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX23HQSamplingParams,
     LTX23SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
@@ -692,7 +694,9 @@ def _register_configs():
         hf_model_paths=["Lightricks/LTX-2"],
         model_detectors=[
             lambda path: "ltx" in path.lower() and "video" in path.lower(),
-            lambda path: "ltx-2" in path.lower() and "ltx-2.3" not in path.lower(),
+            lambda path: "ltx-2" in path.lower()
+            and "ltx-2.3" not in path.lower()
+            and "ltx-2.5" not in path.lower(),
         ],
     )
     register_configs(
@@ -701,6 +705,18 @@ def _register_configs():
         hf_model_paths=["Lightricks/LTX-2.3"],
         model_detectors=[
             lambda path: "ltx-2.3" in path.lower(),
+        ],
+    )
+    # Keeps the LTX-2 pipeline class; only component geometry and the pinned
+    # distilled schedule differ. Only the `-Diffusers` repo is listed --
+    # `Lightricks/LTX-2.5` is a split pack of bare `.safetensors` and would need
+    # a model overlay first.
+    register_configs(
+        sampling_param_cls=LTX25SamplingParams,
+        pipeline_config_cls=LTX25PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2.5-Diffusers"],
+        model_detectors=[
+            lambda path: "ltx-2.5" in path.lower(),
         ],
     )
     # register dedicated sampling params for LTX2TwoStageHQPipeline

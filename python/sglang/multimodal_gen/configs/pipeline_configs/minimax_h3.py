@@ -110,6 +110,12 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             else type(current_platform).__name__
         )
         model_variant = str(server_args.model_variant or "fl2va").lower()
+        resolved_quant_config = self.text_encoder_configs[0].quant_config
+        text_encoder_quantization = (
+            resolved_quant_config.get_name()
+            if resolved_quant_config is not None
+            else None
+        )
         actual = {
             "attention_backend": attention_backend,
             "backend": self._server_arg_value(server_args.backend),
@@ -123,6 +129,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "num_gpus": server_args.num_gpus,
             "performance_mode": server_args.performance_mode,
             "quantization": server_args.quantization,
+            "text_encoder_quantization": text_encoder_quantization,
             "regional_compile": server_args.regional_compile,
             "ring_degree": server_args.ring_degree,
             "sp_degree": server_args.sp_degree,
@@ -144,6 +151,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
             "num_gpus": 4,
             "performance_mode": "speed",
             "quantization": None,
+            "text_encoder_quantization": None,
             "regional_compile": False,
             "ring_degree": 1,
             "sp_degree": 4,

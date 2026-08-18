@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn im
     CubeSparseAttentionMetadata,
     CubeSparseAttentionMetadataBuilder,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
