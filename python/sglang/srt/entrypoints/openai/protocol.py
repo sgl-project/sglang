@@ -419,10 +419,13 @@ class SpecTokensDetails(BaseModel):
 
     spec_accept_rate: float = 0.0
     spec_accept_length: float = 0.0
+    spec_cap_length: float = 0.0
+    spec_block_accept_length: float = 0.0
     spec_num_correct_drafts: int = 0
     spec_num_proposed_drafts: int = 0
     spec_verify_ct: int = 0
     spec_correct_drafts_histogram: List[int] = Field(default_factory=list)
+    spec_cap_lens_histogram: List[int] = Field(default_factory=list)
 
 
 class SglExt(BaseModel):
@@ -434,7 +437,9 @@ class SglExt(BaseModel):
 
     routed_experts: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
-    spec_tokens_details: Optional[SpecTokensDetails] = None
+    spec_tokens_details: Optional[Union[SpecTokensDetails, List[SpecTokensDetails]]] = (
+        None
+    )
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
