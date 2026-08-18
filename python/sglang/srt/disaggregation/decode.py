@@ -1694,7 +1694,9 @@ def alloc_for_decode_prealloc_hisparse(
             extend_num_tokens=fill_len,
             swa_tail_len=swa_tail_len,
         )
-        req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
+        swa_evicted_seqlen = fill_len - swa_tail_len
+        assert swa_evicted_seqlen >= 0 and swa_evicted_seqlen % allocator.page_size == 0
+        req.kv.swa_evicted_seqlen = swa_evicted_seqlen
     else:
         kv_loc = allocator.alloc_logical_only(
             prefix_lens=prefix_lens,
