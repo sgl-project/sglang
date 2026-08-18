@@ -17,7 +17,11 @@ from copy import copy
 from typing import Any
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    align_num_frames_for_num_gpus,
+    resolve_sequence_shard,
+)
 from sglang.multimodal_gen.registry import get_pipeline_config_classes
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import (
@@ -252,38 +256,70 @@ def _resolve_warmup_num_frames(
         return num_frames
 
     capped_num_frames = min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
-    # Warmup requests skip SamplingParams._adjust, so the cap must re-apply
-    # the model frame contract itself. Without this, e.g. LongLive2's capped
-    # 17 frames map to 5 latent frames (not divisible by its 8-frame causal
-    # block) and every server warmup fails silently under fail-open.
-    return server_args.pipeline_config.adjust_num_frames(capped_num_frames)
+    return _apply_warmup_frame_contract(
+        server_args, sampling_defaults, num_frames=capped_num_frames
+    )
+
+
+def _apply_warmup_frame_contract(
+    server_args: ServerArgs, sampling_defaults: SamplingParams, *, num_frames: int
+) -> int:
+    """Re-apply the real-request frame contract to a capped warmup frame count.
+
+    Warmup requests skip ``SamplingParams._adjust``, so the cap must run the
+    model frame contract itself -- without this, e.g. LongLive2's capped 17
+    frames map to 5 latent frames (not divisible by its 8-frame causal block)
+    and every server warmup fails silently under fail-open. Pipelines that
+    align frames to ``num_gpus`` (rather than sharding the sequence dim) get
+    the same latent alignment real requests get.
+    """
+    num_frames = server_args.pipeline_config.adjust_num_frames(num_frames)
+    if sampling_defaults.adjust_frames and not resolve_sequence_shard(
+        server_args.pipeline_config, sampling_defaults.enable_sequence_shard
+    ):
+        num_frames = align_num_frames_for_num_gpus(
+            num_frames,
+            num_gpus=server_args.num_gpus,
+            vae_config=server_args.pipeline_config.vae_config,
+            round_down=sampling_defaults.num_frames_round_down,
+        )
+    return num_frames
 
 
 def _resolve_calibration_num_frames(
     server_args: ServerArgs,
     sampling_defaults: SamplingParams,
-    warmup_num_frames: int,
     *,
+    warmup_num_frames: int | None,
     server_based_warmup: bool,
 ) -> int | None:
     """A second, smaller warmup frame count for auto-residency calibration.
 
-    Only produced when the main video warmup was frame-capped under
-    ``--performance-mode auto``: the auto-residency estimator then has two
-    workload sizes to fit the constant/linear split of the peak. Returns None
-    when a second measurement adds no information (same adjusted frames).
+    Only produced when the main video warmup was frame-capped and the
+    auto-residency promotion is actually eligible to consume the measurement
+    (``auto_residency_skip_reason``): the estimator then has two workload
+    sizes to fit the constant/linear split of the peak. Returns None when a
+    second measurement adds no information (same adjusted frames) or would
+    never be read.
     """
+    # local import: server_warmup imports this module at module level
+    from sglang.multimodal_gen.runtime.server_warmup import (
+        auto_residency_skip_reason,
+    )
+
     if not server_based_warmup or not _is_video_warmup_task(server_args):
         return None
-    if server_args.performance_mode != "auto":
+    if warmup_num_frames is None:
         return None
-    if getattr(server_args, "enable_breakable_cuda_graph", False) is True:
+    if auto_residency_skip_reason(server_args) is not None:
         return None
-    default_num_frames = getattr(sampling_defaults, "num_frames", 1) or 1
+    default_num_frames = sampling_defaults.num_frames or 1
     if warmup_num_frames >= default_num_frames:
         return None
-    calibration_num_frames = server_args.pipeline_config.adjust_num_frames(
-        SERVER_WARMUP_CALIBRATION_VIDEO_FRAMES
+    calibration_num_frames = _apply_warmup_frame_contract(
+        server_args,
+        sampling_defaults,
+        num_frames=SERVER_WARMUP_CALIBRATION_VIDEO_FRAMES,
     )
     if calibration_num_frames == warmup_num_frames or calibration_num_frames <= 0:
         return None
@@ -404,7 +440,7 @@ def build_warmup_reqs(
         _resolve_calibration_num_frames(
             server_args,
             sampling_defaults,
-            warmup_num_frames,
+            warmup_num_frames=warmup_num_frames,
             server_based_warmup=server_based_warmup,
         )
         if warmup_resolutions is None
@@ -444,23 +480,6 @@ def build_warmup_reqs(
         elif negative_prompt is not None and cfg_scale is not None and cfg_scale > 1.0:
             req_kwargs["do_classifier_free_guidance"] = True
 
-        if calibration_num_frames is not None and (width, height) == resolutions[0]:
-            # smaller-workload measurement first; it also pre-warms kernels
-            # so the main warmup measurement is cleaner
-            calibration_kwargs = req_kwargs.copy()
-            calibration_kwargs["sampling_params"] = copy(req_kwargs["sampling_params"])
-            calibration_kwargs["num_frames"] = calibration_num_frames
-            calibration_req = Req(**calibration_kwargs)
-            calibration_req.set_as_warmup(warmup_steps)
-            calibration_req.sampling_params.prepare_synthetic_warmup_request_for_queue(
-                calibration_req, server_args
-            )
-            if return_warmup_result:
-                calibration_req.extra["return_warmup_result"] = True
-            if server_based_warmup:
-                calibration_req.extra["server_based_warmup"] = True
-            warmup_reqs.append(calibration_req)
-
         run_real_path_prewarm = server_based_warmup and server_args.enable_torch_compile
         prompts = (
             (DEFAULT_PLACEHOLDER_PROMPT,) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
@@ -489,4 +508,46 @@ def build_warmup_reqs(
                 req.extra["server_based_warmup"] = True
             warmup_reqs.append(req)
 
+        if calibration_num_frames is not None and (width, height) == resolutions[0]:
+            # The calibration measurement runs AFTER the main warmup request:
+            # one-time allocations (compile scratch, cuDNN workspaces,
+            # allocator pool growth) then land in the larger measurement,
+            # which can only steepen the fitted slope -- the safe direction.
+            # Measuring the small shape first flattened the slope and
+            # under-estimated the default workload peak.
+            warmup_reqs.append(
+                _build_calibration_warmup_req(
+                    req_kwargs,
+                    calibration_num_frames=calibration_num_frames,
+                    warmup_steps=warmup_steps,
+                    return_warmup_result=return_warmup_result,
+                    server_based_warmup=server_based_warmup,
+                    server_args=server_args,
+                )
+            )
+
     return warmup_reqs
+
+
+def _build_calibration_warmup_req(
+    req_kwargs: dict,
+    *,
+    calibration_num_frames: int,
+    warmup_steps: int,
+    return_warmup_result: bool,
+    server_based_warmup: bool,
+    server_args: ServerArgs,
+) -> Req:
+    calibration_kwargs = req_kwargs.copy()
+    calibration_kwargs["sampling_params"] = copy(req_kwargs["sampling_params"])
+    calibration_kwargs["num_frames"] = calibration_num_frames
+    calibration_req = Req(**calibration_kwargs)
+    calibration_req.set_as_warmup(warmup_steps)
+    calibration_req.sampling_params.prepare_synthetic_warmup_request_for_queue(
+        calibration_req, server_args
+    )
+    if return_warmup_result:
+        calibration_req.extra["return_warmup_result"] = True
+    if server_based_warmup:
+        calibration_req.extra["server_based_warmup"] = True
+    return calibration_req

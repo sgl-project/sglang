@@ -13,7 +13,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     ACTIVATION_EXTRAPOLATION_MARGIN,
     GIB_BYTES,
     MIN_VRAM_RESERVE_BYTES,
+    AppliedPromotion,
     AutoResidencyPlan,
+    AutoResidencyRollbackError,
     PromotionCandidate,
     RankResidencyReport,
     WarmupMemoryRecord,
@@ -68,12 +70,14 @@ class TestEstimateDefaultWorkloadPeak:
         )
         assert estimate == record.peak_reserved_bytes
 
-    def test_unknown_target_uses_measured_peak(self):
+    def test_unknown_target_disables_estimation(self):
+        # An unknown target would silently equate the capped warmup peak with
+        # the serving peak and promote with no margin at all.
         record = _record()
         estimate = estimate_default_workload_peak_bytes(
             records=[record], target_units=None
         )
-        assert estimate == record.peak_reserved_bytes
+        assert estimate is None
 
     def test_single_capped_record_scales_only_the_activation_part(self):
         # Warmup capped to 832x480x17; Wan-class default is 704x1280x121.
@@ -275,6 +279,7 @@ class _FakeLayerwiseManager:
         self.enabled = True
         self._configured = True
         self._tensors = tensors
+        self.fail_load = False
         self.load_all_layers_calls = 0
         self.remove_hooks_calls = 0
         self.register_hooks_calls = 0
@@ -284,8 +289,15 @@ class _FakeLayerwiseManager:
     def iter_cpu_weights(self):
         yield from self._tensors.items()
 
+    def offloaded_weight_bytes(self):
+        return sum(
+            tensor.numel() * tensor.element_size() for tensor in self._tensors.values()
+        )
+
     def load_all_layers(self):
         self.load_all_layers_calls += 1
+        if self.fail_load:
+            raise RuntimeError("CUDA out of memory")
 
     def remove_forward_hooks(self):
         self.remove_hooks_calls += 1
@@ -315,7 +327,7 @@ class _StubResidencyArgs:
     def require_component_resident(self, component_name, *, feature_name):
         self.required.add(component_name)
 
-    def release_required_component_residency(self, component_name):
+    def release_required_component_residency(self, component_name, *, feature_name):
         self.required.discard(component_name)
 
 
@@ -390,6 +402,21 @@ class TestCollectPromotionCandidates:
             by_name["transformer"].promoted_weight_bytes * 50
         )
 
+    def test_mechanism_mismatch_is_not_a_candidate(self):
+        # A module the compile window manages layerwise while its configured
+        # mode says component-offload: promotion would be a silent no-op.
+        mismatch = _FakeLayerwiseDit(
+            [_FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})]
+        )
+        candidates = collect_promotion_candidates(
+            modules={"mismatch": mismatch},
+            residency_mode_of=self._modes({"mismatch": COMPONENT_OFFLOAD}),
+            explicit_residency_mode_of=lambda _name: None,
+            custom_strategy_names=(),
+            num_inference_steps=10,
+        )
+        assert candidates == []
+
 
 class TestApplyAndRollback:
     def test_component_offload_promotion_marks_resident_without_moving(self):
@@ -455,6 +482,69 @@ class TestApplyAndRollback:
         module.enable_offload()
         assert manager.register_hooks_calls == 0
 
+    def test_disable_offload_failure_rearms_the_manager(self):
+        # load_all_layers is the step most likely to OOM; a failed disable
+        # must leave the manager streaming (hooks re-registered), not in a
+        # hook-less enabled=True state serving (1,) placeholders.
+        manager = _FakeLayerwiseManager({"layers.0.w": torch.zeros(16)})
+        manager.fail_load = True
+        module = _FakeLayerwiseDit([manager])
+        with pytest.raises(RuntimeError, match="out of memory"):
+            module.disable_offload()
+        assert manager.enabled is True
+        assert manager.register_hooks_calls == 1
+        assert manager.release_all_calls == 1
+
+    def test_failed_rollback_raises_rollback_error_with_visible_cause(self):
+        class _BrokenArgs(_StubResidencyArgs):
+            def release_required_component_residency(
+                self, component_name, *, feature_name
+            ):
+                # str(AssertionError()) is "" -- describe_error must keep it
+                # visible so no truthiness filter can drop it
+                raise AssertionError()
+
+        args = _BrokenArgs()
+        candidates = [
+            _candidate("text_encoder", weight_gib=1),
+            _candidate("missing_component", weight_gib=1),
+        ]
+        with pytest.raises(AutoResidencyRollbackError) as exc_info:
+            apply_promotions(
+                plan=_plan_for(candidates),
+                modules={"text_encoder": nn.Linear(2, 2)},
+                server_args=args,
+            )
+        assert "AssertionError" in str(exc_info.value)
+        assert "missing_component" in str(exc_info.value)
+
+    def test_rollback_keeps_going_past_a_broken_component(self):
+        released: list[str] = []
+
+        class _PartialArgs(_StubResidencyArgs):
+            def release_required_component_residency(
+                self, component_name, *, feature_name
+            ):
+                if component_name == "vae":
+                    raise RuntimeError("boom")
+                released.append(component_name)
+
+        args = _PartialArgs()
+        applied = [
+            AppliedPromotion(
+                component_name="text_encoder", residency_mode=COMPONENT_OFFLOAD
+            ),
+            AppliedPromotion(component_name="vae", residency_mode=COMPONENT_OFFLOAD),
+        ]
+        with pytest.raises(RuntimeError, match="vae"):
+            rollback_promotions(
+                applied=applied,
+                modules={},
+                server_args=args,
+            )
+        # the earlier-applied promotion was still undone
+        assert released == ["text_encoder"]
+
 
 class TestCandidateRanking:
     def test_post_request_hint_order_matches_promotion_order(self):
@@ -497,14 +587,20 @@ class TestAppliedChangesLog:
 
 
 class TestWarmupFrameAdjustment:
-    def _server_args(self, *, bcg: bool = False) -> SimpleNamespace:
+    def _server_args(self, *, bcg: bool = False, num_gpus: int = 1) -> SimpleNamespace:
         return SimpleNamespace(
             pipeline_config=LongLive2T2VConfig(),
             enable_breakable_cuda_graph=bcg,
+            num_gpus=num_gpus,
         )
 
     def _defaults(self) -> SimpleNamespace:
-        return SimpleNamespace(num_frames=61)
+        return SimpleNamespace(
+            num_frames=61,
+            adjust_frames=True,
+            enable_sequence_shard=None,
+            num_frames_round_down=False,
+        )
 
     def test_capped_frames_keep_the_model_frame_contract(self):
         # LongLive2 default 61 frames is capped to 17, whose 5 latent frames
@@ -527,55 +623,112 @@ class TestWarmupFrameAdjustment:
         )
         assert num_frames == 61
 
+    def test_capped_frames_get_the_gpu_alignment_real_requests_get(self):
+        # a frame-aligning pipeline (no sequence shard) on multiple GPUs:
+        # 17 frames -> 5 latent frames -> ceil to 6 latents on 2 GPUs -> 21
+        args = SimpleNamespace(
+            pipeline_config=SimpleNamespace(
+                task_type=ModelTaskType.T2V,
+                adjust_num_frames=lambda n: n,
+                vae_config=SimpleNamespace(
+                    use_temporal_scaling_frames=True,
+                    arch_config=SimpleNamespace(temporal_compression_ratio=4),
+                ),
+            ),
+            enable_breakable_cuda_graph=False,
+            num_gpus=2,
+        )
+        defaults = SimpleNamespace(
+            num_frames=81,
+            adjust_frames=True,
+            enable_sequence_shard=None,
+            num_frames_round_down=False,
+        )
+        num_frames = _resolve_warmup_num_frames(
+            args, defaults, server_based_warmup=True
+        )
+        assert num_frames == 21
+
 
 class TestCalibrationFrames:
-    def _wan_like_args(self, *, performance_mode: str = "auto") -> SimpleNamespace:
+    def _patch_gate(self, monkeypatch, reason: str | None = None) -> None:
+        monkeypatch.setattr(
+            "sglang.multimodal_gen.runtime.server_warmup.auto_residency_skip_reason",
+            lambda _args: reason,
+        )
+
+    def _wan_like_args(self) -> SimpleNamespace:
         return SimpleNamespace(
             pipeline_config=SimpleNamespace(
                 task_type=ModelTaskType.T2V,
                 adjust_num_frames=lambda n: n,
             ),
-            enable_breakable_cuda_graph=False,
-            performance_mode=performance_mode,
+            num_gpus=1,
         )
 
-    def test_capped_video_gets_a_smaller_calibration_size(self):
+    def _defaults(self, num_frames: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            num_frames=num_frames,
+            adjust_frames=True,
+            enable_sequence_shard=None,
+            num_frames_round_down=False,
+        )
+
+    def test_capped_video_gets_a_smaller_calibration_size(self, monkeypatch):
+        self._patch_gate(monkeypatch)
         calibration = _resolve_calibration_num_frames(
             self._wan_like_args(),
-            SimpleNamespace(num_frames=81),
-            17,
+            self._defaults(81),
+            warmup_num_frames=17,
             server_based_warmup=True,
         )
         assert calibration == 9
 
-    def test_uncapped_video_needs_no_calibration(self):
+    def test_uncapped_video_needs_no_calibration(self, monkeypatch):
+        self._patch_gate(monkeypatch)
         calibration = _resolve_calibration_num_frames(
             self._wan_like_args(),
-            SimpleNamespace(num_frames=13),
-            13,
+            self._defaults(13),
+            warmup_num_frames=13,
             server_based_warmup=True,
         )
         assert calibration is None
 
-    def test_manual_mode_skips_calibration(self):
+    def test_unknown_warmup_frames_skip_calibration(self, monkeypatch):
+        self._patch_gate(monkeypatch)
         calibration = _resolve_calibration_num_frames(
-            self._wan_like_args(performance_mode="manual"),
-            SimpleNamespace(num_frames=81),
-            17,
+            self._wan_like_args(),
+            self._defaults(81),
+            warmup_num_frames=None,
             server_based_warmup=True,
         )
         assert calibration is None
 
-    def test_frame_contract_collapse_skips_calibration(self):
+    def test_skip_gate_disables_calibration(self, monkeypatch):
+        # the calibration request costs a full extra warmup forward: it must
+        # share the promotion's own gate (kill switch, quantized, manual, ...)
+        self._patch_gate(monkeypatch, reason="performance_mode=manual")
+        calibration = _resolve_calibration_num_frames(
+            self._wan_like_args(),
+            self._defaults(81),
+            warmup_num_frames=17,
+            server_based_warmup=True,
+        )
+        assert calibration is None
+
+    def test_frame_contract_collapse_skips_calibration(self, monkeypatch):
         # LongLive2 aligns both 17 and 9 to 29 latent-block frames: a second
         # measurement at the same size adds nothing.
+        self._patch_gate(monkeypatch)
         args = SimpleNamespace(
             pipeline_config=LongLive2T2VConfig(),
-            enable_breakable_cuda_graph=False,
-            performance_mode="auto",
+            num_gpus=1,
         )
         calibration = _resolve_calibration_num_frames(
-            args, SimpleNamespace(num_frames=61), 29, server_based_warmup=True
+            args,
+            self._defaults(61),
+            warmup_num_frames=29,
+            server_based_warmup=True,
         )
         assert calibration is None
 
@@ -588,6 +741,7 @@ class TestAutoResidencySkipReason:
             warmup_resolutions=None,
             backend="sglang",
             enable_breakable_cuda_graph=False,
+            enable_torch_compile=False,
             batching_max_size=1,
             dp_size=1,
             use_fsdp_inference=False,
@@ -625,6 +779,9 @@ class TestAutoResidencySkipReason:
             ({"warmup_mode": "request"}, "server warmup"),
             ({"backend": "diffusers"}, "diffusers"),
             ({"enable_breakable_cuda_graph": True}, "CUDA graph"),
+            # compile warmup strips the memory layout (layerwise DiT +
+            # resident aux components on CPU): its peaks are not serving peaks
+            ({"enable_torch_compile": True}, "stripped memory layout"),
             ({"batching_max_size": 4}, "batching"),
             ({"dp_size": 2}, "dp replicas"),
             ({"use_fsdp_inference": True}, "FSDP"),

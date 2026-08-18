@@ -1,4 +1,5 @@
 import bisect
+import math
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Set, Tuple
@@ -656,6 +657,22 @@ class LayerwiseOffloadManager:
 
         return updated_names
 
+    def offloaded_weight_bytes(self) -> int:
+        """Total bytes of this manager's offloadable weights, from metadata.
+
+        Size-only companion to ``iter_cpu_weights`` -- it never materializes
+        the per-weight buffer views, so it is safe to call per request.
+        """
+        total = 0
+        for layer_meta in self._weight_metadata.values():
+            for meta in layer_meta.values():
+                if meta.get("preserve_strides", False):
+                    numel = math.prod(meta["shape"])
+                else:
+                    numel = meta["numel"]
+                total += int(numel) * meta["dtype"].itemsize
+        return total
+
     def iter_cpu_weights(self):
         """Yield (name, tensor) pairs from consolidated CPU buffers.
 
@@ -839,10 +856,21 @@ class LayerwiseOffloadableModuleMixin:
         if self.layerwise_offload_managers is None:
             return
         for manager in self.layerwise_offload_managers:
-            if manager.enabled:
-                manager.remove_forward_hooks()
+            if not manager.enabled:
+                continue
+            manager.remove_forward_hooks()
+            try:
                 manager.load_all_layers()
-                manager.enabled = False
+            except Exception:
+                # Loading every layer is the step most likely to OOM. Re-arm
+                # this manager before re-raising: leaving it hook-less with
+                # enabled=True would let release_all() swap weights for (1,)
+                # placeholders that nothing ever streams back in, and
+                # enable_offload()'s already-armed guard would skip repair.
+                manager.release_all()
+                manager.register_forward_hooks()
+                raise
+            manager.enabled = False
 
     def enable_offload(self) -> None:
         """Re-enable layerwise offload: sync weights to CPU, release layers, and restore hooks."""

@@ -348,8 +348,10 @@ class ServerArgs(DisaggServerArgsMixin):
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
     _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
-    _required_resident_components: set[str] = field(
-        default_factory=set, init=False, repr=False
+    # component name -> owning feature; the first (loader-time) owner wins so
+    # a runtime feature's rollback can never release a loader hard requirement
+    _required_resident_components: dict[str, str] = field(
+        default_factory=dict, init=False, repr=False
     )
     _fsdp_disabled_components: set[str] = field(
         default_factory=set, init=False, repr=False
@@ -1440,11 +1442,18 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"{feature_name} requires {component_name!r} to be resident; "
                 f"got {configured_mode!r} from --component-residency"
             )
-        self._required_resident_components.add(component_name)
+        self._required_resident_components.setdefault(component_name, feature_name)
 
-    def release_required_component_residency(self, component_name: str) -> None:
-        """Undo ``require_component_resident`` (auto-residency rollback)."""
-        self._required_resident_components.discard(component_name)
+    def release_required_component_residency(
+        self, component_name: str, *, feature_name: str
+    ) -> None:
+        """Undo ``require_component_resident`` for the same owning feature.
+
+        A release with a different owner is a no-op: an auto-residency
+        rollback must not clear a loader's hard residency requirement.
+        """
+        if self._required_resident_components.get(component_name) == feature_name:
+            del self._required_resident_components[component_name]
 
     def should_use_fsdp_for_component(self, component_name: str) -> bool:
         return bool(
