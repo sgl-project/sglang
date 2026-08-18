@@ -45,7 +45,10 @@ from sglang.srt.mem_cache.allocator.swa import (
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    DeepSeekV4TokenToKVPool,
+    use_dsv4_dspark_draft_swa_sidecar,
+)
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -1104,10 +1107,8 @@ class KVCacheConfigurator:
         draft_swa_scratch_width = 0
         if (
             self.is_draft_worker
-            and self.spec_algorithm.is_dspark()
-            and not _is_npu
-            and getattr(
-                self.server_args, "speculative_dspark_draft_swa_sidecar", False
+            and use_dsv4_dspark_draft_swa_sidecar(
+                self.server_args, self.spec_algorithm
             )
         ):
             draft_swa_scratch_width = max(

@@ -1086,9 +1086,10 @@ def build_swa_draft_pools(
     target_swa_host_pool = host_pool_group.entry_map[PoolName.SWA].host_pool
 
     if isinstance(target_swa_host_pool, DeepSeekV4PagedHostPool):
+        device_buffers = draft_kv_pool.get_draft_swa_committed_buffers()
         host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DRAFT_SWA),
-            device_buffers=draft_swa_pool.kv_buffer,
+            device_buffers=device_buffers,
             item_bytes=draft_swa_pool.bytes_per_page_padded,
             num_host_pages=target_swa_host_pool.num_host_pages,
             slot_page_size=draft_swa_pool.page_size,

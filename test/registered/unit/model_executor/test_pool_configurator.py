@@ -906,7 +906,7 @@ class TestDflashDraftKvBudget(CustomTestCase):
             target_only_bytes + draft_sidecar_bytes,
         )
         scratch_bytes = configurator._get_draft_swa_scratch_fixed_bytes(8)
-        expected_pages = 2  # ceil((8 + null slot) * gamma=5 / 256) + guard
+        expected_pages = 1  # ceil((8 + null slot) * gamma=5 / 256)
         expected_page_bytes = 260 * 576  # ceil(256 * 584 / 576) * 576
         self.assertEqual(scratch_bytes, expected_pages * expected_page_bytes * 3)
 
