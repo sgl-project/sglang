@@ -547,7 +547,7 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
 
     def fake_preprocess(images, resize_configs, *args, **kwargs):
         calls.append([int(image[0, 0, 0]) for image in images])
-        return torch.tensor([[float(calls[-1][0]), 0.0]]), torch.tensor([[1, 1, 1]])
+        return [torch.tensor([[float(calls[-1][0]), 0.0]])], torch.tensor([[1, 1, 1]])
 
     # Configured TP size (the IPC consumer count) comes from the published
     # bags; the live topology is forced through the context's own override.
