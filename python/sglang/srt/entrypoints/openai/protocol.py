@@ -53,6 +53,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     field_serializer,
     field_validator,
     model_serializer,
@@ -219,7 +220,10 @@ class JsonSchemaResponseFormat(BaseModel):
     description: Optional[str] = None
     # use alias to workaround pydantic conflict
     schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    strict: Optional[bool] = None
+    # The OpenAI wire contract accepts JSON booleans only; StrictBool rejects
+    # the values lax pydantic would coerce ("yes", "on", 0, 1, ...), matching
+    # OpenAI's 422 behavior. Omitted (None) keeps its meaning.
+    strict: Optional[StrictBool] = None
 
 
 class ResponseFormat(BaseModel):
@@ -795,6 +799,7 @@ class ChatCompletionRequest(BaseModel):
     return_prompt_token_ids: bool = False
     return_token_ids: bool = False
     return_meta_info: bool = False
+    return_sampling_mask: bool = False
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "

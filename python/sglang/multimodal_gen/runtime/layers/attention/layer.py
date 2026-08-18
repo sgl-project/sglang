@@ -130,6 +130,22 @@ def _kv_gather_unsupported_reason(
     return None
 
 
+def _count_active_replicated_modes(
+    num_replicated_prefix: int,
+    num_replicated_suffix: int,
+    num_replicated_kv_prefix: int,
+) -> int:
+    """Count active replicated-token modes without adding symbolic booleans."""
+    return sum(
+        int(value > 0)
+        for value in (
+            num_replicated_prefix,
+            num_replicated_suffix,
+            num_replicated_kv_prefix,
+        )
+    )
+
+
 def build_varlen_mask_meta(
     key_mask: torch.Tensor,
 ) -> dict:
@@ -665,10 +681,12 @@ class USPAttention(nn.Module):
         softmax_scale: float | None = None,
         causal: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        default_attention_backend: AttentionBackendEnum | None = None,
         prefix: str = "",
         dropout_rate: float = 0.0,
         skip_sequence_parallel: bool = False,
         enable_packed_qkv_input_a2a: bool = False,
+        is_cross_attention: bool = False,
         **extra_impl_args,
     ) -> None:
         """
@@ -678,6 +696,11 @@ class USPAttention(nn.Module):
               text/image encoder outputs), the full USP pipeline is redundant:
               each rank's local Q shard can attend directly to the locally-held
               full KV without any collective communication.
+            default_attention_backend:
+              fallback used only when no global or component override is active.
+            is_cross_attention:
+              sparse backend preferences may select a compatible dense backend
+              for cross-attention while remaining strict for self-attention.
         """
         super().__init__()
         if softmax_scale is None:
@@ -690,9 +713,13 @@ class USPAttention(nn.Module):
 
         dtype = get_compute_dtype()
         attn_backend = get_attn_backend(
-            head_size, dtype, supported_attention_backends=supported_attention_backends
+            head_size,
+            dtype,
+            supported_attention_backends=supported_attention_backends,
+            default_attention_backend=default_attention_backend,
+            is_cross_attention=is_cross_attention,
         )
-        if get_ring_parallel_world_size() > 1:
+        if not skip_sequence_parallel and get_ring_parallel_world_size() > 1:
             if not attn_backend.supports_ring_rotation():
                 raise RuntimeError(
                     f"Ring Attention requires a backend whose kernel exposes the "
@@ -822,13 +849,10 @@ class USPAttention(nn.Module):
             and not effective_skip_sp
             and get_sequence_parallel_world_size() > 1
         )
-        replicated_mode_count = sum(
-            value > 0
-            for value in (
-                num_replicated_prefix,
-                num_replicated_suffix,
-                num_replicated_kv_prefix,
-            )
+        replicated_mode_count = _count_active_replicated_modes(
+            num_replicated_prefix,
+            num_replicated_suffix,
+            num_replicated_kv_prefix,
         )
         if (
             self.sp_attention_mode == "kv_gather"

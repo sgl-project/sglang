@@ -124,6 +124,9 @@ class DFlashDraftInputV2(SpecInput):
         bs = batch.batch_size()
         if bs == 0:
             return
+
+        batch.maybe_evict_swa()
+
         self._ensure_prepare_length_buffers(bs, batch.device)
         assert self._prepare_batch_seq_lens_cpu_buf is not None
         assert self._prepare_cur_kv_lens_cpu_buf is not None
@@ -205,7 +208,8 @@ class DFlashDraftInputV2(SpecInput):
             # plan-stream context, so forward work cannot observe partially
             # prepared req_to_token / KV allocation state.
             caller_stream.wait_stream(plan_stream)
-
+        for req in batch.reqs:
+            req.decode_batch_idx += 1
         # Seed committed; overlap's resolve overwrites it with the published value.
         batch.seq_lens_cpu = batch_seq_lens_cpu_t
         batch.seq_lens_sum = committed_seq_lens_sum

@@ -12,6 +12,9 @@ from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
     LTX2ConnectorConfig,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
@@ -528,11 +531,17 @@ class LTX2ConnectorTransformer1d(nn.Module):
         return hidden_states, attention_mask
 
 
-class LTX2TextConnectors(nn.Module):
+class LTX2TextConnectors(nn.Module, LayerwiseOffloadableModuleMixin):
     """
     Text connector stack used by LTX 2.0 to process the packed text encoder hidden states for both the video and audio
     streams.
     """
+
+    layerwise_offload_dit_group_enabled = False
+    layer_names = [
+        "video_connector.transformer_blocks",
+        "audio_connector.transformer_blocks",
+    ]
 
     def __init__(
         self,

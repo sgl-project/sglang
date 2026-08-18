@@ -21,7 +21,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import SharedReadBoundary
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.flashinfer_backend import (
     FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
@@ -103,11 +103,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     supports_ragged_verify_graph: bool = True
 
-    def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Prefill metadata init snapshots all scheduler-shared inputs pre-replay.
-        if forward_mode == ForwardMode.EXTEND:
-            return SharedReadBoundary.PRE_REPLAY
-        return super().shared_read_boundary(forward_mode)
+        if fm == ForwardMode.EXTEND:
+            return SharedReadEnds.PRE_REPLAY
+        return super().shared_read_ends(fm)
 
     def __init__(
         self,
@@ -171,7 +171,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         # Speculative decoding
         # Only support topk <= 1 for now.
-        self.topk = model_runner.server_args.speculative_eagle_topk or 0
+        self.topk = get_spec().speculative_eagle_topk or 0
         self.speculative_step_id = speculative_step_id
         self.target_verify_metadata = {}
 

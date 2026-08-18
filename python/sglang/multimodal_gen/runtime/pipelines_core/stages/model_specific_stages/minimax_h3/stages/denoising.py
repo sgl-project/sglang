@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -412,6 +412,11 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         )
         current_mode = getattr(self, "_minimax_h3_cache_mode", None)
         self._minimax_h3_quality = quality
+
+        if self.server_args.enable_breakable_cuda_graph:
+            if desired_mode is not None:
+                super()._maybe_enable_cache_dit(num_inference_steps, batch)
+            return
 
         # H3 is monolithic-only, and the scheduler executes one worker batch at
         # a time. Combined with `quality` in the dynamic-batch signature, this

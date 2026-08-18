@@ -114,6 +114,42 @@ class TestCompletionRequest(unittest.TestCase):
 class TestChatCompletionRequest(unittest.TestCase):
     """Test ChatCompletionRequest protocol model"""
 
+    def test_json_schema_strict_requires_json_boolean(self):
+        base_request = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type": "object"},
+                },
+            },
+        }
+
+        for strict in (True, False, None):
+            with self.subTest(strict=strict):
+                response_format = dict(base_request["response_format"])
+                response_format["json_schema"] = {
+                    **response_format["json_schema"],
+                    "strict": strict,
+                }
+                request = ChatCompletionRequest.model_validate(
+                    {**base_request, "response_format": response_format}
+                )
+                self.assertIs(request.response_format.json_schema.strict, strict)
+
+        for strict in ("yes", "false", 0, 1):
+            with self.subTest(strict=strict), self.assertRaises(ValidationError):
+                response_format = dict(base_request["response_format"])
+                response_format["json_schema"] = {
+                    **response_format["json_schema"],
+                    "strict": strict,
+                }
+                ChatCompletionRequest.model_validate(
+                    {**base_request, "response_format": response_format}
+                )
+
     def test_basic_chat_completion_request(self):
         """Test basic chat completion request"""
         messages = [{"role": "user", "content": "Hello"}]
@@ -124,6 +160,7 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(request.messages[0].content, "Hello")
         self.assertEqual(request.temperature, None)  # default
         self.assertFalse(request.stream)  # default
+        self.assertFalse(request.return_sampling_mask)
         self.assertEqual(request.tool_choice, "none")  # default when no tools
 
     def test_image_content_hash_validation(self):
