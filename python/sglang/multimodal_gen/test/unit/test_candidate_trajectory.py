@@ -253,3 +253,61 @@ class TestEndToEndCandidateFlow:
         reduced = reduce_candidates(candidates, spec)
         assert torch.allclose(reduced, candidates.mean(dim=0))
         assert reduced.shape == candidate_shape
+
+
+class TestMultiPromptGeneratorAggregation:
+    """Covers the exact aggregation pattern
+    InputValidationStage._generate_seeds uses when batch.candidate_spec is
+    set: for each prompt's independently-derived base_seed, flatten that
+    prompt's derive_candidate_generators(...) output into one per-request
+    generator list, prompt-major / candidate-minor order.
+    """
+
+    @staticmethod
+    def _aggregate(base_seeds, spec, device):
+        # Mirrors InputValidationStage._generate_seeds' candidate_spec branch.
+        return [
+            gen
+            for base_seed in base_seeds
+            for gen in derive_candidate_generators(base_seed, spec, device=device)
+        ]
+
+    def test_flattened_order_is_prompt_major_candidate_minor(self):
+        spec = CandidateTrajectorySpec(count=3, reducer="mean")
+        base_seeds = [100, 200]
+        generators = self._aggregate(base_seeds, spec, DEVICE)
+        assert len(generators) == 6  # 2 prompts * 3 candidates
+
+        draws = [torch.randn(4, generator=g, device=DEVICE) for g in generators]
+        # Same-prompt candidates come from consecutive derive_candidate_generators
+        # calls; re-deriving independently for each prompt must reproduce them.
+        expected_prompt0 = [
+            torch.randn(4, generator=g, device=DEVICE)
+            for g in derive_candidate_generators(100, spec, device=DEVICE)
+        ]
+        expected_prompt1 = [
+            torch.randn(4, generator=g, device=DEVICE)
+            for g in derive_candidate_generators(200, spec, device=DEVICE)
+        ]
+        for a, b in zip(draws[0:3], expected_prompt0):
+            assert torch.equal(a, b)
+        for a, b in zip(draws[3:6], expected_prompt1):
+            assert torch.equal(a, b)
+
+    def test_different_prompts_never_collide(self):
+        spec = CandidateTrajectorySpec(count=2, reducer="mean")
+        generators = self._aggregate([1, 2, 3], spec, DEVICE)
+        draws = [torch.randn(4, generator=g, device=DEVICE) for g in generators]
+        for i in range(len(draws)):
+            for j in range(i + 1, len(draws)):
+                assert not torch.equal(draws[i], draws[j])
+
+    def test_single_prompt_matches_bare_derive_candidate_generators(self):
+        spec = CandidateTrajectorySpec(count=4, reducer="mean")
+        generators = self._aggregate([777], spec, DEVICE)
+        expected = derive_candidate_generators(777, spec, device=DEVICE)
+        assert len(generators) == len(expected)
+        for g, e in zip(generators, expected):
+            d1 = torch.randn(4, generator=g, device=DEVICE)
+            d2 = torch.randn(4, generator=e, device=DEVICE)
+            assert torch.equal(d1, d2)
