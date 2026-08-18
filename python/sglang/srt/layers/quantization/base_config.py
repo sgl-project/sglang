@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 import torch
 from torch import nn
 
-from sglang.srt.model_loader.checkpoint_quantization import (
+from sglang.srt.checkpoint_quantization import (
     canonicalize_modelopt_quant_algo,
 )
 

@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pure-data helpers for quantization metadata in Hugging Face configs."""
+"""Pure-data helpers for quantization metadata in Hugging Face configs.
+
+This module stays outside ``model_loader`` so quantization layers can import it
+without initializing the loader package and creating an import cycle.
+"""
 
 from __future__ import annotations
 
