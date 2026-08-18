@@ -10,8 +10,7 @@ import sglang.multimodal_gen.runtime.models.vlas.pi05_policy as pi05_policy_modu
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.runtime.models.vlas.pi05_core import (
     Pi05CoreModel,
-    Pi05SiglipAttention,
-    patch_siglip_vision_attention_to_native,
+    Pi05SiglipVisionModel,
 )
 from sglang.multimodal_gen.runtime.models.vlas.pi05_policy import (
     Pi05CheckpointManifest,
@@ -30,6 +29,8 @@ from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     PrefixContext,
     VLADensePrefixCache,
 )
+from sglang.srt.models.siglip import SiglipVisionModel
+from sglang.srt.runtime_context import get_context
 
 
 def _prefix_context(value: float, digest: str | None) -> PrefixContext:
@@ -183,30 +184,64 @@ def test_action_parallel_info_reports_single_rank_without_process_group():
     }
 
 
-class _FakeSiglipAttention(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.embed_dim = 8
-        self.num_heads = 2
-        self.head_dim = 4
-        self.scale = self.head_dim**-0.5
-        self.dropout = 0.0
-        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
-        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+def test_pi05_siglip_reuses_srt_model_with_layerwise_groups():
+    config = SimpleNamespace(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        layer_norm_eps=1e-6,
+        image_size=4,
+        patch_size=2,
+        num_channels=3,
+        hidden_act="gelu_pytorch_tanh",
+    )
+    with get_context().override_server_args():
+        model = Pi05SiglipVisionModel(
+            config,
+            act_layer=lambda: nn.GELU(approximate="tanh"),
+            qkv_backend="sdpa",
+            flatten_batch=False,
+            use_data_parallel=True,
+        )
+
+    state_keys = set(model.state_dict())
+    prefix = "vision_model.encoder.layers.0.self_attn"
+    vision_model = model.vision_model
+    layer = vision_model.encoder.layers[0]
+
+    assert isinstance(model, SiglipVisionModel)
+    assert f"{prefix}.qkv_proj.weight" in state_keys
+    assert f"{prefix}.proj.weight" in state_keys
+    assert vision_model.embeddings.position_embedding.tp_size == 1
+    assert layer.self_attn.tp_size == 1
+    assert layer.self_attn.qkv_backend.flatten_batch is False
+    assert layer.mlp.fc1.tp_size == 1
+    assert layer.mlp.fc2.tp_size == 1
+    assert isinstance(layer.mlp.act, nn.GELU)
+    assert layer.mlp.act.approximate == "tanh"
+    assert model.device == vision_model.embeddings.patch_embedding.weight.device
+    assert model.layer_names == ["vision_model.encoder.layers"]
 
 
-def test_siglip_attention_patch_uses_native_wrapper_once():
-    layer = SimpleNamespace(self_attn=_FakeSiglipAttention())
-    vision_model = SimpleNamespace(encoder=SimpleNamespace(layers=[layer]))
+def test_pi05_siglip_checkpoint_names_map_to_srt_layers():
+    source_prefix = (
+        "paligemma_with_expert.paligemma.vision_tower.vision_model."
+        "encoder.layers.0.self_attn"
+    )
+    target_prefix = (
+        "paligemma_with_expert.paligemma.model.vision_tower.vision_model."
+        "encoder.layers.0.self_attn"
+    )
 
-    patch_siglip_vision_attention_to_native(vision_model)
-    first = layer.self_attn
-    patch_siglip_vision_attention_to_native(vision_model)
-
-    assert isinstance(first, Pi05SiglipAttention)
-    assert layer.self_attn is first
+    assert (
+        f"{target_prefix}.qkv_proj.weight",
+        "q",
+    ) in Pi05PolicyModel._candidate_target_weights(f"{source_prefix}.q_proj.weight")
+    assert (
+        f"{target_prefix}.proj.weight",
+        None,
+    ) in Pi05PolicyModel._candidate_target_weights(f"{source_prefix}.out_proj.weight")
 
 
 def test_prefix_language_embedding_matches_openpi_scale():

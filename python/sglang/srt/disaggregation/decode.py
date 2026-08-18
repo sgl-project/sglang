@@ -75,6 +75,8 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
     release_kv_cache,
+    retraction_discard,
+    retraction_restore,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -693,6 +695,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def release_memory_occupation(self):
         self.queue.clear()
+        for req in self.retracted_queue:
+            retraction_discard(
+                req,
+                self.tree_cache,
+                get_disagg().disaggregation_decode_retraction_backup,
+            )
         self.retracted_queue.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
@@ -740,8 +748,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if uses_swa_tail_prealloc:
                 swa_allocatable_tokens -= swa_required
 
-            # load from cpu, release the cpu copy
-            req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+            retraction_restore(
+                req,
+                self.tree_cache,
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                get_disagg().disaggregation_decode_retraction_backup,
+            )
 
         self.retracted_queue = [
             entry
@@ -2322,7 +2335,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
-        new_batch.process_prebuilt(self.server_args, self.future_map)
+        new_batch.process_prebuilt(self.future_map)
 
         return new_batch
 

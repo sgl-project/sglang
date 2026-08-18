@@ -2,7 +2,7 @@ import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.diffusion.common.platform import lazy_fallback, select_impl
 from sglang.srt.utils.custom_op import register_custom_op
 
