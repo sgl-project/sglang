@@ -259,7 +259,9 @@ class TestResolutionDeclarations(CustomTestCase):
             json.dump(_MINI_CONFIG, handle)
         fields = {"random_seed": 42}
         fields.update(extra)
-        return ServerArgs(model_path=path, device="cuda", **fields)
+        server_args = ServerArgs(model_path=path, device="cuda", **fields)
+        server_args.resolve_once()
+        return server_args
 
     def test_converted_fields_are_not_assigned_bare(self):
         bare = _bare_assignments()
