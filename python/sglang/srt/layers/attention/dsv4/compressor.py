@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 
 from sglang.kernels.fused_op import BaseFusedOp
-from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 from sglang.kernels.ops.attention.dsv4 import (
     linear_bf16_fp32,
     triton_create_paged_compress_data,
@@ -16,9 +15,6 @@ from sglang.kernels.ops.attention.dsv4.compress_old import (
     CompressorPrefillPlan,
     compress_forward,
     compress_fused_norm_rope_inplace,
-)
-from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
@@ -185,15 +181,12 @@ class CompressorBackendMixin:
         )
         if out_loc.shape[0] > new_compressed_kv.shape[0]:
             out_loc = out_loc[: new_compressed_kv.shape[0]]
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            token_to_kv_pool.set_extra_key_buffer_fused(
-                layer_id=layer_id,
-                loc=out_loc,
-                cache_k=new_compressed_kv,
-            )
-        else:
-            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
-            token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
+
+        token_to_kv_pool.set_extra_key_buffer_fused(
+            layer_id=layer_id,
+            loc=out_loc,
+            cache_k=new_compressed_kv,
+        )
 
     def forward_indexer_compressor(
         self,
@@ -217,21 +210,11 @@ class CompressorBackendMixin:
                 loc=out_loc,
                 cache_k=new_compressed_kv,
             )
-        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        else:
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
                 loc=out_loc,
                 cache_k=new_compressed_kv,
-            )
-        else:
-            new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
-                new_compressed_kv
-            )
-            token_to_kv_pool.set_index_k_scale_buffer(
-                layer_id=layer_id,
-                loc=out_loc,
-                index_k=new_compressed_kv_fp8,
-                index_k_scale=new_compressed_kv_scale,
             )
 
 
