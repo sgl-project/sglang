@@ -1354,10 +1354,11 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale = down_input_scale.transpose(-1, -2)
         return down_input, down_input_scale
 
-    # Default plain-silu path: the unified JIT masked fused quant. It allocates
-    # the outputs itself, with scales directly in the layout deep_gemm consumes
-    # (packed-int32 col-major for UE8M0, TMA-aligned col-major fp32 otherwise),
-    # so the caller's get_mn_major transform short-circuits.
+    # Default plain-silu path: the unified JIT masked fused quant. Native
+    # DeepGEMM consumes packed/TMA column-major scales; FlashInfer's public
+    # batch API and Cake consume the canonical contiguous row-major layout.
+    # Produce the selected ABI directly so serving does not copy scale buffers
+    # at either grouped-GEMM boundary.
     expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
     return per_token_group_quant(
         gateup_output,
@@ -1366,7 +1367,7 @@ def _varlen_deep_gemm_silu_mul_quant(
         fuse_silu_and_mul=True,
         masked_m=masked_m,
         expected_m=expected_m,
-        column_major_scales=True,
+        column_major_scales=not deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_STANDARD_SCALES,
     )
 
 
