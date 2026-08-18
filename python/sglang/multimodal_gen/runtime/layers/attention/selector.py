@@ -16,6 +16,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionBackend,
     AttentionRequirements,
 )
+from sglang.multimodal_gen.runtime.layers.attention.roles import AttentionRole
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -69,6 +70,7 @@ class ComponentAttnBackendContext(NamedTuple):
     backend: AttentionBackendEnum | None
     component_name: str | None
     selected_backends: dict[str, str | None]
+    backend_by_role: dict[AttentionRole, AttentionBackendEnum]
 
 
 component_attn_backend_context: ContextVar[ComponentAttnBackendContext | None] = (
@@ -106,6 +108,17 @@ def get_component_attn_backend_context() -> ComponentAttnBackendContext | None:
 def get_component_forced_attn_backend() -> AttentionBackendEnum | None:
     context = get_component_attn_backend_context()
     return context.backend if context is not None else None
+
+
+def get_component_forced_attn_backend_for_role(
+    role: AttentionRole,
+) -> AttentionBackendEnum | None:
+    """Role-specific component override (e.g. ``transformer.cross``).
+
+    Takes precedence over the component-wide backend when both are configured.
+    """
+    context = get_component_attn_backend_context()
+    return context.backend_by_role.get(role) if context is not None else None
 
 
 def get_component_attn_backend_name() -> str | None:
@@ -154,7 +167,7 @@ def get_attn_backend(
     selected_attention_backend: AttentionBackendEnum | None = None,
     attention_requirements: AttentionRequirements | None = None,
     default_attention_backend: AttentionBackendEnum | None = None,
-    is_cross_attention: bool = False,
+    attention_role: AttentionRole = AttentionRole.SELF,
 ) -> type[AttentionBackend]:
     requirements = attention_requirements or AttentionRequirements()
     if supported_attention_backends is None:
@@ -169,6 +182,9 @@ def get_attn_backend(
     selection_is_explicit = selected_backend is not None
     if selected_backend is None:
         selected_backend = get_global_forced_attn_backend()
+        selection_is_explicit = selected_backend is not None
+    if selected_backend is None:
+        selected_backend = get_component_forced_attn_backend_for_role(attention_role)
         selection_is_explicit = selected_backend is not None
     if selected_backend is None:
         selected_backend = get_component_forced_attn_backend()
@@ -195,7 +211,10 @@ def get_attn_backend(
     allowed_fallback_reason = None
     if selected_backend is None:
         allowed_fallback_reason = "platform default fallback"
-    elif is_cross_attention and selected_backend.is_sparse:
+    # attention_role serves double duty: besides selecting the per-role config
+    # override above, a cross-attention layer may fall back to a dense backend
+    # when the selected one is sparse.
+    elif attention_role == AttentionRole.CROSS and selected_backend.is_sparse:
         allowed_fallback_reason = "dense cross-attention fallback"
     elif not selection_is_explicit:
         allowed_fallback_reason = "platform default fallback"
@@ -332,13 +351,16 @@ def _is_backend_supported(
 def component_attn_backend_context_manager(
     attn_backend: AttentionBackendEnum | None,
     component_name: str | None = None,
+    backend_by_role: dict[AttentionRole, AttentionBackendEnum] | None = None,
 ) -> Generator[None, None, None]:
-    if attn_backend is None and component_name is None:
+    if attn_backend is None and component_name is None and not backend_by_role:
         yield
         return
 
     token = component_attn_backend_context.set(
-        ComponentAttnBackendContext(attn_backend, component_name, {})
+        ComponentAttnBackendContext(
+            attn_backend, component_name, {}, dict(backend_by_role or {})
+        )
     )
     try:
         yield

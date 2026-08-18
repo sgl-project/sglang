@@ -13,7 +13,7 @@ from sglang.multimodal_gen.configs.models.bridges.mova_dual_tower import (
     MOVADualTowerConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
-from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.attention import AttentionRole, USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     tensor_parallel_rms_norm,
@@ -222,7 +222,7 @@ class ConditionalCrossAttention(nn.Module):
             head_size=self.head_dim,
             causal=False,
             softmax_scale=None,
-            # is_cross_attention=True,
+            attention_role=AttentionRole.CROSS,
         )
 
     def forward(

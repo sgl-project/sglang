@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.layers.attention.layer import (
     build_varlen_mask_meta_from_lengths,
     build_varlen_mask_meta_from_ranges,
 )
+from sglang.multimodal_gen.runtime.layers.attention.roles import AttentionRole
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import MinimalA2AAttnOp
 
@@ -26,6 +27,7 @@ __all__ = [
     "DynamicVarlenMaskMeta",
     "UlyssesAttention",
     "UlyssesAttention_VSA",
+    "AttentionRole",
     "MinimalA2AAttnOp",
     "AttentionBackend",
     "AttentionMetadata",

@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.layers.attention import (
+    AttentionRole,
     MinimalA2AAttnOp,
     UlyssesAttention_VSA,
     USPAttention,
@@ -204,7 +205,9 @@ class WanSelfAttention(nn.Module):
             causal=False,
             supported_attention_backends=supported_attention_backends,
             skip_sequence_parallel=is_cross_attention,
-            is_cross_attention=is_cross_attention,
+            attention_role=(
+                AttentionRole.CROSS if is_cross_attention else AttentionRole.SELF
+            ),
             quant_config=quant_config,
         )
 
@@ -470,7 +473,7 @@ class WanTransformerBlock(nn.Module):
                 supported_attention_backends=self_attn_backends,
                 prefix=add_prefix("attn1", prefix),
                 quant_config=quant_config,
-                is_cross_attention=False,
+                attention_role=AttentionRole.SELF,
             )
 
         self.hidden_dim = dim

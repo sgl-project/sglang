@@ -58,6 +58,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     normalize_cpu_offload_components,
     normalize_layerwise_offload_components,
 )
+from sglang.multimodal_gen.runtime.layers.attention.roles import (
+    AttentionRole,
+    make_component_role_key,
+    split_component_role_key,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -1008,6 +1013,23 @@ class ServerArgs(DisaggServerArgsMixin):
             result[component.strip()] = backend.strip()
         return result
 
+    @staticmethod
+    def _normalize_component_attention_backend_key(component: str) -> str:
+        """Normalize a ``component`` or role-qualified ``component.role`` key.
+
+        The optional trailing ``.<role>`` selects the backend for one attention
+        role (self vs cross); the role token is validated against
+        ``AttentionRole`` while the component half is normalized like any other
+        component name.
+        """
+        component_part, role = split_component_role_key(component.strip())
+        component_name = component_part.strip().replace("-", "_")
+        if not component_name:
+            raise ValueError("Component attention backend key must not be empty")
+        if role is None:
+            return component_name
+        return make_component_role_key(component_name, role)
+
     @classmethod
     def _normalize_component_attention_backends(
         cls, value: dict[str, str] | str | None
@@ -1017,11 +1039,19 @@ class ServerArgs(DisaggServerArgsMixin):
         for component, backend in raw.items():
             if not isinstance(component, str):
                 raise ValueError("Component attention backend key must be a string")
-            component_name = component.strip().replace("-", "_")
-            if not component_name:
-                raise ValueError("Component attention backend key must not be empty")
-            normalized[component_name] = cls._normalize_attention_backend_name(backend)
+            key = cls._normalize_component_attention_backend_key(component)
+            normalized[key] = cls._normalize_attention_backend_name(backend)
         return normalized
+
+    @staticmethod
+    def _component_fallback_keys(component_name: str) -> list[str]:
+        key = component_name.replace("-", "_")
+        fallback_keys = [key]
+        if key.endswith("_2"):
+            # Secondary two-stage components inherit the base component backend
+            # unless explicitly overridden.
+            fallback_keys.append(key[:-2])
+        return fallback_keys
 
     def resolve_component_attention_backend(
         self, *component_names: str | None
@@ -1029,17 +1059,38 @@ class ServerArgs(DisaggServerArgsMixin):
         for component_name in component_names:
             if component_name is None:
                 continue
-            key = component_name.replace("-", "_")
-            fallback_keys = [key]
-            if key.endswith("_2"):
-                # Secondary two-stage components inherit the base component
-                # backend unless explicitly overridden.
-                fallback_keys.append(key[:-2])
-            for backend_key in fallback_keys:
+            for backend_key in self._component_fallback_keys(component_name):
                 backend = self.component_attention_backends.get(backend_key)
                 if backend is not None:
                     return AttentionBackendEnum[backend.upper()], backend_key
         return None, None
+
+    def resolve_component_backend_by_role(
+        self, *component_names: str | None
+    ) -> dict[AttentionRole, AttentionBackendEnum]:
+        """Resolve the per-role backend overrides for a component.
+
+        For each role, tries ``<component>.<role>`` across the candidate names
+        (with the same ``_2`` two-stage fallback as the component-wide lookup).
+        Returns only the roles that have an explicit override configured.
+        """
+        backend_by_role: dict[AttentionRole, AttentionBackendEnum] = {}
+        for role in AttentionRole:
+            for component_name in component_names:
+                if component_name is None:
+                    continue
+                matched = False
+                for base_key in self._component_fallback_keys(component_name):
+                    backend = self.component_attention_backends.get(
+                        make_component_role_key(base_key, role)
+                    )
+                    if backend is not None:
+                        backend_by_role[role] = AttentionBackendEnum[backend.upper()]
+                        matched = True
+                        break
+                if matched:
+                    break
+        return backend_by_role
 
     def _adjust_warmup(self):
         if self.warmup_mode is not None and self.warmup_mode not in WARMUP_MODES:

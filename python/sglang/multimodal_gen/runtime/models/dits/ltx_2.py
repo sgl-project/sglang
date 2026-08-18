@@ -47,7 +47,11 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
+from sglang.multimodal_gen.runtime.layers.attention import (
+    AttentionRole,
+    LocalAttention,
+    USPAttention,
+)
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNormNoWeight
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -745,6 +749,7 @@ class LTX2Attention(nn.Module):
         apply_gated_attention: bool = False,
         enable_packed_qkv_input_a2a: bool = False,
         supported_attention_backends: set[AttentionBackendEnum] | None = None,
+        attention_role: AttentionRole = AttentionRole.SELF,
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
     ) -> None:
@@ -848,6 +853,7 @@ class LTX2Attention(nn.Module):
                 supported_attention_backends=supported_attention_backends,
                 prefix=f"{prefix}.attn",
                 enable_packed_qkv_input_a2a=self.enable_packed_qkv_input_a2a,
+                attention_role=attention_role,
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
                 allow_cudnn_sdp=True,
             )
@@ -861,6 +867,7 @@ class LTX2Attention(nn.Module):
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
                 prefix=f"{prefix}.attn",
+                attention_role=attention_role,
                 # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
                 allow_cudnn_sdp=True,
             )
@@ -1161,6 +1168,7 @@ class LTX2TransformerBlock(nn.Module):
             use_local_attention=True,
             apply_gated_attention=apply_gated_attention,
             supported_attention_backends=supported_attention_backends,
+            attention_role=AttentionRole.CROSS,
             prefix=f"{prefix}.attn2",
             quant_config=quant_config,
         )
@@ -1174,6 +1182,7 @@ class LTX2TransformerBlock(nn.Module):
             use_local_attention=True,
             apply_gated_attention=apply_gated_attention,
             supported_attention_backends=supported_attention_backends,
+            attention_role=AttentionRole.CROSS,
             prefix=f"{prefix}.audio_attn2",
             quant_config=quant_config,
         )
@@ -1190,6 +1199,7 @@ class LTX2TransformerBlock(nn.Module):
             apply_gated_attention=apply_gated_attention,
             enable_packed_qkv_input_a2a=enable_packed_qkv_input_a2a,
             supported_attention_backends=supported_attention_backends,
+            attention_role=AttentionRole.CROSS,
             prefix=f"{prefix}.audio_to_video_attn",
             quant_config=quant_config,
         )
@@ -1203,6 +1213,7 @@ class LTX2TransformerBlock(nn.Module):
             use_local_attention=use_local_av_cross_attention,
             apply_gated_attention=apply_gated_attention,
             enable_packed_qkv_input_a2a=enable_packed_qkv_input_a2a,
+            attention_role=AttentionRole.CROSS,
             supported_attention_backends=(
                 {AttentionBackendEnum.TORCH_SDPA}
                 if force_sdpa_v2a_cross_attention

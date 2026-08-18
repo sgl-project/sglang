@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
 
-from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
+from sglang.multimodal_gen.runtime.layers.attention import AttentionRole, LocalAttention
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -3011,6 +3011,7 @@ class MultiHeadCrossAttention(nn.Module):
         self.attn = LocalAttention(
             num_heads=num_heads,
             head_size=self.head_dim,
+            attention_role=AttentionRole.CROSS,
         )
 
     def forward(

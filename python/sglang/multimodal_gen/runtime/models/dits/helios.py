@@ -27,7 +27,7 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_group
-from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.attention import AttentionRole, USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNorm,
     LayerNormScaleShift,
@@ -271,7 +271,7 @@ class HeliosSelfAttention(nn.Module):
             num_heads=self.local_num_heads,
             head_size=self.head_dim,
             causal=False,
-            is_cross_attention=False,
+            attention_role=AttentionRole.SELF,
         )
 
         self.is_amplify_history = is_amplify_history
@@ -372,6 +372,7 @@ class HeliosCrossAttention(nn.Module):
             head_size=self.head_dim,
             causal=False,
             skip_sequence_parallel=True,
+            attention_role=AttentionRole.CROSS,
         )
 
     def project_kv(self, encoder_hidden_states):
