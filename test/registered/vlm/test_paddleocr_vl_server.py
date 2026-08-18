@@ -47,7 +47,12 @@ class TestPaddleOCRVLServer(TestOpenAIMLLMServerBase):
         img = Image.new("RGB", size, "white")
         draw = ImageDraw.Draw(img)
         draw.rectangle((16, 16, width - 16, height - 16), outline="black", width=4)
-        draw.text((48, height // 3), text, fill="black", font=cls._font(height // 6))
+        font_size = height // 6
+        font = cls._font(font_size)
+        text_width = draw.textbbox((0, 0), text, font=font)[2]
+        if text_width > width - 96:
+            font = cls._font((width - 96) * font_size // text_width)
+        draw.text((48, height // 3), text, fill="black", font=font)
 
         buffer = io.BytesIO()
         img.save(buffer, format="PNG")
