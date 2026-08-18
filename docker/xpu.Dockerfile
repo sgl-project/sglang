@@ -74,6 +74,7 @@ RUN pip install --no-cache-dir torch==2.13.0+xpu torchvision==0.28.0+xpu torchau
 
 RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     git clone --branch ${SG_LANG_BRANCH} --single-branch ${SG_LANG_REPO} sglang && \
+    git -C sglang fetch --tags --force origin && \
     cd sglang && cd python && \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install --no-cache-dir ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu && \
