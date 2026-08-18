@@ -146,15 +146,11 @@ def _register_legacy_hicache_draft(
 
 
 def _local_scheduler_count() -> int:
-    """Schedulers sharing this node, mirroring the launcher's own arithmetic.
+    """Schedulers sharing this node, mirroring ``entrypoints/engine.py``.
 
-    ``entrypoints/engine.py`` derives the per-node rank ranges as
-    ``pp_size_per_node * tp_size_per_node`` with ``tp_size_per_node = tp_size //
-    nnodes_per_pp_rank``. The divisibility invariant is ``(tp_size * pp_size) %
-    nnodes == 0``, so ``tp_size // nnodes`` undercounts whenever ``pp_size >
-    1``. Classic data parallelism (``dp_size > 1`` without attention DP) instead
-    launches ``dp_size`` independent replicas, each owning its own KV pool and
-    therefore its own host mirror.
+    The invariant is ``(tp_size * pp_size) % nnodes == 0``, so ``tp_size //
+    nnodes`` undercounts once ``pp_size > 1``. Classic DP adds a factor: each
+    replica owns its own KV pool, hence its own host mirror.
     """
     parallel = get_parallel()
     nnodes = max(1, parallel.nnodes)
@@ -171,16 +167,11 @@ def _local_scheduler_count() -> int:
 def _agree_across_ranks(fits: bool) -> bool:
     """Reduce a per-rank verdict to one the whole job shares.
 
-    Divergence is the hazard this exists to remove: a rank that keeps
-    ``host_pool`` builds a ``UnifiedRadixCache`` with a host pool while a rank
-    that falls back builds a ``ChunkCache``, leaving one job with two cache
-    topologies. Follows ``sync_fixed_hicache_size``'s shape -- all-reduce MIN
-    over a CPU group, degrading to the local verdict when there is no process
-    group to reduce over.
+    Disagreeing ranks would build different cache topologies -- a host pool on
+    some, a ``ChunkCache`` on others. Shaped after ``sync_fixed_hicache_size``.
 
-    Callers must reach this on every rank, never behind a per-rank predicate:
-    a rank that skips the reduction leaves the others blocked in the
-    all-reduce, converting a mismatch into a hang.
+    Callers must reach this on every rank, never behind a per-rank predicate;
+    a rank that skips it leaves the others blocked here.
     """
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return fits
@@ -203,14 +194,10 @@ def _agree_across_ranks(fits: bool) -> bool:
 def _kv_pool_bytes(pool: object) -> int:
     """Total bytes held by a KV pool, across both shapes of the accessor.
 
-    ``get_kv_size_bytes`` is not a uniform contract: MHA and SWA pools return a
-    ``(k, v)`` pair while MLA, DSA, and Mamba pools return a scalar. Callers that
-    see pools of every class have to normalise, so keep that knowledge in one
-    place rather than assuming the tuple shape.
-
-    Test the pair shape, not the scalar one: MLA reports a ``numpy.int64``, which
-    is not a Python ``int`` subclass, so an ``isinstance(size, int)`` check would
-    fall through to the tuple branch and raise.
+    ``get_kv_size_bytes`` returns a ``(k, v)`` pair for MHA and SWA pools but a
+    scalar for MLA, DSA, and Mamba. Test for the pair: MLA reports a
+    ``numpy.int64``, so ``isinstance(size, int)`` is False and would fall
+    through to the tuple branch and raise.
     """
     size = pool.get_kv_size_bytes()
     return int(sum(size)) if isinstance(size, tuple) else int(size)
@@ -221,23 +208,16 @@ def _host_pool_retraction_fits(
 ) -> tuple[bool, int, int]:
     """Whether host RAM can back a host-pool retraction mirror on this node.
 
-    ``host_pool`` mirrors the device KV pool 1:1 (``hicache_ratio`` 1.0) and
-    every scheduler on the node allocates its own mirror, so the node
-    requirement is the per-rank device bytes times the local scheduler count.
-    The host mirror also packs the MTP/EAGLE draft caches into its own
+    ``host_pool`` mirrors the device pool 1:1 (``hicache_ratio`` 1.0) per
+    scheduler, and the mirror packs the MTP/EAGLE draft caches into its own
     ``layer_num`` (``MHATokenToKVPoolHost.get_size_per_token``), so the draft
-    device pools count toward the requirement too.
+    pools count too. Measured against ``available`` -- what the real gate in
+    ``HostKVCache.__init__`` reads. The verdict is local; callers reduce it.
 
-    Measured against ``virtual_memory().available`` -- the same quantity the
-    real gate in ``HostKVCache.__init__`` reads. The verdict is local; callers
-    reduce it with ``_agree_across_ranks`` so ranks cannot disagree.
-
-    This is a lower bound, not the exact allocation: it does not model the host
-    pool's page round-up nor SIDECAR draft host pools sized off
-    ``host_pool_group.size``, and it counts device-side scale buffers the host
-    mirror may not carry. A configuration that clears it can still fail the
-    per-rank gate, which stays authoritative. The purpose is to turn the
-    arithmetically-unsatisfiable case into a fallback rather than a crash.
+    A lower bound, not the exact allocation: it skips the host pool's page
+    round-up and SIDECAR draft pools, and counts device-side scale buffers the
+    mirror may not carry. The per-rank gate stays authoritative; this only
+    turns the arithmetically-unsatisfiable case into a fallback.
     """
     per_rank_bytes = _kv_pool_bytes(kv_cache)
     for draft_pool in mtp_draft_device_pools or ():
@@ -263,7 +243,7 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
 
     backend = disagg.disaggregation_decode_retraction_backup
     # Drives the hicache_ratio default below; the capacity gate may move
-    # ``backend`` off host_pool but must not move the ratio with it.
+    # ``backend`` but must not move the ratio with it.
     ratio_backend = backend
     if backend is None:
         kv_cache = tp_worker.get_memory_pool()[1].get_kvcache()
@@ -280,11 +260,10 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             schedule.enable_priority_scheduling
             and not schedule.disable_priority_preemption
         )
-        # Split the eligibility test by where its inputs come from. These five
-        # read the config bags, so every rank evaluates them identically and
-        # they can gate a collective. ``supports_host_pool`` cannot: pool class
-        # and full-token capacity are per-rank, and gating the all-reduce on
-        # per-rank state lets one rank skip it and hang its peers.
+        # These five read the config bags, so every rank agrees and they can
+        # gate a collective. ``supports_host_pool`` cannot: pool class and
+        # full-token capacity are per-rank, and gating the all-reduce on those
+        # lets one rank skip it and hang its peers.
         host_pool_eligible = (
             disagg.disaggregation_mode == "decode"
             and not get_parallel().dcp_enabled
@@ -297,17 +276,13 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             "host_pool" if host_pool_eligible and supports_host_pool else "cpu_tensor"
         )
         ratio_backend = backend
-        # Supported is not the same as affordable: a large device pool mirrored
-        # across every scheduler on the node can exceed host RAM outright
-        # (common when the HBM:DRAM ratio is high). Only an explicit
-        # --disaggregation-decode-retraction-backup=host_pool should hard-fail
-        # on that; an inferred default degrades instead of refusing to start.
+        # Supported is not affordable: mirroring a large device pool across
+        # every scheduler can exceed host RAM outright. An inferred default
+        # degrades; an explicit host_pool still hard-fails downstream.
         #
-        # Keyed off the config-uniform half of the eligibility test, so a rank
-        # whose pool cannot host the mirror still reaches the reduction and
-        # cannot strand its peers in the all-reduce. Every other server --
-        # prefill, embedding, non-PD -- skips the estimate entirely rather than
-        # paying a psutil read and a world-group all-reduce it has no use for.
+        # Gated on the config-uniform half only, so a rank whose pool cannot
+        # host the mirror still reaches the reduction, while prefill,
+        # embedding, and non-PD servers skip the estimate altogether.
         if host_pool_eligible:
             local_schedulers = _local_scheduler_count()
             local_fits, required_bytes, available_bytes = _host_pool_retraction_fits(
@@ -335,9 +310,8 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     if memory.hicache_ratio is None:
         # Only a decode server reaches resolution with the ratio unset; host-pool
         # retraction sizes the host pool 1:1 with the device pool, everything
-        # else keeps the standard default. Keyed off the pre-fallback verdict so
-        # the capacity gate cannot raise the ratio: enlarging the host pool
-        # because host memory is short would be exactly backwards.
+        # else keeps the standard default. Keyed off the pre-fallback verdict:
+        # enlarging the pool because host memory is short is backwards.
         fields["hicache_ratio"] = 1.0 if ratio_backend == "host_pool" else 2.0
 
     source = "kv_cache_builder.decode_retraction"
