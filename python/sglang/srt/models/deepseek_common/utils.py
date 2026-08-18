@@ -157,6 +157,16 @@ def is_wint4afp8_or_wint4a16_config(
     ) or quant_config._is_wint4abf16(weight_quant, input_quant)
 
 
+def quant_blocks_shared_experts_fusion(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Whether the quantization keeps shared experts at a higher precision than
+    the routed experts, which would require shared expert fusion to be disabled.
+    """
+    can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
+    return can_fuse_fn is not None and not can_fuse_fn()
+
+
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
