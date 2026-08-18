@@ -10,10 +10,12 @@ import os
 import re
 import struct
 import subprocess
+from collections.abc import Callable, Iterable
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable
+from typing import Any, BinaryIO
 
 FORMAT = "SGLANG-KIMI-GGMLMOEPACK-ADAPTER-v1"
 PACK_MAGIC = b"GGMLMOEPACKv1\0\0\0"
@@ -513,6 +515,128 @@ def validate_ggml_moe_pack(
     if full_pack_hash:
         result["sha256"] = sha256_file(path)
     return result
+
+
+def _align_up(value: int, alignment: int = PACK_ALIGNMENT) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _pack_layout(
+    expert_tensors: dict[tuple[int, str], TensorRecord], spec: KimiK3Spec
+) -> tuple[list[tuple[PackEntryRecord, TensorRecord]], int, int]:
+    index_count = len(spec.active_moe_layer_ids) * spec.num_experts * len(ROLE_ORDER)
+    data_start = _align_up(PACK_HEADER.size + index_count * PACK_ENTRY.size)
+    offset = data_start
+    entries: list[tuple[PackEntryRecord, TensorRecord]] = []
+    for layer in spec.active_moe_layer_ids:
+        for expert in range(spec.num_experts):
+            for role in ROLE_ORDER:
+                tensor = expert_tensors[(layer, role)]
+                expert_bytes = tensor.nbytes // spec.num_experts
+                offset = _align_up(offset)
+                entries.append(
+                    (
+                        PackEntryRecord(tensor.name, expert, offset, expert_bytes),
+                        tensor,
+                    )
+                )
+                offset += expert_bytes
+    return entries, data_start, offset
+
+
+def estimate_ggml_moe_pack_size(
+    expert_tensors: dict[tuple[int, str], TensorRecord], spec: KimiK3Spec
+) -> int:
+    return _pack_layout(expert_tensors, spec)[2]
+
+
+def _copy_tensor_slice(
+    source: BinaryIO, output: BinaryIO, offset: int, nbytes: int
+) -> None:
+    source.seek(offset)
+    remaining = nbytes
+    while remaining:
+        chunk = source.read(min(COPY_CHUNK_BYTES, remaining))
+        if not chunk:
+            raise EOFError(
+                f"short GGUF read at offset {offset}; {remaining} bytes remain"
+            )
+        output.write(chunk)
+        remaining -= len(chunk)
+
+
+def write_ggml_moe_pack(
+    path: Path,
+    expert_tensors: dict[tuple[int, str], TensorRecord],
+    spec: KimiK3Spec,
+    *,
+    progress: Callable[[int, int], None] | None = None,
+) -> int:
+    entries, data_start, final_size = _pack_layout(expert_tensors, spec)
+    path = path.resolve()
+    partial = path.with_name(path.name + ".partial")
+    if path.exists():
+        raise FileExistsError(f"refusing to overwrite existing Expert Pack: {path}")
+    if partial.exists():
+        raise FileExistsError(f"partial Expert Pack already exists: {partial}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with ExitStack() as stack:
+        sources = {
+            source_path: stack.enter_context(Path(source_path).open("rb", buffering=0))
+            for source_path in {tensor.shard_path for _, tensor in entries}
+        }
+        output = stack.enter_context(partial.open("xb", buffering=0))
+        output.write(
+            PACK_HEADER.pack(
+                PACK_MAGIC,
+                PACK_VERSION,
+                PACK_HEADER.size,
+                len(entries),
+                data_start,
+            )
+        )
+        for entry, _ in entries:
+            encoded_name = entry.tensor_name.encode("utf-8")
+            if len(encoded_name) >= 128:
+                raise ValueError(
+                    f"expert tensor name is too long for the Pack index: {entry.tensor_name}"
+                )
+            output.write(
+                PACK_ENTRY.pack(
+                    encoded_name.ljust(128, b"\0"),
+                    entry.expert,
+                    0,
+                    entry.offset,
+                    entry.nbytes,
+                )
+            )
+        output.write(bytes(data_start - output.tell()))
+
+        total = len(entries)
+        for index, (entry, tensor) in enumerate(entries, start=1):
+            padding = entry.offset - output.tell()
+            if padding < 0:
+                raise RuntimeError("Expert Pack layout moved backwards")
+            if padding:
+                output.write(bytes(padding))
+            source_offset = tensor.data_offset + entry.expert * (
+                tensor.nbytes // spec.num_experts
+            )
+            _copy_tensor_slice(
+                sources[tensor.shard_path], output, source_offset, entry.nbytes
+            )
+            if progress is not None and (index % 1024 == 0 or index == total):
+                progress(index, total)
+        output.flush()
+        os.fsync(output.fileno())
+
+    if partial.stat().st_size != final_size:
+        raise RuntimeError(
+            f"generated Expert Pack size {partial.stat().st_size} != {final_size}"
+        )
+    os.replace(partial, path)
+    return final_size
 
 
 def create_manifest(

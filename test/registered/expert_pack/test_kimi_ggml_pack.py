@@ -16,6 +16,7 @@ from tools.expert_pack.kimi_ggml import (
     KimiK3Spec,
     TensorRecord,
     validate_ggml_moe_pack,
+    write_ggml_moe_pack,
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -111,6 +112,22 @@ class TestKimiGGMLPack(unittest.TestCase):
         self.assertEqual(result["object_bytes"], 3 * PACK_ALIGNMENT)
         self.assertEqual(result["payload_samples_verified"], 6)
         self.assertEqual(result["roles"]["down"]["dtype"], "Q3_K")
+
+    def test_builds_expert_major_pack_from_source_tensor_slices(self):
+        source = self.root / "source.gguf"
+        source.write_bytes(
+            b"".join(bytes([value]) * PACK_ALIGNMENT for value in range(6))
+        )
+        pack = self.root / "experts.pack"
+
+        size = write_ggml_moe_pack(pack, _tensor_records(source), _spec())
+        result = validate_ggml_moe_pack(
+            pack, _tensor_records(source), _spec(), payload_samples=6
+        )
+
+        self.assertEqual(pack.stat().st_size, size)
+        self.assertEqual(result["payload_samples_verified"], 6)
+        self.assertFalse(pack.with_name(pack.name + ".partial").exists())
 
     def test_rejects_pack_that_changes_expert_identity(self):
         source = self.root / "source.gguf"

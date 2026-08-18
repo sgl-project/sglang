@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -25,18 +26,18 @@ DEFAULT_LOCK = "/tmp/sglang-kimi-k3-5090-benchmark.lock"
 METADATA_FORMAT_VERSION = 2
 ACTIVE_MOE_LAYERS = tuple(range(1, 93))
 IMMUTABLE_TOP_K = 16
+GGUF_SHARD_SUFFIX_RE = re.compile(r"-\d{5}-of-\d{5}\.gguf$")
 
 
 def cache_root() -> Path:
     return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")).expanduser()
 
 
-def artifact_dir_for_source(gguf: Path, expert_pack: Path) -> Path:
+def artifact_dir_for_source(gguf: Path) -> Path:
     stat = gguf.stat()
-    pack_stat = expert_pack.stat()
     fingerprint = hashlib.sha256(
         f"{gguf.parent.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:"
-        f"{expert_pack.resolve()}:{pack_stat.st_size}:{pack_stat.st_mtime_ns}:{METADATA_FORMAT_VERSION}".encode()
+        f"{METADATA_FORMAT_VERSION}".encode()
     ).hexdigest()[:20]
     return cache_root() / "sglang-expert-pack" / "kimi-k3" / fingerprint
 
@@ -54,11 +55,10 @@ def _tokenizer_candidate(path: Path) -> bool:
 
 def resolve_kimi_assets(gguf: Path) -> tuple[Path, Path, Path]:
     gguf_dir = gguf.parent
-    packs = sorted(gguf_dir.glob("*.expert-major.pack"))
-    if len(packs) != 1:
-        raise RuntimeError(
-            f"expected exactly one Kimi Expert Pack beside --gguf in {gguf_dir}; found {len(packs)}"
-        )
+    shard_match = GGUF_SHARD_SUFFIX_RE.search(gguf.name)
+    if shard_match is None:
+        raise RuntimeError(f"Kimi GGUF is not a numbered shard: {gguf}")
+    expert_pack = gguf_dir / f"{gguf.name[: shard_match.start()]}.expert-major.pack"
     candidates = [gguf_dir / "tokenizer", gguf_dir.parent / "kimi-k3-tokenizer"]
     candidates.extend(
         sorted(path for path in gguf_dir.parent.glob("*tokenizer*") if path.is_dir())
@@ -73,7 +73,7 @@ def resolve_kimi_assets(gguf: Path) -> tuple[Path, Path, Path]:
         raise RuntimeError(
             f"could not uniquely derive Kimi tokenizer beside {gguf_dir}; candidates: {names}"
         )
-    return gguf_dir, packs[0].resolve(), tokenizers[0]
+    return gguf_dir, expert_pack.resolve(), tokenizers[0]
 
 
 def find_sglang_repo() -> Path:
@@ -169,6 +169,29 @@ def prepare_manifest(args: argparse.Namespace, model_dir: Path) -> Path:
         command.append("--full-pack-hash")
     subprocess.run(command, cwd=args.sglang_repo, check=True)
     return manifest
+
+
+def prepare_expert_pack(args: argparse.Namespace, model_dir: Path) -> Path:
+    tool = args.sglang_repo / "tools" / "expert_pack" / "prepare_kimi_pack.py"
+    if not tool.is_file():
+        raise FileNotFoundError(f"missing Kimi Expert Pack preparer: {tool}")
+    subprocess.run(
+        [
+            sys.executable,
+            str(tool),
+            "--gguf",
+            str(args.gguf),
+            "--model-config",
+            str(model_dir / "config.json"),
+        ],
+        cwd=args.sglang_repo,
+        check=True,
+    )
+    if not args.expert_pack.is_file():
+        raise FileNotFoundError(
+            f"Kimi Expert Pack preparer did not create {args.expert_pack}"
+        )
+    return args.expert_pack
 
 
 def validate_manifest(
@@ -580,7 +603,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         expert_cache_mib=5120,
         expert_cache_reserve_mib=1536,
         stage_slots=16,
-        read_splits=4,
+        read_splits=1,
         direct_io=True,
         payload_samples=6,
         full_source_hashes=False,
@@ -604,7 +627,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.gguf = args.gguf.expanduser().resolve(strict=True)
     args.gguf_dir, args.expert_pack, args.tokenizer_dir = resolve_kimi_assets(args.gguf)
     args.sglang_repo = find_sglang_repo()
-    args.artifact_dir = artifact_dir_for_source(args.gguf, args.expert_pack).resolve()
+    args.artifact_dir = artifact_dir_for_source(args.gguf).resolve()
     args.server_log = args.artifact_dir / DEFAULT_SERVER_LOG.name
     args.stats_path = args.artifact_dir / "kimi-k3-expert-pack.stats.json"
     args.report_path = args.artifact_dir / "kimi-k3-5090-benchmark.json"
@@ -651,6 +674,7 @@ def main() -> int:
     try:
         gpu = detect_rtx_5090()
         model_dir = prepare_model_metadata(args.tokenizer_dir, args.artifact_dir)
+        args.expert_pack = prepare_expert_pack(args, model_dir)
         manifest_path = prepare_manifest(args, model_dir)
         manifest = validate_manifest(
             manifest_path, args.expert_pack, args.gguf_dir, args.tokenizer_dir

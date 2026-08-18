@@ -25,8 +25,6 @@ class TestKimiBenchmark(unittest.TestCase):
         gguf_dir.mkdir()
         tokenizer_dir.mkdir()
         (gguf_dir / "KIMI-K3-00001-of-00001.gguf").write_bytes(b"gguf")
-        expert_pack = gguf_dir / "KIMI-K3.expert-major.pack"
-        expert_pack.write_bytes(b"pack")
         (tokenizer_dir / "config.json").write_text("{}\n", encoding="utf-8")
         (tokenizer_dir / "tokenizer.json").write_text("{}\n", encoding="utf-8")
         return [
