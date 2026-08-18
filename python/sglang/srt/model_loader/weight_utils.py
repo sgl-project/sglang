@@ -40,7 +40,6 @@ from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
-from sglang.srt.model_loader.checkpoint_quantization import resolve_checkpoint_quant_spec
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import REQUANTIZATION_METHODS, ModelConfig
 from sglang.srt.distributed import (
@@ -51,6 +50,9 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
+)
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
 )
 from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
