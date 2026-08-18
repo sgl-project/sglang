@@ -391,6 +391,8 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
                 head_k_dim=self.HEAD_DIM,
                 head_v_dim=self.HEAD_DIM,
             )
+            eager_load_count = load_kernel.call_count
+            self.assertGreater(eager_load_count, 0)
             run_gdn_cuda_graph_decode_case(
                 self,
                 self.CAKE_DECODE_CASE,
@@ -398,7 +400,7 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
                 head_v_dim=self.HEAD_DIM,
                 cuda_graph_capture_batch_size=4,
             )
-        self.assertGreater(load_kernel.call_count, 0)
+        self.assertGreater(load_kernel.call_count, eager_load_count)
 
     def test_cake_exact_verify_eager_and_cuda_graph(self):
         cake_api = self._cake_api_or_skip()
@@ -415,6 +417,8 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
                 head_k_dim=self.HEAD_DIM,
                 head_v_dim=self.HEAD_DIM,
             )
+            eager_load_count = load_kernel.call_count
+            self.assertGreater(eager_load_count, 0)
             run_gdn_eagle_verify_cuda_graph_case(
                 self,
                 self.CAKE_VERIFY_CASE,
@@ -424,7 +428,7 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
                 head_v_dim=self.HEAD_DIM,
                 cuda_graph_capture_batch_size=8,
             )
-        self.assertGreater(load_kernel.call_count, 0)
+        self.assertGreater(load_kernel.call_count, eager_load_count)
 
     def test_prefill_tracked_state_checkpoints(self):
         fixture = build_gdn_attention_fixture(
