@@ -40,6 +40,10 @@ from sglang.kernels.ops.diffusion.ltx2_rmsnorm_modulate import (
     mount_ltx2_rms_norm_modulate,
     unmount_ltx2_rms_norm_modulate,
 )
+from sglang.kernels.ops.diffusion.minimax_h3_rmsnorm_adaln import (
+    mount_minimax_h3_indexed_rmsnorm_adaln,
+    unmount_minimax_h3_indexed_rmsnorm_adaln,
+)
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.flux import (
@@ -169,6 +173,11 @@ _QUALITY_FUSION_HANDLERS: tuple[
         "LTX-2 fused RMSNorm+modulate",
         mount_ltx2_rms_norm_modulate,
         unmount_ltx2_rms_norm_modulate,
+    ),
+    (
+        "MiniMax H3 indexed RMSNorm+AdaLN",
+        mount_minimax_h3_indexed_rmsnorm_adaln,
+        unmount_minimax_h3_indexed_rmsnorm_adaln,
     ),
     (
         "fused gate RMSNorm (BF16-native Triton)",

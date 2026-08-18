@@ -20,6 +20,10 @@ from safetensors.torch import safe_open
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
 )
+from sglang.kernels.ops.diffusion.minimax_h3_rmsnorm_adaln import (
+    mark_minimax_h3_indexed_rmsnorm_adaln_site,
+    minimax_h3_indexed_rmsnorm_adaln_active,
+)
 from sglang.kernels.ops.diffusion.qknorm_rope import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
@@ -28,6 +32,10 @@ from sglang.kernels.ops.diffusion.triton.indexed_modulation import (
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
+)
+from sglang.kernels.ops.diffusion.triton.indexed_rmsnorm_adaln import (
+    can_use_fused_indexed_rmsnorm_adaln,
+    fused_indexed_rmsnorm_adaln,
 )
 from sglang.kernels.ops.layernorm.norm import fused_inplace_qknorm
 from sglang.multimodal_gen import envs
@@ -79,6 +87,7 @@ logger = init_logger(__name__)
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
+_H3_RMSNORM_ADALN_FAILED_KEYS = set[tuple[torch.device, torch.dtype]]()
 
 _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER = (
     "video_patch_proj.weight",
@@ -240,6 +249,45 @@ def _modulate_scale_shift(
     return (
         x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)
     ).to(dtype)
+
+
+def _indexed_rmsnorm_adaln(
+    block: nn.Module,
+    norm: nn.RMSNorm,
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Run H3's fused norm+indexed AdaLN path when mounted and supported."""
+    runtime_key = (x.device, x.dtype)
+    if (
+        minimax_h3_indexed_rmsnorm_adaln_active(block)
+        and runtime_key not in _H3_RMSNORM_ADALN_FAILED_KEYS
+        and norm.weight is not None
+        and can_use_fused_indexed_rmsnorm_adaln(x, norm.weight, shift, scale, indices)
+    ):
+        try:
+            return fused_indexed_rmsnorm_adaln(
+                x,
+                norm.weight,
+                shift,
+                scale,
+                indices,
+                float(norm.eps),
+            )
+        except Exception as exc:
+            if torch.compiler.is_compiling():
+                raise
+            _H3_RMSNORM_ADALN_FAILED_KEYS.add(runtime_key)
+            logger.warning_once(
+                "Disabling MiniMax H3 indexed RMSNorm+AdaLN fast path on "
+                f"{x.device}/{x.dtype}: {exc}"
+            )
+
+    return _modulate_scale_shift(norm(x), shift, scale, indices, dtype=dtype)
 
 
 def _modulate_gate(
@@ -1205,6 +1253,7 @@ class MiniMaxH3DiTBlock(nn.Module):
             )
         )
         self.preserve_input_for_cache_dit = False
+        mark_minimax_h3_indexed_rmsnorm_adaln_site(self)
 
     def forward(
         self,
@@ -1236,9 +1285,14 @@ class MiniMaxH3DiTBlock(nn.Module):
         # first gated residual writes to that tensor; the second one operates on
         # a block-local buffer.
         residual = x
-        h = self.norm1(x)
-        h = _modulate_scale_shift(
-            h, shift_msa, scale_msa, combined_indices, dtype=_BF16_DTYPE
+        h = _indexed_rmsnorm_adaln(
+            self,
+            self.norm1,
+            x,
+            shift_msa,
+            scale_msa,
+            combined_indices,
+            dtype=_BF16_DTYPE,
         )
         h = self.attn(
             h,
@@ -1259,9 +1313,14 @@ class MiniMaxH3DiTBlock(nn.Module):
         )
 
         residual = x
-        h = self.norm2(x)
-        h = _modulate_scale_shift(
-            h, shift_mlp, scale_mlp, combined_indices, dtype=_BF16_DTYPE
+        h = _indexed_rmsnorm_adaln(
+            self,
+            self.norm2,
+            x,
+            shift_mlp,
+            scale_mlp,
+            combined_indices,
+            dtype=_BF16_DTYPE,
         )
         h = self.mlp(h)
         # `residual` is block-local here (see above), so this stays in-place
