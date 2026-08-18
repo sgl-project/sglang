@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.diffusion.triton.rotary import apply_rotary_embedding
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -84,7 +84,7 @@ def _apply_rotary_emb_complex(
         torch.Tensor: The same shape and dtype as x.
     """
     b, s, h, d = x.shape
-    dtype_c = torch.float32
+    dtype_c = torch.float64
 
     x_complex = torch.view_as_complex(x.to(dtype_c).reshape(b, s, h, d // 2, 2))
     x_out = torch.view_as_real(x_complex * freqs)
