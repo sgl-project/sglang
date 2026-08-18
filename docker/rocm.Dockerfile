@@ -678,6 +678,8 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   # so drop it before configuring. Only -dev packages go (libabsl-dev plus the
   # libgrpc dev packages that require it); libabsl20220623t64 stays, so the
   # Mooncake binaries built above keep the shared library they linked against.
+  # The three are put back once nixl is built: MORI needs libgrpc++-dev, and the
+  # CI install script rebuilds MORI inside this image.
   case "${GPU_ARCH}" in *rocm7_15*) apt-get remove -y libabsl-dev || true ;; esac; \
   pip install --no-cache-dir meson ninja pybind11 meson-python patchelf pyyaml; \
   git clone --depth=1 -b "${UCX_BRANCH}" "${UCX_REPO}" /sgl-workspace/ucx; \
@@ -698,6 +700,15 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       --config-settings=setup-args="-Denable_plugins=UCX,POSIX"; \
   SITE=$(python3 -c "import sysconfig; print(sysconfig.get_paths()[\"purelib\"])"); \
   ln -sfn nixl_rocm "$SITE/nixl"; \
+  # Restore exactly the packages the abseil removal above took out. Without them a
+  # later MORI rebuild configures without gRPC and silently drops symbols its
+  # python side imports (mori.umbp needs CacheRemoteAdmission).
+  case "${GPU_ARCH}" in \
+    *rocm7_15*) \
+      apt-get update && apt-get install -y --no-install-recommends \
+          libabsl-dev libgrpc-dev libgrpc++-dev && rm -rf /var/lib/apt/lists/*; \
+      ;; \
+  esac; \
   echo "export LD_LIBRARY_PATH=/opt/ucx/lib:\${LD_LIBRARY_PATH}" >> /etc/bash.bashrc'
 
 # -----------------------
