@@ -2264,5 +2264,53 @@ class TestDcpKvEventContract(CustomTestCase):
             args._handle_dcp_validation()
 
 
+class TestDcpAttentionBackend(CustomTestCase):
+    """fa3 has no DCP decode path for MLA models: it returns no LSE for the
+    cross-dcp-rank reduction, so a DCP run crashed at decode cuda-graph
+    capture instead of at args time. fa3 is also the Hopper MLA auto-default,
+    so every Hopper DCP launch without an explicit --attention-backend hit
+    it."""
+
+    def test_explicit_fa3_with_dcp_rejected_for_mla(self):
+        for field in ("attention_backend", "decode_attention_backend"):
+            args = ServerArgs(
+                model_path="dummy", tp_size=4, dcp_size=4, **{field: "fa3"}
+            )
+            with patch.object(ServerArgs, "use_mla_backend", return_value=True):
+                with self.assertRaisesRegex(ValueError, "DCP decode"):
+                    args._handle_dcp_validation()
+
+    def test_fa3_with_dcp_allowed_for_prefill_only_worker(self):
+        # Prefill-only workers never run the DCP decode path.
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=4,
+            dcp_size=4,
+            attention_backend="fa3",
+            disaggregation_mode="prefill",
+        )
+        args._handle_dcp_validation()
+
+    def test_fa3_with_dcp_allowed_for_mha(self):
+        args = ServerArgs(
+            model_path="dummy", tp_size=4, dcp_size=4, attention_backend="fa3"
+        )
+        with patch.object(ServerArgs, "use_mla_backend", return_value=False):
+            args._handle_dcp_validation()
+
+    def test_mla_default_backend_avoids_fa3_under_dcp_on_hopper(self):
+        model_config = MagicMock()
+        model_config.hf_config.architectures = []
+        with patch.object(
+            server_args_module, "is_hopper_with_cuda_12_3", return_value=True
+        ):
+            args = ServerArgs(model_path="dummy", tp_size=4, dcp_size=4)
+            self.assertEqual(
+                args._get_default_attn_backend(True, model_config), "flashinfer"
+            )
+            args = ServerArgs(model_path="dummy", tp_size=4, dcp_size=1)
+            self.assertEqual(args._get_default_attn_backend(True, model_config), "fa3")
+
+
 if __name__ == "__main__":
     unittest.main()
