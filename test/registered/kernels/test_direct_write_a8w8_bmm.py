@@ -18,10 +18,10 @@ covering decode (M=1) and multiple tokens.
 
 Requires ROCm/aiter on gfx95 (MI35x); skipped elsewhere.
 
-NOTE (validate on MI35x): ``w_scale`` here is built as per-batched-tensor
-(heads, 1, 1); if the pinned aiter kernel expects a different scale rank, adjust
-``_make_inputs`` — the parity assertion is independent of the exact shape since
-both paths share it.
+Scale contract: ``w_scale`` is per-batched-tensor ``(heads, 1, 1)`` -- confirmed
+against the pinned aiter build on MI355X (gfx950). Both the original and the
+direct-write paths share it, so the parity assertion is independent of its exact
+rank.
 """
 
 import unittest
@@ -33,19 +33,25 @@ from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
+# Detect the target hardware defensively: a non-ROCm / non-gfx95 (or otherwise
+# broken) environment simply skips this test.
 try:
+    from sglang.srt.models.deepseek_common.utils import _use_aiter_gfx95
+
+    _ON_GFX95 = _use_aiter_gfx95 and torch.cuda.is_available()
+except Exception:
+    _ON_GFX95 = False
+
+# On the gfx95 runner (where this coverage is required) the aiter kernel import is
+# NOT guarded: an API move or an incompatible pinned AITER build must fail loudly
+# here rather than silently degrade into a green skip and lose MI35x coverage.
+if _ON_GFX95:
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _bmm_a8w8,
     )
 
-    from sglang.srt.models.deepseek_common.utils import _use_aiter_gfx95
 
-    _HAS_PATH = _use_aiter_gfx95 and torch.cuda.is_available()
-except Exception:
-    _HAS_PATH = False
-
-
-@unittest.skipUnless(_HAS_PATH, "requires ROCm/aiter gfx95 (MI35x)")
+@unittest.skipUnless(_ON_GFX95, "requires ROCm/aiter gfx95 (MI35x)")
 class TestDirectWriteA8W8Bmm(CustomTestCase):
     H, K, N = 8, 512, 128  # heads, kv_lora_rank (in), v_head_dim (out); N=vdim
     GROUP = 128
