@@ -198,12 +198,25 @@ class BaseMultimodalProcessor(ABC):
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
     preserve_processor_input_ids = False
-    auto_mm_processor_worker_num = 1
+    # Two preprocessing workers, because image preprocessing releases the GIL
+    # (numpy / torch / PIL underneath) and a single worker caps request
+    # throughput at 1 / preprocess_time however much GPU is left idle. Two and
+    # not more: past that, spreading request arrivals fragments the GPU prefill
+    # batches faster than the extra overlap pays for itself. Measured at 32-way
+    # concurrency on an H200 for one / two / four workers -- PaddleOCR-VL 1080p
+    # pages 6.72 / 9.55 / 8.92 req/s, Qwen2.5-VL small images with 512-token
+    # outputs 12.54 / 12.60 / 12.25 req/s.
+    auto_mm_processor_worker_num = 2
     auto_mm_io_worker_num = 4
     # Models opt in by assigning a non-zero default. A user-provided server
     # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
-    supports_mm_processor_concurrency = False
+    # Processors opt out only when their preprocessing is not thread-safe. The
+    # worker pool gives each thread its own `copy.deepcopy` of the HF processor
+    # and injects it, and the single function it runs --
+    # `process_and_combine_mm_data` -- resolves that clone instead of
+    # `self._processor`, so isolation does not depend on the subclass.
+    supports_mm_processor_concurrency = True
 
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs

@@ -88,6 +88,24 @@ def test_every_call_site_can_await():
     )
 
 
+def test_default_worker_count_stays_at_the_measured_optimum():
+    """Two workers, measured, not guessed.
+
+    Image preprocessing releases the GIL, so a second worker overlaps it with
+    the GPU; a third and fourth start spreading request arrivals far enough
+    apart to fragment the prefill batches. Measured at 32-way concurrency on an
+    H200 for one / two / four workers: PaddleOCR-VL 1080p pages 6.72 / 9.55 /
+    8.92 req/s, Qwen2.5-VL small images with 512-token outputs 12.54 / 12.60 /
+    12.25 req/s. Raising this needs a fresh sweep, not a hunch.
+    """
+    from sglang.srt.multimodal.processors.base_processor import (
+        BaseMultimodalProcessor,
+    )
+
+    assert BaseMultimodalProcessor.supports_mm_processor_concurrency is True
+    assert BaseMultimodalProcessor.auto_mm_processor_worker_num == 2
+
+
 def test_the_scan_actually_finds_call_sites():
     """Guard against the scan silently matching nothing after a rename."""
     assert len(list(_call_sites())) > 20
