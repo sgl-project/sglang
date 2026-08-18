@@ -8039,10 +8039,6 @@ class ServerArgs:
         if (
             not envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.is_set()
             and is_mnnvl_fabric_device()
-            # CustomAllReduceV2 supports world sizes 2..8 only
-            # (can_use_custom_all_reduce_v2 rejects larger groups); don't
-            # auto-opt-in a TP16+ launch just to fall back downstream.
-            and self.tp_size <= 8
         ):
             logger.info(
                 "MNNVL fabric device detected with nnodes=%d: enabling "
