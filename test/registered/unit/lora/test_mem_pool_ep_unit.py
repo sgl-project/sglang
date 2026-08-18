@@ -918,6 +918,7 @@ class TestModuleLevelHelpers(unittest.TestCase):
             num_experts=8,
             num_local_experts=2,
             num_fused_shared_experts=0,
+            runner_backend=None,
         )
         parallel = types.SimpleNamespace(moe_ep_size=4, moe_ep_rank=1)
         state = types.SimpleNamespace(backend=None)
@@ -941,6 +942,57 @@ class TestModuleLevelHelpers(unittest.TestCase):
                     _moe_runner_keeps_global_expert_ids(),
                     backend in expected_global,
                 )
+
+    def test_runner_backend_wins_over_configured_backend(self):
+        """A non-AITER built runner should only narrow configured AITER inference."""
+        backends = _load_moe_backend_enum()
+        parallel = types.SimpleNamespace(moe_ep_size=4, moe_ep_rank=1)
+        state = types.SimpleNamespace(backend=backends.AITER)
+        standard_dispatcher = _load_standard_dispatcher(
+            get_parallel=lambda: parallel,
+            get_backend=lambda: state.backend,
+        )
+
+        for configured, runner_backend, keeps_global in (
+            (backends.AITER, backends.TRITON, False),
+            (backends.AITER, backends.AITER, True),
+            (backends.TRITON, backends.AITER, False),
+            (backends.TRITON, backends.TRITON, False),
+        ):
+            state.backend = configured
+            config = types.SimpleNamespace(
+                num_experts=8,
+                num_local_experts=2,
+                num_fused_shared_experts=0,
+                runner_backend=runner_backend,
+            )
+            self.assertEqual(
+                standard_dispatcher(config).use_aiter_moe_runner,
+                keeps_global,
+                f"{configured=} {runner_backend=}",
+            )
+
+    def test_moe_runner_records_its_backend_on_the_shared_config(self):
+        """MoeRunner should record its backend on the shared config."""
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        config = MoeRunnerConfig()
+        self.assertIsNone(config.runner_backend)
+        MoeRunner(MoeRunnerBackend.TRITON, config)
+        self.assertEqual(config.runner_backend, MoeRunnerBackend.TRITON)
+
+    def test_moe_runner_does_not_record_failed_backend(self):
+        """A failed construction should leave the shared config unchanged."""
+        from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+        from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+        from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+        config = MoeRunnerConfig()
+        with self.assertRaises(NotImplementedError):
+            MoeRunner(MoeRunnerBackend.AUTO, config)
+        self.assertIsNone(config.runner_backend)
 
 
 class TestPoolInitPicksUpEpContext(unittest.TestCase):

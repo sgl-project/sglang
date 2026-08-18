@@ -99,6 +99,9 @@ class MoeRunner:
                     f"{a2a_backend_name}, but none is registered."
                 )
 
+        # Record only successfully constructed runners.
+        config.runner_backend = runner_backend
+
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
 
