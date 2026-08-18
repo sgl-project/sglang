@@ -83,6 +83,67 @@ whose `max_tokens` admits the batch (a rule without `max_tokens` terminates
 the ladder). `sites` holds `MoeLoraLaunchConfig` fields (per-site Triton
 tile dicts). A plan row with no rules serves the built-in heuristics.
 
+Route block size (`routing_block_size`, `gate_up_a_routing_block_size`):
+
+The route's block size IS `BLOCK_SIZE_M` for every LoRA stage that reads it,
+and the shared route serves down-A, gate/up-B and down-B. Gate/up-A may take
+a SECOND route at its own block, and on the shipped rows it does. Both values
+are measured, and they are NOT the same knob:
+
+- the SHARED route's block also decides how many rows get padded onto the
+  route, and the fused middle and the base GEMM walk every one of them.
+  Raising it buys faster LoRA kernels and charges everything downstream.
+- gate/up-A's route is free of that. It writes by ORIGINAL PAIR ID, so the
+  shared B route consumes its bridge without a layout conversion and its
+  padding never reaches another stage. A big tile there costs only its own
+  build.
+
+That asymmetry is why the shipped `prefill.serial` rows run 16 on the shared
+route and 64 for gate/up-A, and why collapsing them onto one block is a
+regression in both directions. Measured end-to-end 2026-08-18 on H200 with
+Qwen3.5-35B (4k in / 1k out, bs 1-32, two rounds per arm, noise floor ±0.3%),
+against that shipped split:
+
+| one block for everything | bs1 | bs8 | bs16 | bs32 |
+|---|---|---|---|---|
+| 16  | −0.1% | −2.3% | −2.6% | −2.5% |
+| 32  | +0.1% | −0.1% | +0.2% | +0.0% |
+| 64  | +0.2% | +0.3% | +0.2% | +0.4% |
+| 256 | −21.3% | −28.0% | −28.6% | −28.6% |
+
+Uniform 64 looks free there, but it is not: on Inkling-Small, whose hidden is
+4096 against Qwen's 2048, so every padded row costs twice as much downstream,
+uniform 64 loses 1.0-4.4% on B200 and 4.8-8.5% on GB300. The shipped split is
+the best configuration measured on both models.
+
+Occupancy is what sets the shared block -- routed pairs per virtual expert,
+`tokens × top_k ÷ (local_experts × live adapter slots)`. Do not estimate it
+from the token count alone: a 4096-token prefill of a 256-expert model with 4
+adapters resident is 1024 virtual experts and only ~32 pairs each, not the
+thousands a token count suggests. At that occupancy padding dominates and the
+shared block wants to stay small; the 256 row above is that same effect taken
+to its conclusion.
+
+The SHARED-OUTER prefill rows are the opposite regime and are NOT tuned for
+it. Shared-outer collapses every routed id onto one LoRA expert per adapter,
+so the same forward has 4 virtual experts instead of 1024 and ~16k pairs in
+each -- padding costs 0.4% of rows there, against ~98% for the per-expert
+rows at a block of 64. A kernel-level sweep on GB300 (down-A, gate/up-B,
+down-B at the token_dedup tiles) puts a block of 128 at **+19.6% at 2048
+tokens and +26.0% at 8192** over the 16 those rows ship, with no padding
+penalty to give it back. That is unverified end-to-end and the rows still
+ship 16; it is the open lead here, and Inkling or 397B with a shared-outer
+adapter is the vehicle for it. A block of 256 does not compile for these
+tiles -- it exceeds shared memory.
+
+One caution for anyone re-deriving this. A kernel-level sweep that times only
+the four LoRA stages will report that giving gate/up-A its own block gains
+exactly 0.00%, on every architecture and at every occupancy from 1 to 512
+pairs per expert. That measurement is blind to the padding, because every
+stage it charges reads the same route -- the stages that pay for a bigger
+shared block are the fused middle and the base GEMM, which it never times.
+The 2.5% above is what that blindness costs.
+
 Some rules carry byte-identical `sites` ON PURPOSE, and nothing enforces the
 pairing — the format is deliberately raw values with no reference/alias
 mechanism. As shipped: `decode.per_expert` rules 0+1 share one config
