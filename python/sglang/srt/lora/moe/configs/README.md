@@ -153,6 +153,20 @@ ship 16; it is the open lead here, and Inkling or 397B with a shared-outer
 adapter is the vehicle for it. A block of 256 does not compile for these
 tiles -- it exceeds shared memory.
 
+A second lead, for geometries we do not ship. Which kernel the split favors
+is set by the model's shape: gate/up-A's weight slab is 2R x hidden and
+down-A's is R x intermediate, so the two equalize at intermediate = 2 x
+hidden and down-A dominates past it. Our models all sit at intermediate <=
+hidden, where down-A at 16 wastes a few percent of a sub-100 us kernel --
+noise, and the reason the shipped split pairs the 64 with gate/up-A alone.
+Measured at a Mixtral-shaped 4096/14336 under production geometry (256
+experts x 4 adapters, 8k chunk), it flips: down-A at 16 wastes 54-65% of
+what is now the layer's largest standalone LoRA kernel (0.7-1.0 ms), and
+every rider prefers 32-64 at the kernel level. Onboarding such a model, the
+tuner's per-phase shared-block axis is the first instrument; the finer move
+-- pointing down-A at gate/up-A's list, legal because its input is
+pair-addressed -- needs a plan-level change and is unverified end-to-end.
+
 One caution for anyone re-deriving this. A kernel-level sweep that times only
 the four LoRA stages gets the route STRUCTURE wrong in both directions, while
 looking rigorous:
