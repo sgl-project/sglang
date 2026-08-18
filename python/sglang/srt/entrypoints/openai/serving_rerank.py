@@ -152,10 +152,12 @@ def _render_jinja_chat_template(
         document if isinstance(document, str) else _extract_text_from_content(document)
     )
 
+    # Note: This function is only called for Qwen3-Reranker text path,
+    # detected by the presence of yes/no judgment phrases in the chat template.
     render_kwargs = {
         "messages": [
-            {"role": "user", "content": query_text},
-            {"role": "user", "content": doc_text},
+            {"role": "query", "content": query_text},
+            {"role": "document", "content": doc_text},
         ]
     }
     # Only pass instruct when explicitly provided; template uses `default(...)`
