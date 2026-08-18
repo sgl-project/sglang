@@ -402,5 +402,59 @@ class TestResolutionIsReproducible(CustomTestCase):
         self.assertEqual(getattr(first, "_resolved_overrides", None), first_provenance)
 
 
+class TestTheResolutionSeamHasOneCaller(CustomTestCase):
+    """The pipeline is entered from exactly one place.
+
+    Step 12 moves the call from ``__post_init__`` to ``publish`` so the record
+    stays raw; that is a one-line move only while the seam has a single caller.
+    A second entry point would also mean resolution could run twice on one
+    instance, which the strict ``__setattr__`` guard turns into an
+    ``AttributeError`` rather than a silent re-resolve.
+    """
+
+    def test_only_post_init_runs_the_pipeline(self):
+        import ast
+        from pathlib import Path
+
+        import sglang
+
+        package_root = Path(next(iter(sglang.__path__)))
+        callers = []
+        for path in sorted(package_root.rglob("*.py")):
+            try:
+                tree = ast.parse(path.read_text())
+            except SyntaxError:
+                continue
+            # The full (class, function, ...) scope chain, so the assertion can
+            # say "the one caller is ServerArgs.__post_init__" -- not merely
+            # that nothing outside a function named __post_init__ calls it.
+            scopes = {}
+            for node in ast.walk(tree):
+                own = scopes.get(id(node), ())
+                if isinstance(
+                    node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+                ):
+                    own = own + (node.name,)
+                for child in ast.iter_child_nodes(node):
+                    scopes[id(child)] = own
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "_run_resolution_pipeline"
+                ):
+                    rel = path.relative_to(package_root).as_posix()
+                    callers.append((rel, ".".join(scopes.get(id(node), ()))))
+        # Every call, compared whole: a removed call, a duplicate inside
+        # __post_init__, or another class growing a same-named __post_init__
+        # all show up here.
+        self.assertEqual(
+            [("srt/server_args.py", "ServerArgs.__post_init__")],
+            callers,
+            "the resolution pipeline must be entered exactly once, from "
+            f"ServerArgs.__post_init__; found: {callers}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

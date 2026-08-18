@@ -102,14 +102,14 @@ def awq_dequantize_func():
 
         return awq_dequantize
     elif _is_hip:
-        from sglang.kernel_api_logging import debug_kernel_api
+        from sglang.kernels.kernel_api_logging import debug_kernel_api
         from sglang.kernels.ops.quantization.awq_triton import (
             awq_dequantize_triton as awq_dequantize,
         )
 
         return debug_kernel_api(awq_dequantize, op_name="DeepseekCommon.awq_dequantize")
     elif _is_npu:
-        from sglang.kernel_api_logging import debug_kernel_api
+        from sglang.kernels.kernel_api_logging import debug_kernel_api
         from sglang.kernels.ops.quantization.awq_triton import (
             awq_dequantize_decomposition as awq_dequantize,
         )
@@ -150,6 +150,16 @@ def is_wint4afp8_or_wint4a16_config(
     return quant_config._is_wint4afp8(
         weight_quant, input_quant
     ) or quant_config._is_wint4abf16(weight_quant, input_quant)
+
+
+def quant_blocks_shared_experts_fusion(
+    quant_config: Optional[QuantizationConfig],
+) -> bool:
+    """Whether the quantization keeps shared experts at a higher precision than
+    the routed experts, which would require shared expert fusion to be disabled.
+    """
+    can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
+    return can_fuse_fn is not None and not can_fuse_fn()
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:

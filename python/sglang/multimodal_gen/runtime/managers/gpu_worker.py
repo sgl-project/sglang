@@ -289,13 +289,18 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
-        if self.server_args.layerwise_offload_components:
+        if self.server_args.has_layerwise_offload_components():
             configure_layerwise_offload_modules(
                 self.pipeline.modules,
                 self.server_args,
-                component_names=self.server_args.layerwise_offload_components,
+                component_names=(
+                    None
+                    if self.server_args.component_residency is not None
+                    else self.server_args.layerwise_offload_components
+                ),
                 warn_missing=(
-                    self.server_args.is_arg_explicitly_set(
+                    self.server_args.component_residency is not None
+                    or self.server_args.is_arg_explicitly_set(
                         "layerwise_offload_components"
                     )
                     or self.server_args.is_arg_explicitly_set("dit_layerwise_offload")
