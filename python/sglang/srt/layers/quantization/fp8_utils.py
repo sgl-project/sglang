@@ -1601,24 +1601,32 @@ def _inverse_transform_scale_ue8m0_impl(sf_packed):
     assert len(sf_packed.shape) == 2, f"{sf_packed.shape=}"
     assert sf_packed.dtype == torch.int32
 
-    mn_repeat_128, k_div_4 = sf_packed.shape
-    mn = mn_repeat_128 // block_size
+    mn_repeat, k_div_4 = sf_packed.shape
+    num_full_blocks = mn_repeat // block_size
+    tail_rows = mn_repeat - num_full_blocks * block_size
+    mn = num_full_blocks + (1 if tail_rows else 0)
     k = k_div_4 * 4
 
     # packed u8 -> fp32
-    sf_u8 = sf_packed.contiguous().flatten().view(torch.uint8).view(mn_repeat_128, k)
+    sf_u8 = sf_packed.contiguous().flatten().view(torch.uint8).view(mn_repeat, k)
     sf_fp32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
 
-    # remove repeat
-    sf_reshaped = sf_fp32.view(mn, block_size, k)
-    sf_unrepeated = sf_reshaped[:, 0:1, :]
-    if not torch.all(sf_unrepeated == sf_reshaped):
+    # remove repeat; the last block repeats only mn_repeat % 128 times when the
+    # row count is not a multiple of the block size
+    main = sf_fp32[: num_full_blocks * block_size].view(num_full_blocks, block_size, k)
+    if not torch.all(main[:, 0:1, :] == main):
         from sglang.srt.debug_utils.dumper import get_tensor_info
 
-        raise AssertionError(
-            f"sf_unrepeated != sf_reshaped ({get_tensor_info(sf_unrepeated)=} {get_tensor_info(sf_reshaped)=})"
-        )
-    sf_unrepeated = sf_unrepeated.squeeze(1).contiguous()
+        raise AssertionError(f"sf_unrepeated != sf_reshaped ({get_tensor_info(main)=})")
+    rows = [main[:, 0, :]]
+    if tail_rows:
+        tail = sf_fp32[num_full_blocks * block_size :]
+        if not torch.all(tail[0:1] == tail):
+            from sglang.srt.debug_utils.dumper import get_tensor_info
+
+            raise AssertionError(f"sf tail not repeated ({get_tensor_info(tail)=})")
+        rows.append(tail[0:1])
+    sf_unrepeated = torch.cat(rows, dim=0).contiguous()
 
     assert sf_unrepeated.shape == (mn, k)
     return sf_unrepeated
