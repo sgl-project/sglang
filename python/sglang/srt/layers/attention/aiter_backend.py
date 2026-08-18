@@ -866,7 +866,7 @@ class AiterAttnBackend(AttentionBackend):
 
         if (
             prefer_mla_gluon_decode(
-                num_head=self.num_head, kv_cache_dtype=self.kv_cache_dtype
+                num_head=layer.tp_q_head_num, kv_cache_dtype=self.kv_cache_dtype
             )
             and max_q_len == 1
         ):

@@ -58,9 +58,7 @@ class TestMlaGluonCapability(CustomTestCase):
                 "aiter.ops": mock.MagicMock(),
                 "aiter.ops.triton": mock.MagicMock(),
                 "aiter.ops.triton.gluon": mock.MagicMock(),
-                "aiter.ops.triton.gluon.mla_gluon": mock.MagicMock(
-                    mla_gluon=fake_fn
-                ),
+                "aiter.ops.triton.gluon.mla_gluon": mock.MagicMock(mla_gluon=fake_fn),
             },
         ):
             mod.reset_mla_gluon_state_for_test()
@@ -80,9 +78,7 @@ class TestMlaGluonCapability(CustomTestCase):
         from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
         from sglang.srt.layers.attention.aiter_mla_gluon import prefer_mla_gluon_decode
 
-        self.assertFalse(
-            prefer_mla_gluon_decode(num_head=12, kv_cache_dtype=fp8_dtype)
-        )
+        self.assertFalse(prefer_mla_gluon_decode(num_head=12, kv_cache_dtype=fp8_dtype))
 
     @mock.patch.dict(os.environ, {"SGLANG_AITER_MLA_GLUON_FORCE": "1"}, clear=False)
     @mock.patch(
@@ -97,9 +93,7 @@ class TestMlaGluonCapability(CustomTestCase):
         from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
         from sglang.srt.layers.attention.aiter_mla_gluon import prefer_mla_gluon_decode
 
-        self.assertTrue(
-            prefer_mla_gluon_decode(num_head=16, kv_cache_dtype=fp8_dtype)
-        )
+        self.assertTrue(prefer_mla_gluon_decode(num_head=16, kv_cache_dtype=fp8_dtype))
 
 
 class TestMlaGluonDecodeFallback(CustomTestCase):

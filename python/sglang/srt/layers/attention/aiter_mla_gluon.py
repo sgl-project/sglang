@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 _mla_gluon_fn = None
 _mla_gluon_import_failed = False
-_capability_cache: Optional["MlaGluonCapability"] = None
+_capability_cache: Optional[MlaGluonCapability] = None
 
 
 @dataclass(frozen=True)
