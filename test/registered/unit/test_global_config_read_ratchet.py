@@ -137,6 +137,16 @@ _CONFIGURED_SIZE_CALL_SITES = {
     ("srt/speculative/frozen_kv_mtp_cuda_graph_runner.py", "configured_pp_size"): (
         "the same draft window, frozen-KV MTP"
     ),
+    ("srt/managers/data_parallel_controller.py", "configured_pp_size"): (
+        "the controller lays out its schedulers' ranks before spawning them, so "
+        "the groups it is sizing for do not exist yet"
+    ),
+    ("srt/managers/data_parallel_controller.py", "configured_attn_cp_size"): (
+        "the same pre-spawn rank arithmetic"
+    ),
+    ("srt/managers/data_parallel_controller.py", "configured_moe_dp_size"): (
+        "the same pre-spawn rank arithmetic"
+    ),
     ("srt/entrypoints/v1_loads.py", "configured_pp_size"): (
         "the /v1/loads accelerator count is arithmetic over the launch shape, "
         "reported from the tokenizer process, which holds no model groups"

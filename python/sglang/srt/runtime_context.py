@@ -1187,9 +1187,10 @@ ROLE_NAMESPACE_SETS: dict[str, frozenset[str] | None] = {
     # Reads (almost) everything by design — the model-executing process.
     "scheduler": None,
     "test": None,
-    # Audited (record-mode smokes, plain + DP-attention): the DP controller
-    # reads only the elastic-EP gate; its module's static read set agrees.
-    "dp_controller": frozenset({"exec"}),
+    # The DP controller's static read set, checked against the module: the
+    # elastic-EP gate, the load-balance method, the watchdog timeout, and the
+    # disaggregation mode.
+    "dp_controller": frozenset({"exec", "parallel", "device", "disagg"}),
     # Record-mode audit (2026-08-06, text model, /generate + /get_server_info +
     # /v1/models): reads exactly {"serving"} — the per-instance managers read
     # self.server_args by design. Still declared full, because that run did not
