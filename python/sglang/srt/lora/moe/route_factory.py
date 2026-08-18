@@ -345,14 +345,14 @@ def build_routes(
             num_local_experts=num_local_experts,
             max_loras=max_loras,
             block_size=gate_up_a_block_size,
-            # PDL edges are positional: gdc_wait pairs with whatever grid
-            # launched previously on the stream, so an armed chain is only
-            # as correct as its launch order. Under the joint builder this
-            # build is an insertion right behind the joint triple's own
-            # armed chain -- a neighbor pairing no off/on twin has measured
-            # -- so it runs fully ordered. Under the standard builder it is
-            # part of the measured sequence and takes the architecture
-            # default.
+            # Not a mechanical constraint: every build triple's armed edges
+            # are internal and its hist launches plain, so arming this build
+            # after the joint chain would be position-safe. It stays off
+            # because of the promotion rule (see routing.py): PDL ships only
+            # in compositions an off/on twin has measured, and the 2026-08
+            # twins covered standard-builder plans and the joint chain's own
+            # edges -- not this follow-on build. Promote it with one twin if
+            # its ~10us/layer of launch overlap ever matters.
             use_pdl=(
                 use_pdl if plan.route_builder is RouteBuilderFamily.STANDARD else False
             ),
@@ -396,7 +396,7 @@ def build_routes(
             num_local_experts=num_local_experts,
             max_loras=max_loras,
             block_size=block_size,
-            # Same positional-pairing rule as the gate/up-A build above.
+            # Same unmeasured-composition rule as the gate/up-A build above.
             use_pdl=(
                 use_pdl if plan.route_builder is RouteBuilderFamily.STANDARD else False
             ),
