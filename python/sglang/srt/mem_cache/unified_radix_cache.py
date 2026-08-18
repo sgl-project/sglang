@@ -2045,6 +2045,17 @@ class UnifiedRadixCache(BasePrefixCache):
         enable_storage_metrics: bool,
         extra_metric_labels: Optional[dict[str, str]],
     ) -> None:
+        # Nodes already in the tree were built with hashing off. Fill them in as
+        # storage turns on: a node hashed against an unhashed parent restarts the
+        # page hash chain mid-sequence, so its L3 keys would cover only a suffix of
+        # the prefix they claim to represent.
+        if enable_storage and not self.enable_storage:
+            filled = self.tree_core.backfill_missing_hash_values()
+            if filled:
+                logger.info(
+                    "Hashed %d radix nodes that predate the storage backend.", filled
+                )
+
         self.enable_storage = enable_storage
         self.prefetch_threshold = prefetch_threshold
         self.prefetch_timeout_base = prefetch_timeout_base
