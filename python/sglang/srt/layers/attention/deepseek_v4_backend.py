@@ -588,6 +588,7 @@ class DeepseekV4AttnBackend(
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
+        self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1000,6 +1001,13 @@ class DeepseekV4AttnBackend(
     ) -> DSV4Metadata:
         batch_size = len(seq_lens)
         num_tokens = num_tokens_per_req * batch_size
+        swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(out_cache_loc)
+        if swa_out_cache_loc is None and out_cache_loc is not None:
+            # Eager-only miss (no graph state / oversized batch): translate once
+            # per step instead of per layer at store time.
+            swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                out_cache_loc
+            ).to(torch.int32)
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
 
@@ -1022,10 +1030,35 @@ class DeepseekV4AttnBackend(
             need_compress=False,
             is_prefill=True,
         )
+        if swa_out_cache_loc is not None:
+            # Captures store_cache's cached path instead of a per-layer
+            # in-graph mapping translate.
+            core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
         return DSV4Metadata(
             core_attn_metadata=core_attn_metadata,
             indexer_metadata=None,
         )
+
+    def _fill_cuda_graph_swa_out_cache_loc(
+        self, out_cache_loc: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        # None (buffer absent / too small) is an eager-only miss: capture and
+        # replay always fit the pre-sized buffer.
+        buf = self.cuda_graph_swa_out_cache_loc
+        if (
+            buf is None
+            or out_cache_loc is None
+            or out_cache_loc.shape[0] > buf.shape[0]
+        ):
+            return None
+        n = out_cache_loc.shape[0]
+        buf[n:].zero_()
+        buf[:n].copy_(
+            self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
+                torch.int32
+            )
+        )
+        return buf[:n]
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # Upgrade Raw->Full so the c4/c128 compress + core_attn + indexer
@@ -1446,6 +1479,12 @@ class DeepseekV4AttnBackend(
         self.draft_extend_num_tokens_per_req = (
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
+        if self.is_draft_runner:
+            # Draft-extend SWA write-target buffer; bound as a [:num_tokens]
+            # view and refilled outside the graph each step.
+            self.cuda_graph_swa_out_cache_loc = torch.zeros(
+                max_num_tokens, dtype=torch.int32, device=self.device
+            )
         # Verify metadata never extracts the mask. No skip_prefill notion here.
         self._verify_mask = maybe_create_verify_mask(
             is_draft_runner=self.is_draft_runner,
@@ -1502,15 +1541,12 @@ class DeepseekV4AttnBackend(
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Resolve the SWA KV-store write target for the current forward.
 
-        Fast path: the per-forward value cached by init_forward_metadata_in_graph
-        (recorded inside cuda graphs, so replay re-reads live buffers). Fallback:
-        translate at store time, matching the pre-cache behavior, for paths that
-        never run the in-graph init — eager idle (forward_idle skips attn init),
-        runners that only run the out-graph prep (e.g.
-        EAGLEDraftExtendCudaGraphRunner) — or whose batch was re-padded after
-        init (shape mismatch). Idle always falls back: its metadata is absent or
-        left over from a previous forward, and translating the zero-padded
-        out_cache_loc writes to the dummy slot.
+        Prefer the value cached by the metadata init: in-graph for
+        decode/verify, the hoisted cuda_graph_swa_out_cache_loc buffer for
+        draft-extend. Translate at store time when nothing matching is cached
+        (paths that skip the init, or a batch re-padded after init). Idle
+        always falls back: its metadata may be stale, and
+        translating the zero-padded out_cache_loc writes to the dummy slot.
         """
         out_cache_loc = forward_batch.out_cache_loc
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
