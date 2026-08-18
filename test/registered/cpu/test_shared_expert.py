@@ -2,8 +2,11 @@ import itertools
 import math
 import unittest
 
+import sgl_kernel  # noqa: F401
 import torch
-from utils import (
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.cpu_test_utils import (
     BLOCK_K,
     BLOCK_N,
     factor_for_scale,
@@ -15,8 +18,6 @@ from utils import (
     torch_naive_moe,
     torch_w8a8_per_column_moe,
 )
-
-from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-b-test-cpu")

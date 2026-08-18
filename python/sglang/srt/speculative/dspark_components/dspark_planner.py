@@ -147,7 +147,6 @@ class DSparkVerifyPlanner:
                     f"draft checkpoint that includes the confidence head, or run "
                     f"SGLANG_RAGGED_VERIFY_MODE=static."
                 )
-            self._require_prep_in_cuda_graph()
             sps_table = build_sps_cost_table(
                 server_args=self.server_args,
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
@@ -207,16 +206,6 @@ class DSparkVerifyPlanner:
                         "budget degenerates to verify-all (zero scheduling gain). "
                         "Pass a profiled --speculative-dspark-sps-table-path."
                     )
-
-    def _require_prep_in_cuda_graph(self) -> None:
-        if not envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
-            raise ValueError(
-                f"DSpark ragged-verify mode {self._ragged_verify_mode.value!r} "
-                f"requires SGLANG_PREP_IN_CUDA_GRAPH=1 (the captured-graph prepare "
-                f"path). It is currently disabled, which would put per-step "
-                f"verify_lens_cpu host reads on the critical path. Set "
-                f"SGLANG_PREP_IN_CUDA_GRAPH=1 or run SGLANG_RAGGED_VERIFY_MODE=static."
-            )
 
     @property
     def carries_confidence(self) -> bool:
@@ -1139,6 +1128,6 @@ def build_sps_cost_table(
         return load_sps_table_from_path(sps_table_path)
     max_batch_tokens = max(
         1,
-        int(server_args.max_running_requests or 1) * verify_num_draft_tokens,
+        int(get_schedule().max_running_requests or 1) * verify_num_draft_tokens,
     )
     return build_uninitialized_sps_table(max_batch_tokens=max_batch_tokens)

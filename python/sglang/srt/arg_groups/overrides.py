@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import json
 import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -288,6 +289,42 @@ def attention_backends_of(cfg: Any) -> tuple:
         else cfg.attention_backend
     )
     return prefill, decode
+
+
+def modelexpress_transport_of(cfg: Any) -> str:
+    """The modelexpress transport a config-shaped object asks for.
+
+    ``modelexpress_config`` is a JSON string (or an already-parsed dict) rather
+    than a leaf of its own; this is the shared parse for the transfer-engine
+    gate (`remote_instance_transfer_engine_of`) and any future bag reader.
+    ``ServerArgs.modelexpress_transport`` keeps its own instance-cached parse
+    (`_parsed_modelexpress_config`) -- same rule, cached seed-side."""
+    raw = cfg.modelexpress_config
+    if raw is None:
+        parsed = {}
+    elif isinstance(raw, str):
+        parsed = json.loads(raw)
+    else:
+        parsed = raw
+    return parsed.get("transport", "nixl")
+
+
+def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> bool:
+    """Whether remote-instance weight loading runs over the transfer engine.
+
+    ``load_format`` overrides the config's: a draft runner loading under
+    ``--speculative-draft-load-format`` needs its own transfer engine. Every
+    input is a ``model`` leaf, so this serves both the pre-publish member and
+    the post-publish accessor."""
+    if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
+        return True
+    if (load_format or cfg.load_format) != "remote_instance":
+        return False
+    backend = cfg.remote_instance_weight_loader_backend
+    return backend == "transfer_engine" or (
+        backend == "modelexpress"
+        and modelexpress_transport_of(cfg) == "transfer_engine"
+    )
 
 
 def mamba_extra_buffer_of(cfg: Any) -> bool:
@@ -2368,13 +2405,53 @@ def _data_parallelism_defaults(view: Any) -> dict:
 
 
 @register_post_process
+def _tp_lm_head_all_to_all_default(view: Any) -> dict:
+    """Enable the TP LM-head all-to-all path only for pure-DP decode nodes.
+
+    Prefill-only and colocated nodes keep the feature disabled by default: the
+    LM-head weight layout is fixed at load time, so enabling the TP path would
+    also move their long prefills away from the communication-free DP LM head.
+    An explicit CLI value always wins.
+    """
+    if view.enable_tp_lm_head_all_to_all is not None:
+        return {}
+
+    enable = (
+        view.disaggregation_mode == "decode"
+        and view.enable_dp_attention
+        and view.dp_size > 1
+        and view.tp_size == view.dp_size
+        and view.attn_cp_size == 1
+        and not view.enable_dp_lm_head
+    )
+    return {"enable_tp_lm_head_all_to_all": enable}
+
+
+@register_post_process
 def _dp_lm_head_validation(view: Any) -> dict:
     """Read-only validation pass: dp-attention is a prerequisite for the
-    dp LM head. Reads the mid-resolution values through the view."""
+    dp LM head and the TP LM-head all-to-all path. Reads the mid-resolution
+    values through the view."""
     if view.enable_dp_lm_head:
         assert (
             view.enable_dp_attention
         ), "Please enable dp attention when setting enable_dp_lm_head. "
+    if view.enable_tp_lm_head_all_to_all:
+        assert view.enable_dp_attention, (
+            "Please enable dp attention when setting " "enable_tp_lm_head_all_to_all."
+        )
+        assert not view.enable_dp_lm_head, (
+            "--enable-tp-lm-head-all-to-all uses a TP-sharded LM head and is "
+            "incompatible with --enable-dp-lm-head."
+        )
+        assert view.tp_size == view.dp_size, (
+            "--enable-tp-lm-head-all-to-all currently requires tp_size == "
+            f"dp_size, got tp_size={view.tp_size}, dp_size={view.dp_size}."
+        )
+        assert view.attn_cp_size == 1, (
+            "--enable-tp-lm-head-all-to-all currently requires "
+            f"attn_cp_size == 1, got {view.attn_cp_size}."
+        )
     return {}
 
 
@@ -2396,11 +2473,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         elif moe_runner_backend not in [
             "flashinfer_trtllm",
             "flashinfer_trtllm_routed",
+            "flashinfer_cutedsl",
         ]:
             raise ValueError(
                 "--quantization nvfp4_online supports only "
                 "--moe-runner-backend flashinfer_trtllm or "
-                "flashinfer_trtllm_routed."
+                "flashinfer_trtllm_routed, or flashinfer_cutedsl."
             )
     # Ascend runs MXFP8 MoE on the Ascend runner; every backend selected below is
     # CUDA/ROCm-only. Forcing one here would not merely pick the wrong runner:
@@ -2484,20 +2562,6 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
     return {}
 
 
-def _cutlass_moe_env_override(view: Any) -> dict:
-
-    if envs.SGLANG_CUTLASS_MOE.get():
-        logger.warning(
-            "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
-        )
-        assert view.quantization in [
-            "fp8",
-            "mxfp8",
-        ], "cutlass MoE is only supported with fp8/mxfp8 quantization"
-        return {"moe_runner_backend": "cutlass"}
-    return {}
-
-
 # Every A2A backend that forces expert parallelism to span the TP group.
 _A2A_EP_SPANNING_BACKENDS = frozenset(
     {
@@ -2523,12 +2587,6 @@ def _a2a_backend_overrides(view: Any) -> dict:
             "requires the DeepEP or MegaMOE backend."
         )
         moe_a2a_backend = "deepep"
-    if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get() and moe_a2a_backend != "megamoe":
-        moe_a2a_backend = "megamoe"
-        logger.info(
-            "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE is set, "
-            "auto-configuring --moe-a2a-backend megamoe."
-        )
     if moe_a2a_backend != view.moe_a2a_backend:
         return {"moe_a2a_backend": moe_a2a_backend}
     return {}
