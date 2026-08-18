@@ -325,12 +325,20 @@ class NpuIpcTensorTransportProxy:
         return self._sync_buffer
 
     @property
+    def sync_buffer_data(self):
+        if not hasattr(self, "_sync_buffer_data"):
+            shm = self.sync_buffer
+            if shm is None:
+                self._sync_buffer_data = None
+            else:
+                shape = self.sync_data_meta["shape"]
+                dtype = self.sync_data_meta["dtype"]
+                self._sync_buffer_data = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+        return self._sync_buffer_data
+
+    @property
     def get_sync_buffer_data(self):
-        if not self.sync_buffer:
-            return None
-        shape = self.sync_data_meta["shape"]
-        dtype = self.sync_data_meta["dtype"]
-        return np.ndarray(shape, dtype=dtype, buffer=self.sync_buffer.buf)
+        return self.sync_buffer_data
 
     def close_shm(self):
         if hasattr(self, "_sync_flag") and self._sync_flag:
@@ -388,41 +396,39 @@ class NpuIpcTensorTransportProxy:
 
         return slice_tensor, target_device, None, None
 
+    def acknowledge_consumption(self, consumer_count: int = 1):
+        self._acknowledge_consumption(consumer_count)
+
     def _acknowledge_consumption(self, consumer_count: int = 1):
+        if self._consumer_acknowledged:
+            return
         try:
             ipc_extra = self.proxy_state.get("ipc_extra")
             sync_flag_meta = ipc_extra.get("sync_flag_meta") if ipc_extra else None
             if sync_flag_meta is None:
-                sync_data = self.get_sync_buffer_data
+                sync_data = self.sync_buffer_data
                 if sync_data is not None:
                     sync_data += consumer_count
                     self._consumer_acknowledged = True
             else:
-                shm = shared_memory.SharedMemory(name=sync_flag_meta["handle"])
-                try:
-                    buffer_wrapper = np.ndarray(
-                        1, dtype=sync_flag_meta["dtype"], buffer=shm.buf
-                    )
-                    buffer_wrapper += consumer_count
+                sync_data = self.sync_buffer_data
+                if sync_data is not None:
+                    sync_data += consumer_count
                     self._consumer_acknowledged = True
-                finally:
-                    shm.close()
         except Exception:
             pass
 
     def _copy_slice_tensor_to_target(
         self, slice_tensor, target_device, recons_shape, recons_dtype, consumer_count
     ):
-        reconstructed_tensor = torch.zeros(
+        reconstructed_tensor = torch.empty(
             recons_shape, dtype=recons_dtype, device=target_device
+        ).contiguous()
+        slice_int8 = slice_tensor.view(torch.int8).reshape(-1)
+        total_elements = slice_int8.numel()
+        reconstructed_tensor.view(torch.int8).reshape(-1)[:total_elements].copy_(
+            slice_int8, non_blocking=True
         )
-        start = 0
-        for i in range(consumer_count):
-            end = start + slice_tensor.numel()
-            reconstructed_tensor.view(torch.int8).view(-1)[start:end] = (
-                slice_tensor.view(torch.int8).view(-1)
-            )
-            start = end
         return reconstructed_tensor
 
     def reconstruct_on_target_device(self, rebuild_device_idx, consumer_count: int = 1):
