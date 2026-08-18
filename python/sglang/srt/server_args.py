@@ -3296,12 +3296,13 @@ class ServerArgs:
     # Model weight update and weight loading
     # -------------------------------------------------------------------------
     startup_weight_load_mode: A[
-        Literal["serial", "overlap"],
+        Literal["serial", "overlap", "auto"],
         (
             "Control startup weight loading relative to CUDA graph capture. "
             "'serial' preserves the existing startup order; 'overlap' stages "
             "checkpoint files while CUDA graphs are captured and commits the "
-            "real weights afterward."
+            "real weights afterward; 'auto' uses overlap for supported "
+            "configurations and otherwise preserves the serial path."
         ),
         NS("model"),
     ] = "serial"
@@ -6737,9 +6738,7 @@ class ServerArgs:
                     "KDA, as the linear-attn decode backend; got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
-            from sglang.srt.arg_groups.overrides import (
-                mamba_extra_buffer_of,
-            )
+            from sglang.srt.arg_groups.overrides import mamba_extra_buffer_of
 
             if mamba_extra_buffer_of(resolved_view(self)):
                 raise ValueError(
@@ -9599,6 +9598,10 @@ class ServerArgs:
     def is_startup_weight_load_overlap(self) -> bool:
         return self.startup_weight_load_mode == "overlap"
 
+    @property
+    def should_attempt_startup_weight_load_overlap(self) -> bool:
+        return self.startup_weight_load_mode != "serial"
+
     def ssl_verify(self):
         """Return the value for the requests library's verify= parameter.
 
@@ -9687,9 +9690,7 @@ class ServerArgs:
     def _resolved_attention_backends(self):
         """Mid-resolution (prefill, decode) backends: reads through the pass
         view so declared fields resolve from the declaration stash."""
-        from sglang.srt.arg_groups.overrides import (
-            attention_backends_of,
-        )
+        from sglang.srt.arg_groups.overrides import attention_backends_of
 
         return attention_backends_of(resolved_view(self))
 

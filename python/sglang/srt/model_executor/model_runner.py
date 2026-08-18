@@ -1172,12 +1172,12 @@ class ModelRunner:
 
         after_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         self.weight_load_mem_usage = before_avail_memory - after_avail_memory
-        self.weight_load_time = time.perf_counter() - tic_total
         # Get quantization config from ModelConfig
         # This handles both config.json (standard) and hf_quant_config.json (ModelOpt)
         quant_str = self.model_config.get_quantization_config_log_str()
 
         if self.startup_weight_load is None:
+            self.weight_load_time = time.perf_counter() - tic_total
             logger.info(
                 f"Load weight end. "
                 f"elapsed={self.weight_load_time:.2f} s, "
@@ -1234,7 +1234,11 @@ class ModelRunner:
         the existing startup contract for load failures.
         """
         assert self.startup_weight_load is not None
-        self.startup_weight_load.finalize()
+        timings = self.startup_weight_load.finalize()
+        # Attribute only weight-specific work to the legacy public phase. The
+        # overlap critical path remains visible in scheduler_e2e and the
+        # startup-weight-load phase log.
+        self.weight_load_time = timings.weight_load_seconds
         dist_barrier_after_load(
             elastic_ep_backend=get_exec().moe.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
