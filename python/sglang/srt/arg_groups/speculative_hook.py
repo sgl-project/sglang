@@ -728,11 +728,16 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             and server_args.speculative_num_draft_tokens is None
         )
 
-        (
-            server_args.speculative_num_steps,
-            server_args.speculative_eagle_topk,
-            server_args.speculative_num_draft_tokens,
-        ) = _auto_choose_speculative_params(server_args, model_arch)
+        steps, topk, draft_tokens = _auto_choose_speculative_params(
+            server_args, model_arch
+        )
+        declare_resolution(
+            server_args,
+            "_handle_eagle_family.auto_params",
+            speculative_num_steps=steps,
+            speculative_eagle_topk=topk,
+            speculative_num_draft_tokens=draft_tokens,
+        )
 
     if "trtllm_mha" in attention_backends_of(resolved_view(server_args)):
         if server_args.speculative_eagle_topk > 1:
