@@ -11,6 +11,93 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def conv_state_track_copy_kernel(
+    conv_states_ptr,
+    src_indices_ptr,
+    dst_indices_ptr,
+    step_indices_ptr,
+    req_stride: tl.constexpr,
+    layer_stride: tl.constexpr,
+    window_stride: tl.constexpr,
+    dim_stride: tl.constexpr,
+    conv_window_size: tl.constexpr,
+    num_dims: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Copy valid speculative conv states to their radix-cache track slots."""
+    pid_req = tl.program_id(0)
+    pid_layer = tl.program_id(1).to(tl.int64)
+
+    step_idx = tl.load(step_indices_ptr + pid_req)
+    if step_idx < 0:
+        return
+
+    # Cache slots can have a large stride, so keep scalar address arithmetic
+    # in int64 even though the index tensors themselves are int32.
+    src_idx = tl.load(src_indices_ptr + pid_req).to(tl.int64)
+    dst_idx = tl.load(dst_indices_ptr + pid_req).to(tl.int64)
+    dim_offsets = tl.arange(0, BLOCK_SIZE)
+    dim_mask = dim_offsets < num_dims
+
+    src_base = conv_states_ptr + pid_layer * layer_stride + src_idx * req_stride
+    dst_base = conv_states_ptr + pid_layer * layer_stride + dst_idx * req_stride
+    for window_idx in range(conv_window_size):
+        window_offset = window_idx * window_stride
+        src_ptrs = src_base + window_offset + dim_offsets * dim_stride
+        dst_ptrs = dst_base + window_offset + dim_offsets * dim_stride
+        values = tl.load(src_ptrs, mask=dim_mask)
+        tl.store(dst_ptrs, values, mask=dim_mask)
+
+
+def copy_conv_state_to_track(
+    conv_states: torch.Tensor,
+    src_indices: torch.Tensor,
+    dst_indices: torch.Tensor,
+    step_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Fixed-shape replacement for boolean-indexed radix track copies.
+
+    ``step_indices < 0`` is handled inside the kernel, so the launch never
+    materializes a dynamic boolean-index result or invokes ``NonZero``.
+    """
+    if conv_states.ndim != 4:
+        raise ValueError(f"conv_states must be 4D, got {conv_states.ndim}D")
+    if src_indices.ndim != 1 or dst_indices.ndim != 1 or step_indices.ndim != 1:
+        raise ValueError("src_indices, dst_indices, and step_indices must be 1D")
+    if not (
+        src_indices.shape[0] == dst_indices.shape[0] == step_indices.shape[0]
+    ):
+        raise ValueError("src_indices, dst_indices, and step_indices must match")
+    if src_indices.shape[0] == 0:
+        return conv_states
+    if any(
+        indices.dtype != torch.int32
+        for indices in (src_indices, dst_indices, step_indices)
+    ):
+        raise ValueError("src_indices, dst_indices, and step_indices must be int32")
+
+    src_indices = src_indices.contiguous()
+    dst_indices = dst_indices.contiguous()
+    step_indices = step_indices.contiguous()
+    num_layers, _, conv_window_size, num_dims = conv_states.shape
+    grid = (src_indices.shape[0], num_layers)
+    conv_state_track_copy_kernel[grid](
+        conv_states,
+        src_indices,
+        dst_indices,
+        step_indices,
+        req_stride=conv_states.stride(1),
+        layer_stride=conv_states.stride(0),
+        window_stride=conv_states.stride(2),
+        dim_stride=conv_states.stride(3),
+        conv_window_size=conv_window_size,
+        num_dims=num_dims,
+        BLOCK_SIZE=triton.next_power_of_2(num_dims),
+    )
+    return conv_states
+
+
 def _require_entry_contiguous_dst(
     dst: torch.Tensor, entry_start_dim: int, fn_name: str
 ) -> None:

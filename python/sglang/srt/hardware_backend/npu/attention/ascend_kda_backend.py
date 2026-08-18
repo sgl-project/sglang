@@ -72,7 +72,7 @@ class _AscendKDAExtendKernel:
             cu_seqlens=query_start_loc,
             output_dtype=k.dtype,
         )
-        w, u, gated_k = recompute_w_u_fwd_npu(
+        w, u, _, gated_k = recompute_w_u_fwd_npu(
             k=k,
             v=v,
             beta=beta,
@@ -526,6 +526,9 @@ class AscendKDAHybridLinearAttnBackend:
                 from sgl_kernel_npu.mamba.speculative_state_scatter import (
                     speculative_state_scatter_npu,
                 )
+                from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+                    copy_conv_state_to_track,
+                )
 
                 del req_pool_indices
                 request_number = last_correct_step_indices.shape[0]
@@ -599,12 +602,12 @@ class AscendKDAHybridLinearAttnBackend:
                             mamba_steps_to_track,
                         )
                     else:
-                        track_mask = mamba_steps_to_track >= 0
-                        track_indices = mamba_track_indices[track_mask]
-                        if track_indices.numel() > 0:
-                            conv_states[:, track_indices] = conv_states[
-                                :, dst_indices_tensor[track_mask]
-                            ]
+                        copy_conv_state_to_track(
+                            conv_states,
+                            dst_indices_tensor,
+                            mamba_track_indices,
+                            mamba_steps_to_track,
+                        )
 
                 if not has_conv_snapshots:
                     if dst_indices_tensor.numel() > 0:
