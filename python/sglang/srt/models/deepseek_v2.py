@@ -773,6 +773,7 @@ class DeepseekV2MoE(nn.Module):
                     self.shared_experts.gate_up_proj.quant_method,
                     ModelOptFp4LinearMethod,
                 )
+                and self.shared_experts.gate_up_proj.quant_method.quant_mode == "w4a4"
                 and isinstance(
                     self.shared_experts.down_proj.quant_method,
                     ModelOptFp4LinearMethod,
