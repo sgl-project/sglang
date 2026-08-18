@@ -21,10 +21,9 @@ Registry: nightly-perf-8-gpu-mi35x-kimi-k3 suite
 
 import os
 import unittest
-from typing import List
 
 from sglang.test.ci.ci_register import register_amd_ci
-from sglang.test.nightly_bench_utils import BenchmarkResult
+from sglang.test.nightly_bench_utils import generate_simple_markdown_report
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
@@ -34,40 +33,12 @@ register_amd_ci(est_time=9000, suite="nightly-perf-8-gpu-mi35x-kimi-k3", nightly
 
 KIMI_K3_MODEL_PATH = os.environ.get("KIMI_K3_MODEL_PATH", "moonshotai/Kimi-K3")
 RESULT_DIR = "performance_results_kimi_k3_mi35x"
-# Matched to --cuda-graph-max-bs-decode; capturing decode graphs above the
-# largest batch we time would only burn capture time across K3's 93 attention
-# + 92 MoE layers.
+# 64 is what the ~53 GB per GPU left after the MXFP4 weights admits, which is
+# also why the accuracy test caps concurrency there. The largest batch timed,
+# --max-running-requests and --cuda-graph-max-bs-decode are then held equal to
+# it, so capture across K3's 93 attention + 92 MoE layers is not spent on
+# batches the server would never admit.
 MAX_BATCH_SIZE = 64
-
-
-def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Markdown table without trace or cost columns.
-
-    Skips the first result when it is a warmup run (duplicate batch_size).
-    """
-    model_header = results[0].model_path
-    if results[0].run_name and results[0].run_name != "default":
-        model_header += f" ({results[0].run_name})"
-
-    gpu_config = os.getenv("GPU_CONFIG", "MI35x")
-    if gpu_config:
-        model_header += f" [{gpu_config}]"
-
-    summary = f"### {model_header}\n"
-    summary += "| batch size | input len | latency (s) | input throughput (tok/s) | output throughput (tok/s) | ITL (ms) |\n"
-    summary += "| ---------- | --------- | ----------- | ------------------------ | ------------------------- | -------- |\n"
-
-    report_results = (
-        results[1:]
-        if len(results) > 1 and results[0].batch_size == results[1].batch_size
-        else results
-    )
-
-    for result in report_results:
-        itl = 1 / (result.output_throughput / result.batch_size) * 1000
-        summary += f"| {result.batch_size} | {result.input_len} | {result.latency:.2f} | {result.input_throughput:.2f} | {result.output_throughput:.2f} | {itl:.2f} |\n"
-
-    return summary
 
 
 class TestNightlyKimiK3PerformanceMI35x(unittest.TestCase):
@@ -76,7 +47,10 @@ class TestNightlyKimiK3PerformanceMI35x(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.batch_sizes = [1, 8, 16, MAX_BATCH_SIZE]
+        # The leading 1 is repeated so the report helper drops it as a warmup
+        # run. The perf step launches its own server, so the first request pays
+        # for warmup, and batch 1 is the row that distorts most.
+        cls.batch_sizes = [1, 1, 8, 16, MAX_BATCH_SIZE]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "4096"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "512"))
 
@@ -144,7 +118,8 @@ class TestNightlyKimiK3PerformanceMI35x(unittest.TestCase):
 
             if results:
                 self.runner.full_report += (
-                    generate_simple_markdown_report(results) + "\n"
+                    generate_simple_markdown_report(results, default_gpu_config="MI35x")
+                    + "\n"
                 )
 
             self.assertTrue(
