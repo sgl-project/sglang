@@ -707,7 +707,7 @@ class MiniMaxH3Attention(nn.Module):
                 get_attn_backend(
                     self.head_dim,
                     x.dtype,
-                    supported_attention_backends=self._supported_attention_backends,
+                    attention_requirements=AttentionRequirements(packed_varlen=True),
                 )
             )
         bounds = (
@@ -1542,7 +1542,6 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     # heads) with bf16 blocks; FSDP must gather in each parameter's own dtype
     _fsdp_mixed_dtype_params = True
     mps_stream_non_layer_weights = True
-    _supported_attention_backends = _ARCH_DEFAULTS._supported_attention_backends
     _compile_conditions = [is_block]
     param_names_mapping = _ARCH_DEFAULTS.param_names_mapping
     reverse_param_names_mapping = _ARCH_DEFAULTS.reverse_param_names_mapping
