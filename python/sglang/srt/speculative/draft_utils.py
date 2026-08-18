@@ -549,4 +549,10 @@ class DraftBackendFactory:
             create_kvarn_backend,
         )
 
-        return ("kvarn", create_kvarn_backend(self.draft_model_runner))
+        backend = create_kvarn_backend(self.draft_model_runner)
+        # Override layer mapping for MTP draft (same as decode backend).
+        if getattr(backend, "full_attn_layer_ids", None) is not None:
+            backend.full_attn_layer_ids = [0]
+            backend.num_layers = 1
+            backend._layer_id_to_idx = {0: 0}
+        return ("kvarn", backend)
