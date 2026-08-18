@@ -212,8 +212,19 @@ find_latest_image() {
   esac
 }
 
-# Pull and run the latest image
-IMAGE=$(find_latest_image "${GPU_ARCH}")
+# TEST-ONLY (branch bingxche/pr32754-fullflow): pin every job to the images that
+# release-docker-amd*-nightly built from this branch instead of the published nightly,
+# so the suites run against PR #32754's own Dockerfile output.
+# Revert before merging anything from this branch.
+TEST_IMAGE_REPO="${TEST_IMAGE_REPO:-}"
+TEST_IMAGE_VERSION="${TEST_IMAGE_VERSION:-}"
+TEST_IMAGE_DATE="${TEST_IMAGE_DATE:-}"
+if [[ -n "${TEST_IMAGE_REPO}" ]]; then
+  IMAGE="${TEST_IMAGE_REPO}:${TEST_IMAGE_VERSION}-${ROCM_VERSION}-${GPU_ARCH}-${TEST_IMAGE_DATE}"
+  echo "[pr32754-fullflow] Pinning image to ${IMAGE}"
+else
+  IMAGE=$(find_latest_image "${GPU_ARCH}")
+fi
 # Try the local docker registry first (avoids Docker Hub rate limits and is
 # faster on the LAN); if that fails for any reason, fall back to the
 # public registry with exponential-backoff retries. Capture stderr so the

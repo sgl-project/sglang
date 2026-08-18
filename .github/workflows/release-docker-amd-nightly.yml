@@ -62,10 +62,10 @@ jobs:
       - name: Login to Docker Hub (AMD)
         uses: docker/login-action@v2
         with:
-          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_AMD_TEST_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TEST_TOKEN }}
 
-      - name: Build and Push to rocm/sgl-dev
+      - name: Build and Push to bingxche/sgl-test
         run: |
           version=${{ steps.version.outputs.version }}
           pretend_version=${{ steps.version.outputs.pretend_version }}
@@ -87,8 +87,8 @@ jobs:
           # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
           # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
           # to Canonical's archive.ubuntu.com mirror IPs from the amd-docker-scale runner.
-          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg ENABLE_NIXL=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
-          docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
+          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg ENABLE_NIXL=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t bingxche/sgl-test:${tag}-${{ env.DATE }} --no-cache
+          docker push bingxche/sgl-test:${tag}-${{ env.DATE }}
 
       # Persist the tag right after rocm/sgl-dev push succeeds so the local
       # registry mirror can run even if a later step in this job (lmsys push)
@@ -105,17 +105,6 @@ jobs:
           name: image-tag-${{ matrix.gpu_arch }}
           path: image-tag/${{ matrix.gpu_arch }}.txt
           retention-days: 1
-
-      - name: Login to Docker Hub (lmsys)
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Push to lmsysorg/sglang-rocm
-        run: |
-          docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
-          docker push lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
 
   # Mirror the freshly published rocm/sgl-dev image to the in-network Docker
   # registry so AMD CI runners can pull without hitting Docker Hub rate limits.
