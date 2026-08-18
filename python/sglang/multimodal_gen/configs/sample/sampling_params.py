@@ -180,6 +180,16 @@ class SamplingParams:
     width: int | None = None
     fps: int = 24
 
+    # LTX-2.5 duration head. Ignored by other models, so the flags stay
+    # universally accepted.
+    # Decode with the diffusion decoder instead of the VAE one. Ignored by
+    # models that ship no such decoder.
+    use_diffusion_decoder: bool = False
+
+    auto_duration: bool = False
+    auto_duration_min_seconds: float = 1.0
+    auto_duration_max_seconds: float = 20.0
+
     # Resolution validation
     supported_resolutions: list[tuple[int, int]] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
@@ -200,6 +210,11 @@ class SamplingParams:
     progressive_mode: str = "fullres"
     progressive_levels: int = 1
     progressive_delta: float = 0.01
+
+    # LongCat-Image parameters
+    enable_cfg_renorm: bool = False
+    cfg_renorm_min: float = 0.0
+    enable_prompt_rewrite: bool = False
 
     # TeaCache parameters
     enable_teacache: bool = False
@@ -880,6 +895,11 @@ class SamplingParams:
             return parser.add_argument(*name_or_flags, **kwargs)
 
         add_argument("--data-type", type=str, nargs="+")
+        # Predict the shot length from the caption, overriding `--num-frames`.
+        add_argument("--use-diffusion-decoder", action="store_true")
+        add_argument("--auto-duration", action="store_true")
+        add_argument("--auto-duration-min-seconds", type=float)
+        add_argument("--auto-duration-max-seconds", type=float)
         add_argument(
             "--num-frames-round-down",
             action="store_true",
@@ -950,6 +970,23 @@ class SamplingParams:
             dest="spectrum_tau_num_steps",
             type=int,
             help="Spectrum tau normalization horizon.",
+        )
+
+        # LongCat-Image parameters
+        add_argument(
+            "--enable-cfg-renorm",
+            action=StoreBoolean,
+            help="Enable CFG renormalization for LongCat-Image (default: false).",
+        )
+        add_argument(
+            "--cfg-renorm-min",
+            type=float,
+            help="Minimum CFG renorm scale for LongCat-Image (default: 0.0).",
+        )
+        add_argument(
+            "--enable-prompt-rewrite",
+            action=StoreBoolean,
+            help="Enable prompt rewriting via Qwen2.5-VL before encoding for LongCat-Image (default: false).",
         )
 
         # profiling

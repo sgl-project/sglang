@@ -16,7 +16,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_align, ceil_div, get_available_gpu_memory, is_musa
 
@@ -67,9 +67,10 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
         #   8192, 9008, ... 16384 (step 16)
         # Totally 1024 + 1024 / 2 + 2048 / 4 + 4096 / 8 + 8192 / 16 = 3072 kernels
         next_m, sample_step = 1024, 2
+        chunked_prefill_size = get_schedule().chunked_prefill_size
         max_prefill_bs = (
-            min(server_args.chunked_prefill_size, 32 * 1024)
-            if server_args.chunked_prefill_size >= 1
+            min(chunked_prefill_size, 32 * 1024)
+            if chunked_prefill_size >= 1
             else 16 * 1024
         )
         while next_m < max_prefill_bs:
@@ -81,10 +82,11 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     else:
         # When fast warmup isn't enabled, generate m_max and compile all the covered Ms.
         m_max = 1024 * 16
-        if server_args.chunked_prefill_size < 1:
+        chunked_prefill_size = get_schedule().chunked_prefill_size
+        if chunked_prefill_size < 1:
             m_max = 1024 * 64
-        elif server_args.chunked_prefill_size > 8192:
-            m_max = server_args.chunked_prefill_size * 2
+        elif chunked_prefill_size > 8192:
+            m_max = chunked_prefill_size * 2
         m_max = min(1024 * 128, m_max)
         _BUILTIN_M_LIST += list(range(1, m_max + 1))
 
@@ -174,7 +176,9 @@ def _compile_deep_gemm_one_type_all(
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
         # Here the precompilation is only run on the first rank, so gpu_id should be 0
-        memory_budget = get_available_gpu_memory(device="cuda", gpu_id=0)
+        memory_budget = get_available_gpu_memory(
+            device="cuda", gpu_id=torch.cuda.current_device()
+        )
 
         # If the memory budget is less memory requirement, we need to reduce max_m to avoid out of memory, which might further cause hanging during warmup
         max_m = max(m_list)
@@ -191,7 +195,7 @@ def _compile_deep_gemm_one_type_all(
                     kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
                 )
                 > memory_budget
-                and max_m > 4096
+                and max_m > 2048
             ):
                 max_m = max_m // 2
             logger.warning(

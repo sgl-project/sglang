@@ -172,6 +172,7 @@ template <
     typename CacheDType,
     bool kRoundNormBeforeRope,
     bool kPackKV,
+    bool kCacheHasFullWidth,
     typename IdType>
 __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_constant__ params) {
   using namespace device;
@@ -185,7 +186,8 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
   constexpr uint32_t kRotaryLanes = kRopeDim / kElemsPerThread;
   constexpr uint32_t kHalfRotaryLanes = kRotaryLanes / 2;
   constexpr uint32_t kActiveMask = active_mask<kRotaryLanes>();
-  constexpr int64_t kCosSinStrideBytes = kRopeDim * sizeof(CacheDType);
+  constexpr int64_t kCacheRotaryDim = kCacheHasFullWidth ? 2 * kRopeDim : kRopeDim;
+  constexpr int64_t kCosSinStrideBytes = kCacheRotaryDim * sizeof(CacheDType);
 
   static_assert(kElemsPerThread % 2 == 0, "Each lane must own an even number of elements");
   static_assert(kRopeDim > 0 && kRopeDim <= kHeadDim, "Invalid rope dimension");
@@ -285,7 +287,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
       auto output_vec = norm::apply_norm_warp<kHeadDim>(input_vec, weight_vec, eps);
       const auto pos = static_cast<int64_t>(static_cast<const IdType*>(positions)[token_id]);
       const auto cos_ptr = static_cast<const CacheDType*>(pointer::offset(cos_sin_cache_ptr, pos * kCosSinStrideBytes));
-      const auto sin_ptr = cos_ptr + kRopeDim / 2;
+      const auto sin_ptr = cos_ptr + (kCacheHasFullWidth ? kRopeDim : kRopeDim / 2);
 
       if constexpr (kIsNeox) {
         if (lane_id < kRotaryLanes) {
@@ -301,9 +303,10 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
             const auto& partner_values = unpack(partner_vec);
 #pragma unroll
             for (uint32_t i = 0; i < 2; ++i) {
-              const auto half_idx = (lane_id % kHalfRotaryLanes) * kElemsPerThread + 2 * j + i;
-              const auto cos = load_cache_value(cos_ptr, half_idx);
-              const auto sin = load_cache_value(sin_ptr, half_idx);
+              const auto cache_idx =
+                  (kCacheHasFullWidth ? lane_id : lane_id % kHalfRotaryLanes) * kElemsPerThread + 2 * j + i;
+              const auto cos = load_cache_value(cos_ptr, cache_idx);
+              const auto sin = load_cache_value(sin_ptr, cache_idx);
               values[i] = lane_id < kHalfRotaryLanes ? rotary_sub(values[i], cos, partner_values[i], sin)
                                                      : rotary_add(values[i], cos, partner_values[i], sin);
             }
@@ -354,7 +357,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
         const auto pos = static_cast<int64_t>(static_cast<const IdType*>(positions)[token_id]);
         const auto cos_ptr =
             static_cast<const CacheDType*>(pointer::offset(cos_sin_cache_ptr, pos * kCosSinStrideBytes));
-        const auto sin_ptr = cos_ptr + kRopeDim / 2;
+        const auto sin_ptr = cos_ptr + (kCacheHasFullWidth ? kRopeDim : kRopeDim / 2);
         const auto partner_lane = lane_id < kHalfRotaryLanes ? lane_id + kHalfRotaryLanes : lane_id - kHalfRotaryLanes;
 
 #pragma unroll
@@ -363,9 +366,9 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
           if (lane_id < kHalfRotaryLanes) {
             swapped = -swapped;
           }
-          const auto half_idx = (lane_id % kHalfRotaryLanes) * kElemsPerThread + i;
-          const float cos = cast<fp32_t>(load_cache_value(cos_ptr, half_idx));
-          const float sin = cast<fp32_t>(load_cache_value(sin_ptr, half_idx));
+          const auto cache_idx = (kCacheHasFullWidth ? lane_id : lane_id % kHalfRotaryLanes) * kElemsPerThread + i;
+          const float cos = cast<fp32_t>(load_cache_value(cos_ptr, cache_idx));
+          const float sin = cast<fp32_t>(load_cache_value(sin_ptr, cache_idx));
           elems[i] = elems[i] * cos + swapped * sin;
         }
       }
@@ -374,7 +377,7 @@ __global__ void fused_qknorm_rope_warp(const QKNormRopeParamsT<kPackKV> __grid_c
         const auto pos = static_cast<int64_t>(static_cast<const IdType*>(positions)[token_id]);
         const auto cos_ptr =
             static_cast<const CacheDType*>(pointer::offset(cos_sin_cache_ptr, pos * kCosSinStrideBytes));
-        const auto sin_ptr = cos_ptr + kRopeDim / 2;
+        const auto sin_ptr = cos_ptr + (kCacheHasFullWidth ? kRopeDim : kRopeDim / 2);
 
 #pragma unroll
         for (uint32_t i = 0; i < kElemsPerThread; i += 2) {
@@ -406,7 +409,8 @@ template <
     bool kUsePDL,
     typename DType,
     typename CacheDType,
-    bool kRoundNormBeforeRope>
+    bool kRoundNormBeforeRope,
+    bool kCacheHasFullWidth>
 struct QKNormRopeKernel {
   static_assert(kHeadDim <= 256, "Only head_dim <= 256 is supported");
   template <typename IdType>
@@ -419,6 +423,7 @@ struct QKNormRopeKernel {
       CacheDType,
       kRoundNormBeforeRope,
       false,
+      kCacheHasFullWidth,
       IdType>;
 
   static void
@@ -448,7 +453,10 @@ struct QKNormRopeKernel {
     TensorMatcher({N, Q, D}).with_strides({Dq, Dd, 1}).with_dtype<DType>().with_device(device).verify(q);
     TensorMatcher({N, K, D}).with_strides({Dk, Dd, 1}).with_dtype<DType>().with_device(device).verify(k);
     TensorMatcher({D}).with_dtype<DType>().with_device(device).verify(q_weight).verify(k_weight);
-    TensorMatcher({-1, R}).with_dtype<CacheDType>().with_device(device).verify(cos_sin_cache);
+    TensorMatcher({-1, kCacheHasFullWidth ? 2 * kRopeDim : kRopeDim})
+        .with_dtype<CacheDType>()
+        .with_device(device)
+        .verify(cos_sin_cache);
     TensorMatcher({N}).with_dtype<int32_t, int64_t>(id_type).with_device(device).verify(positions);
 
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
@@ -498,8 +506,10 @@ template <
     bool kUsePDL,
     typename DType,
     typename CacheDType,
-    bool kRoundNormBeforeRope>
+    bool kRoundNormBeforeRope,
+    bool kCacheHasFullWidth>
 struct QKNormRopePackKVKernel {
+  static_assert(!kCacheHasFullWidth, "KV packing does not support full-width cos/sin caches");
   template <typename IdType>
   static constexpr auto kernel = fused_qknorm_rope_warp<
       kHeadDim,
@@ -510,6 +520,7 @@ struct QKNormRopePackKVKernel {
       CacheDType,
       kRoundNormBeforeRope,
       true,
+      kCacheHasFullWidth,
       IdType>;
 
   static void
