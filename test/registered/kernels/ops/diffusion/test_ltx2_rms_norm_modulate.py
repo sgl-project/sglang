@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+import sglang.multimodal_gen.runtime.models.dits.ltx_2 as ltx2_module
 from sglang.kernels.ops.diffusion.ltx2_rmsnorm_modulate import (
     fused_ltx2_rms_norm_modulate,
     mark_ltx2_rms_norm_modulate_site,
@@ -42,10 +43,26 @@ def _inputs(hidden, batch=1, seq=4096):
 # hidden 4096 = LTX-2 video stream, 2048 = audio stream.
 @pytest.mark.parametrize("hidden", [4096, 2048])
 def test_lossless_default_is_bitexact(hidden):
-    # A marked-but-unmounted site (the lossless default) runs verbatim eager.
+    # A marked-but-unmounted site uses only the self-verified bit-exact
+    # modulate fast path after the reference aten RMSNorm.
     block = nn.Module()
     mark_ltx2_rms_norm_modulate_site(block)
     rms, x, scale, shift = _inputs(hidden)
+    out = _ltx2_rms_norm_modulate(block, rms, x, scale, shift, 1e-6)
+    assert torch.equal(out, _eager(rms, x, scale, shift, 1e-6))
+
+
+def test_lossless_compile_keeps_expression_visible_to_inductor(monkeypatch):
+    block = nn.Module()
+    mark_ltx2_rms_norm_modulate_site(block)
+    rms, x, scale, shift = _inputs(2048, seq=126)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(
+        ltx2_module,
+        "_ltx2_modulate",
+        lambda *_args: pytest.fail("compiled path must not call the opaque custom op"),
+    )
+
     out = _ltx2_rms_norm_modulate(block, rms, x, scale, shift, 1e-6)
     assert torch.equal(out, _eager(rms, x, scale, shift, 1e-6))
 

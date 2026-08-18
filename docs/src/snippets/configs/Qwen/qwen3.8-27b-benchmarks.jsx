@@ -1,5 +1,15 @@
-// Qwen3.8-27B per-cell benchmark numbers, keyed by the same `match` tuple as
-// qwen3.8-27b.jsx cells. See _deployment.jsx for the speed/accuracy schema.
+// Qwen3.8-27B per-cell benchmark numbers. See _deployment.jsx for the
+// speed/accuracy schema.
+//
+// STRUCTURALLY UNMATCHED since the strategy->overlay migration: every entry
+// below keys on the removed `strategy` match dim, and the three gb300
+// `high-throughput` cells they were measured against were deleted (MTP is now
+// the Speculative Decoding OVERLAY row, which never participates in cell
+// matching). No current cell tuple matches these rows, so the UI shows no
+// benchmark card. The numbers are kept as measurement provenance ONLY — do
+// not re-key them onto the new cells without re-measuring: the overlay-era
+// commands differ (explicit --kv-cache-dtype fp8_e4m3, strategy flag emitted
+// by the tier row) and the accept lengths are protocol-specific.
 //
 // All six rows are ONE-BATCH measurements (sglang.bench_serving --flush-cache,
 // random dataset, ISL=1024 / OSL=1024, --random-range-ratio 1, request-rate inf,

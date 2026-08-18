@@ -420,6 +420,36 @@ class TestLTX25DiffusionDecoder(unittest.TestCase):
         # trailing frames that stage 4 crops.
         self.assertEqual(model.decoder.trailing_pad_latent_frames, 2)
 
+    def test_exposes_each_executable_block_group_for_layerwise_offload(self):
+        import torch
+        from torch import nn
+
+        from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+            LayerwiseOffloadableModuleMixin,
+        )
+        from sglang.multimodal_gen.runtime.models.decoders.ltx_2_5_diffusion_decoder import (
+            LTX2VideoDiffusionDecoderModel,
+        )
+
+        with torch.device("meta"):
+            model = LTX2VideoDiffusionDecoderModel(self._config())
+
+        self.assertIsInstance(model, LayerwiseOffloadableModuleMixin)
+        self.assertEqual(
+            model.layer_names,
+            [
+                "decoder.det_stages.0",
+                "decoder.det_stages.1",
+                "decoder.det_stages.2",
+                "decoder.det_stages.3",
+                "decoder.diff_blocks",
+            ],
+        )
+        named_modules = dict(model.named_modules())
+        for layer_name in model.layer_names:
+            with self.subTest(layer_name=layer_name):
+                self.assertIsInstance(named_modules[layer_name], nn.ModuleList)
+
     def test_timestep_embedder_is_replicated_and_checkpoint_compatible(self):
         import torch
         from torch import nn

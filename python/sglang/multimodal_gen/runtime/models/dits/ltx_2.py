@@ -213,7 +213,15 @@ def _ltx2_rms_norm_modulate(
         x, scale, shift
     ):
         return fused_ltx2_rms_norm_modulate(x, scale, shift, eps)
-    return rms_norm(x, eps) * (1 + scale) + shift
+    normed = rms_norm(x, eps)
+    if torch.compiler.is_compiling():
+        # Let Inductor fuse this chain into its surrounding graph. Routing a
+        # compiled call through the opaque custom op would be a regression.
+        return normed * (1 + scale) + shift
+    # Reuse the bit-exact first-sight-verified eager modulate kernel. This
+    # removes two large broadcast pointwise launches without changing the
+    # reference rounding.
+    return _ltx2_modulate(normed, scale, shift)
 
 
 def _ltx2_disable_fused_ada_values(exc: Exception) -> None:
