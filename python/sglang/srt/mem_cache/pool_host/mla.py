@@ -201,6 +201,18 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     pin_memory=self.pin_memory,
                     allocator=self.allocator,
                 )
+            # Host-side mirror of the NPU quantized-Indexer FP32 scale cache
+            # (see NPUMLATokenToKVPool.index_k_scale_buffer). Only present when
+            # the device pool carries one (FP8 DSA + npu_quant_lightning_indexer).
+            self.index_k_scale_buffer = None
+            if getattr(self.device_pool, "index_k_scale_buffer", None) is not None:
+                self.index_k_scale_buffer = alloc_func(
+                    (*base_dims, 1),
+                    dtype=torch.float32,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
             # Return k_buffer to preserve original kv_buffer and data_refs init logic,
             # though Ascend doesn't use these parameters.
             return self.k_buffer
@@ -352,6 +364,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         host_v=self.v_buffer,
                         device_index_k=device_pool.index_k_buffer,
                         host_index_k=self.index_k_buffer,
+                        device_index_k_scale=getattr(
+                            device_pool, "index_k_scale_buffer", None
+                        ),
+                        host_index_k_scale=self.index_k_scale_buffer,
                         page_size=self.page_size,
                         direction=TransferDirection.H2D,
                     )
@@ -551,6 +567,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     host_v=self.v_buffer,
                     device_index_k=device_pool.index_k_buffer,
                     host_index_k=self.index_k_buffer,
+                    device_index_k_scale=getattr(
+                        device_pool, "index_k_scale_buffer", None
+                    ),
+                    host_index_k_scale=self.index_k_scale_buffer,
                     page_size=self.page_size,
                     direction=TransferDirection.D2H,
                 )
@@ -630,6 +650,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             # TODO (iforgetmyname): merge mla kv
             k_buffer_data_ptr = self.k_buffer.data_ptr()
             v_buffer_data_ptr = self.v_buffer.data_ptr()
+            scale_buffer = getattr(self, "index_k_scale_buffer", None)
+            scale_buffer_data_ptr = (
+                scale_buffer.data_ptr() if scale_buffer is not None else None
+            )
             for index in range(0, len(indices), self.page_size):
                 k_ptr = (
                     k_buffer_data_ptr
@@ -647,6 +671,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
                 ptr_list.append(k_ptr)
                 ptr_list.append(v_ptr)
+                if scale_buffer_data_ptr is not None:
+                    # Host scale layout is (page_num, layer_num, page_size, 1, 1)
+                    # FP32: one scale value per token per layer.
+                    ptr_list.append(
+                        scale_buffer_data_ptr
+                        + indices[index] * self.layer_num * 4
+                    )
             k_element_size = (
                 self.layer_num
                 * self.dtype.itemsize
@@ -659,10 +690,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 * self.page_size
                 * self.qk_rope_head_dim
             )
+            scale_element_size = self.layer_num * 4 * self.page_size
             element_size_list = []
             for _ in range(0, len(indices), self.page_size):
                 element_size_list.append(k_element_size)
                 element_size_list.append(v_element_size)
+                if scale_buffer_data_ptr is not None:
+                    element_size_list.append(scale_element_size)
             return ptr_list, element_size_list
         if self.layout == "layer_first":
             for index in range(0, len(indices), self.page_size):

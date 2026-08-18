@@ -103,15 +103,22 @@ class TestAtlasA5Detection(CustomTestCase):
         finally:
             npu_utils._is_ascend_a5_device.cache_clear()
 
-    def test_fp8_dsa_hicache_is_rejected_before_pool_allocation(self):
+    def test_fp8_dsa_hicache_is_supported_after_scale_transfer(self):
+        """FP8 DSA + hierarchical cache is allowed: HiCache now transfers the
+        Indexer FP32 scale buffer (L2 via transfer_kv_dim_exchange, L3 as a
+        per-page ``_scale`` memcache component)."""
         server_args = SimpleNamespace(enable_hierarchical_cache=True)
         config = _glm_dsa_config(index_head_dim=128)
 
-        with self.assertRaisesRegex(ValueError, "does not support hierarchical"):
-            can_use_npu_quant_lightning_indexer(
-                server_args,
-                config,
-                torch.float8_e4m3fn,
+        with patch(
+            "sglang.srt.configs.model_config.is_npu_atlas_a5", return_value=True
+        ):
+            self.assertTrue(
+                can_use_npu_quant_lightning_indexer(
+                    server_args,
+                    config,
+                    torch.float8_e4m3fn,
+                )
             )
 
 

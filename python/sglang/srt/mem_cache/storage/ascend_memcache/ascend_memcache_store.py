@@ -354,6 +354,8 @@ class AscendMemcacheStore(HiCacheStorage):
                 self.register_buffer(self.mem_pool_host.v_buffer)
                 if getattr(self.mem_pool_host, "index_k_buffer", None) is not None:
                     self.register_buffer(self.mem_pool_host.index_k_buffer)
+                if getattr(self.mem_pool_host, "index_k_scale_buffer", None) is not None:
+                    self.register_buffer(self.mem_pool_host.index_k_scale_buffer)
         except TypeError as err:
             logger.error("Failed to register buffer to Ascend Memcache Store: %s", err)
             raise TypeError("Ascend Memcache Store Register Buffer Error.") from err
@@ -391,6 +393,12 @@ class AscendMemcacheStore(HiCacheStorage):
             and self.mem_pool_host is not None
             and getattr(self.mem_pool_host, "layout", None) == "page_first_kv_split"
         )
+
+    def _mla_has_index_scale(self) -> bool:
+        """Whether the MLA host pool carries the quantized-Indexer FP32 scale cache."""
+        return self._mla_uses_kv_split() and getattr(
+            self.mem_pool_host, "index_k_scale_buffer", None
+        ) is not None
 
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
@@ -574,6 +582,8 @@ class AscendMemcacheStore(HiCacheStorage):
             key_list.append(f"{key_}_{self.mla_suffix}_k")
             if self._mla_uses_kv_split():
                 key_list.append(f"{key_}_{self.mla_suffix}_v")
+                if self._mla_has_index_scale():
+                    key_list.append(f"{key_}_{self.mla_suffix}_scale")
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
@@ -599,7 +609,9 @@ class AscendMemcacheStore(HiCacheStorage):
 
         if key_multiplier is None:
             if self.is_mla_backend:
-                key_multiplier = 2 if self._mla_uses_kv_split() else 1
+                key_multiplier = 3 if self._mla_has_index_scale() else (
+                    2 if self._mla_uses_kv_split() else 1
+                )
             else:
                 key_multiplier = 2
                 if self.storage_config and self.storage_config.should_split_heads:
@@ -795,7 +807,9 @@ class AscendMemcacheStore(HiCacheStorage):
         hit_keys = sum(1 for r in get_result if r > 0)
 
         if self.is_mla_backend:
-            key_multiplier = 2 if self._mla_uses_kv_split() else 1
+            key_multiplier = 3 if self._mla_has_index_scale() else (
+                2 if self._mla_uses_kv_split() else 1
+            )
         else:
             key_multiplier = 2
 
@@ -825,7 +839,14 @@ class AscendMemcacheStore(HiCacheStorage):
                 query_keys.append(f"{key}_{self.mla_suffix}_k")
                 if self._mla_uses_kv_split():
                     query_keys.append(f"{key}_{self.mla_suffix}_v")
-            key_multiplier = 2 if self._mla_uses_kv_split() else 1
+                    if self._mla_has_index_scale():
+                        query_keys.append(f"{key}_{self.mla_suffix}_scale")
+            if self._mla_has_index_scale():
+                key_multiplier = 3
+            elif self._mla_uses_kv_split():
+                key_multiplier = 2
+            else:
+                key_multiplier = 1
         else:
             query_keys = []
             if self.storage_config and self.storage_config.should_split_heads:
