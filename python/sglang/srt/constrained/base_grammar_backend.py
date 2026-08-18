@@ -22,7 +22,12 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 import torch
 
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.runtime_context import get_context, get_resources
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_resources,
+    get_serving,
+)
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -315,7 +320,7 @@ def create_grammar_backend(
     eos_token_ids: Optional[set] = None,
     think_end_ids: Optional[List[int]] = None,
 ) -> Optional[BaseGrammarBackend]:
-    name = server_args.grammar_backend
+    name = get_exec().kernel.grammar_backend
 
     # Custom grammar backend has the highest priority
     if name in GRAMMAR_BACKEND_REGISTRY:
@@ -329,7 +334,7 @@ def create_grammar_backend(
 
         grammar_backend = OutlinesGrammarBackend(
             tokenizer,
-            whitespace_pattern=server_args.constrained_json_whitespace_pattern,
+            whitespace_pattern=get_serving().constrained_json_whitespace_pattern,
         )
     elif name == "xgrammar":
         from sglang.srt.constrained.xgrammar_backend import (
@@ -345,10 +350,10 @@ def create_grammar_backend(
                 tokenizer,
                 vocab_size=vocab_size,
                 model_eos_token_ids=eos_list,
-                any_whitespace=not server_args.constrained_json_disable_any_whitespace,
+                any_whitespace=not get_serving().constrained_json_disable_any_whitespace,
             )
         except TokenizerNotSupportedError as e:
-            if server_args.enable_strict_thinking:
+            if get_serving().enable_strict_thinking:
                 raise ValueError(
                     f"--enable-strict-thinking requires a grammar backend with "
                     f"token filtering support, but XGrammar failed to initialize: "
@@ -367,13 +372,13 @@ def create_grammar_backend(
 
         grammar_backend = GuidanceBackend(
             tokenizer=tokenizer,
-            any_whitespace=not server_args.constrained_json_disable_any_whitespace,
-            whitespace_pattern=server_args.constrained_json_whitespace_pattern,
+            any_whitespace=not get_serving().constrained_json_disable_any_whitespace,
+            whitespace_pattern=get_serving().constrained_json_whitespace_pattern,
             n_vocab=vocab_size,
             eos_token_ids=eos_token_ids,
         )
     elif name == "none":
-        if server_args.enable_strict_thinking:
+        if get_serving().enable_strict_thinking:
             raise ValueError(
                 "--enable-strict-thinking requires a grammar backend that supports "
                 "token filtering, but grammar_backend='none' was specified. Use "
@@ -384,13 +389,13 @@ def create_grammar_backend(
     else:
         raise ValueError(f"Invalid grammar backend: {name}")
 
-    if server_args.reasoning_parser and think_end_ids:
+    if get_serving().reasoning_parser and think_end_ids:
         from sglang.srt.constrained.reasoner_grammar_backend import (
             ReasonerGrammarBackend,
         )
 
         reasoning_parser = ReasoningParser(
-            model_type=server_args.reasoning_parser,
+            model_type=get_serving().reasoning_parser,
             stream_reasoning=False,
             tokenizer=tokenizer,
         )
@@ -399,7 +404,7 @@ def create_grammar_backend(
             grammar_backend,
             reasoning_parser,
             tokenizer,
-            enable_strict_thinking=server_args.enable_strict_thinking,
+            enable_strict_thinking=get_serving().enable_strict_thinking,
         )
 
     return grammar_backend
