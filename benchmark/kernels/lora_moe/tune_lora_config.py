@@ -237,18 +237,26 @@ def bench_once(
 ROUTE_BLOCK_KEYS = ("routing_block_size", "gate_up_a_routing_block_size")
 
 
-def _set_route_block(sites: dict, block: int, key: str) -> None:
-    """Move ONE of the two route granularities to ``block``.
+def _set_route_block(sites: dict, block: int, key: str, *, lockstep: bool) -> None:
+    """Move one route granularity to ``block`` without fabricating a split.
 
-    They are independent knobs and have to be swept that way. The SHARED
-    route's block also decides how many padded rows the fused middle and the
-    base GEMM walk, so raising it buys faster LoRA kernels and charges
-    everything downstream; gate/up-A's own route writes by original pair id,
-    so a big tile there costs nothing downstream. Moving them together hides
-    that trade -- it was worth 2.5% at 4k tokens on the shipped H200 row.
+    The two keys are independent knobs and have to be swept that way: the
+    SHARED route's block also decides how many padded rows the fused middle
+    and the base GEMM walk, while gate/up-A's own route writes by original
+    pair id, so its padding reaches nobody. Collapsing them was worth -2.5%
+    at 4k tokens on the shipped H200 row.
+
+    ``lockstep`` moves both keys together. It is REQUIRED for rows whose plan
+    cannot run a split (shared layout, non-grouped gate/up-A -- the bind
+    validation rejects a split there and the arm dies), and rules that never
+    declared their own gate/up-A block move as one route too: raising only
+    the shared key would leave gate/up-A at the loader default and invent a
+    split the row never asked for.
     """
     sites[key] = block
     if key == "routing_block_size":
+        if lockstep or "gate_up_a_routing_block_size" not in sites:
+            sites["gate_up_a_routing_block_size"] = block
         # tripwires on the B sites are checked against the shared route
         for name in ("gate_up_b", "down_b"):
             site = sites.get(name)
@@ -273,6 +281,15 @@ def sweep_route_block(args, seed_path: str, arch: str, variant_dir: str) -> dict
     plans = json.load(open(seed_path))
     rows = plans["scenarios"] + plans.get("fallback", [])
     phase_of = {row["name"]: row.get("phase") for row in rows}
+    # Rows that may legally run gate/up-A on its own route: per-expert layout
+    # with grouped gate/up-A (the loader default). Everything else -- shared
+    # layout, wildcard layout, dedup families -- moves as one route.
+    splittable = {
+        row["name"]
+        for row in rows
+        if row.get("layout") == "per_expert"
+        and row.get("plan", {}).get("gate_up_a_family", "grouped") == "grouped"
+    }
     tiles = json.load(open(tiles_path))
     all_results = {}
     axes = [
@@ -285,6 +302,8 @@ def sweep_route_block(args, seed_path: str, arch: str, variant_dir: str) -> dict
     ]
     for phase, metric, key in axes:
         names = [n for n in tiles["rules"] if phase_of.get(n) == phase]
+        if key == "gate_up_a_routing_block_size":
+            names = [n for n in names if n in splittable]
         if not names:
             continue
         results = {}
@@ -292,13 +311,16 @@ def sweep_route_block(args, seed_path: str, arch: str, variant_dir: str) -> dict
             candidate = copy.deepcopy(tiles)
             for name in names:
                 for rule in candidate["rules"][name]:
-                    _set_route_block(rule["sites"], block, key)
+                    _set_route_block(
+                        rule["sites"], block, key, lockstep=name not in splittable
+                    )
             os.makedirs(variant_dir, exist_ok=True)
             json.dump(
                 candidate, open(os.path.join(variant_dir, f"{arch}.tiles.json"), "w")
             )
             json.dump(plans, open(os.path.join(variant_dir, f"{arch}.plans.json"), "w"))
-            tag = f"route_{phase}_{key.split('_route')[0]}_{block}"
+            short = "shared" if key == "routing_block_size" else "gate_up_a"
+            tag = f"route_{phase}_{short}_{block}"
             results[block] = bench_once(
                 args, {"SGLANG_LORA_MOE_CONFIG_DIR": variant_dir}, tag, metric
             )
@@ -307,7 +329,9 @@ def sweep_route_block(args, seed_path: str, arch: str, variant_dir: str) -> dict
         print(f"{key} winner ({phase}, scored on {metric}): {winner}")
         for name in names:
             for rule in tiles["rules"][name]:
-                _set_route_block(rule["sites"], winner, key)
+                _set_route_block(
+                    rule["sites"], winner, key, lockstep=name not in splittable
+                )
         all_results.update({f"{phase}-{key}-{b}": v for b, v in results.items()})
     json.dump(tiles, open(tiles_path, "w"), indent=1)
     return all_results
