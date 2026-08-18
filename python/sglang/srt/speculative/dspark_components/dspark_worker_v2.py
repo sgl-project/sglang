@@ -96,14 +96,14 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
         self._draft_dp_context_enabled = (
-            server_args.enable_dp_attention and not self._draft_is_moe
+            get_parallel().enable_dp_attention and not self._draft_is_moe
         )
         self._is_pd_prefill = server_args.disaggregation_mode == "prefill"
         self._decode_graph_allowed = (
-            not server_args.disable_cuda_graph and not self._is_pd_prefill
+            not get_exec().graph.disable_cuda_graph and not self._is_pd_prefill
         )
         if (
-            server_args.enable_dp_attention
+            get_parallel().enable_dp_attention
             and self._draft_is_moe
             and ps.attn_tp_size > 1
         ):
@@ -202,7 +202,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             verify_num_draft_tokens=self.verify_num_draft_tokens,
         )
         if (
-            server_args.enable_dp_attention
+            get_parallel().enable_dp_attention
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
@@ -228,7 +228,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             gamma=self.gamma,
             mask_token_id=self._mask_token_id,
             draft_block_spec_info=self._draft_block_spec_info,
-            dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
+            dp_moe_sync=self._draft_is_moe and get_parallel().enable_dp_attention,
         )
         self._verify_epilogue = None
         if (
