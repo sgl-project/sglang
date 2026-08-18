@@ -2675,7 +2675,7 @@ class ServerArgs:
     ] = False
     enable_rdt_weight_sync: A[
         bool,
-        "Expose SchedulerActor.pull_weights for RDT (Ray Direct Transport / NIXL) weight sync from an external trainer job. Requires --use-ray; implies --enable-engine-info-bootstrap.",
+        "Expose SchedulerActor.pull_weights for RDT (Ray Direct Transport / NIXL) weight sync. Requires --use-ray; implies --enable-engine-info-bootstrap.",
     ] = False
     engine_info_bootstrap_port: A[
         int,
@@ -3175,7 +3175,7 @@ class ServerArgs:
             return
         assert (
             self.use_ray
-        ), "--enable-rdt-weight-sync requires --use-ray: the trainer pulls weights through named SchedulerActors."
+        ), "--enable-rdt-weight-sync requires --use-ray: the trainer pulls weights through SchedulerActors."
         self.enable_engine_info_bootstrap = True
 
     def _handle_pd_disaggregation(self):

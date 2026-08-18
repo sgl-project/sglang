@@ -15,14 +15,72 @@
 
 from typing import Callable, Optional
 
-import ray
-
 from sglang.srt.entrypoints.engine import (
     init_tokenizer_manager,
     run_detokenizer_process,
     run_scheduler_process,
 )
 from sglang.srt.server_args import ServerArgs
+
+
+def launch_engine(
+    server_args: ServerArgs,
+    init_tokenizer_manager_func: Callable = init_tokenizer_manager,
+    run_scheduler_process_func: Callable = run_scheduler_process,
+    run_detokenizer_process_func: Callable = run_detokenizer_process,
+):
+    """Create RayEngine subprocesses / SchedulerActors. Does not start HTTP.
+
+    Returns the ``_launch_subprocesses`` 5-tuple:
+    ``(tokenizer_manager, template_manager, port_args, scheduler_init_result,
+    subprocess_watchdog)``. ``scheduler_init_result.scheduler_actors`` are the
+    SchedulerActor handles.
+    """
+    from sglang.srt.ray.engine import RayEngine
+
+    server_args.override("ray.http_server.clear_placement_group", placement_group=None)
+
+    return RayEngine._launch_subprocesses(
+        server_args,
+        init_tokenizer_manager_func=init_tokenizer_manager_func,
+        run_scheduler_process_func=run_scheduler_process_func,
+        run_detokenizer_process_func=run_detokenizer_process_func,
+    )
+
+
+def serve_http(
+    engine,
+    server_args: ServerArgs,
+    execute_warmup_func: Optional[Callable] = None,
+    launch_callback: Optional[Callable[[], None]] = None,
+):
+    """Block in uvicorn. ``engine`` is the 5-tuple from ``launch_engine``."""
+    from sglang.srt.entrypoints.http_server import (
+        _execute_server_warmup,
+        _setup_and_run_http_server,
+    )
+
+    if execute_warmup_func is None:
+        execute_warmup_func = _execute_server_warmup
+
+    (
+        tokenizer_manager,
+        template_manager,
+        port_args,
+        scheduler_init_result,
+        subprocess_watchdog,
+    ) = engine
+
+    _setup_and_run_http_server(
+        server_args,
+        tokenizer_manager,
+        template_manager,
+        port_args,
+        scheduler_init_result.scheduler_infos,
+        subprocess_watchdog,
+        execute_warmup_func=execute_warmup_func,
+        launch_callback=launch_callback,
+    )
 
 
 def launch_server(
@@ -37,47 +95,14 @@ def launch_server(
 
     Mirrors http_server.launch_server() but uses RayEngine for scheduler launching.
     """
-    from sglang.srt.entrypoints.http_server import (
-        _execute_server_warmup,
-        _setup_and_run_http_server,
-    )
-    from sglang.srt.ray.engine import RayEngine
-
-    if execute_warmup_func is None:
-        execute_warmup_func = _execute_server_warmup
-
-    placement_group = getattr(server_args, "placement_group", None)
-    if placement_group is not None and not ray.is_initialized():
-        ray.init(
-            address="auto",
-            runtime_env=getattr(server_args, "ray_runtime_env", None),
-            namespace=getattr(server_args, "ray_namespace", None),
-        )
-    server_args.override(
-        "ray.http_server.placement_group",
-        placement_group=placement_group,
-    )
-
-    (
-        tokenizer_manager,
-        template_manager,
-        port_args,
-        scheduler_init_result,
-        subprocess_watchdog,
-    ) = RayEngine._launch_subprocesses(
+    serve_http(
+        launch_engine(
+            server_args,
+            init_tokenizer_manager_func=init_tokenizer_manager_func,
+            run_scheduler_process_func=run_scheduler_process_func,
+            run_detokenizer_process_func=run_detokenizer_process_func,
+        ),
         server_args,
-        init_tokenizer_manager_func=init_tokenizer_manager_func,
-        run_scheduler_process_func=run_scheduler_process_func,
-        run_detokenizer_process_func=run_detokenizer_process_func,
-    )
-
-    _setup_and_run_http_server(
-        server_args,
-        tokenizer_manager,
-        template_manager,
-        port_args,
-        scheduler_init_result.scheduler_infos,
-        subprocess_watchdog,
         execute_warmup_func=execute_warmup_func,
         launch_callback=launch_callback,
     )

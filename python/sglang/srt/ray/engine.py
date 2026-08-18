@@ -181,14 +181,13 @@ def get_scheduler_actor_name(
     dp_rank: int,
     pp_rank: int,
     tp_rank: int,
-    port: int,
+    pg_id_hex: str,
     bundle_idx: int,
 ) -> str:
-    """Return the Ray actor name for a SchedulerActor. Can be used to retrive scheduler ray actors"""
     return (
         f"sglang_scheduler_node{rank0_node_ip}"
         f"_dp{dp_rank}_pp{pp_rank}_tp{tp_rank}"
-        f"_port{port}_bundle{bundle_idx}"
+        f"_pg{pg_id_hex}_bundle{bundle_idx}"
     )
 
 
@@ -230,12 +229,9 @@ def _create_scheduler_actor(
             dp_rank=dp_rank,
             pp_rank=pp_rank,
             tp_rank=tp_rank,
-            port=server_args.port,
+            pg_id_hex=pg.id.hex()[:8],
             bundle_idx=bundle_idx,
         ),
-        # Non-detached named actors are not listed cross-job, so the trainer (a
-        # separate Ray job) could not discover them. RayEngine.shutdown kills these.
-        lifetime="detached" if rdt else None,
         # SchedulerActor calls set_device() with the absolute id from
         # get_accelerator_ids(), which is only valid if Ray leaves the mask alone.
         runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}},
