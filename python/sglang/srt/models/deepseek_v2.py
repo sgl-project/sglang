@@ -2306,10 +2306,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         if is_nextn and getattr(config, "mla_nope", False):
-            # NoPE checkpoints (e.g. GLM5-Next, mla_nope=True) skip rotary
-            # embedding in the target layers; the NextN draft must match, or
-            # its Q/K live in a different space than the KV it verifies
-            # against.
+            # The NextN draft must match the NoPE target layers, or its Q/K
+            # and the KV it verifies against live in different spaces.
             skip_rope = True
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,

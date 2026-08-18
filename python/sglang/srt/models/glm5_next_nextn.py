@@ -24,11 +24,14 @@ logger = logging.getLogger(__name__)
 
 
 class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
-    hf_to_sglang_mapper = WeightsMapper(
-        orig_to_new_substr={
-            "model.layers.45": "model.decoder",
-        },
-    )
+    @classmethod
+    def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
+        text_config = getattr(config, "text_config", config)
+        return WeightsMapper(
+            orig_to_new_substr={
+                f"model.layers.{text_config.num_hidden_layers}": "model.decoder",
+            },
+        )
 
     def _resolve_nextn_quant_config(self, config, quant_config):
         """Keep a checkpoint-declared BF16 NextN block unquantized.

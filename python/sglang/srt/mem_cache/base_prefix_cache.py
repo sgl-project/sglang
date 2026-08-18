@@ -120,7 +120,6 @@ class IncLockRefResult:
     delta: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
-    mamba_lock_ref_acquired: Optional[bool] = None
     # Component nodes that were tombstones at acquire time. Replaying this set
     # at release prevents a short-lived lock from consuming a later load-back or
     # request lock after that tombstone becomes a valid device value.
@@ -133,7 +132,6 @@ class IncLockRefResult:
         return DecLockRefParams(
             swa_uuid_for_lock=self.swa_uuid_for_lock,
             swa_uuid_for_host_lock=self.swa_uuid_for_host_lock,
-            mamba_lock_ref_acquired=self.mamba_lock_ref_acquired,
             skip_lock_node_ids={
                 component_type: set(node_ids)
                 for component_type, node_ids in self.skip_lock_node_ids.items()
@@ -147,7 +145,6 @@ class DecLockRefParams:
 
     swa_uuid_for_lock: Optional[int] = None
     swa_uuid_for_host_lock: Optional[int] = None
-    mamba_lock_ref_acquired: Optional[bool] = None
     skip_lock_node_ids: dict[ComponentType, set[int]] = dataclasses.field(
         default_factory=dict
     )

@@ -16,6 +16,7 @@
 import dataclasses
 import faulthandler
 import logging
+import math
 import os
 import signal
 import sys
@@ -1549,8 +1550,6 @@ class Scheduler(
         if self.truncation_align_size is None:
             self.truncation_align_size = dsa_index_kpool
         else:
-            import math
-
             self.truncation_align_size = math.lcm(
                 self.truncation_align_size, dsa_index_kpool
             )

@@ -48,7 +48,6 @@ class VideoDecoderWrapper:
             multiple decoders in parallel threads.
         """
         self._source = source
-        self._device = device
         self._num_decode_threads = num_decode_threads
         self._source_bytes = source if isinstance(source, bytes) else None
         self._source_path = source if isinstance(source, str) else None

@@ -1760,5 +1760,5 @@ class IndexerKPool(MultiPlatformOp):
                         kpool_extend_cache=kpool_extend_cache,
                     )
         else:
-            assert False
+            raise NotImplementedError("kpool indexer is only supported on CUDA")
         return topk_result

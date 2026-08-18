@@ -322,6 +322,10 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         },
     )
 
+    @classmethod
+    def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
+        return cls.hf_to_sglang_mapper
+
     def _resolve_nextn_quant_config(self, config, quant_config):
         if quant_config is None or quant_config.get_name() != "quark":
             return quant_config
@@ -329,7 +333,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
 
         ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
-        mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
+        mapped_prefix = self.get_hf_to_sglang_mapper(config)._map_name(ckpt_prefix)
         if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
             return None
         return quant_config
