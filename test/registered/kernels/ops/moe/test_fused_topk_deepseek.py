@@ -1,8 +1,9 @@
 import sys
 
 import pytest
-import sglang.srt.layers.moe.topk as topk_module
 import torch
+
+import sglang.srt.layers.moe.topk as topk_module
 from sglang.srt.layers.moe.topk import biased_grouped_topk_gpu, biased_grouped_topk_impl
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
