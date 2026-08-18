@@ -95,6 +95,7 @@ ATTENTION_BACKEND_CHOICES = [
     "minicpm_flashinfer",
     # AMD specific
     "aiter",
+    "moonmath_mla",
     "wave",
     # Other platforms
     "intel_amx",
@@ -238,6 +239,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "cutedsl_mla",
     "trtllm_mla",
     "tokenspeed_mla",
+    "moonmath_mla",
 ]
 add_chunked_prefix_cache_attention_backend = (
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS.append
