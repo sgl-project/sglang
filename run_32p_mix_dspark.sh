@@ -20,7 +20,13 @@ export SGLANG_NPU_PROFILING_BS=4
 # export SGLANG_NPU_PROFILING=1
 export SGLANG_NPU_PROFILING_PATH="/home/hanwlax/workspace/progress/kimi_k3/profiling"
 SGLANG_REPO_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-export PYTHONPATH="${SGLANG_REPO_DIR}/python:/home/hanwlax/test-codes/sgl-kernel-npu/python/sgl_kernel_npu:${PYTHONPATH:-}"
+SGL_KERNEL_NPU_REPO_DIR=${SGL_KERNEL_NPU_REPO_DIR:-/home/hanwlax/test-codes/sgl-kernel-npu}
+export PYTHONPATH="${SGLANG_REPO_DIR}/python:${SGL_KERNEL_NPU_REPO_DIR}/python/sgl_kernel_npu:${PYTHONPATH:-}"
+KDA_COMMIT_MODULE="${SGL_KERNEL_NPU_REPO_DIR}/python/sgl_kernel_npu/sgl_kernel_npu/mamba/kda_state_commit.py"
+if [[ ! -f "${KDA_COMMIT_MODULE}" ]] || ! grep -q '^def commit_kda_extended_conv_state' "${KDA_COMMIT_MODULE}"; then
+    echo "Missing direct KDA state-commit kernel: ${KDA_COMMIT_MODULE}" >&2
+    exit 2
+fi
 # export PYTHONPATH="${SGLANG_REPO_DIR}/python:${PYTHONPATH:-}"
 
 D_IP=('192.168.25.209' '192.168.25.212' '192.168.25.216' '192.168.25.217')
@@ -48,10 +54,18 @@ do
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_RAGGED_VERIFY_MODE=static
-        export SGLANG_DSPARK_FOLDED_PROPOSAL=0
-        export SGLANG_DSPARK_FOLDED_SAMPLING=0
-        export SGLANG_DSPARK_STACKED_CTX_KV=0
-        export SGLANG_DSPARK_EMBED_IN_GRAPH=0
+        # Maximum #35266 + #34944 stack: fused K3 target projection is selected
+        # by the model code, while the proposal-side fast paths stay explicit
+        # here so an inherited environment cannot silently disable them.
+        export SGLANG_DSPARK_FAST_KERNEL=1
+        export SGLANG_DSPARK_FAST_SAMPLING=1
+        export SGLANG_DSPARK_FOLDED_PROPOSAL=1
+        export SGLANG_DSPARK_FOLDED_SAMPLING=1
+        export SGLANG_DSPARK_STACKED_CTX_KV=1
+        export SGLANG_DSPARK_EMBED_IN_GRAPH=1
+        export SGLANG_DSPARK_OPT_MARKOV_W2_BF16=1
+        export SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD=1
+        export SGLANG_DSPARK_ENABLE_MULTI_STREAM=1
         export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
         export HCCL_SOCKET_IFNAME=enp196s0f0
         export GLOO_SOCKET_IFNAME=enp196s0f0
