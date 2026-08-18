@@ -22,6 +22,12 @@ import torch
 
 pytest.importorskip("triton")
 
+from sglang.srt.lora.moe.activation import ActivationFn  # noqa: E402
+from sglang.srt.lora.moe.execution_plan import (  # noqa: E402
+    DeviceArchitecture,
+    Phase,
+    resolve_plans,
+)
 from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
@@ -327,16 +333,76 @@ class TestRunnerAdmission:
 
         MoeLoraRunner._admit(self._base_layer(**overrides))
 
-    @pytest.mark.parametrize(
-        ("activation", "is_gated"),
-        [("silu", True), ("silu", False), ("relu2", False), ("relu2", True)],
-    )
-    def test_accepts_supported_activation_contracts(
+    @pytest.mark.parametrize("activation", [fn.value for fn in ActivationFn])
+    @pytest.mark.parametrize("is_gated", [True, False])
+    def test_accepts_every_activation_crossed_with_every_gating(
         self,
         activation: str,
         is_gated: bool,
     ) -> None:
+        """The two axes are independent, so the whole product is admissible.
+
+        Parametrized over the enum rather than a written-out list, so a new
+        member is covered the moment it is added instead of quietly not being.
+        """
         self._admit(activation=activation, is_gated=is_gated)
+
+    @pytest.mark.parametrize("activation", [fn.value for fn in ActivationFn])
+    @pytest.mark.parametrize("is_gated", [True, False])
+    def test_every_cell_binds_against_a_matching_provider(
+        self,
+        activation: str,
+        is_gated: bool,
+    ) -> None:
+        """Admission is not enough: the cell must survive validate_plan too.
+
+        Non-gated SiLU used to pass _admit and then die here with "provider
+        exposes 1 gate/up slices but swiglu needs 2", because the slice count
+        was inferred from the activation. The slice count comes from the
+        resident width now, so all four cells bind.
+        """
+        from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
+        from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
+
+        experts, hidden, inter = 4, 256, 128
+        slices = 2 if is_gated else 1
+        device = torch.device("cuda")
+        provider = MoeLoraRunner.select_provider_cls("expert_major", "deepgemm")(
+            MoeLoraBf16QuantInfo(
+                w13_weight=torch.zeros(
+                    (experts, slices * inter, hidden),
+                    device=device,
+                    dtype=torch.bfloat16,
+                ),
+                w2_weight=torch.zeros(
+                    (experts, hidden, inter), device=device, dtype=torch.bfloat16
+                ),
+                num_local_experts=experts,
+                intermediate_size=inter,
+                hidden_size=hidden,
+            )
+        )
+        runner = MoeLoraRunner(
+            providers={"expert_major": provider},
+            top_k=2,
+            routed_scaling_factor=1.0,
+            activation=ActivationFn.parse(activation),
+            is_gated=is_gated,
+        )
+        selected = resolve_plans(
+            architecture=DeviceArchitecture.GB300,
+            is_shared_outer=False,
+            physical_rank=16,
+            activation=ActivationFn.parse(activation),
+            hidden_size=hidden,
+            num_local_experts=experts,
+        )[Phase.DECODE]
+        runner.validate_plan(selected.plan, base_gemm_rows=selected.base_gemm_rows)
+
+        # ...and the mismatched provider is rejected ON THE GATING AXIS.
+        runner.is_gated = not is_gated
+        with pytest.raises(ValueError, match="is_gated"):
+            runner.validate_plan(selected.plan, base_gemm_rows=selected.base_gemm_rows)
 
     @pytest.mark.parametrize(
         ("overrides", "message"),

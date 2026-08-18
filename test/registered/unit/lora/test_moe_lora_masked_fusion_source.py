@@ -320,6 +320,39 @@ class TestMaskedFusionSource(unittest.TestCase):
         self.assertNotIn('("silu", "relu2")', source)
         self.assertIn("num_slices * inter", wrapper)
 
+    def test_no_module_restates_the_activation_set(self):
+        """ActivationFn is the only place the accepted names are written.
+
+        The set used to be hand-copied into eight modules, three of them
+        checking what their own callee checked one frame down, so adding an
+        activation meant finding all eight. Membership is `in ActivationFn`
+        and conversion is ActivationFn.parse(); any literal pair reappearing
+        under moe/ is that drift starting again.
+        """
+        import re
+
+        from sglang.srt.lora.moe.activation import ActivationFn
+
+        moe_root = PROVIDER.parent
+        owner = moe_root / "activation.py"
+        # Any tuple/list/set literal holding two or more of the member names.
+        names = "|".join(re.escape(fn.value) for fn in ActivationFn)
+        pattern = re.compile(
+            rf"""[\(\[{{]\s*["']({names})["']\s*,\s*["']({names})["']"""
+        )
+        offenders = []
+        for path in sorted(moe_root.rglob("*.py")):
+            if path == owner:
+                continue
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                if pattern.search(line):
+                    offenders.append(
+                        f"{path.relative_to(moe_root)}:{number}: {line.strip()}"
+                    )
+        self.assertEqual(offenders, [], "\n".join(offenders))
+        # And the owner really does declare them.
+        self.assertEqual({fn.value for fn in ActivationFn}, {"silu", "relu2"})
+
     def test_shared_rank_finalize_is_fail_closed_and_two_stage(self):
         source = _source("masked_finalize.py")
         provider = _source("masked_row_domain.py")
