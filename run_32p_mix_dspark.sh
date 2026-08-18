@@ -18,8 +18,8 @@ source /usr/local/Ascend/nnal/atb/set_env.sh
 
 export SGLANG_NPU_PROFILING_BS=4
 # export SGLANG_NPU_PROFILING=1
-export SGLANG_NPU_PROFILING_PATH="/home/hanwlax/workspace/progress/kimi_k3/profiling"
 SGLANG_REPO_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+export SGLANG_NPU_PROFILING_PATH="${SGLANG_NPU_PROFILING_PATH:-${SGLANG_REPO_DIR}/profiling}"
 CODEX_SGL_KERNEL_NPU_REPO_DIR=${CODEX_SGL_KERNEL_NPU_REPO_DIR:-/home/hanwlax/test-codes/sgl-kernel-npu}
 export PYTHONPATH="${SGLANG_REPO_DIR}/python:${CODEX_SGL_KERNEL_NPU_REPO_DIR}/python/sgl_kernel_npu:${PYTHONPATH:-}"
 KDA_COMMIT_MODULE="${CODEX_SGL_KERNEL_NPU_REPO_DIR}/python/sgl_kernel_npu/sgl_kernel_npu/mamba/kda_state_commit.py"
@@ -30,8 +30,19 @@ fi
 # export PYTHONPATH="${SGLANG_REPO_DIR}/python:${PYTHONPATH:-}"
 
 D_IP=('192.168.25.209' '192.168.25.212' '192.168.25.216' '192.168.25.217')
+DP_SIZE=${DP_SIZE:-4}
+DSPARK_BLOCK_SIZE=${DSPARK_BLOCK_SIZE:-7}
 if [[ "${ENABLE_NPU_GRAPH:-1}" == "1" ]]; then
-    GRAPH_ARGS=(--cuda-graph-bs 2 4 8 16)
+    if [[ -n "${CUDA_GRAPH_BS:-}" ]]; then
+        GRAPH_BS_TEXT=${CUDA_GRAPH_BS//,/ }
+        read -r -a GRAPH_BS <<< "${GRAPH_BS_TEXT}"
+    elif (( (DSPARK_BLOCK_SIZE + 1) % (64 / DP_SIZE) == 0 )); then
+        # An aligned verify width can capture/replay the true bs=1 shape.
+        GRAPH_BS=(1 2 4 8)
+    else
+        GRAPH_BS=(2 4 8 16)
+    fi
+    GRAPH_ARGS=(--cuda-graph-bs "${GRAPH_BS[@]}")
 else
     GRAPH_ARGS=(--disable-cuda-graph)
 fi
@@ -87,6 +98,7 @@ do
         unset ASCEND_RT_VISIBLE_DEVICES
         unset ASCEND_LAUNCH_BLOCKING
 
+        echo "K3 launch: tp=64 dp=${DP_SIZE} gamma=${DSPARK_BLOCK_SIZE} graph_bs=${GRAPH_BS[*]:-disabled}"
         sglang serve \
             --model-loader-extra-config '{"enable_multithread_load": true}' \
             --dist-init-addr 192.168.25.209:5000 --nnodes 4 --node-rank $i \
@@ -98,7 +110,7 @@ do
             --quantization modelslim \
             --dtype bfloat16 \
             --tp-size 64 \
-	          --enable-dp-attention --dp-size 4 --enable-dp-lm-head \
+	          --enable-dp-attention --dp-size "${DP_SIZE}" --enable-dp-lm-head \
             --mem-fraction-static 0.75 \
             --max-mamba-cache-size 180 \
             --chunked-prefill-size 16384 \
@@ -111,7 +123,7 @@ do
             --deepep-mode auto \
             --speculative-algorithm DSPARK \
             --speculative-draft-model-path "$DRAFT_MODEL_PATH" \
-            --speculative-dspark-block-size 7 \
+            --speculative-dspark-block-size "${DSPARK_BLOCK_SIZE}" \
             --speculative-draft-attention-backend ascend \
             --speculative-eagle-topk 1 \
             --speculative-draft-model-quantization unquant \
