@@ -1674,13 +1674,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 SimpleNamespace(linear_attn_backend="fla"), "Qwen3NextForCausalLM"
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             supports_mamba_cache_extra_buffer(
                 SimpleNamespace(
                     linear_attn_backend="triton",
-                    linear_attn_prefill_backend="flashkda",
+                    linear_attn_prefill_backend="flashinfer",
                 ),
-                "BailingMoeV3ForCausalLM",
+                "Qwen3_5MoeForConditionalGeneration",
             )
         )
 

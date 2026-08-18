@@ -1544,11 +1544,7 @@ def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     """Whether ``model_arch`` supports the extra_buffer strategy on the
     configured linear-attention backend (pure read)."""
     if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS:
-        prefill_backend = (
-            getattr(view, "linear_attn_prefill_backend", None)
-            or view.linear_attn_backend
-        )
-        return prefill_backend == "triton"
+        return view.linear_attn_backend == "triton"
     return False
 
 
