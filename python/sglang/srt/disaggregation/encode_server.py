@@ -802,7 +802,21 @@ class MMEncoder:
             ]
             videos, video_metadata = map(list, zip(*video_processed))
             video_processor_kwargs["do_sample_frames"] = False
-            if video_metadata:
+            # preprocess_video returns (video, None) for input that was already
+            # decoded upstream, so video_metadata can contain Nones -- and such a
+            # list is still truthy. transformers' make_batched_metadata only
+            # converts a list whose first element is a list or a dict; one that
+            # holds None falls through both branches and is returned unchanged,
+            # so the consumer dereferences None ("'NoneType' object has no
+            # attribute 'fps'"). Passing nothing is strictly better than passing
+            # Nones: make_batched_metadata then synthesizes total_num_frames,
+            # width, height and frames_indices from the video itself. The list is
+            # positionally parallel to `videos`, so individual entries cannot be
+            # dropped without breaking alignment -- forward it only when every
+            # entry is present.
+            if video_metadata and all(
+                metadata is not None for metadata in video_metadata
+            ):
                 video_processor_kwargs["video_metadata"] = video_metadata
             return videos, video_processor_kwargs
         else:
