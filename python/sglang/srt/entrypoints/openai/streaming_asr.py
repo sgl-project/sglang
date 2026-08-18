@@ -53,9 +53,8 @@ class StreamingASRState:
 
     def _record_emit(self, delta: str) -> str:
         if delta:
-            self.emitted_text = (
-                f"{self.emitted_text} {delta}".strip() if self.emitted_text else delta
-            )
+            separator = " " if needs_space(self.emitted_text, delta) else ""
+            self.emitted_text = f"{self.emitted_text}{separator}{delta}".strip()
         return delta
 
     def update(self, new_transcript: str) -> str:
@@ -67,8 +66,14 @@ class StreamingASRState:
             self.confirmed_text = ""
         self.full_transcript = new_transcript
         self.chunk_index += 1
-        if self.confirmed_text.startswith(old_confirmed):
-            return self._record_emit(self.confirmed_text[len(old_confirmed) :].strip())
+        prefix_len = len(old_confirmed)
+        suffix = self.confirmed_text[prefix_len:]
+        suffix_starts_at_boundary = not needs_space(old_confirmed, suffix)
+        is_append_only = self.confirmed_text.startswith(old_confirmed) and (
+            suffix_starts_at_boundary
+        )
+        if is_append_only:
+            return self._record_emit(suffix.strip())
         # Model revised earlier text, use word level common prefix to avoid
         # re-emitting already-sent content and cutting mid-word.
         old_words = old_confirmed.split()
