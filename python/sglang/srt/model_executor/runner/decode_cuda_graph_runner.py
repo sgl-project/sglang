@@ -643,6 +643,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         return max(request_counts)
 
+    def _encoder_lens_all_positive(self, forward_batch: ForwardBatch) -> bool:
+        """Mixed-batch (encoder_len = 0) gate shared by the graph admission checks.
+
+        Prefers the CPU mirror list: bool(torch.all(...)) on the device tensor
+        implicitly copies the result D2H and syncs the stream, so every
+        encoder-decoder decode step would drain the previous step's replay
+        before this step's launches can be queued. The mirror is built from
+        the same Python list as the tensor, and the gates that consult this
+        helper run before DP padding appends any device-only zero rows, so
+        both forms return the same answer at those gates; the device
+        fallback covers batches that never got a mirror.
+        """
+        if forward_batch.encoder_lens_cpu is not None:
+            return all(l > 0 for l in forward_batch.encoder_lens_cpu)
+        return bool(torch.all(forward_batch.encoder_lens > 0))
+
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -693,7 +709,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # If mixed batch cannot be supported, then encoder_lens can be removed in cuda graph
         # because the full_text_row_masked_out_mask tensor will always be ones
         is_encoder_lens_supported = (
-            torch.all(forward_batch.encoder_lens > 0)
+            self._encoder_lens_all_positive(forward_batch)
             if self.is_encoder_decoder
             else True
         )
@@ -732,7 +748,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
         is_encoder_lens_supported = (
-            torch.all(forward_batch.encoder_lens > 0)
+            self._encoder_lens_all_positive(forward_batch)
             if self.is_encoder_decoder
             else True
         )
