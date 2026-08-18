@@ -610,6 +610,9 @@ class ComposedPipelineBase(ABC):
                     module_name, load_module_name
                 )
             )
+            backend_by_role = server_args.resolve_component_backend_by_role(
+                module_name, load_module_name
+            )
             if attn_backend is not None:
                 logger.info(
                     "Using %s backend for component: %s",
@@ -626,6 +629,7 @@ class ComposedPipelineBase(ABC):
                 component_architecture=architecture,
                 component_attn_backend=attn_backend,
                 component_attn_name=matched_backend_key or module_name,
+                component_backend_by_role=backend_by_role,
             )
 
             self.memory_usages[module_name] = memory_usage
