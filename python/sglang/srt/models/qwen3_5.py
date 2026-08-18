@@ -218,6 +218,14 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     )
 
 
+def _hidden_states_num_tokens(hidden_states) -> int:
+    """Row count of ``hidden_states``, which the fused AR+quant path hands over
+    as a ``(fp8, scale)`` or ``(bf16, fp8, scale)`` tuple instead of a tensor."""
+    if isinstance(hidden_states, tuple):
+        return hidden_states[0].shape[0]
+    return hidden_states.shape[0]
+
+
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
         split_qkvgate_gemma_rmsnorm_rope,
@@ -803,7 +811,10 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and _hidden_states_num_tokens(hidden_states) > 0
+        ):
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
@@ -1207,7 +1218,10 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
+        if (
+            not forward_batch.forward_mode.is_idle()
+            and _hidden_states_num_tokens(hidden_states) > 0
+        ):
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
