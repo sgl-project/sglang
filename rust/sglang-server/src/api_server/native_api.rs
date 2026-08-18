@@ -46,6 +46,8 @@ use crate::utils::response::{error_response, error_value};
 /// API-only timestamps onto scheduler messages.
 #[derive(Clone, Debug)]
 struct RequestTiming {
+    // TODO: Move request lifecycle timing into a dedicated tracing/metrics
+    // module and align its design with Python's APIServerReqTimeStats.
     created_at: Instant,
     time_to_first_token: Option<Duration>,
     e2e_latency: Option<Duration>,
