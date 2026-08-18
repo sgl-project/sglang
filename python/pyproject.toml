@@ -17,7 +17,7 @@ classifiers = [
 # Please keep dependency lists in this file sorted alphabetically by package name.
 dependencies = [
   "aiohttp",
-  "anthropic>=0.20.0",
+  "anthropic>=0.20.0,<1",
   "apache-tvm-ffi==0.1.11",
   "av==16.1.0 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "blobfile==3.0.0",
