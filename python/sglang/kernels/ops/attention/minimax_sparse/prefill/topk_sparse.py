@@ -63,13 +63,7 @@ def _sparse_subk(block_size_k: int) -> int:
     # Configs that fail to compile on the target arch are skipped, so widening
     # the num_warps x num_stages grid only adds candidates, never a bad kernel.
     configs=[
-        # PORT: vLLM's tuned CDNA config for the sub-tiled kernel --
-        # num_warps=1 keeps one wave resident on the small per-sub-tile GEMM,
-        # matrix_instr_nonkdim=16 / kpack=2 select the MFMA_16x16 path, and
-        # num_stages=1 fits LDS. Passed via the kwargs dict (Triton's AMD backend
-        # consumes them as compile options, same as waves_per_eu in the MoE
-        # configs). Configs that fail to compile are skipped by the autotuner, so
-        # this is safe on non-CDNA.
+        # CDNA sub-tiled MFMA configs; unsupported configs are skipped.
         triton.Config(
             {"matrix_instr_nonkdim": 16, "kpack": 2}, num_warps=1, num_stages=1
         ),

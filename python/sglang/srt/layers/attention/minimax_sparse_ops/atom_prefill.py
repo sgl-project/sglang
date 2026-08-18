@@ -1,32 +1,14 @@
 # Copyright 2025 SGLang Team
-"""Experimental ATOM-style MiniMax-M3 sparse prefill.
+"""MiniMax-M3 sparse prefill using AITER's Gluon paged attention.
 
-This is intentionally narrow and env-gated. It replaces only the main sparse
-attention step after SGLang has already produced ``topk_idx`` with the index
-attention path. The implementation builds the sparse page table that ATOM feeds
-into AITER's Gluon paged-attention kernel, then treats each prefill query token
-as an independent length-1 decode sequence.
-
-DEVIATION from the source port (alexsun07/sglang ``m3-atom-prefill-port``,
-commits 1d5282863c + 6f1821cfe0 + 1185d5ca88): the source requires the KV pool
-to be allocated with ``--page-size`` equal to the Gluon page size (16 or 64) so
-its vectorized_5d K/V buffer is fed to the kernel as a zero-copy view. Here the
-main KV pool MUST stay NHD ``[max_slots, 1, head_dim]`` (a pool-wide 5D switch
-tanked decode), so instead, per sparse layer and per prefill forward, the
-per-request context span (cached prefix + current chunk; the chunk's K/V are
-written to the pool by the rope+cache step BEFORE main attention runs) is
-gathered from the NHD pool into a persistent scratch buffer laid out as SHUFFLE
-5D pages of ``GLUON_PAGE_SIZE`` tokens:
+The main KV pool remains NHD ``[max_slots, 1, head_dim]``. Each request's
+context is gathered into persistent SHUFFLE 5D scratch pages:
 
 - key scratch:   [num_pages, 1, head_dim // x, GLUON_PAGE_SIZE, x]
 - value scratch: [num_pages, 1, GLUON_PAGE_SIZE // x, head_dim, x] (transposed)
 
-with ``x = 16 // dtype.itemsize`` (8 for bf16/fp16), exactly the layouts
-``pa_decode_gluon`` asserts. Each request's context occupies a contiguous,
-position-ordered run of scratch pages (rounded up to whole 128-token sparse
-blocks), so the per-query-token block table is pure arithmetic:
-``page_start[req] + block_id * pages_per_block + j`` -- no req_to_token lookup
-in the builder (the gather kernel does the slot indirection once).
+with ``x = 16 // dtype.itemsize``. Each request occupies a contiguous,
+position-ordered page range rounded up to whole sparse blocks.
 """
 
 from __future__ import annotations
@@ -59,10 +41,7 @@ _PAGE_ELEMS = HEAD_DIM * GLUON_PAGE_SIZE
 _MAX_SCRATCH_PAGES = (512 * 1024 * 1024) // (_PAGE_ELEMS * 2)
 
 
-# ---------------------------------------------------------------------------
-# NHD pool -> SHUFFLE 5D scratch gather. DEVIATION: no counterpart in the
-# source port, which reads the vectorized_5d pool zero-copy.
-# ---------------------------------------------------------------------------
+# NHD pool -> SHUFFLE 5D scratch gather.
 
 
 @triton.jit
@@ -242,10 +221,7 @@ def _build_atom_sparse_bt_prefill_kernel(
     earlier_full = tl.cumsum(is_full.to(tl.int32), axis=0) - is_full.to(tl.int32)
     sparse_slot = tl.where(is_full, earlier_full, n_full)
 
-    # DEVIATION (scratch-page addressing): scratch pages of one request are
-    # contiguous and position-ordered (and the span is rounded up to whole
-    # sparse blocks), so block -> pages is pure arithmetic; the source port
-    # looks up req_to_token at every page boundary instead.
+    # Scratch pages for each request are contiguous and position-ordered.
     dst_base = sparse_slot * pages_per_block
     for j in tl.static_range(0, pages_per_block):
         phys_page = base_page + blk * pages_per_block + j
@@ -404,11 +380,8 @@ def can_use_atom_prefill(
         or block_size_k != SPARSE_BLOCK_SIZE
     ):
         return False
-    # DEVIATION (NHD gather + this tree's fp8 attn-GEMM plumbing): require the
-    # NHD main pool [max_slots, num_kv_heads=1, head_dim=128], bf16/fp16 with
-    # unit scales (fp8 attn-GEMM / calibrated caches stay on the Triton path),
-    # innermost dim contiguous (the gather kernel assumes it). The source port
-    # instead requires its vectorized_5d pool with page size in {16, 64}.
+    # The gather requires a contiguous, single-head NHD pool. Calibrated and
+    # unsupported cache formats stay on the Triton path.
     return (
         q.dim() == 3
         and q.shape[-1] == HEAD_DIM
@@ -456,8 +429,7 @@ def atom_gluon_sparse_prefill(
 
     q = q.contiguous()
     total_q, num_q_heads, head_dim = q.shape
-    # DEVIATION (raise/fallback instead of the source tree's asserts): guard the
-    # empty launch and the runtime shapes the static gate cannot see.
+    # Guard runtime shapes that the static gate cannot validate.
     if total_q == 0:
         return torch.empty_like(q)
     if topk_idx.shape[0] != 1 or topk_idx.shape[1] != total_q:
@@ -482,10 +454,7 @@ def atom_gluon_sparse_prefill(
             f"> cap {_MAX_SCRATCH_PAGES}"
         )
 
-    # DEVIATION (NHD pool): rebind k_cache/v_cache to the gathered SHUFFLE 5D
-    # scratch views; the source port feeds the pool itself zero-copy. Per layer
-    # (never cached): the pool contents differ per layer. Prefix + current
-    # chunk are both in the pool at this point (rope+cache runs first).
+    # Gather the current layer's prefix and current chunk into SHUFFLE 5D views.
     k_cache, v_cache = _gather_context_to_shuffle(
         k_cache,
         v_cache,
@@ -504,16 +473,6 @@ def atom_gluon_sparse_prefill(
     out = torch.empty_like(q)
     num_seqs = total_q
     ctx_part = 256
-    # max_context_partition_num is a PARALLELISM/split knob, not a coverage
-    # requirement: the gluon kernel loops over the full context internally, so a
-    # single partition still attends the whole sparse_ctx. Verified with a
-    # standalone mini-bench -- max_part=1 matches full-coverage output at
-    # ctx=2048 and 4096 (rel diff = bf16 noise, no OOB/crash). ATOM sizes it with
-    # get_recommended_splits alone. An earlier needed_parts floor
-    # (ceil(max_sparse_ctx/256), up to 8) over-split large-ctx chunked-prefill
-    # batches, adding ~400us of empty-partition launch overhead per extra split
-    # (3433us vs 1013us/launch at num_seqs=16384), and needed a GPU->CPU sync per
-    # sparse layer to compute. Match ATOM: rec_splits only.
     max_part_num = get_recommended_splits(num_seqs, 1)
     intermediate_shape = (num_seqs, 1, max_part_num, num_q_heads)
     exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)

@@ -283,18 +283,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         self.dense_backend: Optional[AttentionBackend] = None
 
-        self.index_topk_freq = (
-            max(int(envs.SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ.get()), 1)
-            if is_hip() and not is_tbo_enabled()
-            else 1
-        )
+        # Each pair of sparse layers shares one top-k result. The sharing changes
+        # which KV blocks the skip layers attend, so it is applied on ROCm only
+        # (and never under two-batch overlap); elsewhere every layer computes its
+        # own top-k.
+        self.index_topk_freq = 2 if is_hip() and not is_tbo_enabled() else 1
         self.index_cache_enabled = self.index_topk_freq > 1
-        # Persistent per-bs device buffer for decode top-k reuse. CUDA-graph safe: alloc eager outside capture; the
-        # captured graph only copy_()s into / reads from a fixed address.
+        # Persistent per-bs device buffer for decode top-k reuse. Allocated eagerly
+        # outside CUDA-graph capture; the captured graph only copies into and reads
+        # from a fixed address.
         self._decode_topk_buf: dict = {}
-        # Opt-in prefill skip-layer index elision (default off). Effective only when the elision is safe; see
-        # prefill_skip_index_elision().
-        self._prefill_skip_index = envs.SGLANG_OPT_USE_PREFILL_SKIP_INDEX.get()
         self._topk_group_of_layer: dict[int, int] = {}
         self._topk_is_source: dict[int, bool] = {}
         for ordinal, lid in enumerate(
@@ -1284,46 +1282,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         layer_ids = forward_batch.minimax_m3_precached_sparse_layers
         return layer_ids is not None and layer_id in layer_ids
 
-    def index_topk_skipped(self, layer_id: int, disable_value: bool) -> bool:
-        """Whether this sparse layer reuses another layer's top-k (index cache).
-
-        When True, the layer never runs the indexer (no flash-index attention,
-        no top-k), so its index Q/K norm+rope is dead work the model can skip.
-        Only valid for disable_value layers (idx_o is None there). Prefill-only:
-        decode always computes its own top-k, so callers must gate on is_extend.
-        """
-        return (
-            self.index_cache_enabled
-            and disable_value
-            and not self._topk_is_source.get(layer_id, True)
-        )
-
-    def prefill_skip_index_elision(self, layer_id: int, disable_value: bool) -> bool:
-        """PORT (dfd35ad2a8, prefill half): whether this layer's prefill may drop
-        the index arms of the fused rope+cache kernel (no idx_q/idx_k norm+rope
-        and, crucially, NO idx-K cache write).
-
-        Eliding the idx-K write is safe iff this layer's idx-K cache is never
-        read afterwards. That holds only when ALL of:
-          * SGLANG_OPT_USE_PREFILL_SKIP_INDEX is set (opt-in gate);
-          * the layer is an index-topk skip layer (freq > 1, disable_value,
-            non-source ordinal): in prefill -- including every later chunk of a
-            chunked prefill -- forward_extend feeds it the group source layer's
-            per-forward cached top-k, so the indexer (which is the only idx-K
-            reader) never runs on this layer; a cache miss raises instead of
-            recomputing (see forward_extend);
-          * decode skip layers reuse the source layer's top-k buffer instead of
-            recomputing from their own idx-K history;
-          * the dense-sparse decode path is off: it bypasses decode top-k reuse
-            (attn_fn is non-None in forward_decode), which would make decode
-            skip layers read their own (elided) idx-K.
-        """
-        return (
-            self._prefill_skip_index
-            and not self.use_dense_sparse_decode
-            and self.index_topk_skipped(layer_id, disable_value)
-        )
-
     def forward(
         self,
         q,
@@ -1534,21 +1492,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 else:
                     cached_topk_idx = self._topk_cache.get(group)
                     # Miss (e.g. source layer chunked differently) -> recompute safely.
-                    # Unless index elision is
-                    # active for this layer -- then its idx_q was never computed and
-                    # its idx-K cache never written, so recomputing the top-k here
-                    # would silently use garbage. The group source layer runs
-                    # earlier in the same forward and populates the cache, so this
-                    # is normally unreachable; fail loudly instead of corrupting.
-                    if cached_topk_idx is None and self.prefill_skip_index_elision(
-                        layer.layer_id, disable_value
-                    ):
-                        raise RuntimeError(
-                            "MiniMaxSparse: prefill top-k cache miss for skip layer "
-                            f"{layer.layer_id} while SGLANG_OPT_USE_PREFILL_SKIP_INDEX "
-                            "index elision is active; cannot recompute top-k from "
-                            "an elided idx-K cache."
-                        )
 
             result = minimax_sparse_prefill(
                 q,
@@ -1742,22 +1685,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     _want_topk = True
                 else:
                     _cached_topk = _topk_buf
-            # If prefill index elision was active
-            # for this layer, its idx-K history has holes, so decode must never
-            # recompute its own top-k. Guard the fallthrough (e.g. missing per-bs
-            # reuse buffer) loudly instead of silently reading garbage idx-K.
-            if (
-                _cached_topk is None
-                and not _want_topk
-                and q.shape[0] > 0
-                and self.prefill_skip_index_elision(layer.layer_id, disable_value)
-            ):
-                raise RuntimeError(
-                    "MiniMaxSparse: decode would recompute top-k for skip layer "
-                    f"{layer.layer_id} from its idx-K cache, but "
-                    "SGLANG_OPT_USE_PREFILL_SKIP_INDEX elided its prefill idx-K writes "
-                    f"(bs={q.shape[0]}, reuse_buf_ready={_topk_buf is not None})."
-                )
 
             result = minimax_sparse_decode(
                 q,

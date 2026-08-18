@@ -487,11 +487,8 @@ def _index_block_score_only_kernel(
 ):
     """Score-only variant of the index attention (ATOM-style).
 
-    Computes, per (query token, KV block), the causal max of idx_q . index_k --
-    the block scores the top-k selection needs -- WITHOUT the index-value
-    attention output (idx_o). Used for disable_index_value source layers, where
-    idx_o is unused. Minimal registers (no acc_o/sink/lse) -> faster than the
-    full flash-attention _flash_attn_fwd_with_block_score_kernel.
+    Computes the causal maximum index score for each query token and KV block
+    without producing the index-value attention output.
 
     With ``PER_PAGE_SLOTS`` K addressing is PER-PAGE (ATOM-style): a sparse block
     of ``block_size`` tokens spans ``block_size // page_size`` physical pages, and
@@ -693,9 +690,7 @@ def flash_prefill_with_topk_index(
         and k_scale == 1.0
         and block_size_k % page_size == 0
     ):
-        # Source layers never use idx_o, so run the minimal
-        # score-only kernel (~1.6x faster) with per-page K addressing
-        # (bit-exact topk; -8.4% more at page_size>1).
+        # Source layers do not use idx_o, so run the score-only kernel.
         _index_block_score_only_kernel[grid](
             q,
             k_cache,
