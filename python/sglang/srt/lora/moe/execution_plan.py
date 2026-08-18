@@ -432,7 +432,13 @@ class MoeLoraExecutionPlan:
         # provider capability, checked in MoeLoraRunner.validate_plan.
         return self.down_b is not None and self.late_overlap is LateOverlap.NONE
 
-    def _route_requirements_unchecked(self) -> frozenset[RouteRequirement]:
+    def route_requirements(self) -> frozenset[RouteRequirement]:
+        """Return the exact union of route products consumed by this plan.
+
+        Deliberately does not validate: build_routes calls this per forward
+        per layer, and the plan and every nested stage are frozen dataclasses
+        whose __post_init__ already proved the whole dependency graph.
+        """
         requirements: set[RouteRequirement] = set()
         for stage in (self.gate_up_a, self.gate_up_b, self.down_a, self.down_b):
             if stage is not None:
@@ -440,15 +446,6 @@ class MoeLoraExecutionPlan:
         requirements.update(self.middle.route_requirements())
         requirements.update(self.finalize.route_requirements())
         return frozenset(requirements)
-
-    def route_requirements(self) -> frozenset[RouteRequirement]:
-        """Return the exact union of route products consumed by this plan."""
-
-        # The plan and every nested stage are frozen dataclasses, and
-        # __post_init__ validates the complete dependency graph. Re-running
-        # that proof at each call site would charge immutable plan validation
-        # multiple times per layer/forward.
-        return self._route_requirements_unchecked()
 
 
 # ---------------------------------------------------------------------------
