@@ -43,6 +43,9 @@ _QWEN3_5_HYBRID_VLM_ARCHITECTURES = frozenset(
         "Qwen3_5ForConditionalGeneration",
     }
 )
+_QWEN3_5_MOE_HYBRID_VLM_ARCHITECTURES = frozenset(
+    {"Qwen3_5MoeForConditionalGeneration"}
+)
 _QWEN3_MOE_ARCHITECTURES = frozenset({"Qwen3MoeForCausalLM"})
 _SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
 
@@ -64,6 +67,10 @@ def _get_canonical_model_class(architecture: str):
         from sglang.srt.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 
         return Qwen3_5ForConditionalGeneration
+    if architecture == "Qwen3_5MoeForConditionalGeneration":
+        from sglang.srt.models.qwen3_5 import Qwen3_5MoeForConditionalGeneration
+
+        return Qwen3_5MoeForConditionalGeneration
     if architecture == "Qwen3MoeForCausalLM":
         from sglang.srt.models.qwen3_moe import Qwen3MoeForCausalLM
 
@@ -83,6 +90,7 @@ class StartupWeightLoadState(str, enum.Enum):
 class StartupWeightLoadProfile(str, enum.Enum):
     NATIVE_DENSE = "native_dense"
     QWEN3_5_HYBRID_VLM = "qwen3_5_hybrid_vlm"
+    QWEN3_5_MOE_HYBRID_VLM = "qwen3_5_moe_hybrid_vlm"
     QWEN3_MOE_EP = "qwen3_moe_ep"
 
 
@@ -214,6 +222,8 @@ def _get_startup_weight_load_profile(
         return StartupWeightLoadProfile.NATIVE_DENSE
     if architecture in _QWEN3_5_HYBRID_VLM_ARCHITECTURES:
         return StartupWeightLoadProfile.QWEN3_5_HYBRID_VLM
+    if architecture in _QWEN3_5_MOE_HYBRID_VLM_ARCHITECTURES:
+        return StartupWeightLoadProfile.QWEN3_5_MOE_HYBRID_VLM
     if architecture in _QWEN3_MOE_ARCHITECTURES:
         return StartupWeightLoadProfile.QWEN3_MOE_EP
     return None
@@ -231,6 +241,84 @@ def _get_profile_rejections(
     linear_attn_prefill_backend = (
         options.linear_attn_prefill_backend or options.linear_attn_backend
     )
+
+    def ep_moe_rules(*, family: str, tp_size: int, ep_size: int):
+        return (
+            (
+                "tensor_parallelism",
+                options.tp_size != tp_size,
+                f"{family} startup overlap requires TP{tp_size}",
+            ),
+            (
+                "dtype",
+                model_config.dtype != torch.bfloat16,
+                f"{family} startup overlap requires BF16",
+            ),
+            (
+                "quantization",
+                model_config.quantization is not None,
+                "quantization is not supported",
+            ),
+            (
+                "modelopt",
+                bool(getattr(model_config, "modelopt_quant", False)),
+                "ModelOpt is not supported",
+            ),
+            (
+                "expert_parallelism",
+                options.ep_size != ep_size,
+                f"{family} startup overlap requires EP{ep_size}",
+            ),
+            (
+                "moe_data_parallelism",
+                options.moe_dp_size != 1,
+                "MoE data parallelism is not supported",
+            ),
+            (
+                "moe_a2a_backend",
+                options.moe_a2a_backend != "none",
+                f"{family} startup overlap requires the standard EP path",
+            ),
+            (
+                "moe_runner_backend",
+                options.moe_runner_backend != "triton",
+                f"{family} startup overlap requires the Triton MoE runner",
+            ),
+            (
+                "dp_attention",
+                options.enable_dp_attention,
+                "DP attention is not supported",
+            ),
+            (
+                "two_batch_overlap",
+                options.enable_two_batch_overlap,
+                "two-batch overlap is not supported",
+            ),
+            (
+                "eplb",
+                options.enable_eplb,
+                "EPLB is not supported",
+            ),
+            (
+                "redundant_experts",
+                options.ep_num_redundant_experts != 0,
+                "redundant experts are not supported",
+            ),
+            (
+                "expert_placement",
+                options.init_expert_location != "trivial",
+                "non-trivial expert placement is not supported",
+            ),
+            (
+                "elastic_expert_parallelism",
+                options.elastic_ep_backend is not None
+                or options.enable_elastic_expert_backup
+                or options.ep_join_mode is not None
+                or options.max_ep_size is not None,
+                "elastic expert parallelism is not supported",
+            ),
+        )
+
     if profile == StartupWeightLoadProfile.NATIVE_DENSE:
         rules = (
             (
@@ -323,81 +411,46 @@ def _get_profile_rejections(
                 "Qwen3.5-family hybrid VLM startup overlap does not support full prefill CUDA graphs",
             ),
         )
+    elif profile == StartupWeightLoadProfile.QWEN3_5_MOE_HYBRID_VLM:
+        rules = ep_moe_rules(
+            family="Qwen3.5 MoE hybrid VLM",
+            tp_size=2,
+            ep_size=2,
+        ) + (
+            (
+                "multimodal",
+                not model_config.is_multimodal,
+                "Qwen3.5 MoE hybrid VLM startup overlap requires multimodal execution",
+            ),
+            (
+                "encoder_only",
+                bool(getattr(model_config.hf_config, "encoder_only", False)),
+                "encoder-only execution is not supported",
+            ),
+            (
+                "language_only",
+                bool(getattr(model_config.hf_config, "language_only", False)),
+                "language-only encoder disaggregation is not supported",
+            ),
+            (
+                "language_model_only",
+                bool(getattr(model_config.hf_config, "language_model_only", False)),
+                "language-model-only execution is not supported",
+            ),
+            (
+                "linear_attention_backend",
+                linear_attn_decode_backend != "triton"
+                or linear_attn_prefill_backend != "triton",
+                "Qwen3.5 MoE hybrid VLM startup overlap requires Triton linear attention",
+            ),
+            (
+                "full_prefill_cuda_graph",
+                options.prefill_cuda_graph_backend == Backend.FULL,
+                "Qwen3.5 MoE hybrid VLM startup overlap does not support full prefill CUDA graphs",
+            ),
+        )
     elif profile == StartupWeightLoadProfile.QWEN3_MOE_EP:
-        rules = (
-            (
-                "tensor_parallelism",
-                options.tp_size != 2,
-                "Qwen3 MoE startup overlap requires TP2",
-            ),
-            (
-                "dtype",
-                model_config.dtype != torch.bfloat16,
-                "Qwen3 MoE startup overlap requires BF16",
-            ),
-            (
-                "quantization",
-                model_config.quantization is not None,
-                "quantization is not supported",
-            ),
-            (
-                "modelopt",
-                bool(getattr(model_config, "modelopt_quant", False)),
-                "ModelOpt is not supported",
-            ),
-            (
-                "expert_parallelism",
-                options.ep_size != 2,
-                "Qwen3 MoE startup overlap requires EP2",
-            ),
-            (
-                "moe_data_parallelism",
-                options.moe_dp_size != 1,
-                "MoE data parallelism is not supported",
-            ),
-            (
-                "moe_a2a_backend",
-                options.moe_a2a_backend != "none",
-                "Qwen3 MoE startup overlap requires the standard EP path",
-            ),
-            (
-                "moe_runner_backend",
-                options.moe_runner_backend != "triton",
-                "Qwen3 MoE startup overlap requires the Triton MoE runner",
-            ),
-            (
-                "dp_attention",
-                options.enable_dp_attention,
-                "DP attention is not supported",
-            ),
-            (
-                "two_batch_overlap",
-                options.enable_two_batch_overlap,
-                "two-batch overlap is not supported",
-            ),
-            (
-                "eplb",
-                options.enable_eplb,
-                "EPLB is not supported",
-            ),
-            (
-                "redundant_experts",
-                options.ep_num_redundant_experts != 0,
-                "redundant experts are not supported",
-            ),
-            (
-                "expert_placement",
-                options.init_expert_location != "trivial",
-                "non-trivial expert placement is not supported",
-            ),
-            (
-                "elastic_expert_parallelism",
-                options.elastic_ep_backend is not None
-                or options.enable_elastic_expert_backup
-                or options.ep_join_mode is not None
-                or options.max_ep_size is not None,
-                "elastic expert parallelism is not supported",
-            ),
+        rules = ep_moe_rules(family="Qwen3 MoE", tp_size=2, ep_size=2) + (
             (
                 "multimodal",
                 model_config.is_multimodal,

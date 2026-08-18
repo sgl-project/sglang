@@ -139,6 +139,20 @@ def _make_qwen35_hybrid_vlm_model_config(**overrides):
     return _make_model_config(**values)
 
 
+def _make_qwen35_moe_hybrid_vlm_model_config(**overrides):
+    values = dict(
+        hf_config=SimpleNamespace(
+            architectures=["Qwen3_5MoeForConditionalGeneration"],
+            encoder_only=False,
+            language_only=False,
+            language_model_only=False,
+        ),
+        is_multimodal=True,
+    )
+    values.update(overrides)
+    return _make_model_config(**values)
+
+
 def _make_qwen3_moe_model_config(**overrides):
     values = dict(
         hf_config=SimpleNamespace(architectures=["Qwen3MoeForCausalLM"]),
@@ -487,6 +501,85 @@ class TestStartupWeightLoadSelector(CustomTestCase):
                     prefill_cuda_graph_backend=Backend.FULL,
                 ),
                 _make_qwen35_hybrid_vlm_model_config(),
+                "does not support full prefill CUDA graphs",
+            ),
+        )
+        for name, options, model_config, reason in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, re.escape(reason)):
+                    self._create(options=options, model_config=model_config)
+
+    def test_qwen35_moe_hybrid_vlm_profile_is_admitted(self):
+        manager = self._create(
+            options=_make_options(
+                tp_size=2,
+                ep_size=2,
+                prefill_cuda_graph_backend=Backend.BREAKABLE,
+            ),
+            model_config=_make_qwen35_moe_hybrid_vlm_model_config(),
+        )
+
+        self.assertEqual(
+            manager._plan.profile,
+            StartupWeightLoadProfile.QWEN3_5_MOE_HYBRID_VLM,
+        )
+
+    def test_qwen35_moe_hybrid_vlm_profile_rejects_near_misses(self):
+        cases = (
+            (
+                "tp4",
+                _make_options(
+                    tp_size=4,
+                    ep_size=2,
+                    prefill_cuda_graph_backend=Backend.BREAKABLE,
+                ),
+                _make_qwen35_moe_hybrid_vlm_model_config(),
+                "requires TP2",
+            ),
+            (
+                "tp_only",
+                _make_options(
+                    tp_size=2,
+                    prefill_cuda_graph_backend=Backend.BREAKABLE,
+                ),
+                _make_qwen35_moe_hybrid_vlm_model_config(),
+                "requires EP2",
+            ),
+            (
+                "quantized",
+                _make_options(
+                    tp_size=2,
+                    ep_size=2,
+                    prefill_cuda_graph_backend=Backend.BREAKABLE,
+                ),
+                _make_qwen35_moe_hybrid_vlm_model_config(quantization="fp8"),
+                "quantization is not supported",
+            ),
+            (
+                "text_only",
+                _make_options(
+                    tp_size=2,
+                    ep_size=2,
+                    prefill_cuda_graph_backend=Backend.BREAKABLE,
+                ),
+                _make_qwen35_moe_hybrid_vlm_model_config(is_multimodal=False),
+                "requires multimodal execution",
+            ),
+            (
+                "flashinfer_linear_attention",
+                _make_options(
+                    tp_size=2,
+                    ep_size=2,
+                    linear_attn_backend="flashinfer",
+                    prefill_cuda_graph_backend=Backend.BREAKABLE,
+                ),
+                _make_qwen35_moe_hybrid_vlm_model_config(),
+                "requires Triton linear attention",
+            ),
+            (
+                "full_prefill_cuda_graph",
+                _make_options(tp_size=2, ep_size=2),
+                _make_qwen35_moe_hybrid_vlm_model_config(),
                 "does not support full prefill CUDA graphs",
             ),
         )
@@ -1408,8 +1501,8 @@ class TestModelStorageManifest(CustomTestCase):
         for case, name, value, error_type, message in cases:
             with self.subTest(case=case):
                 model = _DerivedTensorModel()
-                model.named_startup_weight_load_derived_tensors = lambda: (
-                    (name, value),
+                model.named_startup_weight_load_derived_tensors = (
+                    lambda name=name, value=value: ((name, value),)
                 )
 
                 with self.assertRaisesRegex(error_type, message):
