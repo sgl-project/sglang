@@ -1535,16 +1535,12 @@ class DeepseekV4AttnBackend(
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Resolve the SWA KV-store write target for the current forward.
 
-        Fast path: the per-forward value cached by the metadata init — in-graph
-        for decode/verify (recorded inside cuda graphs, so replay re-reads live
-        buffers), out-graph for draft-extend (the hoisted
-        cuda_graph_swa_out_cache_loc buffer). Fallback: translate at store time,
-        matching the pre-cache behavior, for paths that never cache it — eager
-        idle (forward_idle skips attn init), draft-extend without the hoisted
-        buffer (eager / oversized) — or whose batch was re-padded after init
-        (shape mismatch). Idle always falls back: its metadata is absent or
-        left over from a previous forward, and translating the zero-padded
-        out_cache_loc writes to the dummy slot.
+        Prefer the value cached by the metadata init: in-graph for
+        decode/verify, the hoisted cuda_graph_swa_out_cache_loc buffer for
+        draft-extend. Translate at store time when nothing matching is cached
+        (eager paths without the init or the buffer, or a batch re-padded
+        after init). Idle always falls back: its metadata may be stale, and
+        translating the zero-padded out_cache_loc writes to the dummy slot.
         """
         out_cache_loc = forward_batch.out_cache_loc
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
