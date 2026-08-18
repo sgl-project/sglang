@@ -714,6 +714,7 @@ class ServerArgs:
             ),
             choices=["nvfp4", "mxfp4"],
         ),
+        NS("model"),
     ] = "mxfp4"
     enable_fp32_lm_head: A[
         bool, "If set, the LM head outputs (logits) are in FP32.", NS("exec.features")
