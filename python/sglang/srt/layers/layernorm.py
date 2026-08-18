@@ -27,6 +27,7 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.quantization.fp8_utils import MXFP8_DENSE_PTPC_DECODE_MAX_M
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -138,9 +139,7 @@ if _is_hip:
     except ImportError:
         _has_rocm_triton_gemma_rms_norm = False
 
-_FUSE_NORM_FP8_MAX_M = (
-    envs.SGLANG_OPT_MXFP8_DENSE_PTPC_DECODE_M.get() if is_gfx95_supported() else 0
-)
+_FUSE_NORM_FP8_MAX_M = MXFP8_DENSE_PTPC_DECODE_MAX_M if is_gfx95_supported() else 0
 
 if _is_cuda:
     # HF-semantics RMSNorm kernel (JIT-compiled).  Used when `cast_x_before_out_mul=True`

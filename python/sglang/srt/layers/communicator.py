@@ -60,6 +60,7 @@ from sglang.srt.layers.moe import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    MXFP8_DENSE_PTPC_DECODE_MAX_M,
     _use_aiter_bpreshuffle_gfx95,
     materialize_bpreshuffle_fp8_scale_tuple,
 )
@@ -94,9 +95,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
-_fuse_norm_fp8_max_m = (
-    envs.SGLANG_OPT_MXFP8_DENSE_PTPC_DECODE_M.get() if _is_gfx95_supported else 0
-)
+_fuse_norm_fp8_max_m = MXFP8_DENSE_PTPC_DECODE_MAX_M if _is_gfx95_supported else 0
 
 
 def _fuse_norm_fp8_quant(hidden_states: torch.Tensor) -> bool:

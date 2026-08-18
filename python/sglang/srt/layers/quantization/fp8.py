@@ -660,11 +660,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 convert_mxfp8_weight_to_block_fp8,
             )
 
-            use_ptpc = (
-                envs.SGLANG_OPT_MXFP8_DENSE_PTPC_DECODE_M.get() > 0
-                and _is_gfx95_supported
-            )
-            if use_ptpc:
+            if _is_gfx95_supported:
                 from sglang.srt.layers.quantization.mxfp8_block_convert import (
                     dequant_mxfp8_2d_to_bf16,
                 )
@@ -678,7 +674,7 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight = Parameter(qweight, requires_grad=False)
             # Small-M fast-path weights, consumed by aiter_w8a8_block_fp8_linear;
             # attrs survive the later in-place bpreshuffle (copy_ keeps the object).
-            if use_ptpc:
+            if _is_gfx95_supported:
                 w32 = bf16_weight.float()
                 row_scale = w32.abs().amax(dim=1, keepdim=True).clamp(min=1e-12) / 448.0
                 layer.weight._ptpc_weight = shuffle_weight(
