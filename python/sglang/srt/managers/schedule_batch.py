@@ -3,6 +3,7 @@ from __future__ import annotations
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import (
+    get_disagg,
     get_exec,
     get_schedule,
     get_serving,
@@ -97,9 +98,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.common import (
+    RetractionBackup,
     evict_from_tree_cache,
     free_swa_out_of_window_slots,
     release_kv_cache,
+    retraction_backup,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -878,6 +881,7 @@ class Req(ReqDllmMixin):
         # For req-level memory management
         self.kv_committed_len = 0
         self.kv: Optional[ReqKvInfo] = None
+        self.retraction_backup: Optional[RetractionBackup] = None
 
         # for cross-encoder model
         self.token_type_ids = token_type_ids
@@ -1712,19 +1716,24 @@ class Req(ReqDllmMixin):
             self.req_pool_idx, : self.seqlen - 1
         ]
         # Copies over both the kv cache and mamba state if available
-        self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
-            token_indices, mamba_indices=self.mamba_pool_idx
+        self.retraction_backup = RetractionBackup(
+            cpu_tensors=token_to_kv_pool_allocator.get_cpu_copy(
+                token_indices, mamba_indices=self.mamba_pool_idx
+            )
         )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+        assert self.retraction_backup is not None
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
         # Loads both the kv cache and mamba state if exists
         token_to_kv_pool_allocator.load_cpu_copy(
-            self.kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
+            self.retraction_backup.cpu_tensors,
+            token_indices,
+            mamba_indices=self.mamba_pool_idx,
         )
-        del self.kv_cache_cpu
+        self.retraction_backup = None
 
     def build_rebootstrap_payload(self) -> dict:
         """Build the prefill ``/generate`` payload that asks the original prefill
@@ -1914,7 +1923,13 @@ def release_req(
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
     if server_args.disaggregation_mode == "decode" and offload_kv:
-        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+        retraction_backup(
+            req,
+            tree_cache,
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+            get_disagg().disaggregation_decode_retraction_backup,
+        )
     # TODO (csy): for preempted requests, we may want to insert into the tree
     release_kv_cache(req, tree_cache, is_insert=False)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
@@ -2834,7 +2849,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
             reqs_to_abort.append(last_req)
-            self.release_req(last_idx, 0, server_args)
+            self.release_req(last_idx, 0, server_args, offload_kv=False)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -2889,7 +2904,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         return sorted_indices
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+    def release_req(
+        self,
+        idx: int,
+        remaing_req_count: int,
+        server_args: ServerArgs,
+        offload_kv: bool = True,
+    ):
         release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
@@ -2898,6 +2919,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            offload_kv=offload_kv,
         )
 
     def prepare_encoder_info_decode(self):
