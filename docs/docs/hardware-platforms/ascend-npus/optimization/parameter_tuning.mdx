@@ -767,6 +767,8 @@ Captures the compute graph on NPU and replays it to eliminate kernel launch over
 
 Reduces per-token latency by predicting multiple future tokens in a single forward pass, then verifying them against the model. Ascend supports `NEXTN` (for DeepSeek models, using the model's own hidden states) and `EAGLE3` (for Qwen MoE models, using a separate draft model). Controlled by `--speculative-num-steps`, `--speculative-eagle-topk`, and `--speculative-num-draft-tokens`. On Ascend, `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1` enables the optimized overlap scheduler for speculative decoding.
 
+For non-greedy requests, Ascend target verification applies request-level `temperature`, `top_k`, and `top_p`. The default target-only mode supports linear and tree-shaped candidates. Classic rejection sampling is available with `--speculative-use-rejection-sampling` for linear chains configured with `--speculative-eagle-topk 1`.
+
 ### PrefixCache (`--disable-radix-cache`)
 
 Reuses KV cache across requests that share common prompt prefixes (Radix Cache), reducing repeated prefill computation and lowering time-to-first-token. Enabled by default; disable with `--disable-radix-cache` when prefix reuse is not expected (e.g., dedicated prefill nodes in PD disaggregation, or random-input benchmarks).

@@ -726,7 +726,7 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+    if sampling_info.is_all_greedy or _is_cpu or _is_hip or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -756,17 +756,31 @@ def eagle_sample(
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
     else:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
-
-        from sglang.kernels.ops.speculative.reject_sampling import (
-            chain_speculative_sampling_triton,
-        )
-
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+
+        if _is_npu:
+            from sgl_kernel_npu.sample import (
+                chain_speculative_sampling_triton,
+                top_k_renorm_prob,
+                top_p_renorm_prob,
+                tree_speculative_sampling_target_only,
+            )
+        else:
+            from sgl_kernel import (
+                top_k_renorm_prob,
+                top_p_renorm_prob,
+                tree_speculative_sampling_target_only,
+            )
+
+            from sglang.kernels.ops.speculative.reject_sampling import (
+                chain_speculative_sampling_triton,
+            )
+
+        sampling_fn = (
+            chain_speculative_sampling_triton
+            if use_rejection_sampling
+            else tree_speculative_sampling_target_only
+        )
 
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
@@ -777,6 +791,7 @@ def eagle_sample(
             next_token_logits / expanded_temperature, dim=-1
         )  # (bs * num_draft_tokens, vocab_size)
         maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+
         if sampling_info.need_top_k_sampling:
             target_probs = top_k_renorm_prob(
                 target_probs,
@@ -819,11 +834,6 @@ def eagle_sample(
             device=device,
         )
 
-        sampling_fn = (
-            chain_speculative_sampling_triton
-            if use_rejection_sampling
-            else tree_speculative_sampling_target_only
-        )
         sampling_fn(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable
