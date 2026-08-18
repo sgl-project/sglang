@@ -381,20 +381,14 @@ ARG BUILD_TYPE=all
 # pip install RUN so it does not affect AITER, sgl-model-gateway, TileLang, FHT, MORI, etc.
 ARG SETUPTOOLS_SCM_PRETEND_VERSION
 
-# Single source for the torchao pin: the install below and the rocm724 gate that
-# asserts it both read this. python/pyproject_other.toml carries the same pin as
-# the package-level dependency; keep the two in step when bumping.
-ARG TORCHAO_VERSION=0.9.0
-
 RUN pip install IPython \
     && pip install orjson \
     && pip install python-multipart \
-    && pip install torchao=="${TORCHAO_VERSION}" \
     && pip install pybind11
 
 # Rust toolchain — needed by setuptools-rust to build the sglang-mm extension
-# (sglang.srt.multimodal._core) during the sglang pip install below, and later by
-# sgl-model-gateway. Must precede the sglang install.
+# (sglang.srt.rust_extensions._multimodal) during the sglang pip install below
+# and later by sgl-model-gateway. Must precede the sglang install.
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
     && rustc --version && cargo --version
@@ -456,7 +450,7 @@ RUN python -m pip cache purge
 
 RUN if [ "${GPU_ARCH##*-}" = "rocm724" ]; then \
       python3 -m pip check \
-      && python3 -c "import importlib.metadata as m; import torch, torchao, torchaudio, torchvision, triton; expected={'torch':'2.11.','torchao':'${TORCHAO_VERSION}','torchaudio':'2.11.','torchvision':'0.26.'}; actual={'torch':torch.__version__,'torchao':m.version('torchao'),'torchaudio':torchaudio.__version__,'torchvision':torchvision.__version__,'triton':triton.__version__}; assert torch.version.hip, actual; assert all(actual[name].startswith(version) for name, version in expected.items()), actual; print('Validated ROCm stack:', actual, 'HIP', torch.version.hip)" \
+      && python3 -c "import torch, torchaudio, torchvision, triton; expected={'torch':'2.11.','torchaudio':'2.11.','torchvision':'0.26.'}; actual={'torch':torch.__version__,'torchaudio':torchaudio.__version__,'torchvision':torchvision.__version__,'triton':triton.__version__}; assert torch.version.hip, actual; assert all(actual[name].startswith(version) for name, version in expected.items()), actual; print('Validated ROCm stack:', actual, 'HIP', torch.version.hip)" \
       && if pip list --format=freeze | grep -Eq '^nvidia-.*-cu[0-9]+'; then \
            echo "ERROR: NVIDIA CUDA runtime packages were installed into the ROCm image"; \
            exit 1; \

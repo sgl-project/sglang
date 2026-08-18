@@ -7,13 +7,19 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn.functional as F
+import torch_npu
 
+from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
+    BuildBlockSeqLensCausal,
+    BuildDsparkSwaPageIndices,
+    ComputeDsparkWindowGather,
+)
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
-from sglang.srt.layers.attention.dsv4.compressor import CompressorBackendMixin
-from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -50,21 +56,48 @@ def _apply_hadamard(inp: torch.Tensor, hadamard_matrix: torch.Tensor) -> torch.T
     return flat.matmul(hadamard_matrix).view(init_shape).to(torch.bfloat16)
 
 
-def _overlap_transform(
-    tensor: torch.Tensor, value: float, head_dim: int
+def _build_explicit_state_block_table(
+    *,
+    compress_ratio: int,
+    coff: int,
+    state_pool,
+    token_to_kv_pool,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    start_pos: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seqused: torch.Tensor,
+    max_input_capacity: int,
 ) -> torch.Tensor:
-    # Build (n_chunks, 2*ratio, d) from (n_chunks, ratio, coff*d): first ratio rows
-    # = current chunk left half (:d), last ratio rows = previous chunk right half (d:);
-    # first chunk's right half filled with `value`.
-    n_chunks, r, _ = tensor.shape
-    d = head_dim
-    out = tensor.new_full((n_chunks, 2 * r, d), value)
-    out[:, r:] = tensor[..., d:]
-    out[1:, :r] = tensor[:-1, :, :d]
-    return out
+    """Adapt GPU-style state locations to the A3 cache_mode=2 table ABI."""
+    req_pool_indices = req_pool_indices.to(torch.int64)
+    capacities = cu_seqlens[1:] - cu_seqlens[:-1]
+    history_size = coff * compress_ratio
+    width = history_size + max_input_capacity
+    columns = torch.arange(width, dtype=torch.int64, device=req_to_token.device)
+    positions = start_pos[:, None] - history_size + columns
+    within_capacity = columns[None, :] < history_size + capacities[:, None]
+    valid = (seqused[:, None] > 0) & within_capacity & (positions >= 0)
+
+    if compress_ratio == 4:
+        # Masked history/ragged columns are still indexed before torch.where.
+        safe_positions = positions.clamp(0, req_to_token.shape[1] - 1)
+        full_locs = req_to_token[req_pool_indices[:, None], safe_positions]
+        swa_locs = token_to_kv_pool.translate_loc_from_full_to_swa(full_locs)
+        state_locs = state_pool.translate_from_swa_loc_to_state_loc(swa_locs)
+    else:
+        state_locs = state_pool.translate_from_req_position_to_state_loc(
+            req_pool_indices[:, None], positions
+        )
+
+    return torch.where(
+        valid,
+        state_locs.to(torch.int32),
+        state_pool.dummy_state_loc,
+    ).contiguous()
 
 
-class CompressorAscendBackendMixin(CompressorBackendMixin):
+class CompressorAscendBackendMixin:
 
     @staticmethod
     def _to_cpu_int_list(values) -> Optional[list[int]]:
@@ -98,10 +131,13 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         fm = self.forward_metadata
         is_decode = forward_batch.forward_mode.is_decode()
         is_verify = forward_batch.forward_mode.is_target_verify()
+        fm.dsv4_explicit_state_block_tables = {}
+        fm.dsv4_max_input_capacity = 1 if is_decode else None
         _verify_compress = is_verify and bool(self._dsv4_compress_ratios)
         _seq_lens = forward_batch.seq_lens.to(torch.int32)
         if _verify_compress:
-            _seq_lens = _seq_lens + self.speculative_num_draft_tokens
+            n_draft = int(forward_batch.spec_info.draft_token_num)
+            _seq_lens = _seq_lens + n_draft
         result = self._compute_compress_locs(
             pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
@@ -119,8 +155,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         if not is_decode:
             for ratio in self._dsv4_compress_ratios:
                 if ratio in (4, 128):
-                    if f"c{ratio}_state_loc" not in result:
-                        setattr(fm, f"c{ratio}_state_loc", None)
                     if f"c{ratio}_loc" not in result:
                         setattr(fm, f"c{ratio}_loc", None)
             # _compute_compress_locs builds positions_cmp_padding / start_pos /
@@ -144,6 +178,13 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         cu = fm.actual_seq_lengths_q_pa
 
         cu_cpu = cu.cpu().tolist()
+        fm.dsv4_max_input_capacity = max(
+            1,
+            max(
+                (int(cu_cpu[idx + 1]) - int(cu_cpu[idx]) for idx in range(bs)),
+                default=0,
+            ),
+        )
         prefix_cpu = self._extend_prefix_lens_cpu(forward_batch)
         ratio_lists: dict = {
             r: [] for r in self._dsv4_unique_compress_ratios if r in (4, 128)
@@ -182,10 +223,8 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 padding[: cat.shape[0]].copy_(cat)
             setattr(fm, f"positions_cmp_padding_c{ratio}", padding)
 
-        # start_pos = each req's GLOBAL start (= extend_prefix_lens) so the fused op
-        # (cache_mode=1) reads the prior-chunk partial-block state and aligns blocks
-        # to the global grid; prefix==0 -> 0 (non-chunked, unchanged). Only the fused
-        # chunked path reads it. seqused=None -> op derives chunk len from cu_seqlens.
+        # start_pos is each request's global chunk start. cache_mode=2 uses it
+        # together with the explicit table to align history/current columns.
         if forward_batch.extend_prefix_lens is not None:
             fm.start_pos = forward_batch.extend_prefix_lens.to(
                 device=device, dtype=torch.int32
@@ -198,7 +237,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             )
         else:
             fm.start_pos = torch.zeros(bs, dtype=torch.int32, device=device)
-        fm.seqused = None
+        fm.seqused = (cu[1:] - cu[:-1]).to(torch.int32)
 
         # bundle out_c*_loc = the NEW c-pool slots allocated this extend (incremental),
         # densely packed in batch order to match cmp_kv. Valid under chunked prefill:
@@ -217,27 +256,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                 f"c{ratio}_loc",
                 bundle_loc.to(torch.int32) if bundle_loc is not None else None,
             )
-
-        # req_to_token_c*_state is not re-zeroed on slot reuse; zero pre-tail page cols so the kernel block-0 skip masks stale entries
-        page_size = self.page_size
-        for ratio in (4, 128):
-            spt = getattr(fm, f"c{ratio}_state_page_table", None)
-            if spt is None:
-                continue
-            for idx in range(bs):
-                chunk_len = int(cu_cpu[idx + 1] - cu_cpu[idx])
-                if chunk_len == 0:
-                    continue
-                seqlen = int(prefix_cpu[idx]) + chunk_len
-                tail = seqlen % 128
-                if ratio == 4:
-                    c_alloc_len = tail + 128 if (tail <= 3 and seqlen >= 128) else tail
-                else:
-                    c_alloc_len = tail
-                c_alloc_offset = seqlen - c_alloc_len
-                first_tail_page = c_alloc_offset // page_size
-                if first_tail_page > 0:
-                    spt[idx, :first_tail_page] = 0
 
     def _compute_compress_locs(
         self,
@@ -263,32 +281,12 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             seq_lens_max = int(seq_lens_max_override)
         else:
             seq_lens_max = int(seq_lens.max().item()) if bs > 0 else 0
-        n_pages = max(1, (seq_lens_max + self.page_size - 1) // self.page_size)
-
         for ratio in self._dsv4_unique_compress_ratios:
             if ratio not in (4, 128):
                 continue
-            state_loc_src = None
             bundle_loc = None
-            # state table holds one slot per RAW token; block 0 is the skip sentinel reserved by NPUCompressStatePool
-            state_table = (
-                req_to_token_pool.req_to_token_c4_state
-                if ratio == 4
-                else req_to_token_pool.req_to_token_c128_state
-            )
-            state_slots_2d = state_table[req_pool_64, : n_pages * self.page_size]
-            state_page_2d = (state_slots_2d[:, :: self.page_size] // self.page_size).to(
-                torch.int32
-            )
 
             if is_decode:
-                if out_cache_loc_dsv4 is not None:
-                    state_loc_src = (
-                        out_cache_loc_dsv4.out_c4_state_loc
-                        if ratio == 4
-                        else out_cache_loc_dsv4.out_c128_state_loc
-                    )
-
                 # bundle_loc and cmp_kv are both densely packed in batch order, so
                 # write them densely; indexing by batch slot would misalign them.
                 if out_cache_loc_dsv4 is not None:
@@ -298,16 +296,7 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                         else out_cache_loc_dsv4.out_c128_loc
                     )
 
-            result[f"c{ratio}_state_page_table"] = state_page_2d
             if is_decode:
-                if state_loc_src is None:
-                    state_loc_decode = torch.zeros(
-                        bs,
-                        dtype=torch.int32,
-                        device=device,
-                    )
-                else:
-                    state_loc_decode = state_loc_src.to(torch.int32)
                 compress_out_loc = torch.zeros(
                     bs,
                     dtype=torch.int32,
@@ -317,23 +306,24 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
                     n_compress = bundle_loc.numel()
                     if n_compress > 0:
                         compress_out_loc[:n_compress] = bundle_loc.to(torch.int32)
-                result[f"c{ratio}_state_loc"] = state_loc_decode
                 result[f"c{ratio}_loc"] = compress_out_loc
 
-            c_table = (
-                req_to_token_pool.req_to_token_c4
-                if ratio == 4
-                else req_to_token_pool.req_to_token_c128
-            )
             # graph: keep shape aligned with the preallocated buffer; eager: clamp >=1 so kernels see a column
             if is_graph:
                 n_c_tokens = seq_lens_max // ratio
             else:
                 n_c_tokens = max(1, seq_lens_max // ratio)
-            slots = c_table[req_pool_64, :n_c_tokens]
-            c_page_table = (slots[:, :: self.page_size] // self.page_size).to(
-                torch.int32
-            )
+            if ratio == 4:
+                slots = req_to_token[req_pool_64, : n_c_tokens * ratio]
+                c_page_table = (slots[:, :: self.page_size] // self.page_size).to(
+                    torch.int32
+                )
+            else:
+                c128_page_size = req_to_token_pool.c128_page_size
+                n_groups = (n_c_tokens + c128_page_size - 1) // c128_page_size
+                c_page_table = req_to_token_pool.req_to_c128_sidecar[
+                    req_pool_64, :n_groups
+                ].to(torch.int32)
             result[f"c{ratio}_page_table"] = c_page_table
 
         if is_decode:
@@ -372,7 +362,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         x: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> None:
-        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
         ratio = compressor.ratio
         coff = 1 + int(compressor.overlap)
@@ -381,28 +370,29 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         self._ensure_fused_caches(compressor)
 
         fm = self.forward_metadata
-        positions_cmp = getattr(fm, f"positions_cmp_padding_c{ratio}", None)
-        page_table = getattr(fm, f"c{ratio}_state_page_table", None)
-        start_pos = getattr(fm, "start_pos", None)
-        seqused = getattr(fm, "seqused", None)
-        cu_seqlens = getattr(fm, "actual_seq_lengths_q_pa", None)
-        assert positions_cmp is not None and page_table is not None, (
-            "fused compressor needs backend metadata "
-            "(positions_cmp_padding / c*_state_page_table) — make sure "
-            "_build_npu_compress_metadata ran before this forward."
-        )
-        assert start_pos is not None, "fused compressor needs start_pos"
-        assert cu_seqlens is not None, "fused compressor needs cu_seqlens"
-
         pool = self.token_to_kv_pool
-        state_cache = pool.get_state_cache(
-            compressor.layer_id, compressor.is_in_indexer
-        )
+        state_pool = pool._get_state_pool(compressor.layer_id, compressor.is_in_indexer)
+        state_cache = state_pool.state_cache_3d
+        table_cache = fm.dsv4_explicit_state_block_tables
+        if ratio not in table_cache:
+            table_cache[ratio] = _build_explicit_state_block_table(
+                compress_ratio=ratio,
+                coff=coff,
+                state_pool=state_pool,
+                token_to_kv_pool=pool,
+                req_to_token=self.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices,
+                start_pos=fm.start_pos,
+                cu_seqlens=fm.actual_seq_lengths_q_pa,
+                seqused=fm.seqused,
+                max_input_capacity=fm.dsv4_max_input_capacity,
+            )
+        state_block_table = table_cache[ratio]
 
         cos, sin = Dsv4NpuRoPE.for_freqs(
             compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
         ).get_cos_sin(
-            positions_cmp,
+            getattr(fm, f"positions_cmp_padding_c{ratio}"),
             torch.float32,
             view_4d=False,
             allow_build=False,
@@ -419,14 +409,14 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             rope_cos=cos,
             rope_head_dim=compressor.rope_head_dim,
             cmp_ratio=ratio,
-            state_block_table=page_table,
-            cu_seqlens=cu_seqlens,
-            seqused=seqused,
-            start_pos=start_pos,
+            state_block_table=state_block_table,
+            cu_seqlens=fm.actual_seq_lengths_q_pa,
+            seqused=fm.seqused,
+            start_pos=fm.start_pos,
             coff=coff,
             norm_eps=compressor.norm.variance_epsilon,
             rotary_mode=2,
-            cache_mode=1,
+            cache_mode=2,
         )
 
         # prefill output may be padded; trim to loc length
@@ -449,317 +439,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
             if compressor.rotate:
                 cmp_kv = _apply_hadamard(cmp_kv, compressor.hadamard_matrix)
             self._compressor_epilog_npu(compressor, cmp_kv, forward_batch)
-
-    def _forward_compress_native(
-        self,
-        compressor,
-        x: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> None:
-        """Reference per-request unfused compress path for precision ablations.
-
-        Production dispatch no longer calls this path: ordinary prefill, every
-        chunked-prefill chunk, verify, and decode all use the fused compressor.
-
-        * Prefill: split seq into ``cutoff = seqlen - seqlen % ratio`` to compress
-          + ``remainder`` stashed as state (overlap/ratio=4 also stashes the last
-          ``ratio`` of the cutoff). State writes via ``set_state_buffer``; cutoff gets
-          ape-weighted softmax over ratio, sum, norm+rope+(opt) hadamard, then write.
-        * Non-prefill (one token/req): append (kv, score) to the state ring; if it
-          completes a ratio-aligned chunk, gather the chunk (overlap: 2*ratio, else
-          ratio), ape-weighted softmax + sum, and write via ``set_compress_buffer``.
-        """
-        import torch_npu  # local: NPU-only, used for npu_rotary_mul below
-
-        positions = forward_batch.positions
-        ratio, overlap, d = compressor.ratio, compressor.overlap, compressor.head_dim
-        device = x.device
-        self._ensure_compressor_hadamard(compressor, device)
-        dtype = x.dtype
-        x_f32 = x.float()
-        # wkv + wgate are fused into one wkv_gate.weight [2*coff*head_dim, hidden_size]
-        # (kv concatenated before wgate); split along the output dim to recover each.
-        coff = 1 + int(overlap)
-        W = compressor.wkv_gate.weight.float()
-        kv_full = F.linear(x_f32, W[: coff * d])  # [T, coff*d]
-        score_full = F.linear(x_f32, W[coff * d :])  # [T, coff*d]
-
-        seq_lens_cpu = forward_batch.seq_lens_cpu
-        extend_prefix_lens_cpu = self._extend_prefix_lens_cpu(forward_batch)
-        is_prefill = forward_batch.forward_mode.is_prefill()
-        token_to_kv_pool = self.token_to_kv_pool
-        backend_fm = self.forward_metadata
-        if ratio == 4:
-            page_table = backend_fm.c4_state_page_table
-        else:
-            page_table = backend_fm.c128_state_page_table
-
-        kv_out_list: list[torch.Tensor] = []
-        kv_state_to_be_cached: list[torch.Tensor] = []
-        score_state_to_be_cached: list[torch.Tensor] = []
-        state_loc_list: list[torch.Tensor] = []
-        kv_out_positions: list[torch.Tensor] = []
-        # Per-token write loc: record (req_idx_in_batch, compressed_seq_pos_in_req)
-        # to derive the c{N}_kv_pool slot from the slab allocator, not out_cache_loc
-        # // ratio (correct only when raw kv allocation aligns to ratio).
-        write_req_indices: list[torch.Tensor] = []
-        write_pos_in_req: list[torch.Tensor] = []
-        seqlen_offset = 0
-        # Running offset into the tail-only state bundle, flat layout
-        # ``[req0_alloc_len_slots, ...]`` where ``alloc_len_i = seqlen_i -
-        # c{ratio}_state_alloc_offset_i`` (NOT raw seqlen; see
-        # ScheduleBatch._compute_dsv4_state_lens_extend).
-        state_bundle_offset = 0
-
-        for idx, seqlen in enumerate(seq_lens_cpu):
-            seqlen = int(seqlen)
-            if seqlen == 0:
-                continue
-            if is_prefill:
-                # Chunked follow-up (prefix_len>0) is routed to the fused compressor
-                # by the forward_compress dispatch (main compressor + c4 indexer), so
-                # the native path only ever sees non-chunked / first-chunk prefill.
-                prefix_len = (
-                    int(extend_prefix_lens_cpu[idx])
-                    if extend_prefix_lens_cpu is not None
-                    else 0
-                )
-                assert prefix_len == 0, (
-                    "native compress prefill reached with prefix_len="
-                    f"{prefix_len}; chunked prefill must route to the fused op"
-                )
-                pos_req = positions[seqlen_offset : seqlen_offset + seqlen]
-
-                # Per-req tail-only state alloc range; same formula as
-                # ScheduleBatch._compute_dsv4_state_lens_extend (recomputed to
-                # avoid threading another tensor through forward_batch).
-                tail_128 = seqlen % 128
-                if ratio == 4:
-                    c_alloc_len = (
-                        tail_128 + 128
-                        if (tail_128 <= 3 and seqlen >= 128)
-                        else tail_128
-                    )
-                else:  # ratio == 128
-                    c_alloc_len = tail_128
-                c_alloc_offset = seqlen - c_alloc_len
-
-                # Bundle slice for this req. The NPU paged state pool emits real
-                # slot ids (no ring-hash); slice by ``state_bundle_offset`` (cumulative
-                # alloc_len), NOT ``seqlen_offset`` (cumulative raw seqlen).
-                bundle = forward_batch.out_cache_loc_dsv4
-                assert bundle is not None, (
-                    "unfused compress prefill on NPU needs the DSV4 "
-                    "alloc bundle; expected maybe_write_dsv4_extend to have "
-                    "populated batch.out_cache_loc_dsv4 before forward."
-                )
-                bundle_state_loc = (
-                    bundle.out_c4_state_loc if ratio == 4 else bundle.out_c128_state_loc
-                )
-                if c_alloc_len > 0:
-                    # Require a populated bundle only when this req allocates
-                    # slots. A 128-aligned ratio==128 prefill has c_alloc_len==0
-                    # (no partial tail), so an all-128-aligned batch legitimately
-                    # yields an empty bundle. Empty while c_alloc_len > 0 means
-                    # c{ratio}_state_attn_allocator was never initialized.
-                    assert (
-                        bundle_state_loc is not None and bundle_state_loc.numel() > 0
-                    ), (
-                        f"unfused compress prefill: bundle.out_c{ratio}_state_loc "
-                        f"is empty/None — DSV4NPUTokenToKVPoolAllocator's "
-                        f"c{ratio}_state_attn_allocator was not initialized (check "
-                        f"pool_configurator's NPU branch + npu_state_pool_size)."
-                    )
-                    out_cache_loc = bundle_state_loc[
-                        state_bundle_offset : state_bundle_offset + c_alloc_len
-                    ]
-                    state_bundle_offset += c_alloc_len
-                else:
-                    # No tail to cache: empty slot view, never indexed below.
-                    # Only reached for c128 (c4's c_alloc_len is always > 0).
-                    out_cache_loc = torch.empty((0,), dtype=torch.int64, device=device)
-                remainder = seqlen % ratio
-                cutoff = seqlen - remainder
-                # ``cutoff`` is raw coords; subtract ``c_alloc_offset`` for
-                # slice-relative indexing into the per-req bundle slice.
-                cutoff_in_slice = cutoff - c_alloc_offset
-                should_compress = cutoff >= ratio
-                # ratio-strided positions for the cutoff chunks (one rope pos per token).
-                pos_compressed = pos_req[:cutoff:ratio]
-                kv = kv_full[seqlen_offset : seqlen_offset + seqlen]
-                score = score_full[seqlen_offset : seqlen_offset + seqlen]
-
-                if overlap and should_compress:
-                    # Stash the trailing ratio tokens of the cutoff so the next
-                    # decode step can do overlap compression across the boundary
-                    # (for ratio=4 this window is inside the state alloc range).
-                    kv_state_to_be_cached.append(kv[cutoff - ratio : cutoff])
-                    score_state_to_be_cached.append(
-                        score[cutoff - ratio : cutoff] + compressor.ape
-                    )
-                    state_loc_list.append(
-                        out_cache_loc[cutoff_in_slice - ratio : cutoff_in_slice]
-                    )
-                if remainder > 0:
-                    kv_cut, kv_rem = kv.split([cutoff, remainder], dim=0)
-                    score_cut, score_rem = score.split([cutoff, remainder], dim=0)
-                    kv_state_to_be_cached.append(kv_rem)
-                    score_state_to_be_cached.append(
-                        score_rem + compressor.ape[:remainder]
-                    )
-                    state_loc_list.append(out_cache_loc[-remainder:])
-                    kv = kv_cut
-                    score = score_cut
-
-                if should_compress:
-                    kv = kv.unflatten(0, (-1, ratio))  # [n_chunks, ratio, coff*d]
-                    score = score.unflatten(0, (-1, ratio)) + compressor.ape
-                    if overlap:
-                        kv = _overlap_transform(kv, value=0.0, head_dim=d)
-                        score = _overlap_transform(
-                            score, value=float("-inf"), head_dim=d
-                        )
-                    kv_compressed = (kv * score.softmax(dim=1)).sum(
-                        dim=1
-                    )  # [n_chunks, d]
-                    n_compressed_this_req = kv_compressed.shape[0]
-                    kv_out_list.append(kv_compressed)
-                    kv_out_positions.append(pos_compressed)
-                    write_req_indices.append(
-                        torch.full(
-                            (n_compressed_this_req,),
-                            idx,
-                            dtype=torch.int64,
-                            device=device,
-                        )
-                    )
-                    write_pos_in_req.append(
-                        torch.arange(
-                            n_compressed_this_req,
-                            dtype=torch.int64,
-                            device=device,
-                        )
-                    )
-                seqlen_offset += seqlen
-            else:
-                # Decode: append (kv, score+ape[pos%r]) to the state ring at
-                # c{4,128}_state_loc[idx]; if this completes a ratio-aligned
-                # chunk, gather it and produce one compressed kv via ape-softmax-sum.
-                start_pos = seqlen - 1
-                should_compress = (start_pos + 1) % ratio == 0
-                pos_req = positions[idx : idx + 1] + (1 - ratio)
-                kv = kv_full[idx : idx + 1]
-                score = score_full[idx : idx + 1] + compressor.ape[start_pos % ratio]
-                if ratio == 4:
-                    state_loc_decode = backend_fm.c4_state_loc
-                else:
-                    state_loc_decode = backend_fm.c128_state_loc
-                token_to_kv_pool.set_state_buffer(
-                    compressor.layer_id,
-                    state_loc_decode[idx : idx + 1],
-                    kv.view(1, 1, -1),
-                    score.view(1, 1, -1),
-                    compressor.is_in_indexer,
-                )
-                if should_compress:
-                    if overlap:
-                        kv_indices = _get_kv_indices(
-                            forward_batch, 2 * ratio, page_table, idx, seqlen
-                        )
-                        kv_state, score_state = token_to_kv_pool.get_state_buffer(
-                            compressor.layer_id, compressor.is_in_indexer, kv_indices
-                        )
-                        # kv_state / score_state: [2*r, 1, coff*d] → [2*r, d]
-                        kv_state = kv_state.squeeze(1)
-                        score_state = score_state.squeeze(1)
-                        kv_state = torch.cat(
-                            [kv_state[:ratio, :d], kv_state[ratio:, d:]], dim=0
-                        )
-                        score_state = torch.cat(
-                            [score_state[:ratio, :d], score_state[ratio:, d:]],
-                            dim=0,
-                        )
-                        kv_compressed = (kv_state * score_state.softmax(dim=0)).sum(
-                            dim=0, keepdim=True
-                        )
-                    else:
-                        kv_indices = _get_kv_indices(
-                            forward_batch, ratio, page_table, idx, seqlen
-                        )
-                        kv_state, score_state = token_to_kv_pool.get_state_buffer(
-                            compressor.layer_id, compressor.is_in_indexer, kv_indices
-                        )
-                        kv_compressed = (
-                            kv_state[:, 0] * score_state[:, 0].softmax(dim=0)
-                        ).sum(dim=0, keepdim=True)
-                    kv_out_list.append(kv_compressed)
-                    kv_out_positions.append(pos_req)
-                    # Decode: 1 compressed token at compressed_seq_pos = seqlen//ratio - 1
-                    decode_pos = seqlen // ratio - 1
-                    write_req_indices.append(
-                        torch.tensor([idx], dtype=torch.int64, device=device)
-                    )
-                    write_pos_in_req.append(
-                        torch.tensor([decode_pos], dtype=torch.int64, device=device)
-                    )
-
-        # Flush the prefill state stash to the pool in one shot.
-        if kv_state_to_be_cached:
-            kv_state_cat = torch.cat(kv_state_to_be_cached, dim=0).unsqueeze(1)
-            score_state_cat = torch.cat(score_state_to_be_cached, dim=0).unsqueeze(1)
-            state_loc_cat = torch.cat(state_loc_list, dim=0)
-            token_to_kv_pool.set_state_buffer(
-                compressor.layer_id,
-                state_loc_cat,
-                kv_state_cat,
-                score_state_cat,
-                compressor.is_in_indexer,
-            )
-
-        # Norm + rope + optional hadamard on the freshly compressed tokens,
-        # then write via _compressor_epilog_npu with explicit slab-derived locs.
-        if kv_out_list:
-            kv_out = torch.cat(kv_out_list, dim=0).to(dtype)
-            pos_out = torch.cat(kv_out_positions, dim=0)
-            kv_out = compressor.norm(kv_out)
-            rope_dim = compressor.rope_head_dim
-            from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
-
-            cos, sin = Dsv4NpuRoPE.for_freqs(
-                compressor.freqs_cis, getattr(compressor, "rotary_emb", None)
-            ).get_cos_sin(
-                pos_out,
-                kv_out.dtype,
-                view_4d=True,
-                allow_build=False,
-                cache_dtype=torch.float32,
-            )
-            rope_slice = kv_out[..., -rope_dim:]
-            rope_view = rope_slice.unsqueeze(-2).unsqueeze(1)  # (T, 1, 1, rope_dim)
-            rope_rot = torch_npu.npu_rotary_mul(
-                rope_view, cos, sin, rotary_mode="interleave"
-            )
-            rope_slice.copy_(rope_rot.view_as(rope_slice))
-            if compressor.rotate:
-                kv_out = _apply_hadamard(kv_out, compressor.hadamard_matrix)
-            # c{N}_kv_pool slot per compressed token. DSV4NPUReqToTokenPool's
-            # token-level slot id table is indexed directly by compressed-seq
-            # position (elements already are c-pool slot ids; no page indirection).
-            req_indices_flat = torch.cat(write_req_indices, dim=0)
-            pos_in_req_flat = torch.cat(write_pos_in_req, dim=0)
-            req_pool_flat = forward_batch.req_pool_indices[req_indices_flat]
-            c_table = (
-                self.req_to_token_pool.req_to_token_c4
-                if ratio == 4
-                else self.req_to_token_pool.req_to_token_c128
-            )
-            write_locs = c_table[
-                req_pool_flat.to(torch.int64), pos_in_req_flat.to(torch.int64)
-            ].to(torch.int32)
-            self._compressor_epilog_npu(
-                compressor, kv_out, forward_batch, override_loc=write_locs
-            )
-        return None
 
     def _ensure_compressor_hadamard(self, compressor, device: torch.device) -> None:
         if getattr(compressor, "hadamard_matrix", None) is None:
@@ -789,8 +468,6 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         kv_scale: Optional[torch.Tensor] = None
         li_kv_dtype = getattr(compressor, "li_kv_dtype", "bf16")
         if li_kv_dtype == "int8" and compressor.is_in_indexer:
-            import torch_npu
-
             kv, kv_scale = torch_npu.npu_dynamic_quant(kv)
             kv_scale = kv_scale.to(torch.float16)
 
@@ -832,40 +509,90 @@ class CompressorAscendBackendMixin(CompressorBackendMixin):
         )
 
 
-class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
+class C4IndexerAscendBackendMixin:
 
     def init_forward_metadata_indexer(self, core_attn_metadata):
         # li_quant_metadata is built in _compute_kernel_metadata; None satisfies the mixin contract
         return None
 
-    def forward_c4_indexer_npu(
+    def _forward_prepare(
         self,
         c4_indexer,
         x: torch.Tensor,
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
-        skip_compressor: bool = False,
-    ) -> torch.Tensor:
-        assert (
-            not skip_compressor
-        ), "skip_compressor=True is not supported by forward_c4_indexer_npu"
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q = self._compute_q_npu(c4_indexer, q_lora, forward_batch.positions)
+        weights, _ = c4_indexer.weights_proj(x)
+        weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
+        c4_indexer.compressor(x, forward_batch)
+        return q, weights
 
+    def _can_use_indexer_multi_stream(self) -> bool:
+        return envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+
+    def _get_npu_indexer_q_stream(self):
+        s = getattr(self, "_npu_indexer_q_stream_obj", None)
+        if s is None:
+            s = torch.npu.Stream()
+            self._npu_indexer_q_stream_obj = s
+        return s
+
+    def _forward_prepare_multi_stream(
+        self,
+        c4_indexer,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        forward_batch: ForwardBatch,
+        q_lora_ready,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from sglang.srt.hardware_backend.npu.utils import (
+            get_indexer_weight_stream,
+        )
+
+        cur = torch.npu.current_stream()
+        stream_q = self._get_npu_indexer_q_stream()
+        stream_w = get_indexer_weight_stream()
+
+        # q_lora/x are produced on cur; workers wait for them.
+        stream_q.wait_stream(cur)
+        stream_w.wait_stream(cur)
+
+        # route-KV write on cur; ordered before the topk read by cur's program order.
+        c4_indexer.compressor(x, forward_batch)
+
+        # weights_proj + scale on stream_w.
+        with torch.npu.stream(stream_w):
+            weights = c4_indexer.weights_proj(x)[0]
+            weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
+            weights.record_stream(stream_w)
+
+        # q (wq_b + rope + hadamard) on stream_q.
+        with torch.npu.stream(stream_q):
+            if q_lora_ready is not None:
+                stream_q.wait_event(q_lora_ready)
+            q = self._compute_q_npu(c4_indexer, q_lora, forward_batch.positions)
+            q.record_stream(stream_q)
+
+        cur.wait_stream(stream_w)
+        cur.wait_stream(stream_q)
+        return q, weights
+
+    def _forward_indexer(
+        self,
+        c4_indexer,
+        x: torch.Tensor,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
         ratio = c4_indexer.compressor.ratio
         device = x.device
-        self._ensure_npu_c4_indexer(c4_indexer, device)
         bs = x.shape[0]
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_target_verify()
         )
-
-        q = self._compute_q_npu(c4_indexer, q_lora, forward_batch.positions)
-
-        weights, _ = c4_indexer.weights_proj(x)
-        weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
-
-        if not skip_compressor:
-            c4_indexer.compressor(x, forward_batch)
 
         li_kv_dtype = getattr(c4_indexer.compressor, "li_kv_dtype", "bf16")
         if li_kv_dtype == "int8":
@@ -897,7 +624,12 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         for i, _end_token in enumerate(end_pos):
             seq_i = int(seqlens_cpu[i])
             kv_indices = _get_kv_indices(
-                forward_batch, seq_i // ratio, page_table, i, seq_i // ratio
+                forward_batch,
+                seq_i // ratio,
+                page_table,
+                i,
+                seq_i // ratio,
+                page_size=self.page_size // ratio,
             )
             kv_cache_value = self.token_to_kv_pool.get_compress_buffer(
                 c4_indexer.layer_id, True, kv_indices
@@ -958,7 +690,6 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
     def _compute_q_npu(
         self, c4_indexer, q_lora: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
         bs = q_lora.shape[0]
         q, _ = c4_indexer.wq_b(q_lora)
@@ -994,8 +725,6 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
         weights: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        import torch_npu
-
         q_int8, q_scale = torch_npu.npu_dynamic_quant(q)
         fm = self.forward_metadata
         li_quant_metadata = fm.kernel_metadata["li_quant_metadata"]
@@ -1034,9 +763,17 @@ class C4IndexerAscendBackendMixin(C4IndexerBackendMixin):
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        topk_idxs = self.forward_c4_indexer_npu(
-            c4_indexer, x, q_lora, forward_batch, skip_compressor=skip_compressor
-        )
+        assert (
+            not skip_compressor
+        ), "skip_compressor=True is not supported on the NPU indexer path"
+        self._ensure_npu_c4_indexer(c4_indexer, x.device)
+        if self._can_use_indexer_multi_stream():
+            q, weights = self._forward_prepare_multi_stream(
+                c4_indexer, x, q_lora, forward_batch, q_lora_ready
+            )
+        else:
+            q, weights = self._forward_prepare(c4_indexer, x, q_lora, forward_batch)
+        topk_idxs = self._forward_indexer(c4_indexer, x, q, weights, forward_batch)
         self.forward_metadata.c4_topk_indices = topk_idxs
 
 
@@ -1072,6 +809,103 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_unique_compress_ratios = list(
             dict.fromkeys(self._dsv4_compress_ratios)
         )
+        self._is_dspark_algorithm = bool(
+            model_runner.spec_algorithm is not None
+            and model_runner.spec_algorithm.is_dspark()
+        )
+        self._is_dspark_draft_worker = bool(
+            getattr(model_runner, "is_draft_worker", False)
+            and self._is_dspark_algorithm
+        )
+        self._dsv4_graph_tokens_per_req = int(model_runner.decode_num_tokens_per_req())
+        self._dsv4_state_pools_by_ratio = {
+            pool.ratio: pool
+            for pool in self.token_to_kv_pool.compress_state_pools
+            if pool is not None
+        }
+
+    def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
+        spec_algorithm = forward_batch.spec_algorithm
+        return (
+            self._is_dspark_draft_worker
+            and forward_batch.forward_mode.is_target_verify()
+            and spec_algorithm is not None
+            and spec_algorithm.is_dspark()
+        )
+
+    def _init_dspark_sparse_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Build block-noncausal SWA slot ids for a DSpark draft forward.
+
+        Every token in a DSpark draft block attends to the trailing SWA
+        context and to the whole current draft block.  The Ascend
+        sparse-attention operator consumes physical SWA slot ids with shape
+        [T, N_kv, K], where K must be 128-aligned.
+        """
+        fm = self.forward_metadata
+        fm.ori_sparse_indices = None
+        fm.ori_win_left = self._dsv4_sliding_window_size - 1
+        fm.ori_win_right = 0
+
+        if not self._is_dspark_draft_block(forward_batch):
+            return
+
+        block_size = int(forward_batch.spec_info.draft_token_num)
+        out_cache_loc = forward_batch.out_cache_loc
+
+        ori_sparse_indices = self._build_dspark_sparse_indices(
+            seq_lens=forward_batch.seq_lens,
+            req_pool_indices=forward_batch.req_pool_indices,
+            out_cache_loc=out_cache_loc,
+            block_size=block_size,
+        )
+        ori_sparse_indices = ori_sparse_indices.unsqueeze(1).contiguous()
+
+        fm.ori_sparse_indices = ori_sparse_indices
+        fm.ori_win_left = self._dsv4_sliding_window_size + block_size - 1
+        fm.ori_win_right = 0
+
+    def _build_dspark_sparse_indices(
+        self,
+        *,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        block_size: int,
+    ) -> torch.Tensor:
+        """Return [bs * block_size, K] physical SWA slots for one draft block.
+
+        This helper is deliberately allocation-producing.  Eager forwards use
+        the returned tensor directly; graph replay copies it into the stable
+        graph-owned ``ori_sparse_indices`` storage.
+        """
+        bs = int(seq_lens.shape[0])
+        expected_tokens = bs * block_size
+
+        seq_lens_causal = BuildBlockSeqLensCausal.execute(
+            seq_lens=seq_lens,
+            block_size=block_size,
+            device=seq_lens.device,
+        )
+        req_pool_indices_repeated = req_pool_indices.repeat_interleave(block_size)
+        gather = ComputeDsparkWindowGather.execute(
+            seq_lens_casual=seq_lens_causal,
+            req_pool_indices_repeated=req_pool_indices_repeated,
+            block_size=block_size,
+            swa_window=self._dsv4_sliding_window_size,
+        )
+        ori_sparse_indices, _ = BuildDsparkSwaPageIndices.execute(
+            req_to_token=self.req_to_token,
+            full_to_swa_mapping=self.token_to_kv_pool.full_to_swa_index_mapping,
+            req_pool_indices_per_request=gather.req_pool_indices_per_request,
+            offsets=gather.offsets,
+            invalid=gather.invalid,
+            out_loc=out_cache_loc[:expected_tokens],
+            context_lens=gather.context_lens,
+            block_size=block_size,
+            swa_window=self._dsv4_sliding_window_size,
+            page_index_aligned_size=128,
+        )
+        return ori_sparse_indices
 
     def _init_dsv4_graph_buffers(self, *, max_bs: int, max_num_tokens: int) -> None:
         device = self.device
@@ -1089,12 +923,6 @@ class DeepseekV4AscendAttnBackend(
         )
         self.graph_metadata["c128_page_table"] = torch.full(
             (max_bs, max_pages), -1, dtype=torch.int32, device=device
-        )
-        self.graph_metadata["c4_state_page_table"] = torch.zeros(
-            (max_bs, max_pages), dtype=torch.int32, device=device
-        )
-        self.graph_metadata["c128_state_page_table"] = torch.zeros(
-            (max_bs, max_pages), dtype=torch.int32, device=device
         )
 
         # 1024 int32 per kernel-metadata buffer (fixed op metadata size)
@@ -1115,6 +943,22 @@ class DeepseekV4AscendAttnBackend(
             device=device,
         )
 
+        if self._is_dspark_draft_worker:
+            block_size = self._dsv4_graph_tokens_per_req
+            sparse_width = (
+                (self._dsv4_sliding_window_size + block_size + 127) // 128 * 128
+            )
+            self.graph_metadata["ori_sparse_indices"] = torch.full(
+                (
+                    max_bs * block_size,
+                    self._dsv4_kv_head_num,
+                    sparse_width,
+                ),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -1134,7 +978,7 @@ class DeepseekV4AscendAttnBackend(
         device = self.device
 
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
-            tokens_per_req = self.speculative_num_draft_tokens
+            tokens_per_req = self._dsv4_graph_tokens_per_req
         else:
             tokens_per_req = 1
 
@@ -1156,12 +1000,6 @@ class DeepseekV4AscendAttnBackend(
         metadata.swa_page_table = self.graph_metadata["swa_page_table"][:bs, :]
         metadata.c4_page_table = self.graph_metadata["c4_page_table"][:bs, :]
         metadata.c128_page_table = self.graph_metadata["c128_page_table"][:bs, :]
-        metadata.c4_state_page_table = self.graph_metadata["c4_state_page_table"][
-            :bs, :
-        ]
-        metadata.c128_state_page_table = self.graph_metadata["c128_state_page_table"][
-            :bs, :
-        ]
 
         n_tok = bs * tokens_per_req
         c4_pad = min(n_tok, n_tok // 4 + bs)
@@ -1169,8 +1007,19 @@ class DeepseekV4AscendAttnBackend(
         metadata.swa_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
         metadata.c4_loc = torch.zeros(c4_pad, dtype=torch.int64, device=device)
         metadata.c128_loc = torch.zeros(c128_pad, dtype=torch.int64, device=device)
-        metadata.c4_state_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
-        metadata.c128_state_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
+        metadata.dsv4_max_input_capacity = tokens_per_req
+        metadata.dsv4_explicit_state_block_tables = {
+            ratio: torch.full(
+                (
+                    bs,
+                    (2 if ratio == 4 else 1) * ratio + tokens_per_req,
+                ),
+                state_pool.dummy_state_loc,
+                dtype=torch.int32,
+                device=device,
+            )
+            for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
+        }
 
         metadata.positions_cmp_padding_c4 = torch.zeros(
             c4_pad, dtype=torch.int64, device=device
@@ -1190,6 +1039,15 @@ class DeepseekV4AscendAttnBackend(
 
         T = bs * tokens_per_req
         metadata.c4_topk_indices = self.graph_metadata["c4_topk_indices"][:T, :]
+
+        metadata.ori_sparse_indices = None
+        metadata.ori_win_left = self._dsv4_sliding_window_size - 1
+        metadata.ori_win_right = 0
+        if self._is_dspark_draft_worker and forward_mode.is_target_verify():
+            metadata.ori_sparse_indices = self.graph_metadata["ori_sparse_indices"][:T]
+            metadata.ori_sparse_indices.fill_(-1)
+            metadata.ori_sparse_indices[:, :, 0] = 0
+            metadata.ori_win_left = self._dsv4_sliding_window_size + tokens_per_req - 1
 
         self.forward_metadata = metadata
 
@@ -1222,33 +1080,77 @@ class DeepseekV4AscendAttnBackend(
         graph_mode = forward_batch.forward_mode
         runtime_mode = getattr(forward_batch, "actual_forward_mode", None) or graph_mode
         bs = forward_batch.batch_size
+        num_padding = int(getattr(forward_batch, "num_padding", 0) or 0)
+
+        raw_bs = bs - num_padding
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None, "V4 graph replay requires seq_lens_cpu."
 
         device = forward_batch.seq_lens.device
         tokens_per_bs = (
-            self.speculative_num_draft_tokens
+            self._dsv4_graph_tokens_per_req
             if graph_mode.is_target_verify() or graph_mode.is_draft_extend_v2()
             else 1
         )
 
-        seq_lens = forward_batch.seq_lens
-        if graph_mode.is_target_verify():
-            live_seq_lens = seq_lens_cpu[:bs].to(device=device, dtype=torch.int32)
-        elif seq_lens is not None and seq_lens.device.type != "cpu":
-            live_seq_lens = seq_lens[:bs].to(dtype=torch.int32)
-        else:
-            live_seq_lens = seq_lens_cpu[:bs].to(device=device, dtype=torch.int32)
+        raw_seq_lens_cpu = seq_lens_cpu[:bs]
         is_idle_replay = runtime_mode.is_idle()
+        if graph_mode.is_target_verify():
+            explicit_live_cpu = getattr(
+                getattr(forward_batch, "spec_info", None),
+                "live_seq_lens_cpu",
+                None,
+            )
+            if is_idle_replay:
+                live_seq_lens_cpu = torch.zeros_like(raw_seq_lens_cpu)
+                final_seq_lens_cpu = live_seq_lens_cpu
+            elif self._is_dspark_algorithm or explicit_live_cpu is not None:
+                # DSpark/DFLASH temporarily expand seq_lens_cpu to the final
+                # target-verify length and carry the committed/live prefix
+                # separately. Graph replay batches are lightweight namespace
+                # views and do not necessarily retain spec_algorithm.
+                final_seq_lens_cpu = raw_seq_lens_cpu
+                if explicit_live_cpu is None:
+                    live_seq_lens_cpu = torch.clamp(
+                        final_seq_lens_cpu - int(tokens_per_bs), min=0
+                    )
+                else:
+                    explicit_live_cpu = torch.as_tensor(
+                        explicit_live_cpu,
+                        dtype=final_seq_lens_cpu.dtype,
+                        device=final_seq_lens_cpu.device,
+                    ).flatten()
+                    live_seq_lens_cpu = torch.zeros_like(final_seq_lens_cpu)
+                    num_live_rows = min(bs, explicit_live_cpu.numel())
+                    if num_live_rows > 0:
+                        live_seq_lens_cpu[:num_live_rows].copy_(
+                            explicit_live_cpu[:num_live_rows]
+                        )
+            else:
+                # EAGLE and the other uniform verify callers keep
+                # seq_lens_cpu at the committed/live prefix length.
+                live_seq_lens_cpu = raw_seq_lens_cpu
+                final_seq_lens_cpu = live_seq_lens_cpu + int(tokens_per_bs)
+            live_seq_lens = live_seq_lens_cpu.to(device=device, dtype=torch.int32)
+        elif (
+            forward_batch.seq_lens is not None
+            and forward_batch.seq_lens.device.type != "cpu"
+        ):
+            live_seq_lens_cpu = seq_lens_cpu[:bs]
+            final_seq_lens_cpu = live_seq_lens_cpu
+            live_seq_lens = forward_batch.seq_lens[:bs].to(dtype=torch.int32)
+        else:
+            live_seq_lens_cpu = seq_lens_cpu[:bs]
+            final_seq_lens_cpu = live_seq_lens_cpu
+            live_seq_lens = live_seq_lens_cpu.to(device=device, dtype=torch.int32)
         has_compress = self._dsv4_has_c4 or self._dsv4_has_c128
         active_target_verify = (
             graph_mode.is_target_verify() and not is_idle_replay and has_compress
         )
         compress_seq_lens = live_seq_lens
-        compress_seq_lens_max = int(seq_lens_cpu[:bs].max()) if bs > 0 else 0
+        compress_seq_lens_max = int(final_seq_lens_cpu.max()) if bs > 0 else 0
         if active_target_verify:
-            compress_seq_lens = live_seq_lens + int(tokens_per_bs)
-            compress_seq_lens_max += int(tokens_per_bs)
+            compress_seq_lens = final_seq_lens_cpu.to(device=device, dtype=torch.int32)
 
         return SimpleNamespace(
             forward_batch=forward_batch,
@@ -1259,9 +1161,12 @@ class DeepseekV4AscendAttnBackend(
             has_compress=has_compress,
             active_target_verify=active_target_verify,
             bs=bs,
+            raw_bs=raw_bs,
             tokens_per_bs=tokens_per_bs,
             device=device,
             seq_lens_cpu=seq_lens_cpu,
+            final_seq_lens_cpu=final_seq_lens_cpu,
+            live_seq_lens_cpu=live_seq_lens_cpu,
             live_seq_lens=live_seq_lens,
             compress_seq_lens=compress_seq_lens,
             compress_seq_lens_max=compress_seq_lens_max,
@@ -1272,17 +1177,17 @@ class DeepseekV4AscendAttnBackend(
         attn_seq_lens = ctx.live_seq_lens
         if ctx.graph_mode.is_target_verify():
             valid_verify_rows = ctx.live_seq_lens > 0
-            attn_seq_lens = ctx.live_seq_lens + int(ctx.tokens_per_bs)
-            attn_seq_lens = torch.where(
-                valid_verify_rows, attn_seq_lens, ctx.live_seq_lens
+            final_seq_lens = ctx.final_seq_lens_cpu.to(
+                device=ctx.device, dtype=torch.int32
             )
-            fm.seq_lens_cpu_int = (
-                ctx.seq_lens_cpu[: ctx.bs] + int(ctx.tokens_per_bs)
-            ).int()
+            attn_seq_lens = torch.where(
+                valid_verify_rows, final_seq_lens, ctx.live_seq_lens
+            )
+            fm.seq_lens_cpu_int = ctx.final_seq_lens_cpu.int()
             fm.seq_lens_cpu_int = torch.where(
-                ctx.seq_lens_cpu[: ctx.bs] > 0,
+                ctx.live_seq_lens_cpu > 0,
                 fm.seq_lens_cpu_int,
-                ctx.seq_lens_cpu[: ctx.bs].int(),
+                ctx.live_seq_lens_cpu.int(),
             )
         fm.actual_seq_lengths_kv.copy_(attn_seq_lens.clamp(min=1))
 
@@ -1301,16 +1206,9 @@ class DeepseekV4AscendAttnBackend(
             is_graph=True,
             seq_lens_max_override=ctx.compress_seq_lens_max,
         )
-        for key in (
-            "c4_page_table",
-            "c128_page_table",
-            "c4_state_page_table",
-            "c128_state_page_table",
-        ):
+        for key in ("c4_page_table", "c128_page_table"):
             if key in result:
-                self._copy_2d_with_tail(
-                    getattr(ctx.fm, key), result[key], 0 if "state" in key else -1
-                )
+                self._copy_2d_with_tail(getattr(ctx.fm, key), result[key], -1)
 
     def _refresh_graph_decode_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
@@ -1318,14 +1216,9 @@ class DeepseekV4AscendAttnBackend(
         for ratio in self._dsv4_unique_compress_ratios:
             if ratio not in (4, 128):
                 continue
-            state_loc = None
             loc = None
             if bundle is not None:
-                state_loc = (
-                    bundle.out_c4_state_loc if ratio == 4 else bundle.out_c128_state_loc
-                )
                 loc = bundle.out_c4_loc if ratio == 4 else bundle.out_c128_loc
-            self._copy_1d_with_zero_tail(getattr(fm, f"c{ratio}_state_loc"), state_loc)
             self._copy_1d_with_zero_tail(getattr(fm, f"c{ratio}_loc"), loc)
 
         valid = ctx.live_seq_lens > 0
@@ -1343,11 +1236,11 @@ class DeepseekV4AscendAttnBackend(
 
     def _refresh_graph_target_verify_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
-        verify_seq_lens_cpu = ctx.seq_lens_cpu[: ctx.bs] + int(ctx.tokens_per_bs)
+        verify_seq_lens_cpu = ctx.final_seq_lens_cpu
         verify_seq_lens_cpu = torch.where(
-            ctx.seq_lens_cpu[: ctx.bs] > 0,
+            ctx.live_seq_lens_cpu > 0,
             verify_seq_lens_cpu,
-            ctx.seq_lens_cpu[: ctx.bs],
+            ctx.live_seq_lens_cpu,
         )
         self._fill_verify_positions_cmp_padding_one(
             ctx.forward_batch.positions,
@@ -1385,13 +1278,29 @@ class DeepseekV4AscendAttnBackend(
             fm.positions_cmp_padding_c128,
             fm.c4_loc,
             fm.c128_loc,
-            fm.c4_state_loc,
-            fm.c128_state_loc,
         ):
             if tensor is not None:
                 tensor.zero_()
         fm.start_pos.zero_()
         fm.seqused.zero_()
+
+    def _refresh_graph_explicit_state_block_tables(self, ctx) -> None:
+        fm = ctx.fm
+        for ratio, fixed_table in fm.dsv4_explicit_state_block_tables.items():
+            fixed_table.copy_(
+                _build_explicit_state_block_table(
+                    compress_ratio=ratio,
+                    coff=2 if ratio == 4 else 1,
+                    state_pool=self._dsv4_state_pools_by_ratio[ratio],
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=ctx.forward_batch.req_pool_indices[: ctx.bs],
+                    start_pos=fm.start_pos,
+                    cu_seqlens=fm.actual_seq_lengths_q_pa,
+                    seqused=fm.seqused,
+                    max_input_capacity=fm.dsv4_max_input_capacity,
+                )
+            )
 
     def _refresh_graph_swa_metadata_direct(self, ctx) -> None:
         fm = ctx.fm
@@ -1404,12 +1313,52 @@ class DeepseekV4AscendAttnBackend(
             fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
         )
         if ctx.bs > 0:
-            spec = int(getattr(self, "speculative_num_draft_tokens", 0) or 0)
-            max_len = int(ctx.seq_lens_cpu[: ctx.bs].max()) + spec
+            max_len = int(ctx.final_seq_lens_cpu.max())
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
             if 0 < max_seq_pages < swa_src.shape[1]:
                 swa_src = swa_src[:, :max_seq_pages]
         self._copy_2d_with_tail(fm.swa_page_table, swa_src, -1)
+
+    def _refresh_graph_dspark_sparse_metadata(self, ctx) -> None:
+        if not (self._is_dspark_draft_worker and ctx.graph_mode.is_target_verify()):
+            return
+
+        dst = getattr(ctx.fm, "ori_sparse_indices", None)
+        if dst is None:
+            raise RuntimeError(
+                "DSpark NPU graph replay is missing its captured "
+                "ori_sparse_indices buffer."
+            )
+
+        if ctx.is_idle_replay:
+            dst.fill_(-1)
+            dst[:, :, 0] = 0
+            return
+
+        src = self._build_dspark_sparse_indices(
+            # ``out_cache_loc`` is deliberately left unpadded by the graph
+            # replay view.  Build sparse indices for real requests only, then
+            # populate the remaining rows of the captured buffer below.
+            seq_lens=ctx.live_seq_lens[: ctx.raw_bs],
+            req_pool_indices=ctx.forward_batch.req_pool_indices[: ctx.raw_bs],
+            out_cache_loc=ctx.forward_batch.out_cache_loc,
+            block_size=ctx.tokens_per_bs,
+        ).unsqueeze(1)
+        if (
+            src.ndim != dst.ndim
+            or src.shape[0] > dst.shape[0]
+            or src.shape[1:] != dst.shape[1:]
+        ):
+            raise RuntimeError(
+                "DSpark NPU graph sparse-index shape mismatch: "
+                f"runtime={tuple(src.shape)}, captured={tuple(dst.shape)}."
+            )
+        # A graph bucket can contain padded request rows.  Keep those rows
+        # valid for capture/replay while replacing only the live prefix.
+        dst.fill_(-1)
+        dst[: src.shape[0]].copy_(src)
+        if src.shape[0] < dst.shape[0]:
+            dst[src.shape[0] :, :, 0] = 0
 
     def _refresh_graph_kernel_metadata(self, ctx) -> None:
         fm = ctx.fm
@@ -1445,7 +1394,10 @@ class DeepseekV4AscendAttnBackend(
             elif ctx.active_target_verify:
                 self._refresh_graph_target_verify_compress_1d_direct(ctx)
 
+        self._refresh_graph_explicit_state_block_tables(ctx)
+
         self._refresh_graph_swa_metadata_direct(ctx)
+        self._refresh_graph_dspark_sparse_metadata(ctx)
         self._refresh_graph_kernel_metadata(ctx)
 
         self.forward_metadata = ctx.fm
@@ -1493,8 +1445,11 @@ class DeepseekV4AscendAttnBackend(
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             B = forward_batch.batch_size
-
-            n_draft = get_spec().speculative_num_draft_tokens or 1
+            n_draft = (
+                int(forward_batch.spec_info.draft_token_num)
+                if forward_batch.forward_mode.is_target_verify()
+                else self.speculative_num_draft_tokens
+            )
             actual_q = torch.arange(
                 n_draft, B * n_draft + 1, n_draft, dtype=torch.int32, device=device
             )
@@ -1503,15 +1458,6 @@ class DeepseekV4AscendAttnBackend(
                 [torch.zeros(1, dtype=torch.int32, device=device), actual_q],
                 dim=0,
             )
-        elif forward_batch.forward_mode.is_idle():
-            B = forward_batch.batch_size
-            fm.actual_seq_lengths_q = torch.arange(
-                1, B + 1, dtype=torch.int32, device=device
-            )
-            fm.actual_seq_lengths_q_pa = torch.arange(
-                0, B + 1, dtype=torch.int32, device=device
-            )
-            fm.actual_seq_lengths_kv = torch.ones(B, dtype=torch.int32, device=device)
         else:
             fm.actual_seq_lengths_q = None
             fm.actual_seq_lengths_q_pa = None
@@ -1528,6 +1474,7 @@ class DeepseekV4AscendAttnBackend(
             else:
                 fm.actual_seq_lengths_kv = forward_batch.seq_lens.to(torch.int32)
 
+        self._init_dspark_sparse_metadata(forward_batch)
         fm.kernel_metadata = self._compute_kernel_metadata(forward_batch)
 
         if self._dsv4_compress_ratios:
@@ -1539,8 +1486,11 @@ class DeepseekV4AscendAttnBackend(
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
-
-            max_seqlen_q = get_spec().speculative_num_draft_tokens or 1
+            max_seqlen_q = (
+                int(forward_batch.spec_info.draft_token_num)
+                if forward_batch.forward_mode.is_target_verify()
+                else self.speculative_num_draft_tokens
+            )
         else:
             max_seqlen_q = 1
         return self._kernel_metadata_from_parts(
@@ -1562,14 +1512,17 @@ class DeepseekV4AscendAttnBackend(
         max_seqlen_q: int,
         is_nextn: bool,
     ) -> dict:
+        fm = self.forward_metadata
         common = {
             "cu_seqlens_q": actual_seq_lengths_q_pa,
             "seqused_kv": actual_seq_lengths_kv,
             "cmp_ratio": 1,
             "ori_mask_mode": 4,
             "cmp_mask_mode": 3,
-            "ori_win_left": self._dsv4_sliding_window_size - 1,
-            "ori_win_right": 0,
+            "ori_win_left": getattr(
+                fm, "ori_win_left", self._dsv4_sliding_window_size - 1
+            ),
+            "ori_win_right": getattr(fm, "ori_win_right", 0),
             "layout_q": "TND",
             "layout_kv": "PA_ND",
         }
@@ -1582,11 +1535,27 @@ class DeepseekV4AscendAttnBackend(
             "has_cmp_kv": False,
         }
         c1a_kwargs = base_kwargs | common
-        kernel_metadata = {
-            "c1a_metadata": torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
-                **c1a_kwargs
+        if self._is_dspark_draft_worker:
+            seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
+            max_seqlen_kv = (
+                int(seq_lens_cpu[:bs].max().item())
+                if seq_lens_cpu is not None and bs > 0
+                else int(actual_seq_lengths_kv[:bs].max().item())
             )
-        }
+            c1a_kwargs.update(
+                cu_seqlens_ori_kv=actual_seq_lengths_q_pa,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv,
+            )
+            c1a_metadata = torch.ops._C_ascend.npu_sparse_attn_sharedkv_metadata(
+                device=str(actual_seq_lengths_kv.device),
+                **c1a_kwargs,
+            )
+        else:
+            c1a_metadata = torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
+                **c1a_kwargs,
+            )
+        kernel_metadata = {"c1a_metadata": c1a_metadata}
 
         if self._dsv4_has_c4:
             c4a_overrides = {
@@ -1656,12 +1625,12 @@ class DeepseekV4AscendAttnBackend(
                 layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
             )
         if compress_ratio == 0:
-            return self._forward_dense(q, layer, forward_batch, attn_sink)
+            return self._forward_swa(q, layer, forward_batch, attn_sink)
         return self._forward_compressed(
             q, layer, forward_batch, attn_sink, compress_ratio
         )
 
-    def _forward_dense(
+    def _forward_swa(
         self,
         q: torch.Tensor,
         layer: RadixAttention,
@@ -1676,8 +1645,10 @@ class DeepseekV4AscendAttnBackend(
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
-            ori_win_left=self._dsv4_sliding_window_size - 1,
-            ori_win_right=0,
+            ori_win_left=getattr(
+                fm, "ori_win_left", self._dsv4_sliding_window_size - 1
+            ),
+            ori_win_right=getattr(fm, "ori_win_right", 0),
             layout_q="TND",
             layout_kv="PA_ND",
             q=q,
@@ -1686,8 +1657,18 @@ class DeepseekV4AscendAttnBackend(
             sinks=attn_sink,
             metadata=fm.kernel_metadata["c1a_metadata"],
             softmax_scale=layer.scaling,
+            cmp_ratio=1,
         )
-        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
+        if self._is_dspark_draft_worker:
+            attn_kwargs["cu_seqlens_ori_kv"] = fm.actual_seq_lengths_q_pa
+        ori_sparse_indices = getattr(fm, "ori_sparse_indices", None)
+        if ori_sparse_indices is not None:
+            attn_kwargs["ori_sparse_indices"] = ori_sparse_indices
+        q_arg = attn_kwargs.pop("q")
+        if self._is_dspark_draft_worker:
+            out, _ = torch.ops._C_ascend.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
+        else:
+            out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
         return out
 
     def _forward_compressed(
@@ -1720,9 +1701,15 @@ class DeepseekV4AscendAttnBackend(
         ori_page_size = ori_kv.shape[1]
         cmp_native_page_size = cmp_kv.shape[1]
         cmp_block_table = getattr(fm, f"c{compress_ratio}_page_table")
-        assert cmp_native_page_size == ori_page_size, (
-            f"cmp page_size={cmp_native_page_size} != ori page_size={ori_page_size}; "
-            "c{N}_kv_pool must be allocated with the global page_size on NPU "
+        expected_cmp_page_size = (
+            ori_page_size // 4
+            if compress_ratio == 4
+            else pool.c128_kv_pool.kernel_page_size
+        )
+        assert cmp_native_page_size == expected_cmp_page_size, (
+            f"c{compress_ratio} page_size={cmp_native_page_size} != "
+            f"expected={expected_cmp_page_size} for ori page_size={ori_page_size}; "
+            "C4 and C128 must use their configured native page layouts "
             "(see NPUDeepSeekV4SingleKVPool.kernel_page_size)"
         )
 
@@ -1751,12 +1738,34 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None
-        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
+        q_arg = attn_kwargs.pop("q")
+        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(q_arg, **attn_kwargs)
         return out
+
+    def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Return the SWA KV write locations used by DeepSeek-V4 draft layers.
+
+        During NPU graph capture/replay, ``swa_loc`` is stable graph storage
+        whose contents are refreshed by ``_apply_dsv4_graph_metadata``. Eager
+        forwards do not necessarily build that metadata, so translate the
+        current full-pool locations on demand as a fallback.
+        """
+        out_cache_loc = forward_batch.out_cache_loc
+        metadata = self.forward_metadata
+        cached = getattr(metadata, "swa_loc", None)
+        if (
+            cached is not None
+            and not forward_batch.forward_mode.is_idle()
+            and cached.shape[0] == out_cache_loc.shape[0]
+        ):
+            return cached
+        return self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
+            torch.int64
+        )
 
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
         pool = self.token_to_kv_pool
-        swa_loc = pool.translate_loc_from_full_to_swa(forward_batch.out_cache_loc)
+        swa_loc = self.get_swa_out_cache_loc(forward_batch)
         pool.set_swa_buffer(
             layer_id=layer_id,
             loc=swa_loc,
@@ -1769,14 +1778,11 @@ class DeepseekV4AscendAttnBackend(
         positions = forward_batch.positions
         t = positions.shape[0]
         bs = forward_batch.batch_size
-        n_draft = int(
-            getattr(
-                getattr(forward_batch, "spec_info", None),
-                "draft_token_num",
-                self.speculative_num_draft_tokens,
-            )
-        )
-        verify_seq_lens_cpu = forward_batch.seq_lens_cpu[:bs] + int(n_draft)
+        n_draft = int(forward_batch.spec_info.draft_token_num)
+        # The parent backend normalizes this to final KV lengths for every
+        # algorithm: it adds n_draft for EAGLE/NGRAM, while DSpark/DFLASH
+        # already pass expanded lengths and are not incremented again.
+        verify_seq_lens_cpu = fm.seq_lens_cpu_int[:bs]
         padding_sizes = {}
         for ratio in (4, 128):
             if ratio not in self._dsv4_compress_ratios:
@@ -1791,6 +1797,7 @@ class DeepseekV4AscendAttnBackend(
         fm.start_pos = forward_batch.seq_lens.to(torch.int32)
         valid = forward_batch.seq_lens[:bs] > 0
         fm.seqused = valid.to(torch.int32) * int(n_draft)
+        fm.dsv4_max_input_capacity = max(1, n_draft)
         _bundle = getattr(forward_batch, "out_cache_loc_dsv4", None)
         if _bundle is not None:
             for ratio in self._dsv4_unique_compress_ratios:
@@ -1810,82 +1817,18 @@ class DeepseekV4AscendAttnBackend(
                         loc[: bl.numel()].copy_(bl.to(torch.int32))
                 setattr(fm, f"c{ratio}_loc", loc)
 
-    def _fill_verify_positions_cmp_padding(
-        self,
-        positions: torch.Tensor,
-        c4_positions: torch.Tensor,
-        c128_positions: torch.Tensor,
-        seq_lens_cpu: Optional[torch.Tensor] = None,
-    ) -> None:
-        c4_positions.fill_(0)
-        c128_positions.fill_(0)
-        if positions.numel() == 0:
-            return
-
-        n_draft = self.speculative_num_draft_tokens
-        request_num = positions.shape[0] // n_draft
-        if request_num == 0:
-            return
-
-        fm = self.forward_metadata
-        if seq_lens_cpu is None:
-            seq_lens_cpu = getattr(fm, "seq_lens_cpu", None)
-        if seq_lens_cpu is None:
-            seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
-        if seq_lens_cpu is None:
-            raise RuntimeError(
-                "DSV4 verify buffer refresh requires seq_lens_cpu or "
-                "seq_lens_cpu_int on forward metadata."
-            )
-        seq_lens_cpu = seq_lens_cpu[:request_num]
-        if seq_lens_cpu.device.type != "cpu":
-            seq_lens_cpu = seq_lens_cpu.cpu()
-
-        start_positions = seq_lens_cpu - n_draft + 1
-        abs_positions = start_positions.view(-1, 1) + torch.arange(
-            n_draft, dtype=start_positions.dtype
-        ).view(1, -1)
-        mask_c4 = (abs_positions % 4) != 0
-        mask_c128 = (abs_positions % 128) != 0
-
-        gather_shape_c4 = min(
-            positions.shape[0], mask_c4.numel(), c4_positions.shape[0]
-        )
-        gather_shape_c128 = min(
-            positions.shape[0], mask_c128.numel(), c128_positions.shape[0]
-        )
-        sorted_indices_c4 = (
-            torch.argsort(mask_c4.flatten(), dim=0, stable=True)[:gather_shape_c4]
-            .pin_memory()
-            .to(device=positions.device, non_blocking=True)
-        )
-        sorted_indices_c128 = (
-            torch.argsort(mask_c128.flatten(), dim=0, stable=True)[:gather_shape_c128]
-            .pin_memory()
-            .to(device=positions.device, non_blocking=True)
-        )
-
-        c4_positions[:gather_shape_c4].copy_(
-            torch.gather(positions, 0, sorted_indices_c4)
-        )
-        c128_positions[:gather_shape_c128].copy_(
-            torch.gather(positions, 0, sorted_indices_c128)
-        )
-
     def _fill_verify_positions_cmp_padding_one(
         self,
         positions: torch.Tensor,
         dst: torch.Tensor,
         ratio: int,
         seq_lens_cpu: torch.Tensor,
-        n_draft: Optional[int] = None,
+        n_draft: int,
     ) -> None:
         dst.zero_()
         if ratio not in self._dsv4_compress_ratios or positions.numel() == 0:
             return
 
-        if n_draft is None:
-            n_draft = self.speculative_num_draft_tokens
         n_draft = int(n_draft)
         request_num = positions.shape[0] // n_draft
         if request_num == 0:
@@ -1919,9 +1862,7 @@ class DeepseekV4AscendAttnBackend(
         if c4_positions is None or c128_positions is None:
             return
 
-        n_draft = int(
-            getattr(spec_info, "draft_token_num", self.speculative_num_draft_tokens)
-        )
+        n_draft = int(spec_info.draft_token_num)
         seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
         if seq_lens_cpu is None:
             seq_lens_cpu = getattr(spec_info, "seq_lens_cpu", None)
@@ -1946,10 +1887,12 @@ def _get_kv_indices(
     page_table: torch.Tensor,
     req_idx: int,
     seqlen: int,
+    page_size: Optional[int] = None,
 ) -> torch.Tensor:
     logic_start = max(0, seqlen - kv_len)
     logic_end = seqlen
-    page_size = get_attn_backend().page_size
+    if page_size is None:
+        page_size = get_attn_backend().page_size
     if page_size == 1:
         return page_table[req_idx, logic_start:logic_end]
     logic_pos = torch.arange(logic_start, logic_end, device=page_table.device)
@@ -2031,16 +1974,6 @@ class DeepseekV4AscendMultiStepDraftBackend:
         )
         swa_steps = swa_steps.permute((2, 0, 1)).reshape(self.speculative_num_steps, -1)
 
-        def step_state(loc):
-            if loc is None or loc.numel() < total_width:
-                return loc
-            steps = loc[:total_width].reshape(
-                step_width // self.topk, self.topk, self.speculative_num_steps
-            )
-            return steps.permute((2, 0, 1)).reshape(self.speculative_num_steps, -1)[
-                step_id
-            ]
-
         def step_compress(loc, ratio: int):
             if loc is None or loc.numel() == 0:
                 return loc
@@ -2066,8 +1999,6 @@ class DeepseekV4AscendMultiStepDraftBackend:
             out_swa_loc=swa_steps[step_id],
             out_c4_loc=step_compress(bundle.out_c4_loc, 4),
             out_c128_loc=step_compress(bundle.out_c128_loc, 128),
-            out_c4_state_loc=step_state(bundle.out_c4_state_loc),
-            out_c128_state_loc=step_state(bundle.out_c128_state_loc),
         )
 
     def _with_step_cache_locs(self, forward_batch: ForwardBatch, step_id: int, call_fn):
