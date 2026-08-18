@@ -181,7 +181,7 @@ def _load_sglang_component(
     sgl_args: ServerArgs,
     component: ComponentType,
     library: str,
-    text_encoder_cpu_offload: bool | None = None,
+    component_starts_on_cpu: bool | None = None,
 ) -> nn.Module:
     loader = ComponentLoader.for_component_type(component.value, library)
     if component == ComponentType.TEXT_ENCODER:
@@ -189,7 +189,7 @@ def _load_sglang_component(
             comp_path,
             sgl_args,
             component.value,
-            cpu_offload_flag=text_encoder_cpu_offload,
+            component_starts_on_cpu=component_starts_on_cpu,
         )
     else:
         component_model = loader.load_customized(comp_path, sgl_args, component.value)
@@ -501,7 +501,10 @@ class AccuracyEngine:
             shard_rank = shard_context.rank if shard_context is not None else rank
             # TP-sharded params must load via their own weight_loader; the
             # generic narrow mis-slices fused QKV/gate_up projections.
-            if shard_world_size > 1 and load_param_with_weight_loader(
+            needs_weight_loader = (
+                shard_world_size > 1 or tensor.shape != src_tensor.shape
+            )
+            if needs_weight_loader and load_param_with_weight_loader(
                 tensor, name, lookup, reverse_mapping
             ):
                 matched += 1
@@ -611,7 +614,7 @@ class AccuracyEngine:
             sgl_args,
             component,
             library,
-            text_encoder_cpu_offload=(
+            component_starts_on_cpu=(
                 False
                 if component != ComponentType.TEXT_ENCODER or materialize_sgl_on_device
                 else True

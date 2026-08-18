@@ -1,5 +1,6 @@
 import copy
 import logging
+from collections.abc import Callable
 from contextlib import nullcontext
 from typing import Any
 
@@ -42,12 +43,16 @@ logger = init_logger(__name__)
 def _resolve_checkpoint_load_device(
     runtime_device: torch.device,
     *,
-    component_cpu_offload: bool,
+    component_starts_on_cpu: bool,
     runtime_quant_config: object | None,
 ) -> torch.device:
-    if component_cpu_offload and runtime_quant_config is None:
+    if component_starts_on_cpu and runtime_quant_config is None:
         return torch.device("cpu")
     return runtime_device
+
+
+def _minimax_h3_adaln_cache_key_filter(name: str) -> bool:
+    return ".adaln_proj.linear." not in name
 
 
 def _default_quantized_attention_backend(
@@ -162,11 +167,15 @@ class TransformerLoader(ComponentLoader):
 
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
-        component_name = _normalize_component_type(component_name)
+        component_type = _normalize_component_type(component_name)
         server_args.model_paths[component_name] = component_model_path
-        if component_name in ("transformer", "unconditional_transformer", "video_dit"):
+        if component_type in (
+            "transformer",
+            "unconditional_transformer",
+            "video_dit",
+        ):
             pipeline_dit_config_attr = "dit_config"
-        elif component_name in ("audio_dit",):
+        elif component_type == "audio_dit":
             pipeline_dit_config_attr = "audio_dit_config"
         else:
             raise ValueError(f"Invalid module name: {component_name}")
@@ -183,7 +192,14 @@ class TransformerLoader(ComponentLoader):
             component_model_path=component_model_path,
             model_cls=model_cls,
             cls_name=cls_name,
+            component_name=component_name,
         )
+        # Quantization adapters may require resident weights, so placement must
+        # be resolved after they have validated the component configuration.
+        component_starts_on_cpu = server_args.should_start_component_on_cpu(
+            component_name
+        )
+        use_fsdp = server_args.should_use_fsdp_for_component(component_name)
 
         logger.info(
             "Loading %s from %s safetensors file(s) %s, param_dtype: %s",
@@ -198,6 +214,40 @@ class TransformerLoader(ComponentLoader):
             "hf_config": config,
             "quant_config": quant_spec.runtime_quant_config,
         }
+        checkpoint_key_filter: Callable[[str], bool] | None = None
+        adaln_cache_path = component_server_args.minimax_h3_adaln_cache_path
+        if adaln_cache_path is not None:
+            if cls_name != "MiniMaxH3DiTModel":
+                raise ValueError(
+                    "--minimax-h3-adaln-cache-path is only supported by MiniMax H3"
+                )
+            if component_server_args.model_variant not in ("fl2va", "ref2va"):
+                raise ValueError(
+                    "MiniMax H3 AdaLN cache requires --model-variant fl2va or ref2va"
+                )
+            init_params["adaln_cache_path"] = adaln_cache_path
+            init_params["adaln_cache_model_variant"] = (
+                component_server_args.model_variant
+            )
+            checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
+        if component_server_args.minimax_h3_adaln_online:
+            if cls_name != "MiniMaxH3DiTModel":
+                raise ValueError(
+                    "--minimax-h3-adaln-online is only supported by MiniMax H3"
+                )
+            if adaln_cache_path is not None:
+                raise ValueError(
+                    "--minimax-h3-adaln-online and --minimax-h3-adaln-cache-path "
+                    "are mutually exclusive"
+                )
+            # Keep the weights off-device; the model rebuilds the AdaLN
+            # outputs from the checkpoint for each request's timestep plan.
+            init_params["adaln_weight_files"] = safetensors_list
+            init_params["adaln_plan_width"] = (
+                component_server_args.minimax_h3_adaln_plan_width
+            )
+            checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
+
         if (
             init_params["quant_config"] is None
             and component_server_args.transformer_weights_path is not None
@@ -211,7 +261,7 @@ class TransformerLoader(ComponentLoader):
         local_torch_device = get_local_torch_device()
         checkpoint_load_device = _resolve_checkpoint_load_device(
             local_torch_device,
-            component_cpu_offload=bool(component_server_args.dit_cpu_offload),
+            component_starts_on_cpu=component_starts_on_cpu,
             runtime_quant_config=quant_spec.runtime_quant_config,
         )
         direct_gpu_weight_loading = bool(
@@ -224,7 +274,7 @@ class TransformerLoader(ComponentLoader):
         weight_load_plan = WeightLoadPlan.for_component(
             checkpoint_load_device=checkpoint_load_device,
             needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
-            component_cpu_offload=bool(component_server_args.dit_cpu_offload),
+            component_starts_on_cpu=component_starts_on_cpu,
             load_full_state_dict_on_device=direct_gpu_weight_loading,
         )
         if direct_gpu_weight_loading:
@@ -260,14 +310,15 @@ class TransformerLoader(ComponentLoader):
                 device=local_torch_device,
                 hsdp_replicate_dim=server_args.hsdp_replicate_dim,
                 hsdp_shard_dim=server_args.hsdp_shard_dim,
-                cpu_offload=component_server_args.dit_cpu_offload,
+                component_starts_on_cpu=component_starts_on_cpu,
                 pin_cpu_memory=component_server_args.pin_cpu_memory,
-                fsdp_inference=component_server_args.use_fsdp_inference,
+                fsdp_inference=use_fsdp,
                 param_dtype=quant_spec.param_dtype,
                 reduce_dtype=torch.float32,
                 output_dtype=None,
                 strict=False,
                 weight_load_plan=weight_load_plan,
+                checkpoint_key_filter=checkpoint_key_filter,
             )
 
         # post-hooks (e.g., patch scales (nunchaku))
