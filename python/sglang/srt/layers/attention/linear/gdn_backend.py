@@ -29,7 +29,7 @@ if not is_cpu():
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
 
-if is_cuda() or is_hip():
+if is_cuda() or is_hip() or is_xpu():
     from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
         fused_qkv_split_gdn_prefill,
     )
@@ -656,7 +656,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
         if (
-            (is_cuda() or is_hip())
+            (is_cuda() or is_hip() or is_xpu())
             and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
             and not use_strided_target_verify_qkv
         ):
