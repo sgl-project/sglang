@@ -11,7 +11,7 @@ module supplies the promoted Step-6 candidate:
 
 Both kernels are row-domain-agnostic and serve the masked AND contiguous
 providers verbatim: the rank reduction is pure pair-domain (it reads the
-canonical pair-major down-A bridge and never touches a physical row), and
+pair-major down-A bridge and never touches a physical row), and
 the tail reads base down rows exclusively through ``src2dst`` over a flat
 row view — the same lever that makes ``post_reorder`` and the down-B
 scatter portable.  Only the tail's host validation distinguishes the

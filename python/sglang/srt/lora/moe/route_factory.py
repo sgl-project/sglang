@@ -33,7 +33,7 @@ class MoeLoraRoutes:
     aligned_per_expert: RouteView | None = None
     aligned_shared_outer: RouteView | None = None
     # Optional second per-expert plan used only by grouped gate/up-A when its
-    # best M tile differs from the canonical route shared by the other sites.
+    # best M tile differs from the route shared by the other sites.
     gate_up_a_aligned_per_expert: RouteView | None = None
     shared_token: RouteView | None = None
 
@@ -109,7 +109,7 @@ def _aligned_pair_route(
     The scan kernel restores ``counts`` to zero after its final read, so the
     workspace initializes that tensor only when storage is first allocated.
     Supplying the retained scalar directly also avoids a follow-up device copy.
-    The canonical dispatch is checked before allocation, so the JIT path keeps
+    The dispatch is checked before allocation, so the JIT path keeps
     its own metadata without paying for unused fused scratch.
     """
     lora_experts_per_adapter = 1 if is_shared_outer else num_local_experts
@@ -161,7 +161,7 @@ def _dual_granularity_aligned_routes(
     use_pdl: bool | None,
     workspace: MoeLoraWorkspace,
 ) -> tuple[RouteView, RouteView]:
-    """Build the canonical and gate/up-A per-expert aligned routes in ONE pass.
+    """Build the shared and gate/up-A per-expert aligned routes in ONE pass.
 
     Both views cover the same ``(topk_ids, token_slots)`` pairs with the same
     per-expert key; only the M granularity differs, so the fused dual builder
@@ -284,7 +284,7 @@ def build_routes(
         values["aligned_per_expert"] = per_expert
         values["aligned_shared_outer"] = shared
     else:
-        # Both the canonical and gate/up-A per-expert routes cover identical
+        # Both the shared and gate/up-A per-expert routes cover identical
         # pair data with identical keys; when both are retained and the shape
         # dispatches to the fused builder anyway, one dual-granularity pass
         # replaces the two standalone triples (6 route launches -> 3).  The

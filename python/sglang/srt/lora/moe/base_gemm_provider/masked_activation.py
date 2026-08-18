@@ -9,7 +9,7 @@ Layout: the base GEMM1 output is the provider *masked* layout
 ``[E_local, m_max, slices * inter]`` viewed flat by the kernel;
 ``src2dst[t * top_k + k]`` is the flat row for expanded pair (t, k)
 (``expert * m_max + offset``, produced by ``moe_ep_deepgemm_preprocess``).
-The LoRA delta is canonical contiguous ``[gate | up]`` indexed by the EXPANDED
+The LoRA delta is contiguous ``[gate | up]`` indexed by the EXPANDED
 (t, k) — the two index spaces meet here, exactly like the trtllm
 ``fused_activation_quant`` kernel.
 
@@ -45,7 +45,7 @@ def apply_activation(x, ACTIVATION_TYPE: tl.constexpr):
 @triton.jit
 def _activation_delta_masked_kernel(
     gateup_ptr,  # [E_local * m_max, slices * inter] bf16
-    delta_ptr,  # [num_tokens, top_k, slices * inter] canonical
+    delta_ptr,  # [num_tokens, top_k, slices * inter] [gate | up]
     act_out_ptr,  # [E_local * m_max, inter] bf16 (masked layout, flat)
     act_lora_in_ptr,  # [num_tokens, top_k, inter] bf16
     src2dst_ptr,  # [num_tokens * top_k] int32
@@ -98,7 +98,7 @@ def _activation_delta_masked_kernel(
 
         g = tl.load(gateup_row + gate_offs, mask=mask & valid, other=0.0).to(tl.float32)
         if HAS_DELTA:
-            # delta is always canonical contiguous [gate | up]
+            # delta is always contiguous [gate | up]
             dg = tl.load(delta_row + offs, mask=mask & valid, other=0.0).to(tl.float32)
             g += dg
         act = apply_activation(g, ACTIVATION_TYPE)
@@ -152,7 +152,7 @@ def act_delta_masked(
         num_slices * inter,
     ):
         raise ValueError(
-            f"gate_up_delta must be canonical {(*topk_ids.shape, num_slices * inter)}"
+            f"gate_up_delta must be {(*topk_ids.shape, num_slices * inter)}"
         )
     if activation_lora_input.shape != (*topk_ids.shape, inter):
         raise ValueError(f"activation_lora_input must be {(*topk_ids.shape, inter)}")

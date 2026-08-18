@@ -555,7 +555,7 @@ class TestDualGateUpARoute(unittest.TestCase):
         # The JIT regime owns its metadata; no fused scratch is allocated.
         self.assertEqual(self.workspace.tensors, {})
 
-    def test_equal_m_tile_reuses_the_canonical_route(self):
+    def test_equal_m_tile_reuses_the_shared_route(self):
         routes, calls, _ = self._build(gate_up_a_block_size=16)
         self.assertEqual(calls, [16])
         self.assertIsNone(routes.gate_up_a_aligned_per_expert)

@@ -328,7 +328,7 @@ def _indexed_pairs_lora_b_kernel(
     The aligned one-launch kernel pays a full ``BLOCK_SIZE_M`` tensor-core
     tile per occupied virtual expert, which at sparse decode routes is
     almost entirely block padding.  This variant derives the pair's virtual
-    expert key inline (the one canonical definition), so the M axis is
+    expert key inline (the one definition of it), so the M axis is
     exactly the occupied pairs: no sort, no capacity padding, no
     ``num_pairs_post_padded`` device scalar.
 

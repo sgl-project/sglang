@@ -1,7 +1,7 @@
 """BF16 MoE provider backed by the SM90/SM100 CuTeDSL masked grouped GEMM.
 
 The study's winning family (plan section 45): swap_ab, direct schedule,
-canonical ``[E, N, K]`` weights, 1-CTA MMA. Everything except S2/S4 is
+standard ``[E, N, K]`` weights, 1-CTA MMA. Everything except S2/S4 is
 the shared :class:`MaskedRowDomainProvider` — same S1 preprocess (whose
 ``hidden_permuted``/``masked_m`` are exactly this kernel's A contract), same
 S3 activation join, same S5 finalize as the DeepGEMM provider — so a

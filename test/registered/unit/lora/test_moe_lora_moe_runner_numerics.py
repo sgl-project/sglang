@@ -128,7 +128,7 @@ def _token_slots(traffic: str, num_tokens: int) -> torch.Tensor:
     if traffic == "active":
         return torch.zeros(num_tokens, dtype=torch.int32)
     if traffic == "mixed":
-        # Batch preparation canonicalizes every inactive resident assignment
+        # Batch preparation normalizes every inactive resident assignment
         # to -1 before any MoE layer consumes the mapping.
         pattern = torch.tensor([0, -1, -1, 0, -1, -1], dtype=torch.int32)
         return pattern.repeat((num_tokens + pattern.numel() - 1) // pattern.numel())[

@@ -1,6 +1,6 @@
 """SM100 CuTeDSL masked grouped GEMM, ported from the frozen base-GEMM study.
 
-This is the study's winning family (swap_ab + direct schedule, canonical
+This is the study's winning family (swap_ab + direct schedule, standard
 [E, N, K] weights). The kernel retains its NVIDIA BSD-3 header; benchmark-only
 code is not part of the serving package.
 

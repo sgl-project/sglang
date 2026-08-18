@@ -1,13 +1,13 @@
 """Fused LoRA middle stage over the production masked MoE row domain.
 
 This kernel is the production-shaped form of the promoted Step-5 candidate.
-The base GEMM writes ``[E, m_max, S * I]`` while LoRA uses canonical pair
+The base GEMM writes ``[E, m_max, S * I]`` while LoRA uses original pair
 order, so the kernel explicitly crosses the domains through ``src2dst``:
 
 * ``b_activation`` computes gate/up LoRA-B and the activation in one launch.
 
 Activation is always written to the masked rows consumed by the base down
-GEMM.  A canonical pair copy is optional: it remains the compatibility output
+GEMM.  A pair-major copy is optional: it remains the compatibility output
 for non-mapped down-A families, while grouped down-A can read the masked rows
 through the provider's explicit pair-to-row ABI.  When present, an invalid
 routed pair writes exact zero to the pair output and never touches a masked

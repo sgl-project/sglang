@@ -1,6 +1,6 @@
 """Deterministic BF16 math core for routed MoE LoRA.
 
-The core consumes canonical token/expert-pair routing and contains no execution
+The core consumes token/expert-pair routing and contains no execution
 config.  Callers choose tiles and provider column order explicitly.
 """
 
@@ -124,9 +124,9 @@ def grouped_lora_a(
     input_row_map: torch.Tensor | None = None,
     produce_pdl: bool = False,
 ) -> None:
-    """Write one single-K grouped LoRA-A result in canonical pair order.
+    """Write one single-K grouped LoRA-A result in original pair order.
 
-    ``input`` is token-major by default.  ``pair_input`` selects canonical
+    ``input`` is token-major by default.  ``pair_input`` selects
     pair-major input.  A supplied ``input_row_map[pair]`` instead selects a
     provider-private row and may contain ``-1``; such rows are overwritten by
     zero in ``output``. Rows whose virtual expert ID is ``-1`` are undefined;

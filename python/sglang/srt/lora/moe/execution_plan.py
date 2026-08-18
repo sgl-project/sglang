@@ -395,7 +395,7 @@ class MoeLoraExecutionPlan:
         """Whether the schedule is a plain ordered same-stream pipeline.
 
         True iff the schedule has no early/late overlap windows and down-A
-        is GROUPED over the canonical pair activation.  Such a plan drives
+        is GROUPED over the pair activation.  Such a plan drives
         the provider seam
         (prepare / gateup / middle / down / finalize) as ordered same-stream
         calls with no cross-stage coupling, which is the schedule shape
@@ -446,9 +446,9 @@ class MoeLoraExecutionPlan:
     def downstream_route_requirements(self) -> frozenset[RouteRequirement]:
         """The same union with gate/up-A left out.
 
-        build_routes asks this to learn whether the canonical per-expert
+        build_routes asks this to learn whether the SHARED per-expert
         aligned route exists ONLY for gate/up-A, which -- when gate/up-A runs
-        at its own block size -- means the canonical one need not be built.
+        at its own block size -- means the shared one need not be built.
 
         It cannot be derived by subtracting gate_up_a's requirements from the
         full union: that would also drop a requirement a downstream stage

@@ -16,12 +16,12 @@ weight bind, and the serial correctness pipeline ships there as the
 exactly one owner and every required route representation is built once:
 
     gate/up LoRA A  (grouped_lora_a: token-major hidden -> pair-major rank)
-    gate/up LoRA B  (one_launch_sliced_lora_b -> canonical [gate | up] delta)
+    gate/up LoRA B  (one_launch_sliced_lora_b -> standard [gate | up] delta)
     S1 prepare      (provider permute to its physical row domain)
     S2 gateup       (provider grouped GEMM)
     S3 act          (base + delta -> activation; writes provider rows and,
-                     when required, a canonical pair-major down-A source)
-    down LoRA A     (grouped_lora_a, canonical pairs or provider-mapped rows)
+                     when required, a pair-major down-A source)
+    down LoRA A     (grouped_lora_a, original pairs or provider-mapped rows)
     down LoRA B     (one_launch_sliced_lora_b -> unweighted LoRA delta [T, K, H])
     S4 down         (provider grouped GEMM)
     S5 finalize     (provider fixed-order top-k reduction; router coefficient
@@ -35,7 +35,7 @@ routes and contribute exact zeros rather than being diverted to another path.
 
 Base rows: serving gives the base model a REAL resident slot whose factors are
 zero-filled and whose ``adapter_enabled`` entry is 0. Batch preparation
-canonicalizes such assignments to the ``-1`` execution sentinel before any
+normalizes such assignments to the ``-1`` execution sentinel before any
 layer runs — otherwise base rows build routed work against zero weights, which
 is numerically harmless but inflates route padding, group counts, and every
 LoRA GEMM's row count.
@@ -125,7 +125,7 @@ class MoeLoraBatch(msgspec.Struct, kw_only=True):
 
     Narrow by design: the legacy ``LoRAInfo`` carries ~18 fields for the old
     kernels, and passing it wholesale would make it impossible to see what this
-    runner depends on. ``token_slots`` holds canonical active physical slot
+    runner depends on. ``token_slots`` holds active physical slot
     IDs, with every inactive assignment represented by the ``-1`` sentinel.
     """
 
@@ -569,8 +569,7 @@ class MoeLoraRunner:
             # and contiguity come from the producers' own workspace allocation.
             if input_row_map.numel() != route.topk_ids.numel():
                 raise ValueError(
-                    "mapped down-A pair_to_row must have one entry per "
-                    "canonical routed pair"
+                    "mapped down-A pair_to_row must have one entry per " "routed pair"
                 )
         num_tokens = (
             input.shape[0]

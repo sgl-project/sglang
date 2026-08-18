@@ -81,9 +81,9 @@ def _validate_flat_config(name: str, config: Mapping[str, int]) -> None:
 class MoeLoraLaunchConfig:
     """Site-specific launch settings; no token/rank/device config."""
 
-    # The canonical aligned route is shared by gate/up-B, down-A, and down-B.
+    # One aligned route is SHARED by gate/up-B, down-A, and down-B.
     # Gate/up-A may request a second aligned plan with a different M tile.  Its
-    # output is written by original pair ID, so the canonical B route can
+    # output is written by original pair ID, so the shared B route can
     # consume that bridge without a layout conversion.  Keeping the two
     # values explicit also charges the extra route build in composed timing.
     routing_block_size: int = 16

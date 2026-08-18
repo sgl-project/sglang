@@ -80,7 +80,7 @@ def test_compute_moe_lora_info_expands_segments(use_preallocated_buffers: bool):
     ],
     ids=("mixed", "all_inactive"),
 )
-def test_compute_moe_lora_info_cpu_fallback_canonicalizes_inactive_slots(
+def test_compute_moe_lora_info_cpu_fallback_normalizes_inactive_slots(
     weight_indices: list[int],
     lora_ranks: list[int],
     expected_mapping: list[int],

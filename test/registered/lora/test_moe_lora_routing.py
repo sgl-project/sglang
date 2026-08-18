@@ -1,4 +1,4 @@
-"""Correctness tests for canonical SGL-LoRA virtual-expert routing."""
+"""Correctness tests for SGL-LoRA virtual-expert routing."""
 
 import unittest
 from unittest import mock
@@ -531,12 +531,14 @@ class TestMoeLoraDualGranularityRoutes(CustomTestCase):
         return views, scratches
 
     @staticmethod
-    def _canonical(sorted_pair_ids, block_ids, num_pairs_post_padded, block_size):
+    def _sorted_within_buckets(
+        sorted_pair_ids, block_ids, num_pairs_post_padded, block_size
+    ):
         """Plan identity modulo intra-bucket scatter order.
 
         Consecutive equal block labels form one bucket's region (labels are
         the strictly increasing virtual-expert ids plus the trailing -1
-        sentinel run); sorting the slots inside each region canonicalizes the
+        sentinel run); sorting the slots inside each region removes the
         atomic-cursor order while keeping padding (= num_pairs) at the tail.
         """
         padded = int(num_pairs_post_padded.item())
@@ -562,13 +564,13 @@ class TestMoeLoraDualGranularityRoutes(CustomTestCase):
             "block labels are deterministic and must match bitwise",
         )
         self.assertEqual(
-            self._canonical(
+            self._sorted_within_buckets(
                 view.sorted_pair_ids,
                 view.block_virtual_expert_ids,
                 view.num_pairs_post_padded,
                 block_size,
             ),
-            self._canonical(ref_sorted, ref_blocks, ref_padded, block_size),
+            self._sorted_within_buckets(ref_sorted, ref_blocks, ref_padded, block_size),
         )
 
     def _iid(self, num_tokens, top_k, expert_hi, slot_hi, *, seed):
@@ -675,7 +677,7 @@ class TestMoeLoraDualGranularityRoutes(CustomTestCase):
                 use_pdl=enabled,
             )
             plans[enabled] = [
-                self._canonical(
+                self._sorted_within_buckets(
                     view.sorted_pair_ids,
                     view.block_virtual_expert_ids,
                     view.num_pairs_post_padded,

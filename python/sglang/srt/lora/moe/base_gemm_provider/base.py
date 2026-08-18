@@ -38,7 +38,7 @@ class MoeBaseProviderContract(msgspec.Struct, frozen=True, kw_only=True):
 
     key: str
     # Column order of the provider's own gate/up GEMM output. The LoRA delta is
-    # always canonical [gate | up]; these flags describe the BASE rows only.
+    # always [gate | up]; these flags describe the BASE rows only.
     gate_first: bool
     interleaved: bool
     gate_up_output_dtype: torch.dtype
@@ -50,7 +50,7 @@ class MappedLoraAInput(msgspec.Struct, frozen=True, kw_only=True):
     """Provider-owned activation rows exposed through a stable LoRA-A ABI.
 
     ``rows`` is a 2-D physical provider row domain. ``pair_to_row`` is a
-    contiguous int32 tensor mapping each canonical routed pair to one row;
+    contiguous int32 tensor mapping each routed pair to one row;
     ``-1`` denotes an invalid pair. Keeping this descriptor on the provider
     seam lets the runner use mapped grouped LoRA-A without learning the
     provider workspace's private field names or layout details.
@@ -86,7 +86,7 @@ class MoeBaseProvider:
 
     @property
     def gate_up_slices(self) -> int:
-        """One for non-gated activations, two for canonical gate/up."""
+        """One for non-gated activations, two for gate/up."""
         raise NotImplementedError
 
     def prepare(
@@ -153,7 +153,7 @@ class MoeBaseProvider:
 
         Router coefficient and routed scaling are applied exactly once over
         ``base_pair + lora_delta``; ``lora_delta`` is the unweighted down-LoRA
-        contribution in canonical ``[T, K, H]`` pair order.
+        contribution in ``[T, K, H]`` pair order.
         """
         raise NotImplementedError
 
@@ -202,7 +202,7 @@ class MoeBaseProvider:
         """Expose provider activation rows for standalone grouped down-A.
 
         Providers return ``None`` unless their activation row domain has a
-        stable canonical-pair mapping.  The default preserves the pair-major
+        stable pair-to-row mapping.  The default preserves the pair-major
         bridge used by existing plans and future providers.
         """
 
@@ -226,7 +226,7 @@ class MoeBaseProvider:
         """Whether S4's output rows admit the down-B scatter-add epilogue.
 
         True only when the provider's physical row domain has a stable
-        canonical-pair-to-row mapping it can hand the scatter launch, the
+        pair-to-row mapping it can hand the scatter launch, the
         same property behind ``mapped_down_lora_a_input``.
         """
         return False
@@ -247,7 +247,7 @@ class MoeBaseProvider:
         tiling targets ``down_out``'s physical rows through the provider's
         pair-to-row mapping instead of a dense pair-major delta buffer, and
         the materialized finalize then runs in no-pair-delta mode.
-        ``bridge`` is the canonical pair-major down-A output and ``b_down``
+        ``bridge`` is the pair-major down-A output and ``b_down``
         the flattened per-virtual-expert down-B groups.
         """
         raise NotImplementedError(

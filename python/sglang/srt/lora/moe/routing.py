@@ -1,4 +1,4 @@
-"""Canonical virtual-expert routing for MoE LoRA MoE kernels.
+"""Virtual-expert routing for MoE LoRA MoE kernels.
 
 TERMS (all of them are about ONE question: which LoRA A/B weight matrix
 does a given (token, expert) pair multiply by?)
@@ -126,7 +126,7 @@ def uses_fused_align(
     num_virtual_experts: int,
     view: str = ROUTE_ALIGNED,
 ) -> bool:
-    """Return the canonical aligned-route dispatch without building either arm."""
+    """Return the aligned-route dispatch without building either arm."""
     return (
         view == ROUTE_ALIGNED
         and topk_ids.is_cuda
@@ -153,7 +153,7 @@ class FusedAlignScratch(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class RouteView(msgspec.Struct, frozen=True, kw_only=True):
-    """One route representation over canonical ``(adapter, LoRA expert)`` IDs.
+    """One route representation over ``(adapter, LoRA expert)`` IDs.
 
     Carries the source tensors unconditionally so a ``raw`` consumer has what
     it needs to fuse the key computation into its own kernel.
@@ -258,7 +258,7 @@ def virtual_expert_ids_inline(
     USE_LORA_EXPERT_MAP: tl.constexpr,
     SHARED_OUTER: tl.constexpr,
 ):
-    """Canonical fused ``(adapter, LoRA expert)`` key for a block of pairs.
+    """Fused ``(adapter, LoRA expert)`` key for a block of pairs.
 
     A Triton device function, not a kernel: this is the ONE definition of the
     key and of what makes a pair valid.  A ``raw``-view consumer (an indexed
@@ -954,7 +954,7 @@ def build_dual_granularity_aligned_routes(
     for the retained dual-granularity route bundle.
 
     Per-expert ownership only.  The one shipping consumer is grouped
-    per-expert gate/up-A against the canonical per-expert route; shared-outer
+    per-expert gate/up-A against the shared per-expert route; shared-outer
     or expert-mapped duals have no consumer and would multiply the constexpr
     surface (the joint shared-outer builder already covers mixed ownership).
 

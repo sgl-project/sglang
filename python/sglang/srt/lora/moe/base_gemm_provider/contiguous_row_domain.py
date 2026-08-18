@@ -47,7 +47,7 @@ Stage mapping versus the masked twin:
   ``e * m_max + slot`` re-targets them with zero kernel changes, including
   the exactly-once invalid-pair zero-write duty on the pair activation.
   For the same reason the LoRA A/B kernels need no contiguous variants:
-  gate/up A is token-domain, down A consumes the canonical pair activation
+  gate/up A is token-domain, down A consumes the pair activation
   (or the ``src2dst`` row map through ``MappedLoraAInput``), and every B
   kernel is pair-domain.
 
@@ -65,7 +65,7 @@ internal to the three routing launches and independent of the row domain,
 and the finalize is the same ``post_reorder``.
 
 The shared-rank finalize family ports through the SAME lever: the rank
-reduction is pure pair-domain (it reads the canonical pair-major down-A
+reduction is pure pair-domain (it reads the pair-major down-A
 bridge the mapped grouped down-A already emits — output rows are indexed by
 pair id regardless of the input row map), and the from-scratch tail reads
 base down rows exclusively through ``src2dst`` over a flat row view, so
@@ -676,7 +676,7 @@ def act_delta_contiguous(
         num_slices * inter,
     ):
         raise ValueError(
-            f"gate_up_delta must be canonical {(*topk_ids.shape, num_slices * inter)}"
+            f"gate_up_delta must be {(*topk_ids.shape, num_slices * inter)}"
         )
     if activation_lora_input.shape != (*topk_ids.shape, inter):
         raise ValueError(f"activation_lora_input must be {(*topk_ids.shape, inter)}")
@@ -1101,7 +1101,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
 
         The contiguous twin of the masked provider's mapping and the same
         semantic ABI: ``src2dst`` already holds one physical activation row
-        per canonical routed pair.  Sentinel pairs' (uninitialized) entries
+        per routed pair.  Sentinel pairs' (uninitialized) entries
         are never read — the aligned route buckets them into ``-1``-labeled
         blocks the mapped grouped-A kernel skips, identical to the masked
         domain, whose dispatch also leaves them unwritten.

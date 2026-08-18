@@ -17,7 +17,7 @@ The two deltas are in the epilogue:
   output AFTER it has run, so the ``[T, K, H]`` pair-major delta buffer is
   never allocated; and
 * the store is a read-modify-write ADD of the unweighted delta.  No atomics:
-  each provider row corresponds to exactly one canonical routed pair in both
+  each provider row corresponds to exactly one routed pair in both
   row domains (masked ``e * m_max + slot`` and contiguous
   ``seg_offsets[e] + slot`` are both injective over valid pairs), each pair
   appears exactly once in ``sorted_pair_ids``, and different N tiles of one
@@ -30,7 +30,7 @@ memory never becomes a false delta; here the base down GEMM owns
 memory traffic.  That is also a correctness requirement — sentinel pairs'
 ``src2dst`` entries are never written by either row domain's dispatch and
 must not be dereferenced.  A valid virtual-expert group implies routed pairs
-(the canonical key is ``-1`` whenever ``topk_id < 0``), so every unmasked
+(the fused key is ``-1`` whenever ``topk_id < 0``), so every unmasked
 lane's ``src2dst`` entry was written.
 
 ``src2dst`` is only READ here, so the documented hazard barring kernels that
@@ -115,7 +115,7 @@ def _down_b_scatter_kernel(
     pair_mask = pair_ids < num_pairs
     n_offsets = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
     n_mask = n_offsets < N_HIDDEN
-    # A valid group implies routed pairs (the canonical key is -1 whenever
+    # A valid group implies routed pairs (the fused key is -1 whenever
     # topk_id < 0), so every unmasked src2dst entry was written.
     dest_rows = tl.load(src2dst_ptr + pair_ids, mask=pair_mask, other=0).to(tl.int64)
     destination_ptrs = (
@@ -168,7 +168,7 @@ def invoke_down_b_scatter(
 
     ``down_rows`` is the provider's S4 output flattened to ``[rows, H]`` —
     masked slab and contiguous compact buffer alike — indexed only through
-    ``src2dst``.  ``bridge`` is the canonical pair-major down-A output and
+    ``src2dst``.  ``bridge`` is the pair-major down-A output and
     ``b_down`` the flattened ``[V, H, rank]`` down-B groups, exactly the
     operands of the standalone one-launch down-B whose tiling this launch
     keeps; ``config`` is the down-B site's launch config with the same field
