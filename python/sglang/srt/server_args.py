@@ -6265,8 +6265,7 @@ class ServerArgs:
                 is_sm100_supported() and get_device_sm() in (100, 103)
             ):
                 raise ValueError(
-                    "--mamba-backend cake requires datacenter Blackwell "
-                    "SM100/SM103."
+                    "--mamba-backend cake requires datacenter Blackwell " "SM100/SM103."
                 )
 
     def _handle_int8_mamba_checkpoint(self):
