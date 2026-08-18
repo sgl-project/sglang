@@ -20,6 +20,15 @@ from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 class PaddleOCRVLImageProcessor(QwenVLImageProcessor):
     models = [PaddleOCRVLForConditionalGeneration]
 
+    # A document page is a far heavier preprocessing unit than a chat image:
+    # resize + normalize + patchify of a full-resolution scan costs tens of
+    # milliseconds, so a single worker caps request throughput at
+    # 1 / preprocess_time regardless of how much GPU is left idle. Overlap it
+    # across workers; the work itself is unchanged.
+    auto_mm_processor_worker_num = 4
+    auto_mm_io_worker_num = 16
+    supports_mm_processor_concurrency = True
+
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
