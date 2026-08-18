@@ -109,7 +109,6 @@ class TestDSV4TopKDispatch(CustomTestCase):
 
         indexer_capturer = MagicMock()
         with (
-            envs.SGLANG_TOPK_TRANSFORM_512_TORCH.override(False),
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.override(False),
             envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
