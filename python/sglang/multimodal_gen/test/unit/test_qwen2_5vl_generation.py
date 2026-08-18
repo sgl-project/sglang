@@ -26,7 +26,11 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen2_5vl_vision import (
     _vision_window_index,
 )
 from sglang.multimodal_gen.runtime.pipelines.longcat_image import LongCatImagePipeline
-from sglang.srt.layers.linear import ReplicatedLinear, RowParallelLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.srt.models.qwen2_5_vl import (
     Qwen2_5_VisionPatchEmbed,
     Qwen2_5_VisionPatchMerger,
@@ -102,8 +106,9 @@ def test_native_vision_reuses_srt_modules():
     assert isinstance(model.patch_embed, Qwen2_5_VisionPatchEmbed)
     assert isinstance(model.merger, Qwen2_5_VisionPatchMerger)
     assert not mlp.fuse_gate_up
-    assert isinstance(mlp.gate_proj, ReplicatedLinear)
-    assert isinstance(mlp.up_proj, ReplicatedLinear)
+    assert isinstance(mlp.gate_proj, ColumnParallelLinear)
+    assert isinstance(mlp.up_proj, ColumnParallelLinear)
+    assert mlp.gate_proj.tp_size == mlp.up_proj.tp_size == 1
     assert isinstance(mlp.down_proj, ReplicatedLinear)
     assert isinstance(fused_mlp.down_proj, RowParallelLinear)
     assert mlp.act is not None
@@ -117,7 +122,7 @@ def test_native_vision_reuses_srt_modules():
     )
 
 
-def test_text_mlp_falls_back_when_intermediate_size_is_not_tp_divisible(
+def test_text_mlp_uses_single_rank_when_intermediate_size_is_not_tp_divisible(
     monkeypatch,
 ):
     monkeypatch.setattr(qwen2_5vl, "Qwen2_5_VLAttention", lambda *_args: nn.Identity())
@@ -137,7 +142,9 @@ def test_text_mlp_falls_back_when_intermediate_size_is_not_tp_divisible(
 
     assert layer.mlp.tp_size == 1
     assert layer.mlp.tp_rank == 0
-    assert isinstance(layer.mlp.gate_proj, ReplicatedLinear)
+    assert isinstance(layer.mlp.gate_proj, ColumnParallelLinear)
+    assert isinstance(layer.mlp.up_proj, ColumnParallelLinear)
+    assert layer.mlp.gate_proj.tp_rank == layer.mlp.up_proj.tp_rank == 0
     assert isinstance(layer.mlp.down_proj, ReplicatedLinear)
 
 

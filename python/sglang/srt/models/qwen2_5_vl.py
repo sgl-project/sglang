@@ -166,21 +166,6 @@ class Qwen2_5_VLMLP(nn.Module):
                 tp_size=self.tp_size,
                 tp_rank=self.tp_rank,
             )
-        elif self.tp_size == 1:
-            projection_kwargs = dict(
-                input_size=in_features,
-                output_size=hidden_features,
-                bias=bias,
-                quant_config=quant_config,
-            )
-            self.gate_proj = ReplicatedLinear(
-                **projection_kwargs,
-                prefix=add_prefix("gate_proj", prefix),
-            )
-            self.up_proj = ReplicatedLinear(
-                **projection_kwargs,
-                prefix=add_prefix("up_proj", prefix),
-            )
         else:
             projection_kwargs = dict(
                 input_size=in_features,
