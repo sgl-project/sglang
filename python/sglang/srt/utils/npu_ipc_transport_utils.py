@@ -262,9 +262,7 @@ class NpuIpcTensorTransportProxy:
             )
 
         if pool_ipc_handle is not None:
-            sync_flag_meta = (
-                sync_buffer_meta.meta_data if sync_buffer_meta else None
-            )
+            sync_flag_meta = sync_buffer_meta.meta_data if sync_buffer_meta else None
             self.proxy_state = {
                 "ipc_extra": {
                     "pool_handle": pool_ipc_handle,
