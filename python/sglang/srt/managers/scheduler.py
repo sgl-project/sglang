@@ -1921,7 +1921,7 @@ class Scheduler(
         # A runtime PD role switch rebuilt the disaggregation structures for a new
         # role. The response has already been sent above; now break out of the
         # current (old-role) event loop so the supervisor can re-dispatch.
-        if self._event_loop_should_restart:
+        if get_disagg().enable_pd_role_switch and self._event_loop_should_restart:
             self._event_loop_should_restart = False
             raise role_switch.PdRoleSwitchRestart()
 

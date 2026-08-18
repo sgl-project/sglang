@@ -97,6 +97,7 @@ async fn model_info(State(state): State<AppState>) -> Response {
         // selected parser into `server_args` before the scheduler forks.
         "reasoning_parser": sa.reasoning_parser,
         "tool_call_parser": sa.tool_call_parser,
+        "disaggregation_mode": sa.disaggregation_mode,
     });
     (
         StatusCode::OK,

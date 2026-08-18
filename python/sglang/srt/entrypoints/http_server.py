@@ -758,6 +758,9 @@ async def model_info():
         "tool_call_parser": _global_state.tokenizer_manager.config_value(
             "tool_call_parser"
         ),
+        "disaggregation_mode": _global_state.tokenizer_manager.config_value(
+            "disaggregation_mode"
+        ),
         "has_image_understanding": model_config.is_image_understandable_model,
         "has_audio_understanding": model_config.is_audio_understandable_model,
         "model_type": getattr(model_config.hf_config, "model_type", None),

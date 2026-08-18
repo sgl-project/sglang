@@ -1395,7 +1395,7 @@ class ModelRunner:
             logger.info("Decode CUDA graphs already captured; skipping re-capture.")
             return
 
-        cfg = self.server_args.cuda_graph_config
+        cfg = get_exec().graph.cuda_graph_config
         was_disabled = cfg is not None and cfg.decode.backend == Backend.DISABLED
         if was_disabled:
             # Prefill was launched with the decode CUDA graph disabled; enable it
