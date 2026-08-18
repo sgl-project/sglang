@@ -34,6 +34,11 @@ on:
         required: false
         type: string
         default: 'true'
+      trouble_shotting:
+        description: 'Keep pods and sglang processes alive after the test finishes for debugging.'
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       ref:
@@ -61,6 +66,11 @@ on:
         required: false
         type: string
         default: ''
+      trouble_shotting:
+        description: 'Keep pods and sglang processes alive after the test finishes for debugging.'
+        required: false
+        type: boolean
+        default: false
 concurrency:
   group: nightly-test-npu-${{ inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
@@ -73,6 +83,7 @@ jobs:
       image_a2: ${{ steps.set-vars.outputs.image_a2 }}
       image_a3: ${{ steps.set-vars.outputs.image_a3 }}
       skip_install_flag: ${{ steps.set-vars.outputs.skip_install_flag }}
+      trouble_shotting: ${{ steps.set-vars.outputs.trouble_shotting }}
     steps:
       # When triggered by PR, no inputs parameters are used. The latest community code is tested by default.
       - name: Set image config
@@ -102,6 +113,11 @@ jobs:
             echo "skip_install_flag=false" >> $GITHUB_OUTPUT
           else
             echo "skip_install_flag=${{ inputs.skip_install_flag }}" >> $GITHUB_OUTPUT
+          fi
+          if [ -z "${{ inputs.trouble_shotting }}" ]; then
+            echo "trouble_shotting=false" >> $GITHUB_OUTPUT
+          else
+            echo "trouble_shotting=${{ inputs.trouble_shotting }}" >> $GITHUB_OUTPUT
           fi
 #   nightly-poc-single-node-a2-tests:
 #     name: single-node-poc-a2
@@ -316,20 +332,27 @@ jobs:
       matrix:
         test_config:
           # glm5_1 performance tests
-#           - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms
-#             prefill_size: 2
-#             decode_size: 2
-#             router_size: 1
-#             test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms.py
-#             test_type: 'perf'
-#             prefill_decode_deployment: 'separation'
-          - name: glm5_1_w4a8_1p1d_32p_in16k_out1k_50ms
+          - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms
             prefill_size: 2
             decode_size: 2
             router_size: 1
-            test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in16k_out1k_50ms.py
+            test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
+          - name: glm5_1_w4a8_1p1d_32p_in65k_out1k5_prefix90_25ms
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in65k_out1k5_prefix90_25ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
+#           - name: glm5_1_w4a8_1p1d_32p_in16k_out1k_50ms
+#             prefill_size: 2
+#             decode_size: 2
+#             router_size: 1
+#             test_case: test/registered/npu/performance/glm5_1/test_npu_glm5_1_w4a8_1p1d_32p_in16k_out1k_50ms.py
+#             test_type: 'perf'
+#             prefill_decode_deployment: 'separation'
           - name: glm5_1_w4a8_1p1d_32p_in64k_out1k_50ms_aime26
             prefill_size: 2
             decode_size: 2
@@ -363,6 +386,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       ref: ${{ needs.set-image-config.outputs.ref }}
       install_sglang_from_source: true
+      trouble_shotting: ${{ needs.set-image-config.outputs.trouble_shotting }}
       prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
       transformers_version: ''
 

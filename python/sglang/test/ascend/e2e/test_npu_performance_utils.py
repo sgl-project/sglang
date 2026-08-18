@@ -471,7 +471,12 @@ def run_bench_serving(
     logger.info(f"Command: {' '.join(cmd_args)}")
 
     # Run benchmark command and capture output
-    metrics = {"mean_ttft": None, "mean_tpot": None, "total_tps": None}
+    metrics = {
+        "mean_ttft": None,
+        "mean_tpot": None,
+        "total_tps": None,
+        "total_token_tps": None,
+    }
 
     process = subprocess.Popen(
         cmd_args,
@@ -503,6 +508,10 @@ def run_bench_serving(
                     parts = stripped_line.split()
                     if len(parts) >= 5:
                         metrics["total_tps"] = parts[4]
+                elif "Total token throughput" in stripped_line:
+                    parts = stripped_line.split()
+                    if len(parts) >= 5:
+                        metrics["total_token_tps"] = parts[4]
                 elif "Mean E2E Latency" in stripped_line:
                     parts = stripped_line.split()
                     if len(parts) >= 5:
@@ -694,6 +703,18 @@ def run_aisbench(
                 f"Simplified output snippet around Output Token Throughput: {simplified_output[simplified_output.find('Output')-20:simplified_output.find('Output')+100] if 'Output' in simplified_output else 'Output not found'}"
             )
 
+        total_token_tps_matches = re.findall(
+            r"Total\s+Token\s+Throughput\s+total\s+([\d.]+)\s+token\s*/?\s*s",
+            simplified_output,
+        )
+        if total_token_tps_matches:
+            metrics["total_token_tps"] = total_token_tps_matches[0]
+            logger.info(
+                f"Extracted total_token_tps: {metrics['total_token_tps']} token/s"
+            )
+        else:
+            logger.warning("Could not extract total_token_tps from output")
+
         ttft_match = re.search(r"TTFT\s+total\s+([\d.]+)\s+ms", simplified_output)
         if ttft_match:
             metrics["mean_ttft"] = ttft_match.group(1)
@@ -831,6 +852,17 @@ def assert_metrics(self, metrics):
             float(self.output_token_throughput),
             labels={"test_case": tc_name, "type": "perf"},
         )
+    if self.total_token_throughput and metrics.get("total_token_tps"):
+        dump_metric(
+            "total_throughput",
+            float(metrics["total_token_tps"]),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
+        dump_metric(
+            "total_throughput_baseline",
+            float(self.total_token_throughput),
+            labels={"test_case": tc_name, "type": "perf"},
+        )
     if self.ttft and metrics.get("mean_ttft"):
         dump_metric(
             "ttft",
@@ -869,6 +901,11 @@ def assert_metrics(self, metrics):
         self.assertGreaterEqual(
             float(metrics["total_tps"]),
             self.output_token_throughput * OUTPUT_TOKEN_THROUGHPUT_TOLERANCE,
+        )
+    if self.total_token_throughput:
+        self.assertGreaterEqual(
+            float(metrics["total_token_tps"]),
+            self.total_token_throughput * OUTPUT_TOKEN_THROUGHPUT_TOLERANCE,
         )
     if self.ttft:
         self.assertLessEqual(
@@ -910,6 +947,7 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    total_token_throughput = None
 
     dp = None
     generation_kwargs = None
@@ -1138,6 +1176,7 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    total_token_throughput = None
 
     dp = None
     generation_kwargs = None
@@ -1271,6 +1310,7 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     tpot = None
     mean_e2e_latency = None
     output_token_throughput = None
+    total_token_throughput = None
 
     dp = None
     generation_kwargs = None

@@ -672,7 +672,9 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        time.sleep(10000000000)
+        if os.getenv("TROUBLE_SHOTTING", "").lower() == "true":
+            logger.info("TROUBLE_SHOTTING=true, keeping sglang process alive")
+            return
         if cls.process:
             try:
                 kill_process_tree(cls.process.pid)
