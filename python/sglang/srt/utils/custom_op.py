@@ -6,7 +6,7 @@ from typing import Any, Callable, List, Optional, TypeVar, Union, overload
 import torch
 import torch.library
 
-from sglang.kernel_api_logging import debug_torch_op
+from sglang.kernels.kernel_api_logging import debug_torch_op
 
 F = TypeVar("F", bound=Callable)
 

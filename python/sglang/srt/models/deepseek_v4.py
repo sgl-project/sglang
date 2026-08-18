@@ -734,7 +734,10 @@ class MQALayer(MqaAttentionBase):
             self.register_buffer("cos_cache", cos_cache, persistent=False)
             self.register_buffer("sin_cache", sin_cache, persistent=False)
 
-        if envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() and alt_streams is not None:
+        if alt_streams is not None and (
+            (_is_cuda and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get())
+            or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
+        ):
             self.alt_streams = alt_streams[:3]
             self.alt_streams_indexer = alt_streams[-2:]
         else:
@@ -955,6 +958,108 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
 
+        return q
+
+    def _forward_prepare_multi_stream_npu(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+        q_out: Optional[torch.Tensor] = None,
+        x_quant=None,
+    ) -> torch.Tensor:
+        # NPU multi-stream: KV on stream_kv, Q on stream_q, overlapped with
+        # indexer/compressor on current. rope is split; the kv-only call passes
+        # kv.unsqueeze(1) as q_rope so the op sees [T,1,1,head_dim] like the
+        # fused path.
+        assert self.alt_streams is not None
+        current_stream = torch.npu.current_stream()
+        stream_kv = self.alt_streams[0]
+        stream_q = self.alt_streams[1]
+        stream_kv.wait_stream(current_stream)
+        stream_q.wait_stream(current_stream)
+
+        x_linear = x_quant if x_quant is not None else x
+        qkv_a: Optional[torch.Tensor] = None
+        qkv_a_ready = None
+        if self.fuse_wqa_wkv:
+            qkv_a, _ = self.wqkv_a(x_linear)
+            qkv_a_ready = current_stream.record_event()
+        if qkv_a is not None:
+            q_lora = qkv_a[..., : self.q_lora_rank]
+        else:
+            q_lora, _ = self.wq_a(x_linear)
+        q_lora = self.q_norm(q_lora)
+        q_lora_ready = current_stream.record_event()
+
+        # KV block on stream_kv.
+        with torch.npu.stream(stream_kv):
+            if qkv_a_ready is not None:
+                stream_kv.wait_event(qkv_a_ready)
+            if qkv_a is not None:
+                kv = qkv_a[..., self.q_lora_rank :]
+            else:
+                kv, _ = self.wkv(x)
+            kv = self.kv_norm(kv)
+            cos4_k, sin4_k = self._get_npu_rope_position_cache(
+                positions, kv.dtype, inverse=False
+            )
+            Dsv4NpuRoPE.apply_rotary_mul_inplace(
+                kv.unsqueeze(1),
+                None,
+                cos4_k,
+                sin4_k,
+                qk_nope_dim=self.qk_nope_head_dim,
+            )
+            attn_backend.store_cache(
+                layer_id=self.layer_id,
+                swa_k=kv,
+                forward_batch=forward_batch,
+            )
+
+        # Q block on stream_q (needs only q_lora).
+        with torch.npu.stream(stream_q):
+            stream_q.wait_event(q_lora_ready)
+            q, _ = self.wq_b(q_lora)
+            q = q.view(-1, self.n_local_heads, self.head_dim)
+            _dummy = q.new_ones(q.shape[-1])
+            q = torch_npu.npu_rms_norm(q, _dummy, self.eps)[0]
+            cos4_q, sin4_q = self._get_npu_rope_position_cache(
+                positions, q.dtype, inverse=False
+            )
+            Dsv4NpuRoPE.apply_rotary_mul_inplace(
+                q,
+                None,
+                cos4_q,
+                sin4_q,
+                qk_nope_dim=self.qk_nope_head_dim,
+            )
+            if q_out is not None:
+                q_out.copy_(q)
+            q.record_stream(stream_q)
+
+        del qkv_a
+
+        # Indexer + compressor: serial on current.
+        if self.indexer is not None:
+            self.indexer(
+                x=x,
+                q_lora=q_lora,
+                forward_batch=forward_batch,
+                attn_backend=attn_backend,
+            )
+        if self.compressor is not None:
+            attn_backend.forward_core_compressor(
+                x,
+                forward_batch,
+                self.layer_id,
+                self.compressor,
+            )
+
+        # Join stream_kv + stream_q before downstream attention.
+        current_stream.wait_stream(stream_kv)
+        current_stream.wait_stream(stream_q)
         return q
 
     def _forward_prepare_multi_stream_hip(
@@ -1306,6 +1411,12 @@ class MQALayer(MqaAttentionBase):
             )
             and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
             and not (_is_hip and self.compressor is None)
+        ) or (
+            _is_npu
+            and envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            and self.alt_streams is not None
+            and x.shape[0] <= self._multi_stream_bs_limit
+            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
@@ -1332,6 +1443,15 @@ class MQALayer(MqaAttentionBase):
             # so the bf16 KV intermediate is gone.
             if _is_hip:
                 q = self._forward_prepare_multi_stream_hip(
+                    x,
+                    positions,
+                    forward_batch,
+                    attn_backend,
+                    q_out,
+                    x_quant=x_quant,
+                )
+            elif _is_npu:
+                q = self._forward_prepare_multi_stream_npu(
                     x,
                     positions,
                     forward_batch,
@@ -1506,7 +1626,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             layer_id=layer_id,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
-            alt_streams=None if _is_npu else alt_streams,
+            alt_streams=alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
         moe_alt_stream = (
@@ -1659,7 +1779,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, norm is not None
 
-        if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
+        if _is_hip:
             from aiter.ops.mhc import mhc_pre
 
             post, comb, y = mhc_pre(
@@ -1740,7 +1860,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
             return mhc_post(x, residual, post, comb)
 
-        elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
+        elif _is_hip:
             from aiter.ops.mhc import mhc_post
 
             result = torch.empty_like(residual)
@@ -1916,7 +2036,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         _use_tp_attn_a2a_scatter = (
             not _use_cp
-            and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
         )
@@ -2353,7 +2472,7 @@ class DeepseekV4Model(nn.Module):
             or (_is_npu and envs.SGLANG_NPU_USE_MULTI_STREAM.get())
         )
         device_module = torch.get_device_module()
-        num_alt_streams = 5 if _is_cuda else 2
+        num_alt_streams = 5 if (_is_cuda or _is_npu) else 2
         self.alt_streams = (
             [device_module.Stream() for _ in range(num_alt_streams)]
             if use_stream_pool
@@ -3091,10 +3210,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
-        if _is_npu or not (
-            envs.SGLANG_DSV4_MHC_PREWARM.get()
-            and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
-        ):
+        if _is_npu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             return
         layer = next(
             (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
