@@ -3036,24 +3036,24 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
     shm = None
 
     try:
-        with contextlib.suppress(OSError):
-            if rank == source_rank:
+        recv = [None]
+        if rank == source_rank:
+            with contextlib.suppress(OSError):
                 # create a shared memory segment
                 shm = shared_memory.SharedMemory(
                     create=True, size=128, name=make_shm_name("nodecheck")
                 )
                 shm.buf[: len(magic_message)] = magic_message
-                torch.distributed.broadcast_object_list(
-                    [shm.name], src=ranks[source_rank], group=pg
-                )
-                is_in_the_same_node[rank] = 1
-            else:
+                recv[0] = shm.name
+
+        torch.distributed.broadcast_object_list(recv, src=ranks[source_rank], group=pg)
+        name = recv[0]
+
+        if rank == source_rank:
+            is_in_the_same_node[rank] = 1
+        elif name is not None:
+            with contextlib.suppress(OSError):
                 # try to open the shared memory segment
-                recv = [None]
-                torch.distributed.broadcast_object_list(
-                    recv, src=ranks[source_rank], group=pg
-                )
-                name = recv[0]
                 # fix to https://stackoverflow.com/q/62748654/9191338
                 # Python incorrectly tracks shared memory even if it is not
                 # created by the process. The following patch is a workaround.
