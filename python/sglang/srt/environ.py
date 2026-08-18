@@ -363,6 +363,10 @@ class Envs:
     # else /tmp); see debug_utils/cuda_coredump.py.
     SGLANG_CUDA_COREDUMP_DIR = EnvStr(None)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
+    # Upper bound (seconds) on how long a graceful shutdown may wait for
+    # in-flight requests to finish. <= 0 means wait indefinitely; the
+    # orchestrator's SIGKILL is then the only backstop.
+    SGLANG_GRACEFUL_SHUTDOWN_TIMEOUT = EnvFloat(0.0)
     SGLANG_PYSPY_DUMP_BEFORE_CRASH = EnvBool(True)
     SGLANG_CUDA_COREDUMP_BEFORE_CRASH = EnvBool(True)
     SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS = EnvFloat(60.0)

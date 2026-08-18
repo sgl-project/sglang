@@ -3133,8 +3133,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Optional upper bound on how long the drain may wait for in-flight
         # requests. Unset or <= 0 means wait until they all finish (the
-        # orchestrator's SIGKILL is then the only backstop).
-        drain_timeout_s = float(os.environ.get("SGLANG_GRACEFUL_SHUTDOWN_TIMEOUT", 0))
+        # orchestrator's SIGKILL is then the only backstop). The environ
+        # registry warns and falls back to the default on unparsable values,
+        # so a bad setting cannot kill this watchdog mid-drain.
+        drain_timeout_s = envs.SGLANG_GRACEFUL_SHUTDOWN_TIMEOUT.get()
         drain_deadline = (
             time.monotonic() + drain_timeout_s if drain_timeout_s > 0 else None
         )
@@ -3678,6 +3680,13 @@ class SignalHandler:
                 # Orchestrators deliver one stop event as a bundle of DISTINCT
                 # signals (e.g. Modal sends SIGTERM and SIGINT together); a
                 # signal not seen yet joins the stop event already draining.
+                # This is identity-based on purpose, with no time window:
+                # escalation is expressed by REPEATING a signal (Ctrl-C twice,
+                # `kill -TERM` twice), which is what interactive users and
+                # supervisors actually do, while a first-time signal of a new
+                # kind carries the same "stop" intent as the drain already in
+                # progress. A clock-based window would misread signal bundles
+                # under scheduler jitter.
                 if signum is not None:
                     self._stop_signums_seen.add(signum)
                 logger.info(
