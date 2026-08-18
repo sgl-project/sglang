@@ -35,6 +35,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.mm_schedule import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.pool_host.base import HICACHE_HOST_MEMORY_RESERVE_BYTES
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -139,6 +140,32 @@ def _register_legacy_hicache_draft(
     tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
 
 
+def _host_pool_retraction_fits(kv_cache) -> tuple[bool, float, float]:
+    """Whether host RAM can back a host-pool retraction mirror on this node.
+
+    ``host_pool`` mirrors the device KV pool 1:1 (``hicache_ratio`` 1.0) and
+    every local rank allocates its own mirror, so the requirement scales with
+    the ranks sharing the host. Sized off ``virtual_memory().total`` rather
+    than ``.available`` so every rank reaches the same verdict -- a per-rank
+    ``.available`` read drifts as earlier ranks allocate, which would let some
+    ranks pick ``host_pool`` while others fall back.
+    """
+    import psutil
+
+    device_pools = (
+        (kv_cache.full_kv_pool, kv_cache.swa_kv_pool)
+        if isinstance(kv_cache, SWAKVPool)
+        else (kv_cache,)
+    )
+    per_rank_bytes = sum(sum(pool.get_kv_size_bytes()) for pool in device_pools)
+
+    parallel = get_parallel()
+    local_ranks = max(1, parallel.tp_size // max(1, parallel.nnodes))
+    required_bytes = per_rank_bytes * local_ranks
+    budget_bytes = psutil.virtual_memory().total - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    return required_bytes <= budget_bytes, required_bytes, budget_bytes
+
+
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     """Resolve the retraction backend onto the config bags and return it.
 
@@ -177,6 +204,26 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
             and supports_host_pool
             else "cpu_tensor"
         )
+        # Supported is not the same as affordable: a large device pool mirrored
+        # across every local rank can exceed host RAM outright (common when the
+        # HBM:DRAM ratio is high). Only an explicit --disaggregation-decode-
+        # retraction-backup=host_pool should hard-fail on that; an inferred
+        # default degrades instead of refusing to start.
+        if backend == "host_pool":
+            fits, required_bytes, budget_bytes = _host_pool_retraction_fits(kv_cache)
+            if not fits:
+                logger.warning(
+                    "Falling back to cpu_tensor retraction backup: host-pool "
+                    "retraction needs %.2f GB of host memory (device pool "
+                    "mirrored across %d local rank(s)) but only %.2f GB is "
+                    "usable. Pass --disaggregation-decode-retraction-backup="
+                    "host_pool to require it, or shrink the device pool with "
+                    "--max-total-tokens / --mem-fraction-static.",
+                    required_bytes / 1e9,
+                    max(1, get_parallel().tp_size // max(1, get_parallel().nnodes)),
+                    budget_bytes / 1e9,
+                )
+                backend = "cpu_tensor"
         fields["disaggregation_decode_retraction_backup"] = backend
 
     if memory.hicache_ratio is None:
