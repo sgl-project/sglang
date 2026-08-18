@@ -835,7 +835,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 not node.external_cache_stored
                 and node.hit_count >= self.write_through_threshold
             )
-            
+
         return (
             self.enable_hicache
             and not node.backuped

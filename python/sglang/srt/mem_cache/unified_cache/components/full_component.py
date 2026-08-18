@@ -465,7 +465,7 @@ class FullComponent(TreeComponent):
             slots = allocator.alloc(num_tokens)
             if slots is None:
                 return None
-                
+
             return PoolTransfer(
                 name=PoolName.KV,
                 device_indices=slots.to(torch.int64),

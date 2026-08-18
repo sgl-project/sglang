@@ -32,8 +32,8 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
-    LinkerTransferPhase,
     EvictLayer,
+    LinkerTransferPhase,
     LRURefreshPhase,
     PreparePrefetchResult,
     TreeComponent,
@@ -894,7 +894,7 @@ class SWAComponent(TreeComponent):
             value = node.component_data[self.component_type].value
             if value is None or len(value) < page:
                 return None
-                
+
             num_pages = len(value) // page
             return PoolTransfer(
                 name=PoolName.SWA,

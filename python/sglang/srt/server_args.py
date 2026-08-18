@@ -2722,14 +2722,6 @@ class ServerArgs:
         "Link UnifiedRadixCache directly to an external KV store (direct L3), with no host cache tier.",
         NS("memory"),
     ] = False
-    external_linker_strategy: A[
-        str,
-        Arg(
-            help="How the external linker loads KV back to device: overlapped per layer, or up front.",
-            choices=["layer_wise", "prefetch"],
-        ),
-        NS("memory"),
-    ] = "layer_wise"
 
     # -------------------------------------------------------------------------
     # Multi-modal optimization configs

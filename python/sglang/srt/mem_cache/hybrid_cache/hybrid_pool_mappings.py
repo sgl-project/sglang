@@ -225,7 +225,11 @@ class DevicePoolGroup:
         self.kv_buffer = None
 
     def resolve_transfers(
-        self, transfers: list[PoolTransfer], *, allow_partial: bool = False
+        self,
+        transfers: list[PoolTransfer],
+        *,
+        allow_partial: bool = False,
+        allow_missing_kv: bool = False,
     ) -> list[PoolTransfer]:
         """Map logical cache transfers to Mooncake's physical device pools.
 
@@ -235,12 +239,14 @@ class DevicePoolGroup:
         state pools reuse the SWA transfer. This method creates one transfer per
         physical pool and translates the source indices into that pool's rows.
 
-        Lookup and load require every source pool. Offload passes
-        ``allow_partial=True`` because a cache node may contain only some pools.
+        Lookup requires every source pool. A filtered load allows partial source
+        pools and may contain only an auxiliary pool; offload remains KV-anchored.
         """
         by_name = {transfer.name: transfer for transfer in transfers}
         kv = by_name.get(PoolName.KV)
-        if kv is None or not kv.keys:
+        if not any(transfer.keys for transfer in transfers):
+            return []
+        if not allow_missing_kv and (kv is None or not kv.keys):
             return []
         if not allow_partial and not set(self.sources.values()) <= set(by_name):
             return []
@@ -248,7 +254,7 @@ class DevicePoolGroup:
         resolved = []
         for name, source_name in self.sources.items():
             source = by_name.get(source_name)
-            if source is None:
+            if source is None or not source.keys:
                 continue
             indices = source.device_indices
             resolved.append(
@@ -260,7 +266,7 @@ class DevicePoolGroup:
                         if indices is not None
                         else None
                     ),
-                    keys=list(kv.keys if source_name == PoolName.KV else source.keys),
+                    keys=list(source.keys),
                     hit_policy=(
                         PoolHitPolicy.ALL_PAGES
                         if source_name == PoolName.KV

@@ -1,4 +1,5 @@
 import threading
+from array import array
 from queue import Queue
 from types import SimpleNamespace
 
@@ -14,11 +15,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     DevicePoolGroup,
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store import mooncake_direct_linker
-from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
 )
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
     MambaComponent,
 )
@@ -29,6 +31,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
 from sglang.srt.mem_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -117,7 +120,6 @@ def test_lookup_returns_sparse_mamba_boundaries():
     linker.storage._batch_exist = lambda keys: [
         int(key.endswith("_kv") or key[0] in ("b", "d")) for key in keys
     ]
-
     valid = linker.lookup(
         "rid",
         [
@@ -130,6 +132,15 @@ def test_lookup_returns_sparse_mamba_boundaries():
         ],
     )
     assert valid == [2, 4]
+
+
+def test_tail_hashes_honor_radix_key_limit():
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = SimpleNamespace(page_size=256)
+    key = RadixKey(array("q", range(256)), limit=255)
+    result = SimpleNamespace(last_device_node=None)
+
+    assert wrapper._tail_hashes(key, result, device_hit_len=0) == []
 
 
 def test_load_and_offload_share_gc_freeze(monkeypatch):
@@ -171,53 +182,6 @@ def test_load_and_offload_share_gc_freeze(monkeypatch):
 
     assert calls == ["Mooncake direct linker"]
     assert linker.stats["load"] == 2
-
-
-def test_prefetch_loads_before_returning():
-    worker_threads = []
-
-    class _Storage:
-        def batch_get_v2(self, transfers):
-            worker_threads.append(threading.get_ident())
-            return {
-                transfer.name: [True] * len(transfer.keys) for transfer in transfers
-            }
-
-    pool = SimpleNamespace(
-        name=PoolName.KV,
-        indices_from_pool=PoolName.KV,
-        translate_indices=lambda indices: indices,
-    )
-    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
-    linker.page_size = 2
-    linker.pool_group = DevicePoolGroup([pool], num_layers=3, page_size=2)
-    linker.storage = _Storage()
-    linker.load_strategy = "prefetch"
-    linker.gc_frozen = True
-    linker.pending_loads = {}
-    linker.stats = {"load": 0}
-    linker.load_queue = Queue()
-    linker.load_thread = threading.Thread(
-        target=linker.load_thread_func, daemon=True
-    )
-    linker.load_thread.start()
-
-    assert linker.load(
-        "rid",
-        [
-            PoolTransfer(
-                name=PoolName.KV,
-                keys=["a"],
-                device_indices=torch.tensor([0, 1]),
-            )
-        ],
-    )
-    assert worker_threads == [linker.load_thread.ident]
-    assert linker.pending_loads == {}
-    assert linker.stats["load"] == 1
-
-    linker.load_queue.put(None)
-    linker.load_thread.join(timeout=5)
 
 
 def test_offload_runs_on_background_thread(monkeypatch):
@@ -328,9 +292,28 @@ def test_async_offload_pins_node_until_completion():
     assert not unlocks
 
     results.append(False)
-    wrapper.drain_offloads()
+    assert wrapper.num_completed_offloads() == 1
+    wrapper.drain_offloads(finish_count=1)
     assert not node.external_cache_stored
     assert unlocks == [(node_id, lock_params)]
+
+
+def test_check_hicache_events_drains_common_tp_offloads():
+    drained = []
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.linker = SimpleNamespace(
+        num_completed_offloads=lambda: 3,
+        drain_offloads=drained.append,
+    )
+
+    def reduce_to_common_count(count, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        count.fill_(1)
+
+    cache._all_reduce_attn_groups = reduce_to_common_count
+    cache.check_hicache_events()
+
+    assert drained == [1]
 
 
 def test_deepseek_v4_device_pool_group_maps_sparse_sidecars():
@@ -434,6 +417,29 @@ def test_qwen35_device_pool_group_maps_full_and_mamba_layers():
     assert sizes == [24, 40, 56, 88]
 
 
+def test_device_pool_group_allows_partial_side_pool_load():
+    swa_pool = SimpleNamespace(
+        name=PoolName.SWA,
+        indices_from_pool=PoolName.SWA,
+        translate_indices=lambda indices: indices + 100,
+    )
+    group = DevicePoolGroup([swa_pool], num_layers=1, page_size=2)
+    transfer = PoolTransfer(
+        name=PoolName.SWA,
+        keys=["b", "d"],
+        device_indices=torch.tensor([20, 21, 24, 25]),
+        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+    )
+
+    assert group.resolve_transfers([transfer]) == []
+    [resolved] = group.resolve_transfers(
+        [transfer], allow_partial=True, allow_missing_kv=True
+    )
+    assert resolved.name == PoolName.SWA
+    assert resolved.keys == ["b", "d"]
+    assert resolved.host_indices.tolist() == [120, 121, 124, 125]
+
+
 def test_swa_linker_finish_maps_or_releases_slots():
     swa_allocator = _Allocator()
     allocator = SimpleNamespace(
@@ -481,47 +487,46 @@ def test_mamba_linker_load_allocates_cache_and_request_slots():
         mamba_needs_clear=True,
     )
     full = PoolTransfer(name=PoolName.KV, device_indices=torch.tensor([1]))
-    component.finish_external_linker_load(req, full, transfer, prefix_len=2, success=True)
+    component.finish_external_linker_load(
+        req, full, transfer, prefix_len=2, success=True
+    )
     assert req.mamba_pool_idx.item() == 8
     assert req.mamba_cow_src_index is None
     assert not req.mamba_needs_clear
 
     failed = PoolTransfer(name=PoolName.MAMBA, device_indices=torch.tensor([9, 10]))
-    component.finish_external_linker_load(req, full, failed, prefix_len=2, success=False)
+    component.finish_external_linker_load(
+        req, full, failed, prefix_len=2, success=False
+    )
     assert allocator.freed[-1].tolist() == [9, 10]
 
 
-def test_overlapping_load_retargets_freed_slots_to_tree_values():
+def test_insert_filters_overlapping_full_and_swa_load_pages():
+    canonical_swa = torch.tensor([300, 301, 202, 203, 304, 305, 206, 207])
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     wrapper.cache = SimpleNamespace(
+        page_size=2,
         token_to_kv_pool_allocator=SimpleNamespace(
-            translate_loc_from_full_to_swa=lambda indices: indices + 1000
-        ),
-        tree_core=SimpleNamespace(
-            get_component_device_value=lambda node_id, component_type: torch.tensor(
-                [30]
-            )
+            translate_loc_from_full_to_swa=lambda indices: canonical_swa
         ),
     )
-
     full = PoolTransfer(
-        name=PoolName.KV, device_indices=torch.tensor([100, 101, 102, 103])
+        name=PoolName.KV,
+        keys=["a", "b", "c", "d"],
+        device_indices=torch.tensor([100, 101, 102, 103, 104, 105, 106, 107]),
     )
-    swa = PoolTransfer(name=PoolName.SWA, device_indices=torch.tensor([200, 201]))
-    mamba = PoolTransfer(name=PoolName.MAMBA, device_indices=torch.tensor([300, 301]))
-    canonical_tail = torch.tensor([10, 11, 12, 13])
-    rematched = SimpleNamespace(
-        device_indices=torch.cat([torch.tensor([1, 2]), canonical_tail]),
-        last_device_node=30,
+    canonical_tail = torch.tensor([10, 11, 102, 103, 14, 15, 106, 107])
+    swa = PoolTransfer(
+        name=PoolName.SWA,
+        keys=["a", "b", "c", "d"],
+        device_indices=torch.tensor([200, 201, 202, 203, 204, 205, 206, 207]),
     )
-
-    load_transfers = wrapper._point_at_canonical(
-        [(None, full), (None, swa), (None, mamba)],
-        rematched,
+    filtered = wrapper._filter_load_pages_after_insert(
+        [(None, full), (None, swa)],
         canonical_tail,
     )
-
-    assert load_transfers == [full, swa, mamba]
-    assert full.device_indices.tolist() == canonical_tail.tolist()
-    assert swa.device_indices.tolist() == [1012, 1013]
-    assert mamba.device_indices.tolist() == [30, 301]
+    assert filtered == [full, swa]
+    assert full.keys == ["b", "d"]
+    assert full.device_indices.tolist() == [102, 103, 106, 107]
+    assert swa.keys == ["b", "d"]
+    assert swa.device_indices.tolist() == [202, 203, 206, 207]

@@ -26,13 +26,11 @@ import torch
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     InsertParams,
-    MatchPrefixParams,
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import (
-    ComponentType,
     LinkerTransferPhase,
     TreeComponent,
 )
@@ -118,11 +116,6 @@ class UnifiedCacheLinkerWrapper:
         server_args: ServerArgs,
         params: CacheInitParams,
     ):
-        if server_args.external_linker_strategy != "layer_wise":
-            raise ValueError(
-                "The unified cache external linker only drives the layer_wise "
-                f"load strategy, got {server_args.external_linker_strategy!r}."
-            )
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
             MooncakeDirectLinker,
         )
@@ -233,10 +226,14 @@ class UnifiedCacheLinkerWrapper:
                 # Without the anchor the tail would hash as if it started at the
                 # sequence head, yielding keys that can never match.
                 return []
+        page = self.cache.page_size
+        tail_len = (len(key) - device_hit_len) // page * page
+        if tail_len == 0:
+            return []
         return get_hash_str(
-            key.token_ids[device_hit_len:],
+            key[device_hit_len : device_hit_len + tail_len],
             last_hash,
-            page_size=self.cache.page_size,
+            page_size=page,
         )
 
     # ---- init_load_back: remote -> device, then insert ----
@@ -303,22 +300,25 @@ class UnifiedCacheLinkerWrapper:
                 mamba_transfer.device_indices[:1]
             )
 
-        # Insert may keep the tree's existing slots and free ours, or swap ours
-        # in and free the tree's (SWA tombstone recovery). Only a read-back tells
-        # us which slots survived, so the load is queued against those.
-        rematched = cache.match_prefix(MatchPrefixParams(key=hit.prefix_key))
-        canonical_tail = rematched.device_indices[device_hit_len:]
-        load_transfers = self._point_at_canonical(
-            component_transfers, rematched, canonical_tail
+        # Insert already resolved every overlap. Read the committed Full path
+        # directly (without matching the key again), then keep only provisional
+        # component pages whose slots survived insert.
+        canonical_tail = cache.tree_core.collect_full_device_indices(
+            insert_result.last_device_node, req.last_node
         )
-        if not self.cache_linker.load(req.rid, load_transfers):
+        assert canonical_tail.numel() == len(tail_hashes) * cache.page_size
+        load_transfers = self._filter_load_pages_after_insert(
+            component_transfers, canonical_tail
+        )
+
+        if load_transfers and not self.cache_linker.load(req.rid, load_transfers):
             raise RuntimeError(f"Failed to queue the linker load for {req.rid=}.")
 
-        node = cache.resolve_node_handle(rematched.last_device_node)
+        node = cache.resolve_node_handle(insert_result.last_device_node)
         while node.id != req.last_node:
             node.external_cache_stored = True
             node = node.parent
-        return canonical_tail, rematched.last_device_node
+        return canonical_tail, insert_result.last_device_node
 
     def _finish_load(
         self,
@@ -336,46 +336,55 @@ class UnifiedCacheLinkerWrapper:
                 req, full, transfer, prefix_len, success
             )
 
-    def _point_at_canonical(
+    def _filter_load_pages_after_insert(
         self,
         component_transfers: list[tuple[TreeComponent, PoolTransfer]],
-        rematched: MatchResult,
-        canonical_tail: torch.Tensor,
+        canonical_full_tail: torch.Tensor,
     ) -> list[PoolTransfer]:
-        """Aim each transfer at the slots the tree kept, and return them in order.
-
-        The reserved slots were only a guess: ``insert`` decides which ones the
-        tree ends up holding, so the destinations have to be rewritten before the
-        load is queued.
-        """
-        cache = self.cache
+        """Drop provisional pages that insert replaced with resident L1 slots."""
+        result = []
+        page = self.cache.page_size
         for _, transfer in component_transfers:
             if transfer.name == PoolName.KV:
-                transfer.device_indices = canonical_tail
-            elif transfer.name == PoolName.SWA:
-                # SWA covers the trailing window, and the allocator knows which
-                # SWA slot each surviving full slot is paired with.
-                swa_len = transfer.device_indices.numel()
-                transfer.device_indices = (
-                    cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                        canonical_tail[-swa_len:]
-                    ).to(torch.int64)
-                )
+                canonical = canonical_full_tail
             else:
-                assert transfer.name == PoolName.MAMBA
-                # Slot 0 is the radix copy, which insert may have replaced with
-                # the node's own; slot 1 is the request's and never deduped.
-                canonical_mamba = cache.tree_core.get_component_device_value(
-                    rematched.last_device_node, ComponentType.MAMBA
+                # Mamba's direct-linker hooks currently reject this mode, so the
+                # only supported auxiliary component here is SWA.
+                assert transfer.name == PoolName.SWA
+                swa_len = transfer.device_indices.numel()
+                canonical = self.cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                    canonical_full_tail[-swa_len:]
+                ).to(
+                    transfer.device_indices
                 )
-                assert canonical_mamba is not None
-                transfer.device_indices = torch.cat(
-                    [
-                        canonical_mamba.to(transfer.device_indices),
-                        transfer.device_indices[1:],
-                    ]
-                )
-        return [transfer for _, transfer in component_transfers]
+
+            incoming_pages = transfer.device_indices.reshape(-1, page)
+            canonical_pages = canonical.to(transfer.device_indices).reshape(-1, page)
+            assert incoming_pages.shape == canonical_pages.shape
+            assert incoming_pages.shape[0] == len(transfer.keys)
+
+            # ``insert`` resolves each provisional page against the canonical
+            # page currently stored in the tree:
+            #
+            # 1. canonical == provisional: ``insert`` kept the newly allocated,
+            #    still-empty page. Keep it in this transfer so remote storage
+            #    can populate it.
+            # 2. canonical != provisional: ``insert`` deduplicated against an
+            #    existing L1 page and already released the provisional slots.
+            #    Exclude it from this transfer; the canonical page has the data.
+            slot_matches = incoming_pages == canonical_pages
+            pages_to_load = slot_matches.all(dim=1)
+            pages_deduplicated = (~slot_matches).all(dim=1)
+            assert bool(
+                (pages_to_load | pages_deduplicated).all().item()
+            ), "insert must keep or replace a whole page"
+
+            page_ids_to_load = pages_to_load.nonzero(as_tuple=True)[0].tolist()
+            if page_ids_to_load:
+                transfer.keys = [transfer.keys[i] for i in page_ids_to_load]
+                transfer.device_indices = incoming_pages[pages_to_load].reshape(-1)
+                result.append(transfer)
+        return result
 
     # ---- offload: device -> remote, driven by the write-through chain ----
 
@@ -409,11 +418,14 @@ class UnifiedCacheLinkerWrapper:
         node.external_cache_stored = True
         self.pending_offloads.append((node_id, lock_params))
 
-    def drain_offloads(self) -> None:
-        count = min(
+    def num_completed_offloads(self) -> int:
+        return min(
             self.cache_linker.num_completed_offloads(), len(self.pending_offloads)
         )
-        for _ in range(count):
+
+    def drain_offloads(self, finish_count: int) -> None:
+        assert finish_count <= len(self.pending_offloads)
+        for _ in range(finish_count):
             node_id, lock_params = self.pending_offloads.pop(0)
             node = self.cache.resolve_node_handle(node_id)
             node.external_cache_stored = self.cache_linker.pop_completed_offload()

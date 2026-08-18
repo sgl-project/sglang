@@ -28,8 +28,8 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
-    LinkerTransferPhase,
     EvictLayer,
+    LinkerTransferPhase,
     LRURefreshPhase,
     PrepareLoadBackResult,
     PreparePrefetchResult,
@@ -639,7 +639,9 @@ class MambaComponent(TreeComponent):
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
-        raise AssertionError(f"MambaComponent does not support external linker mode, will support soon")
+        raise AssertionError(
+            f"MambaComponent does not support external linker mode, will support soon"
+        )
 
     def finish_external_linker_load(
         self,
@@ -649,7 +651,9 @@ class MambaComponent(TreeComponent):
         prefix_len: int,
         success: bool,
     ) -> None:
-        raise AssertionError(f"MambaComponent does not support external linker mode, will support soon")
+        raise AssertionError(
+            f"MambaComponent does not support external linker mode, will support soon"
+        )
 
     # ---- HiCache Hooks ----
 

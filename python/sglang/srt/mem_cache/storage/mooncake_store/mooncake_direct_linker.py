@@ -120,7 +120,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.storage.mha_suffix = rank_suffix
 
         self.register_buffers()
-        self.load_strategy = server_args.external_linker_strategy
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
@@ -128,9 +127,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.gc_frozen = False
-        self.load_queue: Queue[tuple[int | Future, list[list[PoolTransfer]]] | None] = (
-            Queue()
-        )
+        self.load_queue: Queue[tuple[int, list[list[PoolTransfer]]] | None] = Queue()
         self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
             Queue()
         )
@@ -139,7 +136,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.load_thread = threading.Thread(
             target=self.load_thread_func,
             daemon=True,
-            name=f"mooncake-{self.load_strategy}-tp{tp_rank}",
+            name=f"mooncake-load-tp{tp_rank}",
         )
         self.load_thread.start()
         self.offload_thread = threading.Thread(
@@ -186,16 +183,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return restorable
 
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
-        expanded = self.pool_group.resolve_transfers(transfers)
+        # Query establishes a boundary at which every component is restorable;
+        # insert then removes pages already resident in L1. Loading is therefore
+        # intentionally partial and may contain only a side pool such as SWA.
+        expanded = self.pool_group.resolve_transfers(
+            transfers, allow_partial=True, allow_missing_kv=True
+        )
         if not expanded:
             return False
-        if self.load_strategy == "prefetch":
-            self.freeze_gc_once()
-            completed = Future()
-            self.load_queue.put((completed, [expanded]))
-            success = completed.result()
-            self.stats["load"] += 1
-            return success
         if rid in self.pending_loads:
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
         self.pending_loads[rid] = expanded
@@ -230,23 +225,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             try:
                 if task is None:
                     return
-                completion, transfers = task
-                if isinstance(completion, Future):
-                    try:
-                        completion.set_result(self.load_prefetch(transfers[0]))
-                    except BaseException:
-                        logger.exception("Mooncake prefetch failed")
-                        completion.set_result(False)
-                else:
-                    self.load_layer_wise(completion, transfers)
+                counter_index, transfers = task
+                self.load_layer_wise(counter_index, transfers)
             finally:
                 self.load_queue.task_done()
-
-    def load_prefetch(self, transfers: list[PoolTransfer]) -> bool:
-        results = self.storage.batch_get_v2(transfers)
-        return len(results) == len(transfers) and all(
-            all(pool_results) for pool_results in results.values()
-        )
 
     def load_layer_wise(
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
@@ -266,9 +248,13 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             transfer.host_indices
                         )
                     )
-
             for keys, _ in batches.values():
-                self.storage.store.batch_get_session_start(keys)
+                result = self.storage.store.batch_get_session_start(keys)
+                if list(result) != [0] * len(keys):
+                    raise RuntimeError(
+                        f"Mooncake get session start failed: keys={len(keys)}, "
+                        f"results={result}"
+                    )
                 started.append(keys)
 
             for layer in range(self.num_layers):
