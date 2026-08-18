@@ -421,8 +421,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     # now. Do not preserve an incoming value when that read fails: it may have
     # been serialized from another checkpoint and would mis-size CUDA graphs.
     server_args.speculative_dspark_bonus_anchor = bool(
-        draft_checkpoint_config is not None
-        and draft_checkpoint_config.bonus_anchor
+        draft_checkpoint_config is not None and draft_checkpoint_config.bonus_anchor
     )
     if server_args.speculative_dspark_bonus_anchor:
         logger.info(

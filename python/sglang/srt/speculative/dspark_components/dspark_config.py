@@ -5,6 +5,7 @@ import logging
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import msgspec
+
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 
 if TYPE_CHECKING:
@@ -424,9 +425,7 @@ def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
     gamma = (
         int(prefixed_block_size)
         if prefixed_block_size is not None
-        else speculators_gamma
-        if speculators_gamma is not None
-        else base.block_size
+        else speculators_gamma if speculators_gamma is not None else base.block_size
     )
 
     if prefixed_target_layer_ids is not None:

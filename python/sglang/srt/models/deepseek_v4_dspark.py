@@ -6,6 +6,8 @@ from typing import Iterable, List, Optional, Tuple
 import msgspec
 import torch
 import torch.nn.functional as F
+from torch import nn
+
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
     is_unified_kv_triton,
@@ -57,7 +59,6 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.utils import add_prefix, is_blackwell_supported, is_npu
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
-from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -109,9 +110,9 @@ class DSparkAttention(MqaAttentionBase):
             wo_b_reduce_results=True,
             rope_original_seq_len=0,
         )
-        assert self.compress_ratio == 0, (
-            "DSpark draft attention requires compress_ratio == 0."
-        )
+        assert (
+            self.compress_ratio == 0
+        ), "DSpark draft attention requires compress_ratio == 0."
         self.window_size = int(
             getattr(config, "sliding_window", None) or config.window_size
         )

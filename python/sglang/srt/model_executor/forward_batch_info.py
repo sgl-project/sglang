@@ -1084,10 +1084,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # Keep positions flat so compact ragged verify layouts do not need
             # to satisfy a rectangular batch_size * width shape.
             self.mrope_positions = (
-                seq_positions.to(dtype=torch.int64)
-                .flatten()
-                .unsqueeze(0)
-                .repeat(3, 1)
+                seq_positions.to(dtype=torch.int64).flatten().unsqueeze(0).repeat(3, 1)
             )
             return
 
@@ -1118,9 +1115,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             # repeat count fills the fixed graph shape. Passing output_size keeps
             # repeat_interleave capture-safe without reading the dynamic sum on
             # the host.
-            verify_lens = ragged_layout.verify_lens.to(
-                device=device, dtype=torch.int64
-            )
+            verify_lens = ragged_layout.verify_lens.to(device=device, dtype=torch.int64)
             ghost_len = verify_lens.new_full(
                 (1,), ragged_layout.graph_num_tokens
             ) - verify_lens.sum().reshape(1)
@@ -1139,10 +1134,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             seq_positions = seq_positions.view(batch_size, -1)
             next_input_positions = (
-                (seq_positions + mrope_delta_tensor)
-                .flatten()
-                .unsqueeze(0)
-                .repeat(3, 1)
+                (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
             )
 
         self.mrope_positions = next_input_positions

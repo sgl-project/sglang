@@ -146,9 +146,9 @@ class TargetVerifyExecutor:
                     bs, self.verify_num_draft_tokens
                 )
                 row_ids = torch.arange(bs, device=target_predict.device)
-                bonus = target_predict[
-                    row_ids, correct_len.to(torch.int64)
-                ].to(torch.int64)
+                bonus = target_predict[row_ids, correct_len.to(torch.int64)].to(
+                    torch.int64
+                )
 
         finalized = FinalizeAcceptLens.execute(
             correct_len=correct_len,

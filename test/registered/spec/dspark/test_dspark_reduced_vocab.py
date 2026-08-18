@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
 from sglang.srt.models.dspark import (
     GatedMarkovHead,
     RNNHead,

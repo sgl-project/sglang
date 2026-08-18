@@ -5,6 +5,8 @@ from typing import Callable, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch import nn
+
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
@@ -19,7 +21,6 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
 )
 from sglang.srt.utils import add_prefix
-from torch import nn
 
 logger = logging.getLogger(__name__)
 

@@ -16,6 +16,9 @@
 from pathlib import Path
 from typing import Optional
 
+from transformers import PretrainedConfig
+from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+
 from sglang.srt.configs.model_config_parser_registry import (
     ModelConfigParserBase,
     get_model_config_parser,
@@ -23,8 +26,6 @@ from sglang.srt.configs.model_config_parser_registry import (
 )
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, lru_cache_frozenset
-from transformers import PretrainedConfig
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from ..hf_transformers_patches import _ensure_gguf_version
 from .common import (
