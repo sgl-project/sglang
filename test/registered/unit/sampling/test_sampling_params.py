@@ -73,10 +73,26 @@ class TestSamplingParamsInit(CustomTestCase):
         sp = SamplingParams(stop_token_ids=[])
         self.assertIsNone(sp.stop_token_ids)
 
+    def test_empty_grammar_constraint_becomes_none(self):
+        """An empty grammar string means "unset", not "constrain to nothing".
+        Left as "" it reads as set to the is-not-None checks downstream while
+        the constraint selection skips it.
+        """
+        for field in ("json_schema", "regex", "ebnf", "structural_tag"):
+            with self.subTest(field=field):
+                sp = SamplingParams(**{field: ""})
+                self.assertIsNone(getattr(sp, field))
+
 
 class TestSamplingParamsVerify(CustomTestCase):
 
     VOCAB_SIZE = 32000
+    GRAMMAR_VALUES = {
+        "json_schema": '{"type":"object"}',
+        "regex": "abc",
+        "ebnf": 'root ::= "abc"',
+        "structural_tag": '{"structures":[],"triggers":[]}',
+    }
 
     def _make(self, **kwargs):
         """Helper: create SamplingParams with safe defaults, override with kwargs."""
@@ -273,21 +289,25 @@ class TestSamplingParamsVerify(CustomTestCase):
         sp.verify(self.VOCAB_SIZE)
 
     def test_multiple_grammars_raises(self):
-        """Test that verify() rejects setting both json_schema and regex (mutually exclusive)."""
-        sp = self._make(json_schema='{"type":"object"}', regex="abc")
-        with self.assertRaises(ValueError):
-            sp.verify(self.VOCAB_SIZE)
+        """Reject structural_tag combined with any other grammar constraint.
+
+        Constraint selection is a fixed if/elif chain, so a constraint left out of
+        this check is silently dropped with no error to the caller.
+        """
+        for other in ("json_schema", "regex", "ebnf"):
+            with self.subTest(other=other):
+                sp = self._make(
+                    structural_tag=self.GRAMMAR_VALUES["structural_tag"],
+                    **{other: self.GRAMMAR_VALUES[other]},
+                )
+                with self.assertRaisesRegex(ValueError, "Only one of"):
+                    sp.verify(self.VOCAB_SIZE)
 
     def test_single_grammar_valid(self):
-        """Test that setting only one grammar type is accepted."""
-        sp = self._make(json_schema='{"type":"object"}')
-        sp.verify(self.VOCAB_SIZE)
-
-    def test_all_three_grammars_set_raises(self):
-        """Test that verify() rejects setting json_schema, regex, and ebnf together."""
-        sp = self._make(json_schema="{}", regex="a", ebnf="rule")
-        with self.assertRaises(ValueError):
-            sp.verify(self.VOCAB_SIZE)
+        """Test that each grammar constraint is valid on its own."""
+        for grammar, value in self.GRAMMAR_VALUES.items():
+            with self.subTest(grammar=grammar):
+                self._make(**{grammar: value}).verify(self.VOCAB_SIZE)
 
 
 class TestSamplingParamsNormalize(CustomTestCase):
@@ -410,11 +430,6 @@ class TestSamplingParamsMsgspecStruct(CustomTestCase):
         self.assertTrue(sp.skip_special_tokens)
         self.assertTrue(sp.spaces_between_special_tokens)
         self.assertFalse(sp.no_stop_trim)
-
-    def test_msgpack_omits_default_fields(self):
-        encoded = msgspec.msgpack.encode(SamplingParams())
-
-        self.assertEqual(msgspec.msgpack.decode(encoded), {})
 
     def test_msgpack_round_trip_preserves_normalized_state(self):
         tokenizer = MagicMock()

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Generator, List, Optional, Tuple
 import zmq
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import sock_recv, sock_send
+from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.test.scripted_runtime.background_http_poster import BackgroundHttpPoster
 from sglang.test.scripted_runtime.context import ScriptedContext
@@ -153,7 +153,7 @@ class ScriptedSchedulerHook:
         socket = get_zmq_socket(ctx_zmq, zmq.PAIR, endpoint, bind=False)
         try:
             yield from _drive_engine_through_warmup(self._context)
-            sock_send(socket, HookReady())
+            sock_send(socket, wrap_as_pickle(HookReady()))
             while True:
                 msg = sock_recv(socket)
                 match msg:
@@ -170,10 +170,12 @@ class ScriptedSchedulerHook:
                         except Exception:
                             sock_send(
                                 socket,
-                                ScriptFailed(traceback=traceback.format_exc()),
+                                wrap_as_pickle(
+                                    ScriptFailed(traceback=traceback.format_exc())
+                                ),
                             )
                         else:
-                            sock_send(socket, ScriptSucceeded())
+                            sock_send(socket, wrap_as_pickle(ScriptSucceeded()))
                     case _:
                         raise ValueError(f"dispatch loop: unknown command {msg!r}")
         finally:

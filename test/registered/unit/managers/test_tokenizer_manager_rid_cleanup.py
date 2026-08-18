@@ -13,20 +13,31 @@ Covers:
 """
 
 import asyncio
-import dataclasses
 import unittest
 from unittest.mock import AsyncMock, MagicMock, Mock
+
+import msgspec
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.io_struct import AbortReq, BatchStrOutput, GenerateReqInput
-from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
-from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
+from sglang.srt.managers.io_struct import (  # noqa: E402
+    AbortReq,
+    BatchStrOutput,
+    GenerateReqInput,
+)
+from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
+    ReqState,
+    TokenizerManager,
+)
+from sglang.srt.observability.req_time_stats import (  # noqa: E402
+    APIServerReqTimeStats,
+)
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet
 
@@ -35,7 +46,7 @@ _NOT_FINISHED = object()  # Sentinel: request has not finished yet
 # Categorised by value shape so that _make_batch_str_output can assign
 # type-appropriate defaults without hardcoding every field name.
 # When a field is renamed upstream, the old name simply won't appear in
-# dataclasses.fields() and the new name will fall through to the
+# msgspec.structs.fields() and the new name will fall through to the
 # pattern-matching or safe fallback — no test breakage.
 # ---------------------------------------------------------------------------
 
@@ -96,6 +107,7 @@ def _make_tokenizer_manager() -> TokenizerManager:
     """Create a TokenizerManager with mocked dependencies, bypassing __init__."""
     tm = TokenizerManager.__new__(TokenizerManager)
     tm.server_args = MagicMock()
+    tm._config_updates = []
     tm.server_args.enable_trace = False
     tm.server_args.enable_metrics = False
     tm.server_args.enable_lora = False
@@ -109,6 +121,11 @@ def _make_tokenizer_manager() -> TokenizerManager:
     tm.disaggregation_mode = "none"
     tm.rid_to_state = {}
     tm.enable_metrics = False
+    tm.enable_trace = False
+    tm.enable_lora = False
+    tm.incremental_streaming_output = False
+    tm.allow_auto_truncate = False
+    tm.skip_tokenizer_init = False
     tm.dump_requests_folder = ""
     tm.crash_dump_folder = ""
     tm.send_to_scheduler = MagicMock()
@@ -145,7 +162,7 @@ def _make_abort_req(rid: str, abort_message: str = "Aborted") -> AbortReq:
 def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
     """Create a minimal BatchStrOutput for a single request.
 
-    Uses dataclass field introspection so that new or renamed fields in
+    Uses struct field introspection so that new or renamed fields in
     BatchStrOutput don't break this test.  Only the fields that matter for
     test logic (rids, finished_reasons, output_strs) are set explicitly;
     all others receive type-appropriate defaults based on naming patterns.
@@ -159,7 +176,7 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
         fr = finished_reason
 
     kwargs = {}
-    for f in dataclasses.fields(BatchStrOutput):
+    for f in msgspec.structs.fields(BatchStrOutput):
         if f.name == "rids":
             kwargs[f.name] = [rid]
         elif f.name == "finished_reasons":
@@ -176,8 +193,8 @@ def _make_batch_str_output(rid: str, finished_reason=None) -> BatchStrOutput:
             kwargs[f.name] = [None]
         # Fields with class defaults — skip, let the default be used
         elif (
-            f.default is not dataclasses.MISSING
-            or f.default_factory is not dataclasses.MISSING
+            f.default is not msgspec.NODEFAULT
+            or f.default_factory is not msgspec.NODEFAULT
         ):
             continue
         # Unknown required field — provide a safe per-request default.
@@ -401,6 +418,7 @@ def _make_tm_for_generate() -> TokenizerManager:
     tm = _make_tokenizer_manager()
     tm.server_args.language_only = False
     tm.server_args.tokenizer_worker_num = 1
+    tm.server_args.enable_strict_thinking = False
     tm.auto_create_handle_loop = Mock()
     tm._set_default_priority = Mock()
     tm.request_logger = Mock()
@@ -421,6 +439,7 @@ def _make_generate_obj(rid, is_single):
     obj.received_time = 0.0
     obj.external_trace_header = None
     obj.bootstrap_room = None
+    obj.max_thinking_tokens = None
     obj.normalize_batch_and_arguments = Mock()
     if not is_single:
         obj.__getitem__.side_effect = lambda i: Mock()
@@ -461,6 +480,60 @@ class TestDiscardPendingReqStates(CustomTestCase):
         obj.rid = ["p1", "already_gone"]
         tm._discard_pending_req_states(obj)  # must not raise
         self.assertNotIn("p1", tm.rid_to_state)
+
+
+class TestParallelStreamTaskCleanup(CustomTestCase):
+    def test_failing_choice_cancels_and_closes_sibling_waiters(self):
+        tm = _make_tokenizer_manager()
+
+        async def drive():
+            sibling_closed = asyncio.Event()
+
+            async def failing_choice():
+                await asyncio.sleep(0)
+                raise RuntimeError("choice failed")
+                yield  # pragma: no cover
+
+            async def blocked_choice():
+                try:
+                    await asyncio.Event().wait()
+                    yield  # pragma: no cover
+                finally:
+                    sibling_closed.set()
+
+            stream = tm._stream_batch_responses(
+                [failing_choice(), blocked_choice()],
+                ["choice-0", "choice-1"],
+            )
+            with self.assertRaisesRegex(RuntimeError, "choice failed"):
+                await stream.__anext__()
+            self.assertTrue(sibling_closed.is_set())
+
+        asyncio.run(drive())
+
+    def test_failing_non_stream_choice_cancels_and_closes_sibling_waiters(self):
+        tm = _make_tokenizer_manager()
+
+        async def drive():
+            sibling_closed = asyncio.Event()
+
+            async def failing_choice():
+                await asyncio.sleep(0)
+                raise RuntimeError("choice failed")
+                yield  # pragma: no cover
+
+            async def blocked_choice():
+                try:
+                    await asyncio.Event().wait()
+                    yield  # pragma: no cover
+                finally:
+                    sibling_closed.set()
+
+            with self.assertRaisesRegex(RuntimeError, "choice failed"):
+                await tm._collect_batch_responses([failing_choice(), blocked_choice()])
+            self.assertTrue(sibling_closed.is_set())
+
+        asyncio.run(drive())
 
 
 class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
@@ -513,6 +586,23 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         # All sub-request entries created by _init_req_state are cleaned up.
         for r in rids:
             self.assertNotIn(r, tm.rid_to_state)
+
+    def test_thinking_budget_rejects_runtime_without_strict_thinking(self):
+        tm = _make_tm_for_generate()
+        obj = GenerateReqInput(
+            text="hello",
+            rid="thinking-budget",
+            sampling_params={},
+            max_thinking_tokens=32,
+        )
+
+        async def drive():
+            await tm.generate_request(obj).__anext__()
+
+        with self.assertRaisesRegex(ValueError, "--enable-strict-thinking"):
+            asyncio.run(drive())
+
+        self.assertFalse(tm.rid_to_state)
 
 
 if __name__ == "__main__":

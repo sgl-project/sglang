@@ -8,6 +8,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerManager,
     get_generate_fn,
@@ -23,7 +24,10 @@ from sglang.multimodal_gen.test.test_utils import (
 
 
 def _all_cases() -> list[DiffusionTestCase]:
-    import sglang.multimodal_gen.test.server.testcase_configs as cfg
+    if current_platform.is_npu():
+        import sglang.multimodal_gen.test.server.ascend.testcase_configs_npu as cfg
+    else:
+        import sglang.multimodal_gen.test.server.testcase_configs as cfg
 
     cases: list[DiffusionTestCase] = []
     for _, v in inspect.getmembers(cfg):
@@ -42,7 +46,7 @@ def _all_cases() -> list[DiffusionTestCase]:
 def _baseline_path() -> Path:
     import sglang.multimodal_gen.test.server.testcase_configs as cfg
 
-    return Path(cfg.__file__).with_name("perf_baselines.json")
+    return cfg.get_perf_baseline_path()
 
 
 def _openai_client(port: int) -> OpenAI:
@@ -68,8 +72,8 @@ def _build_server_extra_args(case: DiffusionTestCase) -> str:
     if server_args.lora_path:
         a += f" --lora-path {server_args.lora_path}"
 
-    # default warmup
-    a += " --warmup"
+    # request-based warmup keeps the first measured generation out of the baseline
+    a += " --warmup-mode request"
 
     for extra_arg in server_args.extras:
         a += f" {extra_arg}"
@@ -112,7 +116,6 @@ def _run_case(case: DiffusionTestCase) -> dict:
     ctx = mgr.start()
     try:
         sp = case.sampling_params
-        output_size = os.environ.get("SGLANG_TEST_OUTPUT_SIZE", sp.output_size)
         client = _openai_client(ctx.port)
         gen = get_generate_fn(
             model_path=case.server_args.model_path,

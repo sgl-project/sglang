@@ -19,6 +19,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from typing_extensions import ParamSpec
 
+from sglang.srt.cuda_vmm_utils import _gpu_fabric_clique
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs as sglang_envs
@@ -389,6 +390,32 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
                         )
                         return False
         return True
+
+
+@with_nvml_context
+def is_one_nvlink_clique(
+    group: torch.distributed.ProcessGroup, device: torch.device
+) -> bool:
+    """True iff every rank's GPU is in the same NVLink fabric clique (one NVL72 /
+    MNNVL domain). Such a clique shares a single NVLink address space even across
+    nodes, so custom-AR v2's symm-mem storage + fabric peer VAs are valid group-wide."""
+    if _is_hip:
+        return False
+    try:
+        clique = _gpu_fabric_clique(device)
+    except Exception as e:
+        logger.warning(
+            "GPU fabric clique query failed (%r); custom-AR stays intra-node.", e
+        )
+        clique = None
+    # Always all-gather (every rank calls it once) so a failed query on any rank
+    # resolves to a clean False rather than a collective mismatch.
+    world_size = dist.get_world_size(group=group)
+    gathered: List[object] = [None] * world_size
+    dist.all_gather_object(gathered, clique, group=group)
+    if any(c is None for c in gathered):
+        return False
+    return len(set(gathered)) == 1
 
 
 def is_weak_contiguous(inp: torch.Tensor):

@@ -24,6 +24,7 @@ import zmq
 from sglang.srt.entrypoints.engine import _calculate_rank_ranges
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.data_parallel_controller import DataParallelController
+from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
 from sglang.srt.ray.engine import (
     _compute_world_size,
     _create_scheduler_actor,
@@ -51,15 +52,18 @@ class RayDataParallelController(DataParallelController):
         placement_group,
         bundle_for_node: Optional[List[int]],
         rank0_node_ip: str,
+        is_custom_pg: bool = False,
     ):
         # Set Ray-specific attributes BEFORE super().__init__() because the
         # parent constructor calls launch_dp_schedulers / launch_dp_attention_schedulers
         # which we override, and those methods need these attributes.
         self.pg = placement_group
+        self.is_custom_pg = is_custom_pg
         self.bundle_for_node = bundle_for_node
         self.rank0_node_ip = rank0_node_ip
         self.scheduler_actors: List = []
         self.event_loop_refs: List = []
+        self.startup_time = None
 
         # super().__init__ will call our overridden launch methods via MRO.
         # Pass run_scheduler_process_func=None since we don't spawn mp.Process.
@@ -135,7 +139,7 @@ class RayDataParallelController(DataParallelController):
         nnodes = server_args.nnodes
         batch_start_idx = len(self.scheduler_actors)
 
-        if self.server_args.placement_group is None:
+        if not self.is_custom_pg:
             for node_idx in range(nnodes):
                 bundle_idx = self.bundle_for_node[node_idx]
                 pp_range, tp_range, pp_per_node, tp_per_node = _calculate_rank_ranges(
@@ -270,6 +274,10 @@ class RayDataParallelController(DataParallelController):
         if scheduler_infos:
             self.max_total_num_tokens = scheduler_infos[0]["max_total_num_tokens"]
             self.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
+            self.startup_time = aggregate_scheduler_startup_times(
+                [self.startup_time]
+                + [info.get("startup_time") for info in scheduler_infos]
+            )
 
         # Start event loops (non-blocking — runs until actor is killed)
         self.event_loop_refs.extend(

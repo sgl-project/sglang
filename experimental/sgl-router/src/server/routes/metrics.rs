@@ -102,7 +102,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_endpoint_reflects_recorded_counters() {
         let ctx = Arc::new(AppContext::stub());
-        ctx.metrics.record_request(
+        ctx.metrics.record_worker_request(
             "http://w-test:30000",
             "tiny",
             WorkerModeLabel::Prefill,

@@ -25,7 +25,7 @@ class TestFlashAttention3LocalAttn(CustomTestCase):
     @classmethod
     def get_server_args(cls):
         return [
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "2",
             "--attention-backend",
             "fa3",

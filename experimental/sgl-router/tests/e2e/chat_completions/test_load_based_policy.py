@@ -19,7 +19,7 @@ _ACTIVE_RE = re.compile(
     r'^sgl_router_active_load\{worker_url="([^"]+)",kind="prefill_tokens"\}\s+(-?\d+)'
 )
 _REQ_TOTAL_RE = re.compile(
-    r"^sgl_router_requests_total\{([^}]*)\}\s+(\d+(?:\.\d+)?)\s*$"
+    r"^sgl_router_worker_requests_total\{([^}]*)\}\s+(\d+(?:\.\d+)?)\s*$"
 )
 _LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
 

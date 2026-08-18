@@ -397,6 +397,10 @@ class ConditionalCrossAttentionBlock(nn.Module):
         return self.inner(x=x, y=y, x_freqs=x_freqs, y_freqs=y_freqs)
 
 
+def _is_conditioner_block(_name: str, module: nn.Module) -> bool:
+    return isinstance(module, ConditionalCrossAttentionBlock)
+
+
 class DualTowerConditionalBridge(
     CachableDiT,
     LayerwiseOffloadableModuleMixin,
@@ -411,9 +415,8 @@ class DualTowerConditionalBridge(
 
     layerwise_offload_dit_group_enabled = False
 
-    _fsdp_shard_conditions = MOVADualTowerConfig()._fsdp_shard_conditions
-    _compile_conditions = MOVADualTowerConfig()._compile_conditions
-    _supported_attention_backends = MOVADualTowerConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [_is_conditioner_block]
+    _compile_conditions = [_is_conditioner_block]
     param_names_mapping = MOVADualTowerConfig().param_names_mapping
     reverse_param_names_mapping = MOVADualTowerConfig().reverse_param_names_mapping
     lora_param_names_mapping = MOVADualTowerConfig().lora_param_names_mapping
@@ -536,7 +539,6 @@ class DualTowerConditionalBridge(
             A tuple of ((cos_v, sin_v), (cos_a, sin_a)).
         """
         f_v, h, w = grid_size
-        L_v = f_v * h * w
         L_a = int(audio_steps)
 
         device = device or next(self.parameters()).device

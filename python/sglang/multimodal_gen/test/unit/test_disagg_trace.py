@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.srt import server_args as srt_server_args_module
 from sglang.srt.observability import trace as srt_trace
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
+from sglang.srt.runtime_context import reset_context
 from sglang.srt.server_args import set_global_server_args_for_scheduler
 
 try:
@@ -62,12 +63,18 @@ def _enable_minimal_otel() -> None:
 
 @contextmanager
 def _srt_trace_server_args():
-    prev_server_args = srt_server_args_module._global_server_args
+    try:
+        prev_server_args = srt_server_args_module.get_global_server_args()
+    except ValueError:  # nothing published yet
+        prev_server_args = None
     set_global_server_args_for_scheduler(SimpleNamespace(trace_modules="request"))
     try:
         yield
     finally:
-        srt_server_args_module._global_server_args = prev_server_args
+        if prev_server_args is None:
+            reset_context()
+        else:
+            set_global_server_args_for_scheduler(prev_server_args)
 
 
 def _traceparent_from(ctx) -> str | None:

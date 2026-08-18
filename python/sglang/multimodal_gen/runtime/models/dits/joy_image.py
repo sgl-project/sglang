@@ -9,6 +9,7 @@ import torch.nn as nn
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.dits.joy_image import JoyImageDiTConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_double_blocks
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_group,
@@ -38,11 +39,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanTimeTextImageEmbedding
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 
 logger = init_logger(__name__)
 _MODULATION_FACTOR = 6
@@ -348,9 +349,8 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
 
     _supports_gradient_checkpointing = True
-    _fsdp_shard_conditions = JoyImageDiTConfig()._fsdp_shard_conditions
-    _compile_conditions = JoyImageDiTConfig()._compile_conditions
-    _supported_attention_backends = JoyImageDiTConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_blocks_or_double_blocks]
+    _compile_conditions = [is_blocks_or_double_blocks]
     param_names_mapping = JoyImageDiTConfig().param_names_mapping
     reverse_param_names_mapping = JoyImageDiTConfig().reverse_param_names_mapping
     lora_param_names_mapping = JoyImageDiTConfig().lora_param_names_mapping
@@ -421,7 +421,7 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             self.hidden_size,
             self.out_channels * math.prod(self.patch_size),
             quant_config=quant_config,
-            prefix=f"proj_out",
+            prefix="proj_out",
         )
         self.__post_init__()
 

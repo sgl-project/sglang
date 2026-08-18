@@ -109,15 +109,15 @@ class TestTopkPaddedRegion(CustomTestCase):
 
     def test_invalid_pad_count_tensor_raises(self):
         x = torch.rand((8, 8), device=self.DEVICE, dtype=torch.float32)
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(TypeError):
             _fill_padded_rows(x, 4, 0.0)  # python int, not a tensor
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             _fill_padded_rows(
                 x,
                 torch.tensor([1, 2], device=self.DEVICE, dtype=torch.int32),
                 0.0,
             )
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(TypeError):
             _fill_padded_rows(
                 x,
                 torch.tensor(4.0, device=self.DEVICE, dtype=torch.float32),
@@ -188,6 +188,64 @@ class TestPostProcessPaddedMaskingHip(CustomTestCase):
             self.assertTrue(torch.all(out[n_valid:] > 0.0))
         finally:
             topk_mod._skip_hip_pad_mask = orig
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "padded-region masking needs a GPU")
+@unittest.skipIf(_IS_HIP, "HIP keeps the pre-mask routing contract (AITER/MORI)")
+class TestSelectExpertsCustomRoutingPadMask(CustomTestCase):
+    """``select_experts`` must accept ``num_token_non_padded`` together with a
+    ``custom_routing_function`` and mask the padded region to -1.
+
+    Bug regression (EP MoE dispatch overflow): DP-attention/SP pad rows
+    carry garbage router input; a custom routing function can emit the same
+    expert id in every top-k slot for them (the masked argmax degenerates on
+    non-finite scores), which overflows an EP dispatch pool's
+    min(top_k, experts_per_rank) distinct-ids sizing bound. The fix routes
+    padded-region masking through the shared post-process; previously this
+    combination was rejected with ``assert num_token_non_padded is None``,
+    so no model with a custom router could mask its pad rows at all.
+    """
+
+    DEVICE = "cuda"
+
+    def test_padded_tail_masked_after_custom_routing(self):
+        from sglang.srt.layers.moe.topk import select_experts
+
+        num_tokens, num_experts, top_k, n_valid = 12, 32, 8, 10
+        hidden = torch.randn((num_tokens, 64), device=self.DEVICE, dtype=torch.bfloat16)
+        router_logits = torch.randn(
+            (num_tokens, num_experts), device=self.DEVICE, dtype=torch.float32
+        )
+        # Pad rows carry non-finite router input, like real DP-pad rows.
+        router_logits[n_valid:] = float("nan")
+
+        def _degenerate_router(hidden_states, gating_output, topk, renormalize):
+            # Mimic the incident: NaN rows collapse to one expert id x top_k.
+            weights = torch.softmax(gating_output.nan_to_num(0.0), dim=-1).topk(
+                topk, dim=-1
+            )
+            ids = weights.indices.to(torch.int32)
+            ids[gating_output.isnan().any(dim=-1)] = 7
+            return weights.values.float(), ids
+
+        out = select_experts(
+            hidden_states=hidden,
+            router_logits=router_logits,
+            topk_config=TopKConfig(
+                top_k=top_k,
+                renormalize=True,
+                custom_routing_function=_degenerate_router,
+            ),
+            layer_id=0,
+            num_token_non_padded=torch.tensor(
+                n_valid, device=self.DEVICE, dtype=torch.int32
+            ),
+        )
+        # Padded tail fully -1 (skipped by every EP dispatch path)...
+        self.assertTrue(torch.all(out.topk_ids[n_valid:] == -1))
+        # ...and real rows untouched (in-range, no -1 leakage).
+        self.assertTrue(torch.all(out.topk_ids[:n_valid] >= 0))
+        self.assertTrue(torch.all(out.topk_ids[:n_valid] < num_experts))
 
 
 if __name__ == "__main__":

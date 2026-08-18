@@ -8,6 +8,7 @@ import torch
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
@@ -15,9 +16,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TextEncodingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
 
 
 class SD3ConditioningStage(PipelineStage):
@@ -64,7 +62,7 @@ class SD3ConditioningStage(PipelineStage):
         return merged_embeds, merged_pooled
 
 
-class StableDiffusion3Pipeline(ComposedPipelineBase):
+class StableDiffusion3Pipeline(LoRAPipeline, ComposedPipelineBase):
     """StableDiffusion3 pipeline implementation."""
 
     pipeline_name = "StableDiffusion3Pipeline"

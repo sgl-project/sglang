@@ -51,6 +51,12 @@ def generate_request_id() -> str:
     return str(uuid.uuid4())
 
 
+# Validated request-level quality levels. "lossless" is the exact reference
+# path (bit-exact against the CI golden outputs); "high" opts into validated
+# accelerated paths whose quality is guaranteed but not bit-exact.
+QUALITY_LEVELS: tuple[str, ...] = ("lossless", "high")
+
+
 def _sanitize_filename(name: str, replacement: str = "_", max_length: int = 150) -> str:
     """Create a filesystem- and ffmpeg-friendly filename.
 
@@ -76,12 +82,15 @@ class DataType(Enum):
     IMAGE = auto()
     VIDEO = auto()
     MESH = auto()
+    ACTION = auto()
 
     def get_default_extension(self) -> str:
         if self == DataType.IMAGE:
             return "png"
         if self == DataType.VIDEO:
             return "mp4"
+        if self == DataType.ACTION:
+            return "json"
         return "glb"
 
 
@@ -103,6 +112,9 @@ class SamplingParams:
     # Image inputs
     image_path: str | list[str] | None = None
 
+    # Video inputs (video-to-video conditioning)
+    video_path: str | list[str] | None = None
+
     # Text inputs
     prompt: str | list[str] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
@@ -117,6 +129,21 @@ class SamplingParams:
     )
     output_quality: str | None = "default"
     output_compression: int | None = None
+    # Model-owned, request-scoped quality level.
+    #
+    # - "lossless" (default): the exact reference path. Output is expected to
+    #   be bit-identical to the HF reference implementation and to pass the
+    #   CI golden/ground-truth comparisons.
+    # - "high": opt into validated accelerated paths. Quality stays
+    #   guaranteed (the intent is to back every such path with mathematical
+    #   acceptance thresholds, e.g. PSNR > 25 against the reference), but
+    #   the output is no longer bit-exact versus the HF reference or the CI
+    #   ground truth.
+    #
+    # Models that support "high" must validate the deployment and workload
+    # explicitly. It intentionally participates in the dynamic-batch
+    # signature.
+    quality: str = "lossless"
 
     # Frame interpolation
     enable_frame_interpolation: bool = False
@@ -153,10 +180,23 @@ class SamplingParams:
     width: int | None = None
     fps: int = 24
 
+    # LTX-2.5 duration head. Ignored by other models, so the flags stay
+    # universally accepted.
+    # Decode with the diffusion decoder instead of the VAE one. Ignored by
+    # models that ship no such decoder.
+    use_diffusion_decoder: bool = False
+
+    auto_duration: bool = False
+    auto_duration_min_seconds: float = 1.0
+    auto_duration_max_seconds: float = 20.0
+
     # Resolution validation
     supported_resolutions: list[tuple[int, int]] | None = field(
         default=None, metadata={"batch_sig_exclude": True}
     )  # None means all resolutions allowed
+
+    # Output audio duration in seconds (models without an audio modality ignore this).
+    sound_duration: float = 0.0
 
     # Denoising parameters
     num_inference_steps: int = None
@@ -171,11 +211,20 @@ class SamplingParams:
     progressive_levels: int = 1
     progressive_delta: float = 0.01
 
+    # LongCat-Image parameters
+    enable_cfg_renorm: bool = False
+    cfg_renorm_min: float = 0.0
+    enable_prompt_rewrite: bool = False
+
     # TeaCache parameters
     enable_teacache: bool = False
     teacache_params: Any = (
         None  # TeaCacheParams or WanTeaCacheParams, set by model-specific subclass
     )
+
+    # Spectrum parameters
+    enable_spectrum: bool = False
+    spectrum_params: Any = None  # SpectrumParams
 
     # Profiling
     profile: bool = field(default=False, metadata={"batch_sig_exclude": True})
@@ -240,10 +289,8 @@ class SamplingParams:
 
     def _set_output_file_ext(self):
         # add extension if needed
-        if not any(
-            self.output_file_name.endswith(ext)
-            for ext in [".mp4", ".jpg", ".png", ".webp", ".obj", ".glb"]
-        ):
+        output_extensions = (".mp4", ".jpg", ".png", ".webp", ".obj", ".glb", ".json")
+        if not any(self.output_file_name.endswith(ext) for ext in output_extensions):
             self.output_file_name = (
                 f"{self.output_file_name}.{self.data_type.get_default_extension()}"
             )
@@ -302,6 +349,16 @@ class SamplingParams:
         if env_steps is not None and self.num_inference_steps is not None:
             self.num_inference_steps = int(env_steps)
 
+        if self.enable_spectrum and isinstance(self.spectrum_params, dict):
+            from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
+
+            self.spectrum_params = SpectrumParams(**self.spectrum_params)
+
+        if self.enable_spectrum and self.spectrum_params is None:
+            from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
+
+            self.spectrum_params = SpectrumParams()
+
     def build_request_extra(self) -> dict[str, Any]:
         """Return optional request-scoped extras for downstream pipeline stages."""
         extra = {}
@@ -321,8 +378,68 @@ class SamplingParams:
         if self.realtime_chunk_size is not None:
             req.realtime_chunk_size = self.realtime_chunk_size
 
+    @classmethod
+    def video_request_extra_fields(cls) -> frozenset[str]:
+        """Declare model-specific multipart video fields accepted by this type."""
+
+        return frozenset()
+
+    @classmethod
+    def lower_video_request_kwargs(
+        cls,
+        request: Any,
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Adapt generic video-API kwargs before constructing this params type."""
+        del request
+        return kwargs
+
+    def prepare_video_request_for_queue(self, req: Any) -> None:
+        """Resolve model-specific admission facts before a video job is queued."""
+        del req
+
+    def expand_video_request_outputs_for_queue(self, req: Any) -> list[Any] | None:
+        """Return per-output requests when a model owns grouped execution.
+
+        ``None`` preserves the default model-native ``num_outputs`` handling.
+        Models that need the framework's independent-seed request expansion
+        can opt in after their shared pre-queue work has completed.
+        """
+        del req
+        return None
+
+    def prepare_synthetic_warmup_request_for_queue(
+        self, req: Any, server_args: Any
+    ) -> None:
+        """Resolve model-specific facts for one synthetic warmup request."""
+        del req, server_args
+
+    def project_video_queued_job_fields(self, req: Any) -> dict[str, str]:
+        """Return model-resolved fields to publish with the queued video job."""
+        del req
+        return {}
+
+    def validate_video_final_outputs(
+        self,
+        output_paths: list[str],
+        req: Any,
+    ) -> dict[str, str]:
+        """Validate final files and return truthful completion metadata."""
+        del output_paths, req
+        return {}
+
+    def cleanup_video_request(self, req: Any) -> None:
+        """Release request-scoped resources owned by the model integration."""
+        del req
+
+    def refresh_request_extra_after_output_expansion(self, req: Any) -> None:
+        """Refresh request identity after assigning a per-output seed."""
+        del req
+
     def _adjust_output_quality(self, output_quality: str, data_type: DataType) -> int:
         """Convert output_quality string to compression level."""
+        if data_type == DataType.ACTION:
+            return 0
         output_quality_mapper = {"maximum": 100, "high": 90, "medium": 55, "low": 35}
         if output_quality == "default":
             return 50 if data_type == DataType.VIDEO else 75
@@ -335,6 +452,12 @@ class SamplingParams:
         if self.prompt_path and not self.prompt_path.endswith(".txt"):
             raise ValueError(
                 f"prompt_path must be a txt file, got {self.prompt_path!r}"
+            )
+
+        if self.quality not in QUALITY_LEVELS:
+            raise ValueError(
+                f"quality must be one of {list(QUALITY_LEVELS)}, "
+                f"got {self.quality!r}"
             )
 
         # These are always required to be sane regardless of pipeline.
@@ -453,6 +576,11 @@ class SamplingParams:
                     f"boundary_ratio must be within [0, 1], got {self.boundary_ratio!r}"
                 )
 
+        if self.enable_teacache and self.enable_spectrum:
+            raise ValueError(
+                "enable_teacache and enable_spectrum are mutually exclusive; enable only one."
+            )
+
         RLRolloutArgs.validate_sampling_params(self)
 
     def check_sampling_param(self):
@@ -463,18 +591,22 @@ class SamplingParams:
         """
         check if the sampling params is compatible and valid with server_args
         """
-        if pipeline_config.task_type.requires_image_input():
+        task_type = pipeline_config.task_type
+        if task_type.is_action_gen():
+            return
+
+        if task_type.requires_image_input():
             # requires image input
             if self.image_path is None:
                 raise ValueError(
-                    f"Served model with task type '{pipeline_config.task_type.name}' requires an 'image_path' input, but none was provided"
+                    f"Served model with task type '{task_type.name}' requires an 'image_path' input, but none was provided"
                 )
 
-        if not pipeline_config.task_type.accepts_image_input():
+        if not task_type.accepts_image_input():
             # does not support image input
             if self.image_path is not None:
                 raise ValueError(
-                    f"input_reference is not supported for {pipeline_config.task_type.name} models."
+                    f"input_reference is not supported for {task_type.name} models."
                 )
 
     def _adjust(
@@ -488,7 +620,39 @@ class SamplingParams:
 
         # TODO: SamplingParams should not rely on ServerArgs
         pipeline_config = server_args.pipeline_config
+        task_type = pipeline_config.task_type
+        self.data_type = task_type.data_type()
 
+        self._adjust_output_path(server_args)
+        if task_type.is_action_gen():
+            self._adjust_action_fields(server_args)
+            return
+
+        if task_type.is_mesh_gen():
+            self._adjust_mesh_fields(server_args, pipeline_config)
+            return
+
+        if task_type.is_visual_gen():
+            self._adjust_visual_fields(server_args, pipeline_config)
+
+    def _adjust_output_path(self, server_args):
+        if self.output_path is None:
+            if server_args.output_path is not None:
+                self.output_path = server_args.output_path
+                logger.debug(
+                    f"Overriding output_path with server configuration: {self.output_path}"
+                )
+            else:
+                self.save_output = False
+
+    def _adjust_action_fields(self, server_args):
+        self.return_file_paths_only = False
+        self.num_frames = 1
+        self.adjust_frames = False
+        if self.save_output and not server_args.comfyui_mode:
+            self._set_output_file_name()
+
+    def _adjust_mesh_fields(self, server_args, pipeline_config):
         if self.guidance_scale is None:
             try:
                 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
@@ -501,17 +665,16 @@ class SamplingParams:
                     self.guidance_scale = 1.0
             except ImportError:
                 self.guidance_scale = 1.0
+        self.return_frames = False
+        self.return_video = False
+        self.num_frames = 1
+        self.adjust_frames = False
+        if self.save_output and not server_args.comfyui_mode:
+            self._set_output_file_name()
 
-        self.data_type = server_args.pipeline_config.task_type.data_type()
-
-        if self.output_path is None:
-            if server_args.output_path is not None:
-                self.output_path = server_args.output_path
-                logger.debug(
-                    f"Overriding output_path with server configuration: {self.output_path}"
-                )
-            else:
-                self.save_output = False
+    def _adjust_visual_fields(self, server_args, pipeline_config):
+        if self.guidance_scale is None:
+            self.guidance_scale = 1.0
 
         # Process negative prompt
         if self.negative_prompt is not None and not self.negative_prompt.isspace():
@@ -570,7 +733,6 @@ class SamplingParams:
             if not server_args.pipeline_config.allow_set_num_frames():
                 logger.debug("Setting `num_frames` to 1 for image generation model")
                 self.num_frames = 1
-
         else:
             # mandatory frame adjusting logic, mod
             # NOTE: We must apply adjust_num_frames BEFORE the SP alignment logic below.
@@ -733,6 +895,11 @@ class SamplingParams:
             return parser.add_argument(*name_or_flags, **kwargs)
 
         add_argument("--data-type", type=str, nargs="+")
+        # Predict the shot length from the caption, overriding `--num-frames`.
+        add_argument("--use-diffusion-decoder", action="store_true")
+        add_argument("--auto-duration", action="store_true")
+        add_argument("--auto-duration-min-seconds", type=float)
+        add_argument("--auto-duration-max-seconds", type=float)
         add_argument(
             "--num-frames-round-down",
             action="store_true",
@@ -740,6 +907,86 @@ class SamplingParams:
         add_argument(
             "--enable-teacache",
             action="store_true",
+        )
+        add_argument(
+            "--enable-spectrum",
+            action="store_true",
+        )
+        add_argument("--w", type=float)
+        add_argument(
+            "--taylor-order",
+            "--taylor_order",
+            dest="taylor_order",
+            type=int,
+        )
+        add_argument(
+            "--history-size",
+            "--history_size",
+            dest="history_size",
+            type=int,
+        )
+        add_argument(
+            "--spectrum-window-size",
+            "--spectrum_window_size",
+            "--window-size",
+            "--window_size",
+            dest="spectrum_window_size",
+            type=float,
+            help="Spectrum initial skip window size.",
+        )
+        add_argument(
+            "--spectrum-flex-window",
+            "--spectrum_flex_window",
+            "--flex-window",
+            "--flex_window",
+            dest="spectrum_flex_window",
+            type=float,
+            help="Spectrum adaptive window growth slope.",
+        )
+        add_argument(
+            "--spectrum-warmup-steps",
+            "--spectrum_warmup_steps",
+            dest="spectrum_warmup_steps",
+            type=int,
+            help="Spectrum warmup denoising steps before caching.",
+        )
+        add_argument(
+            "--spectrum-m",
+            "--spectrum_m",
+            dest="spectrum_m",
+            type=int,
+            help="Spectrum Chebyshev polynomial degree (M).",
+        )
+        add_argument(
+            "--spectrum-lam",
+            "--spectrum_lam",
+            dest="spectrum_lam",
+            type=float,
+            help="Spectrum ridge regularization strength.",
+        )
+        add_argument(
+            "--spectrum-tau-num-steps",
+            "--spectrum_tau_num_steps",
+            dest="spectrum_tau_num_steps",
+            type=int,
+            help="Spectrum tau normalization horizon.",
+        )
+
+        # LongCat-Image parameters
+        add_argument(
+            "--enable-cfg-renorm",
+            action=StoreBoolean,
+            help="Enable CFG renormalization for LongCat-Image (default: false).",
+        )
+        add_argument(
+            "--cfg-renorm-min",
+            type=float,
+            help="Minimum CFG renorm scale for LongCat-Image (default: 0.0).",
+        )
+        add_argument(
+            "--enable-prompt-rewrite",
+            action=StoreBoolean,
+            help="Enable prompt rewriting via Qwen2.5-VL before encoding for LongCat-Image (default: false).",
         )
 
         # profiling
@@ -820,9 +1067,24 @@ class SamplingParams:
             help="Output compression level (0-100, higher means better quality but larger file size)",
         )
         add_argument(
+            "--quality",
+            type=str,
+            choices=list(QUALITY_LEVELS),
+            help=(
+                "Request-level quality: 'lossless' (default) keeps the exact "
+                "reference path, bit-exact against the reference "
+                "implementation; 'high' opts into the model-owned validated "
+                "accelerated path, whose quality stays guaranteed but is not "
+                "bit-exact. Support and validated deployment constraints are "
+                "model-specific."
+            ),
+        )
+        add_argument(
             "--num-outputs-per-prompt",
+            "--num-outputs",
+            dest="num_outputs_per_prompt",
             type=int,
-            help="Number of outputs to generate per prompt",
+            help="Number of outputs to generate per prompt (alias: --num-outputs)",
         )
         add_argument(
             "--seed",
@@ -840,6 +1102,11 @@ class SamplingParams:
             "--num-frames",
             type=int,
             help="Number of frames to generate",
+        )
+        add_argument(
+            "--sound-duration",
+            type=float,
+            help="Duration of generated audio in seconds; 0 disables audio output (audio-capable models only)",
         )
         add_argument(
             "--height",
@@ -952,9 +1219,10 @@ class SamplingParams:
             "--action",
             type=str,
             help=(
-                "SANA-WM WASD/IJKL action DSL, e.g. "
-                "'w-80,jw-40,w-40,lw-60,w-100'. Model-specific fields are "
-                "ignored by other pipelines."
+                "Action input. SANA-WM uses a WASD/IJKL DSL, e.g. "
+                "'w-80,jw-40,w-40,lw-60,w-100'. Cosmos3 uses a JSON array of "
+                "shape [T, D], e.g. '[[0.1, 0.2, ...], ...]'. Model-specific "
+                "fields are ignored by other pipelines."
             ),
         )
         add_argument(
@@ -977,6 +1245,57 @@ class SamplingParams:
             type=float,
             dest="pitch_limit_deg",
             help="SANA-WM action DSL absolute pitch clamp in degrees.",
+        )
+        add_argument(
+            "--video-path",
+            type=str,
+            nargs="+",
+            help=(
+                "Path(s) to input video(s) for video-to-video generation. "
+                "The first/last frames of the video become the conditioning "
+                "frames for the generated output."
+            ),
+        )
+        add_argument(
+            "--action-mode",
+            type=str,
+            dest="action_mode",
+            help=(
+                "Cosmos3 action mode: 'forward_dynamics' (predict next frame "
+                "from action), 'policy' (predict action from frame), or "
+                "'inverse_dynamics' (predict action from two frames)."
+            ),
+        )
+        add_argument(
+            "--domain-id",
+            type=int,
+            dest="domain_id",
+            help="Action embodiment domain ID (integer). Overrides --domain-name.",
+        )
+        add_argument(
+            "--domain-name",
+            type=str,
+            dest="domain_name",
+            help="Action embodiment domain name (e.g. 'av', 'camera_pose', 'umi').",
+        )
+        add_argument(
+            "--raw-action-dim",
+            type=int,
+            dest="raw_action_dim",
+            help=(
+                "Number of active action dimensions to predict; remaining "
+                "dimensions are zero-padded. Required for 'policy' and "
+                "'inverse_dynamics' modes."
+            ),
+        )
+        add_argument(
+            "--action-fps",
+            type=float,
+            dest="action_fps",
+            help=(
+                "Frame rate used for action token temporal mRoPE positions. "
+                "Defaults to the video fps when not set."
+            ),
         )
         add_argument(
             "--moba-config-path",
@@ -1099,6 +1418,34 @@ class SamplingParams:
         }
         if isinstance(cli_args.get("seed"), list) and len(cli_args["seed"]) == 1:
             cli_args["seed"] = cli_args["seed"][0]
+
+        spectrum_overrides = {}
+        spectrum_flag_map = {
+            "w": "w",
+            "taylor_order": "taylor_order",
+            "window_size": "spectrum_window_size",
+            "flex_window": "spectrum_flex_window",
+            "history_size": "history_size",
+            "warmup_steps": "spectrum_warmup_steps",
+            "m": "spectrum_m",
+            "lam": "spectrum_lam",
+            "tau_num_steps": "spectrum_tau_num_steps",
+        }
+        for field_name, arg_name in spectrum_flag_map.items():
+            if hasattr(args, arg_name) and getattr(args, arg_name) is not None:
+                spectrum_overrides[field_name] = getattr(args, arg_name)
+        if spectrum_overrides:
+            if not cli_args.get("enable_spectrum", False):
+                logger.info(
+                    "Spectrum override flags were provided without --enable-spectrum; "
+                    "auto-enabling Spectrum caching."
+                )
+                cli_args["enable_spectrum"] = True
+            existing_spectrum_params = cli_args.get("spectrum_params")
+            if isinstance(existing_spectrum_params, dict):
+                spectrum_overrides = {**existing_spectrum_params, **spectrum_overrides}
+            cli_args["spectrum_params"] = spectrum_overrides
+
         return cli_args
 
     def output_file_path(self):

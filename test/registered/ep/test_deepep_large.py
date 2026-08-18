@@ -15,7 +15,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=528, stage="extra-b", runner_config="deepep-8-gpu-h200")
+register_cuda_ci(est_time=528, stage="extra-b", runner_config="8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
@@ -176,7 +176,7 @@ class TestDeepseekV32TBO(CustomTestCase):
             "--enable-two-batch-overlap",
             "--moe-a2a-backend",
             "deepep",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "256",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true, "num_threads": 64}',
