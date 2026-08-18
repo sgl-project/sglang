@@ -78,7 +78,6 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.server_args import ServerArgs
 
 
 if _is_cuda:
@@ -98,7 +97,6 @@ logger = logging.getLogger(__name__)
 def resolve_num_tokens_per_req(
     *,
     phase: Literal["draft_decode", "draft_extend", "target_verify"],
-    server_args: ServerArgs,
     spec_algorithm=None,
     is_draft_worker: bool = False,
     num_draft_tokens: Optional[int] = None,
@@ -107,14 +105,19 @@ def resolve_num_tokens_per_req(
     width (sizes capture shapes / buffers); the per-forward dynamic width
     lives on ``SpecInput.num_tokens_per_req``. Draft phases are
     EAGLE-family-only; "target_verify" is algorithm-generic via the hook.
+
+    The widths come from the bags: adaptive spec captures each candidate step
+    config with that config's leaves overridden, so the buffers being sized
+    must follow the override rather than the startup values.
     """
+    spec = get_spec()
     if phase == "draft_decode":
-        return server_args.speculative_eagle_topk
+        return spec.speculative_eagle_topk
     if phase == "draft_extend":
-        return server_args.speculative_num_draft_tokens
+        return spec.speculative_num_draft_tokens
     if phase == "target_verify":
         if num_draft_tokens is None:
-            num_draft_tokens = server_args.speculative_num_draft_tokens
+            num_draft_tokens = spec.speculative_num_draft_tokens
         return spec_algorithm.get_num_tokens_per_req_for_target_verify(
             num_draft_tokens, is_draft_worker
         )
