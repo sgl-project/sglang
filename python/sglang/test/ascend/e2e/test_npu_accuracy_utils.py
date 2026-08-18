@@ -672,6 +672,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        time.sleep(10000000000)
         if cls.process:
             try:
                 kill_process_tree(cls.process.pid)

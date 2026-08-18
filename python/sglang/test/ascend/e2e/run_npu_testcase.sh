@@ -131,6 +131,7 @@ else
     ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" 2>&1 | tee -a "${log_path}/${tc_name}.log"
 fi
 echo "Finished test case ${test_case}"
+sleep 10000000
 
 if [ -n "${METRICS_DATA_FILE}" ]; then
     mkdir -p "${METRICS_DATA_FILE}"
