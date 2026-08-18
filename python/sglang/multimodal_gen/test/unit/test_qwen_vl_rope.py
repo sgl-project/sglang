@@ -20,7 +20,7 @@ class _RecordingRotaryEmbedding(nn.Module):
         self.query_shape = None
         self.key_shape = None
 
-    def forward(self, positions, query, key):
+    def forward_native(self, positions, query, key):
         self.positions = positions
         self.query_shape = query.shape
         self.key_shape = key.shape
@@ -56,7 +56,33 @@ def test_qwen_vl_rope_supports_transformers_v5_config(monkeypatch):
         "max_position": 128,
         "base": 1_000_000.0,
         "is_neox_style": True,
-        "rope_scaling": rope_parameters,
+        "rope_scaling": {**rope_parameters, "mrope_interleaved": False},
+    }
+
+
+def test_qwen_vl_rope_enables_interleaved_layout_explicitly(monkeypatch):
+    config = SimpleNamespace(
+        head_dim=8,
+        max_position_embeddings=128,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 1_000_000.0,
+            "mrope_section": [2, 1, 1],
+        },
+    )
+    captured_kwargs = {}
+
+    def get_rope(**kwargs):
+        captured_kwargs.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(qwen_vl_rope, "get_rope", get_rope)
+
+    build_qwen_vl_text_rope(config, mrope_interleaved=True)
+
+    assert captured_kwargs["rope_scaling"] == {
+        **config.rope_parameters,
+        "mrope_interleaved": True,
     }
 
 

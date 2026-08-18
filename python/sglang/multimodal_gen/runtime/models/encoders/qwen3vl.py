@@ -283,7 +283,7 @@ class Qwen3VLTextAttention(nn.Module):
         )
         self.q_norm = _make_text_rms_norm(self.head_dim, config.rms_norm_eps)
         self.k_norm = _make_text_rms_norm(self.head_dim, config.rms_norm_eps)
-        self.rotary_emb = build_qwen_vl_text_rope(config)
+        self.rotary_emb = build_qwen_vl_text_rope(config, mrope_interleaved=True)
 
         self.attn = LocalAttention(
             num_heads=self.num_heads,

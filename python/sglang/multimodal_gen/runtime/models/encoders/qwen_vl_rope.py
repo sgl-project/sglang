@@ -10,11 +10,15 @@ from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.utils.hf_transformers.common import get_rope_config
 
 
-def build_qwen_vl_text_rope(config: Any) -> RotaryEmbedding:
+def build_qwen_vl_text_rope(
+    config: Any, *, mrope_interleaved: bool = False
+) -> RotaryEmbedding:
     head_dim = getattr(config, "head_dim", None) or (
         config.hidden_size // config.num_attention_heads
     )
     rope_theta, rope_scaling = get_rope_config(config)
+    rope_scaling = dict(rope_scaling or {})
+    rope_scaling["mrope_interleaved"] = mrope_interleaved
     return get_rope(
         head_size=head_dim,
         rotary_dim=head_dim,
@@ -54,7 +58,8 @@ def apply_qwen_vl_text_rope(
 
     query = query.transpose(1, 2).reshape(-1, num_query_heads * head_dim)
     key = key.transpose(1, 2).reshape(-1, num_key_value_heads * head_dim)
-    query, key = rotary_emb(position_ids.reshape(3, -1), query, key)
+    # Preserve HF's bf16 arithmetic order; fused MRoPE changes generated images.
+    query, key = rotary_emb.forward_native(position_ids.reshape(3, -1), query, key)
     query = query.view(batch_size, sequence_length, num_query_heads, head_dim)
     key = key.view(batch_size, sequence_length, num_key_value_heads, head_dim)
     return query.transpose(1, 2), key.transpose(1, 2)
