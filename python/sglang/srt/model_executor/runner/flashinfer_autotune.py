@@ -171,7 +171,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     )
 
 
-def autotune_tactic_sync_group(
+def _autotune_tactic_sync_group(
     tp_group: GroupCoordinator,
 ) -> Optional[torch.distributed.ProcessGroup]:
     """CPU group over the ranks that must agree on the tuned tactics.
@@ -185,7 +185,9 @@ def autotune_tactic_sync_group(
     """
     if tp_group.world_size <= 1:
         return None
-    # gloo keeps the reduction of these host-side scalars off the profiled stream.
+    # A CPU-side group (gloo, or mooncake-cpu under the elastic backend) keeps
+    # the reduction of these host-side scalars off the profiled stream:
+    # FlashInfer reduces on a CPU tensor for any backend that is not NCCL.
     return tp_group.cpu_group
 
 
@@ -205,10 +207,14 @@ def _autotune_process_group(group: Optional[torch.distributed.ProcessGroup]):
         set_autotune_process_group(previous)
 
 
-def _autotune_cache_digest(cache_path: Path) -> str:
-    """Hash of the tuned entries in ``cache_path`` ("" when absent/unreadable).
+def _autotune_cache_digest(cache_path: Path, env: dict[str, str]) -> str:
+    """Hash of what this rank would load from ``cache_path`` ("" for nothing).
 
-    ``_metadata`` is excluded: it records local toolkit versions, not tactics.
+    Covers the file as a whole *and* the rank's current environment, because
+    ``load_configs`` ignores every entry when the file's ``_metadata`` stamp
+    disagrees with the environment it is read in. Hashing only the tuned
+    entries would let two ranks holding the same tactics still enter tuning
+    with different caches -- one loading them, one loading nothing.
     """
     if not cache_path.is_file():
         return ""
@@ -216,22 +222,14 @@ def _autotune_cache_digest(cache_path: Path) -> str:
         configs = json.loads(cache_path.read_text())
     except (OSError, ValueError):
         return ""
-    configs.pop("_metadata", None)
-    return hashlib.sha256(json.dumps(configs, sort_keys=True).encode()).hexdigest()
-
-
-def _gather_autotune_cache_digests(
-    cache_path: Path, group: torch.distributed.ProcessGroup
-) -> list[str]:
-    digests: list[Optional[str]] = [None] * torch.distributed.get_world_size(group)
-    torch.distributed.all_gather_object(
-        digests, _autotune_cache_digest(cache_path), group=group
-    )
-    return digests
+    if not isinstance(configs, dict):
+        return ""
+    payload = {"file": configs, "env": env}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 def _drop_diverged_autotune_cache(
-    cache_path: Path, group: torch.distributed.ProcessGroup
+    cache_path: Path, group: torch.distributed.ProcessGroup, env: dict[str, str]
 ) -> None:
     """Enter tuning with the same cache on every rank, or with none at all.
 
@@ -239,7 +237,11 @@ def _drop_diverged_autotune_cache(
     and hang. Synced runs leave identical caches, so a mismatch means they
     predate the sync or a rank died mid-tune.
     """
-    if len(set(_gather_autotune_cache_digests(cache_path, group))) == 1:
+    digests: list[str] = [""] * torch.distributed.get_world_size(group)
+    torch.distributed.all_gather_object(
+        digests, _autotune_cache_digest(cache_path, env), group=group
+    )
+    if len(set(digests)) == 1:
         return
     log_info_on_rank0(
         logger,
@@ -249,33 +251,19 @@ def _drop_diverged_autotune_cache(
     cache_path.unlink(missing_ok=True)
 
 
-def _check_autotune_cache_agreement(
-    cache_path: Path, group: torch.distributed.ProcessGroup
-) -> None:
-    """Report whether the ranks actually came out with the same tactics."""
-    if len(set(_gather_autotune_cache_digests(cache_path, group))) == 1:
-        log_info_on_rank0(
-            logger, "FlashInfer autotune: all TP ranks selected the same tactics."
-        )
-        return
-    logger.warning(
-        "FlashInfer autotune: TP ranks selected different tactics despite the "
-        "cross-rank timing sync. Ranks are likely not profiling in lockstep "
-        "(differing shapes, skipped ops, or a per-rank failure during tuning)."
-    )
-
-
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
-    from flashinfer.autotuner import autotune
+    # _collect_metadata is the environment stamp load_configs compares a cache
+    # file against; the entry gate below has to see the same inputs it does.
+    from flashinfer.autotuner import _collect_metadata, autotune
 
     mr = model_runner
     cache_path = flashinfer_autotune_cache_path(mr)
-    sync_group = autotune_tactic_sync_group(mr.tp_group)
+    sync_group = _autotune_tactic_sync_group(mr.tp_group)
     if envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.get():
         autotune_cache = cache_path
         if sync_group is not None:
-            _drop_diverged_autotune_cache(cache_path, sync_group)
+            _drop_diverged_autotune_cache(cache_path, sync_group, _collect_metadata())
         logger.info("Running FlashInfer autotune with cache: %s", autotune_cache)
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -302,8 +290,6 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         ), autotune_dummy_run_mode(run_lm_head=run_lm_head):
             yield
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
-    if sync_group is not None:
-        _check_autotune_cache_agreement(autotune_cache, sync_group)
     logger.info("FlashInfer autotune completed.")
 
 
@@ -416,6 +402,14 @@ def maybe_flashinfer_autotune_extend(
     try:
         run_flashinfer_autotune_forward(mr, forward_fn, run_lm_head=False)
     except torch.OutOfMemoryError:
+        if _autotune_tactic_sync_group(mr.tp_group) is not None:
+            # Tuning is collective across the TP group, and OOM here (unlike
+            # OOM inside a tactic measurement, which FlashInfer disqualifies in
+            # lockstep) already stopped this rank from reducing while its peers
+            # wait on the next tactic. Skipping the pass would leave them
+            # blocked until the group's timeout -- 2h for the default gloo one
+            # -- so surface the failure instead of degrading alone.
+            raise
         # The pass is an optimization; without headroom for the extend-shaped
         # forward, fall back to untuned extend buckets instead of failing.
         log_info_on_rank0(
