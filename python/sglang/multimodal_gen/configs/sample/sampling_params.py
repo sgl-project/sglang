@@ -242,6 +242,16 @@ class SamplingParams:
     # CACHE_DIT_REQUEST_PARAM_KEYS in runtime/cache/cache_dit_integration.py.
     cache_dit_params: dict[str, Any] | None = None
 
+    # Per-request attention backend switch for the DiT denoise loop. ``None``
+    # keeps the server-selected backend; valid values are the exact/drop-in
+    # dense kernels ("fa", "torch_sdpa", "sage_attn", "sage_attn_3" — see
+    # REQUEST_SWITCHABLE_ATTENTION_BACKENDS). Sage variants are lossy
+    # (quantized attention). Incompatible server settings (breakable CUDA
+    # graphs, torch.compile, sparse server backends, non-ring-capable target
+    # under ring parallelism) reject the request instead of silently falling
+    # back. Participates in the dynamic-batch signature.
+    attention_backend_override: str | None = None
+
     # Spectrum parameters
     enable_spectrum: bool = False
     spectrum_params: Any = None  # SpectrumParams
@@ -939,6 +949,10 @@ class SamplingParams:
         add_argument(
             "--cfg-gate-step",
             type=float,
+        )
+        add_argument(
+            "--attention-backend-override",
+            type=str,
         )
         add_argument(
             "--enable-spectrum",

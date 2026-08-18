@@ -87,6 +87,13 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
     world_group_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.attention.layer import (
+    LocalAttention,
+    UlyssesAttention,
+    USPAttention,
+    apply_attention_backend_override,
+    prepare_attention_backend_override,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
     configure_sta,
@@ -243,6 +250,19 @@ class DenoisingStepState:
     attn_metadata: Any | None
 
 
+# Backends a request may switch to via SamplingParams.attention_backend_override.
+# Deliberately limited to exact/drop-in dense kernels: the sparse family needs
+# per-model mask configs and per-step metadata, and stays a server-level choice.
+REQUEST_SWITCHABLE_ATTENTION_BACKENDS = frozenset(
+    {
+        AttentionBackendEnum.FA,
+        AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.SAGE_ATTN,
+        AttentionBackendEnum.SAGE_ATTN_3,
+    }
+)
+
+
 class DualTransformerExecutionMode(str, Enum):
     """How a denoising stage uses a second DiT.
 
@@ -316,6 +336,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             dtype=torch.float16,
             selected_attention_backend=selected_attention_backend,
         )
+        # Per-request attention backend override state (see
+        # _maybe_override_attention_backend). The metadata head size is kept so
+        # the stage-level metadata backend can be re-resolved per batch.
+        self._attn_backend_default = self.attn_backend
+        self._attn_metadata_head_size = attn_head_size
+        self._attention_backend_active_override: AttentionBackendEnum | None = None
 
         # cfg
         self.guidance = None
@@ -503,10 +529,125 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
         """Apply request-dependent transformer acceleration in trace-safe order."""
+        self._maybe_override_attention_backend(batch)
         self._maybe_toggle_quality_fusions(batch)
         self._maybe_enable_cache_dit(num_inference_steps, batch)
         for transformer in filter(None, [self.transformer, self.transformer_2]):
             self._maybe_torch_compile(transformer)
+
+    def _maybe_override_attention_backend(self, batch: Req) -> None:
+        """Apply the per-request attention backend override at the batch boundary.
+
+        ``attention_backend_override`` participates in the dynamic-batch
+        signature, so the flip below never lands mid-batch. Incompatible server
+        settings reject the request (fail-fast) rather than silently running
+        the default backend. The switch is two-phase: every layer's impl is
+        prepared first (no mutation, may raise), then all layers flip, so a
+        rejected request leaves the transformers untouched.
+        """
+        target = self._parse_attention_backend_override(
+            batch.sampling_params.attention_backend_override
+        )
+        if target == self._attention_backend_active_override:
+            return
+        layers = self._request_switchable_attention_layers()
+        stage_backend = self._attn_backend_default
+        if target is not None:
+            stage_backend = self._validate_attention_backend_override(target, layers)
+            for layer in layers:
+                prepare_attention_backend_override(layer, target)
+        for layer in layers:
+            apply_attention_backend_override(layer, target)
+        self.attn_backend = stage_backend
+        self._attention_backend_active_override = target
+        logger.info(
+            "Attention backend for this batch: %s (%d layers switched)",
+            target.name.lower() if target else "server default",
+            len(layers),
+        )
+
+    def _parse_attention_backend_override(
+        self, name: str | None
+    ) -> AttentionBackendEnum | None:
+        if name is None:
+            return None
+        try:
+            target = AttentionBackendEnum[name.upper()]
+        except KeyError:
+            raise ValueError(
+                f"Unknown attention_backend_override {name!r}. Valid values: "
+                f"{sorted(b.name.lower() for b in REQUEST_SWITCHABLE_ATTENTION_BACKENDS)}."
+            ) from None
+        if target not in REQUEST_SWITCHABLE_ATTENTION_BACKENDS:
+            raise ValueError(
+                f"attention_backend_override {name!r} is not switchable per "
+                f"request. Valid values: "
+                f"{sorted(b.name.lower() for b in REQUEST_SWITCHABLE_ATTENTION_BACKENDS)}."
+            )
+        return target
+
+    def _request_switchable_attention_layers(self) -> list[nn.Module]:
+        return [
+            module
+            for transformer in filter(None, [self.transformer, self.transformer_2])
+            for module in transformer.modules()
+            if isinstance(module, (LocalAttention, UlyssesAttention, USPAttention))
+        ]
+
+    def _validate_attention_backend_override(
+        self, target: AttentionBackendEnum, layers: list[nn.Module]
+    ) -> type:
+        """Fail fast on server settings incompatible with a per-request switch.
+
+        Returns the resolved backend class for the stage-level metadata slot.
+        """
+        args = self.server_args
+        reasons: list[str] = []
+        if args.enable_breakable_cuda_graph:
+            reasons.append("breakable CUDA graphs bake the attention kernel in")
+        if args.enable_torch_compile:
+            reasons.append("torch.compile traces the attention kernel in")
+        if not layers:
+            reasons.append("this model exposes no switchable attention layers")
+        sparse_defaults = sorted(
+            {
+                layer._default_attn_backend.name.lower()
+                for layer in layers
+                if layer._default_attn_backend.is_sparse
+            }
+        )
+        if sparse_defaults:
+            reasons.append(
+                f"the server-selected sparse backend(s) {sparse_defaults} cannot "
+                "be mixed with per-request dense switching"
+            )
+        stage_backend = None
+        if not reasons:
+            try:
+                stage_backend = get_attn_backend(
+                    head_size=self._attn_metadata_head_size,
+                    dtype=torch.float16,
+                    selected_attention_backend=target,
+                )
+            except ValueError as exc:
+                reasons.append(str(exc))
+        if stage_backend is not None:
+            if (
+                args.ring_degree or 1
+            ) > 1 and not stage_backend.supports_ring_rotation():
+                reasons.append(
+                    f"ring parallelism requires a ring-capable backend; "
+                    f"{target.name.lower()} is not"
+                )
+        if reasons:
+            message = (
+                f"Rejecting attention_backend_override={target.name.lower()!r}: "
+                + "; ".join(reasons)
+                + "."
+            )
+            logger.warning(message)
+            raise ValueError(message)
+        return stage_backend
 
     def _maybe_toggle_quality_fusions(self, batch: Req) -> None:
         """Mount/unmount the ``quality="high"`` fusions for this batch.
