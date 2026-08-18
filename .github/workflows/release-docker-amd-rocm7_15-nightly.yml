@@ -29,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx1250-rocm7_15']
+        gpu_arch: ['gfx942-rocm7_15', 'gfx950-rocm7_15', 'gfx1250-rocm7_15']
         build_type: ['all']
     steps:
       - name: Checkout repository
@@ -81,12 +81,15 @@ jobs:
           echo "Version: ${version}"
           echo "Pretend version: ${pretend_version}"
 
-          if [ "${{ matrix.gpu_arch }}" = "gfx1250-rocm7_15" ]; then
-            rocm_tag="rocm7.15-mi45x"
-          else
-            echo "Unsupported gfx arch"
-            exit 1
-          fi
+          case "${{ matrix.gpu_arch }}" in
+            gfx942-rocm7_15)  rocm_tag="rocm7.15-mi30x" ;;
+            gfx950-rocm7_15)  rocm_tag="rocm7.15-mi35x" ;;
+            gfx1250-rocm7_15) rocm_tag="rocm7.15-mi45x" ;;
+            *)
+              echo "Unsupported gfx arch"
+              exit 1
+              ;;
+          esac
 
           tag=v${version}-${rocm_tag}
           echo "IMAGE_TAG=${tag}-${{ env.DATE }}" >> $GITHUB_ENV
@@ -94,7 +97,7 @@ jobs:
           # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
           # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
           # to Canonical's archive.ubuntu.com mirror IPs from the build runner.
-          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.sha }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg GPU_ARCH_LIST_ARG=gfx1250 --build-arg ENABLE_MORI=1 --build-arg SGLANG_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
+          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.sha }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
           # docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
 
       - name: Login to Docker Hub (lmsys)

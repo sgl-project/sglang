@@ -115,6 +115,21 @@ git_clone_with_retry() {
   return 1
 }
 
+# Detect ROCm version inside the CI container to select the correct
+# compressed-tensors extra (rocm_legacy=0.15.0 vs rocm_rock=0.16.0).
+# Same detection pattern used by the AITER and MORI blocks below.
+CI_ROCM_VERSION=$(docker exec ci_sglang bash -c 'cat $ROCM_HOME/.info/version 2>/dev/null || cat /opt/rocm/.info/version 2>/dev/null || echo unknown')
+echo "Detected ROCm version inside container: ${CI_ROCM_VERSION}"
+
+if [[ "${CI_ROCM_VERSION}" != "unknown" ]] && \
+   [[ "$(printf '%s\n' "7.15.0" "${CI_ROCM_VERSION}" | sort -V | head -n1)" == "7.15.0" ]]; then
+  CT_EXTRA="rocm_rock"
+else
+  CT_EXTRA="rocm_legacy"
+fi
+echo "Using compressed-tensors extra: ${CT_EXTRA}"
+EXTRAS="${EXTRAS},${CT_EXTRA}"
+
 # Install checkout sglang
 if [ -n "$SKIP_SGLANG_BUILD" ]; then
   echo "Didn't build checkout SGLang"
@@ -221,6 +236,19 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     cd /sgl-workspace/mori
     git checkout '${MORI_COMMIT}'
     git submodule update --init --recursive
+    # Same rocm_sysdeps handling as docker/rocm.Dockerfile's MORI step: the pip
+    # ROCm SDK vendors NUMA and libdrm there, off every default search path. Kept
+    # scoped to the MORI build instead of exported image-wide because
+    # rocm_sysdeps/include also carries zlib.h/expat.h/elf.h, which would shadow
+    # the system headers for every other component.
+    ROCM_SYSDEPS=\"\${ROCM_HOME:-/opt/rocm}/lib/rocm_sysdeps\"
+    if [ -d \"\${ROCM_SYSDEPS}\" ]; then
+      export CMAKE_PREFIX_PATH=\"\${ROCM_SYSDEPS}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}\"
+      export CPATH=\"\${ROCM_SYSDEPS}/include\${CPATH:+:\${CPATH}}\"
+      export LIBRARY_PATH=\"\${ROCM_SYSDEPS}/lib\${LIBRARY_PATH:+:\${LIBRARY_PATH}}\"
+      echo \"\${ROCM_SYSDEPS}/lib\" > /etc/ld.so.conf.d/rocm-sysdeps.conf
+      ldconfig
+    fi
     python3 setup.py develop
     python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))' > /etc/ld.so.conf.d/torch.conf
     ldconfig
@@ -250,10 +278,15 @@ echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 
 # ROCm 7.0 keeps the Triton its base image ships; later ROCm images run on the
 # Triton AITER pins, so a rebuilt AITER has to bring its own along.
+# ROCm 7.15 keeps its own as well: AITER's install_triton.sh resolves its index
+# from `dpkg -l rocm-core`, which does not exist for a pip-installed SDK, so it
+# would fall back to the ROCm 7.2 index and drop a 7.2-built Triton into a 7.15
+# image. Matches BUILD_TRITON=0 on the rocm7_15 stages of docker/rocm.Dockerfile.
 IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
 case "${IMAGE_HIP_VERSION}" in
-    7.0*) INSTALL_AITER_TRITON="false" ;;
-    7.*)  INSTALL_AITER_TRITON="true" ;;
+    7.0*)  INSTALL_AITER_TRITON="false" ;;
+    7.15*) INSTALL_AITER_TRITON="false" ;;
+    7.*)   INSTALL_AITER_TRITON="true" ;;
     *)
         echo "[CI-AITER-CHECK] ERROR: Unsupported or empty HIP version: '${IMAGE_HIP_VERSION}'"
         exit 1
