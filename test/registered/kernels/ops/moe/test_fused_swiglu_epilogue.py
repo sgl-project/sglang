@@ -8,6 +8,9 @@ innocuous-looking rewrite:
 2. The epilogue reproduces the `silu_and_mul` it replaces bit for bit (that
    kernel keeps silu at float until the multiply; rounding to bf16 first
    double-rounds and diverges on many inputs).
+3. With `gemm1_alpha` set the epilogue takes a second branch -- clamped
+   sigmoid-alpha instead of silu -- which must likewise reproduce the
+   standalone `swiglu_gpt_oss_sigmoid_alpha` it replaces.
 
 Hence bitwise assertions: a tolerance would accept exactly the errors these
 tests exist to catch.
@@ -201,6 +204,85 @@ def test_epilogue_matches_silu_and_mul_bitwise():
 
     mismatch = (got.view(torch.int16) != ref[0].view(torch.int16)).sum().item()
     assert mismatch == 0, f"{mismatch}/{inter} elements differ from silu_and_mul"
+
+
+# MAGI-2's swiglu7, the only production caller of the epilogue's alpha branch.
+_SWIGLU7_ALPHA = 1.702
+_SWIGLU7_LIMIT = 7.0
+
+
+@pytest.mark.parametrize(
+    "num_tokens,hidden,inter,num_experts,topk",
+    [
+        (1, 256, 128, 8, 2),
+        (13, 512, 256, 16, 4),
+    ],
+)
+def test_fused_swiglu_alpha_matches_unfused_bitwise(
+    num_tokens, hidden, inter, num_experts, topk
+):
+    """Both arms feed the SAME interleaved W13 here, because the standalone
+    reference `swiglu_gpt_oss_sigmoid_alpha` also reads `[..., ::2]` /
+    `[..., 1::2]`; only the flag differs.
+    """
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_experts
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    x = torch.randn(num_tokens, hidden, dtype=dtype, device="cuda")
+    # Wider than the tests above: the clamps are half of what this branch does,
+    # and at /16 the pre-activation never reaches +-7.
+    w13 = torch.randn(num_experts, 2 * inter, hidden, dtype=dtype, device="cuda") / 4
+    w2 = torch.randn(num_experts, hidden, inter, dtype=dtype, device="cuda") / 16
+
+    router_logits = torch.randn(num_tokens, num_experts, dtype=dtype, device="cuda")
+    topk_weights, topk_ids = torch.topk(router_logits.float(), topk, dim=-1)
+    topk_weights = torch.softmax(topk_weights, dim=-1)
+    topk_ids = topk_ids.to(torch.int32)
+
+    w13_interleaved = _interleave_w13_rows(w13)
+
+    def _run(fuse, limit):
+        topk_output = StandardTopKOutput(
+            topk_weights=topk_weights.clone(),
+            topk_ids=topk_ids.clone(),
+            router_logits=router_logits,
+        )
+        config = MoeRunnerConfig(
+            num_experts=num_experts,
+            top_k=topk,
+            hidden_size=hidden,
+            intermediate_size_per_partition=inter,
+            params_dtype=dtype,
+            activation="silu",
+            inplace=False,
+            gemm1_alpha=_SWIGLU7_ALPHA,
+            gemm1_clamp_limit=limit,
+        )
+        return fused_experts(
+            x.clone(),
+            w13_interleaved,
+            w2,
+            topk_output,
+            config,
+            fuse_swiglu_interleaved=fuse,
+        )
+
+    ref = _run(False, _SWIGLU7_LIMIT)
+    got = _run(True, _SWIGLU7_LIMIT)
+
+    # Guard the premise: at a limit this shape cannot reach, the clamps are
+    # no-ops, so an unchanged output would mean these cases never clamped and
+    # would pass even if the kernel dropped the clamps entirely.
+    unclamped = _run(True, 1.0e30)
+    assert not torch.equal(
+        got, unclamped
+    ), "clamp never engaged; raise the weight scale"
+
+    mismatch = (got.view(torch.int16) != ref.view(torch.int16)).sum().item()
+    assert mismatch == 0, f"{mismatch}/{ref.numel()} output elements differ"
 
 
 if __name__ == "__main__":

@@ -84,7 +84,7 @@ collective:
 Divisibility alone does not make a count usable, because expert parallelism is also
 what makes the weights fit. The 114B headline is the preview partition — 113.9B
 parameters, 228 GB in BF16 — and only its expert tensors shard; the 6.7B refiner is
-separate and is replicated on every rank. Measured on 143 GB H20Z cards, preview
+separate and is replicated on every rank. Measured on 143 GB H200 cards, preview
 tier, 20 steps:
 
 | GPUs | Result |
@@ -114,7 +114,7 @@ double-applied.
 
 Tensor parallelism is rejected too. No layer in either DiT is column- or
 row-parallel, so `--tp-size` shards nothing and only takes ranks away from
-Ulysses. Measured at 896x512, 20 steps on 4x H20Z. These are whole-stage times
+Ulysses. Measured at 896x512, 20 steps on 4x H200. These are whole-stage times
 including per-process warmup, so do not divide them into a per-step cost and
 compare against the 100-step figures in section 8:
 
@@ -334,7 +334,7 @@ audio-video sequence, both of which depend heavily on GPU model, interconnect,
 offload policy, and the selected quality tier. Benchmark your own topology before
 sizing a deployment; the figures below are one data point, not a target.
 
-Measured on four H20Z (143771 MiB each), two-stage 1080p tier, 100 preview steps
+Measured on four H200 (143771 MiB each), two-stage 1080p tier, 100 preview steps
 plus 5 refiner steps, one 10-second clip, `--ulysses-degree 4`. The compiled column
 adds `--enable-torch-compile --regional-compile` and is the configuration to deploy;
 both columns are steady state, so the first clip of a process costs more while its
