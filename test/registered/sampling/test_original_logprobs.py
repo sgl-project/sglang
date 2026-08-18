@@ -22,11 +22,12 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sglang as sgl
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=290.229, suite="base-c-test-cpu")
 
 # ------------------------- Configurable via env ------------------------- #
 MODEL_ID = DEFAULT_SMALL_MODEL_NAME_FOR_TEST

@@ -87,7 +87,24 @@ jobs:
         include:
           - runner: xeon-gnr
             suite: base-b-test-cpu
+            partition: b
             partition_args: ""
+          - runner: xeon-spr
+            suite: base-c-test-cpu
+            partition: c0
+            partition_args: "--auto-partition-id 0 --auto-partition-size 4"
+          - runner: xeon-spr
+            suite: base-c-test-cpu
+            partition: c1
+            partition_args: "--auto-partition-id 1 --auto-partition-size 4"
+          - runner: xeon-spr
+            suite: base-c-test-cpu
+            partition: c2
+            partition_args: "--auto-partition-id 2 --auto-partition-size 4"
+          - runner: xeon-spr
+            suite: base-c-test-cpu
+            partition: c3
+            partition_args: "--auto-partition-id 3 --auto-partition-size 4"
     steps:
       - name: Cleanup workspace
         run: |
@@ -118,26 +135,26 @@ jobs:
             -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
             -v $HOME/.cache/huggingface:/root/.cache/huggingface \
             -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
-            --name ci_sglang_${{ matrix.runner }} \
+            --name ci_sglang_${{ matrix.partition }} \
             sglang_xeon
 
       - name: Check AMX support
         id: check_amx
         timeout-minutes: 5
         run: |
-          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.runner }} \
+          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.partition }} \
             bash -c "source /opt/.venv/bin/activate && python3 -c 'import torch; import sgl_kernel; assert torch.cpu._is_amx_tile_supported(); assert hasattr(torch.ops.sgl_kernel, \"convert_weight_packed\"); '"
 
       - name: Run unit tests
         timeout-minutes: 120
         run: |
-          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.runner }} \
-            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite ${{ matrix.suite }} ${{ matrix.partition_args }}"
+          docker exec -w /sglang-checkout/ ci_sglang_${{ matrix.partition }} \
+            bash -c "source /opt/.venv/bin/activate && cd ./test && python3 run_suite.py --hw cpu --suite ${{ matrix.suite }} --timeout-from-est-time ${{ matrix.partition_args }}"
 
       - name: Change permission
         timeout-minutes: 2
         run: |
-          docker exec -u root ci_sglang_${{ matrix.runner }} bash -c "
+          docker exec -u root ci_sglang_${{ matrix.partition }} bash -c "
             rm -rf /tmp/ci-home  &&
             chown -R  $(id -u):$(id -g) /sglang-checkout/ 2>/dev/null || true
           "
@@ -145,4 +162,4 @@ jobs:
       - name: Cleanup container
         if: always()
         run: |
-          docker rm -f ci_sglang_${{ matrix.runner }} || true
+          docker rm -f ci_sglang_${{ matrix.partition }} || true
