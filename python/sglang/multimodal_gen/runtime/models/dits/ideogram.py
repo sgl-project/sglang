@@ -7,13 +7,27 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion.bitexact_gate import (
+    BitExactFusionGate,
+    tensors_equal,
+)
 from sglang.kernels.ops.diffusion.fused_gate_rmsnorm import (
     fused_gate_rmsnorm_active,
     fused_rmsnorm_scale,
     fused_rmsnorm_tanh_residual,
     mark_fused_gate_rmsnorm_site,
 )
+from sglang.kernels.ops.diffusion.modulate_scale_shift import modulate_scale_shift
+from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
+from sglang.kernels.ops.diffusion.triton.rope_rotate_half_bitexact import (
+    fused_rope_rotate_half_bitexact,
+)
+from sglang.kernels.ops.diffusion.triton.silu_mul_bitexact import (
+    can_use_fused_silu_mul,
+    fused_silu_mul_bitexact,
+)
 from sglang.multimodal_gen.configs.models.dits.ideogram import Ideogram4DiTConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_layer
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_tp_world_size,
@@ -46,9 +60,116 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 OUTPUT_IMAGE_INDICATOR = 2
 LLM_TOKEN_INDICATOR = 3
+
+_IDEOGRAM_ROPE = BitExactFusionGate("Ideogram fused RoPE")
+_IDEOGRAM_SWIGLU = BitExactFusionGate("Ideogram fused SiLU-mul")
+_IDEOGRAM_ZERO_SHIFTS: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
+
+
+def _can_use_fused_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> bool:
+    # cos/sin are full-span (B, S, 1, D) rows broadcast over heads.
+    expected = (q.shape[0], q.shape[1], 1, q.shape[-1])
+    return (
+        q.dtype is torch.bfloat16
+        and k.dtype is torch.bfloat16
+        and q.is_cuda
+        and q.dim() == 4
+        and q.is_contiguous()
+        and k.shape == q.shape
+        and k.is_contiguous()
+        and k.device == q.device
+        and cos.dtype is torch.bfloat16
+        and sin.dtype is torch.bfloat16
+        and cos.device == q.device
+        and sin.device == q.device
+        and cos.shape == expected
+        and sin.shape == expected
+        and cos.is_contiguous()
+        and sin.is_contiguous()
+        and q.shape[-1] % 2 == 0
+    )
+
+
+def _ideogram_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Single-kernel Qwen3-style RoPE per projection, bit-exact vs eager.
+
+    The eager chain is ~6 kernels per projection (four muls, two add/subs,
+    plus the sliced ``empty_like`` fills); the Triton kernel reproduces every
+    aten bf16 rounding boundary (``round(round(q1*cos1) + round(-q2*sin1))``
+    equals the eager ``round(round(q1*cos1) - round(q2*sin1))`` exactly), so
+    it mounts by default with first-call self-verification.
+    """
+    verified = _IDEOGRAM_ROPE.verified
+    if (
+        not _IDEOGRAM_ROPE.disabled
+        and _can_use_fused_rope(q, k, cos, sin)
+        and (verified or _IDEOGRAM_ROPE.can_attempt_once())
+    ):
+        try:
+            cos_rows = cos.reshape(-1, cos.shape[-1])
+            sin_rows = sin.reshape(-1, sin.shape[-1])
+            q_fused = fused_rope_rotate_half_bitexact(q, cos_rows, sin_rows)
+            k_fused = fused_rope_rotate_half_bitexact(k, cos_rows, sin_rows)
+        except Exception as exc:
+            _IDEOGRAM_ROPE.on_exception(exc, logger=logger)
+        else:
+            if verified:
+                return q_fused, k_fused
+            return _IDEOGRAM_ROPE.accept_or_fallback(
+                (q_fused, k_fused),
+                qwen3_apply_rotary_pos_emb(q, k, cos, sin),
+                equal=tensors_equal,
+                logger=logger,
+                mismatch_msg=(
+                    "Ideogram fused RoPE fast path is not bit-exact on this "
+                    "platform; falling back to eager"
+                ),
+            )
+    return qwen3_apply_rotary_pos_emb(q, k, cos, sin)
+
+
+def _ideogram_swiglu(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``silu(a) * b`` in one kernel, bit-exact vs the eager pair."""
+    verified = _IDEOGRAM_SWIGLU.verified
+    if (
+        not _IDEOGRAM_SWIGLU.disabled
+        and can_use_fused_silu_mul(a, b)
+        and (verified or _IDEOGRAM_SWIGLU.can_attempt_once())
+    ):
+        try:
+            out = fused_silu_mul_bitexact(a, b)
+        except Exception as exc:
+            _IDEOGRAM_SWIGLU.on_exception(exc, logger=logger)
+        else:
+            if verified:
+                return out
+            return _IDEOGRAM_SWIGLU.accept_or_fallback(
+                out,
+                F.silu(a) * b,
+                logger=logger,
+                mismatch_msg=(
+                    "Ideogram fused SiLU-mul fast path is not bit-exact on "
+                    "this platform; falling back to eager"
+                ),
+            )
+    return F.silu(a) * b
 
 
 class Ideogram4RMSNorm(nn.Module):
@@ -253,7 +374,7 @@ class Ideogram4Attention(nn.Module):
         q, k, v = qkv.unbind(dim=2)
         q = self.norm_q(q)
         k = self.norm_k(k)
-        q, k = qwen3_apply_rotary_pos_emb(q, k, cos, sin)
+        q, k = _ideogram_rope(q, k, cos, sin)
         out = self.attn(q, k, v, attn_mask=attn_mask, attn_mask_meta=attn_mask_meta)
         out = out.reshape(batch_size, seq_len, self.local_num_heads * self.head_dim)
         return self.o(out)
@@ -297,7 +418,7 @@ class Ideogram4MLP(nn.Module):
         )
 
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        return self.w2(_ideogram_swiglu(self.w1(x), self.w3(x)))
 
 
 def _norm_scale(
@@ -316,6 +437,20 @@ def _norm_scale(
         )
         if y is not None:
             return y
+    if (
+        not torch.compiler.is_compiling()
+        and x.is_cuda
+        and not torch.cuda.is_current_stream_capturing()
+        and x.dim() == 3
+        and scale.shape == (x.shape[0], 1, x.shape[-1])
+        and x.shape[0] == 1
+    ):
+        key = (x.device, x.dtype, x.shape[-1])
+        zero_shift = _IDEOGRAM_ZERO_SHIFTS.get(key)
+        if zero_shift is None:
+            zero_shift = torch.zeros(1, x.shape[-1], device=x.device, dtype=x.dtype)
+            _IDEOGRAM_ZERO_SHIFTS[key] = zero_shift
+        return modulate_scale_shift(norm(x), scale.squeeze(1), zero_shift)
     return norm(x) * (1.0 + scale)
 
 
@@ -337,7 +472,15 @@ def _gate_residual(
         )
         if y is not None:
             return y
-    return residual + torch.tanh(gate) * norm(x)
+    normed = norm(x)
+    tanh_gate = torch.tanh(gate)
+    if (
+        not torch.compiler.is_compiling()
+        and x.is_cuda
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        return residual_gate_add(residual, normed, tanh_gate)
+    return residual + tanh_gate * normed
 
 
 class Ideogram4TransformerBlock(nn.Module):
@@ -497,11 +640,12 @@ class Ideogram4FinalLayer(nn.Module):
 class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     _repeated_blocks = ["Ideogram4TransformerBlock"]
     layer_names = ["layers"]
-    _fsdp_shard_conditions = Ideogram4DiTConfig().arch_config._fsdp_shard_conditions
-    _compile_conditions = Ideogram4DiTConfig().arch_config._compile_conditions
-    _supported_attention_backends = (
-        Ideogram4DiTConfig().arch_config._supported_attention_backends
-    )
+    _fsdp_shard_conditions = [is_layer]
+    _compile_conditions = [is_layer]
+    _supported_attention_backends = {
+        AttentionBackendEnum.FA,
+        AttentionBackendEnum.TORCH_SDPA,
+    }
     param_names_mapping = Ideogram4DiTConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = {}
 
@@ -513,9 +657,8 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         **kwargs,
     ) -> None:
         super().__init__(config, hf_config, **kwargs)
-        cfg = config.arch_config
+        cfg = self.config
         use_weight_only_fp8_linears = config.use_weight_only_fp8_linears
-        self._supported_attention_backends = cfg._supported_attention_backends
         hidden_size = cfg.num_attention_heads * cfg.attention_head_dim
         self.hidden_size = hidden_size
         self.num_attention_heads = cfg.num_attention_heads
@@ -586,7 +729,7 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     def post_load_weights(self) -> None:
         if not self.rotary_emb.inv_freq.is_meta:
             return
-        cfg = self.config.arch_config
+        cfg = self.config
         inv_freq = 1.0 / (
             cfg.rope_theta
             ** (
