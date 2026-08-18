@@ -94,6 +94,7 @@ from sglang.srt.disaggregation.utils import (
     ReqToMetadataIdxAllocator,
     TransferBackend,
     get_dsa_seed_metadata_dim,
+    is_aborted,
     prepare_abort,
     unified_memory_disagg_move_gate,
 )
@@ -2725,11 +2726,25 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self._prefetch_kvcache(req)
-            self.disagg_prefill_bootstrap_queue.add(
-                req, self.model_config.num_key_value_heads
-            )
-            req.time_stats.set_prefill_bootstrap_queue_entry_time()
+            if is_aborted(req):
+                # Validation aborts (``Req.set_finish_with_abort``) leave the
+                # request with ``to_finish=FINISH_ABORT`` and a 1-token
+                # ``origin_input_ids``. They must never enter the bootstrap
+                # queue: prefill would run a 1-token prefill, sample a garbage
+                # handoff token and transfer it to the decode side, whose
+                # shadow request could commit it and decode nonsense instead
+                # of the abort. Finish locally and stream the error instead.
+                if req.finished_reason is None and req.to_finish is not None:
+                    req.finished_reason = req.to_finish
+                    req.to_finish = None
+                req.time_stats.set_completion_time()
+                self.output_streamer.stream_output([req], req.return_logprob)
+            else:
+                self._prefetch_kvcache(req)
+                self.disagg_prefill_bootstrap_queue.add(
+                    req, self.model_config.num_key_value_heads
+                )
+                req.time_stats.set_prefill_bootstrap_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:

@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.utils import (
     _is_fake_transfer,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
@@ -62,7 +63,6 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
     NextBatchPlan,
     ReqKvInfo,
     ScheduleBatch,
@@ -979,7 +979,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
-            if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+            # is_aborted also covers to_finish=FINISH_ABORT: a shadow that was
+            # aborted locally (e.g. the same validation failure that aborted
+            # the prefill copy, via set_finish_with_abort) must never prealloc
+            # or commit the handoff token of a 1-token garbage transfer.
+            if is_aborted(decode_req.req):
+                # Update finish state so the streamer sees the abort reason
+                # rather than a never-finished request.
+                decode_req.req.update_finish_state()
                 if not getattr(decode_req.req, "finished_output", False):
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
@@ -2080,8 +2087,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     continue
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
-                # Check if request was aborted due to corruption
-                if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                # Check if the request is aborted (locally via to_finish, or
+                # due to corruption in _commit_transfer_to_req). Never admit
+                # such a request into decode: committing the prefill handoff
+                # token of a 1-token garbage transfer and decoding until
+                # max_new_tokens would surface nonsense instead of the abort.
+                if is_aborted(decode_req.req):
+                    # Update finish state so the streamer sees the abort reason.
+                    decode_req.req.update_finish_state()
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
                         decode_req.req.return_logprob,
