@@ -90,7 +90,6 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
         gate_up_output_dtype=torch.bfloat16,
         lora_delta_dtype=torch.bfloat16,
         lora_activation_dtype=torch.bfloat16,
-        supported_output_dtypes=(torch.bfloat16, torch.float32),
     )
 
     # Study winner tiles (section 45): (128, 8)/pc128 for decode-scale rows,
@@ -516,7 +515,6 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
         gate_up_output_dtype=torch.bfloat16,
         lora_delta_dtype=torch.bfloat16,
         lora_activation_dtype=torch.bfloat16,
-        supported_output_dtypes=(torch.bfloat16, torch.float32),
     )
 
     # The segment alignment of the flat row buffer.  Pinned at 128: it keeps

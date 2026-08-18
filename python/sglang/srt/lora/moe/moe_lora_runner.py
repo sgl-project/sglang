@@ -456,10 +456,8 @@ class MoeLoraRunner:
         topk_ids = topk_output.topk_ids
 
         output_dtype = hidden_states.dtype if output_dtype is None else output_dtype
-        provider.validate_runtime_inputs(hidden_states, output_dtype=output_dtype)
         num_tokens = self._checked_token_count(hidden_states, batch)
         self.workspace.begin_forward(graph_mode=batch.use_cuda_graph)
-        launch_config.validate_for_plan(plan)
         routes = build_routes(
             plan,
             topk_ids=topk_ids,
@@ -537,27 +535,6 @@ class MoeLoraRunner:
                 f"but the runner received {num_tokens}. Gather/remap "
                 "assignments before MoE-DP execution."
             )
-        if batch.token_slots.dtype not in (torch.int32, torch.int64):
-            raise TypeError(
-                "MoE LoRA token_slots must be int32 or int64, got "
-                f"{batch.token_slots.dtype}"
-            )
-        if batch.token_slots.device != hidden_states.device:
-            raise ValueError(
-                "MoE LoRA token_slots and hidden states must share a device"
-            )
-        if batch.adapter_enabled is not None:
-            if (
-                batch.adapter_enabled.ndim != 1
-                or batch.adapter_enabled.shape[0] != batch.slot_capacity
-            ):
-                raise ValueError(
-                    "adapter_enabled must have one entry per resident LoRA slot"
-                )
-            if batch.adapter_enabled.device != hidden_states.device:
-                raise ValueError(
-                    "adapter_enabled and hidden states must share a device"
-                )
         return num_tokens
 
     def _route_for_a(self, spec: LoraASpec, routes: MoeLoraRoutes) -> RouteView:

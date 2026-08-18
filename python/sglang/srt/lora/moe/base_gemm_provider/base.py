@@ -44,15 +44,6 @@ class MoeBaseProviderContract(msgspec.Struct, frozen=True, kw_only=True):
     gate_up_output_dtype: torch.dtype
     lora_delta_dtype: torch.dtype
     lora_activation_dtype: torch.dtype
-    supported_output_dtypes: tuple[torch.dtype, ...]
-
-    def validate_output_dtype(self, dtype: torch.dtype) -> None:
-        if dtype not in self.supported_output_dtypes:
-            supported = ", ".join(str(item) for item in self.supported_output_dtypes)
-            raise ValueError(
-                f"{self.key} cannot write MoE LoRA output dtype {dtype}; "
-                f"supported dtypes: {supported}"
-            )
 
 
 class MappedLoraAInput(msgspec.Struct, frozen=True, kw_only=True):
@@ -327,17 +318,3 @@ class MoeBaseProvider:
 
     def down_out_shape(self, ws) -> tuple[int, ...]:
         raise NotImplementedError
-
-    def validate_runtime_inputs(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        output_dtype: torch.dtype,
-    ) -> None:
-        """Validate the semantic boundary shared by every shipped provider."""
-        if hidden_states.dtype != torch.bfloat16:
-            raise TypeError(
-                f"{self.contract.key} requires BF16 MoE/LoRA activations, got "
-                f"{hidden_states.dtype}"
-            )
-        self.contract.validate_output_dtype(output_dtype)

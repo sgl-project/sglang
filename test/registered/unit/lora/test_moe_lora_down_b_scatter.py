@@ -273,7 +273,6 @@ class TestProviderScatterSurface:
             gate_up_output_dtype=torch.bfloat16,
             lora_delta_dtype=torch.bfloat16,
             lora_activation_dtype=torch.bfloat16,
-            supported_output_dtypes=(torch.bfloat16,),
         )
         assert provider.supports_down_b_scatter() is False
         with pytest.raises(NotImplementedError, match="scatter"):
