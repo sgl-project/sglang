@@ -1,21 +1,15 @@
 from __future__ import annotations
 
 import os
-from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.attention.deepseek_v4_rope import (
-    apply_rotary_emb_triton,
     fused_norm_rope_inplace_triton,
     fused_softmax_pool_triton,
 )
-from sglang.kernels.ops.attention.dsv4.fused_compress_triton import (
-    fused_ape_pool_norm_rope,
-)
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
 from sglang.srt.layers.attention.dsv4.compressor import Compressor as _CompressorBase
 from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
@@ -58,22 +52,6 @@ class CompressorHip(_CompressorBase):
         super().__init__(*args, **kwargs)
         self.norm = DeepseekRefRMSNorm(self.head_dim, eps=self.norm.variance_epsilon)
         self._freqs_cis_real: torch.Tensor | None = None
-
-    @cached_property
-    def use_fused_compress(self) -> bool:
-        return envs.SGLANG_OPT_USE_FUSED_COMPRESS.get()
-
-    @cached_property
-    def use_hip_fused_compress(self) -> bool:
-        return envs.SGLANG_OPT_USE_FUSED_COMPRESS.get()
-
-    @cached_property
-    def use_fused_compress_triton(self) -> bool:
-        # The fused Triton kernel only benefits non-overlap (HCA, ratio=128)
-        # but HCA's K=128 loop is too sequential to outperform batched ops.
-        # CSA (overlap=True) has a reshape/overlap-transform semantic mismatch.
-        # Disabled until a tiled kernel for CSA overlap is implemented.
-        return False
 
     def _get_states(
         self,
@@ -237,16 +215,10 @@ class CompressorHip(_CompressorBase):
             beg_idx = prefix_lens[i] // self.ratio * self.ratio
             end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio
 
-            if self.use_hip_fused_compress:
-                kv_compressed = fused_softmax_pool_triton(
-                    kv_and_score_to_compress.kv_score,
-                    kv_and_score_to_compress._item_size,
-                )
-            else:
-                kv_compressed = (
-                    kv_and_score_to_compress.kv
-                    * kv_and_score_to_compress.score.softmax(dim=1)
-                ).sum(dim=1)
+            kv_compressed = fused_softmax_pool_triton(
+                kv_and_score_to_compress.kv_score,
+                kv_and_score_to_compress._item_size,
+            )
 
             assert kv_compressed.dtype == torch.float32
 
@@ -254,15 +226,9 @@ class CompressorHip(_CompressorBase):
             assert freqs_cis.size(0) == kv_compressed.size(
                 0
             ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            if self.use_hip_fused_compress:
-                fused_norm_rope_inplace_triton(
-                    kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
-                )
-            else:
-                kv_compressed = self.norm(kv_compressed)
-                apply_rotary_emb_triton(
-                    kv_compressed[..., -self.rope_head_dim :], freqs_cis
-                )
+            fused_norm_rope_inplace_triton(
+                kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+            )
             del beg_idx, end_idx
 
             if self.rotate:
@@ -343,34 +309,6 @@ class CompressorHip(_CompressorBase):
         ).view(-1, self.ratio, self.coff * self.head_dim)
         bs = seq_lens.size(0)
 
-        if self.use_fused_compress_triton and not self.overlap:
-            # Fused path for non-overlap (HCA, ratio=128, coff=1):
-            # APE + softmax-pool + norm + RoPE in one kernel.
-            # Overlap (CSA) is excluded because the overlap_transform_decode
-            # rearranges A/B halves across the coff dimension in a way
-            # that simple reshape cannot replicate correctly.
-            raw = kv_and_score_to_compress.kv_score
-            gathered = raw.reshape(bs, self.ratio, raw.shape[-1]).contiguous()
-
-            comp_positions = (seq_lens - 1) // self.ratio * self.ratio
-            freqs_real_table = self._get_freqs_cis_real()
-            freqs_batch = freqs_real_table[comp_positions]
-
-            kv_compressed = fused_ape_pool_norm_rope(
-                kv_score_gathered=gathered,
-                ape=self.ape,
-                rms_weight=self.norm.weight,
-                rms_eps=self.norm.eps,
-                freqs_cis_real=freqs_batch,
-                head_dim=self.head_dim,
-                rope_head_dim=self.rope_head_dim,
-                ratio=self.ratio,
-                overlap=self.overlap,
-            )
-            if self.rotate:
-                kv_compressed = rotate_activation(kv_compressed)
-            return kv_compressed
-
         # Unfused reference path
         kv_and_score_to_compress.score.add_(self.ape.unsqueeze(0))
 
@@ -387,27 +325,14 @@ class CompressorHip(_CompressorBase):
             bs, self.ratio * self.coff, self.head_dim
         )
 
-        if self.use_hip_fused_compress:
-            kv_compressed = fused_softmax_pool_triton(
-                kv_and_score_to_compress.kv_score,
-                kv_and_score_to_compress._item_size,
-            )
-        else:
-            kv_compressed = (
-                kv_and_score_to_compress.kv
-                * kv_and_score_to_compress.score.softmax(dim=1)
-            ).sum(dim=1)
-        if self.use_hip_fused_compress:
-            freqs_cis = self._init_freqs_cis_per_decode_step(forward_batch, seq_lens)
-            fused_norm_rope_inplace_triton(
-                kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
-            )
-        else:
-            kv_compressed = self.norm(kv_compressed)
-            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
-            apply_rotary_emb_triton(
-                kv_compressed[..., -self.rope_head_dim :], freqs_cis
-            )
+        kv_compressed = fused_softmax_pool_triton(
+            kv_and_score_to_compress.kv_score,
+            kv_and_score_to_compress._item_size,
+        )
+        freqs_cis = self._init_freqs_cis_per_decode_step(forward_batch, seq_lens)
+        fused_norm_rope_inplace_triton(
+            kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+        )
         if self.rotate:
             kv_compressed = rotate_activation(kv_compressed)
 
@@ -455,12 +380,9 @@ class CompressorHip(_CompressorBase):
         forward_batch: ForwardBatch,
         attn_backend: AttentionBackend,
     ) -> torch.Tensor:
-        if self.use_fused_compress and (
-            envs.SGLANG_OPT_DPSK_V4_RADIX.get()
-            and (
-                forward_batch.forward_mode.is_decode()
-                or forward_batch.forward_mode.is_extend_without_speculative()
-            )
+        if (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_extend_without_speculative()
         ):
             return self.compress_fused(
                 kv_score, forward_batch, attn_backend=attn_backend
