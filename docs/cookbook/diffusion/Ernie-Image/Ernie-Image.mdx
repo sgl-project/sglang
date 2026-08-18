@@ -77,5 +77,5 @@ with open("ernie_image.png", "wb") as f:
 
 - ERNIE-Image is a text-to-image pipeline; do not pass `--image-path`.
 - `--performance-mode auto` keeps conservative defaults while preserving explicit user flags.
-- If the checkpoint includes a PE component, SGLang loads it automatically from `model_index.json`.
+- If the checkpoint includes a PE component, SGLang loads it automatically with the native Ministral3 runtime. Use `--layerwise-offload-components pe` when the local PE decoder needs to trade latency for lower GPU memory usage.
 - Treat FSDP, SP/Ulysses/Ring, and TP as explicit benchmark knobs. Measure the target resolution, step count, and GPU type before making them production defaults.

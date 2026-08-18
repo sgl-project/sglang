@@ -77,6 +77,22 @@ def _model_hub_name() -> str:
     return "ModelScope" if envs.SGLANG_USE_MODELSCOPE.get() else "Hugging Face Hub"
 
 
+def _is_revisionless_snapshot_root(local_path: str) -> bool:
+    """Detect a resolved "snapshot" that is really the ``snapshots/`` parent.
+
+    An empty ``refs/<revision>`` makes the offline resolver join ``""`` onto
+    ``snapshots/`` and return the parent, which holds only revision subdirectories.
+    The ``models--*`` folder above is required too, since a ``local_dir`` may
+    legitimately be named ``snapshots``.
+    """
+    head, tail = os.path.split(os.path.normpath(local_path))
+    return tail == "snapshots" and os.path.basename(head).split("--")[0] in (
+        "models",
+        "datasets",
+        "spaces",
+    )
+
+
 def _snapshot_has_files(
     local_path: str,
     allow_patterns: Optional[Union[list[str], str]],
@@ -167,6 +183,24 @@ def _get_missing_declared_weight_components(model_path: str) -> list[str]:
         elif not _has_local_weight_files(component_path):
             missing_files.append(f"{component_dir}/<weights>")
     return missing_files
+
+
+def _is_metadata_only_pipeline_snapshot(model_path: str) -> bool:
+    """Detect a snapshot holding only pipeline metadata, with no component weights.
+
+    ``maybe_download_model_index`` probes a repo by fetching just ``model_index.json``;
+    that single-file fetch materializes a full cache entry, so a later
+    ``local_files_only`` snapshot resolves it as a hit — offline there is no remote file
+    list to tell "cached" from "fully cached", so completeness must be read off disk.
+
+    Requires *all* declared components missing, not any: a partially populated snapshot
+    is legitimate (``allow_patterns``-filtered fetch), so only total absence is
+    unambiguously the probe stub. No declarations means no evidence to act on.
+    """
+    declared = _get_declared_weight_component_dirs(model_path)
+    if not declared:
+        return False
+    return len(_get_missing_declared_weight_components(model_path)) == len(declared)
 
 
 def _check_index_files_for_missing_shards(
@@ -594,7 +628,14 @@ def maybe_download_lora(
     Returns:
         Local path to the model
     """
-    allow_patterns = ["*.json", "*.safetensors", "*.bin"]
+    # Repositories often publish several adapter revisions side by side.  If a
+    # filename is pinned, do not download every weight before selecting it.
+    # Keep JSON metadata so PEFT's lora_alpha remains available.
+    allow_patterns = (
+        ["*.json", weight_name, f"**/{weight_name}"]
+        if weight_name is not None
+        else ["*.json", "*.safetensors", "*.bin"]
+    )
 
     local_path = maybe_download_model(
         model_name_or_path,
@@ -888,9 +929,31 @@ def maybe_download_model(
             local_files_only=True,
             max_workers=8,
         )
+        if _is_revisionless_snapshot_root(local_path):
+            # A cache miss, so the download below re-resolves and rewrites the ref.
+            raise LocalEntryNotFoundError(
+                f"Cached ref for {model_name_or_path} is corrupt: resolved to the "
+                f"snapshots parent {local_path!r} instead of a revision directory."
+            )
         if not force_diffusers_model:
-            return str(local_path)
-        if is_lora or _verify_diffusers_model_complete(local_path):
+            # maybe_download_model_index's model_index.json fetch materializes a full
+            # cache entry, so this resolve reports that stub as a hit; returning it
+            # would skip the download. LoRA repos declare no components.
+            if not is_lora and _is_metadata_only_pipeline_snapshot(local_path):
+                if not download:
+                    raise ValueError(
+                        f"Model {model_name_or_path} found in cache but only contains "
+                        "pipeline metadata (no component weights) and download=False."
+                    )
+                logger.info(
+                    "Cached snapshot for %s only contains pipeline metadata, "
+                    "will download component weights from %s",
+                    model_name_or_path,
+                    _model_hub_name(),
+                )
+            else:
+                return str(local_path)
+        elif is_lora or _verify_diffusers_model_complete(local_path):
             if not is_lora:
                 is_valid, cleanup_performed = _ci_validate_diffusers_model(local_path)
                 if not is_valid:

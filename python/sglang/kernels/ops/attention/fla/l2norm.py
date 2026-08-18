@@ -9,7 +9,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.triton.fla_math import l2norm_row_values
+from sglang.kernels.ops.attention.fla.fla_math import l2norm_row_values
 from sglang.kernels.ops.attention.fla.utils import input_guard
 
 BT_LIST = [8, 16, 32, 64, 128]

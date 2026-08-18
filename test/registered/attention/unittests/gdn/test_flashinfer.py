@@ -1,18 +1,11 @@
-import sys
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
     GDNAttentionCase,
@@ -31,6 +24,7 @@ from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_
 from sglang.test.kits.attention_unittest.runner_modes.split_op_runner import (
     run_gdn_split_op_extend_case,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
@@ -61,6 +55,7 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
         page_size=16,
         prefix_lens=(0, 8),
         extend_lens=(17, 9),
+        linear_attn_prefill_backend="flashinfer",
     )
     CUDA_GRAPH_CASES = (
         GDNAttentionCase(
@@ -245,19 +240,14 @@ class TestFlashInferGDNBackendCorrectness(CustomTestCase):
 
     def test_fused_prefill_attention_block(self):
         """Exercise the fused prefill through the real attention/backend route."""
-        from sglang.jit_kernel.triton.gdn_prefill_fused import gdn_prefill_fused
+        from sglang.kernels.ops.attention.fla.gdn_prefill_fused import (
+            gdn_prefill_fused,
+        )
 
-        with (
-            patch(
-                "sglang.srt.layers.attention.linear.gdn_backend."
-                "get_linear_attn_prefill_backend",
-                return_value=LinearAttnKernelBackend.FLASHINFER,
-            ),
-            patch(
-                "sglang.jit_kernel.triton.gdn_prefill_fused.gdn_prefill_fused",
-                wraps=gdn_prefill_fused,
-            ) as fused_prefill,
-        ):
+        with patch(
+            "sglang.kernels.ops.attention.fla.gdn_prefill_fused.gdn_prefill_fused",
+            wraps=gdn_prefill_fused,
+        ) as fused_prefill:
             run_gdn_attention_case(
                 self,
                 self.FUSED_PREFILL_CASE,

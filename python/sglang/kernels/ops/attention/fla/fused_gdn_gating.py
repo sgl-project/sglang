@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.triton.fla_math import gdn_gating_values
+from sglang.kernels.ops.attention.fla.fla_math import gdn_gating_values
 
 
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)

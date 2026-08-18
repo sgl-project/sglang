@@ -487,7 +487,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         **kwargs,
     ) -> tuple:
         """Run the fused FlashInfer prefill path."""
-        from sglang.jit_kernel.triton.gdn_prefill_fused import gdn_prefill_fused
+        from sglang.kernels.ops.attention.fla.gdn_prefill_fused import (
+            gdn_prefill_fused,
+        )
 
         q_fi, k_fi, v_fi, alpha_fi, beta_fi = gdn_prefill_fused(
             mixed_qkv,
