@@ -270,7 +270,6 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             raise ValueError(
                 "MiniMaxH3TextEncodingStage direct encode requires a tokenizer component"
             )
-        self._manage_text_encoder_use(0)
         with set_forward_context(current_timestep=0, attn_metadata=None):
             if plan.task == "ref2va":
                 embeddings = self._encode_ref2va(batch, plan, encode_ids)

@@ -61,6 +61,7 @@ from sglang.srt.entrypoints.openai.utils import (
     should_include_usage,
     to_openai_style_logprobs,
 )
+from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -816,6 +817,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        if request.return_sampling_mask and not request.return_meta_info:
+            return "return_sampling_mask requires return_meta_info=true."
+
         media_error = self._validate_media_content(request)
         if media_error:
             return media_error
@@ -1004,6 +1008,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
+            return_sampling_mask=request.return_sampling_mask,
             stream=request.stream,
             return_text_in_logprobs=True,
             modalities=processed_messages.modalities,
@@ -1033,6 +1038,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return_prompt_token_ids=request.return_prompt_token_ids
             or request.return_token_ids,
         )
+        if (
+            raw_request is not None
+            and envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get()
+        ):
+            apply_header_overrides(adapted_request, raw_request.headers)
 
         return adapted_request, request
 

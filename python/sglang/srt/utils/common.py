@@ -25,6 +25,7 @@ import gc
 import importlib
 import inspect
 import io
+import ipaddress
 import itertools
 import json
 import logging
@@ -75,7 +76,7 @@ from typing import (
 )
 from unittest import SkipTest
 from unittest.case import _ShouldStop
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import numpy as np
 import orjson
@@ -97,7 +98,11 @@ from typing_extensions import Literal
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    configured_tp_size,
+    get_exec,
+    get_parallel,
+)
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
@@ -316,14 +321,15 @@ def is_sm121() -> bool:
     return is_cuda() and torch.cuda.get_device_capability() == (12, 1)
 
 
-try:
-    import sgl_kernel  # noqa: F401
+@lru_cache(maxsize=1)
+def _is_intel_amx_backend_available():
+    try:
+        import sgl_kernel  # noqa: F401
 
-    is_intel_amx_backend_available = hasattr(
-        torch.ops.sgl_kernel, "convert_weight_packed"
-    )
-except:
-    is_intel_amx_backend_available = False
+        return hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+    except Exception:
+        return False
+
 
 try:
     # move torch.cpu._is_amx_tile_supported() from cpu_has_amx_support
@@ -334,7 +340,7 @@ except:
 
 
 def cpu_has_amx_support():
-    return is_amx_tile_supported and is_intel_amx_backend_available
+    return is_amx_tile_supported and _is_intel_amx_backend_available()
 
 
 def use_intel_amx_backend(layer):
@@ -996,7 +1002,7 @@ def get_compiler_backend(mode=None) -> str:
     if hasattr(torch, "npu") and torch.npu.is_available():
         try:
             import torchair
-            import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce
+            import torchair.ge_concrete_graph.ge_converter.experimental.patch_for_hcom_allreduce  # noqa: F401
             from torchair.configs.compiler_config import CompilerConfig
         except ImportError:
             raise ImportError(
@@ -1509,6 +1515,158 @@ def set_random_seed(seed: int) -> None:
 
 _mm_http_session = threading.local()
 
+_DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB = 64
+_MAX_MEDIA_URL_REDIRECTS = 5
+_MEDIA_URL_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+_allowed_media_domains: frozenset[str] = frozenset()
+_media_url_max_file_size_bytes = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB * 1024 * 1024
+
+
+def _normalize_media_domain(domain: str) -> str:
+    if not isinstance(domain, str):
+        raise ValueError("allowed media domains must be strings")
+
+    domain = domain.strip().rstrip(".")
+    if not domain:
+        raise ValueError("allowed media domains cannot be empty")
+    if "://" in domain or any(char in domain for char in "/?#@"):
+        raise ValueError(
+            f"Invalid allowed media domain {domain!r}: provide a hostname only"
+        )
+
+    # Brackets are URL syntax, not part of an IPv6 hostname.
+    if domain.startswith("[") and domain.endswith("]"):
+        domain = domain[1:-1]
+    try:
+        return str(ipaddress.ip_address(domain))
+    except ValueError:
+        if ":" in domain:
+            raise ValueError(
+                f"Invalid allowed media domain {domain!r}: ports are not supported"
+            )
+
+    try:
+        normalized = domain.encode("idna").decode("ascii").lower()
+    except UnicodeError as e:
+        raise ValueError(f"Invalid allowed media domain {domain!r}") from e
+    if not normalized:
+        raise ValueError("allowed media domains cannot be empty")
+    return normalized
+
+
+def configure_media_url_security(
+    allowed_media_domains: Optional[Sequence[str]] = None,
+    max_file_size_mb: int = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB,
+) -> list[str]:
+    """Configure process-wide safeguards for client-supplied media URLs.
+
+    A serving worker hosts one engine configuration, while media loading fans
+    out to worker threads. Keeping the immutable policy here makes the same
+    checks apply to image, video, audio, cache, and model-specific loaders.
+    """
+
+    if max_file_size_mb < 0:
+        raise ValueError("media_url_max_file_size_mb must be non-negative")
+
+    normalized_domains = sorted(
+        {_normalize_media_domain(domain) for domain in allowed_media_domains or []}
+    )
+    global _allowed_media_domains, _media_url_max_file_size_bytes
+    _allowed_media_domains = frozenset(normalized_domains)
+    _media_url_max_file_size_bytes = max_file_size_mb * 1024 * 1024
+    return normalized_domains
+
+
+def _assert_media_url_allowed(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+        raise ValueError(f"Invalid media URL: {url!r}")
+
+    hostname = _normalize_media_domain(parsed.hostname)
+    if _allowed_media_domains and hostname not in _allowed_media_domains:
+        raise ValueError(
+            "Media URL domain is not allowed. "
+            f"Allowed domains: {sorted(_allowed_media_domains)}; "
+            f"input domain: {hostname}"
+        )
+
+
+def download_remote_media(url: str, timeout: float) -> bytes:
+    """Download one HTTP(S) media object under the configured URL policy.
+
+    Redirects are followed manually so every destination is validated before
+    a connection is made. The response is streamed to enforce both the total
+    request deadline and the configured byte limit without first buffering an
+    attacker-controlled body in memory.
+    """
+
+    if timeout <= 0:
+        raise ValueError("media URL timeout must be positive")
+
+    session = get_mm_http_session()
+    deadline = time.monotonic() + timeout
+    current_url = url
+
+    for redirect_count in range(_MAX_MEDIA_URL_REDIRECTS + 1):
+        # Validate the same normalized URL representation that requests sends
+        # to urllib3. This avoids parser disagreements around backslashes and
+        # userinfo separators.
+        prepared_url = requests.Request("GET", current_url).prepare().url
+        if prepared_url is None:
+            raise ValueError(f"Invalid media URL: {current_url!r}")
+        _assert_media_url_allowed(prepared_url)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise requests.exceptions.Timeout(
+                f"Timed out while downloading media URL: {url}"
+            )
+
+        with session.get(
+            prepared_url,
+            allow_redirects=False,
+            stream=True,
+            timeout=remaining,
+        ) as response:
+            location = response.headers.get("Location")
+            if response.status_code in _MEDIA_URL_REDIRECT_STATUS_CODES and location:
+                if redirect_count == _MAX_MEDIA_URL_REDIRECTS:
+                    raise requests.exceptions.TooManyRedirects(
+                        f"Media URL exceeded {_MAX_MEDIA_URL_REDIRECTS} redirects: {url}"
+                    )
+                current_url = urljoin(response.url, location)
+                continue
+
+            response.raise_for_status()
+            max_bytes = _media_url_max_file_size_bytes
+            content_length = response.headers.get("Content-Length")
+            if max_bytes and content_length is not None:
+                try:
+                    declared_size = int(content_length)
+                except ValueError:
+                    declared_size = None
+                if declared_size is not None and declared_size > max_bytes:
+                    raise ValueError(
+                        f"Remote media exceeds the {max_bytes} byte download limit"
+                    )
+
+            content = bytearray()
+            for chunk in response.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                if time.monotonic() > deadline:
+                    raise requests.exceptions.Timeout(
+                        f"Timed out while downloading media URL: {url}"
+                    )
+                if max_bytes and len(content) + len(chunk) > max_bytes:
+                    raise ValueError(
+                        f"Remote media exceeds the {max_bytes} byte download limit"
+                    )
+                content.extend(chunk)
+            return bytes(content)
+
+    raise AssertionError("unreachable")
+
 
 def get_mm_http_session() -> requests.Session:
     """Per-thread HTTP session for multimodal downloads, to pool/reuse TCP
@@ -1533,7 +1691,7 @@ CLIENT_MEDIA_EXCEPTIONS = (
 
 
 def load_audio(
-    audio_file: str, sr: Optional[int] = None, mono: bool = True
+    audio_file: Union[str, bytes], sr: Optional[int] = None, mono: bool = True
 ) -> np.ndarray:
     if sr is None:
         sr = 16000
@@ -1547,9 +1705,7 @@ def load_audio(
         audio_file.startswith("http://") or audio_file.startswith("https://")
     ):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        with get_mm_http_session().get(audio_file, timeout=timeout) as response:
-            response.raise_for_status()
-            source = response.content
+        source = download_remote_media(audio_file, timeout=timeout)
     elif isinstance(audio_file, str) and audio_file.startswith("file://"):
         source = unquote(urlparse(audio_file).path)
     elif isinstance(audio_file, str):
@@ -1752,13 +1908,7 @@ def get_image_bytes(image_file: Union[str, bytes]) -> bytes:
         return image_file
     if image_file.startswith(("http://", "https://")):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = get_mm_http_session().get(image_file, timeout=timeout)
-        try:
-            response.raise_for_status()
-            result = response.content
-        finally:
-            response.close()
-        return result
+        return download_remote_media(image_file, timeout=timeout)
     if image_file.startswith(("file://", "/")):
         with open(image_file, "rb") as f:
             return f.read()
@@ -1784,11 +1934,7 @@ def _normalize_video_input(
     elif isinstance(video_file, str):
         if video_file.startswith(("http://", "https://")):
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-            with get_mm_http_session().get(
-                video_file, stream=True, timeout=timeout
-            ) as response:
-                response.raise_for_status()
-                return response.content
+            return download_remote_media(video_file, timeout=timeout)
         elif video_file.startswith("data:"):
             _, encoded = video_file.split(",", 1)
             return pybase64.b64decode(encoded, validate=True)
@@ -3303,9 +3449,10 @@ def has_hf_quant_config(model_path: str) -> bool:
     Returns:
         True if hf_quant_config.json exists, False otherwise.
     """
-    # Check if the model_path is a local path
-    if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
-        return True
+    # Local paths are decided on the filesystem; the hub helpers below
+    # reject them as invalid repo ids.
+    if os.path.isdir(model_path):
+        return os.path.isfile(os.path.join(model_path, "hf_quant_config.json"))
 
     from huggingface_hub import try_to_load_from_cache
 
@@ -3435,10 +3582,12 @@ def bind_or_assign(target, source):
 
 # TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
 # TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
-def is_no_spec_infer_or_topk_one(server_args):
-    return server_args.speculative_eagle_topk is None or (
-        server_args.speculative_eagle_topk == 1
-        and (server_args.page_size == 1 or server_args.page_size is None)
+def is_no_spec_infer_or_topk_one(cfg):
+    """``cfg`` is a resolving config view, not the published record: the
+    resolution pipeline is the only caller, and it asks mid-resolution."""
+    return cfg.speculative_eagle_topk is None or (
+        cfg.speculative_eagle_topk == 1
+        and (cfg.page_size == 1 or cfg.page_size is None)
     )
 
 
@@ -3609,7 +3758,7 @@ def require_mlp_tp_gather(server_args: ServerArgs):
         else:
             return (
                 get_parallel().moe_dense_tp_size
-                > server_args.tp_size // get_parallel().dp_size
+                > configured_tp_size() // get_parallel().dp_size
             )
     else:
         return False
@@ -3635,7 +3784,7 @@ def require_attn_tp_gather(server_args: ServerArgs):
         or get_parallel().moe_dense_tp_size is not None
     ):
         if get_parallel().enable_dp_attention:
-            return get_parallel().dp_size < server_args.tp_size
+            return get_parallel().dp_size < configured_tp_size()
         else:
             return True
     else:
@@ -3654,7 +3803,7 @@ def require_mlp_sync(server_args: ServerArgs):
 
 def get_cuda_graph_batch_size_alignment(server_args: ServerArgs) -> int:
     alignment = 1
-    if server_args.enable_two_batch_overlap:
+    if get_exec().overlap.enable_two_batch_overlap:
         alignment *= 2
     if require_gathered_buffer(server_args):
         alignment *= get_parallel().attn_tp_size
@@ -3901,14 +4050,20 @@ def ceil_align(x: int, y: int) -> int:
     return ceil_div(x, y) * y
 
 
-def spec_decode_alloc_len_per_request(server_args) -> int:
+def spec_decode_alloc_len_per_request(
+    *,
+    page_size,
+    speculative_num_steps,
+    speculative_eagle_topk,
+    speculative_num_draft_tokens,
+) -> int:
     """Per-request KV tokens a (spec-v1) decode step allocates: the draft-decode
-    topk*num_steps peak vs. the verify num_draft_tokens, page-aligned.
+    topk*num_steps peak vs. the verify num_draft_tokens, page-aligned. A pure
+    function of the resolved values its one caller reads off the bags.
     """
-    page_size = server_args.page_size
-    len_per_topk = server_args.speculative_num_steps or 1
-    spec_topk = server_args.speculative_eagle_topk or 1
-    spec_tokens = server_args.speculative_num_draft_tokens or 1
+    len_per_topk = speculative_num_steps or 1
+    spec_topk = speculative_eagle_topk or 1
+    spec_tokens = speculative_num_draft_tokens or 1
 
     if page_size > 1 and spec_topk > 1:
         # last partial page and ceil alignment
