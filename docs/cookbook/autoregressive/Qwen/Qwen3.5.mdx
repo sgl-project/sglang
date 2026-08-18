@@ -998,7 +998,6 @@ Container image (pinned for reproducibility):
 
 Server Launch Command:
 ```bash Command
-export HICACHE_SIZE_GB=77  # per-rank, per-host-pool GB
 SGLANG_ENABLE_SPEC_V2=1 \
 python3 -m sglang.launch_server \
   --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
@@ -1023,7 +1022,7 @@ python3 -m sglang.launch_server \
   --speculative-num-draft-tokens 4 \
   --page-size 64 \
   --enable-hierarchical-cache \
-  --hicache-size "$HICACHE_SIZE_GB" \
+  --hicache-size 77 \
   --hicache-io-backend kernel \
   --hicache-mem-layout page_first \
   --hicache-write-policy write_through_selective
