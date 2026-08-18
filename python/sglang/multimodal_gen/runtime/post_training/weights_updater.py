@@ -58,6 +58,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.pipelines.diffusers_pipeline import DiffusersPipeline
+from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import (
+    LoRAPipeline,
+    stack_or_compose_fused_lora,
+)
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.weight_sync.tensor_bucket import (
@@ -67,6 +71,54 @@ from sglang.srt.weight_sync.tensor_bucket import (
 
 logger = init_logger(__name__)
 _DEFAULT_TENSOR_TARGET_MODULE = "transformer"
+LORA_MERGE_WEIGHT_UPDATE_MODE = "lora_merge"
+_LORA_IPC_TARGET_MODULES = frozenset({"transformer", "transformer_2"})
+
+
+def _get_lora_layer_dict(
+    lora_pipeline: LoRAPipeline, target_module: str
+) -> dict[str, object]:
+    if target_module == "transformer":
+        return lora_pipeline.lora_layers
+    if target_module == "transformer_2":
+        if not lora_pipeline.lora_layers_transformer_2:
+            raise ValueError(
+                "transformer_2 is not present or has no LoRA layers in this pipeline"
+            )
+        return lora_pipeline.lora_layers_transformer_2
+    raise ValueError(
+        f"Unsupported LoRA IPC target_module={target_module!r}; "
+        f"expected one of {sorted(_LORA_IPC_TARGET_MODULES)}"
+    )
+
+
+def _group_lora_ab_tensors(
+    named_tensors: list[tuple[str, torch.Tensor]],
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Group flattened IPC tensors into {layer_name: (lora_A, lora_B)} pairs."""
+    partial: dict[str, dict[str, torch.Tensor]] = {}
+    for name, tensor in named_tensors:
+        if ".lora_A" in name:
+            layer_name = name.split(".lora_A", 1)[0]
+            partial.setdefault(layer_name, {})["A"] = tensor
+        elif ".lora_B" in name:
+            layer_name = name.split(".lora_B", 1)[0]
+            partial.setdefault(layer_name, {})["B"] = tensor
+
+    pairs: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for layer_name, ab in partial.items():
+        lora_a = ab.get("A")
+        lora_b = ab.get("B")
+        if lora_a is None or lora_b is None:
+            logger.warning(
+                "Incomplete LoRA pair for layer %s (has_A=%s has_B=%s); skipping",
+                layer_name,
+                lora_a is not None,
+                lora_b is not None,
+            )
+            continue
+        pairs[layer_name] = (lora_a, lora_b)
+    return pairs
 
 
 def get_updatable_modules(pipeline) -> dict[str, torch.nn.Module]:
@@ -120,23 +172,44 @@ def _load_weights_into_module(module: torch.nn.Module, weights_iter) -> None:
 
     For offloaded modules, updates CPU buffers directly via
     update_cpu_weights(); non-offloaded parameters use in-place copy.
+
+    The in-place copies below (param.data.copy_, DTensor _local_tensor.copy_,
+    and the offload manager's CPU-buffer copies) mutate tensors that were
+    created while the pipeline ran under ``torch.inference_mode()`` and are
+    therefore "inference tensors".  PyTorch forbids in-place mutation of an
+    inference tensor outside an inference-mode context, so wrap the whole
+    update in ``torch.inference_mode()`` (matching the offload manager's own
+    restore path).  Without this the weight-update API raises
+    "Inplace update to inference tensor outside InferenceMode is not allowed"
+    and returns an HTTP error.
     """
-    model_params = dict(module.named_parameters())
-    weights_iter = _iter_module_weight_updates(module, weights_iter, model_params)
+    with torch.inference_mode():
+        model_params = dict(module.named_parameters())
+        weights_iter = _iter_module_weight_updates(module, weights_iter, model_params)
 
-    offload_managers: list = []
-    if is_layerwise_offloaded_module(module):
-        offload_managers = [m for m in module.layerwise_offload_managers if m.enabled]
+        offload_managers: list = []
+        if is_layerwise_offloaded_module(module):
+            offload_managers = [
+                m for m in module.layerwise_offload_managers if m.enabled
+            ]
 
-    if offload_managers:
-        weight_dict = dict(weights_iter)
-        offloaded_names: set[str] = set()
-        for manager in offload_managers:
-            offloaded_names.update(manager.update_cpu_weights(weight_dict))
-        remaining = ((n, w) for n, w in weight_dict.items() if n not in offloaded_names)
-        load_weights_into_model(remaining, model_params)
-    else:
-        load_weights_into_model(weights_iter, model_params)
+        if offload_managers:
+            entries = list(weights_iter)
+            if any(shard_id is not None for _, _, shard_id in entries):
+                raise NotImplementedError(
+                    "Fused-parameter weight updates are not supported for "
+                    "layerwise-offloaded modules."
+                )
+            weight_dict = {n: w for n, w, _ in entries}
+            offloaded_names: set[str] = set()
+            for manager in offload_managers:
+                offloaded_names.update(manager.update_cpu_weights(weight_dict))
+            remaining = (
+                (n, w) for n, w in weight_dict.items() if n not in offloaded_names
+            )
+            load_weights_into_model(remaining, model_params)
+        else:
+            load_weights_into_model(weights_iter, model_params)
 
 
 def _build_module_weight_name_mapper(module: torch.nn.Module):
@@ -151,13 +224,48 @@ def _build_module_weight_name_mapper(module: torch.nn.Module):
     if not mapping_fns:
         return None
 
-    def map_name(name: str) -> str:
+    def map_name(name: str) -> tuple[str, Any]:
         mapped_name = name
+        merge_index = None
         for mapping_fn in mapping_fns:
-            mapped_name = mapping_fn(mapped_name)[0]
-        return mapped_name
+            mapped_name, index, _ = mapping_fn(mapped_name)
+            if index is not None:
+                merge_index = index
+        return mapped_name, merge_index
 
     return map_name
+
+
+def _strip_param_weight_suffix(param_name: str) -> str:
+    if param_name.endswith(".weight"):
+        return param_name[: -len(".weight")]
+    if param_name.endswith(".bias"):
+        return param_name[: -len(".bias")]
+    return param_name
+
+
+def _resolve_lora_ipc_layer_dict_key(
+    layer_prefix: str,
+    layer_dict: dict,
+    module: torch.nn.Module,
+) -> tuple[Any | None, str, int | None]:
+    """Map training-side LoRA layer prefix to lora_layers key (Layer 2)."""
+    layer = layer_dict.get(layer_prefix)
+    if layer is not None:
+        return layer, layer_prefix, None
+
+    map_name = _build_module_weight_name_mapper(module)
+    if map_name is None:
+        return None, layer_prefix, None
+
+    mapped_name, merge_index = map_name(f"{layer_prefix}.weight")
+    mapped = _strip_param_weight_suffix(mapped_name)
+    if mapped != layer_prefix:
+        layer = layer_dict.get(mapped)
+        if layer is not None:
+            return layer, mapped, merge_index
+
+    return None, layer_prefix, None
 
 
 def _iter_module_weight_updates(
@@ -165,17 +273,22 @@ def _iter_module_weight_updates(
     weights_iter,
     model_params: dict,
 ):
+    """Yield (mapped_name, weight, shard_id); shard_id is the merge index for
+    weights that map into a fused parameter (e.g. q/k/v -> to_qkv), else None.
+    """
     map_name = _build_module_weight_name_mapper(module)
     module_name = type(module).__name__
 
     for name, loaded_weight in weights_iter:
         if name in model_params:
-            yield name, loaded_weight
+            yield name, loaded_weight, None
             continue
 
-        mapped_name = map_name(name) if map_name is not None else name
+        mapped_name, merge_index = (
+            map_name(name) if map_name is not None else (name, None)
+        )
         if mapped_name in model_params:
-            yield mapped_name, loaded_weight
+            yield mapped_name, loaded_weight, merge_index
             continue
 
         logger.warning(
@@ -189,15 +302,21 @@ def _iter_module_weight_updates(
 def load_weights_into_model(
     weights_iter, model_params: dict, module_name: str | None = None
 ) -> None:
-    """Copy weights from weights_iter into model_params in-place."""
-    for name, loaded_weight in weights_iter:
+    """Copy weights into model_params in-place; entries are (name, weight) or
+    (name, weight, shard_id), shard_id routing fused parts via weight_loader."""
+    for entry in weights_iter:
+        name, loaded_weight, *rest = entry
+        shard_id = rest[0] if rest else None
         if name not in model_params:
             logger.warning("Skipping weight update: parameter %r not found", name)
             continue
         param = model_params[name]
         weight_loader = getattr(param, "weight_loader", None)
         if callable(weight_loader):
-            weight_loader(param, loaded_weight.to(param.dtype))
+            if shard_id is not None:
+                weight_loader(param, loaded_weight.to(param.dtype), shard_id)
+            else:
+                weight_loader(param, loaded_weight.to(param.dtype))
         else:
             dtensor_param = param if isinstance(param, DTensor) else None
             if dtensor_param is None and isinstance(
@@ -385,7 +504,19 @@ class WeightsUpdater:
         named_tensors: Any,
         load_format: str | None = None,
         target_modules: list[str] | None = None,
+        weight_update_mode: str | None = None,
+        lora_alpha: int | None = None,
+        lora_rank: int | None = None,
     ) -> tuple[bool, str]:
+        if weight_update_mode == LORA_MERGE_WEIGHT_UPDATE_MODE:
+            return self._update_lora_from_tensor(
+                named_tensors=named_tensors,
+                load_format=load_format,
+                target_modules=target_modules,
+                lora_alpha=lora_alpha,
+                lora_rank=lora_rank,
+            )
+
         if target_modules is None:
             target_modules = [_DEFAULT_TENSOR_TARGET_MODULE]
         try:
@@ -432,6 +563,178 @@ class WeightsUpdater:
         torch.cuda.empty_cache()
         names = ", ".join(updated_modules)
         message = f"Updated {len(updated_modules)} modules from tensor ({names})."
+        logger.info(message)
+        return True, message
+
+    def _update_lora_from_tensor(
+        self,
+        named_tensors: Any,
+        load_format: str | None,
+        target_modules: list[str] | None,
+        lora_alpha: int | None,
+        lora_rank: int | None,
+    ) -> tuple[bool, str]:
+        if not isinstance(self.pipeline, LoRAPipeline):
+            return (
+                False,
+                "LoRA merge weight update requires a LoRAPipeline-backed model",
+            )
+
+        if target_modules is None:
+            target_modules = [_DEFAULT_TENSOR_TARGET_MODULE]
+        if len(target_modules) != 1:
+            return (
+                False,
+                "LoRA IPC weight update requires exactly one target module per request",
+            )
+        target_module = target_modules[0]
+        if target_module not in _LORA_IPC_TARGET_MODULES:
+            return (
+                False,
+                f"LoRA IPC weight update supports target_modules in "
+                f"{sorted(_LORA_IPC_TARGET_MODULES)}, got {target_module!r}",
+            )
+
+        try:
+            modules_to_update = self._collect_modules([target_module])
+        except ValueError as e:
+            logger.error(str(e))
+            return False, str(e)
+
+        try:
+            module_payloads = self._resolve_module_payloads(
+                named_tensors=named_tensors,
+                modules_to_update=modules_to_update,
+            )
+        except ValueError as e:
+            logger.error(str(e))
+            return False, str(e)
+
+        materialized: list[tuple[str, torch.Tensor]] = []
+        for module_name, _module in modules_to_update:
+            payload = module_payloads[module_name]
+            weights_iter = self._materialize_weights_iter(payload, load_format)
+            materialized.extend(list(weights_iter))
+
+        pairs = _group_lora_ab_tensors(materialized)
+        if not pairs:
+            return False, "No LoRA A/B tensor pairs found in payload"
+
+        lora_pipeline: LoRAPipeline = self.pipeline
+        if not lora_pipeline.lora_initialized:
+            convert_target = (
+                "all"
+                if "transformer_2" in get_updatable_modules(lora_pipeline)
+                else "transformer"
+            )
+            # Match disk LoRA loading: wrap all supported Linear layers regardless
+            # of lora_target_modules. Training-side HF keys are resolved at write time.
+            saved_lora_target_modules = lora_pipeline.lora_target_modules
+            lora_pipeline.lora_target_modules = None
+            try:
+                with lora_pipeline._temporarily_disable_offload(
+                    target=convert_target, use_module_names_only=True
+                ):
+                    lora_pipeline.convert_to_lora_layers()
+            finally:
+                lora_pipeline.lora_target_modules = saved_lora_target_modules
+
+        try:
+            layer_dict = _get_lora_layer_dict(lora_pipeline, target_module)
+        except ValueError as e:
+            logger.error(str(e))
+            return False, str(e)
+
+        dit_module = dict(modules_to_update).get(target_module)
+        if dit_module is None:
+            return False, f"No DiT module found for LoRA IPC target {target_module!r}"
+
+        updated = 0
+        skipped = 0
+        unknown_layers: list[str] = []
+        # Honor lora_merge_mode: merged and unmerged evaluation differ bitwise.
+        merge_mode = lora_pipeline._resolve_lora_merge_mode(None, None)
+        merge_weights = lora_pipeline._should_merge_lora_for_layers(
+            target_module, layer_dict, merge_mode
+        )
+        plain_pairs: list[tuple[torch.Tensor, torch.Tensor, Any]] = []
+        fused_sections: dict[Any, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+        for layer_name, (lora_a, lora_b) in pairs.items():
+            layer, _resolved_key, merge_index = _resolve_lora_ipc_layer_dict_key(
+                layer_name, layer_dict, dit_module
+            )
+            if layer is None:
+                logger.warning(
+                    "Unknown LoRA layer name %s for target %s; skipping",
+                    layer_name,
+                    target_module,
+                )
+                unknown_layers.append(layer_name)
+                skipped += 1
+                continue
+            inferred_rank = int(lora_a.shape[-2])
+            if lora_rank is not None and lora_rank != inferred_rank:
+                logger.warning(
+                    "LoRA rank mismatch for %s: payload=%d request=%d; using payload rank",
+                    layer_name,
+                    inferred_rank,
+                    lora_rank,
+                )
+            if merge_index is None:
+                plain_pairs.append((lora_a, lora_b, layer))
+            else:
+                # Per-section pairs of one fused layer compose into one adapter.
+                fused_sections.setdefault(layer, {})[merge_index] = (lora_a, lora_b)
+
+        with lora_pipeline._temporarily_disable_offload(target=target_module):
+            for lora_a, lora_b, layer in plain_pairs:
+                inferred_rank = int(lora_a.shape[-2])
+                layer.lora_rank = inferred_rank
+                layer.lora_alpha = (
+                    lora_alpha if lora_alpha is not None else inferred_rank
+                )
+                layer.set_lora_weights(
+                    lora_a, lora_b, merge_weights=merge_weights, clear_existing=True
+                )
+                updated += 1
+            for layer, layer_sections in fused_sections.items():
+                indices = sorted(layer_sections)
+                lora_a, lora_b, fused_alpha = stack_or_compose_fused_lora(
+                    [layer_sections[i][0] for i in indices],
+                    [layer_sections[i][1] for i in indices],
+                    lora_alpha,
+                )
+                if fused_alpha is not None:
+                    # Composed pairs fold the scale; alpha == rank keeps it neutral.
+                    layer.lora_rank = fused_alpha
+                    layer.lora_alpha = fused_alpha
+                else:
+                    inferred_rank = int(lora_a.shape[-2])
+                    layer.lora_rank = inferred_rank
+                    layer.lora_alpha = (
+                        lora_alpha if lora_alpha is not None else inferred_rank
+                    )
+                layer.set_lora_weights(
+                    lora_a, lora_b, merge_weights=merge_weights, clear_existing=True
+                )
+                updated += len(layer_sections)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        if updated == 0:
+            sample = unknown_layers[:5]
+            return (
+                False,
+                f"No LoRA layers updated for {target_module} ({skipped} unknown layer names"
+                f"{f', e.g. {sample}' if sample else ''}); "
+                "check training-side layer name mapping",
+            )
+
+        message = (
+            f"Updated {updated} LoRA layers in {target_module} from IPC tensors "
+            f"(skipped {skipped} unknown layers)."
+        )
         logger.info(message)
         return True, message
 

@@ -101,6 +101,48 @@ class LTX2GuidancePassSpec:
     disable_v2a_cross_attn: bool = False
 
 
+def _prepare_ltx2_rope_coords_for_bcg(
+    *,
+    enabled: bool,
+    current_model,
+    latent_model_input: torch.Tensor,
+    audio_latent_model_input: torch.Tensor,
+    video_coords: torch.Tensor | None,
+    audio_coords: torch.Tensor | None,
+    num_frames: int,
+    height: int,
+    width: int,
+    audio_num_frames: int,
+    fps: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Build missing LTX-2 RoPE coordinates before CUDA graph capture.
+
+    The legacy LTX-2.3 one-stage path normally builds these tensors inside the
+    model forward. That performs an unpinned host-to-device copy, which CUDA
+    graph capture rejects. Preparing the same coordinates before entering the
+    graph preserves the eager values and makes both legacy and two-stage LTX
+    forwards capturable.
+    """
+    if not enabled:
+        return video_coords, audio_coords
+    if video_coords is None:
+        video_coords = current_model.rope.prepare_video_coords(
+            batch_size=int(latent_model_input.shape[0]),
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            device=latent_model_input.device,
+            fps=fps,
+        )
+    if audio_coords is None:
+        audio_coords = current_model.audio_rope.prepare_audio_coords(
+            batch_size=int(audio_latent_model_input.shape[0]),
+            num_frames=audio_num_frames,
+            device=audio_latent_model_input.device,
+        )
+    return video_coords, audio_coords
+
+
 class LTX2DenoisingStage(DenoisingStage):
     """
     LTX-2 specific denoising stage that handles joint video and audio generation.
@@ -136,6 +178,12 @@ class LTX2DenoisingStage(DenoisingStage):
             transformer=transformer, scheduler=scheduler, vae=vae, **kwargs
         )
         self.sampler_name = sampler_name
+
+    def _scheduler_step_kwargs(self, batch: Req, scheduler) -> dict:
+        return self.prepare_extra_func_kwargs(
+            scheduler.step,
+            {"generator": batch.generator, "eta": batch.eta, "batch": batch},
+        )
 
     @staticmethod
     def _randn_like_with_batch_generators(
@@ -1163,6 +1211,19 @@ class LTX2DenoisingStage(DenoisingStage):
                 audio_latent_model_input,
                 num_frames=audio_num_frames_latent,
             )
+        video_coords, audio_coords = _prepare_ltx2_rope_coords_for_bcg(
+            enabled=server_args.enable_breakable_cuda_graph,
+            current_model=step.current_model,
+            latent_model_input=latent_model_input,
+            audio_latent_model_input=audio_latent_model_input,
+            video_coords=video_coords,
+            audio_coords=audio_coords,
+            num_frames=ctx.latent_num_frames_for_model,
+            height=ctx.latent_height,
+            width=ctx.latent_width,
+            audio_num_frames=audio_num_frames_latent,
+            fps=batch.fps,
+        )
 
         batch_size = int(latent_model_input.shape[0])
         use_raw_sigma_timestep = ctx.use_ltx23_hq_timestep_semantics
@@ -1463,6 +1524,28 @@ class LTX2DenoisingStage(DenoisingStage):
             ):
                 yield
 
+    def _ltx2_call_current_model(
+        self,
+        ctx: "LTX2DenoisingContext",
+        step: DenoisingStepState,
+        model_kwargs: dict,
+    ):
+        """Run the LTX-2 DiT forward, replaying a breakable CUDA graph when
+        one is captured for this input signature.
+
+        LTX-2 builds its model kwargs locally instead of going through the
+        generic ``predict_noise`` path, so BCG must be routed here. Capture is
+        driven explicitly from the warmup request (``ctx.is_warmup``); LTX-2
+        tokenizes prompts to a fixed max length, so every serving request
+        shares the warmup signatures and no text bucketing is needed.
+        """
+        runner = self._maybe_get_bcg_runner(step.current_model)
+        if runner is None:
+            return step.current_model(**model_kwargs)
+        if ctx.is_warmup:
+            runner.capture(**model_kwargs)
+        return runner(**model_kwargs)
+
     def _prepare_denoising_loop(
         self,
         batch: Req,
@@ -1746,7 +1829,9 @@ class LTX2DenoisingStage(DenoisingStage):
                         )
 
             with self._ltx2_model_forward_context(ctx, step):
-                model_video, model_audio = step.current_model(**model_kwargs)
+                model_video, model_audio = self._ltx2_call_current_model(
+                    ctx, step, model_kwargs
+                )
 
             model_video = model_video.float()
             model_audio = model_audio.float()
@@ -1842,7 +1927,9 @@ class LTX2DenoisingStage(DenoisingStage):
                                 )
 
                         with self._ltx2_model_forward_context(ctx, step):
-                            mid_v, mid_a = step.current_model(**model_kwargs_local)
+                            mid_v, mid_a = self._ltx2_call_current_model(
+                                ctx, step, model_kwargs_local
+                            )
 
                         mid_v = mid_v.float()
                         mid_a = mid_a.float()
@@ -1873,9 +1960,19 @@ class LTX2DenoisingStage(DenoisingStage):
                     midpoint_model_call=_stage2_midpoint_model_call,
                 )
             else:
-                ctx.latents = ctx.scheduler.step(
-                    model_video, step.t_device, ctx.latents, return_dict=False
-                )[0]
+                if batch.rollout:
+                    ctx.scheduler._step_index = step.step_index
+                    ctx.latents = ctx.scheduler.step(
+                        model_video,
+                        step.t_device,
+                        ctx.latents,
+                        return_dict=False,
+                        **self._scheduler_step_kwargs(batch, ctx.scheduler),
+                    )[0]
+                else:
+                    ctx.latents = ctx.scheduler.step(
+                        model_video, step.t_device, ctx.latents, return_dict=False
+                    )[0]
                 ctx.audio_latents = ctx.audio_scheduler.step(
                     model_audio, step.t_device, ctx.audio_latents, return_dict=False
                 )[0]

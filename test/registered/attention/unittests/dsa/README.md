@@ -29,7 +29,7 @@ hardware/SDK. The variant tests live in `test_dsa.py` as
 |---|---|---|---|---|
 | `flashmla_sparse` | ✓ | ✓ | ✓ | SM>=9.0 + `sgl_kernel.flash_mla` |
 | `flashmla_kv` | ✓ | ✓ | ✓ | SM>=9.0 + `sgl_kernel.flash_mla` |
-| `fa3` | ✓ | ✓ | ✓ | SM>=9.0 + `sglang.jit_kernel.flash_attention` |
+| `fa3` | ✓ | ✓ | ✓ | SM>=9.0 + `sglang.kernels.ops.attention.flash_attention` |
 | `tilelang` | ✓ (topk=2048 dedicated fixture) | ✓ (topk=2048 dedicated fixture) | skipped: not yet wired into CG runner | `tilelang_sparse_fwd` asserts `topk == 2048`; the topk=2048 fixture instance (`build_dsa_sparse_attention_fixture(..., index_topk=2048)`) is used by `test_sparse_tilelang_prefill_case` / `test_sparse_tilelang_decode_case`. The default-topk impl-variant matrix still skips tilelang with the same reason. **SM10.x container gate**: on Blackwell the tilelang JIT generates `wait_wgmma` which the container's MMA template doesn't ship (`KNOWN_FAILURES.md §2`); `dsa_impl_capability("tilelang")` skips on `major >= 10`. Set `SGLANG_TEST_DSA_TILELANG_FORCE=1` to override after re-imaging. |
 | `trtllm` | skipped: SM<10 | skipped: SM<10 | skipped: SM<10 | TRT-LLM Gen FMHA/MLA requires Blackwell (SM>=10.0). |
 | `aiter` | skipped: not HIP | skipped: not HIP | skipped: not HIP | AMD-only kernel library. |

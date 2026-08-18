@@ -358,8 +358,6 @@ class Conversation:
             ret = system_prompt + self.sep
             for role, message in self.messages:
                 if message:
-                    if type(message) is tuple:
-                        message, _, _ = message
                     ret += role + message + self.sep
                 else:
                     ret += role

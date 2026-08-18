@@ -35,6 +35,7 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, U
 
 import aiohttp
 import numpy as np
+import orjson
 import requests
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
@@ -108,6 +109,10 @@ class RequestFuncOutput:
     start_time: float = 0.0
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
+    spec_accept_length: float = 0.0
+    spec_cap_length: float = 0.0
+    spec_block_accept_length: float = 0.0
+    spec_cap_lens_histogram: List[int] = field(default_factory=list)
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -135,7 +140,12 @@ def get_request_headers() -> Dict[str, str]:
 
 
 def _combine_openai_chat_content(message: Dict[str, Any]) -> str:
-    return (message.get("reasoning_content") or "") + (message.get("content") or "")
+    # Most OpenAI-compatible servers use ``reasoning_content``. vLLM's Kimi
+    # parser instead streams its reasoning in ``reasoning``. Prefer the
+    # standard field when both are present to avoid counting the same tokens
+    # twice on servers that expose aliases.
+    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+    return reasoning + (message.get("content") or "")
 
 
 def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
@@ -473,6 +483,19 @@ async def async_request_openai_chat_completions(
                         output.output_len = response_json.get("usage", {}).get(
                             "completion_tokens", output_len
                         )
+                        _meta_info = response_json["choices"][0].get("meta_info") or {}
+                        output.spec_accept_length = (
+                            _meta_info.get("spec_accept_length", 0.0) or 0.0
+                        )
+                        output.spec_cap_length = (
+                            _meta_info.get("spec_cap_length", 0.0) or 0.0
+                        )
+                        output.spec_block_accept_length = (
+                            _meta_info.get("spec_block_accept_length", 0.0) or 0.0
+                        )
+                        output.spec_cap_lens_histogram = (
+                            _meta_info.get("spec_cap_lens_histogram", []) or []
+                        )
                         if getattr(args, "cache_report", False):
                             _extract_cache_from_sglext(response_json, output)
                     else:
@@ -688,12 +711,24 @@ async def async_request_sglang_generate(
                         if not chunk_bytes:
                             continue
 
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                        # Cumulative chunks make parsing O(n^2) per request on this
+                        # single asyncio thread; orjson on raw bytes is ~2.2x cheaper.
+                        sse_data = (
+                            chunk_bytes[6:]
+                            if chunk_bytes.startswith(b"data: ")
+                            else chunk_bytes
+                        )
                         latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
+                        if sse_data == b"[DONE]":
                             pass
                         else:
-                            data = json.loads(chunk)
+                            data = orjson.loads(sse_data)
+
+                            _meta_info = data.get("meta_info") or {}
+                            if _meta_info.get("spec_accept_length") is not None:
+                                output.spec_accept_length = _meta_info[
+                                    "spec_accept_length"
+                                ]
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -909,6 +944,7 @@ ASYNC_REQUEST_FUNCS = {
     "sglang-embedding": async_request_openai_embeddings,
     "vllm": async_request_openai_completions,
     "vllm-chat": async_request_openai_chat_completions,
+    "vllm-embedding": async_request_openai_embeddings,
     "lmdeploy": async_request_openai_completions,
     "lmdeploy-chat": async_request_openai_chat_completions,
     "trt": async_request_trt_llm,
@@ -926,11 +962,37 @@ _BACKEND_API_PATHS = {
     "sglang-embedding": "/v1/embeddings",
     "vllm": "/v1/completions",
     "vllm-chat": "/v1/chat/completions",
+    "vllm-embedding": "/v1/embeddings",
     "lmdeploy": "/v1/completions",
     "lmdeploy-chat": "/v1/chat/completions",
     "trt": "/v2/models/ensemble/generate_stream",
     "truss": "/v1/models/model:predict",
 }
+
+_EMBEDDING_BACKENDS = frozenset(("sglang-embedding", "vllm-embedding"))
+
+_DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT = 60.0
+
+
+def flush_server_cache(
+    base_url: str,
+    backend: str,
+    flush_cache_timeout: float = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
+) -> None:
+    """Flush an engine's prefix cache after benchmark warmup."""
+    if backend.startswith("vllm"):
+        response = requests.post(
+            base_url + "/reset_prefix_cache", headers=get_auth_headers()
+        )
+    elif backend.startswith("sglang"):
+        response = requests.post(
+            base_url + "/flush_cache",
+            headers=get_auth_headers(),
+            params={"timeout": flush_cache_timeout},
+        )
+    else:
+        response = requests.post(base_url + "/flush_cache", headers=get_auth_headers())
+    response.raise_for_status()
 
 
 @dataclass
@@ -1289,6 +1351,7 @@ async def benchmark(
     profile: bool,
     pd_separated: bool = False,
     flush_cache: bool = False,
+    flush_cache_timeout: float = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
     warmup_requests: int = 1,
     use_trace_timestamps: bool = False,
     mooncake_slowdown_factor=1.0,
@@ -1391,9 +1454,14 @@ async def benchmark(
             f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run..."
         )
 
-    # Flush cache
-    if ("sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")) or flush_cache:
-        requests.post(base_url + "/flush_cache", headers=get_auth_headers())
+    # Flush cache after warmup so the measured run does not benefit from
+    # request-local prefix reuse. vLLM exposes a different, development-mode
+    # endpoint for the same purpose.
+    should_flush_cache = (
+        "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
+    ) or flush_cache
+    if should_flush_cache:
+        flush_server_cache(base_url, backend, flush_cache_timeout)
 
     time.sleep(1.0)
 
@@ -1567,7 +1635,7 @@ async def benchmark(
                 "Total input vision tokens:", metrics.total_input_vision
             )
         )
-    is_embedding = backend == "sglang-embedding"
+    is_embedding = backend in _EMBEDDING_BACKENDS
     if not is_embedding:
         print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
         print(
@@ -1935,6 +2003,7 @@ def run_benchmark(args_: argparse.Namespace):
             "sglang-oai": 30000,
             "lmdeploy": 23333,
             "vllm": 8000,
+            "vllm-embedding": 8000,
             "trt": 8000,
             "gserver": 9988,
             "truss": 8080,
@@ -1986,14 +2055,14 @@ def run_benchmark(args_: argparse.Namespace):
         print("No model specified or found. Please provide a model using `--model`.")
         sys.exit(1)
 
-    if args.backend != "sglang-embedding" and not check_chat_template(args.model):
+    if args.backend not in _EMBEDDING_BACKENDS and not check_chat_template(args.model):
         print(
             "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
             "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
         )
 
     if (
-        args.backend == "sglang-embedding"
+        args.backend in _EMBEDDING_BACKENDS
         and args.dataset_name in _EMBEDDING_UNSUPPORTED_DATASETS
     ):
         print(f"{args.dataset_name} dataset is unsupported for embeddings benchmark")
@@ -2039,6 +2108,8 @@ def run_benchmark(args_: argparse.Namespace):
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
+    if not hasattr(args, "flush_cache_timeout"):
+        args.flush_cache_timeout = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT
 
     # Prepare LoRA arguments
     lora_request_distribution = (
@@ -2069,6 +2140,7 @@ def run_benchmark(args_: argparse.Namespace):
             profile=args.profile,
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
+            flush_cache_timeout=args.flush_cache_timeout,
             warmup_requests=args.warmup_requests,
             use_trace_timestamps=args.use_trace_timestamps,
             mooncake_slowdown_factor=args.mooncake_slowdown_factor,
@@ -2158,7 +2230,7 @@ def cli_main():
         type=str,
         default="sharegpt",
         choices=[
-            "autobench",
+            "agentic-trace",
             "sharegpt",
             "custom",
             "openai",
@@ -2175,6 +2247,21 @@ def cli_main():
     )
     parser.add_argument(
         "--dataset-path", type=str, default="", help="Path to the dataset."
+    )
+    parser.add_argument(
+        "--dataset-offset",
+        type=int,
+        default=0,
+        help="Rotate the conversation list by this many entries before sampling "
+        "(agentic-trace dataset), so successive sweep steps start on fresh "
+        "conversations.",
+    )
+    parser.add_argument(
+        "--agentic-max-turns",
+        type=int,
+        default=None,
+        help="Cap each conversation to at most this many turns (agentic-trace "
+        "dataset). Default: use all turns in the trace.",
     )
     parser.add_argument(
         "--speed-bench-category",
@@ -2254,7 +2341,9 @@ def cli_main():
         default="1080p",
         help=(
             "Resolution of images for image dataset. "
-            "Supports presets 4k/1080p/720p/360p or custom 'heightxwidth' (e.g., 1080x1920)."
+            "Supports presets 4k/1080p/720p/360p, custom 'heightxwidth' "
+            "(e.g., 1080x1920), or random 'random:<min_h>x<min_w>-<max_h>x<max_w>' "
+            "bounds (e.g., random:256x256-1024x1024)."
         ),
     )
     parser.add_argument(
@@ -2499,6 +2588,12 @@ def cli_main():
         "--flush-cache",
         action="store_true",
         help="Flush the cache before running the benchmark",
+    )
+    parser.add_argument(
+        "--flush-cache-timeout",
+        type=_finite_positive_float,
+        default=_DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
+        help="Maximum seconds to wait for an SGLang server to become idle before flushing the cache",
     )
     parser.add_argument(
         "--warmup-requests",

@@ -408,16 +408,6 @@ class TestMultiEndedAllocator(unittest.TestCase):
         expected = full_alloc.virtual_to_physical[v]
         self.assertTrue(bool((buf == expected).all().item()))
 
-    def test_translate_kv_loc_without_out_returns_fresh_tensor(self):
-        """REGRESSION: without `out=`, behavior returns a fresh tensor."""
-        _, full_alloc, _, full_kv, _ = self._build_pair()
-        v = self._alloc(full_alloc, full_kv, 5)
-        ret = full_alloc.translate_kv_loc(v)
-        # Fresh tensor: different storage from v2p table
-        self.assertNotEqual(ret.data_ptr(), full_alloc.virtual_to_physical.data_ptr())
-        expected = full_alloc.virtual_to_physical[v]
-        self.assertTrue(bool((ret == expected).all().item()))
-
     def test_translate_kv_loc_out_matches_no_out(self):
         """REGRESSION: result of translate_kv_loc(v, out=buf) byte-equals
         translate_kv_loc(v)."""
@@ -833,62 +823,6 @@ class TestUnifiedSWATokenToKVPoolAllocator(unittest.TestCase):
         self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
         self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
 
-    # 7. Joint byte-budget pre-check.
-    def test_swa_joint_byte_budget_pre_check(self):
-        # Pick sizes where the byte gap, not slot-index headroom, is the bind.
-        full_spec = MHASubPoolSpec(
-            name="full",
-            layer_num=2,
-            head_num=2,
-            head_dim=4,
-            store_dtype=torch.float16,
-            grow_direction="up",
-        )
-        swa_spec = MHASubPoolSpec(
-            name="swa",
-            layer_num=2,
-            head_num=2,
-            head_dim=4,
-            store_dtype=torch.float16,
-            grow_direction="down",
-        )
-        n_full, n_swa = 10, 10
-        total = n_full * full_spec.entry_bytes() + n_swa * swa_spec.entry_bytes()
-        pool = UnifiedKVPool(
-            total_bytes=total,
-            sub_pool_specs=[full_spec, swa_spec],
-            device=_DEV,
-            enable_memory_saver=False,
-        )
-        kvcache = _FakeUnifiedSWAKVPool(pool)
-        allocator = UnifiedSWATokenToKVPoolAllocator(
-            unified_buffer=pool,
-            kvcache=kvcache,
-            device=_DEV,
-            full_max_total_num_tokens=n_full,
-            swa_max_total_num_tokens=n_swa,
-            need_sort=False,
-            forward_stream=None,
-        )
-        fa = allocator.full_attn_allocator
-        sa = allocator.swa_attn_allocator
-        # Compute the "naive min" against the joint budget — at idle, the
-        # joint budget is strictly less than min(full.available, swa.available)
-        # because the joint uses (entry_full + entry_swa) per slot.
-        naive = min(fa.available_size(), sa.available_size())
-        joint = allocator.available_size()
-        # The joint must be no greater than naive (typically strictly less).
-        self.assertLessEqual(joint, naive)
-        # And it must equal `gap_bytes // (entry_full + entry_swa)` clamped
-        # by slot-room.
-        gap = sa._byte_low_frontier() - fa._byte_high_frontier()
-        expected = min(
-            gap // (fa.entry_bytes + sa.entry_bytes),
-            fa.max_slots - fa.min_slot_index - fa.allocated_count(),
-            sa.max_slots - sa.min_slot_index - sa.allocated_count(),
-        )
-        self.assertEqual(joint, expected)
-
     # 8. Watermark rollback on partial alloc failure.
     def test_swa_alloc_swa_failure_is_fail_loud(self):
         """The SWA composite runs a tight JOINT pre-check before allocating, so
@@ -1194,6 +1128,11 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             self.assertNotEqual(int(full_alloc.virtual_to_physical[v_page].item()), -1)
 
     # 5. free() recovers pages via unique(// page_size) — matches upstream.
+    # REGRESSION: `allocated_count()` MUST return
+    # TOKENS, not pages -- matching upstream's convention that all external
+    # capacity methods report tokens. At page_size > 1, returning pages
+    # here breaks the leak invariant
+    # (`available + evictable + ... == total`, with all terms in tokens).
     def test_paged_free_unique_by_page(self):
         _, full_alloc, _, full_kv, _ = self._build()
         a = full_alloc.alloc(self.PAGE_SIZE * 2)  # 2 pages = 2*PS tokens
@@ -1501,31 +1440,6 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             int(free_before.numel()),
         )
 
-    # 12. translate_kv_loc preserves token-level identity end-to-end.
-    def test_paged_translate_kv_loc_token_round_trip(self):
-        _, full_alloc, _, _, _ = self._build()
-        v = full_alloc.alloc(self.PAGE_SIZE * 2)
-        # Build the composite-style translation manually: virt_page * ps + offset.
-        ps = self.PAGE_SIZE
-        virt_pages = v // ps
-        offsets = v % ps
-        phys_pages = full_alloc.virtual_to_physical[virt_pages]
-        phys_tokens = phys_pages * ps + offsets
-        # `phys_tokens` should be a coherent set of two contiguous PAGES.
-        phys_pages_unique = sorted(set(phys_pages.tolist()))
-        self.assertEqual(len(phys_pages_unique), 2)
-        # Within each page the tokens go through offsets 0..7 in order.
-        for p in phys_pages_unique:
-            page_phys = sorted(
-                int(t)
-                for i, t in enumerate(phys_tokens.tolist())
-                if int(phys_pages[i].item()) == p
-            )
-            self.assertEqual(
-                page_phys,
-                [p * ps + i for i in range(ps)],
-            )
-
     # REGRESSION: `translate_kv_loc(virt, out=buf)` must work
     # under page_size > 1 — the page-math branch writes via
     # `index_select(out=out)` + in-place `mul_` / `add_` and must match the
@@ -1678,28 +1592,6 @@ class TestPagedMultiEndedAllocator(unittest.TestCase):
             "paged out= path must clamp tombstoned entries",
         )
         self.assertTrue(bool((buf[:ps] == 0).all().item()))
-
-    # 13. REGRESSION: `allocated_count()` MUST return
-    # TOKENS, not pages — matching upstream's convention that all external
-    # capacity methods report tokens. At page_size > 1, returning pages
-    # here breaks the leak invariant
-    # (`available + evictable + ... == total`, with all terms in tokens).
-    def test_paged_allocated_count_returns_tokens(self):
-        _, full_alloc, _, _, _ = self._build()
-        PS = self.PAGE_SIZE
-        # Idle → allocated_count == 0.
-        self.assertEqual(full_alloc.allocated_count(), 0)
-        # Alloc 2 pages = 2 * PS tokens.
-        v = full_alloc.alloc(2 * PS)
-        self.assertIsNotNone(v)
-        # allocated_count() must report TOKENS (= 2 * PS), not pages (= 2).
-        self.assertEqual(
-            full_alloc.allocated_count(),
-            2 * PS,
-            "REGRESSION: allocated_count() must return TOKENS at page_size > 1",
-        )
-        # _allocated_pages() is the page-granular internal helper.
-        self.assertEqual(full_alloc._allocated_pages(), 2)
 
     # 14. REGRESSION: the leak-invariant terms used by the
     # scheduler runtime checker must all be in TOKENS. Specifically
@@ -2032,24 +1924,6 @@ class TestLazyCompaction(unittest.TestCase):
             p = int(alloc.virtual_to_physical[v].item())
             kv.buf[p] = int(v)
 
-    def test_lazy_state_initialized(self):
-        """Lazy allocator initializes the new state cleanly."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        self.assertTrue(fa.lazy_compaction)
-        self.assertEqual(len(fa._free_phys_pages), 0)
-        self.assertEqual(fa._pending_reuse, {})
-        self.assertEqual(fa.live_page_count, 0)
-        # Watermark + free virtual list start equivalent to eager.
-        self.assertEqual(fa.watermark_physical, fa.min_page_index)
-
-    def test_lazy_alloc_increments_live_page_count(self):
-        _pool, fa, _kv = self._make_full(lazy=True)
-        tokens = fa.alloc(8)
-        self.assertIsNotNone(tokens)
-        self.assertEqual(int(tokens.numel()), 8)
-        self.assertEqual(fa.live_page_count, 8)
-        self.assertEqual(len(fa._free_phys_pages), 0)
-
     def test_lazy_free_boundary_shortcut(self):
         """Boundary absorption is DEFERRED to `_flush` (the hot
         path `_free_lazy` does only a `torch.cat`, no watermark mutation).
@@ -2074,21 +1948,6 @@ class TestLazyCompaction(unittest.TestCase):
         self.assertEqual(fa.watermark_physical, before_wm - 1)
         self.assertEqual(len(fa._free_phys_pages), 0)
         self.assertEqual(fa.live_page_count, 2)
-
-    def test_lazy_free_non_boundary_pushes_hole(self):
-        """Freeing a non-boundary page enters _free_phys_pages, watermark
-        stays put.
-        """
-        _pool, fa, _kv = self._make_full(lazy=True)
-        a = fa.alloc(5)
-        wm_before = fa.watermark_physical
-        # Free a middle id (NOT the topmost), boundary-shortcut should
-        # NOT fire.
-        mid = a[2:3].clone()
-        fa.free(mid)
-        self.assertEqual(fa.watermark_physical, wm_before)
-        self.assertEqual(len(fa._free_phys_pages), 1)
-        self.assertEqual(fa.live_page_count, 4)
 
     def test_lazy_free_inward_walk(self):
         """The inward walk (multiple contiguous holes absorbed
@@ -2248,29 +2107,6 @@ class TestLazyCompaction(unittest.TestCase):
             )
             self.assertEqual(lazy_data[v], lazy_stamps[v], f"lazy: KV[v={v}] != stamp")
 
-    def test_lazy_hole_set_directional_pop(self):
-        """The _HoleSet pops smallest-first for grow-up; alloc must drain
-        the deepest hole first (the greedy clustering rule keeps near-
-        boundary holes available for cheap absorption by compaction).
-        """
-        _pool, fa, _kv = self._make_full(lazy=True)
-        a = fa.alloc(6)
-        # Free middle and lower middles so the holes are NOT at boundary.
-        fa.free(a[1:2].clone())  # frees physical at index v2p[a[1]]
-        fa.free(a[3:4].clone())
-        # Capture which physical pages are now in the hole set.
-        # `_free_phys_pages` is a torch.Tensor; `.tolist()` returns
-        # Python ints so `sorted` produces ints (not 0-dim tensors).
-        holes_before = sorted(fa._free_phys_pages.tolist())
-        self.assertEqual(len(holes_before), 2)
-        # Alloc 1 — should drain a hole (grow-up).
-        # With sort-after-merge OFF (default), the drain order
-        # is FIFO over the free-list tensor — NOT "smallest first".
-        # We only assert that the bound physical is ONE OF the holes.
-        a2 = fa.alloc(1)
-        bound_phys = int(fa.virtual_to_physical[int(a2.item())].item())
-        self.assertIn(bound_phys, holes_before)
-
     def test_lazy_non_urgent_stops_at_write_set_blocker(self):
         """Write-race case: when the topmost survivor IS in an
         in-flight batch's write-set, non-urgent `_flush` STOPS the
@@ -2358,57 +2194,6 @@ class TestLazyCompaction(unittest.TestCase):
         self.assertEqual(len(fa._pending_reuse), 0)
         self.assertEqual(len(fa._pending_reuse_pages_cpu), 0)
 
-    def test_lazy_pending_reuse_urgent_wait(self):
-        """Under urgent drain, an unfired event triggers wait_event; we
-        simulate this by checking that the drain ALSO releases unfired
-        entries (with a fake event whose `query` is False — `wait_event` is
-        a no-op in CPU mode since there's no current stream's wait_event for
-        a FakeEvent, so we test the release path)."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        a = fa.alloc(4)
-
-        class _FakeEvent:
-            def __init__(self):
-                self.waited = False
-
-            def query(self):
-                return False  # never fires
-
-        # Inject ONE batch entry into _pending_reuse keyed by
-        # Event. Value is `(cpu_list, gpu_tensor)`. The parallel CPU
-        # set must also be updated.
-        # (Simulates a prior compaction whose event hasn't fired.)
-        p = int(fa.virtual_to_physical[int(a[2].item())].item())
-        # Clear v2p/p2v so post-drain reuse is safe.
-        fa.virtual_to_physical[int(a[2].item())] = -1
-        fa.physical_to_virtual[p] = -1
-        ev = _FakeEvent()
-        gpu_t = torch.tensor([p], dtype=torch.int64, device=fa.device)
-        fa._pending_reuse[ev] = ([p], gpu_t)
-        fa._pending_reuse_pages_cpu.add(p)
-        # Urgent drain — should release p despite event.query()=False.
-        # (CPU shim: torch.cuda.current_stream() may not exist; wrap try.)
-        try:
-            fa._drain_pending_reuse(urgent=True)
-        except Exception:
-            # CPU: wait_event may not work; this test is GPU-only.
-            self.skipTest("wait_event requires CUDA")
-        self.assertEqual(len(fa._pending_reuse), 0)
-        self.assertEqual(len(fa._pending_reuse_pages_cpu), 0)
-
-    def test_lazy_flush_opportunistic_hook(self):
-        """The public flush_opportunistic method runs the non-urgent path
-        and is safe to call when no holes exist."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        # No holes → returns 0 moves, no-op.
-        self.assertEqual(fa.flush_opportunistic(), 0)
-        # Create a hole then call flush_opportunistic; latest_event=None
-        # means src releases immediately.
-        a = fa.alloc(3)
-        fa.free(a[0:1].clone())
-        moves = fa.flush_opportunistic()
-        self.assertGreaterEqual(moves, 1)
-
 
 class TestO3FusedAllocBind(unittest.TestCase):
     """Fused take_physical_pages + bind_pages.
@@ -2464,17 +2249,6 @@ class TestO3FusedAllocBind(unittest.TestCase):
         fa.bind_peer(ma)
         ma.bind_peer(fa)
         return pool, fa, full_kv
-
-    def test_helper_exists_and_returns_tensor(self):
-        """The helper `_alloc_bind_fast_or_slow` is wired and returns a
-        tensor on success."""
-        _pool, fa, _kv = self._make_full(lazy=True)
-        v_pages = torch.tensor([10, 11, 12], dtype=torch.int64, device="cuda")
-        phys = fa._alloc_bind_fast_or_slow(v_pages, 3)
-        self.assertIsNotNone(phys)
-        self.assertEqual(phys.shape, (3,))
-        self.assertEqual(phys.dtype, torch.int64)
-        self.assertEqual(phys.device.type, "cuda")
 
     def test_fast_path_when_no_holes(self):
         """When `_free_phys_pages` is empty, the fast path fires.

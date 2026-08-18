@@ -21,16 +21,24 @@ Usage:
     python3 -m unittest test_int8_mamba_checkpoint_e2e
 """
 
+import time
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
-from sglang.test.server_fixtures.default_fixture import DefaultServerBase
-from sglang.test.test_utils import DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST
+from sglang.test.server_fixtures.default_fixture import (
+    DefaultServerBase,
+    openai_api_env,
+)
+from sglang.test.test_utils import (
+    DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST,
+    popen_launch_server,
+)
 
-register_cuda_ci(est_time=400, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=800, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestInt8MambaCheckpointE2E(KLDivergenceMixin, DefaultServerBase):
@@ -87,6 +95,28 @@ class TestInt8MambaCheckpointE2E(KLDivergenceMixin, DefaultServerBase):
             f"(threshold: {self.gsm8k_threshold})"
         )
         self.assertGreaterEqual(metrics["accuracy"], self.gsm8k_threshold)
+
+
+class TestUnifiedRadixTreeInt8MambaCheckpointE2E(TestInt8MambaCheckpointE2E):
+    """Run the same int8 mamba checkpoint checks with UnifiedRadixTree forced on."""
+
+    @classmethod
+    def setUpClass(cls):
+        assert cls.model is not None, "Please set cls.model in subclass"
+
+        with openai_api_env(cls.api_key):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=cls.timeout,
+                other_args=cls.other_args,
+                env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid, wait_timeout=60)
+        time.sleep(2)
 
 
 if __name__ == "__main__":

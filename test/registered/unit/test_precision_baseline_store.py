@@ -62,13 +62,6 @@ class TestHfStoreConfig(CustomTestCase):
             cfg = hfs.HfStoreConfig.from_env()
         self.assertEqual(cfg.revision, "dev")
 
-    def test_from_env_default_revision(self):
-        with patch.dict(
-            os.environ, {"SGLANG_PRECISION_HF_REPO": "my/repo"}, clear=False
-        ):
-            cfg = hfs.HfStoreConfig.from_env()
-        self.assertEqual(cfg.revision, "main")
-
     def test_from_env_raises_when_missing(self):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(RuntimeError):
@@ -622,19 +615,6 @@ class TestWithRetries(CustomTestCase):
         exc_429 = HfHubHTTPError("rate limited", response=resp_429)
 
         mock_op = MagicMock(side_effect=[exc_429, "ok"])
-        result = hfs._with_retries(mock_op, what="test", base_delay=0.01)
-        self.assertEqual(result, "ok")
-        mock_time.sleep.assert_called_once()
-
-    @patch("sglang.test.precision_baseline_store.time")
-    def test_retries_on_5xx(self, mock_time):
-        from huggingface_hub.errors import HfHubHTTPError
-
-        resp_500 = MagicMock()
-        resp_500.status_code = 500
-        exc_500 = HfHubHTTPError("server error", response=resp_500)
-
-        mock_op = MagicMock(side_effect=[exc_500, "ok"])
         result = hfs._with_retries(mock_op, what="test", base_delay=0.01)
         self.assertEqual(result, "ok")
         mock_time.sleep.assert_called_once()

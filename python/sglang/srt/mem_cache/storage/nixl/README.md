@@ -192,6 +192,72 @@ This method is convenient for testing / experimenting. For production or multi-p
 
 Also note that the flat inline config form is interpreted as plugin-specific parameters for the selected plugin.
 
+### 4. Validated Hybrid-Model Example
+
+The following setup was validated against a hybrid Mamba model with HiCache enabled:
+
+- model: `Qwen/Qwen3.5-9B`
+- storage backend: `nixl`
+- NIXL plugin: `POSIX`
+- HiCache layout: `page_first_direct`
+- model type: hybrid attention + Mamba sidecar cache (`KV + MAMBA`)
+
+Important details from this validation:
+
+- Use a real `.toml` file path with `--hicache-storage-backend-extra-config`.
+- For this validated path, the storage directory was provided through `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`.
+- Use `--mamba-scheduler-strategy extra_buffer` to support page sizes larger than 1.
+
+Example TOML file:
+
+```toml
+[plugin.posix]
+active = true
+```
+
+Example serve command for a hybrid model:
+
+```bash
+export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/tmp/sglang_nixl_e2e_storage
+
+~/ve_sgl_dev/bin/sglang serve \
+  --model-path /workspace/LLM_models/Qwen3.5-9B \
+  --served-model-name Qwen/Qwen3.5-9B \
+  --host 127.0.0.1 \
+  --tp 2 \
+  --reasoning-parser qwen3 \
+  --attention-backend triton \
+  --enable-hierarchical-cache \
+  --hicache-ratio 2 \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct \
+  --hicache-storage-prefetch-policy wait_complete \
+  --page-size 256 \
+  --log-level info \
+  --disable-cuda-graph \
+  --hicache-storage-backend nixl \
+  --hicache-storage-backend-extra-config @/tmp/nixl.config.toml \
+  --mamba-scheduler-strategy extra_buffer
+```
+
+Expected behavior for this validated setup:
+
+- the server starts with `Attached hybrid pool stack to UnifiedRadixCache: pools=KV + MAMBA`
+- NIXL logs show `Backend POSIX was instantiated`
+- the server logs `HiCacheNixl: registered hybrid host pool mamba zero_copy=...`
+- the storage directory contains KV files plus Mamba sidecar files such as `..._0_2_mamba_temporal` and `..._0_2_mamba_conv_0`
+- after restarting the server against the same storage directory, a repeated long prompt shows large `cached_tokens` in the response metadata
+
+Minimal end-to-end validation flow:
+
+1. Start the server with the TOML file shown above.
+2. Send a long prompt once to populate storage.
+3. Restart the server against the same `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`.
+4. Send the same long prompt again and confirm that `meta_info.cached_tokens` is high.
+
+A reusable local validation script is available at `~/TestEnv/nixl_hicache_hybrid_e2e.py`; it starts this server, sends a long request, and checks both NIXL backend selection and Mamba sidecar storage files.
+
+
 
 ## Running Unit Tests
 
@@ -562,7 +628,7 @@ Configures the 3FS (third-party filesystem) backend.
 
 #### Description
 
-Configures an object storage backend compatible with S3 APIs (e.g., AWS S3, MinIO, Ceph).
+Configures an object storage backend compatible with S3 APIs (e.g., AWS S3, MinIO, Ceph). See the [NIXL OBJ plugin documentation](https://github.com/ai-dynamo/nixl/blob/main/src/plugins/obj/README.md) for backend-specific options and behavior.
 
 
 #### Configuration Keys
@@ -571,6 +637,8 @@ Configures an object storage backend compatible with S3 APIs (e.g., AWS S3, MinI
 | ------------------------ | ------- | ------------ | ---------------------------------------------- |
 | `num_threads`            | integer | `4`          | Number of client worker threads.               |
 | `endpoint_override`      | string  | `""`         | Custom endpoint URL (for non-AWS S3 services). |
+| `crtMinLimit`            | integer | disabled      | Minimum object size in bytes for S3 CRT.       |
+| `throughput_target_gbps` | integer | `10`          | Whole-Gbps target for S3 CRT.                  |
 | `scheme`                 | string  | `"http"`     | Connection scheme (`http` or `https`).         |
 | `region`                 | string  | `""`         | Cloud region (if applicable).                  |
 | `req_checksum`           | string  | `"required"` | Request checksum behavior.                     |
@@ -581,6 +649,16 @@ Configures an object storage backend compatible with S3 APIs (e.g., AWS S3, MinI
 | `use_virtual_addressing` | string  | `"true"`     | Enables virtual-hosted-style addressing.       |
 | `bucket`                 | string  | `""`         | Default bucket name.                           |
 | `active`                 | boolean |      N/A     | Controls whether this plugin is eligible for backend selection.                                          |
+
+`throughput_target_gbps` only affects transfers routed through the S3 CRT client. Set `crtMinLimit` to enable the CRT path for objects at or above the chosen size. The throughput target must be a whole number. Values below the 5 MiB AWS S3 minimum multipart part size are accepted for `crtMinLimit`, but the AWS CRT SDK clamps the part size to 5 MiB.
+
+To saturate a high-bandwidth link with low tensor parallelism, set `SGLANG_AUTO_NUMA_BIND=false`. Disabling automatic NUMA pinning allows the CRT thread pool to use all available CPU cores for workers.
+
+For example, the following inline configuration uses the CRT client for objects of at least 5 MiB and targets 25 Gbps:
+
+```bash
+--hicache-storage-backend-extra-config '{"plugin":{"obj":{"active":true,"crtMinLimit":"5242880","throughput_target_gbps":"25"}}}'
+```
 
 ##### `req_checksum` Valid Values
 

@@ -1,0 +1,9 @@
+<svg width="940" height="525" viewBox="0 0 940 525" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="JoyAI-Echo logo">
+  <rect width="940" height="525" rx="28" fill="none"/>
+  <circle cx="354" cy="262" r="86" fill="#FF4D2E"/>
+  <circle cx="410" cy="262" r="86" fill="#111111" fill-opacity="0.92"/>
+  <path d="M345 231C362 213 393 213 410 231" stroke="white" stroke-width="16" stroke-linecap="round"/>
+  <path d="M345 293C362 311 393 311 410 293" stroke="white" stroke-width="16" stroke-linecap="round"/>
+  <text x="494" y="249" fill="#111111" font-family="Arial, Helvetica, sans-serif" font-size="72" font-weight="700" letter-spacing="0">JoyAI</text>
+  <text x="494" y="318" fill="#FF4D2E" font-family="Arial, Helvetica, sans-serif" font-size="58" font-weight="700" letter-spacing="0">Echo</text>
+</svg>

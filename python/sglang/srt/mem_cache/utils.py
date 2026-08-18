@@ -13,8 +13,33 @@
 # ==============================================================================
 """Common utilities."""
 
+import hashlib
 from typing import Any, Callable, List, Optional, Tuple
 
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    get_mla_kv_buffer_kernel as get_mla_kv_buffer_kernel,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    get_mla_kv_buffer_triton as get_mla_kv_buffer_triton,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_fp8_quant_kernel as set_mla_kv_buffer_fp8_quant_kernel,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_kernel as set_mla_kv_buffer_kernel,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_triton as set_mla_kv_buffer_triton,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_triton_fp8_quant as set_mla_kv_buffer_triton_fp8_quant,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_scale_buffer_kernel as set_mla_kv_scale_buffer_kernel,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_scale_buffer_triton as set_mla_kv_scale_buffer_triton,
+)
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cpp_utils.native_hash import get_native_hash
 from sglang.srt.mem_cache.evict_policy import (
@@ -26,30 +51,6 @@ from sglang.srt.mem_cache.evict_policy import (
     MRUStrategy,
     PriorityStrategy,
     SLRUStrategy,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    get_mla_kv_buffer_kernel as get_mla_kv_buffer_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    get_mla_kv_buffer_triton as get_mla_kv_buffer_triton,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_buffer_fp8_quant_kernel as set_mla_kv_buffer_fp8_quant_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_buffer_kernel as set_mla_kv_buffer_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_buffer_triton as set_mla_kv_buffer_triton,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_buffer_triton_fp8_quant as set_mla_kv_buffer_triton_fp8_quant,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_scale_buffer_kernel as set_mla_kv_scale_buffer_kernel,
-)
-from sglang.srt.mem_cache.triton_ops.mla_buffer import (
-    set_mla_kv_scale_buffer_triton as set_mla_kv_scale_buffer_triton,
 )
 
 _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
@@ -133,6 +134,54 @@ def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
     hash_values = get_hash_str(node.key, parent_hash, page_size=page_size)
     assert isinstance(hash_values, list)
     return hash_values
+
+
+def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
+    """Compute and memoize namespace-aware external KV-event hashes."""
+    cache_salt = node.key.cache_salt
+    if cache_salt is None:
+        return compute_node_hash_values(node, page_size)
+
+    if node.event_hash_value is not None:
+        return node.event_hash_value
+
+    missing_nodes = []
+    current = node
+    while (
+        current is not None
+        and current.key is not None
+        and len(current.key) > 0
+        and current.event_hash_value is None
+    ):
+        if current.key.cache_salt != cache_salt:
+            raise ValueError("Radix path contains mismatched cache_salt values")
+        missing_nodes.append(current)
+        current = current.parent
+
+    if (
+        current is not None
+        and current.key is not None
+        and len(current.key) > 0
+        and current.key.cache_salt != cache_salt
+    ):
+        raise ValueError("Radix path contains mismatched cache_salt values")
+
+    if current is not None and current.event_hash_value:
+        parent_hash = current.event_hash_value[-1]
+    else:
+        parent_hash = hashlib.sha256(
+            b"sglang-cache-salt-v1\0" + cache_salt.encode("utf-8")
+        ).hexdigest()
+
+    for missing_node in reversed(missing_nodes):
+        hash_values = get_hash_str(missing_node.key, parent_hash, page_size=page_size)
+        assert isinstance(hash_values, list)
+        missing_node.event_hash_value = hash_values
+        if hash_values:
+            parent_hash = hash_values[-1]
+
+    assert node.event_hash_value is not None
+    return node.event_hash_value
 
 
 def split_node_hash_value(

@@ -15,6 +15,7 @@ _HEADER_OVERRIDES = {
     "x-override-conversation-id": ("conversation_id", str),
     "x-override-routed-dp-rank": ("routed_dp_rank", int),
     "x-override-disagg-prefill-dp-rank": ("disagg_prefill_dp_rank", int),
+    "x-override-priority": ("priority", int),
 }
 
 
