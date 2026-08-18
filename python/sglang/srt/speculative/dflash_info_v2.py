@@ -154,7 +154,15 @@ class DFlashDraftInputV2(SpecInput):
             committed_len = int(req.kv_committed_len)
             # Read the allocation watermark from the req object like EAGLE.
             cur_alloc_len = int(req.kv.kv_allocated_len)
-            reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
+            # Whole-page accounting (same as eagle_prepare_for_decode): the
+            # paged allocator hands out full pages, so an unaligned reserve
+            # strands the tail of the last page -- allocated but never recorded.
+            reserved_len = max(
+                cur_alloc_len,
+                (committed_len + 2 * block_size + page_size - 1)
+                // page_size
+                * page_size,
+            )
             top_k = int(req.sampling_params.top_k)
 
             batch_seq_lens_cpu_t[i] = committed_len
