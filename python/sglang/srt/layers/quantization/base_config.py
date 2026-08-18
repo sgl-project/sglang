@@ -10,7 +10,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 import torch
 from torch import nn
 
-from sglang.checkpoint_quantization import canonicalize_modelopt_quant_algo
+from sglang.srt.model_loader.checkpoint_quantization import (
+    canonicalize_modelopt_quant_algo,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
