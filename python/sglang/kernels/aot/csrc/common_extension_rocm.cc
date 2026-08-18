@@ -201,6 +201,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "transfer_kv_all_layer_mla_lf_pf(Tensor src_layers, Tensor dst, Tensor src_indices, Tensor dst_indices, "
       "int item_size, int dst_layout_dim, int num_layers, int block_quota, int num_warps_per_block) -> ()");
   m.impl("transfer_kv_all_layer_mla_lf_pf", torch::kCUDA, &transfer_kv_all_layer_mla_lf_pf);
+  m.def("get_device_accessible_ptr(Tensor tensor, int device_index) -> int", &get_device_accessible_ptr);
   m.def(
       "transfer_kv_direct(Tensor[] src_layers, Tensor[] dst_layers, Tensor src_indices, Tensor dst_indices, int "
       "page_size) -> ()");

@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
+    make_kernel_ptr_table,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -156,10 +157,10 @@ class DSAIndexerPoolHost(HostKVCache):
             self.index_k_data_refs = [
                 self.index_k_with_scale_buffer[i] for i in range(self.layer_num)
             ]
-            self.index_k_data_ptrs = torch.tensor(
-                [x.data_ptr() for x in self.index_k_data_refs],
-                dtype=torch.uint64,
-                device=self.device_pool.device,
+            self.index_k_data_ptrs = make_kernel_ptr_table(
+                self.index_k_data_refs,
+                self.device_pool.device,
+                host_memory_registered=self.pin_memory,
             )
         elif self.layout in ["page_first", "page_first_direct"]:
             self.index_k_with_scale_buffer = alloc_func(

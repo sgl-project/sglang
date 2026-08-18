@@ -23,7 +23,10 @@ from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
 )
-from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
+    make_kernel_ptr_table,
+)
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -99,10 +102,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.data_refs = [transposed[i] for i in range(self.layer_num)]
         else:
             self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
-        self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
+        self.data_ptrs = make_kernel_ptr_table(
+            self.data_refs,
+            self.device_pool.device,
+            host_memory_registered=self.pin_memory,
         )
         if self.mtp_draft_device_pools:
             device_pools = (self.device_pool, *self.mtp_draft_device_pools)
@@ -117,7 +120,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def get_contiguous_buf_infos(self):
         """Return (data_ptrs, data_lens, item_lens) in the same format as device pool,
         for registering host memory with the disaggregation transfer engine."""
-        data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
+        data_ptrs = [tensor.data_ptr() for tensor in self.data_refs]
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
         item_lens = [self.token_stride_size * self.page_size] * self.layer_num
         return data_ptrs, data_lens, item_lens

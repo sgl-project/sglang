@@ -115,8 +115,8 @@ struct TransferMambaKernel {
     dim3 grid(grid_x);
 
     const auto params = MambaTransferParams{
-        .src_base = static_cast<const char*>(src.data_ptr()),
-        .dst_base = static_cast<char*>(dst.data_ptr()),
+        .src_base = static_cast<const char*>(device_accessible_ptr(src, device)),
+        .dst_base = static_cast<char*>(device_accessible_ptr(dst, device)),
         .layer_ptrs = nullptr,
         .src_indices = static_cast<const int64_t*>(src_indices.data_ptr()),
         .dst_indices = static_cast<const int64_t*>(dst_indices.data_ptr()),
@@ -169,7 +169,7 @@ struct TransferMambaKernel {
 
     const auto params = MambaTransferParams{
         .src_base = nullptr,
-        .dst_base = static_cast<char*>(dst.data_ptr()),
+        .dst_base = static_cast<char*>(device_accessible_ptr(dst, device)),
         .layer_ptrs = static_cast<const uintptr_t*>(src_ptrs.data_ptr()),
         .src_indices = static_cast<const int64_t*>(src_indices.data_ptr()),
         .dst_indices = static_cast<const int64_t*>(dst_indices.data_ptr()),
