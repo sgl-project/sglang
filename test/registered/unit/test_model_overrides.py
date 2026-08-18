@@ -253,15 +253,19 @@ class TestPublishInstallsSlot(_IsolatedPublish):
     """Publish wiring: set_server_args installs the already-resolved object
     into the context-owned slot (no transformation at publish time)."""
 
-    def test_dummy_fixture_has_empty_stash_and_publishes_cleanly(self):
+    def test_dummy_fixture_publishes_the_object_it_resolved(self):
         from sglang.srt.server_args import (
             ServerArgs,
             set_global_server_args_for_scheduler,
         )
 
         sa = ServerArgs(model_path="dummy")  # __post_init__ early-returns
-        # The stash is created before the dummy short-circuit and stays empty.
-        self.assertEqual(sa._resolved_overrides, [])
+        # A dummy path short-circuits the pipeline, but the handlers ahead of
+        # that point still declare; whatever they left in the stash is on the
+        # object by the time publish sees it.
+        for source, declared in sa._resolved_overrides:
+            for field, value in declared.items():
+                self.assertEqual(getattr(sa, field), value, f"{source}: {field}")
         set_global_server_args_for_scheduler(sa)
         self.assertIs(get_server_args(), sa)
 
