@@ -696,7 +696,7 @@ def forward_dsa_prepare_npu(
         if dsa_use_prefill_cp(forward_batch):
             latent_cache[..., : m.kv_lora_rank] = k_nope.squeeze(1)
             latent_cache[..., m.kv_lora_rank:] = k_pe.squeeze(1)
-            _, cp_hidden_size = input_tensor.shape
+            _, cp_hidden_size = latent_cache.contiguous().shape
             cp_handle, cp_kv_full = cp_all_gather_rerange_kv_cache_launch(
                 latent_cache.contiguous(),
                 m.cp_size,
