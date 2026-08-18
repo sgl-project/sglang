@@ -270,6 +270,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
         server_args.enable_torch_compile = False
+        server_args.num_gpus = 1
 
         server_args.pipeline_config.task_type = ModelTaskType.T2V
         server_args.pipeline_config.adjust_num_frames.side_effect = lambda value: value
@@ -362,6 +363,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
         server_args.enable_torch_compile = False
+        server_args.num_gpus = 1
 
         server_args.pipeline_config.task_type = ModelTaskType.T2V
         server_args.pipeline_config.adjust_num_frames.side_effect = lambda value: value
@@ -474,6 +476,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
         server_args.enable_torch_compile = False
+        server_args.num_gpus = 1
 
         server_args.pipeline_config.task_type = ModelTaskType.T2V
         server_args.pipeline_config.adjust_num_frames.side_effect = lambda value: value
@@ -502,6 +505,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args = SimpleNamespace(
             pipeline_config=pipeline_config,
             enable_breakable_cuda_graph=False,
+            num_gpus=1,
         )
 
         num_frames = _resolve_warmup_num_frames(
@@ -523,6 +527,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
         server_args.enable_torch_compile = False
+        server_args.num_gpus = 1
 
         server_args.pipeline_config.task_type = ModelTaskType.T2V
         server_args.pipeline_config.adjust_num_frames.side_effect = lambda value: value
@@ -559,6 +564,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
         server_args.enable_torch_compile = False
+        server_args.num_gpus = 1
         server_args.pipeline_class_name = "LTX2TwoStageHQPipeline"
 
         server_args.pipeline_config.task_type = ModelTaskType.T2V
@@ -757,6 +763,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         server_args.warmup_steps = 1
         server_args.enable_cfg_parallel = False
         server_args.enable_torch_compile = False
+        server_args.num_gpus = 1
         server_args.pipeline_config.task_type = ModelTaskType.TI2V
 
         with patch(

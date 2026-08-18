@@ -273,8 +273,12 @@ def _apply_warmup_frame_contract(
     the same latent alignment real requests get.
     """
     num_frames = server_args.pipeline_config.adjust_num_frames(num_frames)
-    if sampling_defaults.adjust_frames and not resolve_sequence_shard(
-        server_args.pipeline_config, sampling_defaults.enable_sequence_shard
+    if (
+        sampling_defaults.adjust_frames
+        and not resolve_sequence_shard(
+            server_args.pipeline_config, sampling_defaults.enable_sequence_shard
+        )
+        and server_args.num_gpus > 1
     ):
         num_frames = align_num_frames_for_num_gpus(
             num_frames,
