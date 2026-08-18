@@ -438,6 +438,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From csrc/mamba
    */
+  // Compatibility API: SGLang dispatches to the JIT implementation, but external
+  // sgl_kernel consumers still rely on these exported CUDA ops.
   m.def(
       "causal_conv1d_update(Tensor! x,"
       "Tensor! conv_state,"
