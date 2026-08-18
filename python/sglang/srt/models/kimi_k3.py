@@ -706,6 +706,20 @@ class KimiK3MoE(nn.Module):
             and self.moe_hidden_size == k3_ar_fusion.NORM_DIM
             and hidden_size == 2 * k3_ar_fusion.NORM_DIM
         )
+        self._npu_fused_latent_norm_quant = False
+        if (
+            _is_npu
+            and envs.SGLANG_NPU_FUSED_RMS_QUANT.get()
+            and self.routed_expert_norm is not None
+            and self.routed_expert_up_proj is not None
+        ):
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                supports_npu_prequantized_input,
+            )
+
+            self._npu_fused_latent_norm_quant = supports_npu_prequantized_input(
+                self.routed_expert_up_proj
+            )
         # Static eligibility for the column-parallel up_proj tail (gemm_ag):
         # per-rank 1/8-column GEMV -> multicast all-gather staged in the v2
         # push workspace -> spin-add3 with shared_output (+ prefix_sum),
@@ -890,9 +904,21 @@ class KimiK3MoE(nn.Module):
                 y.mul_(self.routed_scaling_factor)
         return y
 
-    def _latent_norm(self, latent: torch.Tensor) -> torch.Tensor:
+    def _latent_norm(
+        self, latent: torch.Tensor, *, quantize_for_up_proj: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.routed_expert_norm is None:
             return latent
+        if quantize_for_up_proj and self._npu_fused_latent_norm_quant:
+            quant, _, _, scale, _ = torch.ops.npu.npu_add_rms_norm_dynamic_quant(
+                latent,
+                latent,
+                self.routed_expert_norm.weight,
+                epsilon=4 * self.routed_expert_norm.variance_epsilon,
+                output_mask=[True, False],
+                y_dtype=torch.int8,
+            )
+            return quant, scale
         return self.routed_expert_norm(latent)
 
     @cached_property
@@ -1025,12 +1051,16 @@ class KimiK3MoE(nn.Module):
                 value.record_stream(current_stream)
         return topk_output, routed_input
 
-    def _reduce_latent(self, latent: torch.Tensor) -> torch.Tensor:
+    def _reduce_latent(
+        self, latent: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Unfused-front latent tail: TP-partial routed sums must be reduced
         in latent space BEFORE the RMSNorm (sum(norm(x_i)) != norm(sum(x_i)))."""
         if not self._routed_needs_reduce:
-            return self._latent_norm(latent)
-        return self._latent_norm(tensor_model_parallel_all_reduce(latent))
+            return self._latent_norm(latent, quantize_for_up_proj=True)
+        return self._latent_norm(
+            tensor_model_parallel_all_reduce(latent), quantize_for_up_proj=True
+        )
 
     def _prepare_shared_experts_input(
         self, hidden_states: torch.Tensor

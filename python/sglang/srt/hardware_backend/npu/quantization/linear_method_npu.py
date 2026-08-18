@@ -239,7 +239,14 @@ def supports_npu_fused_collective_matmul(layer: torch.nn.Module) -> bool:
     """Whether a linear has the exact dynamic-int8 contract of the fused ops."""
     return (
         envs.SGLANG_NPU_FUSED_COLLECTIVE_MATMUL.get()
-        and getattr(layer, "bias", None) is None
+        and supports_npu_prequantized_input(layer)
+    )
+
+
+def supports_npu_prequantized_input(layer: torch.nn.Module) -> bool:
+    """Whether a linear consumes a precomputed dynamic-int8 input tuple."""
+    return (
+        getattr(layer, "bias", None) is None
         and _get_w8a8_dynamic_kernel(layer) is not None
     )
 

@@ -865,6 +865,8 @@ class Envs:
     SGLANG_K3_DENSE_MLP_ATTN_TP = EnvBool(False)
     # Fuse attention-TP collectives with dynamic-int8 dense matmuls.
     SGLANG_NPU_FUSED_COLLECTIVE_MATMUL = EnvBool(False)
+    # Fuse K3 latent RMSNorm with the dynamic-int8 quantization for up-proj.
+    SGLANG_NPU_FUSED_RMS_QUANT = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
