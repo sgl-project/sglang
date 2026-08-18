@@ -1926,8 +1926,8 @@ class OpenAIServingChat(OpenAIServingBase):
             stripped_text = self._strip_template_artifacts(
                 text, reasoning_separated=reasoning_text is not None
             )
-            # Only the cleanup above is span deletion, so realigning text the other
-            # parsers already reshaped would drop logprobs they used to return.
+            # Only this cleanup is span deletion; text the other parsers reshaped
+            # cannot be realigned.
             if choice_logprobs is not None and stripped_text != text:
                 aligned = align_token_logprobs_to_text(
                     choice_logprobs.content, stripped_text

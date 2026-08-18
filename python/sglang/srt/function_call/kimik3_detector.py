@@ -72,8 +72,8 @@ def _parse_attrs(attrs: str) -> dict:
 
 
 def _strip_template_markers(text: str) -> str:
-    # Before whole markers, or the surviving half of a cut one stays glued to the
-    # text as ``tool``. Two characters minimum keeps a reply ending in ``<``.
+    # Cut markers first: their surviving half looks like plain text to the
+    # regexes below. Two characters minimum keeps a reply ending in ``<``.
     holdback = partial_suffix_len(text, ALL_MARKERS, min_len=2)
     if holdback:
         text = text[:-holdback]
@@ -101,7 +101,8 @@ def _strip_template_artifacts(text: str, reasoning_separated: bool = False) -> s
         close_idx = text.find(THINK_CLOSE)
         if close_idx != -1:
             text = text[close_idx + len(THINK_CLOSE) :]
-        # Unwrapping would also cut the trace the caller asked to keep inline.
+        # Only safe once the trace is gone: otherwise this drops it along with
+        # the wrappers, even though the caller wanted it inline.
         text = strip_response_wrappers(text)
     return _strip_template_markers(text)
 

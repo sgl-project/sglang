@@ -935,8 +935,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             cleaned = self._strip_template_artifacts(
                 content, reasoning_separated=reasoning_content is not None
             )
-            # Only the cleanup above is span deletion, so realigning text the other
-            # parsers already reshaped would drop logprobs they used to return.
+            # Only this cleanup is span deletion; text the other parsers reshaped
+            # cannot be realigned.
             if output_logprobs is not None and cleaned != content:
                 output_logprobs = align_token_logprobs_to_text(output_logprobs, cleaned)
             content = cleaned
