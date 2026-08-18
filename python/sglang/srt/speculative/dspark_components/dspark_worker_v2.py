@@ -38,10 +38,10 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
     DraftBlockResult,
     make_next_draft_input,
+    resolve_greedy_mask,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
-    resolve_greedy_mask,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
