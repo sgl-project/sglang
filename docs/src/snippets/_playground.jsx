@@ -171,11 +171,19 @@ export const Playground = ({ config }) => {
     return null;
   };
 
-  // hw|variant|quant → variant|quant → "".
+  // hw|variant|quant → variant|quant → hw|quant → quant → "".
   const resolveModelName = (sel) => {
-    const triple = `${sel.hw}|${sel.variant}|${sel.quant}`;
-    const pair = `${sel.variant}|${sel.quant}`;
-    return config.modelNames[triple] ?? config.modelNames[pair] ?? "";
+    const keys = [
+      `${sel.hw}|${sel.variant}|${sel.quant}`,
+      `${sel.variant}|${sel.quant}`,
+      `${sel.hw}|${sel.quant}`,
+      sel.quant,
+    ];
+    for (const k of keys) {
+      const hit = config.modelNames[k];
+      if (hit) return hit;
+    }
+    return "";
   };
 
   const interpolate = (text, env, modelName) =>

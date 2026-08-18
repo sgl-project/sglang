@@ -2745,6 +2745,7 @@ class NixlKVSender(CommonKVSender):
             pp_rank,
             req_has_disagg_prefill_dp_rank,
         )
+        self.init_time = time.time()
         self.has_sent = False
         self.chunk_id = 0
         self._send_failed = False
@@ -2790,6 +2791,10 @@ class NixlKVSender(CommonKVSender):
         if self._send_failed:
             return KVPoll.Failed  # type: ignore
         status = self.kv_mgr.check_status(self.bootstrap_room)
+        if status == KVPoll.Bootstrapping:
+            timeout_result = self._check_bootstrap_timeout()
+            if timeout_result is not None:
+                return timeout_result
         # Hold Success until all staging chunks transferred: a deferred chunk
         # can still be pending, and concluding now would drop it.
         if (

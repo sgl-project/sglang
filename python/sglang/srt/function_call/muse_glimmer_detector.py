@@ -251,6 +251,11 @@ class MuseGlimmerDetector(BaseFormatDetector):
     def supports_structural_tag(self) -> bool:
         return False
 
+    def parses_required_natively(self) -> bool:
+        """The model only ever emits ATEM tool calls, so the JSON-array grammar
+        the default required/named path forces cannot parse its output."""
+        return True
+
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
             begin=f'{FUNCTION_CALLS_OPEN}\n{INVOKE_OPEN} name="{name}">',

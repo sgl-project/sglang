@@ -13,9 +13,7 @@ gate+norm+rotate compression itself) is a deferred follow-up.
 """
 
 import importlib.util
-import sys
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -23,8 +21,6 @@ import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 _FLASH_MLA_AVAILABLE = (
     importlib.util.find_spec("sgl_kernel") is not None

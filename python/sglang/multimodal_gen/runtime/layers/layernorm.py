@@ -973,11 +973,15 @@ def apply_qk_norm_rope(
     position_offset: int = 0,
     allow_inplace: bool = True,
     allow_strided_qk: bool = False,
+    round_norm_before_rope: bool = False,
+    cache_has_full_width: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply QK RMSNorm followed by RoPE, fusing supported CUDA/XPU shapes.
 
     Strided packed-QKV views require an explicit opt-in because selecting the fused
     kernel changes the numerical path for models that historically used the fallback.
+    ``cache_has_full_width`` describes ``[full cos, full sin]`` cache rows and
+    requires the fused CUDA path; the ordinary cache stores half-width cos/sin.
     """
 
     from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
@@ -1004,7 +1008,12 @@ def apply_qk_norm_rope(
     batch_size, seq_len, _, _ = q.shape
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
-    rope_dim = cos_sin_cache.size(-1)
+    cache_width = cos_sin_cache.size(-1)
+    if cache_has_full_width and cache_width % 2:
+        raise ValueError(
+            f"full-width cos/sin cache must have even width, got {cache_width}"
+        )
+    rope_dim = cache_width // 2 if cache_has_full_width else cache_width
     if rope_dim % 2 != 0 or rope_dim > head_dim:
         raise ValueError(
             f"cos_sin_cache width must be even and <= head_dim, got {rope_dim} vs {head_dim}"
@@ -1054,7 +1063,15 @@ def apply_qk_norm_rope(
         and k_norm.weight.dtype == k.dtype
         and q_has_supported_layout
         and k_has_supported_layout
-        and can_use_fused_inplace_qknorm_rope(head_dim, rope_dim, is_neox, q.dtype)
+        and can_use_fused_inplace_qknorm_rope(
+            head_dim=head_dim,
+            rope_dim=rope_dim,
+            is_neox=is_neox,
+            dtype=q.dtype,
+            cache_dtype=cos_sin_cache.dtype,
+            round_norm_before_rope=round_norm_before_rope,
+            cache_has_full_width=cache_has_full_width,
+        )
     ):
         fused_inplace_qknorm_rope(
             q=q.view(-1, q.shape[-2], head_dim),
@@ -1067,8 +1084,13 @@ def apply_qk_norm_rope(
             eps=q_eps,
             head_dim=head_dim,
             rope_dim=rope_dim,
+            round_norm_before_rope=round_norm_before_rope,
+            cache_has_full_width=cache_has_full_width,
         )
         return q, k
+
+    if cache_has_full_width:
+        raise RuntimeError("full-width cos/sin cache requires fused QKNorm+RoPE")
 
     if (
         _is_xpu
