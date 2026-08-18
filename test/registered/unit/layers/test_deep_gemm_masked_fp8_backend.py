@@ -10,6 +10,9 @@ class _FakeTensor:
     def __init__(self, shape):
         self.shape = shape
 
+    def is_contiguous(self):
+        return True
+
 
 class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
     def setUp(self):
