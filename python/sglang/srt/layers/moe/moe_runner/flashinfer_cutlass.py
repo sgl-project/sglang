@@ -8,6 +8,7 @@ Quantization methods prepare a small quant_info payload and route through
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -89,6 +90,10 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     swiglu_beta: Optional[torch.Tensor] = None
     swiglu_limit: Optional[torch.Tensor] = None
 
+    # Optional per-expert SiTU scales, fp32 [E] (FlashInfer PR #4460).
+    situ_beta: Optional[torch.Tensor] = None
+    situ_linear_beta: Optional[torch.Tensor] = None
+
     # TP/EP topology (forwarded to the FlashInfer kernel)
     moe_tp_size: int = 1
     moe_tp_rank: int = 0
@@ -109,6 +114,20 @@ def _flashinfer_cutlass_fused_moe():
     from flashinfer.fused_moe.core import ActivationType
 
     return cutlass_fused_moe, ActivationType
+
+
+def flashinfer_cutlass_supports_situ() -> bool:
+    """Return whether the installed FlashInfer exposes the PR #4460 API."""
+    try:
+        cutlass_fused_moe, activation_type = _flashinfer_cutlass_fused_moe()
+        parameters = inspect.signature(cutlass_fused_moe).parameters
+    except (ImportError, RuntimeError, TypeError, ValueError):
+        return False
+    return (
+        hasattr(activation_type, "Situ")
+        and "situ_beta" in parameters
+        and "situ_linear_beta" in parameters
+    )
 
 
 def _activation_type(runner_config: MoeRunnerConfig):
@@ -385,6 +404,8 @@ def fused_experts_none_to_flashinfer_mxfp4(
         swiglu_alpha=quant_info.swiglu_alpha,
         swiglu_beta=quant_info.swiglu_beta,
         swiglu_limit=quant_info.swiglu_limit,
+        situ_beta=quant_info.situ_beta,
+        situ_linear_beta=quant_info.situ_linear_beta,
         tp_size=quant_info.moe_tp_size,
         tp_rank=quant_info.moe_tp_rank,
         ep_size=quant_info.moe_ep_size,

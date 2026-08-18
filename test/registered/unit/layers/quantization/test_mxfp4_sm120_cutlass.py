@@ -106,9 +106,8 @@ def test_dsv4_sm120_load_contract(monkeypatch):
 
 
 def test_kimi_k3_sm120_situ_requires_patched_flashinfer(monkeypatch):
-    from flashinfer.fused_moe import core as flashinfer_moe_core
-
     import sglang.srt.layers.quantization.mxfp4 as mxfp4_module
+    import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as runner_module
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
     from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
@@ -118,8 +117,8 @@ def test_kimi_k3_sm120_situ_requires_patched_flashinfer(monkeypatch):
         "get_moe_runner_backend",
         lambda: MoeRunnerBackend.FLASHINFER_MXFP4,
     )
-    monkeypatch.delattr(
-        flashinfer_moe_core, "CUTLASS_FUSED_MOE_SUPPORTS_SITU", raising=False
+    monkeypatch.setattr(
+        runner_module, "flashinfer_cutlass_supports_situ", lambda: False
     )
 
     method = Mxfp4MoEMethod.__new__(Mxfp4MoEMethod)
@@ -466,12 +465,8 @@ def test_kimi_k3_sm120_situ_layout_and_noncontiguous_input(monkeypatch):
     pytest.importorskip("flashinfer.fused_moe")
 
     from flashinfer import block_scale_interleave, mxfp8_quantize
-    from flashinfer.fused_moe import core as flashinfer_moe_core
     from flashinfer.fused_moe import cutlass_fused_moe
     from flashinfer.fused_moe.core import ActivationType
-
-    if not getattr(flashinfer_moe_core, "CUTLASS_FUSED_MOE_SUPPORTS_SITU", False):
-        pytest.skip("FlashInfer CUTLASS SiTU support required")
 
     import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as runner_module
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -480,6 +475,9 @@ def test_kimi_k3_sm120_situ_layout_and_noncontiguous_input(monkeypatch):
     from sglang.srt.layers.moe.topk import StandardTopKOutput
     from sglang.srt.layers.moe.utils import MoeRunnerBackend
     from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+    if not runner_module.flashinfer_cutlass_supports_situ():
+        pytest.skip("FlashInfer CUTLASS SiTU support from PR #4460 required")
 
     monkeypatch.setattr(
         runner_module, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
@@ -552,9 +550,11 @@ def test_kimi_k3_sm120_situ_layout_and_noncontiguous_input(monkeypatch):
     ).reshape_as(layer.w13_weight_scale)
     assert torch.equal(layer.w13_weight, expected_w13)
     assert torch.equal(layer.w13_weight_scale, expected_w13_scale)
-    assert torch.all(layer.swiglu_alpha == 4.0)
-    assert torch.all(layer.swiglu_beta == 25.0)
+    assert layer.swiglu_alpha is None
+    assert layer.swiglu_beta is None
     assert layer.swiglu_limit is None
+    assert torch.all(layer.situ_beta == 4.0)
+    assert torch.all(layer.situ_linear_beta == 25.0)
     assert runner_module._activation_type(config) == ActivationType.Situ
 
     x = (
@@ -603,9 +603,8 @@ def test_kimi_k3_sm120_situ_layout_and_noncontiguous_input(monkeypatch):
             layer.mxfp4_weight_global_scale,
         ],
         input_sf=x_scale,
-        swiglu_alpha=layer.swiglu_alpha,
-        swiglu_beta=layer.swiglu_beta,
-        swiglu_limit=None,
+        situ_beta=layer.situ_beta,
+        situ_linear_beta=layer.situ_linear_beta,
         use_w4_group_scaling=False,
         use_mxfp8_act_scaling=True,
         activation_type=ActivationType.Situ,

@@ -1241,27 +1241,52 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         beta = self.moe_runner_config.gemm1_beta
         limit = self.moe_runner_config.gemm1_clamp_limit
         if activation == "situ":
-            alpha = 4.0 if alpha is None else alpha
-            beta = 25.0 if limit is None else limit
-            limit = None
+            situ_beta = 4.0 if alpha is None else alpha
+            situ_linear_beta = 25.0 if limit is None else limit
+            alpha = beta = limit = None
         else:
+            situ_beta = situ_linear_beta = None
             alpha = 1.702 if alpha is None else alpha
             beta = 1.0 if beta is None else beta
             limit = 7.0 if limit is None else limit
 
-        layer.swiglu_alpha = Parameter(
-            torch.full((E,), alpha, dtype=torch.float32, device=device),
-            requires_grad=False,
+        layer.swiglu_alpha = (
+            None
+            if alpha is None
+            else Parameter(
+                torch.full((E,), alpha, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
         )
-        layer.swiglu_beta = Parameter(
-            torch.full((E,), beta, dtype=torch.float32, device=device),
-            requires_grad=False,
+        layer.swiglu_beta = (
+            None
+            if beta is None
+            else Parameter(
+                torch.full((E,), beta, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
         )
         layer.swiglu_limit = (
             None
             if limit is None
             else Parameter(
                 torch.full((E,), limit, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
+        )
+        layer.situ_beta = (
+            None
+            if situ_beta is None
+            else Parameter(
+                torch.full((E,), situ_beta, dtype=torch.float32, device=device),
+                requires_grad=False,
+            )
+        )
+        layer.situ_linear_beta = (
+            None
+            if situ_linear_beta is None
+            else Parameter(
+                torch.full((E,), situ_linear_beta, dtype=torch.float32, device=device),
                 requires_grad=False,
             )
         )
@@ -1310,15 +1335,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self._fi_kernel == "cutlass_sm120"
                 and moe_runner_config.activation == "situ"
             ):
-                from flashinfer.fused_moe import core as flashinfer_moe_core
+                from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                    flashinfer_cutlass_supports_situ,
+                )
 
-                if not getattr(
-                    flashinfer_moe_core, "CUTLASS_FUSED_MOE_SUPPORTS_SITU", False
-                ):
+                if not flashinfer_cutlass_supports_situ():
                     raise RuntimeError(
                         "Kimi-K3 FlashInfer MXFP4 MoE on SM120 requires a "
-                        "FlashInfer build with CUTLASS SiTU support. Upgrade "
-                        "FlashInfer or restart with --moe-runner-backend marlin."
+                        "FlashInfer build with CUTLASS SiTU support from PR #4460 "
+                        "(ActivationType.Situ plus situ_beta/situ_linear_beta). "
+                        "Upgrade FlashInfer or restart with "
+                        "--moe-runner-backend marlin."
                     )
             # Register the fused func at runner construction so the FusedOpPool
             # lookup at `MoeRunner.__init__` finds it.
@@ -1396,6 +1423,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             swiglu_alpha=layer.swiglu_alpha,
             swiglu_beta=layer.swiglu_beta,
             swiglu_limit=layer.swiglu_limit,
+            situ_beta=layer.situ_beta,
+            situ_linear_beta=layer.situ_linear_beta,
             moe_tp_size=layer.moe_tp_size,
             moe_tp_rank=layer.moe_tp_rank,
             moe_ep_size=layer.moe_ep_size,
