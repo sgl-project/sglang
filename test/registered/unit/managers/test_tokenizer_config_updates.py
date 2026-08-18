@@ -1,9 +1,9 @@
-"""Control-plane config updates stay on the tokenizer manager.
+"""Control-plane config updates go into the process log, not onto the record.
 
 Regression: runtime updates (weight version, model path, HiCache attach) were
 written onto the manager's ServerArgs instance so that the readback endpoints
-would show them. They are per-engine — several Engines can share a tokenizer
-process — so they live on the manager and the endpoints overlay them.
+would show them. The record stays pristine; the update lands in the runtime
+context, which is where a reader of any field asks for the value in effect.
 """
 
 import re
@@ -12,6 +12,7 @@ from pathlib import Path
 
 import sglang
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -19,33 +20,31 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _manager(**fields):
+def _manager(case, **fields):
+    """A manager over a published config: the updates it records go to the bags."""
+    server_args = ServerArgs(model_path="dummy", **fields)
+    publish(server_args, role="tokenizer")
+    case.addCleanup(reset_context)
     manager = TokenizerManager.__new__(TokenizerManager)
-    manager.server_args = ServerArgs(model_path="dummy", **fields)
-    manager._config_updates = []
+    manager.server_args = server_args
     return manager
 
 
 class TestTokenizerConfigUpdates(CustomTestCase):
     def test_startup_config_shows_through_until_something_updates_it(self):
-        manager = _manager(weight_version="v1")
+        manager = _manager(self, weight_version="v1")
         self.assertEqual(manager.config_value("weight_version"), "v1")
 
         manager.record_config_updates("test", weight_version="v2")
         self.assertEqual(manager.config_value("weight_version"), "v2")
 
     def test_the_serverargs_instance_is_not_written(self):
-        manager = _manager(weight_version="v1")
+        manager = _manager(self, weight_version="v1")
         manager.record_config_updates("test", weight_version="v2")
         self.assertEqual(manager.server_args.weight_version, "v1")
 
-    def test_two_engines_keep_their_own_updates(self):
-        first, second = _manager(weight_version="v1"), _manager(weight_version="v1")
-        first.record_config_updates("test", weight_version="v2")
-        self.assertEqual(second.config_value("weight_version"), "v1")
-
     def test_the_readback_dict_carries_the_updates(self):
-        manager = _manager(hicache_storage_backend=None)
+        manager = _manager(self, hicache_storage_backend=None)
         manager.record_config_updates(
             "test", hicache_storage_backend="file", hicache_write_policy="write_through"
         )
@@ -59,7 +58,7 @@ class TestTokenizerConfigUpdates(CustomTestCase):
         self.assertEqual(resolved["model_path"], "dummy")
 
     def test_detach_reports_the_backend_as_gone(self):
-        manager = _manager(hicache_storage_backend="file")
+        manager = _manager(self, hicache_storage_backend="file")
         manager.record_config_updates(
             "test",
             hicache_storage_backend=None,
@@ -68,22 +67,27 @@ class TestTokenizerConfigUpdates(CustomTestCase):
         self.assertIsNone(manager.config_value("hicache_storage_backend"))
 
     def test_an_unknown_field_is_refused(self):
-        manager = _manager()
-        with self.assertRaisesRegex(ValueError, "not ServerArgs fields"):
+        manager = _manager(self)
+        with self.assertRaisesRegex(ValueError, "not a resolved config leaf"):
             manager.record_config_updates("test", waight_version="v2")
 
+    def test_a_name_that_is_not_a_config_leaf_is_refused(self):
+        manager = _manager(self)
+        with self.assertRaisesRegex(ValueError, "not a config leaf"):
+            manager.config_value("waight_version")
+
     def test_the_source_is_kept_for_provenance(self):
-        manager = _manager(weight_version="v1")
+        manager = _manager(self, weight_version="v1")
         manager.record_config_updates("http.update_weight_version", weight_version="v2")
         self.assertEqual(
-            manager._config_updates,
+            get_context().overrides_log(),
             [("http.update_weight_version", {"weight_version": "v2"})],
         )
 
     def test_the_dump_snapshot_identifies_the_running_checkpoint(self):
         import dataclasses
 
-        manager = _manager(load_format="auto")
+        manager = _manager(self, load_format="auto")
         manager.model_path = "at-startup"
         manager.served_model_name = "at-startup"
         manager._update_model_path_info("after-reload", "dummy")
@@ -92,6 +96,10 @@ class TestTokenizerConfigUpdates(CustomTestCase):
         self.assertEqual(snapshot["model_path"], "after-reload")
         self.assertEqual(snapshot["served_model_name"], "after-reload")
         self.assertEqual(snapshot["load_format"], "dummy")
+        self.assertEqual(
+            get_context().overrides_log(),
+            [("tokenizer.update_weights", {"load_format": "dummy"})],
+        )
         self.assertEqual(manager.server_args.model_path, "dummy")
 
     def test_an_unsnapshotable_config_does_not_lose_the_dump(self):
@@ -99,7 +107,7 @@ class TestTokenizerConfigUpdates(CustomTestCase):
             def __deepcopy__(self, memo):
                 raise RuntimeError("refuses to be copied")
 
-        manager = _manager()
+        manager = _manager(self)
         manager.model_path = "dummy"
         manager.served_model_name = "dummy"
         manager.server_args.custom_sigquit_handler = Hostile()
@@ -110,7 +118,7 @@ class TestTokenizerConfigUpdates(CustomTestCase):
         import dataclasses
         import pickle
 
-        manager = _manager()
+        manager = _manager(self)
         manager.model_path = "dummy"
         manager.served_model_name = "dummy"
         # What --custom-sigquit-handler leaves on a real ServerArgs.
@@ -118,7 +126,7 @@ class TestTokenizerConfigUpdates(CustomTestCase):
 
         payload = {
             "server_args": manager.server_args,
-            "config_updates": list(manager._config_updates),
+            "config_updates": get_context().overrides_log(),
             "resolved_config": manager.resolved_config_dict(
                 dataclasses.asdict(manager.server_args)
             ),
@@ -133,7 +141,7 @@ class TestTokenizerConfigUpdates(CustomTestCase):
         self.assertTrue(pickle.dumps(payload))
 
     def test_the_model_path_readback_follows_the_manager(self):
-        manager = _manager()
+        manager = _manager(self)
         manager.model_path = "after-update"
         manager.served_model_name = "after-update"
         resolved = manager.resolved_config_dict({"model_path": "at-startup"})
@@ -205,8 +213,9 @@ class TestControlPlaneFieldsAreNotReadFromTheInstance(CustomTestCase):
         self.assertEqual(
             stale,
             [],
-            "control-plane fields change at runtime and the update lives on the "
-            "TokenizerManager; read them with config_value() / "
+            "control-plane fields change at runtime and the update lands in "
+            "the process bags (model_path / served_model_name stay manager "
+            "attributes); read them with config_value() / "
             "resolved_config_dict() so the readback reflects the change:\n"
             + "\n".join(stale),
         )
