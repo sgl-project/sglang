@@ -1715,3 +1715,65 @@ class KVarNAttnBackend(AttentionBackend):
         if block_id in self._block_to_slot:
             self._flush_block(block_id)
             self._sink_block_ids.discard(block_id)
+
+
+class KVarNMultiStepDraftBackend:
+    """Wrap a single shared KVarNAttnBackend for multi-step EAGLE draft decoding.
+
+    The EAGLE draft worker creates N-1 attention backends (one per speculative
+    step after the seed). For KVarN, all steps share the same backend instance
+    because the draft model's KV cache (tail pool + int4 compressed cache) is a
+    single physical allocation — duplicating it per step would waste GPU memory
+    and break the block-to-slot mapping.
+
+    This wrapper exposes the same interface as ``FlashInferMultiStepDraftBackend``
+    (``attn_backends``, ``init_forward_metadata``, ``init_forward_metadata_out_graph``,
+    ``init_forward_metadata_in_graph``, ``init_cuda_graph_state``) so the EAGLE
+    worker can use it transparently.
+    """
+
+    needs_cpu_seq_lens: bool = False
+
+    def __init__(
+        self,
+        model_runner: "ModelRunner",
+        topk: int,
+        speculative_num_steps: int,
+    ):
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+        self.model_runner = model_runner
+        self.device = model_runner.device
+
+        # Create one shared KVarNAttnBackend for all draft steps.
+        self._backend = KVarNAttnBackend(model_runner)
+
+        # Expose the same attributes as FlashInferMultiStepDraftBackend
+        self.max_context_len = getattr(
+            self._backend, "max_context_len", model_runner.model_config.context_len
+        )
+        self.page_size = model_runner.page_size
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+
+        # The EAGLE worker accesses self.attn_backends[i] for step i.
+        # All steps share the same backend instance.
+        self.attn_backends = [self._backend] * (speculative_num_steps - 1)
+
+    def init_forward_metadata(self, forward_batch: "ForwardBatch"):
+        self._backend.init_forward_metadata(forward_batch)
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: "ForwardBatch",
+        in_capture: bool = False,
+    ):
+        self._backend.init_forward_metadata_out_graph(
+            forward_batch, in_capture=in_capture
+        )
+
+    def init_forward_metadata_in_graph(self, forward_batch: "ForwardBatch"):
+        self._backend.init_forward_metadata_in_graph(forward_batch)
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        self._backend.init_cuda_graph_state(max_bs, max_num_tokens)

@@ -30,6 +30,7 @@ _SUPPORTED_DRAFT_BACKENDS = (
     "triton",
     "ascend",
     "trtllm_mha",
+    "kvarn",
 )
 
 

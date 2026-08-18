@@ -433,6 +433,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
             graph_supported_backend_types.append(DeepseekV4AttnBackend)
+            # KVarN is CUDA-only; import lazily so non-CUDA builds don't pull
+            # in the kvarn triton kernels at import time.
+            from sglang.srt.layers.attention.kvarn_backend import KVarNAttnBackend
+
+            graph_supported_backend_types.append(KVarNAttnBackend)
         if _is_cuda:
             # FlashMLA is CUDA-only; import lazily so CPU builds don't pull
             # sgl_kernel.flash_mla at import time.
