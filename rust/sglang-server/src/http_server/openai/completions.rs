@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
@@ -34,7 +35,7 @@ use crate::message::sampling::SamplingParams;
 use crate::message::types::{OneOrMany, TokenIds};
 use crate::utils::error::Error;
 
-pub(super) fn routes() -> Router<AppState> {
+pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/completions", post(completions))
 }
 
@@ -60,7 +61,7 @@ pub(super) struct ChoiceExtensions {
 }
 
 async fn completions(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     body: Result<Json<CreateCompletionRequest>, JsonRejection>,
 ) -> Response {
     let request = match body {

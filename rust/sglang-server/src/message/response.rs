@@ -66,7 +66,7 @@ pub enum ResponseItem {
 /// a single control-request result payload.
 pub const EGRESS_TAG_RESULT: u8 = 1;
 /// A whole decode batch: msgpack columnar header + one concatenated raw buffer;
-/// tm-egress decodes it into per-request [`ChunkEvent`]s (no per-request FFI).
+/// from-scheduler decodes it into per-request [`ChunkEvent`]s (no per-request FFI).
 pub const EGRESS_TAG_BATCH: u8 = 2;
 /// A per-request failure `[rid, message]`: the Python drain couldn't decode a
 /// header, so it routes a 400 back to that request instead of crashing the loop.
@@ -106,7 +106,7 @@ fn take_i32(data: &[u8], off: &mut usize, n: usize) -> Option<Vec<i32>> {
 /// Frame a decode batch: `[BATCH tag][u32 header len][header][data cols…]`. The
 /// caller's `data_cols` are concatenated straight into the frame (one copy, no
 /// `b"".join`); `header` is the msgpack [`BatchHeader`]. Runs off the GIL.
-pub fn frame_egress_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
+pub fn frame_decode_batch_cols(header: &[u8], data_cols: &[&[u8]]) -> Bytes {
     let data_len: usize = data_cols.iter().map(|c| c.len()).sum();
     let mut buf = Vec::with_capacity(1 + 4 + header.len() + data_len);
     buf.push(EGRESS_TAG_BATCH);
@@ -618,9 +618,9 @@ mod tests {
         let header = [1u8, 2, 3];
         let a = [10u8, 11];
         let b = [12u8, 13, 14];
-        let multi = frame_egress_batch_cols(&header, &[&a[..], &b[..]]);
+        let multi = frame_decode_batch_cols(&header, &[&a[..], &b[..]]);
         let joined: Vec<u8> = a.iter().chain(&b).copied().collect();
-        let single = frame_egress_batch_cols(&header, &[joined.as_slice()]);
+        let single = frame_decode_batch_cols(&header, &[joined.as_slice()]);
         assert_eq!(multi, single);
         assert_eq!(multi[0], EGRESS_TAG_BATCH);
         assert_eq!(
@@ -664,7 +664,7 @@ mod tests {
             .flat_map(|x| x.to_le_bytes())
             .collect();
 
-        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let framed = frame_decode_batch_cols(&header, &[&data]);
         assert_eq!(framed[0], EGRESS_TAG_BATCH);
         let mut events = Vec::new();
         assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
@@ -690,7 +690,7 @@ mod tests {
         assert_eq!(events[2].prompt_tokens, 6);
         // A plain decode frame carries no extras columns at all, so the per-frame
         // `has_extras` guard must skip the extras machinery entirely for every
-        // request (this is the tm-egress hot path — see `for_each_chunk`).
+        // request (this is the from-scheduler hot path — see `for_each_chunk`).
         assert!(events.iter().all(|e| e.extras.is_none()));
     }
 
@@ -717,7 +717,7 @@ mod tests {
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
         let data: Vec<u8> = [0i32].iter().flat_map(|x| x.to_le_bytes()).collect(); // 4 bytes
 
-        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let framed = frame_decode_batch_cols(&header, &[&data]);
         let mut routed = 0usize;
         let decoded = for_each_chunk(&framed[1..], |_| routed += 1);
         assert!(!decoded.ok, "malformed frame must be rejected, not decoded");
@@ -759,7 +759,7 @@ mod tests {
         data.extend(i(&[10, 20])); // token_ids
         data.extend(f(&[-0.1, -0.2, -0.3, -0.4])); // out_top_val (sum of poslens = 4)
         data.extend(i(&[1, 2, 3, 4])); // out_top_idx
-        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let framed = frame_decode_batch_cols(&header, &[&data]);
         let mut routed = 0usize;
         assert!(
             !for_each_chunk(&framed[1..], |_| routed += 1).ok,
@@ -790,7 +790,7 @@ mod tests {
         let mut data = Vec::new();
         data.extend(i(&[10, 20])); // token_ids
         data.extend(f(&[0.1, 0.2, 0.3])); // hidden_val (sum of poslens = 3)
-        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let framed = frame_decode_batch_cols(&header, &[&data]);
         let mut routed = 0usize;
         assert!(
             !for_each_chunk(&framed[1..], |_| routed += 1).ok,
@@ -812,7 +812,7 @@ mod tests {
         ]);
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
-        let framed = frame_egress_batch_cols(&header, &[&[0u8; 4][..]]);
+        let framed = frame_decode_batch_cols(&header, &[&[0u8; 4][..]]);
         let mut routed = 0usize;
         let decoded = for_each_chunk(&framed[1..], |_| routed += 1);
         assert!(!decoded.ok);
@@ -839,12 +839,12 @@ mod tests {
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
         let data: Vec<u8> = vec![0u8; 8]; // 4 bytes too many
-        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let framed = frame_decode_batch_cols(&header, &[&data]);
         let decoded = for_each_chunk(&framed[1..], |_| {});
         assert!(!decoded.ok, "header and data must agree exactly");
     }
 
-    /// Ingress/egress rid agreement: the rid decoded from the frame must be the
+    /// Request/response rid agreement: the rid decoded from the frame must be the
     /// one Python sent, AND both sides must derive the same shard from it. The
     /// partition key is memoized inside `Rid`, so a per-conversion hasher seed
     /// would send a request's chunks to a shard that never registered it.
@@ -862,7 +862,7 @@ mod tests {
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
         let data: Vec<u8> = [0i32].iter().flat_map(|x| x.to_le_bytes()).collect();
 
-        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let framed = frame_decode_batch_cols(&header, &[&data]);
         let mut events = Vec::new();
         assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
         assert_eq!(events.len(), 1);
@@ -931,7 +931,7 @@ mod tests {
         data.extend(i(&[10, 11])); // out_top_idx
         data.extend(f(&[0.1, 0.2, 0.3])); // hidden_val (1 row, dim 3)
 
-        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let framed = frame_decode_batch_cols(&header, &[&data]);
         let mut events = Vec::new();
         assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
         assert_eq!(events.len(), 2);
@@ -999,7 +999,7 @@ mod tests {
             data.extend(i(&[10, 20])); // token_ids
             data.extend(f(&[-0.5, -0.6])); // out_lp_val (req0)
             data.extend(i(&[10, 99])); // out_lp_idx
-            let framed = frame_egress_batch_cols(&header, &[&data]);
+            let framed = frame_decode_batch_cols(&header, &[&data]);
             let mut events = Vec::new();
             assert!(
                 for_each_chunk(&framed[1..], |ev| events.push(ev)).ok,
@@ -1093,7 +1093,7 @@ mod tests {
         data.extend(i(&[61])); // in_tid_idx
         data.extend(f(&[7.1, 7.2, 7.3])); // hidden_val
 
-        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let framed = frame_decode_batch_cols(&header, &[&data]);
         let mut events = Vec::new();
         assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
         assert_eq!(events.len(), 1);
@@ -1137,7 +1137,7 @@ mod tests {
         let mut header = Vec::new();
         rmpv::encode::write_value(&mut header, &header_arr).unwrap();
         let data: Vec<u8> = [7i32, 8].iter().flat_map(|x| x.to_le_bytes()).collect();
-        let framed = frame_egress_batch_cols(&header, &[&data]);
+        let framed = frame_decode_batch_cols(&header, &[&data]);
         let mut events = Vec::new();
         assert!(for_each_chunk(&framed[1..], |ev| events.push(ev)).ok);
         // Each chunk carries its OWN rid — the value a shard keys its table on.
@@ -1182,7 +1182,7 @@ mod rid_recovery_tests {
             cols.extend((0..extra_cols).map(|_| Value::from("unexpected")));
             let mut header = Vec::new();
             rmpv::encode::write_value(&mut header, &Value::Array(cols)).unwrap();
-            let framed = frame_egress_batch_cols(&header, &[]);
+            let framed = frame_decode_batch_cols(&header, &[]);
             let decoded = for_each_chunk(&framed[1..], |_| {});
             assert!(!decoded.ok, "arity {extra_cols}: must reject");
             assert_eq!(

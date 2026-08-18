@@ -1,7 +1,5 @@
 //! The `/generate` request path: the HTTP body and its per-request fan-out
-//! ([`GenerateBody`] → [`GenerateRequest`]s), the variant bodies, and the
-//! scheduler ingress encodings (`TokenizedGenerateReqInput` header,
-//! control/abort, `SchedulerRequest`).
+//! ([`GenerateBody`] → [`GenerateRequest`]s).
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -547,7 +545,7 @@ fn mm_value_present(v: &Option<rmpv::Value>) -> bool {
         .is_some_and(crate::multi_modality::payload::value_present)
 }
 
-/// The owned request as it travels ingress stages (single owner, so `state` is
+/// The owned request as it travels request stages (single owner, so `state` is
 /// mutated lock-free). Common fields here; variant data in [`RequestKind`].
 #[derive(Debug)]
 pub struct Request {
@@ -561,7 +559,7 @@ pub struct Request {
     pub kind: RequestKind,
 }
 
-/// One ingress-ring entry, split columnar: the scalar `header` (msgpack, `input_ids`
+/// One to_scheduler channel entry, split columnar: the scalar `header` (msgpack, `input_ids`
 /// omitted) + the raw int64 `ids` cell, so the big tensor never goes through msgpack.
 #[derive(Debug)]
 pub struct SchedulerRequest {
@@ -569,7 +567,7 @@ pub struct SchedulerRequest {
     pub ids: Bytes,
 }
 
-/// Request variant — selects the ingress branch, scheduler wire message, and
+/// Request variant — selects the request branch, scheduler wire message, and
 /// egress shape. Each owns its body, so generate/control fields stay type-separate.
 #[derive(Debug)]
 pub enum RequestKind {
@@ -620,7 +618,7 @@ pub struct GenerateRequest {
     /// by the pool before the header is built; never reaches the scheduler wire.
     pub skip_special_tokens: bool,
     /// Sampling params (defaults when the client sent none, as in Python);
-    /// normalized + verified at ingress, then serialized into the header.
+    /// normalized + verified, then serialized into the header.
     pub sampling_params: SamplingParams,
     /// Whether the client asked for SSE streaming.
     pub stream: bool,
@@ -721,8 +719,8 @@ impl GenerateRequest {
     }
 
     /// `input_ids` widened to raw little-endian int64 bytes (the scheduler's
-    /// `array("q")` columnar cell — rides the ingress ring outside msgpack). Empty
-    /// when not tokenized.
+    /// `array("q")` columnar cell — rides the to-scheduler channel outside
+    /// msgpack). Empty when not tokenized.
     pub fn encode_data_buf(&self) -> Bytes {
         let ids = self.input_ids.as_deref().unwrap_or(&[]);
         let mut buf = Vec::with_capacity(ids.len() * 8);
@@ -910,7 +908,7 @@ mod tests {
         assert!(requests(r#"{"text": "a", "input_ids": [1]}"#).is_err());
         assert!(requests(r#"{"stream": true}"#).is_err());
         // Parallel sampling is rejected where Python reads it — in the params,
-        // at normalization (the ingress step), not here.
+        // at normalization, not here.
         let (mut ps, _) = requests(r#"{"text": "a", "sampling_params": {"n": 2}}"#).unwrap();
         assert!(ps[0].sampling_params.normalize(false, TEST_VOCAB).is_err());
     }

@@ -17,7 +17,7 @@ use bytes::Bytes;
 
 use crate::message::request::SchedulerRequest;
 
-/// Ingress: TokenizerManager → scheduler `recv_requests`.
+/// ToSchedulerTx: TokenizerManager → scheduler `recv_requests`.
 /// Producers are Rust TM workers; the single consumer is the Python thread.
 /// Carries [`SchedulerRequest`] (columnar: scalar header + raw int64 ids cell), not a
 /// single msgpack blob, so the large `input_ids` tensor bypasses msgpack.
@@ -39,7 +39,7 @@ pub struct ToSchedulerRx {
     stash: Mutex<Option<SchedulerRequest>>,
 }
 
-/// A drained ingress batch in **columnar** (struct-of-arrays) form. The `ids`
+/// A drained request batch in **columnar** (struct-of-arrays) form. The `ids`
 /// cells are kept *un-concatenated* so the pyo3 boundary can copy them straight
 /// into one `PyBytes` (no intermediate buffer); `ids_total` is their summed
 /// length, precomputed for that single allocation.

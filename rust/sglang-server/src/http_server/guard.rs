@@ -105,7 +105,7 @@ mod tests {
     /// An armed guard aborts its rid on drop — exactly the cleanup a busy-skipped
     /// `/health_generate` probe relies on. It never sees a terminal frame here, so
     /// dropping the guard is the only path that deregisters its detok sink (via the
-    /// ingress `on_abort`). Regression for the detok-entry leak per health probe.
+    /// request `on_abort`). Regression for the detok-entry leak per health probe.
     #[test]
     fn armed_guard_aborts_on_drop() {
         let (tm_tx, tm_rx) = flume::unbounded();

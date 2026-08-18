@@ -14,13 +14,17 @@ use crate::tokenizer_manager::wiring::Senders;
 
 /// Shared handler state: submission handles, immutable server configuration,
 /// and the API-owned chat formatter.
-#[derive(Clone)]
+///
+/// axum clones the router state into **every** request, so it is mounted as
+/// `Arc<AppState>` — one refcount bump per request instead of cloning each
+/// `flume::Sender` and the chat formatter. Deliberately not `Clone`, so it
+/// can only be shared through that `Arc`.
 pub(super) struct AppState {
     pub(super) senders: Senders,
     pub(super) response_buf: usize,
     pub(super) server_args: Arc<ServerArgs>,
     pub(super) chat_formatter: Option<openai::ChatFormatter>,
-    /// Egress heartbeat (bumped per drained ring frame).
+    /// Response heartbeat (bumped per drained ring frame).
     pub(super) response_activity: ActivityCounter,
 }
 
@@ -30,19 +34,20 @@ pub async fn serve(
     response_buf: usize,
     server_args: Arc<ServerArgs>,
     response_activity: ActivityCounter,
-    // The SAME set ingress releases from — see `Ingress::on_abort`. Constructing a
-    // local one here would leave the api server admitting rids that nothing ever
-    // releases.
+    // The runtime's shutdown signal, shared with every worker stage: it fires
+    // (disconnects) when `Runtime::request_shutdown` drops the sender, at
+    // which point `serve` stops accepting and its in-flight handlers are
+    // aborted with the api runtime.
     shutdown: flume::Receiver<()>,
 ) {
     let chat_formatter = openai::load_chat_support(&server_args);
-    let state = AppState {
+    let state = Arc::new(AppState {
         senders,
         response_buf,
         server_args: server_args.clone(),
         chat_formatter,
         response_activity,
-    };
+    });
     // Each endpoint module registers its own routes and merges here.
     let router = Router::new()
         .merge(common::routes())
@@ -60,7 +65,7 @@ pub async fn serve(
 
     // Prefill-only KV bootstrap registry. Merged AFTER `with_state` — its
     // router carries its own Arc<Registry> state, so it cannot merge into the
-    // Router<AppState> above — and before `log::apply`, so bootstrap traffic
+    // Router<Arc<AppState>> above — and before `log::apply`, so bootstrap traffic
     // shows in the access log.
     if server_args.enable_pd_bootstrap() {
         let (routes, sweeper) = pd_bootstrap::router_and_sweeper();

@@ -11,6 +11,7 @@ scheduler holds an `Optional[RustServer]` and delegates to it.
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import os
 from array import array
@@ -791,7 +792,11 @@ class RustServer:
             ),
             # `preferred_sampling_params` is deliberately absent: `launch`
             # refuses to start when it is set, so the Rust server never needs it.
-            preferred_sampling_params=sa.preferred_sampling_params,
+            preferred_sampling_params=(
+                json.dumps(sa.preferred_sampling_params)
+                if sa.preferred_sampling_params is not None
+                else None
+            ),
             allow_auto_truncate=sa.allow_auto_truncate,
             enable_return_hidden_states=sa.enable_return_hidden_states,
             # Not a `server_args` field: `TokenizerManager` derives it, and the

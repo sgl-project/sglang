@@ -1,4 +1,4 @@
-//! Request submission into the ingress pipeline, shared by every endpoint
+//! Request submission into the to_scheduler pipeline, shared by every endpoint
 //! module: mint the client-visible rid (uuid hex, Python-parity), build the
 //! `Request`, and hand it to the TM with an egress receiver for the response.
 

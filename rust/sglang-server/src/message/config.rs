@@ -11,11 +11,14 @@
 //! pyo3 enforces it at construction: every field is a required, typed
 //! constructor argument, so a drifted caller fails at boot rather than running
 //! on a silently-defaulted knob. The `#[pyo3::pymethods]` constructors below
-//! each struct are the only Python-facing code in this file; the rest is pure
-//! Rust.
+//! each struct — plus the one hand-written extraction,
+//! [`PreferredSamplingParams`] — are the only Python-facing code in this file;
+//! the rest is pure Rust.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+
+use serde::Serialize;
 
 /// Boot knobs specific to the embedded rust server — none of these exist in
 /// the Python-built [`ServerArgs`]; they arrive as explicit
@@ -86,12 +89,10 @@ pub struct ServerArgs {
     /// narrowed to `gguf` / `mistral` / `runai_streamer` / `remote` where the
     /// checkpoint demands it). Not consumed for loading -- the scheduler owns
     /// that; `None` only when the blob omits the key.
-    #[serde(default)]
     pub load_format: Option<String>,
     /// Operator-supplied weight version, reported by `/model_info`. Defaults to
     /// `"default"` on the Python side, so it is present in every blob; `None`
     /// only when the blob omits the key.
-    #[serde(default)]
     pub weight_version: Option<String>,
     /// HTTP bind address (see [`Self::bind`]).
     pub host: String,
@@ -115,7 +116,7 @@ pub struct ServerArgs {
     pub tokenizer_worker_num: usize,
     pub detokenizer_worker_num: usize,
     /// Token-ids-in / token-ids-out mode: no tokenizer load, raw `output_ids`
-    /// frames (drives the `Skip` detok backend and the ingress branch).
+    /// frames.
     pub skip_tokenizer_init: bool,
     /// Streamed `/generate` frames carry per-step deltas instead of cumulative
     /// text. Matches the Python `TokenizerManager`.
@@ -127,8 +128,7 @@ pub struct ServerArgs {
     pub model_config: ModelConfig,
     /// Default sampling params advertised by `/get_model_info`, verbatim from
     /// `server_args.preferred_sampling_params` (a JSON object or null).
-    #[serde(default)]
-    pub preferred_sampling_params: Option<serde_json::Value>,
+    pub preferred_sampling_params: Option<PreferredSamplingParams>,
     /// Over-long inputs are truncated to fit the context instead of 400ing, and
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).
@@ -155,6 +155,8 @@ impl ServerArgs {
         served_model_name,
         tokenizer_path,
         revision,
+        load_format,
+        weight_version,
         host,
         port,
         log_level,
@@ -169,6 +171,7 @@ impl ServerArgs {
         incremental_streaming_output,
         disaggregation_mode,
         model_config,
+        preferred_sampling_params,
         allow_auto_truncate,
         enable_return_hidden_states,
         num_reserved_tokens,
@@ -182,6 +185,8 @@ impl ServerArgs {
         served_model_name: String,
         tokenizer_path: String,
         revision: Option<String>,
+        load_format: Option<String>,
+        weight_version: Option<String>,
         host: String,
         port: u16,
         log_level: String,
@@ -196,6 +201,7 @@ impl ServerArgs {
         incremental_streaming_output: bool,
         disaggregation_mode: DisaggregationMode,
         model_config: ModelConfig,
+        preferred_sampling_params: Option<PreferredSamplingParams>,
         allow_auto_truncate: bool,
         enable_return_hidden_states: bool,
         num_reserved_tokens: u64,
@@ -207,6 +213,8 @@ impl ServerArgs {
             served_model_name,
             tokenizer_path,
             revision,
+            load_format,
+            weight_version,
             host,
             port,
             log_level,
@@ -221,6 +229,7 @@ impl ServerArgs {
             incremental_streaming_output,
             disaggregation_mode,
             model_config,
+            preferred_sampling_params,
             allow_auto_truncate,
             enable_return_hidden_states,
             num_reserved_tokens,
@@ -240,6 +249,8 @@ impl Default for ServerArgs {
             served_model_name: String::new(),
             tokenizer_path: String::new(),
             revision: None,
+            load_format: None,
+            weight_version: None,
             host: "127.0.0.1".into(),
             port: 30000,
             log_level: "info".into(),
@@ -254,12 +265,33 @@ impl Default for ServerArgs {
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
             model_config: ModelConfig::default(),
+            preferred_sampling_params: None,
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
             num_reserved_tokens: 0,
             version: String::new(),
             max_total_num_tokens: 0,
         }
+    }
+}
+
+/// `--preferred-sampling-params`, carried verbatim: `/get_model_info` echoes
+/// whatever Python advertises, and the keys are whatever `SamplingParams`
+/// accepts, so there is no fixed field list to model as a `#[pyclass]`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(transparent)]
+pub struct PreferredSamplingParams(pub serde_json::Value);
+
+impl<'py> pyo3::FromPyObject<'_, 'py> for PreferredSamplingParams {
+    type Error = pyo3::PyErr;
+
+    fn extract(obj: pyo3::Borrowed<'_, 'py, pyo3::PyAny>) -> pyo3::PyResult<Self> {
+        let text = obj.extract::<String>()?;
+        serde_json::from_str(&text).map(Self).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "preferred_sampling_params is not valid JSON: {e}"
+            ))
+        })
     }
 }
 
@@ -286,11 +318,11 @@ pub struct ModelConfig {
     /// Resolved context length (`max_model_len` in `/v1/models`); the ceiling
     /// for input + `max_new_tokens`.
     pub context_len: u64,
-    /// Bounds client-supplied token ids — ingress 400s out-of-vocab ids before
+    /// Bounds client-supplied token ids — return 400s out-of-vocab ids before
     /// they crash the scheduler's embedding lookup.
     pub vocab_size: u64,
     /// Whether the model accepts multimodal inputs. Gates the MM Encoding branch
-    /// in tm-ingress; `false` silently ignores mm fields, as the Python
+    /// in to-scheduler; `false` silently ignores mm fields, as the Python
     /// `TokenizerManager` does with `mm_processor is None`.
     pub is_multimodal: bool,
     /// Resolved default sampling parameters, from Python's
@@ -484,9 +516,9 @@ impl From<MmResample> for sglang_mm::qwen_vl::Resampler {
 
 fn join_host_port(host: &str, port: u16) -> String {
     if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}") // bare IPv6 (`::`) needs brackets to bind
+        return format!("[{host}]:{port}"); // bare IPv6 (`::`) needs brackets to bind
     } else {
-        format!("{host}:{port}")
+        return format!("{host}:{port}");
     }
 }
 
@@ -535,10 +567,10 @@ impl ServerArgs {
             .as_deref()
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.log_level);
-        matches!(
+        return matches!(
             level.to_ascii_lowercase().as_str(),
             "trace" | "debug" | "info"
-        )
+        );
     }
 
     /// Pinned API threads for the embedded HTTP api-server. Python `server_args`

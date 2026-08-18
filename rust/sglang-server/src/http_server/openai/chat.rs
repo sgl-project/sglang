@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
@@ -43,12 +44,12 @@ use crate::message::response::{ChunkExtras, ResponseItem};
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
 
-pub(super) fn routes() -> Router<AppState> {
+pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
 }
 
 async fn chat_completions(
-    State(state): State<AppState>,
+    State(state): State<Arc<AppState>>,
     body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
 ) -> Response {
     let request = match body {

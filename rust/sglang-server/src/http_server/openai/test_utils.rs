@@ -105,14 +105,14 @@ pub(super) fn server_args() -> Arc<ServerArgs> {
     })
 }
 
-pub(super) fn app_state(senders: Senders) -> super::AppState {
-    super::AppState {
+pub(super) fn app_state(senders: Senders) -> Arc<super::AppState> {
+    Arc::new(super::AppState {
         senders,
         response_buf: 8,
         server_args: server_args(),
         chat_formatter: None,
         response_activity: Default::default(),
-    }
+    })
 }
 
 pub(super) fn senders_closed() -> Senders {

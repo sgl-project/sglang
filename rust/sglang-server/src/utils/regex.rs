@@ -221,7 +221,7 @@ const ADMISSION_CACHE_CAP: usize = 512;
 /// it is HIR translation, which expands `\w`/`\W` into large Unicode class unions.
 /// A 256-byte `\W`-heavy pattern (exactly [`MAX_STOP_REGEX_LEN`]) measures 574 µs,
 /// and a request may carry [`MAX_STOP_REGEX_COUNT`] of them — 18 ms of admission on
-/// the single ingress thread, re-derived from scratch on every request. It
+/// the single to-scheduler thread, re-derived from scratch on every request. It
 /// multiplies through a batch, because one `sampling_params` object broadcasts to
 /// every item: a 13.6 KB body measured **1.01 s**, during which that thread serves
 /// no other request, no abort and no health probe.
@@ -234,7 +234,7 @@ const ADMISSION_CACHE_CAP: usize = 512;
 /// Cleared wholesale when full rather than evicted one at a time: that is what
 /// CPython's `re` does, and it keeps the hot path one lookup with no LRU
 /// bookkeeping. The lock is held across a hash lookup and nothing else, and is
-/// taken almost exclusively by the one ingress thread.
+/// taken almost exclusively by the one to-scheduler thread.
 static ADMISSION_CACHE: LazyLock<Mutex<HashMap<Box<str>, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 

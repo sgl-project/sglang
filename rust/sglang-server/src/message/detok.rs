@@ -21,13 +21,13 @@ pub enum DetokMsg {
         /// `SamplingParams.no_stop_trim`: keep the matched stop; default trims it.
         no_stop_trim: bool,
     },
-    /// One decode step's chunks for *this shard*. Batched because `tm-egress` blocks
-    /// per send, so one message per request cost ~1.3 µs × batch (5.1x at 4096).
+    /// One decode step's chunks for *this shard*. Batched because `from-scheduler` blocks
+    /// per send.
     Chunks(Vec<ChunkEvent>),
     /// Decode a complete token-id sequence — the backend of
     /// [`RequestKind::Detokenize`](super::RequestKind::Detokenize), the one
     /// request kind the detok stage itself answers (it never reaches the
-    /// scheduler ring). Sent by tm-ingress right after the same rid's `Register`
+    /// scheduler ring). Sent by to-scheduler right after the same rid's `Register`
     /// on the same channel (FIFO), so the shard delivers the text through the
     /// registered sink like a control `Result` and drops the entry.
     Decode { rid: Rid, token_ids: Vec<u32> },

@@ -127,7 +127,7 @@ impl MmWorker {
 }
 
 impl Runnable for MmWorker {
-    /// Drain until the mm channel closes (tm-ingress drops its sender on
+    /// Drain until the mm channel closes (to-scheduler drops its sender on
     /// shutdown). One request at a time, so the pool size bounds MM
     /// concurrency; an error rejects the request back to the client.
     fn run(self) {
@@ -144,7 +144,7 @@ impl Runnable for MmWorker {
                 }
             };
             if self.tm.send(event).is_err() {
-                return; // tm-ingress gone: shutdown
+                return; // to-scheduler gone: shutdown
             }
         }
     }

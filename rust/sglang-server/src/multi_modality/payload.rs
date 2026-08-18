@@ -114,8 +114,7 @@ fn collect_images(
 }
 
 /// Rust mirror of Python `has_valid_data`: `nil` and (recursively) empty or
-/// all-nil lists don't count as multimodal input. Shared with the ingress
-/// `has_multimodal` check so routing and parsing cannot drift.
+/// all-nil lists don't count as multimodal input.
 pub fn value_present(value: &Value) -> bool {
     match value {
         Value::Nil => false,

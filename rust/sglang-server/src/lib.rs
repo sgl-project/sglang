@@ -5,7 +5,7 @@
 //! (`_server`) and the classes exposed to the scheduler — the boot config
 //! ([`ServerArgs`] and its parts, constructed by keyword from Python; their
 //! `#[pyclass]`es and constructors live in `message::config`), [`Server`]
-//! (boot, `recv_requests`/`wait_ingress`, `push_*`, MM handoff, shutdown),
+//! (boot, `recv_requests`/`wait_request`, `push_*`, MM handoff, shutdown),
 //! [`RequestBatch`] and [`MmEncodeResult`]. Everything behind that boundary —
 //! receiving requests, encoding multimodal inputs, tokenizing, detokenizing,
 //! SSE streaming, and so on — is implemented purely in Rust and never touches
@@ -62,7 +62,7 @@ struct MmEncodeResult {
     mrope_delta: i64,
 }
 
-/// Columnar ingress batch handed to Python by [`Server::recv_requests`].
+/// Columnar request batch handed to Python by [`Server::recv_requests`].
 /// `frozen`: immutable snapshot, so field access never contends on a borrow.
 #[pyclass(frozen, get_all)]
 struct RequestBatch {
@@ -159,12 +159,9 @@ impl Server {
     }
 
     /// Park up to `timeout_ms` for an incoming request so the idle scheduler loop
-    /// sleeps instead of spinning at 100% CPU. Returns `True` when a request is
-    /// ready (the next `recv_requests` includes it). The GIL is released while
-    /// parked, and `flume` wakes the moment a request is pushed, so this adds no
-    /// latency to real requests — only the idle wait is bounded by `timeout_ms`.
+    /// sleeps instead of spinning at 100% CPU.
     #[pyo3(signature = (timeout_ms = 1000))]
-    fn wait_ingress(&self, py: Python<'_>, timeout_ms: u64) -> bool {
+    fn wait_request(&self, py: Python<'_>, timeout_ms: u64) -> bool {
         py.detach(|| {
             self.rt
                 .to_scheduler_rx
@@ -184,7 +181,7 @@ impl Server {
         let cols: Vec<&[u8]> = data_cols.iter().map(|d| d.as_ref()).collect();
         self.push_frame(
             py,
-            crate::message::response::frame_egress_batch_cols(header, &cols),
+            crate::message::response::frame_decode_batch_cols(header, &cols),
         )
     }
 
@@ -223,8 +220,8 @@ impl Server {
     }
 
     /// Pop the MM result for `rid` — parked strictly before the request reached
-    /// the ingress ring — or `None` if there is none. The numeric buffers become
-    /// 1-D numpy arrays that take **ownership** of the Rust vectors, no copy.
+    /// the to_scheduler channel — or `None` if there is none. The numeric buffers
+    /// become 1-D numpy arrays that take **ownership** of the Rust vectors, no copy.
     ///
     /// Runs on the scheduler loop (`RustServer.drain`, under the GIL) between
     /// decode steps, so any per-byte work here — memcpy or hashing, tens of MB

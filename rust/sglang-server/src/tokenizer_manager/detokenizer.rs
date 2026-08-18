@@ -144,9 +144,9 @@ struct DetokState {
     /// cumulative view where a consumer needs it (every unary response and the
     /// cumulative SGLang `/generate` stream); OpenAI streaming forwards deltas.
     decoder: Option<Box<dyn StreamDecoder>>,
-    /// Egress half of the lifecycle FSM. Lives here because the ingress
-    /// `Request` (and its FSM) was handed to the scheduler when queued; the
-    /// shard is the sole owner of the request's egress state, so no lock.
+    /// Egress half of the lifecycle FSM. Lives here because the `Request` (and
+    /// its FSM) was handed to the scheduler when queued; the shard is the sole
+    /// owner of the request's egress state, so no lock.
     fsm: RequestState,
 }
 
@@ -186,7 +186,7 @@ impl Runnable for DetokenizerWorker {
         // Plain `recv`: exits when the `DetokMsg` channel closes (every `Senders`
         // clone gone). On shutdown that happens once the API runtime drop cancels
         // in-flight handlers (their `AbortGuard`s release the last clones) and
-        // tm-ingress/tm-egress exit — no shutdown signal needed here.
+        // to-scheduler/from-scheduler exit — no shutdown signal needed here.
         while let Ok(msg) = self.rx.recv() {
             match msg {
                 DetokMsg::Register {
@@ -207,7 +207,7 @@ impl Runnable for DetokenizerWorker {
                         },
                     );
                 }
-                // One decode step's chunks for this shard, batched by tm-egress.
+                // One decode step's chunks for this shard, batched by from-scheduler.
                 DetokMsg::Chunks(evs) => {
                     for ev in evs {
                         handle_chunk(&mut table, ev, &self.backend, &self.abort);
@@ -228,7 +228,7 @@ impl Runnable for DetokenizerWorker {
     }
 }
 
-/// The `RequestKind::Detokenize` backend stage: tm-ingress queued this rid's
+/// The `RequestKind::Detokenize` backend stage: to-scheduler queued this rid's
 /// `Register` just before on this same channel, so the entry exists — deliver
 /// the decoded text (or the error) through the registered sink and drop it,
 /// like a one-result control request. No scheduler abort on failure: this kind

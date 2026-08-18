@@ -6,6 +6,7 @@
 
 use axum::{Router, http::StatusCode, response::Response};
 use futures::StreamExt;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 mod chat;
@@ -31,7 +32,7 @@ use crate::utils::response::error_response;
 const MAX_OPENAI_CHOICES: usize = 4096;
 
 /// The routes this module owns, mounted by `api_server::serve`.
-pub(super) fn routes() -> Router<AppState> {
+pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(models::routes())
         .merge(completions::routes())
