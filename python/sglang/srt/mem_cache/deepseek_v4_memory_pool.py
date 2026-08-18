@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.runtime_context import get_exec, get_spec
-from sglang.srt.utils import ceil_div, is_hip
+from sglang.srt.utils import ceil_align, ceil_div, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -497,9 +497,26 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
+        draft_swa_scratch_width: int = 0,
     ):
+        resolved_num_req_slots = (
+            num_req_slots if num_req_slots is not None else max_num_reqs + 1
+        )
+        self.draft_swa_scratch_width = int(draft_swa_scratch_width)
+        self.draft_swa_committed_size = int(swa_size)
+        self.draft_swa_scratch_base = 0
+        physical_swa_size = int(swa_size)
+        if self.draft_swa_scratch_width:
+            self.draft_swa_scratch_base = ceil_align(
+                self.draft_swa_committed_size + 1, swa_page_size
+            )
+            physical_swa_size = (
+                self.draft_swa_scratch_base
+                + resolved_num_req_slots * self.draft_swa_scratch_width
+            )
+
         super().__init__(
-            swa_size,
+            physical_swa_size,
             page_size,
             dtype,
             layer_num,
@@ -521,9 +538,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # SWA ring needs one slot per addressable req_pool_idx. PD decode inflates
         # req_to_token past max_num_reqs (pre-alloc), so the caller passes the real
         # capacity; sizing as max_num_reqs+1 overflows ("length out of range").
-        self.num_req_slots = (
-            num_req_slots if num_req_slots is not None else max_num_reqs + 1
-        )
+        self.num_req_slots = resolved_num_req_slots
         self.c4_size = c4_size
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
@@ -567,7 +582,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert page_size % swa_page_size == 0
         self.sliding_window = sliding_window
 
-        self.swa_size = swa_size
+        # Allocator/radix/HiCache capacity excludes the appended step workspace.
+        self.swa_size = self.draft_swa_committed_size
         self.swa_window_size = swa_page_size
         self.swa_page_size = swa_page_size
         self.scale_pad = 1
@@ -587,6 +603,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
 
         self._unified_kv = is_unified_kv_triton()
+        if self._unified_kv and self.draft_swa_scratch_width:
+            raise NotImplementedError(
+                "DSV4 DSpark draft SWA scratch is not supported by unified_kv yet."
+            )
 
         if self._unified_kv:
             self.swa_kv_pool = None
@@ -616,7 +636,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         else:
             self.unified_kv_pool = None
             self.swa_kv_pool = self._make_kv_pool(
-                size=swa_size,
+                size=physical_swa_size,
                 page_size=swa_page_size,
                 dtype=dtype,
                 layer_num=stage_layer_num,
@@ -680,6 +700,31 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
         return self.full_to_swa_index_mapping[kv_indices]
+
+    @property
+    def has_draft_swa_scratch(self) -> bool:
+        return self.draft_swa_scratch_width > 0
+
+    def get_draft_swa_scratch_locs(
+        self, req_pool_indices: torch.Tensor, block_size: int
+    ) -> torch.Tensor:
+        """Return step-local rows outside the committed sidecar address space."""
+        if not self.has_draft_swa_scratch:
+            raise RuntimeError("DSV4 draft SWA scratch is not enabled.")
+        if block_size > self.draft_swa_scratch_width:
+            raise ValueError(
+                f"Draft block size {block_size} exceeds scratch width "
+                f"{self.draft_swa_scratch_width}."
+            )
+        offsets = torch.arange(
+            block_size, dtype=torch.int64, device=req_pool_indices.device
+        )
+        return (
+            self.draft_swa_scratch_base
+            + req_pool_indices.to(torch.int64).unsqueeze(1)
+            * self.draft_swa_scratch_width
+            + offsets.unsqueeze(0)
+        ).reshape(-1)
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
@@ -800,8 +845,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             for buf in self.swa_kv_pool.kv_buffer:
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
-                data_lens.append(buf.nbytes)
-                item_lens.append(buf[0].nbytes)
+                item_len = buf[0].nbytes
+                item_lens.append(item_len)
+                if self.has_draft_swa_scratch:
+                    committed_pages = (
+                        self.draft_swa_committed_size
+                        + self.swa_page_size
+                        + 1
+                    ) // self.swa_page_size
+                    data_lens.append(committed_pages * item_len)
+                else:
+                    data_lens.append(buf.nbytes)
 
         for pools in [
             self.compress_state_pools,
