@@ -248,16 +248,16 @@ class DSANPUIndexerMixin:
             raise RuntimeError(
                 "The quantized NPU DSA Indexer requires an Atlas A5 H128 buffer."
             )
-        if (
-            use_quant_lightning_indexer
-            and is_prefill
-            and self.dsa_enable_prefill_cp
-            and forward_batch.attn_cp_metadata is not None
-        ):
-            raise NotImplementedError(
-                "The quantized NPU DSA Indexer does not support prefill context "
-                "parallelism yet."
-            )
+        # if (
+        #     use_quant_lightning_indexer
+        #     and is_prefill
+        #     and self.dsa_enable_prefill_cp
+        #     and forward_batch.attn_cp_metadata is not None
+        # ):
+        #     raise NotImplementedError(
+        #         "The quantized NPU DSA Indexer does not support prefill context "
+        #         "parallelism yet."
+        #     )
 
         if self.rotary_emb.is_neox_style:
             if not hasattr(forward_batch, "npu_indexer_sin_cos_cache"):
@@ -269,58 +269,58 @@ class DSANPUIndexerMixin:
             else:
                 sin, cos = forward_batch.npu_indexer_sin_cos_cache
 
-            if self.alt_stream is not None:
-                self.alt_stream.wait_stream(torch.npu.current_stream())
-                with torch.npu.stream(self.alt_stream):
-                    q_lora = (
-                        (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
-                    )
-                    q = self.wq_b(q_lora)[
-                        0
-                    ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
-                    q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
-                    q_pe, q_nope = torch.split(
-                        q,
-                        [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                        dim=-1,
-                    )  # [bs, 64, 64 + 64]
-                    q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-                    q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
-                        bs, self.n_heads, self.rope_head_dim
-                    )  # [bs, n, d]
-                    q = torch.cat([q_pe, q_nope], dim=-1)
-                    q.record_stream(self.alt_stream)
-                    q_rope_event = self.alt_stream.record_event()
-            else:
-                q_lora = (
-                    (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
-                )
-                q = self.wq_b(q_lora)[
-                    0
-                ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
-                q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
-                q_pe, q_nope = torch.split(
-                    q,
-                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                    dim=-1,
-                )  # [bs, 64, 64 + 64]
-                q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-                q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
-                    bs, self.n_heads, self.rope_head_dim
-                )  # [bs, n, d]
-                q = torch.cat([q_pe, q_nope], dim=-1)
+            # if self.alt_stream is not None:
+            #     self.alt_stream.wait_stream(torch.npu.current_stream())
+            #     with torch.npu.stream(self.alt_stream):
+            #         q_lora = (
+            #             (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
+            #         )
+            #         q = self.wq_b(q_lora)[
+            #             0
+            #         ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
+            #         q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+            #         q_pe, q_nope = torch.split(
+            #             q,
+            #             [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+            #             dim=-1,
+            #         )  # [bs, 64, 64 + 64]
+            #         q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
+            #         q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
+            #             bs, self.n_heads, self.rope_head_dim
+            #         )  # [bs, n, d]
+            #         q = torch.cat([q_pe, q_nope], dim=-1)
+            #         q.record_stream(self.alt_stream)
+            #         q_rope_event = self.alt_stream.record_event()
+            # else:
+            q_lora = (
+                (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
+            )
+            q = self.wq_b(q_lora)[
+                0
+            ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
+            q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+            q_pe, q_nope = torch.split(
+                q,
+                [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                dim=-1,
+            )  # [bs, 64, 64 + 64]
+            q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
+            q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
+                bs, self.n_heads, self.rope_head_dim
+            )  # [bs, n, d]
+            q = torch.cat([q_pe, q_nope], dim=-1)
 
-            if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
-                indexer_weight_stream = get_indexer_weight_stream()
-                indexer_weight_stream.wait_stream(torch.npu.current_stream())
-                with torch.npu.stream(indexer_weight_stream):
-                    x = x.view(-1, self.hidden_size)
-                    weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
-                    weights.record_stream(indexer_weight_stream)
-                    weights_event = indexer_weight_stream.record_event()
-            else:
-                x = x.view(-1, self.hidden_size)
-                weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+            # if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+            #     indexer_weight_stream = get_indexer_weight_stream()
+            #     indexer_weight_stream.wait_stream(torch.npu.current_stream())
+            #     with torch.npu.stream(indexer_weight_stream):
+            #         x = x.view(-1, self.hidden_size)
+            #         weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+            #         weights.record_stream(indexer_weight_stream)
+            #         weights_event = indexer_weight_stream.record_event()
+            # else:
+            x = x.view(-1, self.hidden_size)
+            weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
 
             k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
             k = self.k_norm(k_proj)
@@ -343,17 +343,17 @@ class DSANPUIndexerMixin:
             k = torch.cat([k_pe, k_nope.unsqueeze(1)], dim=-1)  # [bs, 1, 128]
 
         else:
-            if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
-                indexer_weight_stream = get_indexer_weight_stream()
-                indexer_weight_stream.wait_stream(torch.npu.current_stream())
-                with torch.npu.stream(indexer_weight_stream):
-                    x = x.view(-1, self.hidden_size)
-                    weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
-                    weights.record_stream(indexer_weight_stream)
-                    weights_event = indexer_weight_stream.record_event()
-            else:
-                x = x.view(-1, self.hidden_size)
-                weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+            # if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+            #     indexer_weight_stream = get_indexer_weight_stream()
+            #     indexer_weight_stream.wait_stream(torch.npu.current_stream())
+            #     with torch.npu.stream(indexer_weight_stream):
+            #         x = x.view(-1, self.hidden_size)
+            #         weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+            #         weights.record_stream(indexer_weight_stream)
+            #         weights_event = indexer_weight_stream.record_event()
+            # else:
+            x = x.view(-1, self.hidden_size)
+            weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
 
             q_lora = (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
             q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
@@ -374,7 +374,7 @@ class DSANPUIndexerMixin:
 
             k_pe = k_pe.unsqueeze(1)
 
-            if layer_id == 0:
+            if layer_id == get_token_to_kv_pool().start_layer:
                 self.rotary_emb.sin_cos_cache = (
                     self.rotary_emb.cos_sin_cache.index_select(0, positions)
                 )
@@ -488,10 +488,10 @@ class DSANPUIndexerMixin:
         if use_quant_lightning_indexer:
             past_key_states_scale = kv_pool.get_index_k_scale_buffer(layer_id)
 
-        if self.rotary_emb.is_neox_style and self.alt_stream is not None:
-            torch.npu.current_stream().wait_event(q_rope_event)
-        if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
-            torch.npu.current_stream().wait_event(weights_event)
+        # if self.rotary_emb.is_neox_style and self.alt_stream is not None:
+        #     torch.npu.current_stream().wait_event(q_rope_event)
+        # if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+        #     torch.npu.current_stream().wait_event(weights_event)
         if (
             _use_ag_after_qlora
             and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
@@ -512,6 +512,8 @@ class DSANPUIndexerMixin:
                 actual_seq_lengths_q,
                 actual_seq_lengths_kv,
                 block_table,
+                use_quant_lightning_indexer,
+                layer_id,
             )
             return topk_indices
         else:
@@ -576,6 +578,8 @@ class DSANPUIndexerMixin:
         actual_seq_lengths_q,
         actual_seq_lengths_kv,
         block_table,
+        use_quant_lightning_indexer,
+        layer_id,
     ):
         q_prev, q_next = torch.split(q, (q.size(0) + 1) // 2, dim=0)
         weights_prev, weights_next = None, None
@@ -589,39 +593,96 @@ class DSANPUIndexerMixin:
         actual_seq_lengths_q_prev, actual_seq_lengths_q_next = actual_seq_lengths_q
         actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
 
-        topk_indices_prev = torch_npu.npu_lightning_indexer(
-            query=q_prev,
-            key=past_key_states,
-            weights=weights_prev,
-            actual_seq_lengths_query=actual_seq_lengths_q_prev.to(
-                device=q.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_key=actual_seq_lengths_kv_prev.to(
-                device=q.device, dtype=torch.int32
-            ),
-            block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=self.index_topk,
-            sparse_mode=3,
-        )
-        topk_indices_next = torch_npu.npu_lightning_indexer(
-            query=q_next,
-            key=past_key_states,
-            weights=weights_next,
-            actual_seq_lengths_query=actual_seq_lengths_q_next.to(
-                device=q.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_key=actual_seq_lengths_kv_next.to(
-                device=q.device, dtype=torch.int32
-            ),
-            block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=self.index_topk,
-            sparse_mode=3,
-        )
-        return torch.cat([topk_indices_prev[0], topk_indices_next[0]], dim=0).squeeze(1)
+        if use_quant_lightning_indexer:
+            q_prev, q_prev_scale = _quantize_npu_indexer_activation(
+                q_prev,
+                self._npu_hadamard_128,
+                get_token_to_kv_pool().dtype,
+            )
+            past_key_states_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
+                layer_id
+            )
+            topk_indices_prev = torch_npu.npu_quant_lightning_indexer(
+                query=q_prev,
+                key=past_key_states,
+                weights=weights_prev,
+                query_dequant_scale=q_prev_scale,
+                key_dequant_scale=past_key_states_scale,
+                actual_seq_lengths_query=actual_seq_lengths_q_prev.to(
+                    device=q.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_key=actual_seq_lengths_kv_prev.to(
+                    device=q.device, dtype=torch.int32
+                ),
+                block_table=block_table,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk,
+                sparse_mode=3,
+                query_quant_mode=0,
+                key_quant_mode=0,
+            )
+            q_next, q_next_scale = _quantize_npu_indexer_activation(
+                q_next,
+                self._npu_hadamard_128,
+                get_token_to_kv_pool().dtype,
+            )
+            topk_indices_next = torch_npu.npu_quant_lightning_indexer(
+                query=q_next,
+                key=past_key_states,
+                weights=weights_next,
+                query_dequant_scale=q_next_scale,
+                key_dequant_scale=past_key_states_scale,
+                actual_seq_lengths_query=actual_seq_lengths_q_next.to(
+                    device=q.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_key=actual_seq_lengths_kv_next.to(
+                    device=q.device, dtype=torch.int32
+                ),
+                block_table=block_table,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk,
+                sparse_mode=3,
+                query_quant_mode=0,
+                key_quant_mode=0,
+            )
+            return torch.cat([topk_indices_prev, topk_indices_next], dim=0).squeeze(1)
+
+        else:
+            topk_indices_prev = torch_npu.npu_lightning_indexer(
+                query=q_prev,
+                key=past_key_states,
+                weights=weights_prev,
+                actual_seq_lengths_query=actual_seq_lengths_q_prev.to(
+                    device=q.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_key=actual_seq_lengths_kv_prev.to(
+                    device=q.device, dtype=torch.int32
+                ),
+                block_table=block_table,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk,
+                sparse_mode=3,
+            )
+            topk_indices_next = torch_npu.npu_lightning_indexer(
+                query=q_next,
+                key=past_key_states,
+                weights=weights_next,
+                actual_seq_lengths_query=actual_seq_lengths_q_next.to(
+                    device=q.device, dtype=torch.int32
+                ),
+                actual_seq_lengths_key=actual_seq_lengths_kv_next.to(
+                    device=q.device, dtype=torch.int32
+                ),
+                block_table=block_table,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk,
+                sparse_mode=3,
+            )
+            return torch.cat([topk_indices_prev[0], topk_indices_next[0]], dim=0).squeeze(1)
 
 
 def scattered_to_tp_attn_full(

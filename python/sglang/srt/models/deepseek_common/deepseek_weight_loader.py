@@ -248,7 +248,7 @@ class DeepseekV2WeightLoaderMixin:
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             futures = []
             params_dict = dict(self.named_parameters())
             weight_names = []

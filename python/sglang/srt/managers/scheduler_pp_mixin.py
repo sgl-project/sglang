@@ -39,7 +39,7 @@ from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module, is_xpu
+from sglang.srt.utils.common import get_device_module, is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +94,13 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                # NPU: Barrier to prevent TP rank desync. NPU's isend is
+                # effectively blocking, so different TP ranks spend different
+                # time in P2P ops. Without this barrier, fast ranks advance to
+                # the next mb_id's collective ops while slow ranks are still in
+                # the current mb_id's P2P, causing collective op mismatch.
+                if is_npu():
+                    torch.distributed.barrier(self.tp_cpu_group)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -102,7 +109,10 @@ class SchedulerPPMixin:
                     recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
                 if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
+                    if not is_npu():
+                        self._pp_commit_comm_work(self.send_req_work)
+                    else:
+                        self.pending_send_req_work = self.send_req_work
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
                             recv_reqs,
@@ -146,6 +156,13 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                # NPU: commit pending send_reqs AFTER output recv to avoid
+                # circular dependency: PP1 output_send blocks waiting for
+                # PP0 output_recv, but PP0 can't reach output_recv because
+                # commit send_reqs blocks waiting for PP1 recv_reqs.
+                if not self.pp_group.is_last_rank and is_npu():
+                    self._pp_commit_comm_work(self.pending_send_req_work)
+                    self.pending_send_req_work = []
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
@@ -167,6 +184,16 @@ class SchedulerPPMixin:
                                 async_send=True,
                                 msg_type="proxy",
                             )
+
+                # NPU last rank: deferred output send (after proxy send to
+                # avoid blocking the proxy channel with output isend).
+                if is_npu() and self.pp_group.is_last_rank:
+                    self.send_output_work = self._pp_send_output_to_next_stage(
+                        next_first_rank_mb_id,
+                        self.mbs,
+                        self.last_rank_comm_queue,
+                        self.pp_outputs,
+                    )
 
                 self.pp_outputs = next_pp_outputs
 
@@ -228,6 +255,8 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                if is_npu():
+                    torch.distributed.barrier(self.tp_cpu_group)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -381,6 +410,8 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                if is_npu():
+                    torch.distributed.barrier(self.tp_cpu_group)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -575,6 +606,7 @@ class SchedulerPPMixin:
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
 
         self.send_req_work = []
+        self.pending_send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []
         self.launch_event = None
@@ -1237,8 +1269,17 @@ class SchedulerPPMixin:
         # same time.
 
         # CUDA: send first
-        # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
+        # XPU/NPU: even ranks send first, odd ranks recv first.
+        send_first = (not (is_xpu() or is_npu())) or ((self.ps.pp_rank % 2) == 0)
+
+        # NPU last rank: defer the output send to after proxy send.
+        # NPU's isend blocks until a matching recv is posted. If the last
+        # rank sends output (to rank 0) before sending proxy (to next stage),
+        # the blocking isend stalls the pipeline: rank 0 is waiting for
+        # proxy from the last rank, but the last rank is blocked in output
+        # send waiting for rank 0 to post a recv. Deferring the output send
+        # to after proxy send breaks this circular dependency.
+        defer_output_send = is_npu() and self.pp_group.is_last_rank
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
@@ -1268,7 +1309,10 @@ class SchedulerPPMixin:
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
 
-        if send_first:
+        if defer_output_send:
+            # NPU last rank: only recv here, send is deferred
+            _do_recv()
+        elif send_first:
             send_output_work = _do_send()
             _do_recv()
         else:

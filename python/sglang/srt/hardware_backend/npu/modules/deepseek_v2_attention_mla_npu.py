@@ -22,6 +22,11 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_kv_cache_finalize,
+    cp_all_gather_rerange_kv_cache_launch,
+)
+from sglang.srt.utils import get_current_device_stream_fast
 from sglang.srt.utils import is_npu_before_atlas_a5
 
 if TYPE_CHECKING:
@@ -584,6 +589,8 @@ def forward_dsa_prepare_npu(
         is_mla_preprocess_enabled()
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
     )
+    cp_handle = None
+    cp_kv_full = None
     if mla_preprocess_used:
         (
             q_pe,
@@ -670,10 +677,6 @@ def forward_dsa_prepare_npu(
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
-        q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
-
-        q_nope_out = q_nope_out.transpose(0, 1)
-
         if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
             q_pe, k_pe = _apply_dsa_interleave_half_rope(
                 m,
@@ -683,7 +686,7 @@ def forward_dsa_prepare_npu(
                 forward_batch,
             )
         else:
-            if m.layer_id == 0:
+            if m.layer_id == get_token_to_kv_pool().start_layer:
                 m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
                     0,
                     positions,
@@ -691,10 +694,18 @@ def forward_dsa_prepare_npu(
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
-            # support allgather+rerrange
-            k_nope, k_pe = m.rebuild_cp_kv_cache(
-                latent_cache, forward_batch, k_nope, k_pe
+            latent_cache[..., : m.kv_lora_rank] = k_nope.squeeze(1)
+            latent_cache[..., m.kv_lora_rank:] = k_pe.squeeze(1)
+            _, cp_hidden_size = latent_cache.contiguous().shape
+            cp_handle, cp_kv_full = cp_all_gather_rerange_kv_cache_launch(
+                latent_cache.contiguous(),
+                m.cp_size,
+                forward_batch,
             )
+
+        q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
+
+        q_nope_out = q_nope_out.transpose(0, 1)
 
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(
@@ -708,7 +719,14 @@ def forward_dsa_prepare_npu(
         )
     else:
         topk_indices = prev_topk_indices
-
+    if cp_handle is not None:
+        cp_handle.wait()
+        latent_cache_output = cp_all_gather_rerange_kv_cache_finalize(
+            cp_kv_full, forward_batch
+        )
+        latent_cache_output = latent_cache_output.view(-1, cp_hidden_size)
+        k_nope = latent_cache_output[..., : m.kv_lora_rank].unsqueeze(1)
+        k_pe = latent_cache_output[..., m.kv_lora_rank :].unsqueeze(1)
     return (
         q_pe,
         k_pe,
@@ -757,14 +775,23 @@ def forward_dsa_core_npu(
         and not forward_batch.forward_mode.is_draft_extend_v2()
         and not forward_batch.forward_mode.is_target_verify()
     ):
-        attn_output = attn_output.transpose(0, 1)
-        torch.bmm(
+        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
             attn_output,
             m.w_vc,
-            out=attn_bmm_output.view(-1, m.num_local_heads, m.v_head_dim).transpose(
-                0, 1
-            ),
+            perm_x1=(1, 0, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
         )
+
+        # attn_output = attn_output.transpose(0, 1)
+        #
+        # torch.bmm(
+        #     attn_output,
+        #     m.w_vc,
+        #     out=attn_bmm_output.view(-1, m.num_local_heads, m.v_head_dim).transpose(
+        #         0, 1
+        #     ),
+        # )
     else:
         attn_output = attn_output.contiguous()
         if is_npu_before_atlas_a5():

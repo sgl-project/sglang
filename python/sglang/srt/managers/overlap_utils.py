@@ -309,7 +309,7 @@ class FutureMap:
             and payload.hidden_states is not None
         )
 
-        if self.need_topk:
+        if self.need_topk and payload.topk_p is not None:
             topk_p0 = payload.topk_p[0]
             topk_index0 = payload.topk_index[0]
             self.topk_p_buf = torch.empty(
@@ -511,9 +511,9 @@ class FutureMap:
         self._maybe_init_dsa_topk_indices_buf(payload)
         self.output_tokens_buf[indices] = payload.bonus_tokens.to(
             self.output_tokens_buf.dtype
-        )
+        ).to(self.device)
 
-        if self.need_topk:
+        if self.need_topk and payload.topk_p is not None:
             self.topk_p_buf[indices] = payload.topk_p.to(self.topk_p_buf.dtype)
             self.topk_index_buf[indices] = payload.topk_index.to(
                 self.topk_index_buf.dtype
