@@ -75,6 +75,7 @@ from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_
 from sglang.srt.layers import deep_gemm_wrapper, model_parallel
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.cp.utils import (
+    cp_shard_model_inputs,
     get_cp_strategy,
     is_cp_v2_active,
 )
@@ -1379,13 +1380,48 @@ class ModelRunner:
             self.model_config.num_hidden_layers,
         )
         with device_timer_ctx(self.device_timer, "split_prefill"):
-            ret = self.model.forward_split_prefill(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                (forward_batch.split_index, next_split_index),
-            )
+            cp_v2_active = is_cp_v2_active(forward_batch)
+            forward_positions = forward_batch.positions
+            split_prefill_kwargs = {}
+            if cp_v2_active and forward_batch.split_index == 0:
+                # Shard once on the first layer group, then cache the CP-local view.
+                kwargs = self._extend_forward_kwargs(forward_batch, None)
+                input_embeds = kwargs.get("input_embeds")
+                if input_embeds is None:
+                    input_embeds = self.model.get_input_embeddings()(
+                        forward_batch.input_ids
+                    )
+                cp_shard_ctx = cp_shard_model_inputs(
+                    input_embeds, forward_batch.positions, forward_batch
+                )
+            else:
+                if cp_v2_active:
+                    # Later groups reuse the cached CP-local positions.
+                    forward_positions = (
+                        forward_batch.split_prefill_cp_sharded_positions
+                    )
+                cp_shard_ctx = contextlib.nullcontext((None, forward_positions))
+
+            with cp_shard_ctx as (forward_input_embeds, forward_positions):
+                if forward_input_embeds is not None:
+                    forward_batch.split_prefill_cp_sharded_input_embeds = (
+                        forward_input_embeds
+                    )
+                    forward_batch.split_prefill_cp_sharded_positions = (
+                        forward_positions
+                    )
+                    split_prefill_kwargs["input_embeds"] = forward_input_embeds
+                ret = self.model.forward_split_prefill(
+                    forward_batch.input_ids,
+                    forward_positions,
+                    forward_batch,
+                    (forward_batch.split_index, next_split_index),
+                    **split_prefill_kwargs,
+                )
         forward_batch.split_index = next_split_index
+        if cp_v2_active and next_split_index == self.model_config.num_hidden_layers:
+            forward_batch.split_prefill_cp_sharded_input_embeds = None
+            forward_batch.split_prefill_cp_sharded_positions = None
         return ret
 
     def forward(

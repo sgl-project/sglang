@@ -140,7 +140,10 @@ def is_cp_v2_active(forward_batch) -> bool:
     if not enable_cp_v2():
         return False
     forward_mode = getattr(forward_batch, "forward_mode", None)
-    if forward_mode is None or not forward_mode.is_context_parallel_extend():
+    if forward_mode is None or not (
+        forward_mode.is_context_parallel_extend()
+        or forward_mode.is_split_prefill()
+    ):
         return False
 
     strategy = get_cp_strategy()

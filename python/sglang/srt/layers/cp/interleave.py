@@ -62,7 +62,10 @@ class InterleaveCPStrategy(ContextParallelStrategy):
     kind = ContextParallelStrategyKind.INTERLEAVE
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
-        if not forward_batch.forward_mode.is_context_parallel_extend():
+        if not (
+            forward_batch.forward_mode.is_context_parallel_extend()
+            or forward_batch.forward_mode.is_split_prefill()
+        ):
             return False
         cp_size = self.cp_size
         seq_len = sum(forward_batch.extend_seq_lens_cpu)

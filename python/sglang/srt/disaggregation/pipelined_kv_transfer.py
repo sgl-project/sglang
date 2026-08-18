@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.utils import (
     is_dsv4_c128_online_enabled,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.utils import CP_V2_DEFAULT_MODEL_CLASSES
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.common import kv_to_page_indices
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -228,8 +229,9 @@ class LayerPipelinedKVTransferAdapter:
             return "prefill-side HiSparse is unsupported"
         if self.ps.pp_size > 1:
             return "pipeline parallelism is unsupported"
-        if self.ps.attn_cp_size > 1:
-            return "context parallelism is unsupported"
+        cp_reason = self._get_cp_incompatibility_reason()
+        if cp_reason is not None:
+            return cp_reason
         if getattr(self.ps, "dcp_size", 1) > 1:
             return "decode context parallelism is unsupported"
         if not callable(
@@ -254,6 +256,16 @@ class LayerPipelinedKVTransferAdapter:
             return "returning indexer top-k results is unsupported"
         if getattr(self.server_args, "elastic_ep_backend", None):
             return "elastic EP is unsupported"
+        return None
+
+    def _get_cp_incompatibility_reason(self) -> Optional[str]:
+        if self.ps.attn_cp_size <= 1:
+            return None
+        if not envs.SGLANG_ENABLE_CP_V2.get():
+            return "context parallelism v2 is disabled"
+        model_arch = self.model_config.hf_config.architectures[0]
+        if model_arch not in CP_V2_DEFAULT_MODEL_CLASSES:
+            return f"context parallelism is unsupported for model {model_arch}"
         return None
 
     def _is_batch_compatible(self, batch: ScheduleBatch) -> bool:

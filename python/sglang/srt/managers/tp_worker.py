@@ -47,6 +47,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.layers.cp.utils import is_cp_v2_active, prepare_cp_forward
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
@@ -672,6 +673,8 @@ class TpModelWorker(BaseTpWorker):
         )
         forward_batch.forward_mode = ForwardMode.SPLIT_PREFILL
         forward_batch.split_index = 0
+        if is_cp_v2_active(forward_batch):
+            prepare_cp_forward(forward_batch)
         return forward_batch
 
     def forward_batch_generation_split_prefill(

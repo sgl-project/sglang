@@ -568,6 +568,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     model_specific_states: Dict[str, any] = None
     # current split index of layer
     split_index: int = 0
+    # CP-v2 shards split-prefill model inputs once and reuses them across layer groups.
+    split_prefill_cp_sharded_input_embeds: Optional[torch.Tensor] = None
+    split_prefill_cp_sharded_positions: Optional[torch.Tensor] = None
 
     # For multimodal
     mm_input_embeds: Optional[torch.Tensor] = None

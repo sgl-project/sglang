@@ -45,6 +45,7 @@ from sglang.srt.layers.logprob_processor import (
     get_token_ids_logprobs_raw,
     get_top_logprobs_raw,
 )
+from sglang.srt.layers.cp.utils import cp_gather_after_forward, is_cp_v2_active
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -400,6 +401,20 @@ class LogitsProcessor(nn.Module):
         multi_item_delimiter_indices = None
         if isinstance(logits_metadata, ForwardBatch):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
+            if logits_metadata.forward_mode.is_split_prefill() and is_cp_v2_active(
+                logits_metadata
+            ):
+                # Split-prefill may carry both the post-norm hidden states and an
+                # optional pre-norm copy; keep their token order aligned before
+                # pruning/logprob handling.
+                stream = torch.cuda.current_stream()
+                hidden_states = cp_gather_after_forward(
+                    hidden_states, logits_metadata, stream
+                )
+                if hidden_states_before_norm is not None:
+                    hidden_states_before_norm = cp_gather_after_forward(
+                        hidden_states_before_norm, logits_metadata, stream
+                    )
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
         # Autotune dummy run discards this output; see _in_autotune_dummy_run.

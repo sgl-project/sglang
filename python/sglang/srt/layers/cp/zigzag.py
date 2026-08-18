@@ -110,7 +110,10 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
             return False
         forward_mode = getattr(forward_batch, "forward_mode", None)
-        if forward_mode is not None and not forward_mode.is_context_parallel_extend():
+        if forward_mode is not None and not (
+            forward_mode.is_context_parallel_extend()
+            or forward_mode.is_split_prefill()
+        ):
             return False
 
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
