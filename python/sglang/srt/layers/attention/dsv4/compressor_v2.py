@@ -277,6 +277,31 @@ class CompressorBackendMixin:
             cache_k=kv_compressed,
         )
 
+    def _write_online_c128_prefix_states(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        compressor: Compressor,
+        kv_score_input: torch.Tensor,
+    ) -> None:
+        """Persist the online-C128 prefix states on target-verify steps.
+
+        No-op unless online-C128 MTP is enabled; every store path
+        (compressed, MXFP4) must route through here — the next decode's
+        C128 state depends on it.
+        """
+        online_c128_mtp = getattr(self, "online_c128_mtp", None)
+        if online_c128_mtp is not None:
+            online_c128_mtp.write_prefix_states(
+                layer_id=layer_id,
+                compressor=compressor,
+                kv_score_input=kv_score_input,
+                logical_forward_mode=getattr(
+                    forward_batch, "_original_forward_mode", None
+                )
+                or forward_batch.forward_mode,
+            )
+
     def forward_unified(
         self,
         x: torch.Tensor,
@@ -299,6 +324,12 @@ class CompressorBackendMixin:
                 state_pool=state_pool,
                 compressor=compressor,
                 layer_id=layer_id,
+            )
+            # The MXFP4 store skips the shared tail below, but target-verify
+            # still needs its online-C128 prefix states written — otherwise
+            # the next commit continues from stale state.
+            self._write_online_c128_prefix_states(
+                forward_batch, layer_id, compressor, kv_score_input
             )
             return
 
@@ -345,17 +376,10 @@ class CompressorBackendMixin:
             use_fp4_indexer=use_fp4_indexer,
             bf16_store=bf16_store,
         )
-        online_c128_mtp = getattr(self, "online_c128_mtp", None)
-        if online_c128_mtp is not None:
-            online_c128_mtp.write_prefix_states(
-                layer_id=layer_id,
-                compressor=compressor,
-                kv_score_input=kv_score_input,
-                logical_forward_mode=getattr(
-                    forward_batch, "_original_forward_mode", None
-                )
-                or forward_batch.forward_mode,
-            )
+        self._write_online_c128_prefix_states(
+            forward_batch, layer_id, compressor, kv_score_input
+        )
+
 
     def _forward_unified_hip(
         self,
