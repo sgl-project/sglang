@@ -51,10 +51,6 @@ try:
     from flashinfer import top_k as _flashinfer_top_k
 except ImportError:
     _flashinfer_top_k = None
-    logger.warning(
-        "flashinfer is unavailable; the DFlash2 selector falls back to torch.topk, "
-        "which roughly halves end-to-end throughput on a large vocabulary."
-    )
 
 
 def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -823,6 +819,12 @@ class CandidateSelector(nn.Module):
         top_k: int,
     ) -> None:
         super().__init__()
+        if _flashinfer_top_k is None:
+            logger.warning(
+                "flashinfer is unavailable; the DFlash2 selector falls back to "
+                "torch.topk, which roughly halves end-to-end throughput on a large "
+                "vocabulary."
+            )
         state_rank = int(state_rank)
         self.top_k = int(top_k)
         self.predecessor_codebook = nn.Parameter(
