@@ -358,6 +358,26 @@ class BaseFormatDetector(ABC):
         """
         return StreamingParseResult()
 
+    def strip_template_artifacts(
+        self, text: str, reasoning_separated: bool = False
+    ) -> str:
+        """Remove chat-template syntax that tool-call parsing did not consume.
+
+        ``reasoning_separated`` says a reasoning parser already pulled the
+        thinking trace into its own field, so it may be dropped here instead of
+        merely unwrapped. Formats whose tool channel is literal text override
+        this; the default leaves ``text`` untouched.
+        """
+        return text
+
+    def strip_template_markers(self, text: str) -> str:
+        """Remove stray template markers, keeping the text they surrounded.
+
+        Used for text that is already routed to its own field, such as
+        reasoning, where the content must survive but the syntax must not.
+        """
+        return text
+
     def supports_structural_tag(self) -> bool:
         """Return True if this detector supports structural tag format."""
         return True

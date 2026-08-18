@@ -1,5 +1,15 @@
 import logging
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import (
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Protocol,
+    Sequence,
+    TypeVar,
+    Union,
+)
 
 import torch
 
@@ -50,6 +60,34 @@ def to_openai_style_logprobs(
         append_top_logprobs(output_top_logprobs)
 
     return ret_logprobs
+
+
+class _TokenLogprob(Protocol):
+    """Shared shape of the per-token logprob entries of both APIs."""
+
+    token: str
+
+
+_TokenLogprobT = TypeVar("_TokenLogprobT", bound=_TokenLogprob)
+
+
+def align_token_logprobs_to_text(
+    entries: Sequence[_TokenLogprobT], text: str
+) -> Optional[List[_TokenLogprobT]]:
+    """Keep the logprob entries whose token survives text sanitization.
+
+    Sanitization only deletes spans, so ``text`` is a subsequence of the
+    concatenated generated tokens: walk both in order and drop the entries whose
+    token was removed. Returns ``None`` when the two cannot be reconciled, since
+    a partially aligned array misleads more than a missing one.
+    """
+    aligned: List[_TokenLogprobT] = []
+    cursor = 0
+    for entry in entries:
+        if entry.token and text.startswith(entry.token, cursor):
+            aligned.append(entry)
+            cursor += len(entry.token)
+    return aligned if cursor == len(text) else None
 
 
 def process_hidden_states_from_ret(

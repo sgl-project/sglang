@@ -1,4 +1,4 @@
-from typing import List
+from typing import Sequence
 
 THINK_OPEN = "<|open|>think<|sep|>"
 THINK_CLOSE = "<|close|>think<|sep|>"
@@ -9,6 +9,7 @@ TOOLS_CLOSE = "<|close|>tools<|sep|>"
 MESSAGE_CLOSE = "<|close|>message<|sep|>"
 CALL_OPEN = "<|open|>call"
 CALL_CLOSE = "<|close|>call<|sep|>"
+ARGUMENT_OPEN = "<|open|>argument"
 ARGUMENT_CLOSE = "<|close|>argument<|sep|>"
 
 # max_tokens can stop after an XTML control token or channel name, before <|sep|>.
@@ -24,14 +25,29 @@ _PARTIAL_MARKER_SUFFIXES = (
 )
 
 
-def partial_suffix_len(text: str, markers: List[str]) -> int:
-    best = 0
+ALL_MARKERS = (
+    THINK_OPEN,
+    THINK_CLOSE,
+    RESPONSE_OPEN,
+    RESPONSE_CLOSE,
+    TOOLS_OPEN,
+    TOOLS_CLOSE,
+    MESSAGE_CLOSE,
+    CALL_OPEN,
+    CALL_CLOSE,
+    ARGUMENT_OPEN,
+    ARGUMENT_CLOSE,
+)
+
+
+def partial_suffix_len(text: str, markers: Sequence[str], min_len: int = 1) -> int:
+    best = min_len - 1
     for marker in markers:
         for length in range(min(len(marker) - 1, len(text)), best, -1):
             if text.endswith(marker[:length]):
                 best = length
                 break
-    return best
+    return best if best >= min_len else 0
 
 
 def strip_partial_marker_suffix(text: str) -> str:

@@ -68,7 +68,10 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
-from sglang.srt.entrypoints.openai.utils import to_openai_style_logprobs
+from sglang.srt.entrypoints.openai.utils import (
+    align_token_logprobs_to_text,
+    to_openai_style_logprobs,
+)
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -826,6 +829,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ),
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
+            if reasoning_content:
+                reasoning_content = self._strip_template_markers(reasoning_content)
         else:
             reasoning_content = None
             content = final_output
@@ -927,21 +932,31 @@ class OpenAIServingResponses(OpenAIServingChat):
                 logger.error("Required tool JSON parse error: %s", e)
 
         if content:
-            output_text = ResponseOutputText(
-                text=content,
-                annotations=[],  # TODO
-                type="output_text",
-                # logprobs cover all generated tokens, not just the stripped content.
-                logprobs=output_logprobs,
+            cleaned = self._strip_template_artifacts(
+                content, reasoning_separated=reasoning_content is not None
             )
-            message = ResponseOutputMessage(
-                id=f"msg_{random_uuid()}",
-                content=[output_text],
-                role="assistant",
-                status="completed",
-                type="message",
-            )
-            output_items.append(message)
+            # Only the cleanup above is span deletion, so realigning text the other
+            # parsers already reshaped would drop logprobs they used to return.
+            if output_logprobs is not None and cleaned != content:
+                output_logprobs = align_token_logprobs_to_text(output_logprobs, cleaned)
+            content = cleaned
+            # Text that was nothing but template syntax still gets a message, so
+            # a stop-finished response never comes back without any output item.
+            if content or not tool_call_items:
+                output_text = ResponseOutputText(
+                    text=content,
+                    annotations=[],  # TODO
+                    type="output_text",
+                    logprobs=output_logprobs,
+                )
+                message = ResponseOutputMessage(
+                    id=f"msg_{random_uuid()}",
+                    content=[output_text],
+                    role="assistant",
+                    status="completed",
+                    type="message",
+                )
+                output_items.append(message)
         output_items.extend(tool_call_items)
         return output_items
 
