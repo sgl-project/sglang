@@ -57,17 +57,34 @@ SHARED_WINDOW_CANDIDATES = [
 ]
 
 
-def load_geometry(model_path: str) -> dict:
+def load_geometry(model_path: str, args) -> dict:
+    """Read what the checkpoint states; take the rest from flags.
+
+    The activation is in the config for most models under ``hidden_act``.
+    Gating is NOT -- sglang decides it per architecture in the model file
+    (nemotron_h passes is_gated=False), so there is nothing to read and the
+    flag is the only source. Both were hardcoded here before, which meant
+    every tuned table claimed the same activation whatever the model was.
+    """
     cfg = json.load(open(os.path.join(model_path, "config.json")))
     for sub in ("language_config", "text_config", "llm_config"):
         cfg = cfg.get(sub, cfg) if isinstance(cfg.get(sub, None), dict) else cfg
     experts = cfg.get("num_experts") or cfg.get("n_routed_experts")
+    activation = (
+        args.activation or cfg.get("hidden_act") or cfg.get("hidden_activation")
+    )
+    if activation is None:
+        raise SystemExit(
+            f"{model_path}/config.json names no hidden_act; pass --activation "
+            "(guessing it would tune the tables for the wrong kernel)"
+        )
     return {
         "hidden_size": cfg["hidden_size"],
         "num_experts": experts,
         "intermediate": cfg.get("moe_intermediate_size")
         or cfg.get("intermediate_size"),
-        "activation": "silu",  # see --activation
+        "activation": activation,
+        "is_gated": args.gated,
     }
 
 
@@ -118,6 +135,10 @@ def emit_seed(args, geometry) -> str:
         "model": args.model_path,
         "hidden": geometry["hidden_size"],
         "local_experts": e_local,
+        # Recorded because neither is recoverable from the emitted table:
+        # rows are activation- and gating-agnostic by design.
+        "activation": geometry["activation"],
+        "is_gated": geometry["is_gated"],
         "date": str(date.today()),
         "note": "domain widened; rows beyond the campaign geometries are "
         "seed:untuned until --sweep certifies them",
@@ -255,7 +276,7 @@ def sweep(args, seed_path: str) -> None:
     # everywhere (the result at all three campaign geometries).
     gemm_out = os.path.join(args.out, "base_gemm")
     os.makedirs(gemm_out, exist_ok=True)
-    geometry = load_geometry(args.model_path)
+    geometry = load_geometry(args.model_path, args)
     subprocess.run(
         [
             sys.executable,
@@ -269,7 +290,7 @@ def sweep(args, seed_path: str) -> None:
             "--intermediate-size",
             str(geometry["intermediate"] // args.tp_size),
             "--gate-up-slices",
-            "2",
+            str(2 if geometry["is_gated"] else 1),
             "--top-k",
             str(args.top_k),
             "--output-dir",
@@ -287,6 +308,17 @@ def main() -> None:
     ap.add_argument("--ep-size", type=int, default=1)
     ap.add_argument("--tp-size", type=int, default=1)
     ap.add_argument("--top-k", type=int, default=8)
+    ap.add_argument(
+        "--activation",
+        default=None,
+        help="override the checkpoint's hidden_act (silu, relu2)",
+    )
+    ap.add_argument(
+        "--gated",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="whether gate/up is 2x intermediate; not in any config.json",
+    )
     ap.add_argument("--max-rank", type=int, default=32)
     ap.add_argument("--config-dir", default=None)
     ap.add_argument("--out", default="./tuned_config")
@@ -298,7 +330,7 @@ def main() -> None:
     ap.add_argument("--sweep", action="store_true")
     args = ap.parse_args()
 
-    geometry = load_geometry(args.model_path)
+    geometry = load_geometry(args.model_path, args)
     print(f"geometry: {geometry} (ep={args.ep_size})")
     rc = 0
     if args.check or not (args.emit_seed or args.sweep):
