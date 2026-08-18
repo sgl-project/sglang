@@ -55,16 +55,6 @@ if is_cuda():
     )
 
     causal_conv1d_fn = causal_conv1d_fn_cuda
-elif is_npu():
-    from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_fn_npu,
-        causal_conv1d_update_npu,
-    )
-
-    fused_gdn_gating = fused_gdn_gating_npu
-    causal_conv1d_fn = causal_conv1d_fn_npu
-    causal_conv1d_update = causal_conv1d_update_npu
 elif is_cpu():
     from sgl_kernel.mamba import causal_conv1d_fn_cpu, causal_conv1d_update_cpu
 
