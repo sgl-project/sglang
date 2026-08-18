@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 
 class MambaSSUBackend(ABC):
+    prefill_requires_chunk_metadata = False
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -438,6 +440,8 @@ class FlashInferSSUBackend(MambaSSUBackend):
 class FlashInferSSDCombinedSSUBackend(FlashInferSSUBackend):
     """FlashInfer CuTe SSDCombined prefill and selective-state-update decode."""
 
+    prefill_requires_chunk_metadata = True
+
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._prefill_backend = "cute"
@@ -595,7 +599,6 @@ def mamba_chunk_scan_combined(*args, **kwargs):
 
 def mamba_prefill_requires_chunk_metadata() -> bool:
     """Whether the selected prefill backend needs logical chunks unconditionally."""
-    return getattr(_mamba_ssu_backend, "_prefill_backend", None) in (
-        "cute",
-        "cake",
+    return bool(
+        getattr(_mamba_ssu_backend, "prefill_requires_chunk_metadata", False)
     )

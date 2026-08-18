@@ -14,7 +14,9 @@ class _FakeSSDCombined:
 
     def run(self, x, dt, A, B, C, **kwargs):
         self.call = (x, dt, A, B, C, kwargs)
-        output = torch.arange(x.numel(), dtype=torch.float32).reshape(x.shape).to(x.dtype)
+        output = (
+            torch.arange(x.numel(), dtype=torch.float32).reshape(x.shape).to(x.dtype)
+        )
         final = torch.ones(
             (
                 kwargs["initial_states"].shape[0],
@@ -111,9 +113,11 @@ def test_flashinfer_prefill_pads_with_identity_and_copies_token_major(monkeypatc
     assert torch.count_nonzero(kwargs["initial_states"]) == 0
     assert intermediate is None
     assert final.shape == (2, nheads, headdim, dstate)
-    expected = torch.arange(padded_x.numel(), dtype=torch.float32).reshape(
-        padded_x.shape
-    )[:, :seqlen].to(out.dtype)
+    expected = (
+        torch.arange(padded_x.numel(), dtype=torch.float32)
+        .reshape(padded_x.shape)[:, :seqlen]
+        .to(out.dtype)
+    )
     assert torch.equal(out, expected)
 
 
