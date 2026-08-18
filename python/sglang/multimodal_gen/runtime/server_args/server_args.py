@@ -1903,8 +1903,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 "`auto` folds encoders wide enough to benefit (best "
                 "single-request latency) and data-parallels eligible native "
                 "text encoders at batch>1; `fold` always tensor-parallels the "
-                "encoder weights; `dp` never folds and splits the batch across "
-                "the replica's ranks (best batched throughput); "
+                "encoder weights across the replica; `dp` never folds and "
+                "splits the batch across encoder copies inside each replica, "
+                "composing with encoder TP (best batched throughput); "
                 "`replicate` disables both. The default is `auto`."
             ),
         )

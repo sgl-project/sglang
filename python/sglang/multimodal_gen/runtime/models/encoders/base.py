@@ -14,6 +14,7 @@ from sglang.multimodal_gen.configs.models.encoders import (
     TextEncoderConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import (
+    get_replica_group,
     get_sp_group,
     get_tp_group,
     get_world_group,
@@ -39,8 +40,6 @@ def get_folding_tp_group(config: EncoderConfig):
     if mode == "replica":
         # the ranks serving this rank's pipeline replica (== world when
         # dp_size is 1); the shape-independent choice for explicit folding
-        from sglang.multimodal_gen.runtime.distributed import get_replica_group
-
         return get_replica_group()
     if mode is None:
         return get_tp_group()

@@ -1,19 +1,22 @@
 """Unit test for the batched text-encode data-parallel gate.
 
 _text_encode_dp_group decides whether a batched encode may split across
-ranks. It must engage for any replicated encoder regardless of the DiT's
-TP layout (encoders are only sharded through folding), and stay off for
-folded encoders, multi-replica servers, and non-dp policies. Pure logic,
-no GPU / distributed init (the world group is monkeypatched).
+encoder copies. It composes with DiT TP through the orthogonal encoder-DP
+group and stays off for folded encoders, single-copy replicas, and non-DP
+policies. Pure logic, no GPU / distributed init.
 """
 
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 from sglang.multimodal_gen.configs.models.encoders import TextEncoderConfig
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    _get_encoder_data_parallel_group_ranks,
+)
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.pipelines_core.stages import text_encoding as _te_mod
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.distributed import RankGenerator
 
 
 def _enc(hidden=4096, heads=64, inter=10240, folding_mode=None):
@@ -33,12 +36,12 @@ def _gate(
     folding_mode=None,
     batch_size=4,
     world_size=4,
+    group_available=True,
     measured=True,
     supports_dp=True,
 ):
-    monkeypatch.setattr(
-        _te_mod, "get_replica_group", lambda: SimpleNamespace(world_size=world_size)
-    )
+    group = SimpleNamespace(world_size=world_size) if group_available else None
+    monkeypatch.setattr(_te_mod, "get_encoder_data_parallel_group", lambda: group)
     monkeypatch.setattr(_te_mod, "group_has_measured_topology", lambda group: measured)
     encoder = Mock(spec=TextEncoder)
     encoder.supports_dp_encode = supports_dp
@@ -53,11 +56,16 @@ def test_dp_engages_for_replicated_encoder(monkeypatch):
     assert _gate(monkeypatch) is not None
 
 
-def test_dit_tp_does_not_block_dp(monkeypatch):
-    # pure-TP DiT deployments never fold the encoder (replica == tp), so each
-    # rank holds a full replica and can encode a batch slice alone
+def test_dit_tp_composes_with_encoder_dp_group(monkeypatch):
+    # TP ranks jointly run one encoder copy; the orthogonal group distributes
+    # batch slices across those TP-sharded copies.
     assert _gate(monkeypatch, tp=4) is not None
     assert _gate(monkeypatch, policy="auto", tp=4) is not None
+
+
+def test_pure_tp_has_no_independent_encoder_copy(monkeypatch):
+    # A pure-TP replica already uses every GPU for one encoder copy.
+    assert _gate(monkeypatch, tp=4, group_available=False) is None
 
 
 def test_folded_encoder_blocks_dp(monkeypatch):
@@ -67,10 +75,9 @@ def test_folded_encoder_blocks_dp(monkeypatch):
     assert _gate(monkeypatch, tp=4, folding_mode="world") is None
 
 
-def test_multi_replica_uses_replica_group(monkeypatch):
-    # dp>1 no longer blocks: the gate operates on the replica group, which
-    # only spans the ranks sharing this batch. A single-GPU replica still
-    # falls back to the replicated forward via the world_size gate.
+def test_multi_replica_uses_per_replica_encoder_group(monkeypatch):
+    # dp>1 no longer blocks: the encoder-DP group stays within one pipeline
+    # replica. A replica with one encoder copy uses its normal TP forward.
     assert _gate(monkeypatch, dp=2) is not None
     assert _gate(monkeypatch, dp=2, world_size=1) is None
 
@@ -99,8 +106,14 @@ def _validate_batching(encoder_parallel, tp, dp):
 
 
 def test_server_args_accepts_dp_for_any_parallel_shape():
-    # encoder parallelism is independent of the DiT layout: no combination
-    # of tp/dp is rejected at validation time
+    # Encoder DP composes with TP and stays within each pipeline replica.
     _validate_batching("dp", tp=4, dp=1)
     _validate_batching("dp", tp=1, dp=2)
     _validate_batching("dp", tp=4, dp=2)
+
+
+def test_encoder_dp_groups_are_tp_orthogonal_and_replica_local():
+    ranks = _get_encoder_data_parallel_group_ranks(
+        RankGenerator(tp=2, sp=2, pp=1, cfg=1, dp=2, order="tp-sp-pp-cfg-dp")
+    )
+    assert ranks == [[0, 2], [1, 3], [4, 6], [5, 7]]
