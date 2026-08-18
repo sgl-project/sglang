@@ -2212,5 +2212,57 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args._check_two_batch_overlap()
 
 
+class TestDcpKvEventContract(CustomTestCase):
+    """DCP widens the radix-tree page to page_size * dcp_size, so the two
+    values every external consumer depends on -- the advertised KV-event
+    block size and the tp/dcp topology -- must reflect that."""
+
+    KV_EVENTS = '{"publisher":"zmq","topic":"kv","endpoint":"tcp://*:5557"}'
+
+    def test_kv_events_descriptor_reports_logical_block_size(self):
+        """Advertising the physical page_size made every KV-aware router hash
+        prompts at a width no emitted block can match, silently pinning its
+        hit rate to zero while stores kept applying cleanly."""
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=4,
+            dcp_size=4,
+            page_size=64,
+            kv_events_config=self.KV_EVENTS,
+        )
+        self.assertEqual(args.describe_kv_events_publisher()["block_size"], 256)
+        args = ServerArgs(
+            model_path="dummy", page_size=64, kv_events_config=self.KV_EVENTS
+        )
+        self.assertEqual(args.describe_kv_events_publisher()["block_size"], 64)
+
+    def test_kv_event_block_size_widens_a_single_token_page(self):
+        # page_size=1 + DCP is a real deployment shape: the allocator is still
+        # paged, at dcp_size.
+        args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
+        self.assertEqual(args.kv_event_block_size, 8)
+
+    def test_dcp_larger_than_tp_rejected(self):
+        """dcp_size > tp_size left a zero-sized KV group, surfacing as a
+        ZeroDivisionError in get_num_kv_heads during model init."""
+        for tp, dcp in [(1, 2), (2, 4)]:
+            args = ServerArgs(model_path="dummy", tp_size=tp, dcp_size=dcp)
+            with self.assertRaisesRegex(ValueError, "must divide --tp-size"):
+                args._handle_dcp_validation()
+
+    def test_dcp_non_divisor_of_tp_rejected(self):
+        """The worse half: tp=4, dcp=3 tiles the TP group as [0,1,2] and [3],
+        leaving a 1-rank DCP group. Nothing raised -- get_num_kv_heads returns
+        a plausible 32 -- so the run silently mis-grouped instead."""
+        args = ServerArgs(model_path="dummy", tp_size=4, dcp_size=3)
+        with self.assertRaisesRegex(ValueError, "must divide --tp-size"):
+            args._handle_dcp_validation()
+
+    def test_dcp_divisor_of_tp_accepted(self):
+        for tp, dcp in [(4, 4), (4, 2), (8, 4), (4, 1)]:
+            args = ServerArgs(model_path="dummy", tp_size=tp, dcp_size=dcp)
+            args._handle_dcp_validation()
+
+
 if __name__ == "__main__":
     unittest.main()
