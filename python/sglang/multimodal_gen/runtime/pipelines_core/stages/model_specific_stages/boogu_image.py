@@ -49,6 +49,23 @@ def _retrieve_latents(
     raise AttributeError("Could not access latents of provided encoder_output")
 
 
+def _reference_vae_generator(batch: Req) -> torch.Generator | None:
+    """Pick the generator that seeds the reference-image VAE sample.
+
+    Req.generator is typed torch.Generator | list[torch.Generator] | None, and
+    input validation always replaces it with a one-entry-per-sample list. The
+    reference image is encoded once per request, so take the first entry -- the
+    request seed then reaches latent_dist.sample() instead of falling back to
+    the global RNG, which would also let CFG-parallel ranks disagree.
+    """
+    generator = batch.generator
+    if isinstance(generator, torch.Generator):
+        return generator
+    if isinstance(generator, list) and generator:
+        return generator[0]
+    return None
+
+
 class BooguImageEncodingStage(TextEncodingStage):
     def __init__(self, text_encoders, tokenizers, vae) -> None:
         super().__init__(text_encoders, tokenizers)
@@ -84,6 +101,11 @@ class BooguImageEncodingStage(TextEncodingStage):
         ref_images = batch.condition_image
         if not ref_images:
             return super().forward(batch, server_args)
+        if len(ref_images) != 1:
+            raise ValueError(
+                "Boogu-Image conditions on exactly one reference image, got "
+                f"{len(ref_images)}"
+            )
 
         raw_pil = ref_images[0].convert("RGB")
         prompts = batch.prompt if isinstance(batch.prompt, list) else [batch.prompt]
@@ -137,8 +159,7 @@ class BooguImageEncodingStage(TextEncodingStage):
                 device, None, self.vae
             )
         )
-        gen = batch.generator
-        vae_generator = gen if isinstance(gen, torch.Generator) else None
+        vae_generator = _reference_vae_generator(batch)
 
         with self.use_declared_component(component_name="vae", module=self.vae) as vae:
             assert vae is not None

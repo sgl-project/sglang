@@ -13,6 +13,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.boogu_image import (
 from sglang.multimodal_gen.configs.sample.boogu_image import BooguImageSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.boogu_image import (
     BooguImageEncodingStage,
+    _reference_vae_generator,
 )
 
 
@@ -218,6 +219,57 @@ class TestBooguImageMessageBuilding(unittest.TestCase):
         messages = stage._build_edit_messages("", SimpleNamespace())
         self.assertEqual(messages[0]["content"][0]["text"], BOOGU_SYSTEM_PROMPT_DROP)
         self.assertEqual(messages[1]["content"][1]["text"], "")
+
+
+class TestBooguImageReferenceVaeGenerator(unittest.TestCase):
+    """The reference-image VAE sample must be seeded from the request.
+
+    Regression guard: the seed was read as
+    `gen if isinstance(gen, torch.Generator) else None`, but input validation
+    always replaces Req.generator with a list, so that expression yielded None
+    for every real request. latent_dist.sample(None) then falls back to the
+    global RNG, dropping the request seed and letting CFG-parallel ranks sample
+    different reference latents.
+    """
+
+    def test_per_request_generator_is_unwrapped_from_the_list(self) -> None:
+        generator = torch.Generator().manual_seed(1234)
+        batch = SimpleNamespace(generator=[generator])
+        self.assertIs(_reference_vae_generator(batch), generator)
+
+    def test_first_entry_is_used_when_several_samples_are_requested(self) -> None:
+        generators = [torch.Generator().manual_seed(s) for s in (7, 8, 9)]
+        batch = SimpleNamespace(generator=generators)
+        self.assertIs(_reference_vae_generator(batch), generators[0])
+
+    def test_bare_generator_is_passed_through(self) -> None:
+        generator = torch.Generator().manual_seed(1234)
+        batch = SimpleNamespace(generator=generator)
+        self.assertIs(_reference_vae_generator(batch), generator)
+
+    def test_missing_generator_falls_back_to_none(self) -> None:
+        for value in (None, []):
+            with self.subTest(value=value):
+                self.assertIsNone(_reference_vae_generator(SimpleNamespace(generator=value)))
+
+
+class TestBooguImageReferenceImageCount(unittest.TestCase):
+    """Extra reference images must be rejected, not silently dropped.
+
+    The stage indexes ref_images[0], so passing two images used to encode the
+    first and discard the rest without any diagnostic.
+    """
+
+    def test_multiple_reference_images_are_rejected(self) -> None:
+        stage = object.__new__(BooguImageEncodingStage)
+        batch = SimpleNamespace(
+            condition_image=[SimpleNamespace(name="a"), SimpleNamespace(name="b")]
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            stage.forward(batch, server_args=None)
+
+        self.assertIn("one reference image", str(ctx.exception))
 
 
 if __name__ == "__main__":
