@@ -380,7 +380,6 @@ class CompressorBackendMixin:
             forward_batch, layer_id, compressor, kv_score_input
         )
 
-
     def _forward_unified_hip(
         self,
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
