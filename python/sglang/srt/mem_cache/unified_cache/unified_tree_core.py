@@ -177,8 +177,12 @@ def _set_depth_and_raise_convo_length(
 ) -> None:
     """Record a new node's path depth and raise the branch high-water mark.
 
-    Walks up only until an ancestor is already at least this deep, so extending a
-    conversation by one turn costs O(new nodes) rather than O(conversation).
+    The walk stops early only at an ancestor whose subtree already reached this
+    depth (e.g. under a deeper sibling); a conversation that keeps setting a new
+    high-water mark walks its whole root path, so an insert costs O(path nodes)
+    in the worst case. The path length is bounded by the number of node segments
+    (roughly extend/split operations, not tokens), and the walk only runs under
+    --radix-eviction-policy tlru.
     """
     if node.key is None:
         raise ValueError(
@@ -430,6 +434,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             tlru_threshold=params.tlru_threshold,
             tlru_next_prompt_estimate=params.tlru_next_prompt_estimate,
         )
+        # depth/convo_length are read only by TLRUStrategy.get_priority; every
+        # other policy skips the per-insert bookkeeping entirely.
+        self.tlru_bookkeeping = params.eviction_policy.lower() == "tlru"
 
         # ``device`` is derived from the construction-time allocator; the
         # allocator/pool themselves are owned by the cache, not the tree.
@@ -1089,11 +1096,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
         new_node.creation_time = child.creation_time
-        # A split adds no depth to the branch: the new parent sits at split_len
-        # tokens and inherits the branch's high-water mark, while child keeps its
-        # own depth because its path length is unchanged.
-        new_node.depth = new_node.parent.depth + split_len
-        new_node.convo_length = child.convo_length
+        if self.tlru_bookkeeping:
+            # A split adds no depth to the branch: the new parent sits at
+            # split_len tokens and inherits the branch's high-water mark, while
+            # child keeps its own depth because its path length is unchanged.
+            new_node.depth = new_node.parent.depth + split_len
+            new_node.convo_length = child.convo_length
         # Split fragments stay on the anchor's root path for the ack's walk.
         new_node.load_back_pending_id = child.load_back_pending_id
 
@@ -1148,7 +1156,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node = self._new_node(priority=priority)
         new_node.parent = parent
         new_node.key = key
-        _set_depth_and_raise_convo_length(new_node, parent)
+        if self.tlru_bookkeeping:
+            _set_depth_and_raise_convo_length(new_node, parent)
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
@@ -1811,7 +1820,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node = self._new_node(priority=node.priority)
         new_node.parent = node
         new_node.key = key
-        _set_depth_and_raise_convo_length(new_node, node)
+        if self.tlru_bookkeeping:
+            _set_depth_and_raise_convo_length(new_node, node)
         new_node.hash_value = hash_value
         new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
         node.children[child_key] = new_node
