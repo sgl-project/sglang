@@ -3,7 +3,10 @@ import types
 import unittest
 from unittest.mock import Mock, patch
 
+import torch
+
 from sglang.srt.layers.deep_gemm_wrapper import entrypoint
+from sglang.srt.layers.moe.moe_runner import deep_gemm as deep_gemm_runner
 
 
 class _FakeTensor:
@@ -85,6 +88,33 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
                     expected_m=1,
                     overlap_args=object(),
                 )
+
+    def test_standard_scale_backend_quantizes_down_input_row_major(self):
+        gateup = torch.empty((2, 3, 16), dtype=torch.bfloat16)
+        masked_m = torch.tensor([1, 2], dtype=torch.int32)
+        expected = (object(), object())
+        with (
+            patch.object(
+                deep_gemm_runner.deep_gemm_wrapper,
+                "DEEPGEMM_MASKED_FP8_STANDARD_SCALES",
+                True,
+            ),
+            patch.object(
+                deep_gemm_runner,
+                "per_token_group_quant",
+                return_value=expected,
+            ) as quant,
+        ):
+            result = deep_gemm_runner._varlen_deep_gemm_silu_mul_quant(
+                gateup,
+                masked_m,
+                group_size=4,
+                topk=1,
+                num_real_tokens=2,
+            )
+
+        self.assertIs(result, expected)
+        self.assertFalse(quant.call_args.kwargs["column_major_scales"])
 
 
 if __name__ == "__main__":
