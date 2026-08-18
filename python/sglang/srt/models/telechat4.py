@@ -50,8 +50,10 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix, is_npu, make_layers
 from sglang.srt.utils.custom_op import register_custom_op
+
+_is_npu = is_npu()
 
 
 def _mhc_pre_fake(
@@ -99,6 +101,27 @@ def mhc_pre(
     n_splits: int,
     n_splits_pre: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if _is_npu:
+        hc_mult = residual.shape[1]
+        if hc_sinkhorn_eps != hc_pre_eps:
+            raise ValueError(
+                "The AscendC hc_pre kernel uses one hc_eps for both pre and "
+                "Sinkhorn; hc_pre_eps and hc_sinkhorn_eps must match."
+            )
+        if hc_post_mult_value != 2.0:
+            raise ValueError("The AscendC hc_pre kernel requires post multiplier 2.0.")
+        layer_input, post_mix, comb_mix = torch.ops.npu.hc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            hc_mult=hc_mult,
+            hc_sinkhorn_iters=sinkhorn_repeat,
+            norm_eps=rms_eps,
+            hc_eps=hc_pre_eps,
+        )
+        return post_mix.unsqueeze(-1), comb_mix, layer_input
+
     return _mhc_pre_orig(
         residual=residual,
         fn=fn,
@@ -125,6 +148,11 @@ def mhc_post(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    if _is_npu:
+        return torch.ops.npu.hc_post(
+            x, residual, post_layer_mix.squeeze(-1), comb_res_mix
+        )
+
     return _mhc_post_orig(x, residual, post_layer_mix, comb_res_mix)
 
 
@@ -322,7 +350,7 @@ class TeleChat4DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.config = config
 
-        if hasattr(config, "rope_parameters"):
+        if getattr(config, "rope_parameters", None) is not None:
             rope_theta = config.rope_parameters["rope_theta"]
             rope_type = config.rope_parameters.get("rope_type")
             rope_scaling = config.rope_parameters if rope_type != "default" else None
@@ -980,8 +1008,12 @@ class TeleChat4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if _is_npu:
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
