@@ -95,8 +95,9 @@ are measured, and they are NOT the same knob:
   Raising it buys faster LoRA kernels and charges everything downstream.
 - gate/up-A's route is free of that. It writes by ORIGINAL PAIR ID, so the
   shared B route consumes its bridge without a layout conversion and its
-  padding never reaches another stage. A big tile there costs only its own
-  build.
+  padding never reaches another stage. Its build is nearly free too: past
+  16k pairs (any real prefill chunk) the fused dual builder produces both
+  granularities in one hist/scan/expand pass.
 
 That asymmetry is why the shipped `prefill.serial` rows run 16 on the shared
 route and 64 for gate/up-A, and why collapsing them onto one block is a
@@ -113,8 +114,9 @@ against that shipped split:
 
 Uniform 64 looks free there, but it is not: on Inkling-Small, whose hidden is
 4096 against Qwen's 2048, so every padded row costs twice as much downstream,
-uniform 64 loses 1.0-4.4% on B200 and 4.8-8.5% on GB300. The shipped split is
-the best configuration measured on both models.
+uniform 64 loses 1.0-4.4% on B200 and 4.8-8.5% on GB300 (bs 1-16, one round
+per arm, decode controls flat; bs32 flat). The shipped split is the best
+configuration measured on both models.
 
 Occupancy is what sets the shared block -- routed pairs per virtual expert,
 `tokens × top_k ÷ (local_experts × live adapter slots)`. Do not estimate it
@@ -137,12 +139,22 @@ adapter is the vehicle for it. A block of 256 does not compile for these
 tiles -- it exceeds shared memory.
 
 One caution for anyone re-deriving this. A kernel-level sweep that times only
-the four LoRA stages will report that giving gate/up-A its own block gains
-exactly 0.00%, on every architecture and at every occupancy from 1 to 512
-pairs per expert. That measurement is blind to the padding, because every
-stage it charges reads the same route -- the stages that pay for a bigger
-shared block are the fused middle and the base GEMM, which it never times.
-The 2.5% above is what that blindness costs.
+the four LoRA stages gets the route STRUCTURE wrong in both directions, while
+looking rigorous:
+
+- it never times the stages that pay for a bigger shared block -- the fused
+  middle and the base GEMM walk the padded rows -- which is how one block of
+  64 for everything scored +15-21% at the kernel level and measures ~0 on
+  Qwen and negative on Inkling end-to-end;
+- it cannot price the split's second route. Charged as a standalone build it
+  scored one block of 16 as ~10% better than the shipped split at 1k tokens,
+  when end-to-end that collapse LOSES 2.5% -- in production the fused dual
+  builder makes both routes in one pass, so the sweep was billing the split
+  for a cost it does not pay. An E=32 harness geometry (128 virtual experts
+  against production's 1024) does not represent gate/up-A's economics either.
+
+Use kernel sweeps to rank tiles within one stage at a fixed route. Decide
+route structure -- how many routes, which stage reads which -- end-to-end.
 
 Some rules carry byte-identical `sites` ON PURPOSE, and nothing enforces the
 pairing — the format is deliberately raw values with no reference/alias
