@@ -41,12 +41,10 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
     eight otherwise-idle ranks during encoding.
     """
 
-    # encode_ids drives the forward pass; __call__ is never used, so FSDP2
-    # needs it registered or the root group (the vision tower) stays sharded.
-    _fsdp_forward_methods = ("encode_ids",)
     layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
 
     supports_dp_encode = True
+    supported_checkpoint_quantization_methods = frozenset({"fp8"})
 
     @staticmethod
     def should_materialize_checkpoint_weight(name: str) -> bool:
@@ -64,7 +62,11 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                 "MiniMax H3 Qwen3-VL config must be trimmed to "
                 f"{selected_layer} language layers before construction"
             )
-        self.model = Qwen3VLModel(arch, use_tensor_parallel=True)
+        self.model = Qwen3VLModel(
+            arch,
+            quant_config=config.quant_config,
+            use_tensor_parallel=True,
+        )
         # H3 consumes the unnormalized output immediately after layer 49.
         self.model.language_model.norm = nn.Identity()
         self.image_token_id = int(arch.image_token_id)
@@ -150,10 +152,6 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
         call_kwargs: dict[str, Any] = {
             "input_ids": ids,
             "attention_mask": torch.ones_like(ids),
-            "output_attentions": False,
-            "output_hidden_states": False,
-            "return_dict": True,
-            "use_cache": False,
         }
         if position_ids is not None:
             call_kwargs["position_ids"] = position_ids.to(self.device)
@@ -166,7 +164,7 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             )
             call_kwargs["video_grid_thw"] = host_video_grid_thw
 
-        hidden = self.model(**call_kwargs).last_hidden_state[0].to(torch.bfloat16)
+        hidden = self(**call_kwargs).last_hidden_state[0].to(torch.bfloat16)
         expected_shape = [int(ids.shape[1]), self.hidden_dim]
         if list(hidden.shape) != expected_shape:
             raise ValueError(
