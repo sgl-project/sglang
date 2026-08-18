@@ -321,7 +321,7 @@ def _build_runner(plan, launch_config, base_gemm_rows: str, gpu, num_experts: in
     runner._test_execution = dict(
         plan=plan, launch_config=launch_config, base_gemm_rows="test"
     )
-    runner.prepare_plan(plan, base_gemm_rows="test")
+    runner.validate_plan(plan, base_gemm_rows="test")
     return runner
 
 

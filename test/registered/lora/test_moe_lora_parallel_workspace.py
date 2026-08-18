@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import unittest
-from types import SimpleNamespace
-from unittest import mock
 
 import torch
 
-from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace, run_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -22,17 +19,6 @@ class TestMoeLoraParallelWorkspace(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA required")
         cls.device = torch.device("cuda", torch.cuda.current_device())
-
-    def test_prepare_plan_owns_the_menu_entry_checks(self):
-        runner = object.__new__(MoeLoraRunner)
-        provider = SimpleNamespace(name="test")
-        runner.providers = {"test": provider}
-        runner._validate_plan_provider = mock.Mock()
-        plan = mock.Mock()
-
-        runner.prepare_plan(plan, base_gemm_rows="test")
-
-        runner._validate_plan_provider.assert_called_once_with(plan, provider)
 
     def test_side_stream_is_capture_safe_and_fully_joined(self):
         workspace = MoeLoraWorkspace()

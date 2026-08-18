@@ -786,7 +786,7 @@ def _build_runner(architecture, choice, vendor: str, gpu, num_experts, layout):
         launch_config=_shipped_launch(architecture, choice),
         base_gemm_rows="test",
     )
-    runner.prepare_plan(choice.plan, base_gemm_rows="test")
+    runner.validate_plan(choice.plan, base_gemm_rows="test")
     return runner
 
 

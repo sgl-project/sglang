@@ -28,7 +28,7 @@ class _FakeRunner:
         self.prepared: list[str] = []
         self.runs = 0
 
-    def prepare_plan(self, _plan, *, base_gemm_rows):
+    def validate_plan(self, _plan, *, base_gemm_rows):
         self.prepared.append(base_gemm_rows)
 
     def run(
@@ -143,7 +143,7 @@ def test_run_before_binding_is_an_error(monkeypatch) -> None:
 
 def test_failed_initial_binding_is_transactional(monkeypatch) -> None:
     class _FailingRunner(_FakeRunner):
-        def prepare_plan(self, _plan, *, base_gemm_rows):
+        def validate_plan(self, _plan, *, base_gemm_rows):
             self.prepared.append(base_gemm_rows)
             if len(self.prepared) == 2:
                 raise NotImplementedError("unsupported plan")

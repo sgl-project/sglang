@@ -382,14 +382,13 @@ class MoeLoraRunner:
             )
         )
 
-    def prepare_plan(self, plan: MoeLoraExecutionPlan, *, base_gemm_rows: str) -> None:
-        """Validate one menu entry against its provider, once, at bind time."""
-        self._validate_plan_provider(plan, self.providers[base_gemm_rows])
+    def validate_plan(self, plan: MoeLoraExecutionPlan, *, base_gemm_rows: str) -> None:
+        """Reject unsupported provider/plan pairs before forward CUDA work.
 
-    def _validate_plan_provider(
-        self, plan: MoeLoraExecutionPlan, provider: MoeBaseProvider
-    ) -> None:
-        """Reject unsupported provider/plan pairs before forward CUDA work."""
+        Takes the row order rather than the provider so the lookup stays with
+        the ``providers`` dict that owns it, once, at bind time.
+        """
+        provider = self.providers[base_gemm_rows]
         plan.validate()
         if plan.middle.activation is not self.activation:
             raise ValueError(
@@ -1298,7 +1297,7 @@ class MoeLoraLayerEngine:
         )
         tiles: dict[Phase, TileTable] = {}
         for phase, sel in selected.items():
-            runner.prepare_plan(sel.plan, base_gemm_rows=sel.base_gemm_rows)
+            runner.validate_plan(sel.plan, base_gemm_rows=sel.base_gemm_rows)
             table = resolve_tiles(
                 architecture_value=self.architecture.value,
                 plan_key_name=sel.name,

@@ -425,7 +425,7 @@ class MoeLoraExecutionPlan:
 
         # A standalone down-B implies the materialized finalize (any other
         # finalize consumes it).  Which B kernel implements the epilogue is a
-        # provider capability, checked in MoeLoraRunner._validate_plan_provider.
+        # provider capability, checked in MoeLoraRunner.validate_plan.
         return self.down_b is not None and self.late_overlap is LateOverlap.NONE
 
     def _route_requirements_unchecked(self) -> frozenset[RouteRequirement]:
