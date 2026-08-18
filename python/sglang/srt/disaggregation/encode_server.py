@@ -57,11 +57,13 @@ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalSta
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_precompile_model_kernels_after_loading,
 )
-from sglang.srt.model_loader import get_model
+from sglang.srt.model_loader import get_model as load_model
+from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderPreprocessOutput,
     get_encoder_preprocessed_items,
     invoke_encoder_preprocessor,
+    resolve_encoder_media_processor_config,
 )
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
@@ -71,10 +73,15 @@ from sglang.srt.observability.trace import (
     trace_set_thread_info,
 )
 from sglang.srt.runtime_context import (
+    configured_tp_size,
+    get_device,
     get_disagg,
     get_exec,
     get_mm,
+    get_model,
+    get_observability,
     get_parallel,
+    get_serving,
     publish,
 )
 from sglang.srt.server_args import (
@@ -85,6 +92,7 @@ from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     add_prometheus_middleware,
     configure_logger,
+    configure_media_url_security,
     load_audio,
     load_image,
     load_video,
@@ -306,9 +314,15 @@ class MMEncoder:
         ``base_gpu_id + rank`` — the DP launcher's per-worker placement. It is
         this instance's value, not a config change, so it travels as an
         argument."""
+        # The DP and TP encoder workers are spawned, so this constructor is
+        # the first publish in those processes.
+        publish(server_args, role="encoder")
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
-        publish(server_args, role="encoder")
+        configure_media_url_security(
+            get_mm().allowed_media_domains,
+            server_args.media_url_max_file_size_mb,
+        )
         self.rank = rank
         # DP rank for metric labels; overridden by run_dp_worker in DP mode.
         # 0 in the single-instance (non-DP) path.
@@ -320,7 +334,7 @@ class MMEncoder:
             server_args,
         )
         self.load_config = LoadConfig(
-            load_format=server_args.load_format,
+            load_format=get_model().load_format,
             download_dir=server_args.download_dir,
             model_loader_extra_config=server_args.model_loader_extra_config,
             remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
@@ -331,7 +345,7 @@ class MMEncoder:
             self.model_config.hf_config, "model_type", "unknown"
         ).lower()
 
-        self.device = server_args.device
+        self.device = get_device().device
         self.gpu_id = server_args.base_gpu_id + rank if gpu_id is None else gpu_id
 
         self.device_config = DeviceConfig(
@@ -345,7 +359,7 @@ class MMEncoder:
             use_image_processor_gpu
             and resolve_image_processor_backend(server_args) != "pil"
         )
-        self._build_vision_config(server_args.mm_process_config)
+        self._build_vision_config(get_mm().mm_process_config)
         self.model_audio_sr = self._resolve_audio_sr()
         logger.info(f"Resolved model audio sample rate: {self.model_audio_sr} Hz")
 
@@ -359,10 +373,13 @@ class MMEncoder:
         initialize_model_parallel(tensor_model_parallel_size=server_args.tp_size)
         initialize_dp_attention(server_args, self.model_config)
 
-        self.model = get_model(
+        self.model = load_model(
             model_config=self.model_config,
             load_config=self.load_config,
             device_config=self.device_config,
+        )
+        self.encoder_media_processor_config = resolve_encoder_media_processor_config(
+            self.model
         )
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
@@ -616,7 +633,7 @@ class MMEncoder:
         )
         try:
             self.image_processor = AutoImageProcessor.from_pretrained(
-                server_args.tokenizer_path or server_args.model_path,
+                get_serving().tokenizer_path or get_model().model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
                 **image_processor_kwargs,
@@ -627,7 +644,7 @@ class MMEncoder:
 
         try:
             self.video_processor = AutoVideoProcessor.from_pretrained(
-                server_args.tokenizer_path or server_args.model_path,
+                get_serving().tokenizer_path or get_model().model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
@@ -638,7 +655,7 @@ class MMEncoder:
         try:
             # Note: AutoProcessor is used for audio processor
             _audio_proc = AutoProcessor.from_pretrained(
-                server_args.tokenizer_path or server_args.model_path,
+                get_serving().tokenizer_path or get_model().model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
@@ -665,13 +682,27 @@ class MMEncoder:
         Load a single multimodal data.
         If data is precomputed, returns directly.
         Static method that can be pickled for multiprocessing"""
+        media_metadata = {}
+        content_hash = None
         if isinstance(data, dict):
-            return data
+            if "url" not in data:
+                return data
+            media_metadata = {key: value for key, value in data.items() if key != "url"}
+            content_hash = parse_content_hash(data.get("content_hash"))
+            data = data["url"]
         try:
             if modality == Modality.IMAGE:
+                if content_hash is not None:
+                    snapshot = snapshot_media(data)
+                    if snapshot.content_digest != content_hash:
+                        raise BadRequestError(
+                            "Encoder media content hash mismatch: "
+                            f"expected {content_hash}, got {snapshot.content_digest}"
+                        )
+                    data = snapshot.data
                 gpu_image_decode = (
-                    "nvjpeg_fancy"
-                    if self.use_image_processor_gpu and self.model_type == "kimi_k3"
+                    self.encoder_media_processor_config.image_decode_mode
+                    if self.use_image_processor_gpu
                     else False
                 )
                 img, _ = load_image(data, gpu_image_decode)
@@ -682,12 +713,23 @@ class MMEncoder:
                 ):
                     # Needed only when `img` is a PIL image
                     img = img.convert("RGB")
+                if (
+                    media_metadata
+                    and self.encoder_media_processor_config.preserve_media_metadata
+                ):
+                    return {
+                        "type": "image",
+                        "image": img,
+                        **media_metadata,
+                    }
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
                 return load_audio(data, self.model_audio_sr)
 
+        except MMError:
+            raise
         except CLIENT_MEDIA_EXCEPTIONS as e:
             # Not ValueError: the DP envelope classifies by `.code`, which only MMError carries.
             raise BadRequestError(f"Error while loading data {data}: {e}") from e
@@ -2063,7 +2105,7 @@ class MMEncoder:
 
         _zmq_xfer_start = time.perf_counter()
         if (
-            self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+            get_disagg().encoder_transfer_backend == "zmq_to_scheduler"
             and url is not None
         ):
             lock = self.scheduler_send_locks.get(endpoint)
@@ -2109,7 +2151,7 @@ class MMEncoder:
             if encoder_metrics_collector is not None:
                 encoder_metrics_collector.observe_transfer(
                     time.perf_counter() - _zmq_xfer_start,
-                    backend=self.server_args.encoder_transfer_backend,
+                    backend=get_disagg().encoder_transfer_backend,
                 )
             return
 
@@ -2970,7 +3012,7 @@ async def _push_embedding_to_prefill(enc: MMEncoder, request: dict) -> None:
     # No-op for mooncake (its /send is separate). embedding_port=None is
     # rejected upfront, so ports is always a concrete list here.
     req_id = request["req_id"]
-    backend = enc.server_args.encoder_transfer_backend
+    backend = get_disagg().encoder_transfer_backend
 
     if backend == "zmq_to_tokenizer":
         await enc.send(
@@ -3013,7 +3055,7 @@ async def _dp_worker_encode_and_send(
     modality = Modality.from_str(request["modality"])
     time_stats.modality = modality.name.lower()
     time_stats.set_metrics_collector(encoder_metrics_collector)
-    backend = enc.server_args.encoder_transfer_backend
+    backend = get_disagg().encoder_transfer_backend
 
     # URL state lives in main process module globals; workers don't see it.
     if backend == "zmq_to_scheduler" and request.get("embedding_port") is None:
@@ -3629,14 +3671,14 @@ async def run_dp_worker(
     )
 
     global encoder_metrics_collector
-    if server_args.enable_metrics:
+    if get_observability().enable_metrics:
         set_prometheus_multiproc_dir()
         labels = {
-            "model_name": server_args.served_model_name,
+            "model_name": get_serving().served_model_name,
             "dp_rank": str(dp_rank),
         }
-        if server_args.extra_metric_labels:
-            labels.update(server_args.extra_metric_labels)
+        if get_observability().extra_metric_labels:
+            labels.update(get_observability().extra_metric_labels)
         encoder_metrics_collector = EncoderMetricsCollector(labels)
         enc.dp_rank = dp_rank
 
@@ -3917,21 +3959,24 @@ def _unregister_encoder_url_from_bootstrap(server_args: ServerArgs):
 
 def launch_server(server_args: ServerArgs):
     configure_logger(server_args, prefix=" encode_server")
-    if server_args.dp_size > 1:
+    # Publish before the launch path reads configuration; the encoder built
+    # below re-projects the same object.
+    publish(server_args, role="encoder")
+    if get_parallel().dp_size > 1:
         _launch_server_dp(server_args)
         return
 
     global encoder, encoder_metrics_collector
 
     # Set up prometheus metrics.
-    if server_args.enable_metrics:
+    if get_observability().enable_metrics:
         set_prometheus_multiproc_dir()
         labels = {
-            "model_name": server_args.served_model_name,
+            "model_name": get_serving().served_model_name,
             "dp_rank": "0",
         }
-        if server_args.extra_metric_labels:
-            labels.update(server_args.extra_metric_labels)
+        if get_observability().extra_metric_labels:
+            labels.update(get_observability().extra_metric_labels)
         encoder_metrics_collector = EncoderMetricsCollector(labels)
         add_prometheus_middleware(app)
 
@@ -3939,21 +3984,21 @@ def launch_server(server_args: ServerArgs):
     zmq_ctx = zmq.Context(10)
     ipc_path_prefix = random_uuid()
     port_args = PortArgs.init_new(server_args)
-    if server_args.dist_init_addr:
-        na = NetworkAddress.parse(server_args.dist_init_addr)
+    if get_parallel().dist_init_addr:
+        na = NetworkAddress.parse(get_parallel().dist_init_addr)
         dist_init_method = na.to_tcp()
     else:
         dist_init_method = NetworkAddress(
-            server_args.host or "127.0.0.1", port_args.nccl_port
+            get_serving().host or "127.0.0.1", port_args.nccl_port
         ).to_tcp()
-    if server_args.enable_trace:
+    if get_observability().enable_trace:
         process_tracing_init(
-            server_args.otlp_traces_endpoint,
+            get_observability().otlp_traces_endpoint,
             "sglang",
-            trace_modules=server_args.trace_modules,
+            trace_modules=get_observability().trace_modules,
         )
         trace_set_thread_info("Encoder")
-    for rank in range(1, server_args.tp_size):
+    for rank in range(1, configured_tp_size()):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(
             get_zmq_socket(zmq_ctx, zmq.PUSH, schedule_path, bind=False)
@@ -3966,24 +4011,24 @@ def launch_server(server_args: ServerArgs):
     encoder = MMEncoder(server_args, dist_init_method=dist_init_method)
 
     # Register this encoder's URL with prefill server(s) if configured.
-    if server_args.encoder_register_urls:
+    if get_disagg().encoder_register_urls:
         import atexit
 
         _register_encoder_url_with_bootstrap(server_args)
         atexit.register(_unregister_encoder_url_from_bootstrap, server_args)
 
-    uvicorn.run(app, host=server_args.host, port=server_args.port)
+    uvicorn.run(app, host=get_serving().host, port=get_serving().port)
 
 
 def _launch_server_dp(server_args: ServerArgs):
     global dp_dispatcher
 
-    if server_args.dp_size <= 1 or server_args.tp_size != 1:
+    if get_parallel().dp_size <= 1 or server_args.tp_size != 1:
         raise ValueError(
             "Encoder DP mode requires --dp-size > 1 and --tp-size 1; got "
-            f"dp_size={server_args.dp_size}, tp_size={server_args.tp_size}."
+            f"dp_size={get_parallel().dp_size}, tp_size={server_args.tp_size}."
         )
-    dp_size = server_args.dp_size
+    dp_size = get_parallel().dp_size
     logger.info(f"Launching encoder in DP mode: dp_size={dp_size}")
 
     # DP mode: workers (subprocesses) write metrics to the shared multiproc dir;
@@ -4043,7 +4088,7 @@ def _launch_server_dp(server_args: ServerArgs):
             proc.start()
         worker_processes.append(proc)
 
-    labels = {"model_name": server_args.served_model_name}
+    labels = {"model_name": get_serving().served_model_name}
     if server_args.extra_metric_labels:
         labels.update(server_args.extra_metric_labels)
     dp_dispatcher = DPDispatcher(
@@ -4148,7 +4193,7 @@ async def handle_encode_request(request: dict):
         # when multiple decoder TP ranks POST /encode
         # with the same req_id, only the first triggers the VIT forward;
         # subsequent callers wait and return the same metadata.
-        if encoder.server_args.encoder_transfer_backend == "mooncake":
+        if get_disagg().encoder_transfer_backend == "mooncake":
             async with encoder._inflight_encode_lock:
                 if req_id in encoder._inflight_encode_events:
                     event = encoder._inflight_encode_events[req_id]
@@ -4234,7 +4279,7 @@ async def handle_encode_request(request: dict):
             time_stats.set_mm_encode_end_time()
 
         if error_msg:
-            if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+            if get_disagg().encoder_transfer_backend == "zmq_to_scheduler":
                 if request["embedding_port"] is None:
                     start_background_send(req_id)
                 else:
@@ -4245,7 +4290,7 @@ async def handle_encode_request(request: dict):
                             embedding_port=port,
                         )
             # Signal waiters on failure for mooncake
-            if encoder.server_args.encoder_transfer_backend == "mooncake":
+            if get_disagg().encoder_transfer_backend == "mooncake":
                 encoder._inflight_encode_meta.pop(req_id, None)
                 evt = encoder._inflight_encode_events.pop(req_id, None)
                 if evt:
@@ -4259,7 +4304,7 @@ async def handle_encode_request(request: dict):
                 status_code=error_code,
                 content={"status": "error", "message": error_msg, "req_id": req_id},
             )
-        if encoder.server_args.encoder_transfer_backend == "mooncake":
+        if get_disagg().encoder_transfer_backend == "mooncake":
             # Store metadata for duplicate callers and signal them
             encoder._inflight_encode_meta[req_id] = (
                 nbytes,
@@ -4283,7 +4328,7 @@ async def handle_encode_request(request: dict):
                     modality=modality_str, status="success"
                 )
             return ORJSONResponse(content=request)
-        elif encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":
+        elif get_disagg().encoder_transfer_backend == "zmq_to_scheduler":
             logger.info(f"{request['embedding_port'] = }")
             if request["embedding_port"] is None:
                 await encoder.send_with_url(
@@ -4307,7 +4352,7 @@ async def handle_encode_request(request: dict):
                     modality=modality_str, status="success"
                 )
             return ORJSONResponse(content=None)
-        elif encoder.server_args.encoder_transfer_backend == "zmq_to_tokenizer":
+        elif get_disagg().encoder_transfer_backend == "zmq_to_tokenizer":
             await encoder.send(
                 req_id=request["req_id"],
                 prefill_host=request["prefill_host"],
@@ -4329,7 +4374,7 @@ async def handle_encode_request(request: dict):
         logger.error(f"Unexpected error in encoder logic for {req_id}: {error_msg}")
         rid_to_err_msg[req_id] = error_msg
         # Ensure inflight waiters are unblocked on unexpected errors
-        if encoder.server_args.encoder_transfer_backend == "mooncake":
+        if get_disagg().encoder_transfer_backend == "mooncake":
             encoder._inflight_encode_meta.pop(req_id, None)
             evt = encoder._inflight_encode_events.pop(req_id, None)
             if evt:
