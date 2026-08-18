@@ -1694,10 +1694,6 @@ def alloc_for_decode_prealloc_hisparse(
             extend_num_tokens=fill_len,
             swa_tail_len=swa_tail_len,
         )
-        # swa_evicted_seqlen is the page-aligned eviction floor: _swa_tail_len
-        # floors its window_start to page_size, so fill_len - swa_tail_len is
-        # a page multiple. Assert it here to pin the invariant; a future caller
-        # bypassing _swa_tail_len must floor the value explicitly.
         swa_evicted_seqlen = fill_len - swa_tail_len
         assert swa_evicted_seqlen >= 0 and swa_evicted_seqlen % allocator.page_size == 0
         req.kv.swa_evicted_seqlen = swa_evicted_seqlen
