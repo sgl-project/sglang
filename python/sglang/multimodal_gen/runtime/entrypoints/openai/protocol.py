@@ -65,6 +65,7 @@ class ImageGenerationsRequest(BaseModel):
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     enable_teacache: Optional[bool] = False
+    enable_step_reuse: Optional[bool] = False
     max_sequence_length: Optional[int] = None
     flow_shift: Optional[float] = None
     # Upscaling
@@ -134,6 +135,7 @@ class VideoGenerationsRequest(BaseModel):
     max_sequence_length: Optional[int] = None
     flow_shift: Optional[float] = None
     enable_teacache: Optional[bool] = False
+    enable_step_reuse: Optional[bool] = False
     # Frame interpolation
     enable_frame_interpolation: Optional[bool] = False
     frame_interpolation_exp: Optional[int] = 1  # 1=2×, 2=4×

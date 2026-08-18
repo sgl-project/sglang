@@ -12,6 +12,10 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTCon
 # NOTE: SpectrumMixin lives in runtime.cache.spectrum
 from sglang.multimodal_gen.runtime.cache.spectrum import SpectrumMixin
 
+# NOTE: StepReuseMixin lives in runtime.cache.step_reuse, alongside the
+# framework-level StepReuseController/StepReusePolicy contract it wraps.
+from sglang.multimodal_gen.runtime.cache.step_reuse import StepReuseMixin
+
 # NOTE: TeaCacheContext and TeaCacheMixin have been moved to
 # sglang.multimodal_gen.runtime.cache.teacache
 # For backwards compatibility, re-export from the new location
@@ -112,13 +116,19 @@ class BaseDiT(nn.Module, ABC):
         return next(self.parameters()).device
 
 
-class CachableDiT(SpectrumMixin, TeaCacheMixin, BaseDiT):
+class CachableDiT(SpectrumMixin, TeaCacheMixin, StepReuseMixin, BaseDiT):
     """
     Base class for DiT models that support inference-time cache accelerators.
 
-    Inherits ``SpectrumMixin`` (Chebyshev step skipping) and ``TeaCacheMixin``
-    (temporal L1 similarity caching) plus ``BaseDiT`` core functionality.
+    Inherits ``SpectrumMixin`` (Chebyshev step skipping), ``TeaCacheMixin``
+    (temporal L1 similarity caching), and ``StepReuseMixin`` (the generic
+    step-reuse contract: a plain relative-L1 threshold with an explicit
+    consecutive-skip cap) plus ``BaseDiT`` core functionality.
 
+    ``enable_teacache``, ``enable_spectrum``, and ``enable_step_reuse`` are
+    mutually exclusive per-request skip-forward strategies (see
+    ``SamplingParams.validate_sampling_params``); a subclass's ``forward()``
+    only needs to call the hooks for the strategy(ies) it supports.
     """
 
     # These are required class attributes that should be overridden by concrete implementations
@@ -135,6 +145,7 @@ class CachableDiT(SpectrumMixin, TeaCacheMixin, BaseDiT):
         super().__init__(config, **kwargs)
         self._init_spectrum_state()
         self._init_teacache_state()
+        self._init_step_reuse_state()
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, dict[str, Any]]:

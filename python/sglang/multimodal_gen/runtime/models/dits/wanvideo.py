@@ -1073,6 +1073,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.enable_teacache = (
             forward_batch is not None and forward_batch.enable_teacache
         )
+        self.enable_step_reuse = (
+            forward_batch is not None and forward_batch.enable_step_reuse
+        )
         enable_spectrum = forward_batch is not None and forward_batch.enable_spectrum
 
         orig_dtype = hidden_states.dtype
@@ -1208,17 +1211,23 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         # 4. Transformer blocks
         run_transformer_blocks = self.begin_spectrum_step()
-        should_skip_forward = self.should_skip_forward_for_cached_states(
-            timestep_proj=timestep_proj, temb=temb
-        )
+        if self.enable_step_reuse:
+            should_skip_forward = self.should_skip_forward_for_step_reuse()
+        else:
+            should_skip_forward = self.should_skip_forward_for_cached_states(
+                timestep_proj=timestep_proj, temb=temb
+            )
 
         if enable_spectrum and not run_transformer_blocks:
             hidden_states = self.spectrum_predict_features(hidden_states)
         elif should_skip_forward:
-            hidden_states = self.retrieve_cached_states(hidden_states)
+            if self.enable_step_reuse:
+                hidden_states = self.retrieve_step_reuse_prediction(hidden_states)
+            else:
+                hidden_states = self.retrieve_cached_states(hidden_states)
         else:
-            # if teacache is enabled, we need to cache the original hidden states
-            if self.enable_teacache:
+            # if teacache/step-reuse is enabled, we need to cache the original hidden states
+            if self.enable_teacache or self.enable_step_reuse:
                 original_hidden_states = hidden_states.clone()
 
             rope_cos_sin_cache = None
@@ -1239,9 +1248,13 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     freqs_cis,
                     rope_cos_sin_cache=rope_cos_sin_cache,
                 )
-            # if teacache is enabled, we need to cache the original hidden states
+            # if teacache/step-reuse is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)
+            elif self.enable_step_reuse:
+                self.maybe_record_step_reuse(
+                    hidden_states, original_hidden_states, modulated_inp=timestep_proj
+                )
             if enable_spectrum:
                 self.spectrum_record_features(hidden_states)
         self.cnt += 1
