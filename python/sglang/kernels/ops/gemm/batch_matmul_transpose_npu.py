@@ -23,10 +23,12 @@ _GENERIC_CONFIGS = [
     triton.Config({"BLOCK_B": 32, "BLOCK_N": 128, "BLOCK_K": 32}),
     triton.Config({"BLOCK_B": 16, "BLOCK_N": 128, "BLOCK_K": 64}),
     triton.Config({"BLOCK_B": 32, "BLOCK_N": 128, "BLOCK_K": 64}),
+    triton.Config({"BLOCK_B": 24, "BLOCK_N": 128, "BLOCK_K": 128}),
 ]
 _FAST_CONFIGS = [
     triton.Config({"BLOCK_B": 8, "BLOCK_N": 128, "BLOCK_K": 64}),
     triton.Config({"BLOCK_B": 8, "BLOCK_N": 128, "BLOCK_K": 128}),
+    triton.Config({"BLOCK_B": 24, "BLOCK_N": 128, "BLOCK_K": 128}),
 ]
 _B1_FAST_CONFIGS = [
     triton.Config({"BLOCK_N": 128, "BLOCK_K": 64}),
