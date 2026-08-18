@@ -670,10 +670,6 @@ def forward_dsa_prepare_npu(
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
-        q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
-
-        q_nope_out = q_nope_out.transpose(0, 1)
-
         if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
             q_pe, k_pe = _apply_dsa_interleave_half_rope(
                 m,
@@ -695,6 +691,12 @@ def forward_dsa_prepare_npu(
             k_nope, k_pe = m.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
             )
+
+        q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
+
+        q_nope_out = q_nope_out.transpose(0, 1)
+
+
 
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(
@@ -757,14 +759,23 @@ def forward_dsa_core_npu(
         and not forward_batch.forward_mode.is_draft_extend_v2()
         and not forward_batch.forward_mode.is_target_verify()
     ):
-        attn_output = attn_output.transpose(0, 1)
-        torch.bmm(
+        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
             attn_output,
             m.w_vc,
-            out=attn_bmm_output.view(-1, m.num_local_heads, m.v_head_dim).transpose(
-                0, 1
-            ),
+            perm_x1=(1, 0, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
         )
+
+        # attn_output = attn_output.transpose(0, 1)
+        #
+        # torch.bmm(
+        #     attn_output,
+        #     m.w_vc,
+        #     out=attn_bmm_output.view(-1, m.num_local_heads, m.v_head_dim).transpose(
+        #         0, 1
+        #     ),
+        # )
     else:
         attn_output = attn_output.contiguous()
         if is_npu_before_atlas_a5():

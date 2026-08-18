@@ -269,58 +269,58 @@ class DSANPUIndexerMixin:
             else:
                 sin, cos = forward_batch.npu_indexer_sin_cos_cache
 
-            if self.alt_stream is not None:
-                self.alt_stream.wait_stream(torch.npu.current_stream())
-                with torch.npu.stream(self.alt_stream):
-                    q_lora = (
-                        (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
-                    )
-                    q = self.wq_b(q_lora)[
-                        0
-                    ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
-                    q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
-                    q_pe, q_nope = torch.split(
-                        q,
-                        [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                        dim=-1,
-                    )  # [bs, 64, 64 + 64]
-                    q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-                    q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
-                        bs, self.n_heads, self.rope_head_dim
-                    )  # [bs, n, d]
-                    q = torch.cat([q_pe, q_nope], dim=-1)
-                    q.record_stream(self.alt_stream)
-                    q_rope_event = self.alt_stream.record_event()
-            else:
-                q_lora = (
-                    (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
-                )
-                q = self.wq_b(q_lora)[
-                    0
-                ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
-                q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
-                q_pe, q_nope = torch.split(
-                    q,
-                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-                    dim=-1,
-                )  # [bs, 64, 64 + 64]
-                q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-                q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
-                    bs, self.n_heads, self.rope_head_dim
-                )  # [bs, n, d]
-                q = torch.cat([q_pe, q_nope], dim=-1)
+            # if self.alt_stream is not None:
+            #     self.alt_stream.wait_stream(torch.npu.current_stream())
+            #     with torch.npu.stream(self.alt_stream):
+            #         q_lora = (
+            #             (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
+            #         )
+            #         q = self.wq_b(q_lora)[
+            #             0
+            #         ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
+            #         q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+            #         q_pe, q_nope = torch.split(
+            #             q,
+            #             [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+            #             dim=-1,
+            #         )  # [bs, 64, 64 + 64]
+            #         q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
+            #         q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
+            #             bs, self.n_heads, self.rope_head_dim
+            #         )  # [bs, n, d]
+            #         q = torch.cat([q_pe, q_nope], dim=-1)
+            #         q.record_stream(self.alt_stream)
+            #         q_rope_event = self.alt_stream.record_event()
+            # else:
+            q_lora = (
+                (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
+            )
+            q = self.wq_b(q_lora)[
+                0
+            ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
+            q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+            q_pe, q_nope = torch.split(
+                q,
+                [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                dim=-1,
+            )  # [bs, 64, 64 + 64]
+            q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
+            q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
+                bs, self.n_heads, self.rope_head_dim
+            )  # [bs, n, d]
+            q = torch.cat([q_pe, q_nope], dim=-1)
 
-            if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
-                indexer_weight_stream = get_indexer_weight_stream()
-                indexer_weight_stream.wait_stream(torch.npu.current_stream())
-                with torch.npu.stream(indexer_weight_stream):
-                    x = x.view(-1, self.hidden_size)
-                    weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
-                    weights.record_stream(indexer_weight_stream)
-                    weights_event = indexer_weight_stream.record_event()
-            else:
-                x = x.view(-1, self.hidden_size)
-                weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+            # if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+            #     indexer_weight_stream = get_indexer_weight_stream()
+            #     indexer_weight_stream.wait_stream(torch.npu.current_stream())
+            #     with torch.npu.stream(indexer_weight_stream):
+            #         x = x.view(-1, self.hidden_size)
+            #         weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+            #         weights.record_stream(indexer_weight_stream)
+            #         weights_event = indexer_weight_stream.record_event()
+            # else:
+            x = x.view(-1, self.hidden_size)
+            weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
 
             k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
             k = self.k_norm(k_proj)
@@ -343,17 +343,17 @@ class DSANPUIndexerMixin:
             k = torch.cat([k_pe, k_nope.unsqueeze(1)], dim=-1)  # [bs, 1, 128]
 
         else:
-            if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
-                indexer_weight_stream = get_indexer_weight_stream()
-                indexer_weight_stream.wait_stream(torch.npu.current_stream())
-                with torch.npu.stream(indexer_weight_stream):
-                    x = x.view(-1, self.hidden_size)
-                    weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
-                    weights.record_stream(indexer_weight_stream)
-                    weights_event = indexer_weight_stream.record_event()
-            else:
-                x = x.view(-1, self.hidden_size)
-                weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+            # if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+            #     indexer_weight_stream = get_indexer_weight_stream()
+            #     indexer_weight_stream.wait_stream(torch.npu.current_stream())
+            #     with torch.npu.stream(indexer_weight_stream):
+            #         x = x.view(-1, self.hidden_size)
+            #         weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
+            #         weights.record_stream(indexer_weight_stream)
+            #         weights_event = indexer_weight_stream.record_event()
+            # else:
+            x = x.view(-1, self.hidden_size)
+            weights = self.weights_proj(x.float())[0].to(torch.bfloat16)
 
             q_lora = (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
             q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
@@ -488,10 +488,10 @@ class DSANPUIndexerMixin:
         if use_quant_lightning_indexer:
             past_key_states_scale = kv_pool.get_index_k_scale_buffer(layer_id)
 
-        if self.rotary_emb.is_neox_style and self.alt_stream is not None:
-            torch.npu.current_stream().wait_event(q_rope_event)
-        if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
-            torch.npu.current_stream().wait_event(weights_event)
+        # if self.rotary_emb.is_neox_style and self.alt_stream is not None:
+        #     torch.npu.current_stream().wait_event(q_rope_event)
+        # if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+        #     torch.npu.current_stream().wait_event(weights_event)
         if (
             _use_ag_after_qlora
             and layer_scatter_modes.layer_input_mode == ScatterMode.SCATTERED
