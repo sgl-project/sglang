@@ -143,6 +143,7 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,
+    quant_blocks_shared_experts_fusion,
 )
 from sglang.srt.models.deepseek_v2 import (
     ParallelLMHead,
@@ -3016,6 +3017,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         """V4 only fuses when explicitly asked to, and then the checkpoint must
         carry exactly one shared expert. Asked by the loader before any layer is
         built."""
+        # Need to disable if quant precision mismatch, even if
+        # --enforce-shared-experts-fusion is specified
+        if quant_blocks_shared_experts_fusion(quant_config):
+            return (
+                "Quantization keeps shared experts at a higher precision than the "
+                "routed experts, so they cannot be fused into the quantized "
+                "routed-expert path."
+            )
         if not get_exec().moe.enforce_shared_experts_fusion:
             return "Config does not support fused shared expert(s)."
         if hf_config.n_shared_experts != 1:
