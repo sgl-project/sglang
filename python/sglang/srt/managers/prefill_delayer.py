@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -103,7 +104,7 @@ class PrefillDelayer:
             f"queue_trigger_enabled={self._queue_trigger_enabled}"
         )
         self.dp_size = dp_size
-        self.enable_dp_attention = server_args.enable_dp_attention
+        self.enable_dp_attention = get_parallel().enable_dp_attention
         dp_size_dim = dp_size if self.enable_dp_attention else 1
 
         # Mirror scheduler_dp_attn_mixin's NCCL all-gather path: when the
