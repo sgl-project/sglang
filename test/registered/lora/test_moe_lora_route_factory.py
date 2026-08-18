@@ -54,9 +54,7 @@ def _serial_materialized_reference():
             False,
             PLAN.BridgeLayout.PAIR_MAJOR,
         ),
-        middle=PLAN.MiddleSpec(
-            PLAN.MiddleFamily.MATERIALIZED, PLAN.ActivationFamily.SWIGLU
-        ),
+        middle=PLAN.MiddleSpec(PLAN.MiddleFamily.MATERIALIZED, PLAN.ActivationFn.SILU),
         down_a=PLAN.LoraASpec(
             PLAN.Site.DOWN,
             PLAN.LoraAFamily.GROUPED,

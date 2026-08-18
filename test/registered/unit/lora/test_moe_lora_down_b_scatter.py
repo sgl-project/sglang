@@ -44,7 +44,7 @@ import pytest
 import torch
 
 from sglang.srt.lora.moe.execution_plan import (
-    ActivationFamily,
+    ActivationFn,
     BridgeLayout,
     DeviceArchitecture,
     FinalizeFamily,
@@ -70,7 +70,7 @@ register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-small")
 
 _GB300 = DeviceArchitecture.GB300
 _H200 = DeviceArchitecture.H200
-_SWIGLU = ActivationFamily.SWIGLU
+_SWIGLU = ActivationFn.SILU
 
 
 def _menu(architecture, layout, activation=_SWIGLU):
@@ -228,7 +228,7 @@ class TestDownBScatterConfig:
             # Rows are activation-agnostic: the ReLU2 build of the same menu
             # (including the fallback rows every menu carries) makes the
             # same per-row scatter decision.
-            ("gb300_relu2", _GB300, False, ActivationFamily.RELU2),
+            ("gb300_relu2", _GB300, False, ActivationFn.RELU2),
         )
         for name, architecture, layout, activation in cases:
             for row_name, choice in _menu(architecture, layout, activation).items():
@@ -700,7 +700,7 @@ def _build_runner(plan, launch_config, base_gemm_rows: str, gpu, num_experts: in
         providers={"test": provider},
         top_k=_TOP_K,
         routed_scaling_factor=_ROUTED_SCALING,
-        activation=ActivationFamily.SWIGLU,
+        activation=ActivationFn.SILU,
     )
     runner._test_execution = dict(
         plan=plan, launch_config=launch_config, base_gemm_rows="test"

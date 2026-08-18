@@ -28,7 +28,7 @@ import pytest
 import torch
 
 from sglang.srt.lora.moe.execution_plan import (
-    ActivationFamily,
+    ActivationFn,
     BridgeLayout,
     DeviceArchitecture,
     FinalizeFamily,
@@ -55,7 +55,7 @@ register_cuda_ci(est_time=150, stage="base-b", runner_config="1-gpu-small")
 
 _GB300 = DeviceArchitecture.GB300
 _H200 = DeviceArchitecture.H200
-_SWIGLU = ActivationFamily.SWIGLU
+_SWIGLU = ActivationFn.SILU
 
 
 def _menu(architecture, layout, activation=_SWIGLU):
@@ -154,7 +154,7 @@ class TestBActMiddleConfig:
         # a standalone gate/up-B owner.
         for architecture in (_GB300, _H200):
             for layout in (False, True):
-                for activation in (_SWIGLU, ActivationFamily.RELU2):
+                for activation in (_SWIGLU, ActivationFn.RELU2):
                     for name, choice in _menu(architecture, layout, activation).items():
                         if not name.startswith("decode.") and name != "fallback.serial":
                             continue
@@ -176,7 +176,7 @@ class TestBActMiddleConfig:
 
         per_expert = _prefill(False)
         shared = _prefill(True)
-        relu2 = _prefill(False, ActivationFamily.RELU2)
+        relu2 = _prefill(False, ActivationFn.RELU2)
         for sel in (per_expert, shared, relu2):
             assert sel.name == "fallback.serial_prefill"
         # The per-expert twin composes the swap with the scatter; the shared
@@ -192,7 +192,7 @@ class TestBActMiddleConfig:
         assert shared.plan.down_b_scatter is False
         assert shared.base_gemm_rows == "expert_major"
         assert relu2.plan.middle.family is MiddleFamily.B_ACTIVATION
-        assert relu2.plan.middle.activation is ActivationFamily.RELU2
+        assert relu2.plan.middle.activation is ActivationFn.RELU2
         assert relu2.plan.down_b_scatter is True
 
 
@@ -316,7 +316,7 @@ def _build_runner(plan, launch_config, base_gemm_rows: str, gpu, num_experts: in
         providers={"test": provider},
         top_k=_TOP_K,
         routed_scaling_factor=_ROUTED_SCALING,
-        activation=ActivationFamily.SWIGLU,
+        activation=ActivationFn.SILU,
     )
     runner._test_execution = dict(
         plan=plan, launch_config=launch_config, base_gemm_rows="test"

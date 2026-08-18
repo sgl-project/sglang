@@ -90,6 +90,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.lora.moe.activation import ActivationFn
 from sglang.srt.lora.moe.base_gemm_provider.base import (
     MappedLoraAInput,
     MoeBaseProvider,
@@ -98,7 +99,6 @@ from sglang.srt.lora.moe.base_gemm_provider.masked_activation import (
     _activation_delta_masked_kernel,
 )
 from sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle import (
-    MASKED_MIDDLE_ACTIVATIONS,
     MASKED_MIDDLE_FAMILIES,
     MASKED_MIDDLE_TRITON,
     _b_act_kernel,
@@ -656,8 +656,7 @@ def act_delta_contiguous(
     the slab's leading dimension, which the compact 2-D buffer no longer
     carries.
     """
-    if activation not in ("silu", "relu2"):
-        raise ValueError(f"activation={activation!r} is not 'silu' or 'relu2'")
+    ActivationFn.parse(activation)  # fail closed on an unknown name
     num_pairs = topk_ids.numel()
     inter = act_out.shape[-1]
     if gateup_output.ndim != 2:
@@ -745,10 +744,7 @@ def fused_b_act_contiguous(
             f"contiguous fused middle needs route view {ROUTE_ALIGNED!r}, got "
             f"{routing.view!r}"
         )
-    if activation not in MASKED_MIDDLE_ACTIVATIONS:
-        raise ValueError(
-            f"activation={activation!r} is not one of {MASKED_MIDDLE_ACTIVATIONS}"
-        )
+    ActivationFn.parse(activation)
     pairs = routing.topk_ids.numel()
     if src2dst.dtype != torch.int32 or src2dst.numel() != pairs:
         raise ValueError(f"src2dst must be int32 with {pairs} entries")
@@ -922,8 +918,8 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         self._gate_up_slices = gateup_width // quant_info.intermediate_size
         if self._gate_up_slices not in (1, 2):
             raise ValueError(
-                "contiguous BF16 provider supports one ReLU2 slice or two "
-                f"gate/up slices, got {self._gate_up_slices}"
+                "contiguous BF16 provider supports one non-gated slice or two "
+                f"gated gate/up slices, got {self._gate_up_slices}"
             )
 
         # Bind callees once at attach time, mirroring the masked domain: the
@@ -1087,8 +1083,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         activation: str = "silu",
         consume_base_pdl: bool = False,
     ) -> None:
-        if activation not in ("silu", "relu2"):
-            raise ValueError(f"activation={activation!r} is not 'silu' or 'relu2'")
+        # act_delta_contiguous, called on the next line, checks the registry.
         act_delta_contiguous(
             gateup_out,
             gate_up_delta,
@@ -1161,7 +1156,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
     ) -> bool:
         return (
             family in MASKED_MIDDLE_FAMILIES
-            and activation in MASKED_MIDDLE_ACTIVATIONS
+            and activation in ActivationFn
             and implementation == MASKED_MIDDLE_TRITON
         )
 

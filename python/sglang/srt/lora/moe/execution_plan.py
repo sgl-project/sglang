@@ -33,6 +33,8 @@ from typing import Any, Literal
 import pydantic
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
+from sglang.srt.lora.moe.activation import ActivationFn
+
 logger = logging.getLogger(__name__)
 
 _STRICT = pydantic.ConfigDict(strict=True, extra="forbid")
@@ -81,11 +83,6 @@ class LoraAFamily(str, Enum):
 class LoraBFamily(str, Enum):
     ONE_LAUNCH_SLICED = "one_launch_sliced"
     INDEXED_PAIRS = "indexed_pairs"
-
-
-class ActivationFamily(str, Enum):
-    SWIGLU = "swiglu"
-    RELU2 = "relu2"
 
 
 class MiddleFamily(str, Enum):
@@ -223,7 +220,7 @@ class MiddleSpec:
     """
 
     family: MiddleFamily
-    activation: ActivationFamily
+    activation: ActivationFn
     consumed_gate_up_b: StageContract | None = None
 
     def __post_init__(self) -> None:
@@ -602,7 +599,7 @@ class SelectedPlan:
 def build_plan(
     spec: _PlanSpecModel,
     *,
-    activation: ActivationFamily,
+    activation: ActivationFn,
     is_shared_outer: bool,
 ) -> MoeLoraExecutionPlan:
     """Materialize one row's plan spec into a validated execution plan.
@@ -682,7 +679,7 @@ def resolve_plans(
     architecture: DeviceArchitecture,
     is_shared_outer: bool,
     physical_rank: int,
-    activation: ActivationFamily,
+    activation: ActivationFn,
     hidden_size: int,
     num_local_experts: int,
 ) -> dict[Phase, SelectedPlan]:

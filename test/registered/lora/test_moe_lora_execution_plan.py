@@ -25,7 +25,7 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
-ActivationFamily = _MODULE.ActivationFamily
+ActivationFn = _MODULE.ActivationFn
 EarlyOverlap = _MODULE.EarlyOverlap
 StageContract = _MODULE.StageContract
 BridgeLayout = _MODULE.BridgeLayout
@@ -74,7 +74,7 @@ def _plan(**changes) -> MoeLoraExecutionPlan:
     values = {
         "gate_up_a": _a(Site.GATE_UP),
         "gate_up_b": _b(Site.GATE_UP),
-        "middle": MiddleSpec(MiddleFamily.MATERIALIZED, ActivationFamily.SWIGLU),
+        "middle": MiddleSpec(MiddleFamily.MATERIALIZED, ActivationFn.SILU),
         "down_a": _a(Site.DOWN),
         "down_b": _b(Site.DOWN),
         "finalize": FinalizeSpec(FinalizeFamily.MATERIALIZED),
@@ -186,17 +186,17 @@ class TestFactorAndKernelSpecs(unittest.TestCase):
 class TestFusionOwnership(unittest.TestCase):
     def test_middle_rejects_missing_duplicate_and_wrong_site_consumers(self):
         with self.assertRaisesRegex(ValueError, "requires.*gate/up B"):
-            MiddleSpec(MiddleFamily.B_ACTIVATION, ActivationFamily.SWIGLU)
+            MiddleSpec(MiddleFamily.B_ACTIVATION, ActivationFn.SILU)
         with self.assertRaisesRegex(ValueError, "does not consume.*gate/up B"):
             MiddleSpec(
                 MiddleFamily.MATERIALIZED,
-                ActivationFamily.SWIGLU,
+                ActivationFn.SILU,
                 consumed_gate_up_b=_factor(Site.GATE_UP),
             )
         with self.assertRaisesRegex(ValueError, "gate/up site"):
             MiddleSpec(
                 MiddleFamily.B_ACTIVATION,
-                ActivationFamily.SWIGLU,
+                ActivationFn.SILU,
                 consumed_gate_up_b=_factor(Site.DOWN),
             )
         # The consumed contract's ownership is the adapter weight format,
@@ -205,7 +205,7 @@ class TestFusionOwnership(unittest.TestCase):
         self.assertIsNotNone(
             MiddleSpec(
                 MiddleFamily.B_ACTIVATION,
-                ActivationFamily.SWIGLU,
+                ActivationFn.SILU,
                 consumed_gate_up_b=_factor(Site.GATE_UP, True),
             ).consumed_gate_up_b
         )
@@ -240,7 +240,7 @@ class TestWholePipelineValidation(unittest.TestCase):
                 gate_up_b=None,
                 middle=MiddleSpec(
                     MiddleFamily.B_ACTIVATION,
-                    ActivationFamily.SWIGLU,
+                    ActivationFn.SILU,
                     consumed_gate_up_b=gate,
                 ),
             ),
@@ -248,7 +248,7 @@ class TestWholePipelineValidation(unittest.TestCase):
                 gate_up_b=None,
                 middle=MiddleSpec(
                     MiddleFamily.B_ACTIVATION,
-                    ActivationFamily.SWIGLU,
+                    ActivationFn.SILU,
                     consumed_gate_up_b=gate,
                 ),
                 down_b=None,
@@ -265,7 +265,7 @@ class TestWholePipelineValidation(unittest.TestCase):
             _plan(
                 middle=MiddleSpec(
                     MiddleFamily.B_ACTIVATION,
-                    ActivationFamily.SWIGLU,
+                    ActivationFn.SILU,
                     consumed_gate_up_b=gate,
                 )
             )
@@ -303,7 +303,7 @@ class TestWholePipelineValidation(unittest.TestCase):
                 gate_up_b=None,
                 middle=MiddleSpec(
                     MiddleFamily.B_ACTIVATION,
-                    ActivationFamily.SWIGLU,
+                    ActivationFn.SILU,
                     consumed_gate_up_b=gate,
                 ),
                 early_overlap=EarlyOverlap.GATE_UP_A_B,

@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.lora.moe.execution_plan import (
-    ActivationFamily,
+    ActivationFn,
     Phase,
     architecture_for_capability,
     resolve_plans,
@@ -62,7 +62,7 @@ def _resolve_execution(architecture, mode: Phase, num_tokens: int):
         architecture=architecture,
         is_shared_outer=False,
         physical_rank=_PHYSICAL_RANK,
-        activation=ActivationFamily.SWIGLU,
+        activation=ActivationFn.SILU,
         hidden_size=_HIDDEN,
         num_local_experts=_EXPERTS,
     )[mode]
@@ -249,7 +249,7 @@ def test_config_chosen_per_expert_swiglu_matches_fp32_reference(
         providers={"test": provider},
         top_k=_TOP_K,
         routed_scaling_factor=_ROUTED_SCALING,
-        activation=ActivationFamily.SWIGLU,
+        activation=ActivationFn.SILU,
     )
     runner._test_execution = dict(
         plan=choice.plan, launch_config=launch_config, base_gemm_rows="test"
@@ -344,7 +344,7 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
         providers={"test": provider},
         top_k=_TOP_K,
         routed_scaling_factor=_ROUTED_SCALING,
-        activation=ActivationFamily.SWIGLU,
+        activation=ActivationFn.SILU,
     )
     runner._test_execution = dict(
         plan=choice.plan, launch_config=launch_config, base_gemm_rows="test"

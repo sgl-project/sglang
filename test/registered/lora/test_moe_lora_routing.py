@@ -19,7 +19,7 @@ def _serial_materialized_reference():
     """The simplest correct pipeline: every stage standalone, nothing fused,
     no overlap window."""
     from sglang.srt.lora.moe.execution_plan import (
-        ActivationFamily,
+        ActivationFn,
         BridgeLayout,
         FinalizeFamily,
         FinalizeSpec,
@@ -43,7 +43,7 @@ def _serial_materialized_reference():
             False,
             BridgeLayout.PAIR_MAJOR,
         ),
-        middle=MiddleSpec(MiddleFamily.MATERIALIZED, ActivationFamily.SWIGLU),
+        middle=MiddleSpec(MiddleFamily.MATERIALIZED, ActivationFn.SILU),
         down_a=LoraASpec(
             Site.DOWN, LoraAFamily.GROUPED, False, BridgeLayout.PAIR_MAJOR
         ),

@@ -33,13 +33,13 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.lora.moe.activation import ActivationFn
 from sglang.srt.lora.moe.base_gemm_provider.masked_activation import (
     apply_activation,
 )
 from sglang.srt.lora.moe.routing import ROUTE_ALIGNED, RouteView
 
 MASKED_MIDDLE_FAMILIES = ("b_activation",)
-MASKED_MIDDLE_ACTIVATIONS = ("silu", "relu2")
 MASKED_MIDDLE_TRITON = "triton"
 
 FUSED_B_ACT_DEFAULT_CONFIG: dict[str, int] = {
@@ -96,10 +96,7 @@ def _validate_common(
             f"masked fused middle needs route view {ROUTE_ALIGNED!r}, got "
             f"{routing.view!r}"
         )
-    if activation not in MASKED_MIDDLE_ACTIVATIONS:
-        raise ValueError(
-            f"activation={activation!r} is not one of {MASKED_MIDDLE_ACTIVATIONS}"
-        )
+    ActivationFn.parse(activation)
     pairs = routing.topk_ids.numel()
     if src2dst.dtype != torch.int32 or src2dst.numel() != pairs:
         raise ValueError(f"src2dst must be int32 with {pairs} entries")

@@ -67,7 +67,7 @@ def load_geometry(model_path: str) -> dict:
         "num_experts": experts,
         "intermediate": cfg.get("moe_intermediate_size")
         or cfg.get("intermediate_size"),
-        "activation": "swiglu",  # relu2 models must pass --activation relu2
+        "activation": "silu",  # see --activation
     }
 
 
@@ -75,8 +75,8 @@ def resolve_report(args, geometry) -> int:
     sys.path.insert(0, os.path.join(REPO, "python"))
     if args.config_dir:
         os.environ["SGLANG_LORA_MOE_CONFIG_DIR"] = args.config_dir
+    from sglang.srt.lora.moe.activation import ActivationFn
     from sglang.srt.lora.moe.execution_plan import (
-        ActivationFamily,
         architecture_for_capability,
         resolve_plans,
     )
@@ -88,7 +88,7 @@ def resolve_report(args, geometry) -> int:
             architecture=architecture_for_capability(args.capability_major, 0),
             is_shared_outer=is_shared_outer,
             physical_rank=args.max_rank,
-            activation=ActivationFamily(geometry["activation"]),
+            activation=ActivationFn.parse(geometry["activation"]),
             hidden_size=geometry["hidden_size"],
             num_local_experts=e_local,
         )

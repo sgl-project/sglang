@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 import msgspec
 import torch
 
+from sglang.srt.lora.moe.activation import ActivationFn
 from sglang.srt.lora.moe.base_gemm_provider.base import (
     MappedLoraAInput,
     MoeBaseProvider,
@@ -84,8 +85,8 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         self._gate_up_slices = gateup_width // quant_info.intermediate_size
         if self._gate_up_slices not in (1, 2):
             raise ValueError(
-                "masked BF16 provider supports one ReLU2 slice or two "
-                f"gate/up slices, got {self._gate_up_slices}"
+                "masked BF16 provider supports one non-gated slice or two "
+                f"gated gate/up slices, got {self._gate_up_slices}"
             )
 
         # Bind callees once: this instance is constructed at LoRA-attach time
@@ -111,7 +112,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             invoke_shared_rank_reduce,
         )
         from sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle import (
-            MASKED_MIDDLE_ACTIVATIONS,
             MASKED_MIDDLE_FAMILIES,
             MASKED_MIDDLE_TRITON,
             run_masked_fused_middle,
@@ -122,7 +122,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         self._fused_middle_impls: dict[tuple[str, str, str], Callable] = {
             (family, activation, MASKED_MIDDLE_TRITON): run_masked_fused_middle
             for family in MASKED_MIDDLE_FAMILIES
-            for activation in MASKED_MIDDLE_ACTIVATIONS
+            for activation in ActivationFn
         }
         self._shared_reduce_impls: dict[str, Callable] = {
             MASKED_FINALIZE_TRITON: invoke_shared_rank_reduce
@@ -225,8 +225,8 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         activation: str = "silu",
         consume_base_pdl: bool = False,
     ) -> None:
-        if activation not in ("silu", "relu2"):
-            raise ValueError(f"activation={activation!r} is not 'silu' or 'relu2'")
+        # No activation check: act_delta_masked fails closed on the same
+        # string one frame down, against the registry.
         self._act_kernel(
             gateup_out,
             gate_up_delta,
@@ -291,8 +291,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         """Inject an explicitly forceable provider-local implementation."""
         if family != "b_activation":
             raise ValueError(f"unknown fused-middle family {family!r}")
-        if activation not in ("silu", "relu2"):
-            raise ValueError(f"unknown fused-middle activation {activation!r}")
         if not name or not callable(implementation):
             raise ValueError("a fused-middle implementation needs a name and callable")
         self._fused_middle_impls[(family, activation, name)] = implementation
@@ -382,8 +380,6 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             activation,
             implementation,
         )
-        if activation not in ("silu", "relu2"):
-            raise ValueError(f"activation={activation!r} is not 'silu' or 'relu2'")
         invoke(
             family,
             activation=activation,

@@ -21,6 +21,7 @@ from unittest import mock
 import msgspec
 import torch
 
+from sglang.srt.lora.moe.activation import ActivationFn
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-c-test-cpu")
@@ -279,7 +280,10 @@ class TestMaskedFusionSource(unittest.TestCase):
     def test_middle_pair_store_is_optional_and_masked_store_is_unconditional(self):
         source = _source("masked_fused_middle.py")
         self.assertIn('("b_activation",)', source)
-        self.assertIn('("silu", "relu2")', source)
+        # The activation set is single-sourced from moe.activation; restating
+        # it here is the drift this assertion exists to prevent.
+        self.assertIn("ActivationFn.parse", source)
+        self.assertNotIn('("silu", "relu2")', source)
         base_columns = _function(source, "_base_columns")
         self.assertIn("interleaved", base_columns)
         self.assertIn("gate_first", base_columns)
@@ -299,14 +303,21 @@ class TestMaskedFusionSource(unittest.TestCase):
         launcher = _function(source, "run_masked_fused_middle")
         self.assertIn("store_pair_act=act_pairs is not None", launcher)
 
-    def test_materialized_activation_supports_swiglu_and_relu2(self):
+    def test_materialized_activation_keeps_the_two_axes_independent(self):
+        """The pointwise function and the gating are separate constexprs.
+
+        NUM_SLICES carries the gating and ACTIVATION_TYPE the function, so all
+        four combinations compile. A kernel that took one "swiglu-or-relu2"
+        constant instead could not express non-gated silu or gated relu2.
+        """
         source = _source("masked_activation.py")
         kernel = _function(source, "_activation_delta_masked_kernel")
         wrapper = _function(source, "act_delta_masked")
         self.assertIn("NUM_SLICES", kernel)
         self.assertIn("ACTIVATION_TYPE", kernel)
         self.assertIn("tl.maximum", _function(source, "apply_activation"))
-        self.assertIn('("silu", "relu2")', source)
+        self.assertIn("ActivationFn.parse", source)
+        self.assertNotIn('("silu", "relu2")', source)
         self.assertIn("num_slices * inter", wrapper)
 
     def test_shared_rank_finalize_is_fail_closed_and_two_stage(self):
@@ -408,7 +419,6 @@ class TestMaskedFusionSource(unittest.TestCase):
         middle = types.ModuleType(
             "sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle"
         )
-        middle.MASKED_MIDDLE_ACTIVATIONS = ("silu", "relu2")
         middle.MASKED_MIDDLE_FAMILIES = ("b_activation",)
         middle.MASKED_MIDDLE_TRITON = "triton"
         middle.run_masked_fused_middle = lambda *_args, **_kwargs: None
@@ -442,7 +452,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             )
 
         for family in middle.MASKED_MIDDLE_FAMILIES:
-            for candidate_activation in middle.MASKED_MIDDLE_ACTIVATIONS:
+            for candidate_activation in ActivationFn:
                 self.assertTrue(
                     provider.supports_fused_middle(
                         family,
@@ -475,8 +485,12 @@ class TestMaskedFusionSource(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "contiguous"):
             provider.mapped_down_lora_a_input(workspace, activation_rows)
 
-    def test_cutedsl_relu2_schedule_uses_the_resident_slice_count(self):
-        """A one-slice ReLU2 provider must not schedule a two-slice GEMM1."""
+    def test_cutedsl_schedule_uses_the_resident_slice_count(self):
+        """A NON-GATED provider must not schedule a two-slice GEMM1.
+
+        Named for the gating, not for relu2: the slice count comes from the
+        resident width, so a non-gated silu layer is the same case.
+        """
 
         class StubWorkspace(msgspec.Struct, kw_only=True):
             hidden_permuted: torch.Tensor

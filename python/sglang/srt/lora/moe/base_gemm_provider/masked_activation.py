@@ -1,7 +1,9 @@
 """S3 activation-join kernel for the MoE LoRA BF16 pipeline.
 
-SwiGLU or ReLU2 with the LoRA delta added PRE-activation, plus the
-``activation_lora_input`` side output consumed by the down-proj LoRA shrink.
+A pointwise activation from ``moe.activation`` applied with the LoRA delta
+added PRE-activation, plus the ``activation_lora_input`` side output consumed
+by the down-proj LoRA shrink. Gating is NOT part of that choice: the gate half
+is multiplied in only when ``NUM_SLICES`` says the resident buffer has one.
 
 Layout: the base GEMM1 output is the provider *masked* layout
 ``[E_local, m_max, slices * inter]`` viewed flat by the kernel;
@@ -25,7 +27,7 @@ import torch
 import triton
 import triton.language as tl
 
-_ACTIVATIONS = ("silu", "relu2")
+from sglang.srt.lora.moe.activation import ActivationFn
 
 
 @triton.jit
@@ -135,8 +137,7 @@ def act_delta_masked(
     consume_base_pdl: bool = False,
 ) -> None:
     """Join base and LoRA delta, then activate; gating comes from the shapes."""
-    if activation not in _ACTIVATIONS:
-        raise ValueError(f"activation={activation!r} is not one of {_ACTIVATIONS}")
+    ActivationFn.parse(activation)  # fail closed on an unknown name
     num_pairs = topk_ids.numel()
     inter = act_out.shape[-1]
     # Gating is a resident-shape property, independent of the activation.

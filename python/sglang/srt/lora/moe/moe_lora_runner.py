@@ -53,12 +53,12 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+from sglang.srt.lora.moe.activation import ActivationFn
 from sglang.srt.lora.moe.base_gemm_provider.base import (
     MappedLoraAInput,
     MoeBaseProvider,
 )
 from sglang.srt.lora.moe.execution_plan import (
-    ActivationFamily,
     BridgeLayout,
     EarlyOverlap,
     FinalizeFamily,
@@ -153,7 +153,8 @@ class MoeLoraRunner:
         providers: Mapping[str, MoeBaseProvider],
         top_k: int,
         routed_scaling_factor: float | None,
-        activation: ActivationFamily = ActivationFamily.SWIGLU,
+        activation: ActivationFn = ActivationFn.SILU,
+        is_gated: bool = True,
         workspace: MoeLoraWorkspace | None = None,
         base_gemm_vendor: str = "cutedsl",
     ) -> None:
@@ -186,6 +187,10 @@ class MoeLoraRunner:
         self.top_k = top_k
         self.routed_scaling_factor = routed_scaling_factor
         self.activation = activation
+        # The OTHER axis. Gating is a resident-shape fact -- the gate/up
+        # buffer is one slice or two -- and is never inferred from the
+        # activation, which is what made non-gated SiLU unservable.
+        self.is_gated = is_gated
         self.workspace = workspace if workspace is not None else MoeLoraWorkspace()
 
     @classmethod
@@ -220,11 +225,8 @@ class MoeLoraRunner:
             # Layer-static routing scalars, read once rather than per forward.
             top_k=int(config.top_k),
             routed_scaling_factor=config.routed_scaling_factor,
-            activation=(
-                ActivationFamily.SWIGLU
-                if config.activation == "silu"
-                else ActivationFamily.RELU2
-            ),
+            activation=ActivationFn.parse(config.activation),
+            is_gated=bool(config.is_gated),
             workspace=workspace,
         )
 
@@ -276,7 +278,7 @@ class MoeLoraRunner:
             )
 
         config = base_layer.moe_runner_config
-        supported_activation = config.activation in ("silu", "relu2")
+        supported_activation = config.activation in ActivationFn
         # Gating is validated as its own axis: the resident gate/up width must
         # agree with the layer's is_gated declaration.
         gateup_width = base_layer.w13_weight.shape[1]
@@ -380,18 +382,18 @@ class MoeLoraRunner:
                 f"plan activation {plan.middle.activation.value} does not match "
                 f"resident layer activation {self.activation.value}"
             )
-        expected_slices = 2 if self.activation is ActivationFamily.SWIGLU else 1
+        expected_slices = 2 if self.is_gated else 1
         if provider.gate_up_slices != expected_slices:
             raise ValueError(
-                f"provider exposes {provider.gate_up_slices} gate/up "
-                f"slices but {self.activation.value} needs {expected_slices}"
+                f"provider exposes {provider.gate_up_slices} gate/up slices "
+                f"but is_gated={self.is_gated} needs {expected_slices}"
             )
 
         if plan.middle.family is not MiddleFamily.MATERIALIZED:
             family, implementation = self._middle_implementation(plan)
             if not provider.supports_fused_middle(
                 family,
-                activation=self._activation_name(),
+                activation=self.activation.value,
                 implementation=implementation,
             ):
                 raise NotImplementedError(
@@ -816,9 +818,6 @@ class MoeLoraRunner:
             )
         return state, ws, gateup
 
-    def _activation_name(self) -> str:
-        return "silu" if self.activation is ActivationFamily.SWIGLU else "relu2"
-
     def _run_middle(
         self,
         plan: MoeLoraExecutionPlan,
@@ -872,7 +871,7 @@ class MoeLoraRunner:
                 topk_ids,
                 act_out,
                 act_pairs,
-                activation=self._activation_name(),
+                activation=self.activation.value,
             )
             return act_out, _DownAInput(act_pairs)
 
@@ -884,7 +883,7 @@ class MoeLoraRunner:
             ws,
             family,
             implementation=implementation,
-            activation=self._activation_name(),
+            activation=self.activation.value,
             base_gateup=gateup_out,
             act_masked=act_out,
             act_pairs=act_pairs,
@@ -1226,11 +1225,7 @@ class MoeLoraLayerEngine:
         config = base_layer.moe_runner_config
         self._base_layer = base_layer
         self.architecture = architecture_for_capability(*capability)
-        self.activation = (
-            ActivationFamily.SWIGLU
-            if config.activation == "silu"
-            else ActivationFamily.RELU2
-        )
+        self.activation = ActivationFn.parse(config.activation)
         self.hidden_size = int(base_layer.w2_weight.shape[1])
         self.num_local_experts = int(base_layer.num_local_experts)
         # Server-lifetime constant, so nothing vendor-shaped reaches a forward.

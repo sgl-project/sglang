@@ -57,7 +57,7 @@ from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
     contiguous_m_pad_ceiling,
 )
 from sglang.srt.lora.moe.execution_plan import (
-    ActivationFamily,
+    ActivationFn,
     DeviceArchitecture,
     Phase,
     SelectedPlan,
@@ -73,7 +73,7 @@ register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-small")
 
 _GB300 = DeviceArchitecture.GB300
 _H200 = DeviceArchitecture.H200
-_SWIGLU = ActivationFamily.SWIGLU
+_SWIGLU = ActivationFn.SILU
 
 
 def _menu(architecture, layout, activation=_SWIGLU):
@@ -205,7 +205,7 @@ class TestRowDomainConfig:
         # fallback and the ReLU2 decode winner.
         for architecture in (_GB300, _H200):
             for layout in (False, True):
-                for activation in (_SWIGLU, ActivationFamily.RELU2):
+                for activation in (_SWIGLU, ActivationFn.RELU2):
                     for name, choice in _menu(architecture, layout, activation).items():
                         if not name.startswith("decode.") and name != "fallback.serial":
                             continue
@@ -774,7 +774,7 @@ def _build_runner(architecture, choice, vendor: str, gpu, num_experts, layout):
         providers={"test": provider},
         top_k=_TOP_K,
         routed_scaling_factor=_ROUTED_SCALING,
-        activation=ActivationFamily.SWIGLU,
+        activation=ActivationFn.SILU,
     )
     runner._test_execution = dict(
         plan=choice.plan,

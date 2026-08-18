@@ -19,7 +19,7 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.moe import execution_plan as ep
 from sglang.srt.lora.moe import launch_config as lc
 from sglang.srt.lora.moe.execution_plan import (
-    ActivationFamily,
+    ActivationFn,
     DeviceArchitecture,
     EarlyOverlap,
     FinalizeFamily,
@@ -38,7 +38,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
 
-_SWIGLU = ActivationFamily.SWIGLU
+_SWIGLU = ActivationFn.SILU
 _GB300 = DeviceArchitecture.GB300
 _H200 = DeviceArchitecture.H200
 
@@ -185,16 +185,14 @@ class TestResolution:
             for layout in (False, True):
                 swiglu = _resolve(architecture=architecture, layout=layout)
                 relu2 = _resolve(
-                    architecture=architecture, layout=layout, act=ActivationFamily.RELU2
+                    architecture=architecture, layout=layout, act=ActivationFn.RELU2
                 )
                 assert {p: s.name for p, s in relu2.items()} == {
                     p: s.name for p, s in swiglu.items()
                 }
                 for phase, sel in relu2.items():
-                    assert sel.plan.middle.activation is ActivationFamily.RELU2
-                    assert (
-                        swiglu[phase].plan.middle.activation is ActivationFamily.SWIGLU
-                    )
+                    assert sel.plan.middle.activation is ActivationFn.RELU2
+                    assert swiglu[phase].plan.middle.activation is ActivationFn.SILU
 
     def test_out_of_domain_serves_the_serial_deepgemm_fallback(self):
         selected = _resolve(hidden=8192, experts=1024)

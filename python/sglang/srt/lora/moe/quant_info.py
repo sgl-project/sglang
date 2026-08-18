@@ -21,8 +21,9 @@ import torch
 class MoeLoraBf16QuantInfo(msgspec.Struct, kw_only=True):
     """Unquantized standard-layout MoE weights.
 
-    ``w13_weight`` is ``[E_local, S * I, H]``: ``S=2`` for gated SiLU
-    (gate first) and ``S=1`` for non-gated ReLU2. ``w2_weight`` is
+    ``w13_weight`` is ``[E_local, S * I, H]``: ``S=2`` when the layer is
+    gated (gate first), ``S=1`` when it is not. The pointwise activation is a
+    separate axis and does not affect ``S``. ``w2_weight`` is
     ``[E_local, H, I]``.
     """
 
