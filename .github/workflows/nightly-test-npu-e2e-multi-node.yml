@@ -6,7 +6,7 @@ on:
       runner:
         required: false
         type: string
-        default: linux-amd64-cpu-8
+        default: linux-amd64-cpu-4
       ref:
         required: false
         type: string
