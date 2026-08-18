@@ -526,13 +526,18 @@ def cutlass_w4a8_moe_deepep_ll(
     )
 
     gateup_input = torch.empty(a_states.shape, dtype=torch.float8_e4m3fn, device=device)
-    fp8_per_token_to_per_tensor_quant_triton(
-        x=a_states,
-        x_scale=a_scales,
-        masked_m=masked_m,
-        output_scale=a1_scale,
-        output=gateup_input,
-    )
+    if a_scales is None:
+        # DeepEP low_latency dispatches bf16 (no per-token scales) -> quantize to per-tensor
+        # fp8 with the static input scale, as cutlass_w4a8_moe_deepep_normal() does.
+        per_tensor_quant_fp8(a_states, gateup_input, a1_scale.float(), True)
+    else:
+        fp8_per_token_to_per_tensor_quant_triton(
+            x=a_states,
+            x_scale=a_scales,
+            masked_m=masked_m,
+            output_scale=a1_scale,
+            output=gateup_input,
+        )
     c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)
 
