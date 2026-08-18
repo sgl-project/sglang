@@ -1342,7 +1342,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 if not flashinfer_cutlass_supports_situ():
                     raise RuntimeError(
                         "Kimi-K3 FlashInfer MXFP4 MoE on SM120 requires a "
-                        "FlashInfer build with CUTLASS SiTU support from PR #4460 "
+                        "FlashInfer build with CUTLASS SiTU support "
                         "(ActivationType.Situ plus situ_beta/situ_linear_beta). "
                         "Upgrade FlashInfer or restart with "
                         "--moe-runner-backend marlin."

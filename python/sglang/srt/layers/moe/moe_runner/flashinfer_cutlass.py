@@ -90,7 +90,7 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     swiglu_beta: Optional[torch.Tensor] = None
     swiglu_limit: Optional[torch.Tensor] = None
 
-    # Optional per-expert SiTU scales, fp32 [E] (FlashInfer PR #4460).
+    # Optional per-expert SiTU scales, fp32 [E].
     situ_beta: Optional[torch.Tensor] = None
     situ_linear_beta: Optional[torch.Tensor] = None
 
@@ -117,7 +117,7 @@ def _flashinfer_cutlass_fused_moe():
 
 
 def flashinfer_cutlass_supports_situ() -> bool:
-    """Return whether the installed FlashInfer exposes the PR #4460 API."""
+    """Return whether the installed FlashInfer exposes the CUTLASS SiTU API."""
     try:
         cutlass_fused_moe, activation_type = _flashinfer_cutlass_fused_moe()
         parameters = inspect.signature(cutlass_fused_moe).parameters

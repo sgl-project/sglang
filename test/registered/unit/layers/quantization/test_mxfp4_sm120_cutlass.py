@@ -105,7 +105,7 @@ def test_dsv4_sm120_load_contract(monkeypatch):
     assert captured["fp4_scale_dtype"] == torch.float8_e8m0fnu
 
 
-def test_kimi_k3_sm120_situ_requires_patched_flashinfer(monkeypatch):
+def test_kimi_k3_sm120_situ_requires_flashinfer_cutlass_situ_api(monkeypatch):
     import sglang.srt.layers.quantization.mxfp4 as mxfp4_module
     import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass as runner_module
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -477,7 +477,7 @@ def test_kimi_k3_sm120_situ_layout_and_noncontiguous_input(monkeypatch):
     from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
     if not runner_module.flashinfer_cutlass_supports_situ():
-        pytest.skip("FlashInfer CUTLASS SiTU support from PR #4460 required")
+        pytest.skip("FlashInfer CUTLASS SiTU support required")
 
     monkeypatch.setattr(
         runner_module, "use_symmetric_memory", lambda *args, **kwargs: nullcontext()
