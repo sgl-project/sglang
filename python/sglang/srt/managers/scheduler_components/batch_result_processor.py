@@ -94,6 +94,14 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
 
+    @staticmethod
+    def _commit_dspark_mixed_target_token(
+        *, batch: ScheduleBatch, req: Req, decoding_req_ids: set[int]
+    ) -> None:
+        """Settle the target-only token consumed by a DSpark mixed batch."""
+        if batch.spec_algorithm.is_dspark() and id(req) in decoding_req_ids:
+            req.kv_committed_len += 1
+
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
@@ -234,6 +242,7 @@ class SchedulerBatchResultProcessor:
 
             # Check finish conditions
             logprob_pt = 0
+            decoding_req_ids = {id(req) for req in batch.decoding_reqs or []}
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if (
@@ -265,6 +274,18 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
+                    # Spec-v2 normally commits accepted tokens in
+                    # _resolve_spec_v2_tokens.  A DSpark mixed batch takes the
+                    # target-only prefill path instead, so settle the one bonus
+                    # token consumed for each running request here.  New
+                    # prefill requests were already settled by
+                    # ScheduleBatch.prepare_for_extend and must not be touched.
+                    self._commit_dspark_mixed_target_token(
+                        batch=batch,
+                        req=req,
+                        decoding_req_ids=decoding_req_ids,
+                    )
+
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
 
@@ -276,7 +297,7 @@ class SchedulerBatchResultProcessor:
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                    elif id(req) not in decoding_req_ids:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)

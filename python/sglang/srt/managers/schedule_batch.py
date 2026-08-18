@@ -2746,7 +2746,52 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
-    def mix_with_running(self, running_batch: ScheduleBatch):
+    def prepare_dspark_for_mixed(self) -> List[int]:
+        """Prepare a DSpark running batch for one target-only mixed step.
+
+        DSpark decode preparation reserves a verify window but intentionally
+        leaves ``seq_lens`` at the committed prefix.  A mixed target forward
+        consumes exactly the relayed bonus token, so point ``out_cache_loc`` at
+        the first reserved slot and advance the forward-facing sequence length
+        by one.  The returned prefix lengths must be captured before that
+        advance and appended to the prefill half by ``mix_with_running``.
+        """
+        if not self.spec_algorithm.is_dspark():
+            raise ValueError("prepare_dspark_for_mixed requires DSPARK")
+
+        from sglang.kernels.ops.speculative.cache_locs import (
+            assign_extend_cache_locs_func,
+        )
+
+        running_bs = self.batch_size()
+        # Some attention backends (including DSV4) opt out of FutureMap's
+        # regular seq-lens D2H and intentionally leave seq_lens_cpu unset.
+        # Mixed extend metadata still needs the committed prefix as a Python
+        # list, so materialize the small per-request mirror only on this path.
+        seq_lens_cpu = self.seq_lens_cpu
+        if seq_lens_cpu is None:
+            seq_lens_cpu = self.seq_lens.to(device="cpu")
+        prefix_lens = seq_lens_cpu.tolist()
+        self.out_cache_loc = assign_extend_cache_locs_func(
+            req_pool_indices=self.req_pool_indices,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            start_offset=self.seq_lens,
+            end_offset=self.seq_lens + 1,
+            batch_size=running_bs,
+            draft_token_num=1,
+            device=self.device,
+        )
+        self.seq_lens = self.seq_lens + 1
+        self.seq_lens_cpu = seq_lens_cpu + 1
+        self.seq_lens_sum = int(self.seq_lens_cpu.sum())
+        return prefix_lens
+
+    def mix_with_running(
+        self,
+        running_batch: ScheduleBatch,
+        *,
+        running_prefix_lens: Optional[List[int]] = None,
+    ):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
 
@@ -2767,10 +2812,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         delta = 0 if self.enable_overlap else -1
 
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
-        self.prefix_lens = self.prefix_lens + [
-            len(r.origin_input_ids) + len(r.output_ids) + delta
-            for r in running_batch.reqs
-        ]
+        if running_prefix_lens is None:
+            running_prefix_lens = [
+                len(r.origin_input_ids) + len(r.output_ids) + delta
+                for r in running_batch.reqs
+            ]
+        elif len(running_prefix_lens) != running_bs:
+            raise ValueError(
+                "running_prefix_lens must have one entry per running request, "
+                f"got {len(running_prefix_lens)} for batch size {running_bs}"
+            )
+        self.prefix_lens = self.prefix_lens + running_prefix_lens
         self.extend_lens = self.extend_lens + [1] * running_bs
         self.extend_num_tokens = self.extend_num_tokens + running_bs
         # TODO (lianmin): Revisit this. It should be seq_len - 1

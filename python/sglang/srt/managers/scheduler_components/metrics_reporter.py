@@ -574,6 +574,12 @@ class SchedulerMetricsReporter:
             else self.scheduler.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
+        forward_mode = batch.forward_mode.name if batch is not None else "UNKNOWN"
+        num_mixed_decode_reqs = (
+            len(batch.decoding_reqs or [])
+            if batch is not None and batch.forward_mode.is_mixed()
+            else 0
+        )
 
         msg = (
             f"Prefill batch{iter_msg}, "
@@ -584,6 +590,8 @@ class SchedulerMetricsReporter:
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "
             f"#pending-token: {prefill_stats.num_pending_tokens}, "
+            f"forward mode: {forward_mode}, "
+            f"#mixed-decode-req: {num_mixed_decode_reqs}, "
         )
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:

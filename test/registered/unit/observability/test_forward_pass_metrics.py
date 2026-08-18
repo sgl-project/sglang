@@ -15,6 +15,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
 from sglang.test.test_utils import CustomTestCase
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
 def _make_ps(**overrides) -> ParallelState:
@@ -97,6 +98,8 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
     if not hasattr(scheduler, "kv_events_publisher"):
         scheduler.kv_events_publisher = types.SimpleNamespace(
             init_kv_events=lambda *a, **kw: None,
+            emit_kv_metrics=lambda *a, **kw: None,
+            publish_kv_events=lambda *a, **kw: None,
         )
     if not hasattr(scheduler, "tp_workers"):
         scheduler.tp_workers = []
@@ -144,9 +147,41 @@ class TestForwardPassMetrics(unittest.TestCase):
             prefill_stats=None,
             seq_lens_cpu=[],
             fpm_start_time=100.0,
+            forward_iter=0,
         )
         defaults.update(overrides)
         return types.SimpleNamespace(**defaults)
+
+    def test_prefill_log_identifies_mixed_batch(self):
+        self.scheduler.pool_stats_observer = types.SimpleNamespace(
+            get_pool_stats=lambda: types.SimpleNamespace(
+                get_prefill_usage_msg_parts=lambda: []
+            )
+        )
+        batch = self._make_batch(
+            forward_mode=ForwardMode.MIXED,
+            decoding_reqs=[object(), object(), object()],
+        )
+        stats = PrefillStats(
+            log_input_tokens=128,
+            log_hit_tokens=256,
+            new_token_ratio=1.0,
+            num_running_reqs=types.SimpleNamespace(total=3),
+            num_new_seqs=1,
+        )
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.logger.info"
+        ) as log_info:
+            self.reporter.report_prefill_stats(
+                batch=batch,
+                prefill_stats=stats,
+                can_run_cuda_graph=False,
+            )
+
+        message = log_info.call_args.args[0]
+        self.assertIn("forward mode: MIXED", message)
+        self.assertIn("#mixed-decode-req: 3", message)
 
     def test_emit_mixed_batch_separates_prefill_and_decode(self):
         self.scheduler._fpm_dp_rank = 3

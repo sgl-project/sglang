@@ -49,6 +49,10 @@ _RESOLVE = (
     "managers/scheduler_components/batch_result_processor.py",
     "SchedulerBatchResultProcessor._resolve_spec_v2_tokens",
 )
+_MIXED_PREFILL_RESULT = (
+    "managers/scheduler_components/batch_result_processor.py",
+    "SchedulerBatchResultProcessor._commit_dspark_mixed_target_token",
+)
 _SS = "session/streaming_session.py"
 _OWNER_SITES = {
     # non-spec scheduler
@@ -78,6 +82,9 @@ _OWNER_SITES = {
     ): 1,
     (*_RESOLVE, "kv_committed_len"): 1,
     (*_RESOLVE, "spec_verify_ct"): 1,
+    # DSpark mixed chunk: target-only fallback commits one running token in the
+    # prefill result path; new prefill rows were already committed above.
+    (*_MIXED_PREFILL_RESULT, "kv_committed_len"): 1,
     # disaggregation decode prealloc: kv_allocated_len is settled inside the
     # owned-kv alloc_for_decode_prealloc(_hisparse) functions (op42).
     (
