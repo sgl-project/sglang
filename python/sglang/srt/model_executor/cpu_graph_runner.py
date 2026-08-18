@@ -176,6 +176,8 @@ def register_fake_ops(tp_size: int):
         "gemma_fused_add_rmsnorm_cpu",
         "layernorm_cpu",
         "fused_add_layernorm_cpu",
+        "multimodal_rotary_embedding_cpu",
+        "apply_multidimensional_rope_cpu",
     ]
     for op in none_return_ops:
 
@@ -259,26 +261,12 @@ def register_fake_ops(tp_size: int):
 
     @register_cpu_compile_fake("rotary_embedding_cpu")
     def _(positions, query, key, head_size, cos_sin_cache, is_neox):
-        if query.ndim == 2:
-            return query, key
-        else:
-            return torch.empty_like(query), torch.empty_like(key)
+        # TODO: the kernel aliases query/key for 2D and 4D but allocates for 3D,
+        # which no schema expresses; an accurate fake needs it to pick one
+        return torch.empty_like(query), torch.empty_like(key)
 
     @register_cpu_compile_fake("apply_rotary_pos_emb_cpu")
     def _(query, key, cos, sin):
-        return query, key
-
-    @register_cpu_compile_fake("multimodal_rotary_embedding_cpu")
-    def _(
-        positions,
-        query,
-        key,
-        head_size,
-        cos_sin_cache,
-        mrope_section,
-        mrope_interleaved,
-        is_neox,
-    ):
         return query, key
 
     @register_cpu_compile_fake("qkv_proj_with_rope_fused_weight")
@@ -579,7 +567,7 @@ class CPUGraphRunner:
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker
-            else get_server_return_hidden_states_mode(model_runner.server_args)
+            else get_server_return_hidden_states_mode()
         )
         self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         # bs -> compiled fn (text-only / skip_cross_attention=True)

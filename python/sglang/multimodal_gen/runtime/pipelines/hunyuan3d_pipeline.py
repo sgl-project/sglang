@@ -333,7 +333,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
 
     @staticmethod
     def _component_device(server_args: ServerArgs, component_name: str) -> torch.device:
-        if server_args.should_cpu_offload_component(component_name):
+        if server_args.should_start_component_on_cpu(component_name):
             return torch.device("cpu")
         return get_local_torch_device()
 
@@ -528,15 +528,36 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         components: dict[str, Any] = {}
 
         components["hy3dshape_model"] = self._load_dit_model(
-            model_config["model"], ckpt["model"], device, dtype
+            model_config["model"],
+            ckpt["model"],
+            (
+                torch.device("cpu")
+                if server_args.should_start_component_on_cpu("hy3dshape_model")
+                else device
+            ),
+            dtype,
         )
 
         components["hy3dshape_vae"] = self._load_simple_component(
-            model_config["vae"], ckpt.get("vae"), device, dtype
+            model_config["vae"],
+            ckpt.get("vae"),
+            (
+                torch.device("cpu")
+                if server_args.should_start_component_on_cpu("hy3dshape_vae")
+                else device
+            ),
+            dtype,
         )
 
         components["hy3dshape_conditioner"] = self._load_simple_component(
-            model_config["conditioner"], ckpt.get("conditioner"), device, dtype
+            model_config["conditioner"],
+            ckpt.get("conditioner"),
+            (
+                torch.device("cpu")
+                if server_args.should_start_component_on_cpu("hy3dshape_conditioner")
+                else device
+            ),
+            dtype,
         )
 
         components["hy3dshape_scheduler"] = self._instantiate_component(

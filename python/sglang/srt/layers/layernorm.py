@@ -1310,6 +1310,10 @@ class Gemma4RMSNorm(BaseFusedOp):
 
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         if _is_cpu_amx_available:
+            # the kernel needs a last-dim-contiguous input; the audio conformer
+            # normalizes its depthwise conv output, which arrives permuted
+            if x.stride(-1) != 1:
+                x = x.contiguous()
             return torch.ops.sgl_kernel.gemma4_rmsnorm_cpu(
                 x, self.weight.data, self.eps, self.scale_shift, self.with_scale
             )

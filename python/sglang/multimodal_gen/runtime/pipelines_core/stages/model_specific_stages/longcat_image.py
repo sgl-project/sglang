@@ -268,7 +268,7 @@ class LongCatPromptRewriteStage(PipelineStage):
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
-        logger.info("Rewritten prompts: %s", rewritten)
+        logger.debug("Rewritten prompts: %s", rewritten)
         return rewritten
 
     @torch.no_grad()

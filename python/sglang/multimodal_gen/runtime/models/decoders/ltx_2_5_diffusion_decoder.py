@@ -23,6 +23,9 @@ from sglang.multimodal_gen.configs.models.decoders.ltx_2_5_diffusion_decoder imp
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     timestep_embedding,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -782,18 +785,27 @@ def _tile_intervals(
     ]
 
 
-class LTX2VideoDiffusionDecoderModel(nn.Module):
+class LTX2VideoDiffusionDecoderModel(nn.Module, LayerwiseOffloadableModuleMixin):
     """Checkpoint-level wrapper: the decoder plus the latent statistics.
 
     `diffusion_decoder/` stores `latents_mean` / `latents_std` alongside a
     `decoder.` submodule, so this mirrors that layout rather than flattening it.
     """
 
+    layerwise_offload_dit_group_enabled = False
+
     def __init__(self, config: LTX25DiffusionDecoderConfig) -> None:
         super().__init__()
         self.config = config
         latent_channels = config.arch_config.latent_channels
         self.decoder = LTX2VideoDiffusionDecoder3d(config)
+        self.layer_names = [
+            *(
+                f"decoder.det_stages.{index}"
+                for index in range(len(self.decoder.det_stages))
+            ),
+            "decoder.diff_blocks",
+        ]
         self.register_buffer(
             "latents_mean", torch.zeros(latent_channels), persistent=True
         )
