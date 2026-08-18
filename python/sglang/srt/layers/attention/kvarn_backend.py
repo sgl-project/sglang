@@ -1753,6 +1753,18 @@ class KVarNMultiStepDraftBackend:
 
         self._backend = create_kvarn_backend(model_runner)
 
+        # The draft model (MTP head) has a different layer structure than the
+        # target: it has 1 full-attention layer at layer_id=0, while the target
+        # model's full_attn_layer_ids are [3, 7, 11, ...] (every 4th layer).
+        # The backend was initialized from the target's config (since the draft
+        # loads from the same checkpoint when speculative_draft_model_path is
+        # None), so we need to override the layer mapping for the draft model.
+        if self._backend.full_attn_layer_ids is not None:
+            # Override for the MTP draft: single full-attention layer at index 0
+            self._backend.full_attn_layer_ids = [0]
+            self._backend.num_layers = 1
+            self._backend._layer_id_to_idx = {0: 0}
+
         # Expose the same attributes as FlashInferMultiStepDraftBackend
         self.max_context_len = getattr(
             self._backend, "max_context_len", model_runner.model_config.context_len
