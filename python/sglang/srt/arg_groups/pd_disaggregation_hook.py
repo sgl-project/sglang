@@ -116,11 +116,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"got '{server_args.disaggregation_transfer_backend}'."
             )
 
-        # Runtime role switch only rebuilds the small role-specific disagg
-        # structures on a flip; the per-role buffers of DP attention / expert
-        # parallelism / MoE all-to-all / pipeline parallelism are sized at
-        # startup and not rebuilt, so a flip with those on would silently
-        # deadlock. Reject up-front instead.
+        # Reject features whose role-specific state is not rebuilt on a flip.
         if server_args.enable_pd_role_switch:
             from sglang.srt.arg_groups.overrides import resolved_view
 
@@ -138,11 +134,15 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 unsupported.append(f"pipeline parallelism (--pp-size {view.pp_size})")
             if view.dp_size > 1:
                 unsupported.append(f"data parallelism (--dp-size {view.dp_size})")
+            if view.speculative_algorithm is not None:
+                unsupported.append(
+                    "speculative decoding "
+                    f"(--speculative-algorithm {view.speculative_algorithm})"
+                )
             if unsupported:
                 raise ValueError(
-                    "--enable-pd-role-switch is only supported with pure tensor "
-                    "parallelism; per-role buffers for the following are not "
-                    "rebuilt on a flip and would deadlock at switch time: "
+                    "--enable-pd-role-switch does not rebuild role-specific "
+                    "state for the following features: "
                     + ", ".join(unsupported)
                     + ". Remove these options or drop --enable-pd-role-switch."
                 )

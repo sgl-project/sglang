@@ -237,7 +237,6 @@ _EXPOSED = {
     ("managers/overlap_utils.py", "speculative_algorithm"),
     ("managers/prefill_delayer.py", "disable_overlap_schedule"),
     ("managers/rust_server.py", "mm_process_config"),
-    ("managers/schedule_batch.py", "disaggregation_mode"),
     ("managers/scheduler.py", "attn_cp_size"),
     ("managers/scheduler.py", "disable_overlap_schedule"),
     ("managers/scheduler.py", "disaggregation_mode"),
@@ -367,6 +366,20 @@ _EXPOSED_CUDA_ONLY: frozenset = frozenset()
 # some code overrides post-publish. Each needs an ordering judgment, not a blanket
 # conversion; the list exists so a new one is a decision made when it is written.
 _OVERRIDDEN_AND_READ = {
+    # Role-independent startup setup; live-path reads use the config bags.
+    (
+        "distributed/device_communicators/mooncake_transfer_engine.py",
+        "disaggregation_mode",
+    ),
+    ("managers/disagg_service.py", "disaggregation_mode"),
+    # These configurations are rejected when role switch is enabled.
+    ("managers/data_parallel_controller.py", "disaggregation_mode"),
+    ("speculative/dspark_components/dspark_worker_v2.py", "disaggregation_mode"),
+    # Launch-time metadata.
+    ("kv_canary/api.py", "disaggregation_mode"),
+    ("managers/scheduler.py", "disaggregation_mode"),
+    # Flip-capable instances use a stable "dynamic" metrics label.
+    ("observability/metrics_collector.py", "disaggregation_mode"),
     ("entrypoints/engine.py", "reasoning_parser"),
     ("entrypoints/engine.py", "tool_call_parser"),
     ("configs/model_config.py", "dtype"),

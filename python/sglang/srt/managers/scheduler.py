@@ -4319,7 +4319,7 @@ class Scheduler(
         # decode). A router can query a live decode server here and pass the value
         # as PdRoleSwitchReqInput.decode_cuda_graph_bs so the instance being
         # flipped to decode captures a size-matched graph set.
-        ret["disaggregation_mode"] = self.server_args.disaggregation_mode
+        ret["disaggregation_mode"] = get_disagg().disaggregation_mode
         ret["decode_cuda_graph_bs"] = self.tp_worker.get_decode_cuda_graph_bs()
 
         if get_exec().moe.elastic_ep_backend is not None:

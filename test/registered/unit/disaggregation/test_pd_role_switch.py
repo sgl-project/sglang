@@ -262,6 +262,7 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
             pp_size=1,
             dp_size=1,
             dcp_size=1,
+            speculative_algorithm=None,
         )
         base.update(kw)
         return SimpleNamespace(**base)
@@ -301,6 +302,11 @@ class TestPdRoleSwitchStartupValidation(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self._run(self._sa(dp_size=2))
         self.assertIn("data parallelism", str(ctx.exception))
+
+    def test_reject_speculative_decoding(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._run(self._sa(speculative_algorithm="EAGLE"))
+        self.assertIn("speculative decoding", str(ctx.exception))
 
     def test_no_role_switch_is_unaffected(self):
         # The same unsupported feature is fine when role switch is off.

@@ -1922,7 +1922,8 @@ def release_req(
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
-    if server_args.disaggregation_mode == "decode" and offload_kv:
+    # The config bag reflects role flips; server_args keeps the launch role.
+    if get_disagg().disaggregation_mode == "decode" and offload_kv:
         retraction_backup(
             req,
             tree_cache,
