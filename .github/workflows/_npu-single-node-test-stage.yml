@@ -149,8 +149,7 @@ jobs:
                 core.info(`[health-check] Filtered out h20 job: ${j.name}`);
                 return false;
               }
-              // multimodal-gen NPU tests run on a separate runner pool and
-              // should not cascade fast-fail to perf/accuracy stages.
+              // multimodal-gen NPU tests should not cascade fast-fail to perf/accuracy stages.
               if (baseName === 'multimodal-gen-test-1-npu-a3' || baseName === 'multimodal-gen-test-2-npu-a3') {
                 core.info(`[health-check] Filtered out multimodal-gen NPU job: ${j.name}`);
                 return false;
