@@ -454,7 +454,15 @@ class MoeLoraRunner:
         assert TopKOutputChecker.format_is_standard(topk_output)
         topk_ids = topk_output.topk_ids
 
-        num_tokens = self._checked_token_count(hidden_states, batch)
+        num_tokens = hidden_states.shape[0]
+        if batch.token_slots.ndim != 1 or batch.token_slots.shape[0] != num_tokens:
+            raise RuntimeError(
+                "MoE LoRA token/adapter assignment does not match the MoE "
+                f"token domain: mapping has {batch.token_slots.shape[0]} rows "
+                f"but the runner received {num_tokens}. Gather/remap "
+                "assignments before MoE-DP execution."
+            )
+
         self.workspace.begin_forward(graph_mode=batch.use_cuda_graph)
         routes = build_routes(
             plan,
@@ -521,19 +529,6 @@ class MoeLoraRunner:
             num_tokens,
         )
         return StandardCombineInput(hidden_states=output)
-
-    def _checked_token_count(
-        self, hidden_states: torch.Tensor, batch: MoeLoraBatch
-    ) -> int:
-        num_tokens = hidden_states.shape[0]
-        if batch.token_slots.ndim != 1 or batch.token_slots.shape[0] != num_tokens:
-            raise RuntimeError(
-                "MoE LoRA token/adapter assignment does not match the MoE "
-                f"token domain: mapping has {batch.token_slots.shape[0]} rows "
-                f"but the runner received {num_tokens}. Gather/remap "
-                "assignments before MoE-DP execution."
-            )
-        return num_tokens
 
     def _route_for_a(self, spec: LoraASpec, routes: MoeLoraRoutes) -> RouteView:
         if spec.family is LoraAFamily.TOKEN_DEDUP_GROUPED:
