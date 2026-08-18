@@ -244,6 +244,17 @@ class DsparkFoldedSampling(IntEnum):
     FORCE = 2
 
 
+class B12xOneshotCap(IntEnum):
+    """Sentinels for SGLANG_B12X_ONESHOT_MAX_BYTES; positive values are byte counts.
+
+    UNCAPPED: keep the b12x pool's own limit; the historical (pre-knob) behavior.
+    AUTOTUNE: measure one-shot against NCCL at init and cap at the crossover.
+    """
+
+    AUTOTUNE = -1
+    UNCAPPED = 0
+
+
 class Envs:
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
@@ -1107,6 +1118,23 @@ class Envs:
     # MNNVL-fabric devices (GB200/GB300) when nnodes > 1; set 0/1 to
     # override in either direction.
     SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE = EnvBool(False)
+    # b12x PCIe all-reduce for SM120 (Blackwell workstation & server parts, no
+    # NVLink). Requires the `b12x` PyPI package; falls back to NCCL whenever a
+    # tensor is outside the kernels' supported range.
+    SGLANG_B12X_PCIE_AR = EnvBool(False)
+    # Additionally route large (prefill-sized) all-reduces through the b12x DMA ring.
+    SGLANG_B12X_PCIE_DMA = EnvBool(False)
+    # Upper bound of the DMA ring scratch buffer; sized for the largest all-reduce
+    # the model can issue (chunked_prefill_size x hidden x dtype).
+    SGLANG_B12X_DMA_MAX_BYTES = EnvInt(256 * 1024 * 1024)
+    # DMA ring wire format: "ring" / "a2a" for FP8, empty string for BF16.
+    SGLANG_B12X_DMA_FP8 = EnvStr("ring")
+    # Largest message the one-shot path may take, in bytes; see B12xOneshotCap for
+    # the UNCAPPED / AUTOTUNE sentinels. One-shot is latency-optimal but
+    # bandwidth-poor, so the crossover against NCCL is a property of the rank
+    # placement, not of the kernel. The default keeps the pool's own limit, so
+    # behavior is unchanged unless a deployment opts in.
+    SGLANG_B12X_ONESHOT_MAX_BYTES = EnvInt(B12xOneshotCap.UNCAPPED)
 
     # ===================================================================
     # RoPE cache

@@ -465,6 +465,26 @@ class GroupCoordinator:
                 device=self.device,
             )
 
+        self.b12x_comm: Optional[Any] = None
+        # Only the tensor-parallel group issues the per-layer all-reduces these
+        # kernels target; other groups (PP / DP) would just pin IPC buffers.
+        if (
+            envs.SGLANG_B12X_PCIE_AR.get()
+            and self.world_size > 1
+            and "tp" in self.unique_name
+        ):
+            try:
+                from sglang.srt.distributed.device_communicators.b12x_pcie_ar import (
+                    B12xPCIeCommunicator,
+                )
+
+                # b12x needs the CUDA (NCCL) group for its IPC handshake.
+                self.b12x_comm = B12xPCIeCommunicator(
+                    group=self.device_group, device=self.device
+                )
+            except Exception as e:
+                logger.warning(f"Setup b12x PCIe allreduce failed with {e}.")
+
         self.ca_comm: Optional[Any] = None
         self.qr_comm: Optional[QuickAllReduce] = None
         if use_custom_allreduce and self.world_size > 1:
@@ -598,6 +618,15 @@ class GroupCoordinator:
         # is already collected in init() and we can capture the quick allreduce directly.
         ca_comm = self.ca_comm
         maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
+        # b12x >= 1.x refuses to record a one-shot into a graph outside its own
+        # capture context: the graph pins a channel, so the pool has to know which
+        # one before any node lands in it.
+        b12x_comm = self.b12x_comm
+        maybe_b12x_context = (
+            nullcontext()
+            if b12x_comm is None or b12x_comm.disabled
+            else b12x_comm.capture(stream=stream)
+        )
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
@@ -605,7 +634,7 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with self.device_module.stream(stream), maybe_ca_context:
+        with self.device_module.stream(stream), maybe_ca_context, maybe_b12x_context:
             # In graph mode, we have to be very careful about the collective
             # operations. The current status is:
             #     allreduce \ Mode   |  Eager  |  Graph  |
@@ -784,7 +813,18 @@ class GroupCoordinator:
         weight_: torch.Tensor,
         eps: float,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Attempt fused all-reduce + RMSNorm via custom all-reduce communicator. ROCm/HIP Only"""
+        """Attempt fused all-reduce + RMSNorm via a communicator that provides it
+        (b12x on SM120, custom all-reduce on ROCm/HIP)."""
+        b12x_comm = self.b12x_comm
+        if (
+            b12x_comm is not None
+            and not b12x_comm.disabled
+            and b12x_comm.should_b12x_fused_rmsnorm(input_)
+        ):
+            return b12x_comm.fused_allreduce_rmsnorm(
+                input_, residual_inp_, weight_, eps
+            )
+
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
             return None
@@ -920,6 +960,15 @@ class GroupCoordinator:
                 and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
         if (
+            self.b12x_comm is not None
+            and not self.b12x_comm.disabled
+            and not should_use_pymscclpp_allreduce
+        ):
+            if self.b12x_comm.should_b12x_ar(input_):
+                return "b12x"
+            if self.b12x_comm.should_b12x_dma(input_):
+                return "b12x_dma"
+        if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and not should_use_pymscclpp_allreduce
@@ -994,8 +1043,28 @@ class GroupCoordinator:
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
         pynccl_comm = self.pynccl_comm
-        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
-        if outplace_all_reduce_method == "ca":
+        b12x_comm = self.b12x_comm
+        assert any(
+            [
+                qr_comm,
+                ca_comm,
+                pymscclpp_comm,
+                torch_symm_mem_comm,
+                pynccl_comm,
+                b12x_comm,
+            ]
+        )
+        if outplace_all_reduce_method == "b12x":
+            assert not b12x_comm.disabled
+            out = b12x_comm.b12x_all_reduce(input_)
+            if out is None:
+                # The kernel declined this shape; keep semantics by falling back.
+                out = input_.clone()
+                torch.distributed.all_reduce(out, group=self.device_group)
+        elif outplace_all_reduce_method == "b12x_dma":
+            assert not b12x_comm.disabled
+            out = b12x_comm.b12x_dma_all_reduce(input_)
+        elif outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
         elif outplace_all_reduce_method == "qr":
