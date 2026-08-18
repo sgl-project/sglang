@@ -408,7 +408,7 @@ class TestPrefillAdder(CustomTestCase):
         req1.sampling_params.ignore_eos = False
 
         result1 = adder.add_one_req(
-            req1, has_chunked_req=False, truncation_align_size=None
+            req1, num_chunked_reqs=0, truncation_align_size=None
         )
 
         self.assertEqual(len(adder.can_run_list), 1)
@@ -441,7 +441,7 @@ class TestPrefillAdder(CustomTestCase):
         req2.sampling_params.ignore_eos = False
 
         result2 = adder2.add_one_req(
-            req2, has_chunked_req=False, truncation_align_size=None
+            req2, num_chunked_reqs=0, truncation_align_size=None
         )
 
         self.assertEqual(len(adder2.can_run_list), 1)
@@ -457,7 +457,7 @@ class TestPrefillAdder(CustomTestCase):
         req3.sampling_params.ignore_eos = False
 
         result3 = adder2.add_one_req(
-            req3, has_chunked_req=False, truncation_align_size=None
+            req3, num_chunked_reqs=0, truncation_align_size=None
         )
 
         self.assertEqual(len(adder2.can_run_list), 2)
@@ -601,15 +601,13 @@ class TestPrefillAdder(CustomTestCase):
         # Pre-fix: a constant sliding-window reservation rejects the resume.
         with patch.object(adder, "_swa_reserved_tokens", return_value=WINDOW + PAGE):
             self.assertIs(
-                adder.add_one_req(
-                    req, has_chunked_req=False, truncation_align_size=None
-                ),
+                adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None),
                 AddReqResult.NO_TOKEN,
             )
         self.assertEqual(len(adder.can_run_list), 0)
 
         # Fix: min(extend + decode, window) reservation admits it.
-        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+        adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None)
         self.assertIn(req, adder.can_run_list)
 
     def test_swa_new_tokens_clamps_remaining_not_total(self):
@@ -652,7 +650,7 @@ class TestPrefillAdder(CustomTestCase):
 
         result = adder.add_one_req(
             self._create_delayer_req(50),
-            has_chunked_req=False,
+            num_chunked_reqs=0,
             truncation_align_size=None,
         )
 
@@ -682,7 +680,7 @@ class TestPrefillAdder(CustomTestCase):
 
         result = adder.add_one_req(
             self._create_delayer_req(50),
-            has_chunked_req=False,
+            num_chunked_reqs=0,
             truncation_align_size=None,
         )
 
@@ -699,7 +697,7 @@ class TestPrefillAdder(CustomTestCase):
 
         result = adder.add_one_req(
             self._create_delayer_req(50),
-            has_chunked_req=False,
+            num_chunked_reqs=0,
             truncation_align_size=None,
         )
 
@@ -714,9 +712,7 @@ class TestPrefillAdder(CustomTestCase):
         adder = self._create_delayer_adder(available_tokens=100_000, delayer=delayer)
         req = self._create_delayer_req(50)
 
-        result = adder.add_one_req(
-            req, has_chunked_req=False, truncation_align_size=None
-        )
+        result = adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None)
 
         self.assertEqual(result, AddReqResult.CONTINUE)
         self.assertEqual(delayer.calls, [True])
@@ -889,6 +885,292 @@ class TestPrefillAdder(CustomTestCase):
                 size_swa=4096, sliding_window=128
             )._swa_req_never_fits(**req)
         )
+
+    # ---- long_prefill_token_threshold: concurrent chunked prefill ----
+    # The ceiling caps how many prompt tokens one request takes per pass, so
+    # up to chunked_prefill_size // threshold requests can be mid-prefill at
+    # once. Mid-prefill requests pin their computed KV and cannot be
+    # retracted, so admission reserves each one's FULL remaining prefill +
+    # decode headroom against the lifetime budget from the first chunk on.
+
+    def _create_long_req(self, rid, num_tokens, max_new_tokens=8):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=max_new_tokens)
+        req.full_untruncated_fill_ids = list(range(num_tokens))
+        req.last_node = MagicMock()
+        req.sampling_params.ignore_eos = False
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        return req
+
+    def _create_concurrency_adder(
+        self, *, kv_tokens, chunk_pool, threshold, capacity
+    ) -> PrefillAdder:
+        self.mock_token_allocator.available_size.return_value = kv_tokens
+        return self.create_adder(
+            self.create_running_batch(),
+            page_size=1,
+            rem_chunk_tokens=chunk_pool,
+            rem_input_tokens=100_000_000,
+            long_prefill_token_threshold=threshold,
+            max_concurrent_chunked_reqs=capacity,
+        )
+
+    def test_threshold_chunks_new_long_req_at_ceiling(self):
+        adder = self._create_concurrency_adder(
+            kv_tokens=1_000_000, chunk_pool=8192, threshold=2048, capacity=4
+        )
+        req = self._create_long_req("long", 5000)
+
+        adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None)
+
+        req.set_extend_range.assert_called_once_with(0, 2048)
+        self.assertIn(req, adder.new_chunked_reqs)
+        self.assertIn(req, adder.can_run_list)
+
+    def test_threshold_admits_whole_req_under_ceiling(self):
+        # The ceiling is applied before the chunked/non-chunked split, so a
+        # request whose whole remaining prompt fits under it is NOT chunked.
+        adder = self._create_concurrency_adder(
+            kv_tokens=1_000_000, chunk_pool=8192, threshold=2048, capacity=4
+        )
+        req = self._create_long_req("short", 1000)
+
+        adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None)
+
+        req.set_extend_range.assert_called_once_with(0, 1000)
+        self.assertNotIn(req, adder.new_chunked_reqs)
+        self.assertIn(req, adder.can_run_list)
+
+    def test_capacity_allows_budget_over_threshold_concurrent_reqs(self):
+        # B // F requests each get exactly F tokens in one pass; the request
+        # that would exceed the capacity is refused with SKIP (not OTHER), so
+        # the scheduler keeps scanning the queue behind it. The pool is twice
+        # the aggregate take so the SKIP is attributable to capacity alone --
+        # a drained pool would return OTHER first (see the F=0 test below).
+        adder = self._create_concurrency_adder(
+            kv_tokens=1_000_000, chunk_pool=16384, threshold=2048, capacity=4
+        )
+        reqs = [self._create_long_req(f"long{i}", 5000) for i in range(4)]
+        for i, req in enumerate(reqs):
+            adder.add_one_req(req, num_chunked_reqs=i, truncation_align_size=None)
+
+        for req in reqs:
+            req.set_extend_range.assert_called_once_with(0, 2048)
+        self.assertEqual(len(adder.new_chunked_reqs), 4)
+
+        fifth = self._create_long_req("long4", 5000)
+        res = adder.add_one_req(fifth, num_chunked_reqs=4, truncation_align_size=None)
+        self.assertIs(res, AddReqResult.SKIP)
+        self.assertNotIn(fifth, adder.can_run_list)
+        fifth.set_extend_range.assert_not_called()
+
+    def test_capacity_full_skips_long_but_admits_short(self):
+        # The QoS property: with every mid-prefill slot taken by long
+        # prompts, a short prompt behind them still schedules whole instead
+        # of starving behind their remaining chunks.
+        adder = self._create_concurrency_adder(
+            kv_tokens=1_000_000, chunk_pool=8192, threshold=2048, capacity=2
+        )
+        carried = [self._create_long_req(f"carried{i}", 9000) for i in range(2)]
+        for req in carried:
+            self.assertIs(adder.add_chunked_req(req), req)
+        # Pool is now 8192 - 2*2048 = 4096 with both slots taken.
+
+        long_req = self._create_long_req("long", 5000)
+        res = adder.add_one_req(
+            long_req, num_chunked_reqs=2, truncation_align_size=None
+        )
+        self.assertIs(res, AddReqResult.SKIP)
+        self.assertNotIn(long_req, adder.can_run_list)
+
+        short_req = self._create_long_req("short", 1000)
+        adder.add_one_req(short_req, num_chunked_reqs=2, truncation_align_size=None)
+        short_req.set_extend_range.assert_called_once_with(0, 1000)
+        self.assertIn(short_req, adder.can_run_list)
+
+    def test_carried_chunked_req_capped_at_threshold(self):
+        # One carried request cannot drain the pool ahead of the others.
+        adder = self._create_concurrency_adder(
+            kv_tokens=1_000_000, chunk_pool=8192, threshold=2048, capacity=4
+        )
+        req = self._create_long_req("carried", 9000)
+
+        self.assertIs(adder.add_chunked_req(req), req)
+        req.set_extend_range.assert_called_once_with(0, 2048)
+
+        # Contrast: without the ceiling the same request takes the whole pool.
+        adder0 = self._create_concurrency_adder(
+            kv_tokens=1_000_000, chunk_pool=8192, threshold=0, capacity=1
+        )
+        req0 = self._create_long_req("carried", 9000)
+        self.assertIs(adder0.add_chunked_req(req0), req0)
+        req0.set_extend_range.assert_called_once_with(0, 8192)
+
+    def test_parked_carried_req_holds_completion_reservation(self):
+        # A carried request that finds the per-pass pool drained is parked:
+        # it stays mid-prefill (returned), gets no chunk, and its whole
+        # remaining prefill + decode headroom stays charged to the lifetime
+        # budget so later admissions cannot consume the headroom it needs.
+        adder = self._create_concurrency_adder(
+            kv_tokens=1_000_000, chunk_pool=0, threshold=2048, capacity=4
+        )
+        req = self._create_long_req("carried", 9000, max_new_tokens=8)
+        offset_before = adder.rem_total_token_offset
+
+        self.assertIs(adder.add_chunked_req(req), req)
+
+        self.assertNotIn(req, adder.can_run_list)
+        req.set_extend_range.assert_not_called()
+        self.assertEqual(adder.rem_total_token_offset - offset_before, 9000 + 8 + 1)
+
+        # Without the ceiling the same drained pool force-adds a zero-length
+        # chunk (stock behavior preserved on the disabled path).
+        adder0 = self._create_concurrency_adder(
+            kv_tokens=1_000_000, chunk_pool=0, threshold=0, capacity=1
+        )
+        req0 = self._create_long_req("carried", 9000)
+        self.assertIs(adder0.add_chunked_req(req0), req0)
+        self.assertIn(req0, adder0.can_run_list)
+
+    def test_reserve_to_completion_blocks_second_long_req(self):
+        # Two 10K-token prompts in a 20K-token KV pool. With the ceiling on,
+        # the first chunked request reserves its full remaining prefill +
+        # decode headroom (10_009), so the second fails the KV gate. Without
+        # the ceiling only the chunk (8193) is charged and the second admits
+        # into the reserved headroom -- the mid-prefill deadlock class.
+        kv = 20_000
+        adder = self._create_concurrency_adder(
+            kv_tokens=kv, chunk_pool=8192, threshold=2048, capacity=4
+        )
+        req_a = self._create_long_req("a", 10_000, max_new_tokens=8)
+        adder.add_one_req(req_a, num_chunked_reqs=0, truncation_align_size=None)
+        self.assertIn(req_a, adder.new_chunked_reqs)
+        self.assertEqual(adder.rem_total_tokens, kv - 10_009)
+
+        req_b = self._create_long_req("b", 10_000, max_new_tokens=8)
+        res = adder.add_one_req(req_b, num_chunked_reqs=1, truncation_align_size=None)
+        self.assertIs(res, AddReqResult.NO_TOKEN)
+        self.assertNotIn(req_b, adder.can_run_list)
+
+        adder0 = self._create_concurrency_adder(
+            kv_tokens=kv, chunk_pool=8192, threshold=0, capacity=1
+        )
+        req_a0 = self._create_long_req("a", 10_000, max_new_tokens=8)
+        adder0.add_one_req(req_a0, num_chunked_reqs=0, truncation_align_size=None)
+        self.assertIn(req_a0, adder0.new_chunked_reqs)
+        self.assertEqual(adder0.rem_total_tokens, kv - 8193)
+        # The second request passes the KV gate under stock accounting (it
+        # then stops on the drained per-pass pool, retrying next pass while
+        # holding no reservation).
+        req_b0 = self._create_long_req("b", 10_000, max_new_tokens=8)
+        res0 = adder0.add_one_req(
+            req_b0, num_chunked_reqs=1, truncation_align_size=None
+        )
+        self.assertIsNot(res0, AddReqResult.NO_TOKEN)
+
+    def test_threshold_disabled_drained_pool_returns_other_not_skip(self):
+        # F=0 byte-identity: the capacity check is gated on the ceiling and
+        # ordered after the trunc_len check, so a drained pool stops the pass
+        # with OTHER exactly as stock -- never SKIP.
+        adder = self._create_concurrency_adder(
+            kv_tokens=1_000_000, chunk_pool=8192, threshold=0, capacity=1
+        )
+        carried = self._create_long_req("carried", 9000)
+        self.assertIs(adder.add_chunked_req(carried), carried)  # drains the pool
+
+        req = self._create_long_req("long", 5000)
+        res = adder.add_one_req(req, num_chunked_reqs=1, truncation_align_size=None)
+        self.assertIs(res, AddReqResult.OTHER)
+        self.assertNotIn(req, adder.can_run_list)
+
+    # ---- ceiling composition with the ignore_eos path ----
+    # With the radix cache disabled, ignore_eos requests bypass add_one_req
+    # entirely (add_one_req_ignore_eos). The ceiling, the capacity check, and
+    # the completion reservation must hold there too, or two long ignore_eos
+    # prompts would overflow the mid-prefill capacity and trip the
+    # scheduler's adoption assert.
+
+    def _create_ignore_eos_adder(
+        self, *, kv_tokens, chunk_pool, threshold, capacity
+    ) -> PrefillAdder:
+        self.mock_tree_cache.disable = True
+        return self._create_concurrency_adder(
+            kv_tokens=kv_tokens,
+            chunk_pool=chunk_pool,
+            threshold=threshold,
+            capacity=capacity,
+        )
+
+    def _create_ignore_eos_req(self, rid, num_tokens, max_new_tokens=8):
+        req = self._create_long_req(rid, num_tokens, max_new_tokens)
+        req.sampling_params.ignore_eos = True
+        # add_req_state reads origin_input_ids, an instance attribute the
+        # spec=Req mock does not auto-provide.
+        req.origin_input_ids = list(range(num_tokens))
+        return req
+
+    def test_ignore_eos_chunked_at_ceiling(self):
+        adder = self._create_ignore_eos_adder(
+            kv_tokens=1_000_000, chunk_pool=8192, threshold=2048, capacity=4
+        )
+        req = self._create_ignore_eos_req("long", 5000)
+
+        adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None)
+
+        req.set_extend_range.assert_called_once_with(0, 2048)
+        self.assertIn(req, adder.new_chunked_reqs)
+
+    def test_ignore_eos_under_ceiling_admits_whole(self):
+        adder = self._create_ignore_eos_adder(
+            kv_tokens=1_000_000, chunk_pool=8192, threshold=2048, capacity=4
+        )
+        req = self._create_ignore_eos_req("short", 1000)
+
+        adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None)
+
+        req.set_extend_range.assert_called_once_with(0, 1000)
+        self.assertNotIn(req, adder.new_chunked_reqs)
+
+    def test_ignore_eos_capacity_full_skips(self):
+        adder = self._create_ignore_eos_adder(
+            kv_tokens=1_000_000, chunk_pool=16384, threshold=2048, capacity=2
+        )
+        for i in range(2):
+            req = self._create_ignore_eos_req(f"long{i}", 5000)
+            adder.add_one_req(req, num_chunked_reqs=i, truncation_align_size=None)
+        self.assertEqual(len(adder.new_chunked_reqs), 2)
+
+        third = self._create_ignore_eos_req("long2", 5000)
+        res = adder.add_one_req(third, num_chunked_reqs=2, truncation_align_size=None)
+        self.assertIs(res, AddReqResult.SKIP)
+        self.assertNotIn(third, adder.can_run_list)
+        third.set_extend_range.assert_not_called()
+
+    def test_ignore_eos_reserves_to_completion(self):
+        kv = 20_000
+        adder = self._create_ignore_eos_adder(
+            kv_tokens=kv, chunk_pool=8192, threshold=2048, capacity=4
+        )
+        req = self._create_ignore_eos_req("a", 10_000, max_new_tokens=8)
+        adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None)
+        self.assertIn(req, adder.new_chunked_reqs)
+        self.assertEqual(adder.rem_total_tokens, kv - 10_009)
+
+    def test_ignore_eos_threshold_disabled_takes_whole_pool(self):
+        # F=0 byte-identity on the ignore_eos path: one request takes the
+        # whole pool, exactly as stock.
+        adder = self._create_ignore_eos_adder(
+            kv_tokens=1_000_000, chunk_pool=8192, threshold=0, capacity=1
+        )
+        req = self._create_ignore_eos_req("long", 9000)
+
+        adder.add_one_req(req, num_chunked_reqs=0, truncation_align_size=None)
+
+        req.set_extend_range.assert_called_once_with(0, 8192)
+        self.assertIn(req, adder.new_chunked_reqs)
 
 
 if __name__ == "__main__":

@@ -109,7 +109,7 @@ def advance_to_nth_chunk(r, target_chunk: int, *, max_steps: int = DEFAULT_MAX_S
     # Drive until the hook has recorded `target_chunk` chunked-prefill batches.
     # chunks_done is accumulated from on_run_batch (every forward batch), so it
     # never misses a chunk the way sampling the instantaneous is_chunking flag
-    # once per yield can: on the step the req leaves chunked_req, is_chunking is
+    # once per yield can: on the step the req leaves chunked_reqs, is_chunking is
     # already False, so `seen` undercounted and the req could race to completion
     # on slower CI before the loop caught up.
     for _ in range(max_steps):

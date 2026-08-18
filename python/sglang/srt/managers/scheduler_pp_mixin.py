@@ -48,12 +48,19 @@ if TYPE_CHECKING:
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
-    """Check if output send/recv can be skipped for this batch."""
+    """Check if output send/recv can be skipped for this batch.
+
+    `contains_last_prefill_chunk` is the exact condition: it is False only when
+    no request in the batch consumes the sampled token. The former
+    `len(batch.reqs) == 1` term was a proxy for the same thing, back when the
+    flag itself was derived from the batch size; it is now redundant, and
+    keeping it would suppress the optimization for any batch of several middle
+    chunks.
+    """
     return (
         envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
         and batch is not None
         and batch.forward_mode == ForwardMode.EXTEND
-        and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )

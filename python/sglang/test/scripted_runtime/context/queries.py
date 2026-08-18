@@ -9,8 +9,7 @@ if TYPE_CHECKING:
 
 def _get_all_reqs(ctx: ScriptedContext) -> Iterator[Req]:
     s = ctx.scheduler
-    if s.chunked_req is not None:
-        yield s.chunked_req
+    yield from s.chunked_reqs
     yield from s.waiting_queue
     if s.ps.pp_size > 1:
         for mb in (*s.mbs, *s.last_mbs, *s.running_mbs):
@@ -29,8 +28,8 @@ def list_active_reqs(ctx: ScriptedContext) -> List[Req]:
 
 def batch_composition(ctx: ScriptedContext) -> Dict[str, List[str]]:
     s = ctx.scheduler
-    chunked_rid = s.chunked_req.rid if s.chunked_req is not None else None
-    chunked = [chunked_rid] if chunked_rid is not None else []
+    chunked_rids = {r.rid for r in s.chunked_reqs}
+    chunked = sorted(chunked_rids)
     running = (
         [r.rid for r in s.running_batch.reqs] if s.running_batch is not None else []
     )
@@ -40,7 +39,7 @@ def batch_composition(ctx: ScriptedContext) -> Dict[str, List[str]]:
     batch = s.last_batch
     if batch is not None and not batch.is_empty() and batch.forward_mode is not None:
         bucket = prefill if batch.forward_mode.is_extend() else decode
-        bucket.extend(r.rid for r in batch.reqs if r.rid != chunked_rid)
+        bucket.extend(r.rid for r in batch.reqs if r.rid not in chunked_rids)
 
     return {
         "prefill": prefill,
@@ -53,7 +52,7 @@ def batch_composition(ctx: ScriptedContext) -> Dict[str, List[str]]:
 def is_idle(ctx: ScriptedContext) -> bool:
     s = ctx.scheduler
     return (
-        s.chunked_req is None
+        not s.chunked_reqs
         and len(s.waiting_queue) == 0
         and (s.running_batch is None or s.running_batch.is_empty())
     )
@@ -98,7 +97,7 @@ def is_finished(ctx: ScriptedContext, rid: str) -> bool:
 
 def is_chunking(ctx: ScriptedContext, rid: str) -> bool:
     s = ctx.scheduler
-    return s.chunked_req is not None and s.chunked_req.rid == rid
+    return any(r.rid == rid for r in s.chunked_reqs)
 
 
 def status(ctx: ScriptedContext, rid: str) -> str:
@@ -122,11 +121,11 @@ def remaining_prompt_tokens(ctx: ScriptedContext, rid: str) -> int:
 
 def chunks_done(ctx: ScriptedContext, rid: str) -> int:
     log = ctx._scheduler_hook._batch_log
-    held = sum(1 for record in log if record.chunked_rid == rid and rid in record.rids)
+    held = sum(1 for record in log if rid in record.chunked_rids and rid in record.rids)
     if held == 0:
         return 0
     completed = any(
-        rid in record.extend_rids and record.chunked_rid != rid for record in log
+        rid in record.extend_rids and rid not in record.chunked_rids for record in log
     )
     return held + (1 if completed else 0)
 
@@ -135,5 +134,5 @@ def chunked_parks(ctx: ScriptedContext, rid: str) -> int:
     return sum(
         1
         for record in ctx._scheduler_hook._batch_log
-        if record.chunked_rid == rid and rid not in record.rids
+        if rid in record.chunked_rids and rid not in record.rids
     )

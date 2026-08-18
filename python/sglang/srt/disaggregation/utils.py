@@ -122,7 +122,7 @@ def unified_memory_disagg_move_gate(scheduler):
     transfer concludes, and for part of that lifetime the request is in NEITHER
     end's queue -- so queue emptiness alone is not enough:
 
-    - PREFILL: scheduling the final chunk clears `chunked_req` while earlier
+    - PREFILL: scheduling the final chunk drops it from `chunked_reqs` while earlier
       chunks may still be draining, and the request only reaches the inflight
       queue later, in the result path.
     - DECODE: `pop_preallocated` publishes one request's destinations and keeps

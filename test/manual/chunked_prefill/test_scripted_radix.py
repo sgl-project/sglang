@@ -300,7 +300,7 @@ class TestRadixNoTailChunked(ScriptedTestCase):
 
         observed_mid_chunk: bool = False
         for _ in range(800):
-            req = s.chunked_req
+            req = s.chunked_reqs[0] if s.chunked_reqs else None
             if req is not None and req.rid == r.rid:
                 observed_mid_chunk = True
                 prefix_len: int = len(req.prefix_indices)
@@ -457,7 +457,7 @@ class TestRadixPartialPage(ScriptedTestCase):
         yield from run_until(r, lambda h: h.is_chunking and h.chunks_done >= 1)
 
         for _ in range(800):
-            req = s.chunked_req
+            req = s.chunked_reqs[0] if s.chunked_reqs else None
             if req is not None and req.rid == r.rid:
                 prefix_len: int = len(req.prefix_indices)
                 protected_len: int = req.cache_protected_len

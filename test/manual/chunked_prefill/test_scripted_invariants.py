@@ -393,16 +393,16 @@ class TestInvariantsBasic(ScriptedTestCase):
     def _script_chunked_in_flight_count_exactly_zero_after_finish(t: ScriptedContext):
         r = t.start_req(prompt_len=VERY_LONG_PROMPT_LEN, max_new_tokens=2)
         yield from run_until(r, lambda h: h.is_chunking)
-        assert (1 if t.scheduler.chunked_req is not None else 0) == 1, (
+        assert (len(t.scheduler.chunked_reqs)) == 1, (
             f"chunked_in_flight_count should be 1 mid-chunk; got "
-            f"{(1 if t.scheduler.chunked_req is not None else 0)}"
+            f"{(len(t.scheduler.chunked_reqs))}"
         )
         yield from run_until_finished(r)
         for _ in range(3):
             yield
-            assert (1 if t.scheduler.chunked_req is not None else 0) == 0, (
+            assert (len(t.scheduler.chunked_reqs)) == 0, (
                 f"chunked_in_flight_count must be 0 after finish; got "
-                f"{(1 if t.scheduler.chunked_req is not None else 0)}"
+                f"{(len(t.scheduler.chunked_reqs))}"
             )
 
     def test_extend_batch_idx_monotonic_invariant(self):
@@ -480,9 +480,7 @@ class TestInvariantsBasic(ScriptedTestCase):
             s = t.scheduler
             req = t.find_req_by_rid(r.rid)
             cur_inflight = req.inflight_middle_chunks if req is not None else 0
-            cur_is_chunked_slot = (
-                s.chunked_req is not None and s.chunked_req.rid == r.rid
-            )
+            cur_is_chunked_slot = any(cr.rid == r.rid for cr in s.chunked_reqs)
             cur_finished = req.finished() if req is not None else True
             if cur_inflight < prev_inflight:
                 observed_decrement = True
