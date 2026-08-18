@@ -659,6 +659,10 @@ class KimiK3MoE(nn.Module):
             self._ep_a2a
             and self.shared_experts is not None
             and self.alt_stream is not None
+            # CANN fused collective matmuls block when captured from the
+            # alternate stream. Keep their AG+MM/MM+RS chain on the graph's
+            # current stream; the non-fused shared MLP still uses SBO.
+            and not (_is_npu and self._npu_fused_shared_experts)
         )
 
         if self.use_latent_moe:
