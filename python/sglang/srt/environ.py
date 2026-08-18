@@ -965,6 +965,11 @@ class Envs:
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
+    # Masked FP8 grouped-GEMM implementation used by the DeepGEMM MoE runner.
+    # "native" preserves SGLang's existing direct DeepGEMM path. "flashinfer"
+    # and "cake" use FlashInfer's batch DeepGEMM API with identical float32
+    # groupwise-scale inputs, which makes backend A/B comparisons meaningful.
+    SGLANG_DEEPGEMM_MASKED_FP8_BACKEND = EnvStr("native")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
     # round_up(max(masked_m), 256) instead of round_up(rank_tokens, 256):

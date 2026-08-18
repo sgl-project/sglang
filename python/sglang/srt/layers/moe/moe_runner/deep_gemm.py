@@ -594,7 +594,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 hidden_states_scale = _cast_to_e8m0_with_rounding_up(
                     hidden_states_scale
                 )
-        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        elif deep_gemm_wrapper.DEEPGEMM_MASKED_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 hidden_states_scale
             )
@@ -687,7 +687,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     down_input_scale
                 )
             )
-        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        elif deep_gemm_wrapper.DEEPGEMM_MASKED_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 down_input_scale
             )
