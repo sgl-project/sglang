@@ -518,11 +518,33 @@ class _PlanRowModel(pydantic.BaseModel):
     provenance: str | None = None
 
 
+class _DomainModel(pydantic.BaseModel):
+    """Geometry box the scenario rows were tuned inside.
+
+    Typed rather than a bare dict because the reads used to be
+    ``domain.get("max_hidden", 1 << 30)``: a typo'd key did not fail, it
+    silently left that gate wide open and admitted every geometry to rows
+    that were never measured for it. ``None`` means genuinely unbounded;
+    the shipped ``default`` table uses 0 to admit nothing.
+    """
+
+    model_config = pydantic.ConfigDict(extra="forbid")
+
+    max_hidden: int | None = None
+    max_local_experts: int | None = None
+
+    def admits(self, *, hidden_size: int, num_local_experts: int) -> bool:
+        return (self.max_hidden is None or hidden_size <= self.max_hidden) and (
+            self.max_local_experts is None
+            or num_local_experts <= self.max_local_experts
+        )
+
+
 class _PlansFileModel(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="forbid")
 
     arch: DeviceArchitecture
-    domain: dict[str, int] = pydantic.Field(default_factory=dict)
+    domain: _DomainModel = pydantic.Field(default_factory=_DomainModel)
     scenarios: list[_PlanRowModel] = pydantic.Field(default_factory=list)
     fallback: list[_PlanRowModel]
     # Same: the geometry the tuner widened this table's domain for.
@@ -672,9 +694,9 @@ def resolve_plans(
     """
     table = load_plans(architecture)
     layout_name = "shared" if is_shared_outer else "per_expert"
-    in_domain = hidden_size <= table.domain.get(
-        "max_hidden", 1 << 30
-    ) and num_local_experts <= table.domain.get("max_local_experts", 1 << 30)
+    in_domain = table.domain.admits(
+        hidden_size=hidden_size, num_local_experts=num_local_experts
+    )
     rows = table.scenarios if in_domain else []
     if not in_domain:
         _warn_out_of_domain(architecture, hidden_size, num_local_experts)

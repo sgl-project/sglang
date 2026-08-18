@@ -239,6 +239,41 @@ class TestResolution:
                         ).values():
                             assert sel.name in declared, (sel.name, declared)
 
+    def test_every_tile_rule_key_names_a_declared_plan_row(self):
+        # tiles.rules is keyed by plan-row NAME, and resolve_tiles falls back
+        # to the built-in defaults when the key misses -- silently. A typo, or
+        # renaming a plan row without renaming its tiles key, therefore
+        # discards that row's whole tuned ladder with no error and no log,
+        # costing only throughput. The reverse direction is NOT required: a
+        # row with no rules legitimately serves the built-in heuristics.
+        for architecture in (_GB300, _H200, DeviceArchitecture.DEFAULT):
+            plans = load_plans(architecture)
+            tiles = lc._load_tiles(architecture.value)
+            if tiles is None:
+                continue
+            declared = {row.name for row in (*plans.scenarios, *plans.fallback)}
+            orphans = sorted(set(tiles.rules) - declared)
+            assert not orphans, (architecture.value, orphans)
+
+    def test_unknown_domain_key_fails_closed(self, tmp_path):
+        # domain used to be a bare dict read with .get(key, 1 << 30), so a
+        # typo'd bound did not fail -- it left that gate wide open and served
+        # tuned rows to geometry they were never measured on. The shipped
+        # bound must still gate, and the typo must abort at load.
+        packaged = json.load(open(f"{ep._CONFIG_DIR}/gb300.plans.json"))
+        json.dump(packaged, open(tmp_path / "gb300.plans.json", "w"))
+        with envs.SGLANG_LORA_MOE_CONFIG_DIR.override(str(tmp_path)):
+            _clear_caches()
+            beyond = _resolve(hidden=packaged["domain"]["max_hidden"] * 2)
+            assert beyond[Phase.DECODE].name == "fallback.serial"
+
+            _clear_caches()
+            typo = json.loads(json.dumps(packaged))
+            typo["domain"]["max_hidden_size"] = typo["domain"].pop("max_hidden")
+            json.dump(typo, open(tmp_path / "gb300.plans.json", "w"))
+            with pytest.raises(ValueError):
+                _resolve()
+
     def test_override_dir_wins(self, tmp_path):
         packaged = json.load(open(f"{ep._CONFIG_DIR}/gb300.tiles.json"))
         # flip one tile value; the override must be what resolves
