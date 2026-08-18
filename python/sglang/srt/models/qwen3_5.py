@@ -98,6 +98,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_parallel,
+    get_server_args,
     get_stream,
 )
 
@@ -1346,7 +1347,23 @@ class Qwen3_5ForCausalLM(nn.Module):
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
 
-        alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
+        # Paged experts under the breakable decode backend (BCG) inserts an eager graph break inside
+        # the MoE layers; the GDN/qknorm alt-stream overlap would then end a capture segment on a
+        # different stream than it began on ("Capture must end on the same stream it began on").
+        # Run single-stream in that mode — the overlap is negligible when paging is the bottleneck.
+        # (Same fallback as deepseek_v2's dual-stream handling.)
+        _pe_bcg = False
+        if getattr(get_server_args(), "enable_paged_experts", False):
+            from sglang.srt.layers.moe.paged_experts.method import (
+                resolve_breakable_decode,
+            )
+
+            _pe_bcg = resolve_breakable_decode(get_server_args())
+        alt_stream = (
+            get_stream("alt")
+            if (_is_cuda or _hip_use_alt_stream) and not _pe_bcg
+            else None
+        )
 
         # Embedding layer
         if self.pp_group.is_first_rank:

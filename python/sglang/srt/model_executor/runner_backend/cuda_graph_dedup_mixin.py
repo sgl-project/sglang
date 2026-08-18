@@ -185,6 +185,12 @@ class GraphExecGroup:
     current_raw_graph: int
     compat_exec: int | None
     graphs: list[DedupedCudaGraph] = field(default_factory=list)
+    # Records the most recent launch of graph_exec. cudaGraphExecUpdate must
+    # not run while a prior launch is still executing on the device (the
+    # overlap scheduler enqueues the next step while the previous one is in
+    # flight), so replay() waits on this before patching in another member's
+    # params. None until the group actually has to switch graphs.
+    launch_done_event: int | None = None
 
 
 @dataclass(eq=False, slots=True)
@@ -265,6 +271,8 @@ class DedupedCudaGraphRegistry:
         raw_graph = graph.raw_graph
         graph_exec = group.graph_exec
         if group.current_raw_graph != raw_graph:
+            if group.launch_done_event is not None:
+                checkCudaErrors(cuda_rt.cudaEventSynchronize(group.launch_done_event))
             ok, detail = dedup_update(graph_exec, raw_graph)
             assert ok, (
                 "CUDA graph dedup replay update failed "
@@ -273,6 +281,12 @@ class DedupedCudaGraphRegistry:
             group.current_raw_graph = raw_graph
 
         checkCudaErrors(cuda_rt.cudaGraphLaunch(graph_exec, stream))
+        if len(group.graphs) > 1:
+            if group.launch_done_event is None:
+                group.launch_done_event = checkCudaErrors(
+                    cuda_rt.cudaEventCreateWithFlags(cuda_rt.cudaEventDisableTiming)
+                )
+            checkCudaErrors(cuda_rt.cudaEventRecord(group.launch_done_event, stream))
 
     def close(self) -> None:
         self.sealed = True
@@ -281,6 +295,9 @@ class DedupedCudaGraphRegistry:
             if group.compat_exec is not None:
                 self.destroy_exec(group.compat_exec)
                 group.compat_exec = None
+            if group.launch_done_event is not None:
+                checkCudaErrors(cuda_rt.cudaEventDestroy(group.launch_done_event))
+                group.launch_done_event = None
             self.destroy_exec(group.graph_exec)
             for graph in group.graphs:
                 if graph.original_graph is not None:
