@@ -36,6 +36,74 @@ _READ_BEFORE_RESOLUTION = frozenset({"is_embedding"})
 # has to be looked at.
 _STALE_IN_THE_MODEL_CONFIG = frozenset({"speculative_algorithm"})
 
+# The same staleness through the registries: `_handle_model_specific_adjustments`
+# builds the model configuration and *then* collects the override declarations,
+# both inside one handler body. Named rather than fixed (that means moving the
+# build or the collection), so a fifth field here has to be looked at -- and so
+# does fixing the ordering.
+_STALE_FROM_THE_REGISTRIES = frozenset(
+    {
+        "disable_hybrid_swa_memory",
+        "dtype",
+        "enable_multi_layer_eagle",
+        "quantization",
+    }
+)
+
+
+def _registry_declared_fields():
+    """What the live registries and passes declare.
+
+    Imported from the chain ratchet by path instead of re-derived: two
+    derivations of the same set drift, and the one that drifts narrower makes
+    this check quietly vacuous. Keying on `self._declare(...)` alone is what
+    hid these four -- 26 of the providers register through a helper call, and
+    none of them spell a keyword this file can see.
+    """
+    import importlib.util
+
+    ratchet = (
+        pathlib.Path(__file__).resolve().parent.parent / "test_chain_read_ratchet.py"
+    )
+    spec = importlib.util.spec_from_file_location("_chain_ratchet_for_pin", ratchet)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module._declared_by_registry_and_passes()
+
+
+def _registry_collection_is_after_the_build():
+    """(collection line, first build line) inside the model-specific handler.
+
+    Handler-local ordering only -- the caller still has to compare against the
+    pipeline-wide first build, which sits in an *earlier* step: hoisting the
+    collection above this handler's own `get_model_config()` call does not move
+    it above the configuration another handler already cached.
+    """
+    tree = ast.parse((_SRT / "server_args.py").read_text(encoding="utf-8-sig"))
+    handler = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_handle_model_specific_adjustments"
+    )
+    build = collect = None
+    for node in ast.walk(handler):
+        if not isinstance(node, ast.Call):
+            continue
+        # Both spellings: an Attribute call and a bare Name call.
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            name = func.attr
+        elif isinstance(func, ast.Name):
+            name = func.id
+        else:
+            continue
+        if name == "get_model_config" and build is None:
+            build = node.lineno
+        if name == "collect_model_override_declarations" and collect is None:
+            collect = node.lineno
+    return collect, build
+
 
 def _server_args_names(tree, path):
     names = {"self"} if path.name == "server_args.py" else {"server_args"}
@@ -126,11 +194,15 @@ def _late_resolution_fields():
 def _hook_declarations(dispatch, source_module):
     """{field: dispatcher line} for hooks the dispatch calls on other objects.
 
-    `handle_speculative_decoding(self)` and `current_platform.
-    apply_server_args_defaults(self)` are not `self.<handler>()` calls, so a
-    scan of the dispatcher's own method calls never reaches their
+    `handle_speculative_decoding(self)` is not a `self.<handler>()` call, so a
+    scan of the dispatcher's own method calls never reaches its
     `declare_resolution` sites -- and the speculative hooks decide
     `speculative_algorithm`, which the model configuration reads.
+
+    The platform hook is *not* covered here: it reaches the pipeline as a
+    callback argument, so there is no call node to follow and its writes live
+    outside this tree. Its position is pinned instead --
+    `test_every_opaque_callback_is_still_late`.
     """
     imported = {}
     for node in ast.walk(ast.parse(source_module.read_text(encoding="utf-8-sig"))):
@@ -218,66 +290,196 @@ def _pipeline():
     return steps, methods, {name: reaches(name) for name in steps}, step_lines
 
 
-class TestModelConfigReadsResolvedInput(CustomTestCase):
-    def test_every_field_it_reads_is_resolved_before_it_is_built(self):
-        steps, methods, reached, step_lines = _pipeline()
-        wanted = _constructor_reads()
+def _opaque_callback_positions(dispatch, source_module):
+    """{callback spelling: dispatcher line} for every resolver handed in.
 
-        first_build = None
-        declared_at = {}
+    `declare_direct_writes(record, source, callback)` runs a callable instead of
+    code in this tree -- a platform plugin, a registered speculative algorithm.
+    Which fields such a callback writes is not a static question; only *when* it
+    runs is, so the position is what gets pinned.
+
+    Two spellings reach the pipeline: the dispatcher wraps a callback itself, or
+    it calls a hook in this tree that wraps one. The line recorded is always the
+    dispatcher's, because that is where the ordering against the build is
+    decided -- a hook body sits further down its own file and says nothing about
+    it.
+    """
+    imported = {}
+    for node in ast.walk(ast.parse(source_module.read_text(encoding="utf-8-sig"))):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                imported[alias.asname or alias.name] = node.module
+
+    def callbacks_in(tree):
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else (node.func.attr if isinstance(node.func, ast.Attribute) else None)
+            )
+            if name == "declare_direct_writes" and len(node.args) > 2:
+                found.append(ast.unparse(node.args[2]))
+        return found
+
+    positions = {}
+    for spelling in callbacks_in(dispatch):
+        positions[spelling] = min(
+            positions.get(spelling, 10**9),
+            next(
+                node.lineno
+                for node in ast.walk(dispatch)
+                if isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "declare_direct_writes"
+            ),
+        )
+    for node in ast.walk(dispatch):
+        if not isinstance(node, ast.Call):
+            continue
+        name = (
+            node.func.id
+            if isinstance(node.func, ast.Name)
+            else (node.func.attr if isinstance(node.func, ast.Attribute) else None)
+        )
+        module = imported.get(name)
+        if not module or not module.startswith("sglang.srt."):
+            continue
+        path = _SRT / (module[len("sglang.srt.") :].replace(".", "/") + ".py")
+        if not path.exists():
+            continue
+        for spelling in callbacks_in(ast.parse(path.read_text(encoding="utf-8-sig"))):
+            positions[spelling] = min(positions.get(spelling, 10**9), node.lineno)
+    return positions
+
+
+def _declaration_positions():
+    """({field: position}, first_build) over the fields the constructor reads.
+
+    A position is `(step index, rank)`, and `rank` is 0 only for a declaration
+    that sits *above* the build in the very method that builds: a declaration
+    applies where it is written, so one statement earlier in the same body is
+    genuinely earlier. Everything else in the build's step gets rank 1 and
+    counts as late -- line numbers say nothing across two method bodies, since
+    a handler sits further down the file than the dispatcher that calls it.
+
+    One derivation, two callers: the check below asks which fields land after
+    the build, and the pin check asks whether an exempted field is still one
+    of them. Two derivations of that answer drift apart.
+    """
+    steps, methods, reached, step_lines = _pipeline()
+    wanted = _constructor_reads()
+
+    def build_site():
+        """(step index, method name, line) of the first `get_model_config()`."""
         for index, step in enumerate(steps):
             for method in reached[step]:
-                body = methods[method]
-                for node in ast.walk(body):
-                    if not isinstance(node, ast.Call):
-                        continue
+                for node in ast.walk(methods[method]):
                     if (
-                        isinstance(node.func, ast.Attribute)
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
                         and node.func.attr == "get_model_config"
-                        and first_build is None
                     ):
-                        first_build = (index, step)
-                    if (
-                        isinstance(node.func, ast.Attribute)
-                        and node.func.attr == "_declare"
-                    ):
-                        for keyword in node.keywords:
-                            if keyword.arg in wanted:
-                                # The *last* declaration is the one that has
-                                # to precede the build.
-                                declared_at[keyword.arg] = max(
-                                    declared_at.get(keyword.arg, index), index
-                                )
+                        return index, step, method, node.lineno
+        return None
+
+    site = build_site()
+    if site is None:
+        return {}, None
+    build_index, build_step, build_method, build_line_in_body = site
+    first_build = (build_index, build_step)
+
+    source_module = _SRT / "server_args.py"
+    imported = {}
+    for node in ast.walk(ast.parse(source_module.read_text(encoding="utf-8-sig"))):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                imported[alias.asname or alias.name] = node.module
+
+    def _hook_declared_fields(name):
+        """Fields a hook imported from `sglang.srt` declares, by callable name."""
+        module = imported.get(name)
+        if not module or not module.startswith("sglang.srt."):
+            return frozenset()
+        path = _SRT / (module[len("sglang.srt.") :].replace(".", "/") + ".py")
+        if not path.exists():
+            return frozenset()
+        fields = set()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8-sig"))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "declare_resolution"
+            ):
+                fields |= {kw.arg for kw in node.keywords if kw.arg}
+        return frozenset(fields)
+
+    declared_at = {}
+    for index, step in enumerate(steps):
+        for method in reached[step]:
+            for node in ast.walk(methods[method]):
+                if not isinstance(node, ast.Call):
+                    continue
+                same_body = index == build_index and method == build_method
+                rank = 0 if same_body and node.lineno < build_line_in_body else 1
+                if (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "_declare"
+                ):
+                    fields = {kw.arg for kw in node.keywords if kw.arg}
+                # A handler that calls an imported hook (the Kimi and DeepSeek
+                # defaults live in arg_groups modules) declares through it, and
+                # the hook can sit below the build inside the same handler.
+                elif isinstance(node.func, ast.Name):
+                    fields = _hook_declared_fields(node.func.id)
+                else:
+                    continue
+                for field in fields:
+                    if field in wanted:
+                        # The *last* declaration is the one that has to precede
+                        # the build.
+                        declared_at[field] = max(
+                            declared_at.get(field, (index, rank)), (index, rank)
+                        )
+
+    # Hooks the dispatch calls on other objects declare too, and a hook below
+    # the first build is late by definition. Both positions are read *inside
+    # the dispatcher*: a handler body sits further down the file than the
+    # dispatcher that calls it, so a line number taken from one scope says
+    # nothing about ordering against the other.
+    dispatch = methods["_run_resolution_pipeline"]
+    build_line = step_lines[first_build[1]]
+    for field, line in _hook_declarations(dispatch, _SRT / "server_args.py").items():
+        if field in wanted and line > build_line:
+            declared_at[field] = max(
+                declared_at.get(field, (build_index, 1)), (10**6, 1)
+            )
+
+    # Late resolution is the other channel that can decide a field the
+    # constructor reads, and it runs after every build.
+    for field in _late_resolution_fields():
+        if field in wanted:
+            declared_at[field] = (10**6, 1)
+    return declared_at, first_build
+
+
+class TestModelConfigReadsResolvedInput(CustomTestCase):
+    def test_every_field_it_reads_is_resolved_before_it_is_built(self):
+        declared_at, first_build = _declaration_positions()
         self.assertIsNotNone(
             first_build, "no handler builds a ModelConfig; the scan broke"
         )
 
-        # Hooks the dispatch calls on other objects declare too, and a hook
-        # below the first build is late by definition. Both positions are read
-        # *inside the dispatcher*: a handler body sits further down the file
-        # than the dispatcher that calls it, so a line number taken from one
-        # scope says nothing about ordering against the other.
-        dispatch = methods["_run_resolution_pipeline"]
-        build_line = step_lines[first_build[1]]
-        for field, line in _hook_declarations(
-            dispatch, _SRT / "server_args.py"
-        ).items():
-            if field in wanted and line > build_line:
-                declared_at[field] = max(declared_at.get(field, first_build[0]), 10**6)
-
-        # Late resolution is the other channel that can decide a field the
-        # constructor reads, and it runs at the launcher's validation stage --
-        # after every build. Without this the check iterates `declared_at`
-        # only, so a field written only there is never even a candidate.
-        for field in _late_resolution_fields():
-            if field in wanted:
-                declared_at[field] = 10**6
-
-        known = _READ_BEFORE_RESOLUTION | _STALE_IN_THE_MODEL_CONFIG
+        known = (
+            _READ_BEFORE_RESOLUTION
+            | _STALE_IN_THE_MODEL_CONFIG
+            | _STALE_FROM_THE_REGISTRIES
+        )
         late = sorted(
             field
-            for field, index in declared_at.items()
-            if index >= first_build[0] and field not in known
+            for field, position in declared_at.items()
+            if position >= (first_build[0], 1) and field not in known
         )
         self.assertEqual(
             late,
@@ -285,6 +487,62 @@ class TestModelConfigReadsResolvedInput(CustomTestCase):
             "resolution decides these after it builds the ModelConfig that reads "
             f"them, so the model configuration describes a half-resolved input "
             f"(first build: step {first_build[0]}, {first_build[1]}): {late}",
+        )
+
+    def test_the_registry_stale_set_is_exactly_what_is_late(self):
+        """Equality, not membership.
+
+        A fifth field the registries decide after the build fails here, and so
+        does fixing the ordering -- either way someone has to come back and
+        read this. The earlier version of this file derived declarations only
+        from `self._declare(...)` keywords, so it passed while these four were
+        already stale.
+        """
+        collect_line, build_line = _registry_collection_is_after_the_build()
+        self.assertIsNotNone(
+            collect_line, "the handler no longer collects registry declarations"
+        )
+        reads = _constructor_reads()
+        registry = _registry_declared_fields()
+        self.assertGreater(
+            len(registry), 20, "the registry-declared set collapsed; nothing to compare"
+        )
+        # Late against the *pipeline-wide* first build, not only the build in
+        # the collection's own handler: `_handle_gpu_memory_settings` builds
+        # the configuration many steps earlier, so hoisting the collection
+        # above the local build still leaves that cache describing raw input.
+        steps, methods, reached, _step_lines = _pipeline()
+        _declared_at, first_build = _declaration_positions()
+        self.assertIsNotNone(
+            first_build, "no handler builds a ModelConfig; the scan broke"
+        )
+        collecting_steps = [
+            index
+            for index, step in enumerate(steps)
+            for method in reached[step]
+            if any(
+                isinstance(node, ast.Call)
+                and (
+                    node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else getattr(node.func, "id", None)
+                )
+                == "collect_model_override_declarations"
+                for node in ast.walk(methods[method])
+            )
+        ]
+        self.assertTrue(collecting_steps, "no pipeline step collects the registry")
+        collection_is_late = min(collecting_steps) > first_build[0] or (
+            build_line is not None and collect_line > build_line
+        )
+        late = frozenset(reads & registry) if collection_is_late else frozenset()
+        self.assertEqual(
+            sorted(late),
+            sorted(_STALE_FROM_THE_REGISTRIES),
+            "the set of ModelConfig-read fields the registries decide after the "
+            f"build changed (collection at line {collect_line}, build at line "
+            f"{build_line}); read the comment on _STALE_FROM_THE_REGISTRIES "
+            "before editing it",
         )
 
     def test_the_pinned_stale_field_is_still_stale(self):
@@ -321,31 +579,76 @@ class TestModelConfigReadsResolvedInput(CustomTestCase):
                 "built; retire the pin",
             )
 
-    def test_the_documented_exception_is_still_the_only_one(self):
-        """A field pinned as read-before-resolution has to still be both."""
+    def test_every_opaque_callback_is_still_late(self):
+        """The opaque resolvers all run after the model configuration is built.
+
+        A plugin that rewrites `dtype` or `model_path` in one of them is
+        invisible to the configuration already cached, and no scan can say
+        whether it does: the implementations are out of tree. So the positions
+        are the pin, and the set of callbacks is pinned with them -- a new one
+        has to be placed against the build by whoever adds it. Moving them all
+        above the build fixes the hazard and fails this test; retire the pin
+        then, rather than keeping a note about a hazard that is gone.
+        """
         steps, methods, reached, step_lines = _pipeline()
-        wanted = _constructor_reads()
-        declared = set()
-        for step in steps:
-            for method in reached[step]:
-                for node in ast.walk(methods[method]):
-                    if (
-                        isinstance(node, ast.Call)
-                        and isinstance(node.func, ast.Attribute)
-                        and node.func.attr == "_declare"
-                    ):
-                        declared |= {kw.arg for kw in node.keywords if kw.arg}
-        stale = sorted(
-            field
-            for field in _READ_BEFORE_RESOLUTION
-            if field not in wanted or field not in declared
-        )
+        dispatch = methods["_run_resolution_pipeline"]
+        positions = _opaque_callback_positions(dispatch, _SRT / "server_args.py")
         self.assertEqual(
-            stale,
-            [],
-            "these are pinned as read-before-resolution but are no longer both "
-            f"read by the constructor and written by resolution: {stale}",
+            sorted(positions),
+            [
+                "algo.handle_server_args",
+                "algo.validate_server_args",
+                "current_platform.apply_server_args_defaults",
+            ],
+            "the set of resolvers handed to declare_direct_writes changed; each "
+            "one needs its position against the ModelConfig build looked at",
         )
+        _declared_at, first_build = _declaration_positions()
+        self.assertIsNotNone(
+            first_build, "no handler builds a ModelConfig; the scan broke"
+        )
+        build_line = step_lines[first_build[1]]
+        for spelling, line in sorted(positions.items()):
+            self.assertGreater(
+                line,
+                build_line,
+                f"{spelling} now runs before the model configuration is built, "
+                "so a plugin's writes reach it; retire the pin",
+            )
+
+    def test_the_documented_exception_is_still_the_only_one(self):
+        """A field pinned as read-before-resolution has to still be all three.
+
+        Read by the constructor, written by resolution, and written *after* the
+        build -- the last one is what makes the exemption load-bearing. Without
+        it, moving the declaration earlier leaves the name sitting in the
+        exempt set with nothing to exempt, and the next field that lands in
+        this position gets waved through by a pin nobody re-read.
+        """
+        wanted = _constructor_reads()
+        declared_at, first_build = _declaration_positions()
+        self.assertIsNotNone(
+            first_build, "no handler builds a ModelConfig; the scan broke"
+        )
+        for field in sorted(_READ_BEFORE_RESOLUTION):
+            self.assertIn(
+                field,
+                wanted,
+                f"{field} is pinned as read before resolution, but the "
+                "constructor no longer reads it; retire the pin",
+            )
+            self.assertIn(
+                field,
+                declared_at,
+                f"{field} is pinned as read before resolution, but resolution "
+                "no longer writes it; retire the pin",
+            )
+            self.assertGreaterEqual(
+                declared_at[field],
+                (first_build[0], 1),
+                f"{field} is now decided before the model configuration is "
+                "built, so the exemption covers nothing; retire the pin",
+            )
 
 
 if __name__ == "__main__":

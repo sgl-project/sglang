@@ -731,11 +731,12 @@ class TestSuppliedInstanceExposure(CustomTestCase):
         name, and the *parked* form -- ``self.x = server_args`` in a method
         that takes the parameter, read as ``self.x.field`` anywhere in the
         class. Parking under a different object, a container, or a computed
-        name stays invisible, like in every census of this family -- the
-        loudest known boundary is the *chain* spelling,
-        ``model_runner.server_args.field`` off some other parameter, which
-        this census does not count (~150 reads tree-wide; extending the pin
-        to that spelling is its own step, not a by-product of this one)."""
+        name stays invisible, like in every census of this family. The
+        loudest boundary *was* the *chain* spelling,
+        ``model_runner.server_args.field`` off some other object, which this
+        census still does not count -- but those reads are gone for every
+        resolution-written field and ``test_chain_read_ratchet.py`` holds them
+        at zero, so the gap is no longer where the risk is."""
         pairs = set()
         for path in sorted(_PACKAGE_ROOT.rglob("*.py")):
             rel = path.relative_to(_PACKAGE_ROOT).as_posix()
