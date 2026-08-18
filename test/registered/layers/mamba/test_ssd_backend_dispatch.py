@@ -31,6 +31,7 @@ def _flashinfer_backend_without_imports():
     backend = object.__new__(ssu_dispatch.FlashInferSSDCombinedSSUBackend)
     backend._prefill_backend = "cute"
     backend._prefill_runners = {}
+    backend._zero_initial_states = {}
     return backend
 
 
@@ -114,6 +115,29 @@ def test_flashinfer_prefill_pads_with_identity_and_copies_token_major(monkeypatc
         padded_x.shape
     )[:, :seqlen].to(out.dtype)
     assert torch.equal(out, expected)
+
+
+def test_flashinfer_prefill_reuses_read_only_zero_initial_states():
+    backend = _flashinfer_backend_without_imports()
+    x = torch.empty(1, 128, 2, 4, dtype=torch.bfloat16)
+    B = torch.empty(1, 128, 1, 3, dtype=torch.bfloat16)
+
+    first = backend._get_zero_initial_states(
+        x=x,
+        B=B,
+        num_sequences=2,
+        state_dtype=torch.bfloat16,
+    )
+    second = backend._get_zero_initial_states(
+        x=x,
+        B=B,
+        num_sequences=2,
+        state_dtype=torch.bfloat16,
+    )
+
+    assert first is second
+    assert first.shape == (2, 2, 4, 3)
+    assert torch.count_nonzero(first) == 0
 
 
 def test_flashinfer_prefill_refuses_non_sglang_return_contract():

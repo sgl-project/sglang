@@ -144,6 +144,7 @@ class FlashInferSSUBackend(MambaSSUBackend):
         self._prefill_kernel = mamba_chunk_scan_combined
         self._prefill_backend = None
         self._prefill_runners = {}
+        self._zero_initial_states = {}
 
     @property
     def name(self) -> str:
@@ -263,6 +264,32 @@ class FlashInferSSUBackend(MambaSSUBackend):
             self._prefill_runners[key] = runner
         return runner
 
+    def _get_zero_initial_states(
+        self,
+        *,
+        x: torch.Tensor,
+        B: torch.Tensor,
+        num_sequences: int,
+        state_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        key = (
+            x.device.index,
+            num_sequences,
+            x.shape[2],
+            x.shape[3],
+            B.shape[3],
+            state_dtype,
+        )
+        states = self._zero_initial_states.get(key)
+        if states is None:
+            states = torch.zeros(
+                (num_sequences, x.shape[2], x.shape[3], B.shape[3]),
+                dtype=state_dtype,
+                device=x.device,
+            )
+            self._zero_initial_states[key] = states
+        return states
+
     def chunk_scan_combined(
         self,
         x: torch.Tensor,
@@ -339,10 +366,11 @@ class FlashInferSSUBackend(MambaSSUBackend):
             state_dtype = x.dtype
         num_sequences = len(cu_seqlens) - 1
         if initial_states is None:
-            initial_states = torch.zeros(
-                (num_sequences, x.shape[2], x.shape[3], B.shape[3]),
-                dtype=state_dtype,
-                device=x.device,
+            initial_states = self._get_zero_initial_states(
+                x=x,
+                B=B,
+                num_sequences=num_sequences,
+                state_dtype=state_dtype,
             )
 
         seqlen = x.shape[1]
