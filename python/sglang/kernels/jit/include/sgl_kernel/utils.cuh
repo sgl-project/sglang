@@ -246,6 +246,59 @@ inline void RuntimeDeviceCheck(DebugInfo location = {}) {
   return RuntimeDeviceCheck(::cudaGetLastError(), location);
 }
 
+class DeviceGuard {
+ public:
+  explicit DeviceGuard(int target_device) {
+#ifdef USE_ROCM
+    RuntimeDeviceCheck(::hipGetDevice(&original_device_));
+    if (original_device_ != target_device) {
+      RuntimeDeviceCheck(::hipSetDevice(target_device));
+      changed_ = true;
+    }
+#else
+    RuntimeDeviceCheck(::cudaGetDevice(&original_device_));
+    if (original_device_ != target_device) {
+      RuntimeDeviceCheck(::cudaSetDevice(target_device));
+      changed_ = true;
+    }
+#endif
+  }
+
+  ~DeviceGuard() {
+    if (changed_) {
+#ifdef USE_ROCM
+      (void)::hipSetDevice(original_device_);
+#else
+      (void)::cudaSetDevice(original_device_);
+#endif
+    }
+  }
+
+  DeviceGuard(const DeviceGuard&) = delete;
+  DeviceGuard& operator=(const DeviceGuard&) = delete;
+
+ private:
+  int original_device_ = 0;
+  bool changed_ = false;
+};
+
+inline void* device_accessible_ptr(const tvm::ffi::TensorView& tensor, DLDevice target_device) {
+  void* ptr = tensor.data_ptr();
+  const auto tensor_device_type = tensor.device().device_type;
+  if (tensor_device_type != kDLCPU && tensor_device_type != kDLGPUHost) {
+    return ptr;
+  }
+
+  DeviceGuard guard(target_device.device_id);
+  void* device_ptr = nullptr;
+#ifdef USE_ROCM
+  RuntimeDeviceCheck(::hipHostGetDevicePointer(&device_ptr, ptr, 0));
+#else
+  RuntimeDeviceCheck(::cudaHostGetDevicePointer(&device_ptr, ptr, 0));
+#endif
+  return device_ptr;
+}
+
 inline auto alloc_workspace_tensor(size_t required_bytes, DLDevice device) -> tvm::ffi::Tensor {
   if (required_bytes == 0) return {};
   DLDataType u8 = {kDLUInt, 8, 1};

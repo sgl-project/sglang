@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
+    make_kernel_ptr_table,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -117,15 +118,15 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
             self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
-        self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
+        self.k_data_ptrs = make_kernel_ptr_table(
+            self.k_data_refs,
+            self.device_pool.device,
+            host_memory_registered=self.pin_memory,
         )
-        self.v_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.v_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
+        self.v_data_ptrs = make_kernel_ptr_table(
+            self.v_data_refs,
+            self.device_pool.device,
+            host_memory_registered=self.pin_memory,
         )
         if self.mtp_draft_device_pools:
             device_pools = (self.device_pool, *self.mtp_draft_device_pools)
@@ -758,10 +759,10 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
         else:
             self.k_data_refs = []
-        self.k_data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.k_data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
+        self.k_data_ptrs = make_kernel_ptr_table(
+            self.k_data_refs,
+            self.device_pool.device,
+            host_memory_registered=self.pin_memory,
         )
 
     def get_size_per_token(self):

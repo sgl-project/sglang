@@ -600,6 +600,8 @@ void transfer_kv_all_layer_mla_lf_pf(
     int64_t block_quota,
     int64_t num_warps_per_block);
 
+int64_t get_device_accessible_ptr(const at::Tensor& tensor, int64_t device_index);
+
 void transfer_kv_direct(
     const std::vector<at::Tensor>& src_layers,
     std::vector<at::Tensor> dst_layers,
