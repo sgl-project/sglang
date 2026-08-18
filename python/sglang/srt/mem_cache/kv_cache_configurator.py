@@ -1311,14 +1311,34 @@ class KVCacheConfigurator:
             dsa_cp_layer_shard_rank,
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
-        pool_kwargs = {}
-        if get_memory().enable_hisparse:
-            PoolCls = HiSparseDSATokenToKVPool
-            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+        from sglang.srt.mem_cache.sparsity import (
+            HiSparseBacking,
+            hisparse_backing,
+            hisparse_indexer_expansion_ratio,
+        )
 
-            pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
-                self.server_args
-            ).host_to_device_ratio
+        pool_kwargs = {}
+        backing = hisparse_backing(self.server_args)
+        if backing is HiSparseBacking.PRIVATE_HOST:
+            # The attention KV pool becomes a small hot working set and the
+            # logical token space is the (expanded) indexer space, addressed
+            # through the pool's own full -> device index mapping.
+            PoolCls = HiSparseDSATokenToKVPool
+            pool_kwargs["host_to_device_ratio"] = int(
+                hisparse_indexer_expansion_ratio(self.server_args)
+            )
+        elif backing is HiSparseBacking.HICACHE:
+            # HiCache backing leaves attention KV in the regular radix-owned
+            # pool, so the pool class stays standard; only the indexer region
+            # grows, so the indexer can still score a prefix whose attention KV
+            # was evicted to host. IndexKeyCache rounds the size up to whole
+            # pages itself; P2's unit geometry derives the expanded region's
+            # offset from the resulting page count.
+            PoolCls = DSATokenToKVPool
+            pool_kwargs["index_buf_size"] = int(
+                hisparse_indexer_expansion_ratio(self.server_args)
+                * max_total_num_tokens
+            )
         elif dsa_cp_layer_shard_rank is not None:
             # DSA cache layer split: shard KV/indexer layers across CP ranks.
             from sglang.srt.mem_cache.dsa_cache_layer_split import (
@@ -1612,6 +1632,11 @@ class KVCacheConfigurator:
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
     ) -> BaseTokenToKVPoolAllocator:
+        from sglang.srt.mem_cache.sparsity import HiSparseBacking, hisparse_backing
+
+        hisparse_private_host = (
+            hisparse_backing(self.server_args) is HiSparseBacking.PRIVATE_HOST
+        )
         # Initialize token_to_kv_pool_allocator
         need_sort = get_disagg().disaggregation_mode in ("decode", "prefill")
         if token_to_kv_pool_allocator is None:
@@ -1684,7 +1709,10 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
                 else:
-                    if get_memory().enable_hisparse:
+                    # Only the private-host backing splits the device pool into a
+                    # per-request hot buffer; the HiCache backing leaves the pool
+                    # radix-owned, so it takes the standard allocator below.
+                    if hisparse_private_host:
                         from sglang.srt.mem_cache.sparsity import (
                             parse_hisparse_config,
                         )
@@ -1720,7 +1748,9 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
 
-            if get_memory().enable_hisparse and is_dsv4_model:
+            # DeepSeek V4 HiSparse is private-host only (validation rejects it on
+            # the HiCache backing), so this wrap keys on the backing too.
+            if hisparse_private_host and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
                 token_to_kv_pool_allocator = DeepSeekV4HiSparseTokenToKVPoolAllocator(
                     token_to_kv_pool_allocator
