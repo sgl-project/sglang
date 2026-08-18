@@ -361,7 +361,8 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& w2_bias,
     const std::optional<double>& alpha,
     const std::optional<double>& limit,
-    bool is_vnni);
+    bool is_vnni,
+    const std::optional<std::string>& activation);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
 at::Tensor shared_expert_cpu(
@@ -478,8 +479,11 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
 std::tuple<at::Tensor, at::Tensor>
 apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
 
+// multidimensional rope
+void apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
+
 // mrope
-std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
+void multimodal_rotary_embedding_cpu(
     at::Tensor& positions,
     at::Tensor& query,
     at::Tensor& key,
@@ -795,7 +799,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor topk_weights, Tensor topk_ids, bool "
       "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
       "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, Tensor? w1_bias, Tensor? w2_bias, float? alpha, float? "
-      "limit, bool is_vnni) -> Tensor");
+      "limit, bool is_vnni, str? activation=None) -> Tensor");
   m.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
 
 #if !defined(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
@@ -864,10 +868,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("apply_rotary_pos_emb_cpu(Tensor query, Tensor key, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
   m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
 
+  // multidimensional rope
+  m.def("apply_multidimensional_rope_cpu(Tensor(a!) query, Tensor(b!) key, Tensor cos, Tensor sin) -> ()");
+  m.impl("apply_multidimensional_rope_cpu", torch::kCPU, &apply_multidimensional_rope_cpu);
+
   // multimodal rope
   m.def(
-      "multimodal_rotary_embedding_cpu(Tensor positions, Tensor query, Tensor key, int head_size, Tensor "
-      "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> (Tensor, Tensor)");
+      "multimodal_rotary_embedding_cpu(Tensor positions, Tensor(a!) query, Tensor(b!) key, int head_size, Tensor "
+      "cos_sin_cache, int[]? mrope_section, bool mrope_interleaved, bool is_neox) -> ()");
   m.impl("multimodal_rotary_embedding_cpu", torch::kCPU, &multimodal_rotary_embedding_cpu);
 
   // CPU and memory binding

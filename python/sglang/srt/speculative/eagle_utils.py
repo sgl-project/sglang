@@ -737,6 +737,21 @@ def eagle_sample(
             target_predict=target_predict,
             topk=verify_input.tree_topk,
         )
+
+        if _is_hip:
+            # On ROCm, the per-rank draft tokens can differ, so ranks accept a
+            # different number of drafts, desynchronize the committed seq_lens, and
+            # deadlock the next TP collective. Broadcast from rank 0 to ensure
+            # consistency, the same way the sampling branch below does.
+            tp_group = (
+                get_parallel().attn_tp_group
+                if is_dp_attention_enabled()
+                else get_tp_group()
+            )
+            if tp_group.world_size > 1:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
     else:
         from sgl_kernel import (
             top_k_renorm_prob,
