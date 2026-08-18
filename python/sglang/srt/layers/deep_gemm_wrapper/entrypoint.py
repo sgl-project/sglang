@@ -91,13 +91,20 @@ def grouped_gemm_nt_f8f8bf16_masked(
         )
         logger.info_once(
             "Using FlashInfer batch DeepGEMM API backend=%s for masked FP8 MoE "
-            "(B=%d, M=%d, N=%d, K=%d, expected_m=%d)",
+            "(B=%d, M=%d, N=%d, K=%d, expected_m=%d, "
+            "contiguous=[a:%s,b:%s,a_scale:%s,b_scale:%s,masked_m:%s,out:%s])",
             flashinfer_backend,
             num_groups,
             lhs[0].shape[1],
             n,
             k,
             expected_m,
+            lhs[0].is_contiguous(),
+            rhs[0].is_contiguous(),
+            lhs[1].is_contiguous(),
+            rhs[1].is_contiguous(),
+            masked_m.is_contiguous(),
+            out.is_contiguous(),
         )
         return batch_deepgemm_fp8_nt_groupwise(
             lhs[0],
