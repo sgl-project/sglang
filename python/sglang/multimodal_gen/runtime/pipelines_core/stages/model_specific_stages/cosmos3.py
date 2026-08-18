@@ -30,6 +30,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -498,8 +501,9 @@ class Cosmos3LatentPreparationStage(PipelineStage):
                 )
                 cond_indexes = [0]
 
-            with torch.no_grad():
-                cond_latent = self._vae_encode(pixel_input).to(dtype)
+            with self.use_declared_component(component_name="vae", module=self.vae):
+                with torch.no_grad():
+                    cond_latent = self._vae_encode(pixel_input).to(dtype)
 
             max_idx = max(cond_indexes)
             if max_idx >= num_latent_frames:
@@ -564,6 +568,11 @@ class Cosmos3LatentPreparationStage(PipelineStage):
                 )
             self._prepare_action_latents(batch, generator, device, dtype)
         return batch
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        return [ComponentUse(self._component_stage_name(stage_name), "vae")]
 
     @staticmethod
     def _resolve_domain_id(batch: Req) -> int:
@@ -861,6 +870,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 len(gen_layers),
                 compile_kwargs,
             )
+            transformer._gen_layers_torch_compiled = True
             for i, layer in enumerate(gen_layers):
                 gen_layers[i] = torch.compile(layer, **compile_kwargs)
         else:
@@ -930,21 +940,6 @@ class Cosmos3DenoisingStage(PipelineStage):
                 action_start_frame_offset=action_start_frame_offset,
             )
 
-    def _manage_device_placement(self, server_args: ServerArgs):
-        """Move transformer to GPU if CPU offload is enabled."""
-        if not server_args.dit_cpu_offload:
-            return
-
-        # FSDP manages offloading internally
-        if server_args.use_fsdp_inference:
-            return
-
-        device = get_local_torch_device()
-        # Load the model to GPU if it's on CPU
-        if next(self.transformer.parameters()).device.type == "cpu":
-            self.log_info("Moving transformer to GPU for inference")
-            self.transformer.to(device)
-
     @staticmethod
     def _cfg_active_at(t: torch.Tensor, interval: tuple[float, float] | None) -> bool:
         """Return True iff CFG should be applied at timestep ``t``.
@@ -961,8 +956,6 @@ class Cosmos3DenoisingStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the denoising loop with CFG and optional I2V conditioning."""
-        self._manage_device_placement(server_args)
-
         latents = batch.latents
         sound_latents = batch.audio_latents
         action_latents = getattr(batch, "action_latents", None)
@@ -1449,6 +1442,18 @@ class Cosmos3DenoisingStage(PipelineStage):
             return tuple(cfg_model_parallel_all_reduce(coeff * p) for p in out)
         return cfg_model_parallel_all_reduce(coeff * out)
 
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        return [
+            ComponentUse(
+                self._component_stage_name(stage_name),
+                "transformer",
+                preferred_ready_after_request=True,
+                memory_intensive=True,
+            )
+        ]
+
 
 class Cosmos3DecodingStage(PipelineStage):
     """
@@ -1590,16 +1595,11 @@ class Cosmos3DecodingStage(PipelineStage):
         )
 
         device = batch.latents.device
-        if server_args.vae_cpu_offload:
-            self.vae.to(device)
+        with self.use_declared_component(component_name="vae", module=self.vae):
+            with torch.no_grad():
+                decoded = self._decode_latents(batch.latents)
 
-        with torch.no_grad():
-            decoded = self._decode_latents(batch.latents)
-
-        if server_args.vae_cpu_offload and not getattr(batch, "is_warmup", False):
-            self.vae.to("cpu", non_blocking=True)
-
-        self.log_info(f"Decoded tensor shape: {decoded.shape}")
+        self.log_debug("Decoded tensor shape: %s", decoded.shape)
         output = self._postprocess_tensor(decoded)
 
         if self._guardrails and batch.use_guardrails is not False:
@@ -1614,23 +1614,25 @@ class Cosmos3DecodingStage(PipelineStage):
             else:
                 output = check_video_safety(output)
         elif not is_image_gen:
-            self.log_info(f"Postprocessed video tensor shape: {output.shape}")
+            self.log_debug("Postprocessed video tensor shape: %s", output.shape)
 
         audio = None
         audio_sample_rate = None
         if self.sound_tokenizer is not None and batch.audio_latents is not None:
-            if server_args.vae_cpu_offload:
-                self.sound_tokenizer.to(device)
-            with torch.no_grad():
-                decoded_audio = self.sound_tokenizer.decode(
-                    batch.audio_latents.to(device)
-                )
+            with self.use_declared_component(
+                component_name="sound_tokenizer", module=self.sound_tokenizer
+            ) as sound_tokenizer:
+                assert sound_tokenizer is not None
+                with torch.no_grad():
+                    decoded_audio = sound_tokenizer.decode(
+                        batch.audio_latents.to(device)
+                    )
             audio = decoded_audio.float().cpu()
-            audio_sample_rate = self.sound_tokenizer.sample_rate
-            if server_args.vae_cpu_offload and not getattr(batch, "is_warmup", False):
-                self.sound_tokenizer.to("cpu", non_blocking=True)
-            self.log_info(
-                f"Decoded audio tensor shape: {tuple(audio.shape)} @ {audio_sample_rate} Hz"
+            audio_sample_rate = sound_tokenizer.sample_rate
+            self.log_debug(
+                "Decoded audio tensor shape: %s @ %s Hz",
+                tuple(audio.shape),
+                audio_sample_rate,
             )
 
         return OutputBatch(
@@ -1641,3 +1643,12 @@ class Cosmos3DecodingStage(PipelineStage):
             metrics=batch.metrics if hasattr(batch, "metrics") else None,
             **action_metadata,
         )
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        uses = [ComponentUse(stage_name, "vae", keep_ready_after_warmup=True)]
+        if self.sound_tokenizer is not None:
+            uses.append(ComponentUse(stage_name, "sound_tokenizer"))
+        return uses

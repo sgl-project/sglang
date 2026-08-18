@@ -132,6 +132,8 @@ def fused_qkvzba_split_reshape_cat(
         device=mixed_ba.device,
     )
     a = torch.empty_like(b)
+    if _is_hip and batch * seq_len == 0:
+        return mixed_qkv, z, b, a
     grid = (batch * seq_len, num_heads_qk)
     fused_qkvzba_split_reshape_cat_kernel[grid](
         mixed_qkv,
@@ -297,6 +299,8 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         device=mixed_ba.device,
     )
     a = torch.empty_like(b)
+    if _is_hip and batch * seq_len == 0:
+        return mixed_qkv, z, b, a
     grid = (batch * seq_len, num_heads_qk)
     # Each program moves `v_per_group * head_v` elements for both v and z. For
     # the small head-group ratios (<= 512 elements) a single warp is the best
@@ -402,6 +406,8 @@ def fused_qkv_split_gdn_prefill(
     )
 
     qkv_dim = num_q_heads * head_q + num_k_heads * head_k + num_v_heads * head_v
+    if _is_hip and seq_len == 0:
+        return q, k, v
     fused_qkv_split_gdn_prefill_kernel[(seq_len,)](
         q,
         k,

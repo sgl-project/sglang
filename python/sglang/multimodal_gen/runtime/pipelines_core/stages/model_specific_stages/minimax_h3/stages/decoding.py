@@ -11,6 +11,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_world_group,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -361,7 +362,8 @@ class MiniMaxH3DecodingStage(DecodingStage):
                     server_args,
                     decode_fn=selected_video_vae.decode_base,
                 )
-                visual_frames = video_decode(visual_decode_latent)
+                with set_forward_context(current_timestep=0, attn_metadata=None):
+                    visual_frames = video_decode(visual_decode_latent)
                 visual_frames = selected_video_vae.processor.revert_tensor(
                     visual_frames
                 )

@@ -14,9 +14,12 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_score_type,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 from sglang.srt.utils import is_npu
 
@@ -1627,6 +1630,11 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
     ):
         self.sparse.init_forward_metadata_out_graph(forward_batch, in_capture)
         self.dense.init_forward_metadata_out_graph(forward_batch, in_capture)
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        return SharedReadEnds.max_of(
+            b.shared_read_ends(fm) for b in (self.sparse, self.dense)
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self.sparse.init_forward_metadata_in_graph(forward_batch)
