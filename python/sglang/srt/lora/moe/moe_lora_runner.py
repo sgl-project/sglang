@@ -160,8 +160,7 @@ class MoeLoraRunner:
         if not providers:
             raise ValueError("a MoE LoRA runner needs at least one provider")
         self.providers = dict(providers)
-        # What actually bound, not what was asked for: a device CuteDSL cannot
-        # serve falls back to DeepGEMM. The bind log reports this one.
+        # Which vendor implements the base GEMMs, for the bind log.
         self.base_gemm_vendor = base_gemm_vendor
         # Every provider of a layer reads the same resident tensors, so the
         # geometry is a layer fact and lives here rather than per call.
@@ -203,16 +202,13 @@ class MoeLoraRunner:
         A layer needs at most two: the decode phase's and the prefill phase's.
         Both come from the same vendor, so the flag is read once per layer.
         """
+        # No vendor fallback: _admit has already narrowed the device to SM90 or
+        # SM100, and CuteDSL implements both. The fallback existed when the
+        # floor was ">= SM90" and something had to serve what CuteDSL refused --
+        # but DeepGEMM requires the very same two families, so below them there
+        # was never anything to fall back to.
         cls._admit(base_layer)
         config = base_layer.moe_runner_config
-        if vendor == "cutedsl" and torch.cuda.get_device_capability() < (9, 0):
-            logger.warning(
-                "MoE LoRA base GEMM falling back to DeepGEMM: CuTeDSL needs "
-                "SM90 or newer, and this device is sm%d%d. Decode throughput "
-                "is materially lower on DeepGEMM.",
-                *torch.cuda.get_device_capability(),
-            )
-            vendor = "deepgemm"
         return cls(
             providers={
                 rows: cls._build_provider(
@@ -243,7 +239,6 @@ class MoeLoraRunner:
         LoRA layer attaches, so all of that is validated together here rather
         than assumed.
         """
-        from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
         from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
@@ -266,22 +261,23 @@ class MoeLoraRunner:
         # and that same flag sets the layer's use_deep_gemm (fused_moe_triton/
         # layer.py), which makes the quant method build a DEEP_GEMM runner
         # (unquant.py) -- so the canonical gate-first [E, 2I, H] BF16 residents
-        # are guaranteed by construction. An is_deep_gemm() assert here could
-        # not fail, and its error told users to pass --moe-runner-backend
-        # deep_gemm, which turns this feature off.
+        # are guaranteed by construction.
         #
-        # This one is NOT about the weight layout, despite where it sits. Only
-        # the DeepGEMM provider imports deep_gemm; CuteDSL never touches it. It
-        # stays because it is also, accidentally, the SM120 gate: DeepGEMM's
-        # configurer returns False there ("requires TMEM/tcgen05, not available
-        # on SM120"), while architecture_for_capability and _kernel_class_for
-        # both test major >= 10 and would hand SM120 the GB300 tables and the
-        # tcgen05 kernel it cannot run. Make that rejection explicit before
-        # narrowing this to the DeepGEMM vendor.
-        if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        # Architecture, on the other hand, is a real gate, and it is a CLOSED
+        # set rather than a floor. Every base GEMM we ship is built on one of
+        # two instruction families: WGMMA on SM90, tcgen05 on SM100. DeepGEMM
+        # requires exactly the same two (its configurer rejects sm < 90 and
+        # rejects SM120 by name). SM120 is the case a ">= SM90" floor gets
+        # wrong -- consumer Blackwell reports major 12 and has NEITHER family,
+        # while architecture_for_capability and _kernel_class_for both test
+        # major >= 10 and would hand it the GB300 tables and a tcgen05 kernel.
+        major, minor = torch.cuda.get_device_capability()
+        if major not in (9, 10):
             raise NotImplementedError(
-                "MoE LoRA BF16 requires a usable JIT DeepGEMM build (this also "
-                "excludes SM120, which has neither DeepGEMM nor tcgen05)"
+                f"MoE LoRA BF16 supports SM90 and SM100 only; this device is "
+                f"sm{major}{minor}. Its base GEMMs are WGMMA (SM90) and "
+                "tcgen05 (SM100) kernels, and no other architecture implements "
+                "either -- SM120 included, despite reporting a higher major."
             )
         if base_layer.dispatcher.skip_local_expert_mapping:
             raise NotImplementedError(
@@ -331,11 +327,11 @@ class MoeLoraRunner:
                 "expected 'expert_major' or 'route_major'"
             )
         if vendor == "cutedsl":
-            if torch.cuda.get_device_capability() < (9, 0):
+            if torch.cuda.get_device_capability()[0] not in (9, 10):
                 raise NotImplementedError(
-                    "the CuTeDSL MoE LoRA providers require SM90+ (tcgen05 on "
-                    "SM100+, WGMMA on SM90); this device is "
-                    f"sm{torch.cuda.get_device_capability()}"
+                    "the CuTeDSL MoE LoRA providers implement SM90 (WGMMA) and "
+                    "SM100 (tcgen05) only; this device is "
+                    f"sm{''.join(map(str, torch.cuda.get_device_capability()))}"
                 )
             from sglang.srt.lora.moe.base_gemm_provider.cutedsl_bf16 import (
                 CuteDslBf16ContiguousProvider,
@@ -348,6 +344,17 @@ class MoeLoraRunner:
                 else CuteDslBf16ContiguousProvider
             )
         if vendor == "deepgemm":
+            # Only these providers import deep_gemm, and deep_gemm_wrapper
+            # binds its symbols only when the build is usable -- so an
+            # unusable build must fail HERE, not at admission, or a CuteDSL
+            # serve is refused for a dependency it never touches.
+            from sglang.srt.layers import deep_gemm_wrapper
+
+            if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+                raise NotImplementedError(
+                    "--moe-lora-base-gemm deepgemm needs a usable JIT DeepGEMM "
+                    "build; this one is disabled or absent"
+                )
             from sglang.srt.lora.moe.base_gemm_provider.deep_gemm_bf16 import (
                 DeepGemmBf16ContiguousProvider,
                 DeepGemmBf16Provider,

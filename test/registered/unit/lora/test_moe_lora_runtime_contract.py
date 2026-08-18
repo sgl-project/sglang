@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
-from unittest import mock
 
 import pytest
 import torch
@@ -326,11 +325,7 @@ class TestRunnerAdmission:
     def _admit(self, **overrides) -> None:
         from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
-        with mock.patch(
-            "sglang.srt.layers.deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM",
-            overrides.pop("jit_deep_gemm", True),
-        ):
-            MoeLoraRunner._admit(self._base_layer(**overrides))
+        MoeLoraRunner._admit(self._base_layer(**overrides))
 
     @pytest.mark.parametrize(
         ("activation", "is_gated"),
@@ -346,7 +341,6 @@ class TestRunnerAdmission:
     @pytest.mark.parametrize(
         ("overrides", "message"),
         [
-            ({"jit_deep_gemm": False}, "JIT DeepGEMM"),
             ({"skip_local": True}, "EP-local"),
             ({"fused_scaling": True}, "routed scaling"),
             (

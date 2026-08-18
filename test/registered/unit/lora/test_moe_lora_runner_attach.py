@@ -220,26 +220,44 @@ class TestEngineAdmission(unittest.TestCase):
     def _admit(self, **overrides):
         from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
-        with mock.patch(
-            "sglang.srt.layers.deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM",
-            overrides.pop("jit_deep_gemm", True),
-        ):
-            MoeLoraRunner._admit(self._base_layer(**overrides))
+        MoeLoraRunner._admit(self._base_layer(**overrides))
 
     def test_admits_a_supported_layer(self):
         self._admit()
 
-    def test_rejects_unusable_deep_gemm_build(self):
-        """Also the SM120 gate: no DeepGEMM there, and no tcgen05 either.
+    def test_rejects_architectures_with_neither_mma_family(self):
+        """SM90 and SM100 are a closed set, not a floor.
 
-        The regression this family guards -- a first forward reaching an
-        unbound deep_gemm symbol, since deep_gemm_wrapper imports those names
-        only when the build is usable -- is caught here. The resident BACKEND
-        needs no case: --moe-runner-backend lora is the only way to reach
-        _admit, and it forces the layer's quant method onto a DEEP_GEMM runner.
+        SM120 is the case a ">= SM90" floor gets wrong: it reports major 12
+        yet has neither WGMMA nor tcgen05, and both
+        architecture_for_capability and _kernel_class_for test major >= 10,
+        so it would be handed the GB300 tables and a tcgen05 kernel.
         """
-        with self.assertRaisesRegex(NotImplementedError, "JIT DeepGEMM"):
-            self._admit(jit_deep_gemm=False)
+        from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
+
+        for capability in ((8, 0), (12, 0), (11, 0)):
+            with mock.patch(
+                "torch.cuda.get_device_capability", lambda device=None: capability
+            ):
+                with self.assertRaisesRegex(NotImplementedError, "SM90 and SM100"):
+                    MoeLoraRunner._admit(self._base_layer())
+
+    def test_unusable_deep_gemm_build_only_blocks_the_deepgemm_vendor(self):
+        """A CuteDSL serve must not need a dependency it never imports.
+
+        deep_gemm_wrapper binds its symbols only when the build is usable, so
+        an unusable build has to fail before a DeepGEMM provider is built --
+        but no earlier, or CuteDSL is refused for DeepGEMM's absence.
+        """
+        from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
+
+        with mock.patch(
+            "sglang.srt.layers.deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM", False
+        ):
+            self._admit()  # admission itself is vendor-agnostic
+            assert MoeLoraRunner.select_provider_cls("expert_major", "cutedsl")
+            with self.assertRaisesRegex(NotImplementedError, "JIT DeepGEMM"):
+                MoeLoraRunner.select_provider_cls("expert_major", "deepgemm")
 
     def test_rejects_global_expert_id_dispatch(self):
         with self.assertRaisesRegex(NotImplementedError, "EP-local"):
