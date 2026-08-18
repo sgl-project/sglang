@@ -392,7 +392,7 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     )
     # No need to reshape - output_tensor already has the correct shape [seq_len, ...]
     return output_tensor
-def cp_all_gather_rerange_kv_cache_launch(input_tensor, cp_size, forward_batch, stream):
+def cp_all_gather_rerange_kv_cache_launch(input_tensor, cp_size, forward_batch):
     """Launch async all-gather for KV cache. Returns (handle, input_tensor_full).
 
     Caller MUST call cp_all_gather_rerange_kv_cache_finalize() after handle.wait().
