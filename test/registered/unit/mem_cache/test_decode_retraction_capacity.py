@@ -156,5 +156,59 @@ class TestFallbackKeepsHostPoolRatio(CustomTestCase):
         self.assertEqual(get_memory().hicache_ratio, 1.0)
 
 
+class TestCapacityReductionIsUnconditional(CustomTestCase):
+    """The all-reduce must not sit behind a per-rank predicate.
+
+    ``supports_host_pool`` is per-rank state (pool class, full-token capacity).
+    If the reduction were reached only by ranks that chose ``host_pool``, a rank
+    that decided otherwise would leave its peers blocked in the all-reduce. Only
+    ``backend is None`` -- pure config, hence rank-uniform -- may gate it.
+    """
+
+    def _resolve_with_pool(self, pool):
+        override = get_context().override_server_args(
+            disaggregation_mode="decode", tp_size=1, nnodes=1
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        get_context().override("test.reset_ratio", hicache_ratio=None)
+
+        tp_worker = SimpleNamespace(
+            get_memory_pool=lambda: (None, SimpleNamespace(get_kvcache=lambda: pool)),
+            is_hybrid_swa=False,
+            model_runner=SimpleNamespace(mtp_draft_device_pools=()),
+        )
+        with patch.object(
+            kv_cache_builder, "_agree_across_ranks", side_effect=lambda v: v
+        ) as agree, patch(
+            "sglang.srt.mem_cache.kv_cache_builder.psutil.virtual_memory",
+            return_value=SimpleNamespace(available=1024 * GB),
+        ):
+            backend = kv_cache_builder.resolve_decode_retraction_backup(
+                tp_worker=tp_worker
+            )
+        return backend, agree
+
+    def test_reduced_even_when_the_pool_cannot_use_host_pool(self):
+        # An unsupported pool resolves to cpu_tensor without consulting the
+        # capacity gate -- but the reduction still has to happen.
+        backend, agree = self._resolve_with_pool(_fake_pool(8 * GB))
+        self.assertEqual(backend, "cpu_tensor")
+        agree.assert_called_once()
+
+    def test_estimate_itself_performs_no_collective(self):
+        # Purity keeps the helper unit-testable and keeps the reduction visible
+        # at the call site rather than buried in the estimate.
+        override = get_context().override_server_args(tp_size=1, nnodes=1)
+        override.install()
+        self.addCleanup(override.restore)
+        with patch.object(kv_cache_builder, "_agree_across_ranks") as agree, patch(
+            "sglang.srt.mem_cache.kv_cache_builder.psutil.virtual_memory",
+            return_value=SimpleNamespace(available=1024 * GB),
+        ):
+            _host_pool_retraction_fits(_fake_pool(8 * GB), ())
+        agree.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

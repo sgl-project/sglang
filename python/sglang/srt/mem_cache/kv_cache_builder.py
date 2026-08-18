@@ -177,6 +177,10 @@ def _agree_across_ranks(fits: bool) -> bool:
     topologies. Follows ``sync_fixed_hicache_size``'s shape -- all-reduce MIN
     over a CPU group, degrading to the local verdict when there is no process
     group to reduce over.
+
+    Callers must reach this on every rank, never behind a per-rank predicate:
+    a rank that skips the reduction leaves the others blocked in the
+    all-reduce, converting a mismatch into a hang.
     """
     if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
         return fits
@@ -209,8 +213,8 @@ def _host_pool_retraction_fits(
     device pools count toward the requirement too.
 
     Measured against ``virtual_memory().available`` -- the same quantity the
-    real gate in ``HostKVCache.__init__`` reads -- and reduced to a single
-    verdict with an all-reduce MIN so ranks cannot disagree.
+    real gate in ``HostKVCache.__init__`` reads. The verdict is local; callers
+    reduce it with ``_agree_across_ranks`` so ranks cannot disagree.
 
     This is a lower bound, not the exact allocation: it does not model the host
     pool's page round-up nor SIDECAR draft host pools sized off
@@ -227,8 +231,7 @@ def _host_pool_retraction_fits(
     available_bytes = (
         psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES
     )
-    fits = _agree_across_ranks(required_bytes <= available_bytes)
-    return fits, required_bytes, available_bytes
+    return required_bytes <= available_bytes, required_bytes, available_bytes
 
 
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
@@ -278,25 +281,33 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         # (common when the HBM:DRAM ratio is high). Only an explicit
         # --disaggregation-decode-retraction-backup=host_pool should hard-fail
         # on that; an inferred default degrades instead of refusing to start.
-        if backend == "host_pool":
-            local_schedulers = _local_scheduler_count()
-            fits, required_bytes, available_bytes = _host_pool_retraction_fits(
-                kv_cache, tp_worker.model_runner.mtp_draft_device_pools
+        #
+        # Estimate and reduce on every rank that reaches here, not just the
+        # ranks that chose host_pool. ``backend is None`` is pure config so all
+        # ranks enter this branch, whereas ``supports_host_pool`` above is
+        # per-rank state (pool class, full-token capacity). Gating the
+        # all-reduce on that predicate would make any future divergence in it a
+        # startup hang rather than a mismatch; reducing unconditionally removes
+        # the deadlock precondition instead of relying on it holding.
+        local_schedulers = _local_scheduler_count()
+        local_fits, required_bytes, available_bytes = _host_pool_retraction_fits(
+            kv_cache, tp_worker.model_runner.mtp_draft_device_pools
+        )
+        fits = _agree_across_ranks(local_fits)
+        if backend == "host_pool" and not fits:
+            logger.warning(
+                "Falling back to cpu_tensor retraction backup: host-pool "
+                "retraction needs at least %.2f GB of host memory (device "
+                "pool mirrored across %d scheduler(s) on this node) but "
+                "only %.2f GB is available. Pass "
+                "--disaggregation-decode-retraction-backup=host_pool to "
+                "require it, or shrink the device pool with "
+                "--max-total-tokens / --mem-fraction-static.",
+                required_bytes / 1e9,
+                local_schedulers,
+                available_bytes / 1e9,
             )
-            if not fits:
-                logger.warning(
-                    "Falling back to cpu_tensor retraction backup: host-pool "
-                    "retraction needs at least %.2f GB of host memory (device "
-                    "pool mirrored across %d scheduler(s) on this node) but "
-                    "only %.2f GB is available. Pass "
-                    "--disaggregation-decode-retraction-backup=host_pool to "
-                    "require it, or shrink the device pool with "
-                    "--max-total-tokens / --mem-fraction-static.",
-                    required_bytes / 1e9,
-                    local_schedulers,
-                    available_bytes / 1e9,
-                )
-                backend = "cpu_tensor"
+            backend = "cpu_tensor"
         fields["disaggregation_decode_retraction_backup"] = backend
 
     if memory.hicache_ratio is None:
