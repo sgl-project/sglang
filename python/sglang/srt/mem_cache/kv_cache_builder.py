@@ -207,9 +207,13 @@ def _kv_pool_bytes(pool: object) -> int:
     ``(k, v)`` pair while MLA, DSA, and Mamba pools return a scalar. Callers that
     see pools of every class have to normalise, so keep that knowledge in one
     place rather than assuming the tuple shape.
+
+    Test the pair shape, not the scalar one: MLA reports a ``numpy.int64``, which
+    is not a Python ``int`` subclass, so an ``isinstance(size, int)`` check would
+    fall through to the tuple branch and raise.
     """
     size = pool.get_kv_size_bytes()
-    return sum(size) if isinstance(size, tuple) else int(size)
+    return int(sum(size)) if isinstance(size, tuple) else int(size)
 
 
 def _host_pool_retraction_fits(
