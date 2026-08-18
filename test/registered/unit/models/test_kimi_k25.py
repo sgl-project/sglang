@@ -26,6 +26,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+from sglang.srt.models.kimi_k3_vl import Learnable2DInterpPosEmbDividedFixed
 from sglang.srt.models.kimi_k25 import (
     KimiK25ForConditionalGeneration,
     mm_projection_auto,
@@ -53,6 +54,10 @@ from sglang.srt.multimodal.processors.kimi_k3 import (
     KimiK3ImageProcessor,
     _expand_k3_image_prompt_text,
     _expand_k3_image_prompt_token_ids,
+    _expand_k3_visual_prompt_token_ids,
+    _gpu_preprocess_k3_visual_items,
+    _KimiK3VisualItem,
+    _split_k3_video,
 )
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
@@ -581,14 +586,51 @@ def test_kimi_lazy_vmm_cache_hit_uses_proxy_consumer_count():
     proxy.acknowledge_consumption.assert_called_once_with(2)
 
 
+def test_kimi_k3_temporal_position_embedding_follows_weight_device():
+    position_embedding = Learnable2DInterpPosEmbDividedFixed(
+        height=2,
+        width=2,
+        num_frames=2,
+        dim=4,
+    )
+    position_embedding.weight = nn.Parameter(position_embedding.weight.to("meta"))
+
+    output = position_embedding.position_embeddings(torch.tensor([[2, 2, 2]]))
+
+    assert output.device.type == "meta"
+
+
 class _Tokenizer:
     def encode(self, text, allowed_special=None):
         tokens = {
             "<|media_begin|>image 1536x1024<|media_content|>": [10, 11],
             "<|media_begin|>image 1024x1536<|media_content|>": [12, 13],
+            "00:00:00.000<|media_begin|>video<|media_content|>": [20, 21],
+            "00:00:01.000<|media_begin|>video<|media_content|>": [22, 23],
             "<|media_end|>": [14],
         }
         return tokens.get(text, [])
+
+
+class _FakeVideo:
+    def __init__(self, frame_count=10, fps=5.0):
+        self.frames = (
+            torch.arange(frame_count * 6 * 8 * 3)
+            .remainder(256)
+            .to(torch.uint8)
+            .reshape(frame_count, 6, 8, 3)
+        )
+        self.avg_fps = fps
+        self.closed = False
+
+    def __len__(self):
+        return len(self.frames)
+
+    def get_frames_as_tensor(self, indices):
+        return self.frames[indices]
+
+    def close(self):
+        self.closed = True
 
 
 class _HFProcessor:
@@ -693,6 +735,104 @@ def test_kimi_k3_expands_image_placeholders_with_original_dimensions():
     )
 
     assert actual.tolist() == [[1, 10, 11, 99, 99, 99, 14, 2, 12, 13, 99, 99, 14, 3]]
+
+
+def test_kimi_k3_expands_one_video_placeholder_into_timestamped_chunks():
+    image = Image.new("RGB", (1536, 1024))
+    frame = torch.zeros(3, 6, 8, dtype=torch.uint8)
+    visual_items = [
+        _KimiK3VisualItem("image", (image,), 0, 16384),
+        _KimiK3VisualItem("video", (frame,) * 4, 1, 8192, "00:00:00.000"),
+        _KimiK3VisualItem("video", (frame,) * 4, 1, 8192, "00:00:01.000"),
+    ]
+
+    actual = _expand_k3_visual_prompt_token_ids(
+        [1, 99, 2, 99, 3],
+        99,
+        visual_items,
+        [{"num_tokens": 3}, {"num_tokens": 2}, {"num_tokens": 2}],
+        _Tokenizer(),
+    )
+
+    assert actual.tolist() == [
+        [
+            1,
+            10,
+            11,
+            99,
+            99,
+            99,
+            14,
+            2,
+            20,
+            21,
+            99,
+            99,
+            14,
+            22,
+            23,
+            99,
+            99,
+            14,
+            3,
+        ]
+    ]
+
+
+def test_kimi_k3_samples_and_splits_video_into_four_frame_grids():
+    video = _FakeVideo(frame_count=10, fps=5.0)
+    config = {
+        "sample_fps": 4,
+        "max_num_frames_each_video": None,
+        "temporal_merge_kernel_size": 4,
+        "in_patch_limit": 100,
+        "in_patch_limit_each_frame": 20,
+        "in_patch_limit_video": 80,
+        "timestamp_mode": "hh:mm:ss.fff",
+    }
+
+    chunks = _split_k3_video(video, config, source_index=0)
+
+    assert [len(chunk.frames) for chunk in chunks] == [4, 4]
+    assert [chunk.timestamp_text for chunk in chunks] == [
+        "00:00:00.000",
+        "00:00:01.000",
+    ]
+    assert all(chunk.in_patch_limit == 10 for chunk in chunks)
+    assert all(frame.shape == (3, 6, 8) for chunk in chunks for frame in chunk.frames)
+
+
+def test_kimi_k3_preprocess_preserves_temporal_grid_dimension():
+    frames = tuple(torch.full((3, 14, 14), i, dtype=torch.uint8) for i in range(4))
+    item = _KimiK3VisualItem(
+        "video",
+        frames,
+        source_index=0,
+        in_patch_limit=100,
+        timestamp_text="00:00:00.000",
+    )
+    resize_config = {
+        "new_height": 14,
+        "new_width": 14,
+        "pad_height": 14,
+        "pad_width": 14,
+    }
+
+    with patch(
+        "sglang.srt.multimodal.processors.kimi_k3._k3_to_cuda_chw",
+        side_effect=lambda frame: frame,
+    ):
+        pixel_values, grid_thw = _gpu_preprocess_k3_visual_items(
+            [item],
+            [resize_config],
+            torch.full((1, 3, 1, 1), 1 / 255),
+            torch.zeros(1, 3, 1, 1),
+            patch_size=14,
+            transparent_bg_config=None,
+        )
+
+    assert pixel_values.shape == (16, 3, 14, 14)
+    assert grid_thw.tolist() == [[4, 2, 2]]
 
 
 def test_kimi_k3_cpu_prompt_uses_the_same_media_contract():
@@ -1378,7 +1518,7 @@ def test_kimi_k3_rejects_silently_dropped_images():
     processor.mm_preprocess_cache = MultimodalPreprocessCache(0)
     processor.load_mm_data = AsyncMock(return_value=SimpleNamespace(images=[object()]))
 
-    with pytest.raises(ValueError, match="expected 2, loaded 1"):
+    with pytest.raises(ValueError, match=r"expected 2 image\(s\).*loaded 1 image\(s\)"):
         asyncio.run(
             processor.process_mm_data_async(
                 image_data=["image-1", "image-2"],
@@ -1417,6 +1557,52 @@ def test_kimi_k3_uses_token_ids_to_preserve_media_boundaries():
     processor.load_mm_data.assert_not_awaited()
 
 
+def test_kimi_k3_loads_mixed_media_and_preserves_source_order():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor.mm_feature_transport = "cpu"
+    processor.mm_tokens = SimpleNamespace(
+        image_token="<|media_pad|>", image_token_id=99
+    )
+    processor.media_proc_cfg = {
+        "sample_fps": 4,
+        "max_num_frames_each_video": None,
+        "temporal_merge_kernel_size": 4,
+        "in_patch_limit": 100,
+        "in_patch_limit_each_frame": 20,
+        "in_patch_limit_video": 80,
+        "timestamp_mode": "hh:mm:ss.fff",
+    }
+    video = _FakeVideo(frame_count=10, fps=5.0)
+    loaded = SimpleNamespace(
+        images=[object()],
+        videos=[video],
+        input_ids=[1, 99, 2, 99, 3],
+    )
+    processor.fast_load_mm_data = AsyncMock(return_value=loaded)
+    processor.load_mm_data = AsyncMock()
+    processor.process_and_combine_mm_data_async = AsyncMock(
+        return_value=([], torch.tensor([[1, 2]]), None)
+    )
+
+    asyncio.run(
+        processor.process_mm_data_async(
+            image_data=["image-1"],
+            input_text=[1, 99, 2, 99, 3],
+            request_obj=SimpleNamespace(
+                video_data=["video-1"], modalities=["video", "image"]
+            ),
+        )
+    )
+
+    processor.fast_load_mm_data.assert_awaited_once()
+    processor.load_mm_data.assert_not_awaited()
+    assert [item.media_type for item in loaded.images] == ["video", "video", "image"]
+    assert [item.source_index for item in loaded.images] == [0, 0, 1]
+    assert [len(item.frames) for item in loaded.images] == [4, 4, 1]
+    assert loaded.videos == []
+    assert video.closed
+
+
 def test_kimi_k3_rejects_tokenized_placeholder_mismatch():
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
@@ -1436,25 +1622,18 @@ def test_kimi_k3_rejects_tokenized_placeholder_mismatch():
     processor.load_mm_data.assert_not_awaited()
 
 
-@pytest.mark.parametrize(
-    ("request_obj", "extra_kwargs"),
-    [
-        (SimpleNamespace(video_data=["video"]), {}),
-        (SimpleNamespace(video_data=None), {"audio_data": ["audio"]}),
-    ],
-)
-def test_kimi_k3_rejects_unsupported_modalities(request_obj, extra_kwargs):
+def test_kimi_k3_rejects_audio_input():
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_tokens = Mock()
     processor.load_mm_data = AsyncMock()
 
-    with pytest.raises(ValueError, match="supports image input only"):
+    with pytest.raises(ValueError, match=r"video input \(without audio track\) only"):
         asyncio.run(
             processor.process_mm_data_async(
                 image_data=[],
                 input_text="prompt",
-                request_obj=request_obj,
-                **extra_kwargs,
+                request_obj=SimpleNamespace(video_data=None),
+                audio_data=["audio"],
             )
         )
     processor.load_mm_data.assert_not_awaited()

@@ -376,7 +376,7 @@ class OpenAIServingChat(OpenAIServingBase):
         messages: List[Dict[str, Any]],
         request: ChatCompletionRequest,
     ) -> tuple[List[Dict[str, Any]], int, Optional[str]]:
-        image_count = 0
+        media_count = 0
         for index, message in enumerate(messages):
             content = message.get("content")
             if isinstance(content, list):
@@ -399,7 +399,16 @@ class OpenAIServingChat(OpenAIServingBase):
                         if isinstance(image, str):
                             image = {"url": image, "detail": part.get("detail")}
                         parts.append({"type": "image_url", "image_url": image})
-                        image_count += 1
+                        media_count += 1
+                    elif part_type == "video_url":
+                        video = part.get("video_url") or {}
+                        if isinstance(video, str):
+                            video = {"url": video}
+                        # K3's chat encoder only recognizes image parts. Emit one
+                        # structural media placeholder here; the multimodal
+                        # processor expands it into timestamped video chunks.
+                        parts.append({"type": "image_url", "image_url": video})
+                        media_count += 1
                 message["content"] = parts
             elif isinstance(content, str):
                 message["content"] = neutralize_kimi_k3_image_placeholder(content)
@@ -443,7 +452,7 @@ class OpenAIServingChat(OpenAIServingBase):
             messages, assistant_prefix = self._handle_last_assistant_message(
                 messages, request
             )
-        return messages, image_count, assistant_prefix
+        return messages, media_count, assistant_prefix
 
     def _encode_messages(
         self,
@@ -495,15 +504,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 ]
             return prompt_ids
         if self.chat_encoding_spec == "kimi_k3":
-            messages, image_count, assistant_prefix = self._prepare_kimi_k3_messages(
+            messages, media_count, assistant_prefix = self._prepare_kimi_k3_messages(
                 messages, request
             )
             template_kwargs = dict(request.chat_template_kwargs or {})
             template_kwargs.pop("tokenize", None)
             template_kwargs.pop("return_dict", None)
             template_kwargs.pop("image_prompts", None)
-            if image_count:
-                template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
+            if media_count:
+                template_kwargs["image_prompts"] = ["<|media_pad|>"] * media_count
 
             if (
                 request.reasoning_effort in ("low", "high", "max")

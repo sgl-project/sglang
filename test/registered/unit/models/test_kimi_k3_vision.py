@@ -537,7 +537,7 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
             offsets=[(index, index)],
             feature=torch.full((3, 2, 2), index, dtype=torch.uint8),
             model_specific_data={
-                "image_grid_thw": torch.tensor([[1, 1, 1]]),
+                "image_grid_thw": torch.tensor([[1, 1, index + 1]]),
                 DEFERRED_PREPROCESSING_KEY: deferred_config,
             },
         )
@@ -547,7 +547,11 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
 
     def fake_preprocess(images, resize_configs, *args, **kwargs):
         calls.append([int(image[0, 0, 0]) for image in images])
-        return torch.tensor([[float(calls[-1][0]), 0.0]]), torch.tensor([[1, 1, 1]])
+        image_index = calls[-1][0]
+        return (
+            torch.tensor([[float(image_index), 0.0]] * (image_index + 1)),
+            torch.tensor([[1, 1, image_index + 1]]),
+        )
 
     # Configured TP size (the IPC consumer count) comes from the published
     # bags; the live topology is forced through the context's own override.
@@ -566,7 +570,7 @@ def test_kimi_k3_preprocesses_only_dp_owner_images(monkeypatch):
 
     assert calls == [[1]]
     assert one.dtype == torch.float32
-    assert one.tolist() == [[1.0, 0.0]]
+    assert one.tolist() == [[1.0, 0.0], [1.0, 0.0]]
 
 
 def test_kimi_k3_scheduler_leaves_feature_placement_to_dp_owner():

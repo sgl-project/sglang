@@ -98,7 +98,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**Kimi-K3** is Moonshot AI's flagship hybrid MoE vision-language model: **2.8 trillion parameters**, **16 of 896 experts** active per token, roughly **2.5× the scaling efficiency of Kimi-K2**. The backbone interleaves **Kimi Delta Attention (KDA)** with MLA across 93 layers (plus Attention Residuals and Stable LatentMoE); serving supports image input and a **1M-token** window with prefix caching. Weights ship in **MXFP4**: the FlashInfer MXFP4 (trtllm-gen SiTU) runner serves them on Blackwell, Marlin (W4A16) elsewhere, MegaMoE for short-context batch throughput.
+**Kimi-K3** is Moonshot AI's flagship hybrid MoE vision-language model: **2.8 trillion parameters**, **16 of 896 experts** active per token, roughly **2.5× the scaling efficiency of Kimi-K2**. The backbone interleaves **Kimi Delta Attention (KDA)** with MLA across 93 layers (plus Attention Residuals and Stable LatentMoE); serving supports image and video input (without audio track) and a **1M-token** window with prefix caching. Weights ship in **MXFP4**: the FlashInfer MXFP4 (trtllm-gen SiTU) runner serves them on Blackwell, Marlin (W4A16) elsewhere, MegaMoE for short-context batch throughput.
 
 K3 **always runs with thinking enabled**, with reasoning depth controlled by `reasoning_effort` (`low` / `high` / `max`; default `max`).
 
@@ -117,6 +117,38 @@ throughput and accuracy before you rely on any of them.
 **Recommended generation:** `temperature=1.0`, `top_p=0.95`, `presence_penalty=0`, `frequency_penalty=0` (fixed by the model; informational — do not hardcode in sample code).
 
 **Resources:** [HuggingFace](https://huggingface.co/moonshotai/Kimi-K3) · [Kimi-K3 Quickstart](https://platform.kimi.ai/docs/guide/kimi-k3-quickstart).
+
+### Video input
+
+Pass a public URL, server-accessible local file path, or Base64 data URL in a `video_url` content part. SGLang samples visual frames using the checkpoint's media processor configuration and sends timestamped temporal chunks to MoonViT3d. The video's audio track is not processed; separate `audio_url` input is not supported.
+
+```python Video input
+import base64
+
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+# Use an HTTPS URL directly, or encode a local video as a data URL.
+with open("video.mp4", "rb") as video_file:
+    video = "data:video/mp4;base64," + base64.b64encode(video_file.read()).decode()
+
+response = client.chat.completions.create(
+    model="moonshotai/Kimi-K3",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "video_url", "video_url": {"url": video}},
+                {"type": "text", "text": "Describe what happens in this video."},
+            ],
+        }
+    ],
+    max_tokens=512,
+)
+
+print(response.choices[0].message.content)
+```
 
 ## 2. Configuration Tips
 
