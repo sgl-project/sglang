@@ -1519,7 +1519,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
             enable_precompute = envs.SGLANG_ENABLE_NGRAM_PRECOMPUTE.get()
-            draft_token_num = self.num_tokens_per_bs
+            draft_token_num = self.captured_req_width
             batch_size = num_tokens // draft_token_num
             spec_info = NgramVerifyInput(
                 draft_token=None,
