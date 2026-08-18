@@ -273,23 +273,41 @@ echo "[CI-AITER-CHECK] Container HIP=${IMAGE_HIP_VERSION}, install AITER's Trito
 
 #############################################
 # 1. Extract AITER_COMMIT from the Dockerfile stage that built this image.
-# Torch 2.11 is the 724 stages; remaining HIP 7.2 is 720; else the 7.0
-# blocks. Both 720 and 724 report HIP 7.2*, so torch version has to
-# distinguish them. Using the 7.0 FROM line for every flavor would
-# silently keep gfx950/gfx942's pin when a 724 AITER_COMMIT_DEFAULT
-# diverges.
+# Prefer GPU_ARCH stamped into the image (gfx950-rocm724, gfx942, ...).
+# Images built before that ENV existed: 724 stages already set
+# PIP_CONSTRAINT and HSA_ENABLE_IPC_MODE_LEGACY; remaining HIP 7.2* is
+# 720; else 7.0. Do not key off torch 2.11 — 720 may ship that later.
 #############################################
-if [[ "${IMAGE_TORCH_VERSION}" == 2.11.* ]]; then
-    _from_suffix="_ROCM724"
-    _stage_suffix="-rocm724"
-elif [[ "${IMAGE_HIP_VERSION}" == 7.2* ]]; then
-    _from_suffix="_ROCM720"
-    _stage_suffix="-rocm720"
+IMAGE_GPU_ARCH=$(docker exec ci_sglang printenv GPU_ARCH 2>/dev/null || true)
+if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950)(-rocm720|-rocm724)?$ ]]; then
+    echo "[CI-AITER-CHECK] Image GPU_ARCH=${IMAGE_GPU_ARCH}"
+    case "${IMAGE_GPU_ARCH}" in
+        *-rocm724) _from_suffix="_ROCM724"; _stage_suffix="-rocm724" ;;
+        *-rocm720) _from_suffix="_ROCM720"; _stage_suffix="-rocm720" ;;
+        *)         _from_suffix=""; _stage_suffix="" ;;
+    esac
+    _gfx="${IMAGE_GPU_ARCH%-*}"
 else
-    _from_suffix=""
-    _stage_suffix=""
+    IMAGE_PIP_CONSTRAINT=$(docker exec ci_sglang printenv PIP_CONSTRAINT 2>/dev/null || true)
+    IMAGE_HSA_LEGACY=$(docker exec ci_sglang printenv HSA_ENABLE_IPC_MODE_LEGACY 2>/dev/null || true)
+    if [[ -n "${IMAGE_PIP_CONSTRAINT}" || "${IMAGE_HSA_LEGACY}" == "1" ]]; then
+        _from_suffix="_ROCM724"
+        _stage_suffix="-rocm724"
+    elif [[ "${IMAGE_HIP_VERSION}" == 7.2* ]]; then
+        _from_suffix="_ROCM720"
+        _stage_suffix="-rocm720"
+    else
+        _from_suffix=""
+        _stage_suffix=""
+    fi
+    if [[ "${GPU_ARCH}" == "mi35x" ]]; then
+        _gfx="gfx950"
+    else
+        _gfx="gfx942"
+    fi
+    echo "[CI-AITER-CHECK] Image has no GPU_ARCH stamp; inferred ${_gfx}${_stage_suffix} (PIP_CONSTRAINT='${IMAGE_PIP_CONSTRAINT}', HSA_ENABLE_IPC_MODE_LEGACY='${IMAGE_HSA_LEGACY}', HIP=${IMAGE_HIP_VERSION})"
 fi
-if [[ "${GPU_ARCH}" == "mi35x" ]]; then
+if [[ "${_gfx}" == "gfx950" ]]; then
     _from_line="FROM \$BASE_IMAGE_950${_from_suffix} AS gfx950${_stage_suffix}"
 else
     _from_line="FROM \$BASE_IMAGE_942${_from_suffix} AS gfx942${_stage_suffix}"
@@ -299,7 +317,7 @@ REPO_AITER_COMMIT=$(grep -F -A20 "${_from_line}" docker/rocm.Dockerfile \
                     | grep 'AITER_COMMIT_DEFAULT=' \
                     | head -n1 \
                     | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
-unset _from_suffix _stage_suffix _from_line
+unset IMAGE_GPU_ARCH IMAGE_PIP_CONSTRAINT IMAGE_HSA_LEGACY _from_suffix _stage_suffix _gfx _from_line
 
 
 if [[ -z "${REPO_AITER_COMMIT}" ]]; then

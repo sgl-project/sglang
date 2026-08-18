@@ -139,6 +139,11 @@ FROM ${GPU_ARCH}
 
 # This is necessary for scope purpose, again
 ARG GPU_ARCH=gfx950
+# ARG is build-time only. Stamp the stage name (gfx950-rocm724, gfx942, ...)
+# so CI can read which AITER_COMMIT_DEFAULT block to use instead of guessing
+# from torch or HIP — 720 may also ship torch 2.11 later, and both 7.2 flavors
+# report HIP 7.2*.
+ENV GPU_ARCH=${GPU_ARCH}
 ENV GPU_ARCH_LIST=${GPU_ARCH%-*}
 ENV PYTORCH_ROCM_ARCH=gfx942;gfx950
 
