@@ -11,6 +11,7 @@ from sglang.srt.distributed import get_world_group
 from sglang.srt.mem_cache.kv_cache_configurator import mm_runtime_reservation_gb
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import pre_capture_activation_reserve_mb
 from sglang.srt.utils.common import get_available_gpu_memory, get_device_memory_capacity
 
 if TYPE_CHECKING:
@@ -72,7 +73,7 @@ def compute_post_capture_kv_resize(
     if eager_decode_gap or mambaish_config(model_runner.model_config) is not None:
         headroom_gb = max(
             headroom_gb,
-            model_runner.server_args.pre_capture_activation_reserve_mb(
+            pre_capture_activation_reserve_mb(
                 get_device_memory_capacity(model_runner.device)
             )
             / 1024,

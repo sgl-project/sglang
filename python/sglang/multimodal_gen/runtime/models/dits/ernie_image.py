@@ -49,7 +49,11 @@ from sglang.multimodal_gen.runtime.layers.attention.layer import (
     USPAttention,
     build_varlen_mask_meta,
 )
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm, apply_qk_norm
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    apply_qk_norm,
+    apply_qk_norm_rope,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -68,6 +72,7 @@ logger = init_logger(__name__)
 _ERNIE_NORM = BitExactFusionGate("ERNIE fused-norm")
 _ERNIE_GATED_NORM = BitExactFusionGate("ERNIE fused gated-norm")
 _ERNIE_ROPE = BitExactFusionGate("ERNIE fused RoPE")
+_ERNIE_QKNORM_ROPE = BitExactFusionGate("ERNIE fused QKNorm+RoPE")
 _ERNIE_GEGLU = BitExactFusionGate("ERNIE fused GELU-mul")
 
 
@@ -284,6 +289,8 @@ class ErnieImageSelfAttention(nn.Module):
         x: torch.Tensor,
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
+        rope_cache: torch.Tensor,
+        rope_positions: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
         attn_mask_meta: dict | None = None,
     ) -> torch.Tensor:
@@ -298,16 +305,20 @@ class ErnieImageSelfAttention(nn.Module):
         v = v.view(B, S, self.num_local_heads, self.head_dim)
 
         if self.qk_layernorm:
-            q, k = apply_qk_norm(
+            q, k = _ernie_qknorm_rope(
                 q,
                 k,
                 self.norm_q,
                 self.norm_k,
                 self.head_dim,
+                rope_cos,
+                rope_sin,
+                rope_cache,
+                rope_positions,
             )
-
-        q = _ernie_rope(q, rope_cos, rope_sin)
-        k = _ernie_rope(k, rope_cos, rope_sin)
+        else:
+            q = _ernie_rope(q, rope_cos, rope_sin)
+            k = _ernie_rope(k, rope_cos, rope_sin)
 
         attn_out = self.attn(
             q, k, v, attn_mask=attn_mask, attn_mask_meta=attn_mask_meta
@@ -378,6 +389,8 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         x: torch.Tensor,
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
+        rope_cache: torch.Tensor,
+        rope_positions: torch.Tensor,
         shift_msa: torch.Tensor,
         scale_msa: torch.Tensor,
         gate_msa: torch.Tensor,
@@ -393,6 +406,8 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
             x,
             rope_cos,
             rope_sin,
+            rope_cache,
+            rope_positions,
             attn_mask=attn_mask,
             attn_mask_meta=attn_mask_meta,
         )
@@ -470,6 +485,89 @@ def _ernie_rope(
                 ),
             )
     return _apply_rotary_bshd_eager(x, cos_, sin_)
+
+
+def _ernie_qknorm_rope_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    head_dim: int,
+    rope_cos: torch.Tensor,
+    rope_sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q, k = apply_qk_norm(q, k, q_norm, k_norm, head_dim)
+    return _ernie_rope(q, rope_cos, rope_sin), _ernie_rope(k, rope_cos, rope_sin)
+
+
+def _ernie_qknorm_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    head_dim: int,
+    rope_cos: torch.Tensor,
+    rope_sin: torch.Tensor,
+    rope_cache: torch.Tensor,
+    rope_positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse ERNIE's QK RMSNorm and rotate-half RoPE without changing bits."""
+    verified = _ERNIE_QKNORM_ROPE.verified
+    if not _ERNIE_QKNORM_ROPE.disabled and (
+        verified or _ERNIE_QKNORM_ROPE.can_attempt_once()
+    ):
+        q_input = q.clone() if not verified else q
+        k_input = k.clone() if not verified else k
+        try:
+            out = apply_qk_norm_rope(
+                q=q,
+                k=k,
+                q_norm=q_norm,
+                k_norm=k_norm,
+                head_dim=head_dim,
+                cos_sin_cache=rope_cache,
+                is_neox=True,
+                positions=rope_positions,
+                round_norm_before_rope=True,
+                cache_has_full_width=True,
+            )
+        except Exception as exc:
+            _ERNIE_QKNORM_ROPE.on_exception(exc, logger=logger)
+            return _ernie_qknorm_rope_reference(
+                q_input,
+                k_input,
+                q_norm,
+                k_norm,
+                head_dim,
+                rope_cos,
+                rope_sin,
+            )
+        else:
+            if verified:
+                return out
+            ref = _ernie_qknorm_rope_reference(
+                q_input,
+                k_input,
+                q_norm,
+                k_norm,
+                head_dim,
+                rope_cos,
+                rope_sin,
+            )
+            return _ERNIE_QKNORM_ROPE.accept_or_fallback(
+                out,
+                ref,
+                equal=tensors_equal,
+                logger=logger,
+                mismatch_msg=(
+                    "ERNIE fused QKNorm+RoPE fast path is not bit-exact on "
+                    "this platform; falling back to split kernels"
+                ),
+            )
+
+    return _ernie_qknorm_rope_reference(
+        q, k, q_norm, k_norm, head_dim, rope_cos, rope_sin
+    )
 
 
 def _eager_geglu(gate_up: torch.Tensor) -> torch.Tensor:
@@ -687,6 +785,10 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
         all_ids = torch.cat([image_ids, text_ids], dim=1)
         rotary_pos_emb = self.pos_embed(all_ids)
         rope_cos, rope_sin = _precompute_rope_cos_sin(rotary_pos_emb, dtype)
+        rope_cache = torch.cat((rope_cos, rope_sin), dim=-1).contiguous()
+        rope_positions = torch.arange(
+            rope_cache.shape[0], device=device, dtype=torch.long
+        )
 
         attn_mask = attn_mask_meta = None
         if encoder_hidden_states_mask is not None:
@@ -715,6 +817,8 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
                 x,
                 rope_cos,
                 rope_sin,
+                rope_cache,
+                rope_positions,
                 shift_msa,
                 scale_msa,
                 gate_msa,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from dataclasses import replace
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
@@ -10,6 +11,7 @@ import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
+from sglang.srt.managers.cache_controller import CacheOperation
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -23,6 +25,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -32,7 +35,9 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     CacheAction,
@@ -70,6 +75,7 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
 )
 from sglang.srt.session.streaming_session import StreamingSession
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheAck
@@ -425,6 +431,9 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not result.cache_actions
         return result
 
+    def is_chunk_cache(self) -> bool:
+        return self.disable
+
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
@@ -454,6 +463,7 @@ class UnifiedRadixCache(BasePrefixCache):
             ComponentType.FULL: params.num_tokens,
             ComponentType.SWA: params.swa_num_tokens,
             ComponentType.MAMBA: params.mamba_num,
+            ComponentType.C128: 0,
         }
         self._evict_components(request_by_type, tracker)
 
@@ -773,11 +783,21 @@ class UnifiedRadixCache(BasePrefixCache):
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
 
+        radix_key = RadixKey(
+            token_ids[:effective_cache_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        )
+
         if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+            # The frontier lands a page below page_floor(pre_len + 1), which has to
+            # be where the insert stops, or the leaf it creates keeps less than a
+            # sliding window of live SWA and the match after the insert rejects it.
+            # The insert stops at page_floor(len(radix_key)), and a bigram key is
+            # one shorter than the tokens it spans, so measure the key.
             for comp in self._components_tuple:
-                comp.free_out_of_window_slots(
-                    req, effective_cache_len - 1, insert_params
-                )
+                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
 
         if effective_cache_len <= 0:
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
@@ -789,12 +809,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
-        radix_key = RadixKey(
-            token_ids[:effective_cache_len],
-            req.extra_key,
-            is_bigram=self.tree_core.is_eagle,
-            cache_salt=req.cache_salt,
-        ).page_aligned(self.page_size)
+        radix_key = radix_key.page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
@@ -803,7 +818,7 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self.insert(insert_params)
 
         # Match prefix
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        match_result = self.match_prefix(MatchPrefixParams(key=radix_key, req=req))
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
@@ -914,6 +929,240 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._free_values(result.device_frees, result.host_frees)
         return result.tracker.get(component_type, 0)
+
+    # ---- Decode retraction ----
+
+    def supports_retraction_backup(self) -> bool:
+        if self.cache_controller is None or self.host_pool_group is None:
+            return False
+        if self.supports_mamba():
+            return False
+
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        if isinstance(kv_cache, SWAKVPool):
+            return (
+                self.supports_swa()
+                and {
+                    PoolName.KV,
+                    PoolName.SWA,
+                }
+                <= self.host_pool_group.entry_map.keys()
+            )
+        return isinstance(kv_cache, MHATokenToKVPool) and (
+            PoolName.KV in self.host_pool_group.entry_map
+        )
+
+    def validate_retraction_host_capacity(self) -> None:
+        if not self.supports_retraction_backup():
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=host_pool requires "
+                "an MHA or hybrid-SWA HiCache host stack."
+            )
+
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        device_pools = {PoolName.KV: kv_cache}
+        if isinstance(kv_cache, SWAKVPool):
+            device_pools = {
+                PoolName.KV: kv_cache.full_kv_pool,
+                PoolName.SWA: kv_cache.swa_kv_pool,
+            }
+
+        for name, device_pool in device_pools.items():
+            host_pool = self.host_pool_group.entry_map[name].host_pool
+            if host_pool.logical_size < device_pool.size:
+                raise ValueError(
+                    "Retraction host pool is smaller than its device pool: "
+                    f"pool={name}, host_slots={host_pool.logical_size}, "
+                    f"device_slots={device_pool.size}. Increase --hicache-ratio "
+                    "or --hicache-size."
+                )
+
+        for spec in self.sidecar_pool_specs:
+            source_size = self.host_pool_group.entry_map[
+                spec.indices_from_pool
+            ].host_pool.logical_size
+            sidecar_size = self.host_pool_group.entry_map[
+                spec.pool_name
+            ].host_pool.logical_size
+            if sidecar_size < source_size:
+                raise ValueError(
+                    "Retraction sidecar host pool is smaller than its index source: "
+                    f"pool={spec.pool_name}, host_slots={sidecar_size}, "
+                    f"source={spec.indices_from_pool}, source_slots={source_size}."
+                )
+
+    @staticmethod
+    def _pad_retraction_indices(indices: torch.Tensor, page_size: int) -> torch.Tensor:
+        aligned_len = ceil_align(len(indices), page_size)
+        if aligned_len == len(indices):
+            return indices
+        tail = indices[-1] + torch.arange(
+            1,
+            aligned_len - len(indices) + 1,
+            dtype=torch.int64,
+            device=indices.device,
+        )
+        return torch.cat([indices, tail])
+
+    def _retraction_device_transfers(
+        self, req: Req
+    ) -> tuple[torch.Tensor, list[PoolTransfer]]:
+        num_tokens = req.seqlen - 1
+        full_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :num_tokens
+        ].to(torch.int64)
+        full_indices = self._pad_retraction_indices(full_indices, self.page_size)
+
+        component_transfers: dict[ComponentType, list[PoolTransfer]] = {}
+        if self.supports_swa():
+            kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+            assert self.sliding_window_size is not None
+            window_start = max(0, num_tokens - self.sliding_window_size)
+            window_start = window_start // self.page_size * self.page_size
+            window_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, window_start:num_tokens
+            ].to(torch.int64)
+            swa_indices = kv_cache.translate_loc_from_full_to_swa(window_indices)
+            assert bool(
+                (swa_indices > 0).all()
+            ), f"unmapped SWA window positions for request {req.rid}"
+            component_transfers[ComponentType.SWA] = [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    device_indices=self._pad_retraction_indices(
+                        swa_indices, self.page_size
+                    ),
+                )
+            ]
+
+        kv_transfer = PoolTransfer(name=PoolName.KV, device_indices=full_indices)
+        extra_transfers = [
+            transfer
+            for transfers in component_transfers.values()
+            for transfer in transfers
+        ]
+        extra_transfers.extend(
+            self._build_sidecar_transfers(
+                CacheTransferPhase.BACKUP_HOST,
+                kv_transfer,
+                component_transfers,
+            )
+        )
+        return full_indices, extra_transfers
+
+    def _reclaim_retraction_host(self, num_tokens: int) -> int:
+        if self.disable:
+            return 0
+        return self.evict_host(num_tokens)
+
+    def retraction_backup(self, req: Req) -> RetractionBackup:
+        assert req.seqlen > 1
+
+        device_indices, extra_transfers = self._retraction_device_transfers(req)
+        host_indices = self.host_pool_group.alloc(len(device_indices))
+        if host_indices is None:
+            self._reclaim_retraction_host(len(device_indices))
+            host_indices = self.host_pool_group.alloc(len(device_indices))
+        if host_indices is None:
+            raise RuntimeError(
+                "Retraction host KV pool exhausted after reclaim: "
+                f"request={req.rid}, required_slots={len(device_indices)}, "
+                f"available_slots={self.host_pool_group.available_size()}."
+            )
+
+        resolved = self.cache_controller._resolve_pool_transfers_allocation(
+            extra_transfers or None,
+            alloc_host=True,
+            kv_device_indices=device_indices,
+            kv_host_indices=host_indices,
+        )
+        if resolved is None and extra_transfers:
+            self.host_pool_group.free(host_indices)
+            raise RuntimeError(
+                "Retraction auxiliary host allocation failed after atomic rollback: "
+                f"request={req.rid}, pools={[x.name for x in extra_transfers]}."
+            )
+
+        backup = RetractionBackup(
+            host_indices=host_indices,
+            pool_transfers=[replace(x, device_indices=None) for x in resolved or []]
+            or None,
+        )
+        operation = CacheOperation(
+            host_indices,
+            device_indices,
+            node_id=-1,
+            pool_transfers=resolved,
+        )
+        try:
+            write_host, write_device, write_pools = (
+                self.cache_controller._move_write_operation(operation)
+            )
+            completion = self.cache_controller.l2_transfer_engine.submit_device_to_host(
+                self.cache_controller._l2_transfers(
+                    write_host, write_device, write_pools
+                )
+            )
+            completion.finish_event.synchronize()
+        except Exception:
+            self.retraction_discard(backup)
+            raise
+        return backup
+
+    def retraction_restore(self, req: Req, backup: RetractionBackup) -> None:
+        device_indices, current_transfers = self._retraction_device_transfers(req)
+        assert len(backup.host_indices) == len(device_indices), (
+            f"Host backup has {len(backup.host_indices)} slots, but restore has "
+            f"{len(device_indices)}"
+        )
+
+        current_by_name = {transfer.name: transfer for transfer in current_transfers}
+        saved_by_name = {
+            transfer.name: transfer for transfer in backup.pool_transfers or []
+        }
+        assert current_by_name.keys() == saved_by_name.keys(), (
+            f"Host backup pools {set(saved_by_name)} do not match restore pools "
+            f"{set(current_by_name)}"
+        )
+        restored_transfers = [
+            replace(
+                saved,
+                device_indices=current_by_name[name].device_indices,
+            )
+            for name, saved in saved_by_name.items()
+        ]
+        resolved = self.cache_controller._resolve_pool_transfers_allocation(
+            restored_transfers or None,
+            alloc_host=False,
+            kv_device_indices=device_indices,
+            kv_host_indices=backup.host_indices,
+        )
+        assert resolved is not None or not restored_transfers
+
+        operation = CacheOperation(
+            backup.host_indices,
+            device_indices,
+            node_id=-1,
+            pool_transfers=resolved,
+        )
+        load_host, load_device, load_pools = self.cache_controller._move_op_indices(
+            operation
+        )
+        completion = self.cache_controller.l2_transfer_engine.submit_host_to_device(
+            self.cache_controller._l2_load_transfers(
+                load_host, load_device, load_pools
+            ),
+            layer_num=self.cache_controller.layer_num,
+        )
+        completion.finish_event.synchronize()
+        self.retraction_discard(backup)
+
+    def retraction_discard(self, backup: RetractionBackup) -> None:
+        self.host_pool_group.free(backup.host_indices)
+        for transfer in backup.pool_transfers or []:
+            if transfer.indices_from_pool is None:
+                assert transfer.host_indices is not None
+                self.host_pool_group.get_pool(transfer.name).free(transfer.host_indices)
 
     # ---- HiCache: Backup / LoadBack ----
 
@@ -2092,6 +2341,14 @@ class UnifiedRadixCache(BasePrefixCache):
             and not self.tree_core.has_swa_host_pool
         )
         return swa.sliding_window_size if unified_compress_only_hicache else 0
+
+    def swa_retain_floor(self, req) -> int | None:
+        if not self.is_mamba_enabled or self._sliding_window_size is None:
+            return None
+        checkpoint = req.mamba_last_track_seqlen
+        if checkpoint is None:
+            return None
+        return checkpoint - self._sliding_window_size
 
     def supports_swa(self) -> bool:
         return self.is_swa_enabled

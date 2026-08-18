@@ -12,7 +12,7 @@ import torch
 from torch import nn
 from torch.nn.parameter import Parameter, UninitializedParameter
 
-from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
+from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
     divide,
     get_tp_group,
@@ -154,6 +154,15 @@ class LinearBase(torch.nn.Module):
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
     """
+
+    # Set by quant methods that attach a per-layer scheme, eagerly in
+    # get_quant_method(), which runs before create_weights() picks the loader,
+    # or lazily inside create_weights() itself (GPTQ). The default is what lets
+    # callers probe with `is None`; a hasattr() probe answers "yes" once it
+    # exists. Schemes must stay plain objects -- nn.Module.__setattr__ files a
+    # Module value under self._modules, which this default then shadows on read.
+    # VocabParallelEmbedding and FusedMoE carry the same default.
+    scheme = None
 
     def __init__(
         self,
@@ -366,7 +375,13 @@ class ColumnParallelLinear(LinearBase):
             skip_block_quant_check=skip_block_quant_check,
             weight_loader=(
                 self.weight_loader_v2
-                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                if (
+                    self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                    or (
+                        self.scheme is not None
+                        and self.scheme.requires_weight_loader_v2
+                    )
+                )
                 else self.weight_loader
             ),
         )
@@ -1462,7 +1477,13 @@ class RowParallelLinear(LinearBase):
             params_dtype=self.params_dtype,
             weight_loader=(
                 self.weight_loader_v2
-                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                if (
+                    self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                    or (
+                        self.scheme is not None
+                        and self.scheme.requires_weight_loader_v2
+                    )
+                )
                 else self.weight_loader
             ),
         )

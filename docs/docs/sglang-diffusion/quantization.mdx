@@ -2,11 +2,12 @@
 title: "Quantization"
 tag: "approx"
 metatags:
-    description: "Configure transformer weight quantization and Quant-VideoGen causal KV-cache quantization in SGLang-Diffusion."
+    description: "Configure transformer and native text-encoder checkpoint quantization, plus Quant-VideoGen causal KV-cache quantization in SGLang-Diffusion."
 ---
 
-SGLang-Diffusion supports quantized transformer checkpoints. In most cases, keep
-the base model and the quantized transformer override separate.
+SGLang-Diffusion supports quantized transformer checkpoints and selected
+quantized native text-encoder checkpoints. Transformer and text-encoder
+precision are resolved independently.
 
 ## Quick Reference
 
@@ -17,6 +18,8 @@ Use these paths:
 - `--transformer-weights-path`: quantized transformer weights provided as a single safetensors file, a sharded safetensors directory, a local path, or a Hugging Face repo ID
 - `--quantization`: apply online quantization to unquantized models at load time (activations are quantized dynamically)
 - `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
+- `--component-paths.text_encoder`: replace a native text encoder with a checkpoint whose `quantization_config` is auto-detected
+- `--text-encoder-path`: shorter alias for `--component-paths.text_encoder`
 - `--kv-cache-quant`: compress completed causal KV-cache chunks for supported realtime models
 
 Recommended example for pre-quantized checkpoints:
@@ -279,6 +282,27 @@ sglang generate \
 ```
 
 Each pattern is matched against the full layer prefix (e.g. `layers.0.attention.to_q`). A layer is skipped and left unquantizd if its prefix contains any of the given patterns.
+
+## MiniMax-H3 Text Encoder FP8
+
+MiniMax-H3 can load a serialized FP8 checkpoint for the language linear layers
+in its native Qwen3-VL text encoder independently of the DiT. Embeddings,
+normalization layers, and the Qwen vision tower remain in BF16.
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --component-paths.text_encoder Qwen/Qwen3-VL-32B-Instruct-FP8 \
+  --num-gpus 4 \
+  --port 30010
+```
+
+`--text-encoder-path` is accepted as a shorter alias. No quantization flag is
+needed: SGLang detects the checkpoint metadata and only enables formats that
+the native encoder explicitly supports. Text-encoder FP8 is approximate, is
+not enabled by default, and is rejected by MiniMax-H3's strict
+`quality="high"` deployment contract.
 
 ## Validated ModelOpt Checkpoints
 
