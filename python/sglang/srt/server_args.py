@@ -1166,6 +1166,22 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = False
+    enable_tp_lm_head_all_to_all: A[
+        Optional[bool],
+        Arg(
+            help="Use all-to-all instead of TP all-gather followed by DP scatter "
+            "for the TP-sharded LM head under DP attention. By default this is "
+            "enabled only on decode-only PD nodes with pure DP attention "
+            "(tp_size == dp_size > 1 and attn_cp_size == 1), and disabled on "
+            "prefill-only and colocated nodes. Pass "
+            "--no-enable-tp-lm-head-all-to-all to opt out. The path is "
+            "incompatible with --enable-dp-lm-head; batches without an equal "
+            "padded row count fall back to the existing all-gather path.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+        NS("parallel"),
+    ] = None
     enable_attn_tp_input_scattered: A[
         bool,
         "Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
@@ -5510,7 +5526,6 @@ class ServerArgs:
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
             elif is_hip():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-                envs.SGLANG_OPT_USE_FUSED_COMPRESS.set(True)
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
@@ -6693,11 +6708,14 @@ class ServerArgs:
                         prefill_cfg.max_bs
                     )
 
-        # The dp-lm-head validation moved to the resolution pipeline
-        # (arg_groups/overrides.py: _dp_lm_head_validation), invoked here at
-        # its legacy slot.
-        from sglang.srt.arg_groups.overrides import _dp_lm_head_validation
+        # Resolve the phase-aware TP LM-head default before validating the
+        # resulting DP/TP LM-head configuration.
+        from sglang.srt.arg_groups.overrides import (
+            _dp_lm_head_validation,
+            _tp_lm_head_all_to_all_default,
+        )
 
+        run_post_process_pass(self, _tp_lm_head_all_to_all_default)
         run_post_process_pass(self, _dp_lm_head_validation)
 
     def _handle_moe_kernel_config(self):
@@ -6885,10 +6903,6 @@ class ServerArgs:
         if self.enable_waterfill:
             self.enforce_shared_experts_fusion = True
             logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
-
-        if a2a_backend == "megamoe":
-            if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
-                envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
 
         if a2a_backend == "deepep":
             if self.moe_runner_backend == "flashinfer_cutedsl":

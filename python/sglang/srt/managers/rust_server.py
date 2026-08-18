@@ -726,9 +726,7 @@ class RustServer:
         server_args["version"] = __version__
         # Not a `server_args` field: `TokenizerManager` derives it, and the rust
         # ingress needs the same number for its total-token check.
-        server_args["num_reserved_tokens"] = compute_num_reserved_tokens(
-            scheduler.server_args
-        )
+        server_args["num_reserved_tokens"] = compute_num_reserved_tokens()
         server_args["max_total_num_tokens"] = scheduler.max_total_num_tokens
 
         return msgspec.json.encode(server_args, enc_hook=str).decode("utf-8")

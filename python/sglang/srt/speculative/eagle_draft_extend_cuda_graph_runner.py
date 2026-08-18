@@ -130,9 +130,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         # Static capture width: full tree width (num_draft_tokens), not
         # num_steps + 1 -- topk > 1 draft-extend overflows the buffers.
-        self.captured_req_width = resolve_num_tokens_per_req(
-            phase="draft_extend", server_args=model_runner.server_args
-        )
+        self.captured_req_width = resolve_num_tokens_per_req(phase="draft_extend")
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
 
