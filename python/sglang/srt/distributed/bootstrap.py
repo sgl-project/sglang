@@ -27,7 +27,10 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import initialize_dp_attention
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -111,7 +114,7 @@ def init_torch_distributed(
 
         # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
         # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
-        if server_args.pre_warm_nccl and (
+        if get_exec().comm.pre_warm_nccl and (
             ps.tp_size > 1 or ps.pp_size > 1 or ps.moe_ep_size > 1
         ):
             _prewarm_nccl(
@@ -185,11 +188,11 @@ def _resolve_dist_init_method(*, server_args: ServerArgs, dist_port: int) -> str
 
 
 def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
-    set_custom_all_reduce(not server_args.disable_custom_all_reduce)
+    set_custom_all_reduce(not get_exec().comm.disable_custom_all_reduce)
     set_mscclpp_all_reduce(server_args.enable_mscclpp)
-    set_torch_symm_mem_all_reduce(server_args.enable_torch_symm_mem)
+    set_torch_symm_mem_all_reduce(get_exec().comm.enable_torch_symm_mem)
     set_flashinfer_allreduce_only(
-        server_args.flashinfer_allreduce_fusion_backend is not None
+        get_exec().comm.flashinfer_allreduce_fusion_backend is not None
     )
 
 
@@ -242,7 +245,7 @@ def _init_parallel_groups(
         local_rank=gpu_id,
         distributed_init_method=dist_init_method,
         timeout=server_args.dist_timeout,
-        moe_a2a_backend=server_args.moe_a2a_backend,
+        moe_a2a_backend=get_exec().moe.moe_a2a_backend,
         recovered_rank=is_ep_joiner,
         max_world_size=server_args.max_ep_size,
     )
@@ -260,7 +263,7 @@ def _init_parallel_groups(
             and server_args.enable_two_batch_overlap
             and get_parallel().enable_dsa_prefill_context_parallel
         ),
-        enable_symm_mem=server_args.enable_symm_mem,
+        enable_symm_mem=get_exec().comm.enable_symm_mem,
         recovered_rank=is_ep_joiner,
         rank_offset=rank_offset,
         max_world_size=server_args.max_ep_size,
