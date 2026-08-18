@@ -348,7 +348,6 @@ class AscendAttnBackend(AttentionBackend):
         ):
             self.speculative_num_draft_tokens = resolve_num_tokens_per_req(
                 phase="target_verify",
-                server_args=model_runner.server_args,
                 spec_algorithm=model_runner.spec_algorithm,
                 is_draft_worker=True,
                 num_draft_tokens=int(self.speculative_num_draft_tokens),
@@ -610,7 +609,7 @@ class AscendAttnBackend(AttentionBackend):
             )
         if self.use_sliding_window_kv_pool:
             # refilled in place at replay; the captured graph reads this storage
-            self.swa_out_cache_loc_buf = torch.zeros(
+            self.cuda_graph_swa_out_cache_loc = torch.zeros(
                 max_num_tokens,
                 dtype=torch.int64,
                 device=self.device,
@@ -641,7 +640,7 @@ class AscendAttnBackend(AttentionBackend):
             metadata.swa_mask = self.graph_metadata["swa_mask"][:bs, :, :]
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
-            metadata.swa_out_cache_loc = self.swa_out_cache_loc_buf[:num_tokens]
+            metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
@@ -715,8 +714,8 @@ class AscendAttnBackend(AttentionBackend):
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             n = out_cache_loc.shape[0]
-            self.swa_out_cache_loc_buf[n:].zero_()
-            self.swa_out_cache_loc_buf[:n].copy_(
+            self.cuda_graph_swa_out_cache_loc[n:].zero_()
+            self.cuda_graph_swa_out_cache_loc[:n].copy_(
                 self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc)
             )
         max_len = seq_lens_cpu[:bs].max().item()

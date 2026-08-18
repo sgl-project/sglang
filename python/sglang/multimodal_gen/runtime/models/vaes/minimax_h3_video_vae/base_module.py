@@ -11,9 +11,7 @@ from diffusers.utils.torch_utils import maybe_allow_in_graph
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
-from sglang.kernels.ops.diffusion.triton.scale_shift import (
-    try_fused_scaled_residual_add_exact,
-)
+from sglang.kernels.ops.diffusion import try_fused_scaled_residual_add_exact
 
 from .attention import Attention
 from .vit_utils import _env_flag, _vit_torch_compile_kwargs

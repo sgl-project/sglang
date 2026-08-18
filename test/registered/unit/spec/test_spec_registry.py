@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_registry import (
     _REGISTRY,
@@ -166,16 +167,15 @@ class TestCustomSpecAlgoInterface(_RegistryIsolated):
         self.assertEqual(SpeculativeAlgorithm.EAGLE.is_some(), self.algo.is_some())
 
     def test_target_verify_width_uses_explicit_non_dspark_layout(self):
-        server_args = SimpleNamespace(speculative_num_draft_tokens=8)
-        self.assertEqual(
-            resolve_num_tokens_per_req(
-                phase="target_verify",
-                server_args=server_args,
-                spec_algorithm=self.algo,
-                is_draft_worker=True,
-            ),
-            8,
-        )
+        with get_context().override_server_args(speculative_num_draft_tokens=8):
+            self.assertEqual(
+                resolve_num_tokens_per_req(
+                    phase="target_verify",
+                    spec_algorithm=self.algo,
+                    is_draft_worker=True,
+                ),
+                8,
+            )
 
     def test_supports_overlap_false_warns_deprecation(self):
         # supports_overlap=False plugins run the V2 schema synchronously; the
