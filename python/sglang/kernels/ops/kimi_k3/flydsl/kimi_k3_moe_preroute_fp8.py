@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 
 import torch
 
@@ -115,16 +116,15 @@ def kimi_k3_moe_dual_projection_fp8(
     return routed_output, shared_output
 
 
-def supports_kimi_k3_moe_tri_projection_fp8(
+def _supports_kimi_k3_moe_tri_projection_fp8(
     hidden: torch.Tensor,
     routed_weight: torch.Tensor,
     routed_scale: torch.Tensor,
     shared_weight: torch.Tensor,
     shared_scale: torch.Tensor,
     router_weight: torch.Tensor,
+    token_counts: tuple[int, ...],
 ) -> bool:
-    """Return whether the mixed-precision tri-projection is supported."""
-
     tensors = (
         hidden,
         routed_weight,
@@ -137,7 +137,7 @@ def supports_kimi_k3_moe_tri_projection_fp8(
         all(tensor.is_cuda and tensor.is_contiguous() for tensor in tensors)
         and hidden.dtype == torch.bfloat16
         and hidden.ndim == 2
-        and hidden.shape[0] in (1, 2)
+        and hidden.shape[0] in token_counts
         and hidden.shape[1] == _HIDDEN_SIZE
         and routed_weight.dtype == torch.float8_e4m3fn
         and tuple(routed_weight.shape) == (_ROUTED_SIZE, _HIDDEN_SIZE)
@@ -154,6 +154,27 @@ def supports_kimi_k3_moe_tri_projection_fp8(
         and router_weight.is_contiguous()
         and _same_device(*tensors)
         and is_kimi_k3_moe_preroute_fp8_available()
+    )
+
+
+def supports_kimi_k3_moe_tri_projection_fp8(
+    hidden: torch.Tensor,
+    routed_weight: torch.Tensor,
+    routed_scale: torch.Tensor,
+    shared_weight: torch.Tensor,
+    shared_scale: torch.Tensor,
+    router_weight: torch.Tensor,
+) -> bool:
+    """Return whether the production B1/B2 tri-projection is supported."""
+
+    return _supports_kimi_k3_moe_tri_projection_fp8(
+        hidden,
+        routed_weight,
+        routed_scale,
+        shared_weight,
+        shared_scale,
+        router_weight,
+        (1,),
     )
 
 
@@ -217,6 +238,117 @@ def kimi_k3_moe_tri_projection_fp8(
     return routed_output, shared_output, router_output
 
 
+def supports_kimi_k3_moe_tri_projection_cooperative_preactivated_fp8(
+    hidden: torch.Tensor,
+    routed_weight: torch.Tensor,
+    routed_scale: torch.Tensor,
+    shared_weight: torch.Tensor,
+    shared_scale: torch.Tensor,
+    router_weight: torch.Tensor,
+) -> bool:
+    return _supports_kimi_k3_moe_tri_projection_fp8(
+        hidden,
+        routed_weight,
+        routed_scale,
+        shared_weight,
+        shared_scale,
+        router_weight,
+        (2, 4),
+    )
+
+
+@functools.cache
+def _tri_cooperative_preactivated_launcher(
+    num_tokens: int,
+    situ_beta: float,
+    situ_linear_beta: float,
+    fast_situ: bool,
+):
+    from .kernels.kimi_k3_tri_projection_multitoken_gfx950 import (
+        build_kimi_k3_multitoken_tri_projection_module,
+    )
+
+    return build_kimi_k3_multitoken_tri_projection_module(
+        num_tokens=num_tokens,
+        token_tile=num_tokens,
+        cu_count=int(os.environ.get("SGLANG_K3_PREROUTE_COOP_CU", "256")),
+        waves_per_block=int(
+            os.environ.get("SGLANG_K3_PREROUTE_COOP_WPB", "8")
+        ),
+        waves_per_eu=int(
+            os.environ.get("SGLANG_K3_PREROUTE_COOP_WPE", "3")
+        ),
+        weight_cache_modifier=int(
+            os.environ.get("SGLANG_K3_PREROUTE_COOP_WCM", "3")
+        ),
+        interleaved_shared_pairs=True,
+        fast_situ=fast_situ,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
+    )
+
+
+def kimi_k3_moe_tri_projection_cooperative_preactivated_fp8(
+    hidden: torch.Tensor,
+    routed_weight: torch.Tensor,
+    routed_scale: torch.Tensor,
+    shared_weight: torch.Tensor,
+    shared_scale: torch.Tensor,
+    router_weight: torch.Tensor,
+    *,
+    situ_beta: float,
+    situ_linear_beta: float,
+    fast_situ: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if (
+        not math.isfinite(situ_beta)
+        or not math.isfinite(situ_linear_beta)
+        or situ_beta <= 0.0
+        or situ_linear_beta <= 0.0
+    ):
+        raise ValueError("SiTU beta values must be finite and positive")
+    if not supports_kimi_k3_moe_tri_projection_cooperative_preactivated_fp8(
+        hidden,
+        routed_weight,
+        routed_scale,
+        shared_weight,
+        shared_scale,
+        router_weight,
+    ):
+        raise ValueError(
+            "unsupported Kimi-K3 cooperative preactivated tri-projection inputs"
+        )
+
+    from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+
+    num_tokens = int(hidden.shape[0])
+    routed_output = hidden.new_empty((num_tokens, _ROUTED_SIZE))
+    shared_output = hidden.new_empty(
+        (num_tokens, _SHARED_INTERMEDIATE_SIZE)
+    )
+    router_output = hidden.new_empty(
+        (num_tokens, _ROUTER_SIZE), dtype=torch.float32
+    )
+    _tri_cooperative_preactivated_launcher(
+        num_tokens,
+        float(situ_beta),
+        float(situ_linear_beta),
+        bool(fast_situ),
+    )(
+        ptr_arg(hidden),
+        ptr_arg(routed_weight),
+        ptr_arg(routed_scale),
+        ptr_arg(shared_weight),
+        ptr_arg(shared_scale),
+        ptr_arg(router_weight),
+        ptr_arg(routed_output),
+        ptr_arg(shared_output),
+        ptr_arg(router_output),
+        stream=torch.cuda.current_stream(hidden.device),
+    )
+    return routed_output, shared_output, router_output
+
+
 def supports_kimi_k3_shared_down_fp8(
     gate_up: torch.Tensor,
     weight: torch.Tensor,
@@ -229,7 +361,7 @@ def supports_kimi_k3_shared_down_fp8(
         gate_up.is_cuda
         and gate_up.dtype == torch.bfloat16
         and gate_up.ndim == 2
-        and gate_up.shape[0] in (1, 2)
+        and gate_up.shape[0] == 1
         and gate_up.shape[1] == _SHARED_GATE_UP_SIZE
         and gate_up.is_contiguous()
         and supports_kimi_k3_shared_down_fp8_weight(

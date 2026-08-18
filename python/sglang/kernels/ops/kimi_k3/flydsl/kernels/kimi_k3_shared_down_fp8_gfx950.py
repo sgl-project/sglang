@@ -74,8 +74,8 @@ def build_kimi_k3_b1_shared_down_fp8_module(
 ):
     """Build the fused SiTU + row-scaled FP8-weight down projection."""
 
-    if num_tokens not in (1, 2):
-        raise ValueError("num_tokens must be 1 or 2")
+    if num_tokens != 1:
+        raise ValueError("num_tokens must be 1")
     if rows_per_wave not in (1, 2, 3, 4, 5, 6, 8):
         raise ValueError("rows_per_wave must be 1, 2, 3, 4, 5, 6, or 8")
     if not 1 <= cu_count <= 256:

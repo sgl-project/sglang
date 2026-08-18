@@ -8,10 +8,12 @@ import torch.nn.functional as F
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_moe_preroute_fp8 import (
     is_kimi_k3_moe_preroute_fp8_available,
+    kimi_k3_moe_tri_projection_cooperative_preactivated_fp8,
     kimi_k3_moe_dual_projection_fp8,
     kimi_k3_moe_tri_projection_fp8,
     kimi_k3_shared_down_fp8,
     supports_kimi_k3_moe_dual_projection_fp8,
+    supports_kimi_k3_moe_tri_projection_cooperative_preactivated_fp8,
     supports_kimi_k3_moe_tri_projection_fp8,
     supports_kimi_k3_shared_down_fp8,
     supports_kimi_k3_shared_down_fp8_weight,
@@ -68,6 +70,14 @@ def test_support_predicates_fail_closed_on_cpu():
     )
     assert not supports_kimi_k3_shared_down_fp8(hidden, fp8, scale)
     assert not supports_kimi_k3_shared_down_fp8_weight(fp8, scale)
+    assert not supports_kimi_k3_moe_tri_projection_cooperative_preactivated_fp8(
+        torch.empty((4, 7168), dtype=torch.bfloat16),
+        fp8,
+        scale,
+        fp8,
+        scale,
+        hidden,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU runtime")
@@ -217,61 +227,87 @@ def test_kimi_k3_preroute_fp8_matches_dequantized_reference():
     torch.testing.assert_close(captured_shared, expected_shared, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("num_tokens", [2])
+@pytest.mark.parametrize("num_tokens", [2, 4])
 @pytest.mark.skipif(
     not torch.cuda.is_available()
     or not is_flydsl_available()
     or get_gfx_runtime() != "gfx950",
     reason="requires FlyDSL on gfx950",
 )
-def test_kimi_k3_tri_and_shared_projection_multitoken(num_tokens: int):
-    torch.manual_seed(20260811 + num_tokens)
+def test_kimi_k3_cooperative_preactivated_projection(num_tokens: int):
+    torch.manual_seed(20260818 + num_tokens)
     hidden = torch.randn(
         (num_tokens, 7168), device="cuda", dtype=torch.bfloat16
     )
     routed_bf16 = torch.randn((3584, 7168), device="cuda", dtype=torch.bfloat16)
     shared_bf16 = torch.randn((1536, 7168), device="cuda", dtype=torch.bfloat16)
-    shared_down_bf16 = torch.randn(
-        (7168, 768), device="cuda", dtype=torch.bfloat16
-    )
     router_bf16 = torch.randn((896, 7168), device="cuda", dtype=torch.bfloat16)
     routed_weight, routed_scale = _quantize_rows(routed_bf16)
     shared_weight, shared_scale = _quantize_rows(shared_bf16)
-    shared_down_weight, shared_down_scale = _quantize_rows(shared_down_bf16)
-    routed, shared, router = kimi_k3_moe_tri_projection_fp8(
-        hidden,
-        routed_weight,
-        routed_scale,
-        shared_weight,
-        shared_scale,
-        router_bf16,
+    shared_interleaved = (
+        shared_weight.view(2, 768, 7168)
+        .permute(1, 0, 2)
+        .contiguous()
+        .view(1536, 7168)
+    )
+    shared_scale_interleaved = (
+        shared_scale.view(2, 768).t().contiguous().view(1536)
+    )
+
+    routed, activated, router = (
+        kimi_k3_moe_tri_projection_cooperative_preactivated_fp8(
+            hidden,
+            routed_weight,
+            routed_scale,
+            shared_interleaved,
+            shared_scale_interleaved,
+            router_bf16,
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+            fast_situ=True,
+        )
     )
     routed_ref = hidden.float() @ (
         routed_weight.float() * routed_scale[:, None]
     ).t()
-    shared_ref = hidden.float() @ (
-        shared_weight.float() * shared_scale[:, None]
-    ).t()
-    router_ref = F.linear(hidden, router_bf16).float()
-    shared_out = kimi_k3_shared_down_fp8(
-        shared,
-        shared_down_weight,
-        shared_down_scale,
-        situ_beta=4.0,
-        situ_linear_beta=25.0,
-    )
-    gate, up = shared_ref.to(torch.bfloat16).float().chunk(2, dim=-1)
-    activated = (
+    gate_up_ref = (
+        hidden.float() @ (shared_weight.float() * shared_scale[:, None]).t()
+    ).to(torch.bfloat16)
+    gate, up = gate_up_ref.float().chunk(2, dim=-1)
+    activated_ref = (
         4.0
         * torch.tanh(gate / 4.0)
         * torch.sigmoid(gate)
         * 25.0
         * torch.tanh(up / 25.0)
     ).to(torch.bfloat16)
-    shared_out_ref = activated.float() @ (
-        shared_down_weight.float() * shared_down_scale[:, None]
-    ).t()
+    router_ref = F.linear(hidden, router_bf16).float()
+
     assert _relative_rmse(routed, routed_ref) < 0.035
-    assert _relative_rmse(shared, shared_ref) < 0.035
+    assert _relative_rmse(activated, activated_ref) < 0.035
     assert _relative_rmse(router, router_ref) < 0.01
-    assert _relative_rmse(shared_out, shared_out_ref) < 0.06
+    torch.testing.assert_close(
+        router.topk(16, dim=-1).indices.sort(dim=-1).values,
+        router_ref.topk(16, dim=-1).indices.sort(dim=-1).values,
+        atol=0,
+        rtol=0,
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = kimi_k3_moe_tri_projection_cooperative_preactivated_fp8(
+            hidden,
+            routed_weight,
+            routed_scale,
+            shared_interleaved,
+            shared_scale_interleaved,
+            router_bf16,
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+            fast_situ=True,
+        )
+    graph.replay()
+    expected = tuple(value.clone() for value in captured)
+    graph.replay()
+    for actual, reference in zip(captured, expected):
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
