@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 import torch
 
-from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
+from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
@@ -44,6 +44,12 @@ class AttentionBackend(ABC):
     @classmethod
     def supports_packed_varlen(cls) -> bool:
         return cls.get_impl_cls().forward_varlen is not AttentionImpl.forward_varlen
+
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        """Whether this backend can serve as the ring-attention kernel; the
+        per-hop online-softmax merge needs the kernel's softmax LSE."""
+        return False
 
     @classmethod
     def unsupported_requirements(

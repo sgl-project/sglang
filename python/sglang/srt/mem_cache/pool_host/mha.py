@@ -384,13 +384,18 @@ class MHATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
-        (
-            device_k_data_ptrs,
-            device_v_data_ptrs,
-            device_k_buffers,
-            device_v_buffers,
-        ) = self._resolve_device_transfer_buffers(device_pool)
-        device_kv_buffers = device_k_buffers + device_v_buffers
+        if io_backend == "kernel_ascend":
+            # NPU pools use contiguous multi-layer tensors and intentionally do
+            # not build the CUDA-style k_data_ptrs/v_data_ptrs arrays.
+            device_kv_buffers = None
+        else:
+            (
+                device_k_data_ptrs,
+                device_v_data_ptrs,
+                device_k_buffers,
+                device_v_buffers,
+            ) = self._resolve_device_transfer_buffers(device_pool)
+            device_kv_buffers = device_k_buffers + device_v_buffers
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:

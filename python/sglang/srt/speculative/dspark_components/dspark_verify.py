@@ -5,6 +5,9 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+    is_unified_kv_triton,
+)
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     AcceptSampling,
@@ -20,6 +23,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     BuildRaggedVerifyWindow,
     RaggedVerifyWindow,
     ScatterCompactToStrided,
+    build_unified_commit_inject_layout,
     scatter_compact_to_strided_into,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -41,7 +45,10 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     sample_simulated_acc_len,
 )
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
+
+_is_npu = is_npu()
 
 # Draft proposal probs feeding rejection sampling; the data layer is the
 # in-kernel NaN-q guard in reject_sampling.py, so this is signal-only.
@@ -210,6 +217,7 @@ class TargetVerifyExecutor:
             batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
             batch.seq_lens_sum = num_dummy_slots
             batch.forward_mode = ForwardMode.TARGET_VERIFY
+        verify_input.live_seq_lens_cpu = batch.seq_lens_cpu
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
@@ -217,7 +225,7 @@ class TargetVerifyExecutor:
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            skip_attn_backend_init=True if not _is_npu else None,
         )
 
     def run_non_compact(
@@ -239,6 +247,7 @@ class TargetVerifyExecutor:
             draft_token_num=verify_w,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            live_seq_lens_cpu=batch.seq_lens_cpu,
         )
         batch.out_cache_loc = verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -285,7 +294,7 @@ class TargetVerifyExecutor:
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            skip_attn_backend_init=True if not _is_npu else None,
         )
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
@@ -317,12 +326,23 @@ class TargetVerifyExecutor:
         if hidden is None:
             raise RuntimeError("DSpark verify requires target hidden states, got None.")
         hidden = hidden.view(bs, self.verify_num_draft_tokens, -1)
+        state_slot = None
+        if is_unified_kv_triton():
+            # unified_kv needs the per-token draft req slot to address the SWA ring
+            # (state_slot * ring + pos % ring). Verify tokens are the latest in each
+            # req so they always fall in the window; the commit gate (via commit_lens
+            # + cache_loc_2d) drops rejected tokens, so no final_pos skip is needed.
+            vlen = verify_window.verify_cache_loc_2d.shape[1]
+            state_slot = (
+                batch.req_pool_indices[:bs].view(-1, 1).expand(bs, vlen).reshape(-1)
+            )
         self.kv_injector.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=verify_window.verify_cache_loc,
             cache_loc_2d=verify_window.verify_cache_loc_2d,
             positions=verify_window.positions_2d.reshape(-1),
             commit_lens=commit_lens,
+            state_slot=state_slot,
         )
 
     def _run_ragged(
@@ -340,6 +360,7 @@ class TargetVerifyExecutor:
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             ragged_verify_layout=layout,
+            live_seq_lens_cpu=batch.seq_lens_cpu,
         )
         batch.out_cache_loc = ragged_window.verify_cache_loc
         seq_lens_cpu_backup = batch.seq_lens_cpu
@@ -645,15 +666,25 @@ class DsparkVerifyEpilogue:
             torch.minimum(commit_lens, verify_lens.to(torch.int32))
             * self.inject_gate_buf
         )
-        inject_layout = BuildCommitInjectLayout.execute(
-            req_pool_indices=req_pool_indices,
-            req_to_token=ctx.resolve_req_to_token(),
-            prefix_lens=seq_lens[:bs],
-            block_pos_offsets=ctx.block_pos_offsets[: self.stride],
-            full_to_swa_mapping=pool.full_to_swa_index_mapping,
-            commit_lens=gated_commit_lens,
-            stride=self.stride,
-        )
+        if is_unified_kv_triton():
+            inject_layout = build_unified_commit_inject_layout(
+                req_pool_indices=req_pool_indices,
+                prefix_lens=seq_lens[:bs],
+                block_pos_offsets=ctx.block_pos_offsets[: self.stride],
+                commit_lens=gated_commit_lens,
+                stride=self.stride,
+                ring_stride=pool.unified_swa_ring_size,
+            )
+        else:
+            inject_layout = BuildCommitInjectLayout.execute(
+                req_pool_indices=req_pool_indices,
+                req_to_token=ctx.resolve_req_to_token(),
+                prefix_lens=seq_lens[:bs],
+                block_pos_offsets=ctx.block_pos_offsets[: self.stride],
+                full_to_swa_mapping=pool.full_to_swa_index_mapping,
+                commit_lens=gated_commit_lens,
+                stride=self.stride,
+            )
         with torch.inference_mode():
             ctx.draft_model.write_target_hidden_kv(
                 main_hidden=self.strided_hidden[: bs * self.stride],
