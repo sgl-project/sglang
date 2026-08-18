@@ -1,5 +1,6 @@
 import logging
 import math
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import List, Optional
 
@@ -14,7 +15,6 @@ from sglang.kernels.ops.speculative.dflash import (
     _prepare_dflash_draft_block_unchecked,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
@@ -28,7 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
-from sglang.srt.runtime_context import get_exec, get_schedule
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
@@ -57,6 +57,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
+    draft_tp_context,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
@@ -85,6 +86,11 @@ _DENSE_HEAD_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 def _is_dense_head_weight(weight) -> bool:
     return weight is not None and weight.dtype in _DENSE_HEAD_DTYPES
+
+
+def _lm_head_shard_group(lm_head):
+    parallel = get_parallel()
+    return parallel.attn_tp_group if lm_head.use_attn_tp_group else parallel.tp_group
 
 
 class _DflashDraftSampler:
@@ -200,14 +206,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
 
-        bundle = build_draft_tp_worker(
-            server_args=server_args,
-            gpu_id=gpu_id,
-            ps=replace(ps, pp_rank=0),
-            nccl_port=nccl_port,
-            target_model_config=target_worker.model_runner.model_config,
-            algo_label="DFLASH",
-        )
+        self._draft_dp_context_enabled = get_parallel().enable_dp_attention
+
+        with self._draft_context():
+            bundle = build_draft_tp_worker(
+                server_args=server_args,
+                gpu_id=gpu_id,
+                ps=replace(ps, pp_rank=0),
+                nccl_port=nccl_port,
+                target_model_config=target_worker.model_runner.model_config,
+                algo_label="DFLASH",
+            )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
@@ -326,6 +335,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             self.draft_model_runner.attn_backend,
         )
 
+    def _draft_context(self):
+        if self._draft_dp_context_enabled:
+            return draft_tp_context(get_parallel().attn_tp_group)
+        return nullcontext()
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
@@ -346,7 +360,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_attention_backends(self):
-        self._draft_worker.init_attention_backends()
+        with self._draft_context():
+            self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
@@ -367,16 +382,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
-        if capture_decode_cuda_graph:
-            # Must run before capture so the draft graph folds the head in.
-            self._draft_sampler = self._maybe_build_draft_sampler()
-            if self._draft_sampler is not None:
-                self.draft_model_runner.capture_tail_hooks.append(
-                    make_draft_sampler_capture_hook(self._draft_sampler)
-                )
-        self._draft_worker.init_cuda_graphs(
-            capture_decode_cuda_graph=capture_decode_cuda_graph
-        )
+        with self._draft_context():
+            if capture_decode_cuda_graph:
+                # Must run before capture so the draft graph folds the head in.
+                self._draft_sampler = self._maybe_build_draft_sampler()
+                if self._draft_sampler is not None:
+                    self.draft_model_runner.capture_tail_hooks.append(
+                        make_draft_sampler_capture_hook(self._draft_sampler)
+                    )
+            self._draft_worker.init_cuda_graphs(
+                capture_decode_cuda_graph=capture_decode_cuda_graph
+            )
 
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
@@ -397,11 +413,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not _is_dense_head_weight(lm_head.weight):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
-        tp_group = get_tp_group()
         if not hasattr(lm_head, "shard_indices"):
-            if tp_group.world_size != 1:
+            if self.ps.tp_size != 1:
                 # No shard metadata to recover per-rank vocab offsets from.
                 return _eager("tp>1 without shard_indices")
+            tp_group = None
             num_org = int(lm_head.weight.shape[0])
             org_vocab_start = 0
         else:
@@ -410,10 +426,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 return _eager("added vocab")
             num_org = int(shard.num_org_elements)
             org_vocab_start = int(shard.org_vocab_start_index)
+            tp_group = _lm_head_shard_group(lm_head)
+            if tp_group.world_size == 1:
+                tp_group = None
         if self.ps.tp_rank == 0:
             logger.info(
                 "DFLASH draft greedy head folded into the draft cuda graph (tp=%d).",
-                tp_group.world_size,
+                1 if tp_group is None else tp_group.world_size,
             )
         return _DflashDraftSampler(
             weight=lm_head.weight,
@@ -421,7 +440,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             num_org=num_org,
             org_vocab_start=org_vocab_start,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
-            tp_group=tp_group if tp_group.world_size > 1 else None,
+            tp_group=tp_group,
         )
 
     def _init_fused_kv_helper(self) -> None:
@@ -837,7 +856,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         makes for GGUF models. Padding rows are excluded so argmax cannot return
         an id outside the real vocabulary.
         """
-        tp_size = int(get_tp_group().world_size)
+        tp_size = int(_lm_head_shard_group(lm_head).world_size)
         if tp_size != 1:
             raise RuntimeError(
                 "DFLASH with a quantized target lm_head is only supported at "
@@ -899,7 +918,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             return out_tokens
 
         shard = lm_head.shard_indices
-        tp_group = get_tp_group()
+        tp_group = _lm_head_shard_group(lm_head)
         tp_size = int(tp_group.world_size)
 
         # Valid ranges in the local shard (excluding padding):
@@ -1436,6 +1455,46 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    def _idle_result(self, *, on_publish) -> GenerationBatchResult:
+        empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
+        empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
+        next_draft_input = self._make_next_draft_input_decode(
+            bonus_tokens=torch.empty((0,), device=self.device, dtype=torch.int64),
+            new_seq_lens=torch.empty((0,), device=self.device, dtype=torch.int64),
+        )
+        if on_publish is not None:
+            on_publish(next_draft_input.new_seq_lens)
+        return GenerationBatchResult(
+            logits_output=None,
+            next_token_ids=empty_ids,
+            accept_lens=empty_lens,
+            next_draft_input=next_draft_input,
+            can_run_cuda_graph=False,
+            speculative_num_draft_tokens=int(self.block_size),
+            new_seq_lens=next_draft_input.new_seq_lens,
+        )
+
+    def _run_idle_verify_participation(self, batch: ScheduleBatch) -> None:
+        empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
+        verify_input = DFlashVerifyInput(
+            draft_token=empty_ids,
+            positions=empty_ids,
+            draft_token_num=int(self.block_size),
+            custom_mask=None,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+        batch.out_cache_loc = empty_ids
+        verify_input.live_seq_lens_cpu = batch.seq_lens_cpu
+        verify_forward_batch, _ = verify_input.prepare_for_verify(
+            batch, self.target_worker
+        )
+        self.target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+            skip_attn_backend_init=True,
+        )
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -1445,6 +1504,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            if batch.forward_mode.is_idle():
+                if get_parallel().enable_dp_attention:
+                    self.target_worker.forward_batch_generation(
+                        batch, capture_hidden_mode=CaptureHiddenMode.FULL
+                    )
+                return self._idle_result(on_publish=on_publish)
+
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch_output = self.target_worker.forward_batch_generation(
                 batch, capture_hidden_mode=CaptureHiddenMode.FULL
@@ -1514,23 +1580,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         if batch.forward_mode.is_idle():
-            empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
-            empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
-            next_draft_input = self._make_next_draft_input_decode(
-                bonus_tokens=torch.empty((0,), device=self.device, dtype=torch.int64),
-                new_seq_lens=torch.empty((0,), device=self.device, dtype=torch.int64),
-            )
-            if on_publish is not None:
-                on_publish(next_draft_input.new_seq_lens)
-            return GenerationBatchResult(
-                logits_output=None,
-                next_token_ids=empty_ids,
-                accept_lens=empty_lens,
-                next_draft_input=next_draft_input,
-                can_run_cuda_graph=False,
-                speculative_num_draft_tokens=int(self.block_size),
-                new_seq_lens=next_draft_input.new_seq_lens,
-            )
+            if get_parallel().enable_dp_attention:
+                self._run_idle_verify_participation(batch)
+            return self._idle_result(on_publish=on_publish)
 
         # `seq_lens` is carried over from the previous overlap iteration and may have been
         # produced on another stream.
@@ -1685,7 +1737,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
-        with torch.inference_mode():
+        with torch.inference_mode(), self._draft_context():
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
