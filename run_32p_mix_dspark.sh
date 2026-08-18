@@ -62,7 +62,10 @@ do
         export SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE=1
         export SGLANG_K3_SHARED_EXPERTS_ATTN_TP=1
         export SGLANG_K3_DENSE_MLP_ATTN_TP=1
-        export SGLANG_NPU_FUSED_COLLECTIVE_MATMUL=1
+        # CANN collective-matmul blocks under SBO side-stream graph capture;
+        # serializing it costs more than it saves. Keep #35266's shared MLP
+        # overlap as the default until that graph/stream combination is fixed.
+        export SGLANG_NPU_FUSED_COLLECTIVE_MATMUL=0
         export SGLANG_NPU_FUSED_RMS_QUANT=1
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
