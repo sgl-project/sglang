@@ -221,7 +221,9 @@ class StepReuseController:
     def get_reused_prediction(self, scope_key: ScopeKey) -> Any:
         state = self._state(scope_key)
         if state.last_real_prediction is None:
-            raise StepReuseError(f"no real prediction recorded yet for scope {scope_key!r}")
+            raise StepReuseError(
+                f"no real prediction recorded yet for scope {scope_key!r}"
+            )
         return state.last_real_prediction
 
     def record_reuse(self, scope_key: ScopeKey) -> None:
@@ -240,7 +242,9 @@ class StepReuseController:
         state.reused_steps += 1
         state.total_steps_seen += 1
 
-    def record_real(self, scope_key: ScopeKey, prediction: Any, observation: Any) -> bool:
+    def record_real(
+        self, scope_key: ScopeKey, prediction: Any, observation: Any
+    ) -> bool:
         """Record that a step ran a real forward, and decide the next skip window.
 
         ``observation`` is the adapter-captured quantity at
