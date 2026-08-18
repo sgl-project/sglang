@@ -77,7 +77,7 @@ class _AscendKDAExtendKernel:
             cu_seqlens=query_start_loc,
             output_dtype=k.dtype,
         )
-        w, u, _, gated_k = recompute_w_u_fwd_npu(
+        w, u, gated_k = recompute_w_u_fwd_npu(
             k=k,
             v=v,
             beta=beta,
