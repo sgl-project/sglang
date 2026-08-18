@@ -160,6 +160,82 @@ class ServingChatTestCase(unittest.TestCase):
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
 
+    def test_required_tool_call_accepts_single_object(self):
+        """Models frequently emit one call object instead of the array the
+        json_schema constraint asks for; the old code iterated the dict's
+        keys and crashed with "string indices must be integers"."""
+        self.chat.tool_call_parser = None
+        result = self.chat._process_tool_calls(
+            '{"name": "add", "parameters": {"a": 1, "b": 2}}',
+            [],
+            {"type": "stop", "matched": None},
+            tool_choice="required",
+        )
+        self.assertIsNotNone(result.tool_calls)
+        self.assertEqual(len(result.tool_calls), 1)
+        self.assertEqual(result.tool_calls[0].function.name, "add")
+        self.assertEqual(
+            result.tool_calls[0].function.arguments, '{"a": 1, "b": 2}'
+        )
+        self.assertEqual(result.finish_reason["type"], "tool_calls")
+
+    def test_required_tool_call_maps_bare_parameters_to_sole_tool(self):
+        """Models also emit just the parameters object with no {name,
+        parameters} wrapper; with a single tool on offer the target is
+        unambiguous."""
+        self.chat.tool_call_parser = None
+        tool = Mock()
+        tool.function.name = "web_search"
+        result = self.chat._process_tool_calls(
+            '{"q": "weather berlin"}',
+            [tool],
+            {"type": "stop", "matched": None},
+            tool_choice="required",
+        )
+        self.assertIsNotNone(result.tool_calls)
+        self.assertEqual(result.tool_calls[0].function.name, "web_search")
+        self.assertEqual(
+            result.tool_calls[0].function.arguments, '{"q": "weather berlin"}'
+        )
+
+    def test_required_tool_call_bare_parameters_ambiguous_falls_back(self):
+        """With several tools and no named tool_choice the bare object is
+        ambiguous — keep the text fallback instead of guessing."""
+        self.chat.tool_call_parser = None
+        result = self.chat._process_tool_calls(
+            '{"q": "weather berlin"}',
+            [Mock(), Mock()],
+            {"type": "stop", "matched": None},
+            tool_choice="required",
+        )
+        self.assertIsNone(result.tool_calls)
+        self.assertEqual(result.finish_reason["type"], "stop")
+
+    def test_required_tool_call_rejects_non_object_entries(self):
+        """A JSON array of bare strings is not a tool call payload — fall back
+        to text with the original finish reason instead of raising TypeError."""
+        self.chat.tool_call_parser = None
+        result = self.chat._process_tool_calls(
+            '["add"]',
+            [],
+            {"type": "stop", "matched": None},
+            tool_choice="required",
+        )
+        self.assertIsNone(result.tool_calls)
+        self.assertEqual(result.remaining_text, '["add"]')
+        self.assertEqual(result.finish_reason["type"], "stop")
+
+    def test_required_tool_call_non_json_falls_back_to_text(self):
+        self.chat.tool_call_parser = None
+        result = self.chat._process_tool_calls(
+            "Sorry, I cannot call a tool here.",
+            [],
+            {"type": "stop", "matched": None},
+            tool_choice="required",
+        )
+        self.assertIsNone(result.tool_calls)
+        self.assertEqual(result.finish_reason["type"], "stop")
+
     def test_parsers_follow_the_control_plane_overlay(self):
         """Template detection records the parsers through `override`, so they
         answer from the bags; `ServerArgs` keeps the launcher's seed."""
