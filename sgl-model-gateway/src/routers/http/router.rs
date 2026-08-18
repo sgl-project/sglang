@@ -13,6 +13,7 @@ use tracing::{debug, error};
 
 use crate::{
     app_context::AppContext,
+    completion::CompletionRequest,
     config::types::RetryConfig,
     core::{
         is_retryable_status, AttachedBody, ConnectionMode, RetryExecutor, Worker, WorkerLoadGuard,
@@ -28,7 +29,6 @@ use crate::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         common::GenerationRequest,
-        completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         rerank::{RerankRequest, RerankResponse, RerankResult},
