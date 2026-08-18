@@ -154,6 +154,16 @@ class StepReuseController:
     def _state(self, scope_key: ScopeKey) -> StepReuseState:
         return self._states.setdefault(scope_key, StepReuseState())
 
+    def _peek_state(self, scope_key: ScopeKey) -> StepReuseState:
+        """Read-only state lookup.
+
+        Unlike ``_state``, this never creates or persists a new entry in
+        ``self._states`` for a scope that hasn't recorded anything yet, so
+        purely observational calls (``should_reuse``, ``metrics``,
+        ``get_reused_prediction``) can't silently leak empty scope entries.
+        """
+        return self._states.get(scope_key, StepReuseState())
+
     def reset(self, scope_key: ScopeKey) -> None:
         """Drop all lifecycle state for one scope (e.g. on request end)."""
         self._states.pop(scope_key, None)
@@ -162,7 +172,7 @@ class StepReuseController:
         self._states.clear()
 
     def metrics(self, scope_key: ScopeKey) -> Dict[str, int]:
-        state = self._state(scope_key)
+        state = self._peek_state(scope_key)
         return {
             "real_forwards": state.real_forwards,
             "reused_steps": state.reused_steps,
@@ -213,13 +223,13 @@ class StepReuseController:
         if self._is_forced(step_index, total_steps, side_effects):
             return False
 
-        state = self._state(scope_key)
+        state = self._peek_state(scope_key)
         if state.last_real_prediction is None:
             return False
         return state.skip_remaining > 0
 
     def get_reused_prediction(self, scope_key: ScopeKey) -> Any:
-        state = self._state(scope_key)
+        state = self._peek_state(scope_key)
         if state.last_real_prediction is None:
             raise StepReuseError(
                 f"no real prediction recorded yet for scope {scope_key!r}"
