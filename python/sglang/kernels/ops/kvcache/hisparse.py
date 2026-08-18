@@ -19,12 +19,29 @@ def _jit_sparse_module(
     hot_buffer_size: int,
     is_mla: bool = False,
     is_dsv4_layout: bool = False,
+    record_miss_plan: bool = False,
+    skip_io: bool = False,
 ) -> Module:
+    # record_miss_plan / skip_io are compile-time kernel flags; the
+    # (False, False) production instantiation stays byte-identical.
     template_args = make_cpp_args(
-        block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        is_mla,
+        is_dsv4_layout,
+        record_miss_plan,
+        skip_io,
     )
     cache_args = make_cpp_args(
-        item_size_bytes, block_size, num_top_k, hot_buffer_size, is_mla, is_dsv4_layout
+        item_size_bytes,
+        block_size,
+        num_top_k,
+        hot_buffer_size,
+        is_mla,
+        is_dsv4_layout,
+        record_miss_plan,
+        skip_io,
     )
     return load_jit(
         "sparse_cache",
@@ -34,6 +51,30 @@ def _jit_sparse_module(
             (
                 "load_cache_to_device_buffer",
                 f"load_cache_to_device_buffer<{template_args}>",
+            )
+        ],
+    )
+
+
+@functools.cache
+def _jit_copy_planned_module(
+    block_size: int,
+    is_mla: bool,
+    is_dsv4_layout: bool,
+    skip_io: bool,
+) -> Module:
+    template_args = make_cpp_args(block_size, is_mla, is_dsv4_layout, skip_io)
+    return load_jit(
+        "sparse_copy_planned",
+        block_size,
+        is_mla,
+        is_dsv4_layout,
+        skip_io,
+        cuda_files=["hisparse.cuh"],
+        cuda_wrappers=[
+            (
+                "copy_cache_planned",
+                f"copy_cache_planned<{template_args}>",
             )
         ],
     )
@@ -91,11 +132,16 @@ def _load_cache_to_device_buffer_mla(
     page_size: int,
     block_size: int,
     num_real_reqs: torch.Tensor | None,
+    miss_src: torch.Tensor | None,
+    miss_dst: torch.Tensor | None,
+    miss_count: torch.Tensor | None,
+    skip_io: bool,
 ) -> None:
     assert (
         hot_buffer_size >= num_top_k
     ), f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
 
+    record_miss_plan = miss_src is not None
     module = _jit_sparse_module(
         item_size_bytes,
         block_size,
@@ -103,6 +149,8 @@ def _load_cache_to_device_buffer_mla(
         hot_buffer_size,
         is_mla=True,
         is_dsv4_layout=is_dsv4_layout,
+        record_miss_plan=record_miss_plan,
+        skip_io=skip_io,
     )
 
     empty = torch.empty(0)
@@ -111,6 +159,16 @@ def _load_cache_to_device_buffer_mla(
         num_real_reqs = torch.tensor(
             [top_k_tokens.size(0)], dtype=torch.int32, device=top_k_tokens.device
         )
+
+    if record_miss_plan:
+        assert miss_dst is not None and miss_count is not None
+        assert miss_src.dtype == torch.int64 and miss_dst.dtype == torch.int32
+        assert miss_count.dtype == torch.int32
+        # The kernel indexes both plan rows with one stride.
+        assert miss_src.stride(0) == miss_dst.stride(0)
+    else:
+        # Unused sentinels; the RecordMissPlan=false instantiation never reads them.
+        miss_src = miss_dst = miss_count = empty
 
     module.load_cache_to_device_buffer(
         top_k_tokens,
@@ -128,6 +186,9 @@ def _load_cache_to_device_buffer_mla(
         num_real_reqs,
         page_size,
         item_size_bytes,
+        miss_src,
+        miss_dst,
+        miss_count,
     )
 
 
@@ -148,8 +209,16 @@ def load_cache_to_device_buffer_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    miss_src: torch.Tensor | None = None,
+    miss_dst: torch.Tensor | None = None,
+    miss_count: torch.Tensor | None = None,
+    skip_io: bool = False,
 ) -> None:
-    """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes)."""
+    """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes).
+
+    Optional miss_src/miss_dst/miss_count record the miss plan for replay by
+    copy_cache_planned_mla; skip_io elides only the KV bytes (timing probe).
+    """
     _load_cache_to_device_buffer_mla(
         is_dsv4_layout=False,
         top_k_tokens=top_k_tokens,
@@ -168,6 +237,47 @@ def load_cache_to_device_buffer_mla(
         page_size=page_size,
         block_size=block_size,
         num_real_reqs=num_real_reqs,
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        skip_io=skip_io,
+    )
+
+
+def copy_cache_planned_mla(
+    *,
+    miss_src: torch.Tensor,
+    miss_dst: torch.Tensor,
+    miss_count: torch.Tensor,
+    num_real_reqs: torch.Tensor,
+    host_cache: torch.Tensor,
+    device_buffer: torch.Tensor,
+    item_size_bytes: int,
+    num_blocks: int = 4,
+    block_size: int = 1024,
+    is_dsv4_layout: bool = False,
+    skip_io: bool = False,
+) -> None:
+    """Replay a recorded miss plan (host_cache -> device_buffer) for a skip layer.
+
+    IO-only, no planning; the small fixed grid keeps the SM footprint low while
+    overlapped on a side stream. The anchor's slot table stays valid (lockstep).
+    """
+    assert miss_src.dtype == torch.int64 and miss_dst.dtype == torch.int32
+    assert miss_count.dtype == torch.int32
+    module = _jit_copy_planned_module(block_size, True, is_dsv4_layout, skip_io)
+    empty = torch.empty(0)
+    module.copy_cache_planned(
+        miss_src,
+        miss_dst,
+        miss_count,
+        num_real_reqs,
+        host_cache,
+        empty,
+        device_buffer,
+        empty,
+        num_blocks,
+        item_size_bytes,
     )
 
 
@@ -188,6 +298,10 @@ def load_cache_to_device_buffer_dsv4_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    miss_src: torch.Tensor | None = None,
+    miss_dst: torch.Tensor | None = None,
+    miss_count: torch.Tensor | None = None,
+    skip_io: bool = False,
 ) -> None:
     """DSv4 hisparse swap-in: page-padded device + page-padded host C4 layout."""
     _load_cache_to_device_buffer_mla(
@@ -208,4 +322,8 @@ def load_cache_to_device_buffer_dsv4_mla(
         page_size=page_size,
         block_size=block_size,
         num_real_reqs=num_real_reqs,
+        miss_src=miss_src,
+        miss_dst=miss_dst,
+        miss_count=miss_count,
+        skip_io=skip_io,
     )

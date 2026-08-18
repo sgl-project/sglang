@@ -1,13 +1,14 @@
 """``ServerArgs`` has no in-place mutation entry, and nothing calls one.
 
-``ServerArgs.override(source, **fields)`` used to mutate a resolved instance;
-after resolution the fields are the record the config bags were projected from,
-so such a write desyncs every namespace reader. The method is gone and the two
-sanctioned replacements are ``get_context().override`` (post-publish, writes the
-bags) and ``ServerArgs.derive`` (a variant for another runner / process). Late
-launcher-stage resolution writes in place through
-``arg_groups.overrides.declare_late_resolution``, which refuses the published
-instance.
+``ServerArgs.override(source, **fields)`` used to mutate a resolved instance,
+and ``ServerArgs.derive(source, **fields)`` used to copy-and-edit one; after
+resolution the fields are the record the config bags were projected from, so a
+write desyncs every namespace reader, and a copy invites publishing stale
+variants. Both are gone: post-publish changes go to the bags
+(``get_context().override``), a value one runner or worker owns travels as a
+constructor argument, and late launcher-stage resolution writes in place
+through ``arg_groups.overrides.declare_late_resolution``, which refuses the
+published instance.
 
 The textual half of this guard matters because the resolution pipeline's own file
 is exempt from the mutation ratchet: a ``self.override(...)`` there — exactly
@@ -41,11 +42,19 @@ _EXCLUDED = ("multimodal_gen",)
 
 
 class TestNoServerArgsMutationEntry(CustomTestCase):
-    def test_the_method_is_gone(self):
+    def test_the_methods_are_gone(self):
         self.assertFalse(
             hasattr(ServerArgs, "override"),
             "ServerArgs.override is back; post-publish changes belong on the bags "
-            "(get_context().override) and per-runner values on a derive() variant.",
+            "(get_context().override); a value one runner owns travels as a "
+            "constructor argument.",
+        )
+        self.assertFalse(
+            hasattr(ServerArgs, "derive"),
+            "ServerArgs.derive is back; a value one runner or worker owns travels "
+            "as a constructor argument (draft_attention_backend, MMEncoder "
+            "gpu_id), and test doubles copy via "
+            "sglang.test.test_utils.server_args_variant.",
         )
 
     def test_nothing_calls_an_instance_override(self):
@@ -63,10 +72,30 @@ class TestNoServerArgsMutationEntry(CustomTestCase):
             self.fail(
                 "in-place ServerArgs mutation call-sites:\n"
                 + "\n".join(offenders)
-                + "\n\nUse get_context().override(source, ...) for resolved config, "
-                "server_args.derive(source, ...) for a per-runner variant, or "
-                "declare_late_resolution(...) for pre-publish launcher resolution."
+                + "\n\nUse get_context().override(source, ...) for resolved config "
+                "or declare_late_resolution(...) for pre-publish launcher "
+                "resolution."
             )
+
+    def test_nothing_derives(self):
+        """A config is never copied-and-edited in the package: a value one
+        runner consumes travels as a constructor argument, and test doubles
+        copy via ``server_args_variant`` (test_utils)."""
+        derive_pattern = re.compile(r"\.derive\(")
+        offenders = []
+        for path in sorted(_SGLANG_ROOT.rglob("*.py")):
+            rel = path.relative_to(_SGLANG_ROOT).as_posix()
+            if rel.startswith(_EXCLUDED):
+                continue
+            source = path.read_text()
+            for match in derive_pattern.finditer(source):
+                line = source.count("\n", 0, match.start()) + 1
+                offenders.append(f"{rel}:{line}")
+        self.assertFalse(
+            offenders,
+            ".derive( call-sites in the package (the method no longer exists):\n"
+            + "\n".join(offenders),
+        )
 
     def test_late_resolution_refuses_the_published_config(self):
         from sglang.srt.arg_groups.overrides import declare_late_resolution
