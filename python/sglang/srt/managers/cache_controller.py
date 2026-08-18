@@ -421,7 +421,6 @@ class HiCacheController:
         self.backup_queue = Queue()
         self.prefetch_buffer = Queue[PrefetchOperation]()
         self.prefetch_sync_queue = Queue[PrefetchAck]()
-
         self.prefetch_hit_queue: Queue[StorageOperation] = Queue()
         self.ack_prefetch_queue = Queue[PrefetchAck]()
         self.ack_backup_queue: Queue[StorageOperation] = Queue()
@@ -716,6 +715,8 @@ class HiCacheController:
             self.backup_thread.join()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
+            self.prefetch_buffer.queue.clear()
+            self.prefetch_sync_queue.queue.clear()
             self.prefetch_hit_queue.queue.clear()
             self.ack_prefetch_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
