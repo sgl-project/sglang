@@ -55,45 +55,6 @@ class MoeLoraRoutes:
         return route
 
 
-def _pair_route(
-    topk_ids: torch.Tensor,
-    token_slots: torch.Tensor,
-    *,
-    is_shared_outer: bool,
-    num_local_experts: int,
-    max_loras: int,
-    block_size: int,
-    view: str,
-    use_pdl: bool | None,
-    num_pairs_post_padded_out: torch.Tensor | None = None,
-    fused_align_scratch: FusedAlignScratch | None = None,
-) -> RouteView:
-    if not is_shared_outer:
-        return build_virtual_expert_routing(
-            topk_ids,
-            token_slots,
-            lora_experts_per_adapter=num_local_experts,
-            max_loras=max_loras,
-            block_size=block_size,
-            view=view,
-            use_pdl=use_pdl,
-            num_pairs_post_padded_out=num_pairs_post_padded_out,
-            fused_align_scratch=fused_align_scratch,
-        )
-    return build_virtual_expert_routing(
-        topk_ids,
-        token_slots,
-        lora_experts_per_adapter=1,
-        max_loras=max_loras,
-        block_size=block_size,
-        shared_outer_local_expert_count=num_local_experts,
-        view=view,
-        use_pdl=use_pdl,
-        num_pairs_post_padded_out=num_pairs_post_padded_out,
-        fused_align_scratch=fused_align_scratch,
-    )
-
-
 def _fused_align_scratch(
     workspace: MoeLoraWorkspace,
     *,
@@ -170,11 +131,16 @@ def _aligned_pair_route(
             num_buckets=lora_experts_per_adapter * max_loras + 1,
             device=topk_ids.device,
         )
-    return _pair_route(
+    # These two move together, and validate_shared_outer enforces it: a shared
+    # adapter has exactly ONE LoRA expert, so the validity test would end in
+    # ``lora_expert_id < 1`` -- always true. Passing the local expert count
+    # restores the bound, without which a routed expert this rank does not own
+    # would be accepted as a valid pair.
+    return build_virtual_expert_routing(
         topk_ids,
         token_slots,
-        is_shared_outer=is_shared_outer,
-        num_local_experts=num_local_experts,
+        lora_experts_per_adapter=lora_experts_per_adapter,
+        shared_outer_local_expert_count=num_local_experts if is_shared_outer else None,
         max_loras=max_loras,
         block_size=block_size,
         view=ROUTE_ALIGNED,
@@ -273,21 +239,22 @@ def build_routes(
     use_pdl = is_arch_support_pdl()
     values: dict[str, object] = {}
     if RouteRequirement.RAW in requirements:
-        values["raw_per_expert"] = _pair_route(
+        values["raw_per_expert"] = build_virtual_expert_routing(
             topk_ids,
             token_slots,
-            is_shared_outer=False,
-            num_local_experts=num_local_experts,
+            lora_experts_per_adapter=num_local_experts,
             max_loras=max_loras,
             block_size=block_size,
             view=ROUTE_RAW,
             use_pdl=use_pdl,
         )
-        values["raw_shared_outer"] = _pair_route(
+        # Shared-outer: one LoRA expert per adapter, with the local expert
+        # count restoring the ownership bound (see _aligned_pair_route).
+        values["raw_shared_outer"] = build_virtual_expert_routing(
             topk_ids,
             token_slots,
-            is_shared_outer=True,
-            num_local_experts=num_local_experts,
+            lora_experts_per_adapter=1,
+            shared_outer_local_expert_count=num_local_experts,
             max_loras=max_loras,
             block_size=block_size,
             view=ROUTE_RAW,

@@ -368,26 +368,27 @@ class TestDualGateUpARoute(unittest.TestCase):
         ``fused_shapes`` keeps the stub's always-fused dispatch; ``False``
         pins the JIT small-shape regime, where the standalone builds carry no
         caller-owned fused metadata.  Dual-granularity dispatch is asserted
-        separately: this helper's ``_pair_route`` mock would hide it.
+        separately: this helper's ``build_virtual_expert_routing`` mock would hide it.
         """
         cached_padded_count = torch.zeros(1, dtype=torch.int32)
         calls: list[int] = []
 
-        def fake_pair_route(
+        def fake_route(
             topk_ids,
             token_slots,
             *,
-            is_shared_outer,
-            num_local_experts,
+            lora_experts_per_adapter,
             max_loras,
             block_size,
             view,
             use_pdl,
+            shared_outer_local_expert_count=None,
+            lora_expert_map=None,
             num_pairs_post_padded_out=None,
             fused_align_scratch=None,
         ):
-            self.assertIs(is_shared_outer, False)
-            self.assertEqual(num_local_experts, 2)
+            self.assertEqual(lora_experts_per_adapter, 2)
+            self.assertIsNone(shared_outer_local_expert_count)
             self.assertEqual(max_loras, 2)
             self.assertEqual(view, "aligned")
             self.assertIs(use_pdl, False)
@@ -415,7 +416,9 @@ class TestDualGateUpARoute(unittest.TestCase):
             stack.enter_context(_arch_pdl(False))
             stack.enter_context(
                 mock.patch.object(
-                    ROUTE_FACTORY, "_pair_route", side_effect=fake_pair_route
+                    ROUTE_FACTORY,
+                    "build_virtual_expert_routing",
+                    side_effect=fake_route,
                 )
             )
             if not fused_shapes:
@@ -477,7 +480,7 @@ class TestDualGateUpARoute(unittest.TestCase):
                 )
             return views[0], views[1]
 
-        def unexpected_pair_route(*_args, **_kwargs):
+        def unexpected_route(*_args, **_kwargs):
             raise AssertionError(
                 "the dual pass must replace every standalone per-expert build"
             )
@@ -490,7 +493,9 @@ class TestDualGateUpARoute(unittest.TestCase):
                 side_effect=fake_dual,
             ),
             mock.patch.object(
-                ROUTE_FACTORY, "_pair_route", side_effect=unexpected_pair_route
+                ROUTE_FACTORY,
+                "build_virtual_expert_routing",
+                side_effect=unexpected_route,
             ),
         ):
             routes = ROUTE_FACTORY.build_routes(
@@ -741,16 +746,17 @@ class TestRoutePdlWiring(unittest.TestCase):
             )
             return route, route
 
-        def fake_pair_route(
+        def fake_route(
             topk_ids,
             token_slots,
             *,
-            is_shared_outer,
-            num_local_experts,
+            lora_experts_per_adapter,
             max_loras,
             block_size,
             view,
             use_pdl,
+            shared_outer_local_expert_count=None,
+            lora_expert_map=None,
             num_pairs_post_padded_out=None,
             fused_align_scratch=None,
         ):
@@ -778,8 +784,8 @@ class TestRoutePdlWiring(unittest.TestCase):
                 ),
                 mock.patch.object(
                     ROUTE_FACTORY,
-                    "_pair_route",
-                    side_effect=fake_pair_route,
+                    "build_virtual_expert_routing",
+                    side_effect=fake_route,
                 ),
             ):
                 ROUTE_FACTORY.build_routes(
@@ -1104,23 +1110,24 @@ class TestSharedTokenRoute(unittest.TestCase):
         workspace = _Workspace()
         calls = []
 
-        def fake_pair_route(
+        def fake_route(
             route_topk_ids,
             route_token_slots,
             *,
-            is_shared_outer,
-            num_local_experts,
+            lora_experts_per_adapter,
             max_loras,
             block_size,
             view,
             use_pdl,
+            shared_outer_local_expert_count=None,
+            lora_expert_map=None,
             num_pairs_post_padded_out=None,
             fused_align_scratch=None,
         ):
             self.assertIs(use_pdl, False)
             calls.append(
                 (
-                    is_shared_outer,
+                    shared_outer_local_expert_count is not None,
                     route_topk_ids.clone(),
                     route_token_slots.clone(),
                 )
@@ -1136,7 +1143,7 @@ class TestSharedTokenRoute(unittest.TestCase):
         with (
             _arch_pdl(False),
             mock.patch.object(
-                ROUTE_FACTORY, "_pair_route", side_effect=fake_pair_route
+                ROUTE_FACTORY, "build_virtual_expert_routing", side_effect=fake_route
             ),
         ):
             routes = ROUTE_FACTORY.build_routes(
@@ -1189,23 +1196,23 @@ class TestSharedTokenRoute(unittest.TestCase):
                 workspace = _Workspace()
                 cached_counts: dict[int, torch.Tensor] = {}
 
-                def fake_pair_route(
+                def fake_route(
                     route_topk_ids,
                     route_token_slots,
                     *,
-                    is_shared_outer,
-                    num_local_experts,
+                    lora_experts_per_adapter,
                     max_loras,
                     block_size,
                     view,
                     use_pdl,
+                    shared_outer_local_expert_count=None,
+                    lora_expert_map=None,
                     num_pairs_post_padded_out=None,
                     fused_align_scratch=None,
                 ):
                     self.assertEqual(view, "aligned")
                     self.assertIs(use_pdl, False)
-                    per_adapter = num_local_experts if is_shared_outer is False else 1
-                    num_virtual = per_adapter * max_loras
+                    num_virtual = lora_experts_per_adapter * max_loras
                     cached_count = cached_counts.setdefault(
                         num_virtual, torch.zeros(1, dtype=torch.int32)
                     )
@@ -1222,17 +1229,17 @@ class TestSharedTokenRoute(unittest.TestCase):
                         route_token_slots,
                         block_size=block_size,
                         padded_count=num_pairs_post_padded_out,
-                        lora_experts_per_adapter=per_adapter,
+                        lora_experts_per_adapter=lora_experts_per_adapter,
                         max_loras=max_loras,
-                        shared_outer_local_expert_count=(
-                            num_local_experts if is_shared_outer is True else None
-                        ),
+                        shared_outer_local_expert_count=shared_outer_local_expert_count,
                     )
 
                 with (
                     _arch_pdl(False),
                     mock.patch.object(
-                        ROUTE_FACTORY, "_pair_route", side_effect=fake_pair_route
+                        ROUTE_FACTORY,
+                        "build_virtual_expert_routing",
+                        side_effect=fake_route,
                     ),
                 ):
                     routes = ROUTE_FACTORY.build_routes(
