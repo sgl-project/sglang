@@ -139,10 +139,11 @@ def is_dsa_prefill_cp_round_robin_split():
 # inside a piecewise/breakable CUDA graph. Both fusions are now on by default on
 # this surface (no feature flag); each adds its own extra carve-outs at its call
 # site (e.g. the indexer also excludes DSA prefill context parallelism).
+# HIP (ROCm) is supported: the breakable prefill graph path was enabled for
+# gfx950 (MI355X) via the same split-op dispatch.
 def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     return (
-        is_cuda()
-        and (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
+        (is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph())
         and forward_batch.forward_mode.is_extend_without_speculative()
     )
 

@@ -21,7 +21,9 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     GRAPH_WEIGHTS_PROJ_LORA_ERROR,
     _is_in_piecewise_or_breakable_cuda_graph,
     bcg_dsa_indexer_prefill_split,
+    logits_head_gate_graph,
     pcg_dsa_indexer_prefill_split,
+    scale_head_gate_graph,
 )
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
@@ -139,11 +141,6 @@ if _is_cuda:
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
     )
-    from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
-        logits_head_gate_graph,
-        scale_head_gate_graph,
-    )
-
     @register_custom_op(mutates_args=["topk_indices"])
     @register_split_op()
     def broadcast_indexer_topk_from_rank0_(topk_indices: torch.Tensor) -> None:
