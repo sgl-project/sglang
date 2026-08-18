@@ -544,6 +544,8 @@ class TransformersBase(nn.Module):
             "model.score.": "classifier.",
             "model.classifier.": "classifier.",
             "transformer.": "model.",
+            "gpt_neox.": "model.",
+            "embed_out.": "lm_head.",
             "model.": "model.",
             "lm_head.": "lm_head.",
             "score.": "classifier.",
