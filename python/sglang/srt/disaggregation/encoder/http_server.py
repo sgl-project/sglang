@@ -45,6 +45,13 @@ from sglang.srt.managers.io_struct import (
     wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_observability,
+    get_parallel,
+    get_serving,
+    publish,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     add_prometheus_middleware,
@@ -199,11 +206,14 @@ def launch_server(server_args: ServerArgs):
     global dp_dispatcher, encoder, encoder_scheduler, local_runtime, send_sockets
 
     configure_logger(server_args, prefix=" encode_server")
-    if server_args.dp_size > 1:
+    # Publish before the launch path reads configuration; each encoder built
+    # below re-projects the same object in its process.
+    publish(server_args, role="encoder")
+    if get_parallel().dp_size > 1:
         dp_dispatcher = launch_dp_runtime(server_args)
         # runtime initializes multiprocess metrics before spawning;
         # HTTP only exposes their endpoint.
-        if server_args.enable_metrics:
+        if get_observability().enable_metrics:
             add_prometheus_middleware(app)
     else:
         local_runtime = launch_local_runtime(server_args)
@@ -212,17 +222,17 @@ def launch_server(server_args: ServerArgs):
         encoder = local_runtime.encoder
         encoder_scheduler = local_runtime.scheduler
         send_sockets = local_runtime.send_sockets
-        if server_args.enable_metrics:
+        if get_observability().enable_metrics:
             add_prometheus_middleware(app)
 
     # Register this encoder's URL with prefill server(s) if configured.
-    if server_args.encoder_register_urls:
+    if get_disagg().encoder_register_urls:
         import atexit
 
         _register_encoder_url_with_bootstrap(server_args)
         atexit.register(_unregister_encoder_url_from_bootstrap, server_args)
 
-    uvicorn.run(app, host=server_args.host, port=server_args.port)
+    uvicorn.run(app, host=get_serving().host, port=get_serving().port)
 
 
 def _summarise_dp_broadcast(results: List[dict]) -> Response:

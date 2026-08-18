@@ -51,13 +51,20 @@ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalSta
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_precompile_model_kernels_after_loading,
 )
-from sglang.srt.model_loader import get_model
+from sglang.srt.model_loader import get_model as load_model
 from sglang.srt.multimodal.encoder_preprocessing import (
     get_encoder_preprocessed_items,
     resolve_encoder_media_processor_config,
 )
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
-from sglang.srt.runtime_context import get_disagg, get_exec, get_mm, publish
+from sglang.srt.runtime_context import (
+    get_device,
+    get_disagg,
+    get_exec,
+    get_mm,
+    get_model,
+    publish,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import configure_media_url_security
 from sglang.srt.utils.network import (
@@ -442,13 +449,15 @@ class MMEncoder:
         ``base_gpu_id + rank`` — the DP launcher's per-worker placement. It is
         this instance's value, not a config change, so it travels as an
         argument."""
+        # The DP and TP encoder workers are spawned, so this constructor is
+        # the first publish in those processes.
+        publish(server_args, role="encoder")
         logger.info(f"init MMEncoder {rank}/{server_args.tp_size}")
         self.server_args = server_args
         configure_media_url_security(
-            server_args.allowed_media_domains,
+            get_mm().allowed_media_domains,
             server_args.media_url_max_file_size_mb,
         )
-        publish(server_args, role="encoder")
         self.transfer_backend = get_disagg().encoder_transfer_backend
         self.use_mooncake = self.transfer_backend == "mooncake"
         self.rank = rank
@@ -461,7 +470,7 @@ class MMEncoder:
             server_args,
         )
         self.load_config = LoadConfig(
-            load_format=server_args.load_format,
+            load_format=get_model().load_format,
             download_dir=server_args.download_dir,
             model_loader_extra_config=server_args.model_loader_extra_config,
             remote_instance_weight_loader_seed_instance_ip=server_args.remote_instance_weight_loader_seed_instance_ip,
@@ -472,7 +481,7 @@ class MMEncoder:
             self.model_config.hf_config, "model_type", "unknown"
         ).lower()
 
-        self.device = server_args.device
+        self.device = get_device().device
         self.gpu_id = server_args.base_gpu_id + rank if gpu_id is None else gpu_id
 
         self.device_config = DeviceConfig(
@@ -492,7 +501,7 @@ class MMEncoder:
         initialize_model_parallel(tensor_model_parallel_size=server_args.tp_size)
         initialize_dp_attention(server_args, self.model_config)
 
-        self.model = get_model(
+        self.model = load_model(
             model_config=self.model_config,
             load_config=self.load_config,
             device_config=self.device_config,

@@ -49,6 +49,12 @@ from sglang.srt.observability.trace import (
     process_tracing_init,
     trace_set_thread_info,
 )
+from sglang.srt.runtime_context import (
+    configured_tp_size,
+    get_observability,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, random_uuid, set_prometheus_multiproc_dir
 from sglang.srt.utils.common import maybe_reindex_device_id
@@ -1379,14 +1385,14 @@ async def run_dp_worker(
         gpu_id=gpu_id,
     )
 
-    if server_args.enable_metrics:
+    if get_observability().enable_metrics:
         set_prometheus_multiproc_dir()
         labels = {
-            "model_name": server_args.served_model_name,
+            "model_name": get_serving().served_model_name,
             "dp_rank": str(dp_rank),
         }
-        if server_args.extra_metric_labels:
-            labels.update(server_args.extra_metric_labels)
+        if get_observability().extra_metric_labels:
+            labels.update(get_observability().extra_metric_labels)
         server_module.encoder_metrics_collector = EncoderMetricsCollector(labels)
         enc.dp_rank = dp_rank
 
@@ -1485,45 +1491,45 @@ def launch_local_runtime(server_args: ServerArgs) -> EncoderRuntime:
     This function owns backend construction only.  HTTP/gRPC middleware,
     service registration, and network serving remain Transport concerns.
     """
-    if server_args.dp_size > 1:
+    if get_parallel().dp_size > 1:
         raise ValueError(
             "launch_local_runtime requires --dp-size 1; got "
-            f"dp_size={server_args.dp_size}."
+            f"dp_size={get_parallel().dp_size}."
         )
 
     # Set up prometheus metrics.
-    if server_args.enable_metrics:
+    if get_observability().enable_metrics:
         set_prometheus_multiproc_dir()
         labels = {
-            "model_name": server_args.served_model_name,
+            "model_name": get_serving().served_model_name,
             "dp_rank": "0",
         }
-        if server_args.extra_metric_labels:
-            labels.update(server_args.extra_metric_labels)
+        if get_observability().extra_metric_labels:
+            labels.update(get_observability().extra_metric_labels)
         server_module.encoder_metrics_collector = EncoderMetricsCollector(labels)
 
     process_context = mp.get_context("spawn")
     zmq_context = zmq.Context(10)
     ipc_path_prefix = random_uuid()
     port_args = PortArgs.init_new(server_args)
-    if server_args.dist_init_addr:
-        dist_init_method = NetworkAddress.parse(server_args.dist_init_addr).to_tcp()
+    if get_parallel().dist_init_addr:
+        dist_init_method = NetworkAddress.parse(get_parallel().dist_init_addr).to_tcp()
     else:
         dist_init_method = NetworkAddress(
-            server_args.host or "127.0.0.1", port_args.nccl_port
+            get_serving().host or "127.0.0.1", port_args.nccl_port
         ).to_tcp()
 
-    if server_args.enable_trace:
+    if get_observability().enable_trace:
         process_tracing_init(
-            server_args.otlp_traces_endpoint,
+            get_observability().otlp_traces_endpoint,
             "sglang",
-            trace_modules=server_args.trace_modules,
+            trace_modules=get_observability().trace_modules,
         )
         trace_set_thread_info("Encoder")
 
     send_sockets: List[zmq.Socket] = []
     tp_processes: List[mp.Process] = []
-    for rank in range(1, server_args.tp_size):
+    for rank in range(1, configured_tp_size()):
         schedule_path = f"ipc:///tmp/{ipc_path_prefix}_schedule_{rank}"
         send_sockets.append(
             get_zmq_socket(zmq_context, zmq.PUSH, schedule_path, bind=False)
@@ -1563,17 +1569,17 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
     HTTP uses this entry point today.  gRPC can reuse it later without
     importing HTTP application state or Uvicorn.
     """
-    if server_args.dp_size <= 1 or server_args.tp_size != 1:
+    if get_parallel().dp_size <= 1 or server_args.tp_size != 1:
         raise ValueError(
             "Encoder DP mode requires --dp-size > 1 and --tp-size 1; got "
-            f"dp_size={server_args.dp_size}, tp_size={server_args.tp_size}."
+            f"dp_size={get_parallel().dp_size}, tp_size={server_args.tp_size}."
         )
-    dp_size = server_args.dp_size
+    dp_size = get_parallel().dp_size
     logger.info(f"Launching encoder in DP mode: dp_size={dp_size}")
 
     # DP mode: workers (subprocesses) write metrics to the shared multiproc dir;
     # the main process exposes the aggregated /metrics endpoint.
-    if server_args.enable_metrics:
+    if get_observability().enable_metrics:
         set_prometheus_multiproc_dir()
 
     ctx = mp.get_context("spawn")
@@ -1624,7 +1630,7 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
             process.start()
         worker_processes.append(process)
 
-    labels = {"model_name": server_args.served_model_name}
+    labels = {"model_name": get_serving().served_model_name}
     if server_args.extra_metric_labels:
         labels.update(server_args.extra_metric_labels)
     return DPDispatcher(
@@ -1632,6 +1638,6 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
         dispatch_sockets,
         result_socket,
         worker_processes,
-        enable_metrics=server_args.enable_metrics,
+        enable_metrics=get_observability().enable_metrics,
         labels=labels,
     )

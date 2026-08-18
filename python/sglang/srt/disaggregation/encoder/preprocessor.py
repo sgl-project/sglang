@@ -28,7 +28,13 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     invoke_encoder_preprocessor,
 )
 from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_device,
+    get_mm,
+    get_model,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
@@ -117,7 +123,7 @@ class EncoderPreprocessor:
             model_config.hf_config, "model_type", "unknown"
         ).lower()
 
-        self.device = server_args.device
+        self.device = get_device().device
 
         use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
         self.use_image_processor_gpu = (
@@ -135,7 +141,7 @@ class EncoderPreprocessor:
             )
             if processor is not None or self._model_preprocessor is not None
         )
-        self._build_vision_config(server_args.mm_process_config)
+        self._build_vision_config(get_mm().mm_process_config)
         self.model_audio_sr = self._resolve_audio_sr()
         logger.info(f"Resolved model audio sample rate: {self.model_audio_sr} Hz")
 
@@ -161,7 +167,7 @@ class EncoderPreprocessor:
         )
         try:
             self.image_processor = AutoImageProcessor.from_pretrained(
-                server_args.tokenizer_path or server_args.model_path,
+                get_serving().tokenizer_path or get_model().model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
                 **image_processor_kwargs,
@@ -172,7 +178,7 @@ class EncoderPreprocessor:
 
         try:
             self.video_processor = AutoVideoProcessor.from_pretrained(
-                server_args.tokenizer_path or server_args.model_path,
+                get_serving().tokenizer_path or get_model().model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
@@ -182,7 +188,7 @@ class EncoderPreprocessor:
 
         try:
             _audio_proc = AutoProcessor.from_pretrained(
-                server_args.tokenizer_path or server_args.model_path,
+                get_serving().tokenizer_path or get_model().model_path,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )

@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReq
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import Modality, Req
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
+from sglang.srt.runtime_context import get_disagg, get_exec, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.srt.utils.common import safe_pickle_loads
@@ -1722,7 +1723,7 @@ class MMReceiverBase(ABC):
         # context alive for the process instead of creating a temporary context
         # whose destruction also closes its per-request socket.
         self.scheduler_context = zmq.Context()
-        self.encoder_transfer_backend = server_args.encoder_transfer_backend
+        self.encoder_transfer_backend = get_disagg().encoder_transfer_backend
         # When ``encode_urls`` is shared with an :class:`EncoderBootstrapServer`
         # (tokenizer manager process), it grows / shrinks in place as encoders
         # register or unregister; the receiver always sees the current set.
@@ -1779,8 +1780,8 @@ class MMReceiverBase(ABC):
                 self.embeddings_engine = init_mooncake_transfer_engine(
                     hostname=self.host,
                     ib_device=(
-                        server_args.disaggregation_ib_device
-                        or server_args.mooncake_ib_device
+                        get_disagg().disaggregation_ib_device
+                        or get_exec().moe.mooncake_ib_device
                     ),
                 )
             pool_mb = envs.SGLANG_EMBEDDING_POOL_SIZE_MB.get()
@@ -1842,7 +1843,7 @@ class MMReceiverBase(ABC):
             extra_kwargs["tokenizer_backend"] = server_args.tokenizer_backend
 
         _processor = get_processor(
-            server_args.tokenizer_path,
+            get_serving().tokenizer_path,
             tokenizer_mode=server_args.tokenizer_mode,
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
@@ -2533,7 +2534,7 @@ class MMReceiverGrpc(MMReceiverBase):
         scheduler: Optional["Scheduler"] = None,
         encode_urls: Optional[List[str]] = None,
     ):
-        if server_args.encoder_transfer_backend == "mooncake":
+        if get_disagg().encoder_transfer_backend == "mooncake":
             # The RDMA receive path (WaitingRDMARequest + /meta + /send) only
             # exists for HTTP encoders; gRPC has no RDMA-capable receive.
             raise NotImplementedError(

@@ -39,6 +39,7 @@ from sglang.srt.multimodal.processors.mimo_audio import (
     MiMoAudioPipeline,
 )
 from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
+from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.common import download_remote_media
 from sglang.utils import logger
@@ -1588,7 +1589,7 @@ class MiMoV2Processor(BaseMultimodalProcessor):
             processor_config, "video_end_token_id"
         )
         self.use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
-        device = server_args.device if self.use_image_processor_gpu else None
+        device = get_device().device if self.use_image_processor_gpu else None
 
         self.mimo_processor = MiMoProcessor(
             tokenizer=self._processor.tokenizer,
