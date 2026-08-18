@@ -1,7 +1,7 @@
 from .mamba_ssm import PAD_SLOT_ID
-from .ssd_combined import mamba_chunk_scan_combined
 from .ssu_dispatch import (
     initialize_mamba_selective_state_update_backend,
+    mamba_chunk_scan_combined,
     selective_state_update,
 )
 

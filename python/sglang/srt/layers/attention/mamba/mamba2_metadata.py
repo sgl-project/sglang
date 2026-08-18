@@ -262,8 +262,12 @@ class Mamba2Metadata(ForwardMetadata):
         # We compute metadata for chunked prefill once at the top level model
         # forward and reuse them in mamba layers. If not needed, they will be
         # ignored inside mamba kernels.
+        from sglang.kernels.ops.mamba.triton_ops.ssu_dispatch import (
+            mamba_prefill_requires_chunk_metadata,
+        )
+
         chunk_offsets, chunk_indices = None, None
-        if prep_initial_states:
+        if prep_initial_states or mamba_prefill_requires_chunk_metadata():
             chunk_indices, chunk_offsets = (
                 cls._query_start_loc_to_chunk_indices_offsets(
                     query_start_loc, chunk_size, num_prefill_tokens
