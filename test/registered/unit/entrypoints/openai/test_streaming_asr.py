@@ -943,7 +943,7 @@ class TestStreamingASR(CustomTestCase):
                 )
                 state.audio.append_pcm(b"\x01\x00\x02\x00")
 
-                with self.assertRaisesRegex(RuntimeError, "no-boundary continuation"):
+                with self.assertRaisesRegex(RuntimeError, "ambiguous decoder-prefix"):
                     _process(processor, state)
 
     def test_no_boundary_reconcile_holds_back_characters(self):

@@ -608,16 +608,16 @@ class RealtimeASRProcessor:
                 text, step.decoder_prefix
             )
         if state.encoder_window_active and not decoder_prefix_replayed:
-            remainder, short_prefix_matched = suffix_state.trim_prefix_echo(
+            _, short_prefix_matched = suffix_state.trim_prefix_echo(
                 text, step.decoder_prefix, trim_short_prefix=True
             )
-            if short_prefix_matched and has_no_word_boundaries(remainder):
-                # Neither anchor confirmed the replay, and keeping it re-emits
-                # the echoed history one decode later; the one-way transition
-                # forbids a cumulative retry, so fail closed.
+            if short_prefix_matched:
+                # Neither anchor can distinguish prompt echo from repeated
+                # speech. Keeping it lets Local Agreement re-emit history;
+                # trimming it can delete speech, so append-only output must fail.
                 raise RuntimeError(
-                    "realtime ASR cannot reconcile a no-boundary continuation "
-                    "after encoder windowing is active"
+                    "realtime ASR cannot reconcile an ambiguous decoder-prefix "
+                    "replay after encoder windowing is active"
                 )
         if not state.encoder_window_active and not decoder_prefix_replayed:
             # The first continuation may replay only the un-emitted cumulative
