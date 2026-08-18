@@ -103,6 +103,7 @@ class Schedule(msgspec.Struct):
                 "routing-key",
                 "hrrn",
                 "shortest-prefill-first",
+                "uniboost",
             ],
         ),
     ] = "fcfs"

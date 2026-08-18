@@ -5757,6 +5757,10 @@ class Scheduler(
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
 
+        # UniBoost gamma-Ada: observe finished request latencies for the
+        # adaptive boost-gamma controller (no-op unless enabled).
+        self.policy.uniboost_record_finished(batch.reqs)
+
         self._record_step_counters(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
