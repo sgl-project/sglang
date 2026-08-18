@@ -31,32 +31,57 @@ _SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
 _DECLARED_FIELDS = frozenset(
     {
         "_speculative_draft_quantization_explicitly_set",
+        "cp_strategy",
         "custom_weight_loader",
         "debug_cuda_graph",
+        "deepep_mode",
         "detokenizer_worker_num",
+        "disable_cuda_graph",
+        "disaggregation_mode",
+        "dp_size",
+        "elastic_ep_initial_size",
         "enable_dp_attention_local_control_broadcast",
+        "enable_dp_lm_head",
         "enable_dynamic_batch_tokenizer",
         "enable_flashinfer_allreduce_fusion",
         "enable_flexkv",
+        "enable_hierarchical_cache",
         "enable_lmcache",
         "enable_lora",
+        "enable_page_major_kv_layout",
+        "enable_prefill_cp",
         "enable_prefill_delayer",
         "enable_return_hidden_states",
         "enable_tokenizer_batch_encode",
         "enable_torch_symm_mem",
+        "encoder_transfer_backend",
         "enforce_disable_flashinfer_allreduce_fusion",
         "enforce_shared_experts_fusion",
+        "ep_dispatch_algorithm",
+        "ep_join_mode",
+        "ep_size",
+        "eplb_algorithm",
         "expert_distribution_recorder_buffer_size",
+        "expert_distribution_recorder_mode",
         "grammar_backend",
         "hicache_ratio",
         "image_processor_backend",
+        "is_embedding",
         "keep_mm_feature_on_device",
+        "load_balance_method",
         "mm_feature_transport",
         "mm_process_config",
+        "moe_a2a_backend",
+        "moe_dp_size",
+        "moe_runner_backend",
+        "mooncake_ib_device",
         "optimistic_prefill_attempts",
+        "pp_size",
         "pre_warm_nccl",
+        "prefill_cp_mode",
         "prefill_delayer_max_delay_passes",
         "prefill_delayer_token_usage_low_watermark",
+        "prefill_only_disable_kv_cache",
         "random_seed",
         "remote_instance_weight_loader_start_seed_via_transfer_engine",
         "return_hidden_states_mode",
@@ -101,6 +126,10 @@ _SHAPES = (
     {"disaggregation_mode": "prefill"},
     {"enable_lora": True, "max_lora_rank": 16},
     {"kv_cache_dtype": "fp8_e4m3", "page_size": 64},
+    # A pass and a handler both decide this one: waterfill forces `deepep`
+    # and the ascend handler wants `none`. Without this shape nothing in
+    # the set reaches a field two writers disagree about.
+    {"enable_waterfill": True, "moe_a2a_backend": "ascend_tp"},
 )
 
 # Which converted fields the shapes above reach; the rest need a device or an
@@ -110,15 +139,23 @@ _REACHED_BY_SHAPES = frozenset(
     {
         "_speculative_draft_quantization_explicitly_set",
         "custom_weight_loader",
+        "disable_cuda_graph",
+        "dp_size",
         "enable_dp_attention_local_control_broadcast",
+        "enable_dp_lm_head",
         "enable_flashinfer_allreduce_fusion",
+        "encoder_transfer_backend",
         "enforce_disable_flashinfer_allreduce_fusion",
+        "ep_size",
         "expert_distribution_recorder_buffer_size",
         "grammar_backend",
         "hicache_ratio",
         "keep_mm_feature_on_device",
+        "load_balance_method",
         "mm_feature_transport",
         "mm_process_config",
+        "moe_a2a_backend",
+        "moe_dp_size",
         "random_seed",
         "return_hidden_states_mode",
         "schedule_conservativeness",
@@ -249,6 +286,73 @@ class TestResolutionDeclarations(CustomTestCase):
             [],
             "a declared field and its stash entry disagree, so something "
             "assigned the field behind the declaration:\n  " + "\n  ".join(mismatches),
+        )
+
+    def test_no_immediate_writer_overrides_a_deferred_one(self):
+        """A handler must not declare over a value a pass already decided.
+
+        Routing a bare write into the stash changed which writer wins: the
+        appended entry is replayed last, so a handler now beats a pass or a
+        registry entry that ran earlier -- where before, the pass's declaration
+        was applied on top of the handler's bare write. One handler was found
+        that way (it gated on the raw field while its neighbours read the
+        resolving view, so `--enable-waterfill --moe-a2a-backend ascend_tp`
+        silently stopped forcing `deepep`).
+
+        This is the invariant rather than that instance: walk the stash in
+        order and fail when an immediate writer declares a field whose previous
+        entry came from a deferred writer with a *different* value. The
+        deferred sources are derived from the live registries and the constant
+        override table, so a new pass is covered without being listed.
+        """
+        from sglang.srt.arg_groups import overrides
+
+        deferred = {
+            getattr(fn, "__qualname__", getattr(fn, "__name__", ""))
+            for fn in overrides.POST_PROCESS_PASSES
+        }
+        deferred |= {
+            getattr(fn, "__qualname__", getattr(fn, "__name__", ""))
+            for fns in overrides._MODEL_OVERRIDE_FNS.values()
+            for fn in fns
+        }
+        deferred |= {
+            getattr(fn, "__qualname__", getattr(fn, "__name__", ""))
+            for _predicate, fn in overrides._PREDICATE_OVERRIDE_FNS
+        }
+        # The constant arch -> {field: value} table is a deferred writer too --
+        # it has no callable, and its stash source is spelled by the collector
+        # (`MODEL_OVERRIDES[<arch>]`).
+        deferred |= {f"MODEL_OVERRIDES[{arch!r}]" for arch in overrides.MODEL_OVERRIDES}
+        self.assertGreater(
+            len(deferred), 40, "the deferred-writer set collapsed; nothing to compare"
+        )
+
+        inversions = []
+        for shape in _SHAPES:
+            server_args = self._resolve(shape)
+            decided_by = {}
+            for source, declared in getattr(server_args, "_resolved_overrides", []):
+                for field, value in declared.items():
+                    previous = decided_by.get(field)
+                    if (
+                        previous is not None
+                        and previous[0] in deferred
+                        and source not in deferred
+                        and previous[1] != value
+                    ):
+                        inversions.append(
+                            f"{shape} -> {field}: {previous[0]} decided "
+                            f"{previous[1]!r}, then {source} declared {value!r}"
+                        )
+                    decided_by[field] = (source, value)
+        self.assertEqual(
+            inversions,
+            [],
+            "a handler declared over a value a pass or a registry entry had "
+            "already decided; if the handler is meant to win, say so, and if "
+            "it is gating on the field, it has to read the resolving view:\n  "
+            + "\n  ".join(inversions),
         )
 
     def test_the_shapes_reach_the_fields_they_are_meant_to(self):

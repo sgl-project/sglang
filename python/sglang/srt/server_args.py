@@ -3926,7 +3926,10 @@ class ServerArgs:
             run_post_process_pass(self, _hrm_text_attention_force)
             self.chunked_prefill_size = -1
             self.disable_radix_cache = True
-            self.disable_cuda_graph = True
+            self._declare(
+                "_handle_model_capability_adjustments",
+                disable_cuda_graph=True,
+            )
             # cuda_graph_config was already parsed from the legacy boolean, so
             # flipping the boolean alone would not stop graph capture.
             self.cuda_graph_config.decode.backend = Backend.DISABLED
@@ -3958,7 +3961,10 @@ class ServerArgs:
             and embedding_model_spec.auto_enable_embedding
             and not self.is_embedding
         ):
-            self.is_embedding = True
+            self._declare(
+                "_handle_model_capability_adjustments",
+                is_embedding=True,
+            )
             logger.info(
                 "Embedding architecture detected: enabling embedding mode automatically."
             )
@@ -3974,7 +3980,10 @@ class ServerArgs:
             # named Gemma3TextModel. Marking it as embedding mode enables the
             # FlashAttention raw-K/V fast path, which does not write or read
             # the paged KV cache during its single prefill forward.
-            self.is_embedding = True
+            self._declare(
+                "_handle_model_capability_adjustments",
+                is_embedding=True,
+            )
             self.disable_radix_cache = True
             self.chunked_prefill_size = -1
             # Submit a list-valued embeddings request atomically so BCG can
@@ -3996,7 +4005,10 @@ class ServerArgs:
                 # tensors for a single embedding prefill. Enable its no-KV
                 # pool path before memory-pool sizing; an explicit non-FA
                 # backend retains the existing paged-KV behavior.
-                self.prefill_only_disable_kv_cache = True
+                self._declare(
+                    "_handle_model_capability_adjustments",
+                    prefill_only_disable_kv_cache=True,
+                )
                 self._validate_prefill_only_disable_kv_cache_args()
             self.cuda_graph_config.decode.backend = Backend.DISABLED
             if is_cuda() and self.cuda_graph_config.prefill.backend != Backend.DISABLED:
@@ -4114,10 +4126,13 @@ class ServerArgs:
             # - non-PD: round_robin
             # - PD prefill: follow_bootstrap_room
             # - PD decode: round_robin
-            self.load_balance_method = (
-                "follow_bootstrap_room"
-                if self.disaggregation_mode == "prefill"
-                else "round_robin"
+            self._declare(
+                "_handle_load_balance_method",
+                load_balance_method=(
+                    "follow_bootstrap_room"
+                    if self.disaggregation_mode == "prefill"
+                    else "round_robin"
+                ),
             )
             return
 
@@ -6616,12 +6631,21 @@ class ServerArgs:
             self.enable_prefill_context_parallel
             or self.enable_dsa_prefill_context_parallel
         ):
-            self.enable_prefill_cp = True
+            self._declare(
+                "_handle_legacy_cp_arguments",
+                enable_prefill_cp=True,
+            )
 
         if self.enable_prefill_context_parallel and self.cp_strategy is None:
-            self.cp_strategy = legacy_mode_to_strategy[self.prefill_cp_mode]
+            self._declare(
+                "_handle_legacy_cp_arguments",
+                cp_strategy=legacy_mode_to_strategy[self.prefill_cp_mode],
+            )
         if self.enable_dsa_prefill_context_parallel and self.cp_strategy is None:
-            self.cp_strategy = legacy_mode_to_strategy[self.dsa_prefill_cp_mode]
+            self._declare(
+                "_handle_legacy_cp_arguments",
+                cp_strategy=legacy_mode_to_strategy[self.dsa_prefill_cp_mode],
+            )
 
         if (
             self.enable_prefill_context_parallel
@@ -6642,7 +6666,10 @@ class ServerArgs:
         else:
             self.enable_prefill_context_parallel = True
         self.dsa_prefill_cp_mode = mode
-        self.prefill_cp_mode = mode
+        self._declare(
+            "_handle_legacy_cp_arguments",
+            prefill_cp_mode=mode,
+        )
 
     def _handle_context_parallelism(self):
         if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
@@ -6772,19 +6799,37 @@ class ServerArgs:
                 "recommended only with --disaggregation-mode prefill."
             )
 
-        self.dp_size = self.dwdp_size
+        self._declare(
+            "_handle_dwdp",
+            dp_size=self.dwdp_size,
+        )
         self.enable_dp_attention = True
         self._declare("_handle_dwdp", enable_dp_attention_local_control_broadcast=True)
-        self.enable_dp_lm_head = True
+        self._declare(
+            "_handle_dwdp",
+            enable_dp_lm_head=True,
+        )
         self.moe_dense_tp_size = 1
-        self.ep_size = self.dwdp_size
+        self._declare(
+            "_handle_dwdp",
+            ep_size=self.dwdp_size,
+        )
         self.moe_ep_size = self.dwdp_size
-        self.moe_dp_size = 1
-        self.moe_a2a_backend = "none"
+        self._declare(
+            "_handle_dwdp",
+            moe_dp_size=1,
+        )
+        self._declare(
+            "_handle_dwdp",
+            moe_a2a_backend="none",
+        )
 
         envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.set(True)
 
-        self.disable_cuda_graph = True
+        self._declare(
+            "_handle_dwdp",
+            disable_cuda_graph=True,
+        )
 
         logger.info(
             f"DWDP enabled: dwdp_size={self.dwdp_size}, "
@@ -7054,7 +7099,10 @@ class ServerArgs:
         if a2a_backend == "deepep":
             if self.moe_runner_backend == "flashinfer_cutedsl":
                 if self.deepep_mode == "auto":
-                    self.deepep_mode = "low_latency"
+                    self._declare(
+                        "_handle_a2a_moe",
+                        deepep_mode="low_latency",
+                    )
                     logger.warning(
                         "Forcing --deepep-mode low_latency: flashinfer_cutedsl "
                         "FP4 MoE has no DeepEP normal-dispatch handler, so "
@@ -7073,11 +7121,15 @@ class ServerArgs:
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
-        if (
-            self.moe_a2a_backend == "none" and is_npu()
-        ) or self.moe_a2a_backend == "ascend_tp":
+        # The resolving view, not the field: `_a2a_backend_overrides` may have
+        # moved this already (waterfill forces `deepep`).
+        a2a_now = resolved_view(self).moe_a2a_backend
+        if (a2a_now == "none" and is_npu()) or a2a_now == "ascend_tp":
             # FIXME (OrangeRedeng): for some reasons if pass "ascend_tp" accuracy drops to zero
-            self.moe_a2a_backend = "none"
+            self._declare(
+                "_handle_a2a_moe",
+                moe_a2a_backend="none",
+            )
 
         if self.moe_a2a_backend == "flashinfer":
             assert (
@@ -7101,7 +7153,10 @@ class ServerArgs:
 
         if a2a_backend == "mori":
             if self.deepep_mode == "auto":
-                self.deepep_mode = "normal"
+                self._declare(
+                    "_handle_a2a_moe",
+                    deepep_mode="normal",
+                )
                 logger.warning("auto set deepep_mode=`normal` for MORI EP")
 
             # Check chunked prefill for mori
@@ -7123,7 +7178,10 @@ class ServerArgs:
                     "set --deepep-mode to 'low_latency' or 'auto'."
                 )
             if self.deepep_mode == "auto":
-                self.deepep_mode = "low_latency"
+                self._declare(
+                    "_handle_a2a_moe",
+                    deepep_mode="low_latency",
+                )
                 logger.warning("auto set deepep_mode=`low_latency` for PPLX EP")
             # pplx-kernels' AllToAll needs numDPGroups (== attention dp_size) > 1;
             # without DP attention numDPGroups == 1 and construction fails deep in
@@ -7141,7 +7199,10 @@ class ServerArgs:
                 "deep_gemm (or auto)."
             )
             if self.moe_runner_backend == "auto":
-                self.moe_runner_backend = "deep_gemm"
+                self._declare(
+                    "_handle_a2a_moe",
+                    moe_runner_backend="deep_gemm",
+                )
                 logger.warning("auto set moe_runner_backend=`deep_gemm` for PPLX EP")
 
             # Check per-rank dispatch tokens for pplx
@@ -7169,7 +7230,10 @@ class ServerArgs:
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
-            self.expert_distribution_recorder_mode = "stat"
+            self._declare(
+                "_handle_eplb_and_dispatch",
+                expert_distribution_recorder_mode="stat",
+            )
             logger.warning(
                 "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
             )
@@ -7181,8 +7245,11 @@ class ServerArgs:
         if (self.enable_eplb or (self.init_expert_location != "trivial")) and (
             self.ep_dispatch_algorithm is None
         ):
-            self.ep_dispatch_algorithm = (
-                "dynamic" if needs_rank_invariant_dispatch else "static"
+            self._declare(
+                "_handle_eplb_and_dispatch",
+                ep_dispatch_algorithm=(
+                    "dynamic" if needs_rank_invariant_dispatch else "static"
+                ),
             )
 
         # `dynamic` / `fake` switch to the row-index pick; `static` reads a
@@ -7207,7 +7274,10 @@ class ServerArgs:
                 logger.warning(
                     "--elastic-ep-rejoin is deprecated, use --elastic-ep-join-mode recover instead."
                 )
-                self.ep_join_mode = "recover"
+                self._declare(
+                    "_handle_elastic_ep",
+                    ep_join_mode="recover",
+                )
             else:
                 assert self.ep_join_mode == "recover", (
                     "--elastic-ep-rejoin (deprecated) conflicts with "
@@ -7216,7 +7286,10 @@ class ServerArgs:
         if self.elastic_ep_backend is not None:
             if self.enable_eplb:
                 if self.eplb_algorithm == "auto":
-                    self.eplb_algorithm = "elasticity_aware"
+                    self._declare(
+                        "_handle_elastic_ep",
+                        eplb_algorithm="elasticity_aware",
+                    )
                 assert self.eplb_algorithm in [
                     "elasticity_aware",
                     "elasticity_aware_hierarchical",
@@ -7225,8 +7298,11 @@ class ServerArgs:
             assert self.pp_size == 1, "PP size should be set to 1 under elastic EP"
 
             if self.elastic_ep_backend == "mooncake":
-                self.mooncake_ib_device = self._validate_ib_devices(
-                    self.mooncake_ib_device
+                self._declare(
+                    "_handle_elastic_ep",
+                    mooncake_ib_device=self._validate_ib_devices(
+                        self.mooncake_ib_device
+                    ),
                 )
         if self.ep_join_mode is not None:
             assert (
@@ -7308,7 +7384,10 @@ class ServerArgs:
                     )
             else:
                 if self.elastic_ep_initial_size is None:
-                    self.elastic_ep_initial_size = self.tp_size
+                    self._declare(
+                        "_handle_elastic_ep",
+                        elastic_ep_initial_size=self.tp_size,
+                    )
                 assert self.elastic_ep_initial_size == self.tp_size, (
                     "The primary --elastic-ep-initial-size must equal its "
                     f"launch-time TP size ({self.tp_size})."
@@ -7394,7 +7473,10 @@ class ServerArgs:
         if self.should_report_expert_balancedness() and (
             self.expert_distribution_recorder_mode is None
         ):
-            self.expert_distribution_recorder_mode = "stat"
+            self._declare(
+                "_handle_expert_distribution_metrics",
+                expert_distribution_recorder_mode="stat",
+            )
 
         if self.expert_distribution_recorder_buffer_size is None:
             if (x := self.eplb_rebalance_num_iterations) is not None:
@@ -7940,8 +8022,11 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
         if self.encoder_transfer_backend == "auto":
-            self.encoder_transfer_backend = resolve_encoder_transfer_backend(
-                self.encoder_transfer_backend, model_arch, self.tp_size
+            self._declare(
+                "_handle_encoder_disaggregation",
+                encoder_transfer_backend=resolve_encoder_transfer_backend(
+                    self.encoder_transfer_backend, model_arch, self.tp_size
+                ),
             )
             if self.encoder_only or self.language_only:
                 logger.info(
@@ -8572,7 +8657,10 @@ class ServerArgs:
         # enabling it implies --enable-page-major-kv-layout — routing it through the
         # single page-major path + stride-aware Triton asserts (set before the guard).
         if self.enable_unified_memory:
-            self.enable_page_major_kv_layout = True
+            self._declare(
+                "_handle_page_major_kv_layout",
+                enable_page_major_kv_layout=True,
+            )
         if not self.enable_page_major_kv_layout:
             return
         # Only the Triton attention kernels read the strided 4-D envelope K/V
@@ -8685,7 +8773,10 @@ class ServerArgs:
                 logger.warning(
                     "Hierarchical cache is disabled because of using diffusion LLM inference"
                 )
-                self.enable_hierarchical_cache = False
+                self._declare(
+                    "_handle_dllm_inference",
+                    enable_hierarchical_cache=False,
+                )
             if self.enable_lmcache:
                 logger.warning(
                     "LMCache is disabled because of using diffusion LLM inference"
@@ -8701,7 +8792,10 @@ class ServerArgs:
             logger.warning(
                 "Pipeline parallelism is disabled because of using diffusion LLM inference"
             )
-            self.pp_size = 1
+            self._declare(
+                "_handle_dllm_inference",
+                pp_size=1,
+            )
 
         if self.enable_lora:
             logger.warning(
@@ -8713,7 +8807,10 @@ class ServerArgs:
             logger.warning(
                 "Currently disaggregation is not supported by diffusion LLM inference."
             )
-            self.disaggregation_mode = "null"
+            self._declare(
+                "_handle_dllm_inference",
+                disaggregation_mode="null",
+            )
 
         if self.enable_mixed_chunk:
             logger.warning(
