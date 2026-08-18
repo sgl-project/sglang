@@ -501,7 +501,10 @@ class AccuracyEngine:
             shard_rank = shard_context.rank if shard_context is not None else rank
             # TP-sharded params must load via their own weight_loader; the
             # generic narrow mis-slices fused QKV/gate_up projections.
-            if shard_world_size > 1 and load_param_with_weight_loader(
+            needs_weight_loader = (
+                shard_world_size > 1 or tensor.shape != src_tensor.shape
+            )
+            if needs_weight_loader and load_param_with_weight_loader(
                 tensor, name, lookup, reverse_mapping
             ):
                 matched += 1
