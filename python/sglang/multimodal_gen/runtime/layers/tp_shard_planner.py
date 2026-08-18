@@ -151,9 +151,7 @@ def parse_workload(workload: Optional[str]) -> Optional[int]:
     try:
         width, height = int(parts[0]), int(parts[1])
     except ValueError as e:
-        raise ValueError(
-            f"Invalid --dit-tp-plan-workload {workload!r}: {e}"
-        ) from None
+        raise ValueError(f"Invalid --dit-tp-plan-workload {workload!r}: {e}") from None
     return width * height
 
 
@@ -168,7 +166,7 @@ class TPShardPlan:
     source: str = "default"
 
     @classmethod
-    def load(cls, spec: Optional[str], workload: Optional[str]) -> "TPShardPlan":
+    def load(cls, spec: Optional[str], workload: Optional[str]) -> TPShardPlan:
         area = parse_workload(workload)
         if not spec or spec in _PLAN_MODES:
             return cls(mode=spec or PLAN_AUTO, workload_area=area, source="mode")
@@ -225,7 +223,9 @@ class TPShardPlanner:
             )
         return scheme
 
-    def decide_ffn(self, *, model_family: str, branch: str, prefix: str = "") -> ShardScheme:
+    def decide_ffn(
+        self, *, model_family: str, branch: str, prefix: str = ""
+    ) -> ShardScheme:
         return self.decide(
             role="ffn", model_family=model_family, branch=branch, prefix=prefix
         )

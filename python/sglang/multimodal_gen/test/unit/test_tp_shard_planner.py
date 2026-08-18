@@ -79,8 +79,7 @@ class TestMeasuredRules:
         # (model, branch) pairs must never get a speculative layout.
         planner = _planner(tp_size=2)
         assert (
-            planner.decide_ffn(model_family="flux", branch="text")
-            is ShardScheme.SHARD
+            planner.decide_ffn(model_family="flux", branch="text") is ShardScheme.SHARD
         )
 
 
@@ -100,9 +99,7 @@ class TestModesAndOverrides:
         )
 
     def test_plan_rule_overrides_registry(self):
-        planner = _planner(
-            tp_size=2, rules={"*.txt_mlp": ShardScheme.SHARD}
-        )
+        planner = _planner(tp_size=2, rules={"*.txt_mlp": ShardScheme.SHARD})
         assert (
             planner.decide_ffn(
                 model_family="qwen_image",
@@ -113,9 +110,7 @@ class TestModesAndOverrides:
         )
 
     def test_plan_rule_can_replicate_unmeasured_model(self):
-        planner = _planner(
-            tp_size=2, rules={"*.ff_context": ShardScheme.REPLICATE}
-        )
+        planner = _planner(tp_size=2, rules={"*.ff_context": ShardScheme.REPLICATE})
         assert (
             planner.decide_ffn(
                 model_family="flux",
@@ -128,16 +123,12 @@ class TestModesAndOverrides:
     def test_attn_out_is_structurally_sharded(self):
         planner = _planner(tp_size=2)
         assert (
-            planner.decide(
-                role="attn_out", model_family="qwen_image", branch="image"
-            )
+            planner.decide(role="attn_out", model_family="qwen_image", branch="image")
             is ShardScheme.SHARD
         )
 
     def test_plan_rule_rejects_unsupported_scheme(self):
-        planner = _planner(
-            tp_size=2, rules={"*.to_out*": ShardScheme.REPLICATE}
-        )
+        planner = _planner(tp_size=2, rules={"*.to_out*": ShardScheme.REPLICATE})
         with pytest.raises(ValueError, match="only supports"):
             planner.decide(
                 role="attn_out",
