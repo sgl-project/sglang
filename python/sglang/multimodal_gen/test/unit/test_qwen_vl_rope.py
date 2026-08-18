@@ -57,15 +57,15 @@ def test_qwen_vl_rope_supports_transformers_v5_config(monkeypatch):
         "base": 1_000_000.0,
         "is_neox_style": True,
         "rope_scaling": rope_parameters,
-        "deterministic": False,
     }
 
 
 def test_qwen_vl_rope_does_not_require_srt_runtime_context(monkeypatch):
     def fail_get_exec():
-        raise AssertionError("Qwen-VL RoPE must not read the SRT exec context")
+        raise AssertionError("Qwen-VL RoPE must not read an unpublished context")
 
     monkeypatch.setattr(rope_base, "get_exec", fail_get_exec)
+    monkeypatch.setattr(rope_base, "publish_role", lambda: None)
     monkeypatch.setattr(rope_factory, "_ROPE_DICT", {})
     config = SimpleNamespace(
         head_dim=None,
@@ -86,7 +86,6 @@ def test_qwen_vl_rope_does_not_require_srt_runtime_context(monkeypatch):
 
     rotated_query, rotated_key = rotary_emb.forward_native(positions, query, key)
 
-    assert rotary_emb.deterministic is False
     assert rotated_query.shape == query.shape
     assert rotated_key.shape == key.shape
 

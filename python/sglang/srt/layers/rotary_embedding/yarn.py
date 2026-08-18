@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Tuple
 
 import torch
 
@@ -85,7 +85,6 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         truncate: bool = True,
         mscale: float = None,
         mscale_all_dim: float = None,
-        deterministic: Optional[bool] = None,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -106,13 +105,7 @@ class YaRNScalingRotaryEmbedding(RotaryEmbedding):
         self.mscale *= attn_factor
 
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            dtype,
-            deterministic=deterministic,
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:

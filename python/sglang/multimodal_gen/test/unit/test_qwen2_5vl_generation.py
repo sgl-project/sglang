@@ -95,10 +95,9 @@ def test_native_vision_reuses_srt_modules():
         mlp = Qwen2_5_VLMLP(
             16,
             24,
-            deterministic_activation=True,
             fuse_gate_up=False,
         )
-        fused_mlp = Qwen2_5_VLMLP(16, 24, deterministic_activation=True)
+        fused_mlp = Qwen2_5_VLMLP(16, 24)
 
     assert isinstance(model.patch_embed, Qwen2_5_VisionPatchEmbed)
     assert isinstance(model.merger, Qwen2_5_VisionPatchMerger)

@@ -139,7 +139,6 @@ class Qwen2_5_VLMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
-        deterministic_activation: Optional[bool] = None,
         fuse_gate_up: bool = True,
         tp_size: Optional[int] = None,
         tp_rank: Optional[int] = None,
@@ -219,7 +218,7 @@ class Qwen2_5_VLMLP(nn.Module):
             )
         self.hidden_act = hidden_act
         if self.fuse_gate_up and self.hidden_act == "silu":
-            self.act = SiluAndMul(deterministic=deterministic_activation)
+            self.act = SiluAndMul()
         elif not self.fuse_gate_up:
             self.act = ACT2FN[self.hidden_act]
         else:
@@ -333,7 +332,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         prefix: str = "",
         use_data_parallel: bool = False,
         cast_x_before_out_mul: bool = False,
-        deterministic_norm: bool = False,
+        force_native_norm: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
@@ -342,7 +341,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
             context_dim,
             eps=1e-6,
             cast_x_before_out_mul=cast_x_before_out_mul,
-            deterministic=deterministic_norm,
+            force_native=force_native_norm,
         )
         tp_size = 1 if use_data_parallel else get_parallel().tp_size
         tp_rank = 0 if use_data_parallel else get_parallel().tp_rank

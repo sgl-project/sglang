@@ -70,7 +70,7 @@ def _make_text_rms_norm(hidden_size: int, eps: float) -> RMSNorm:
         hidden_size,
         eps=eps,
         cast_x_before_out_mul=True,
-        deterministic=True,
+        force_native=True,
     )
 
 

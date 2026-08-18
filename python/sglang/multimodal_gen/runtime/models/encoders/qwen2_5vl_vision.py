@@ -35,13 +35,13 @@ class Qwen2_5VLVisionBlock(nn.Module):
             config.hidden_size,
             eps=1e-6,
             cast_x_before_out_mul=True,
-            deterministic=True,
+            force_native=True,
         )
         self.norm2 = RMSNorm(
             config.hidden_size,
             eps=1e-6,
             cast_x_before_out_mul=True,
-            deterministic=True,
+            force_native=True,
         )
         self.attn = QwenVLVisionAttention(
             config,
@@ -54,7 +54,6 @@ class Qwen2_5VLVisionBlock(nn.Module):
             bias=True,
             hidden_act=config.hidden_act,
             prefix=f"visual.blocks.{layer_idx}.mlp",
-            deterministic_activation=True,
             fuse_gate_up=False,
         )
 
@@ -188,7 +187,7 @@ class Qwen2_5VLVisionTransformer(nn.Module):
             spatial_merge_size=config.spatial_merge_size,
             prefix="visual.merger",
             cast_x_before_out_mul=True,
-            deterministic_norm=True,
+            force_native_norm=True,
         )
 
     @property

@@ -361,7 +361,7 @@ class Qwen2_5_VLDecoderLayer(nn.Module):
         norm_kwargs = dict(
             eps=config.rms_norm_eps,
             cast_x_before_out_mul=True,
-            deterministic=True,
+            force_native=True,
         )
         self.input_layernorm = RMSNorm(config.hidden_size, **norm_kwargs)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, **norm_kwargs)
@@ -449,7 +449,7 @@ class Qwen2_5_VLTextModel(nn.Module):
             config.hidden_size,
             eps=config.rms_norm_eps,
             cast_x_before_out_mul=True,
-            deterministic=True,
+            force_native=True,
         )
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import torch
 
 import sglang.multimodal_gen.runtime.models.encoders.qwen3 as qwen3
+import sglang.srt.layers.activation as srt_activation
 from sglang.multimodal_gen.runtime.models.encoders.qwen3 import Qwen3ForCausalLM
 from sglang.srt.layers.activation import SiluAndMul
 
@@ -29,6 +30,12 @@ class _IdentityNorm(torch.nn.Module):
 
 
 def test_mlp_reuses_srt_activation_without_server_context(monkeypatch):
+    def fail_get_exec():
+        raise AssertionError("SiluAndMul must not read an unpublished context")
+
+    monkeypatch.setattr(srt_activation, "publish_role", lambda: None)
+    monkeypatch.setattr(srt_activation, "get_exec", fail_get_exec)
+
     def make_linear(*_args, **_kwargs):
         return torch.nn.Identity()
 

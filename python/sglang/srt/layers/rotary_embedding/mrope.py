@@ -65,16 +65,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         mrope_section: Optional[List[int]] = None,
         mrope_interleaved: bool = False,
         mrope_interleaved_glm: bool = False,
-        deterministic: Optional[bool] = None,
     ) -> None:
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            dtype,
-            deterministic=deterministic,
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
         self.mrope_section = mrope_section
         self.mrope_interleaved = mrope_interleaved
@@ -138,7 +131,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.register_buffer("axis_map", axis_map, persistent=False)
         else:
             self.axis_map = None
-        if self.deterministic:
+        if self._force_native:
             self._forward_method = self.forward_native
 
     def get_cos_sin_with_position(self, positions):
@@ -441,7 +434,6 @@ class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
         beta_fast: int = 32,
         beta_slow: int = 1,
         truncate: bool = True,
-        deterministic: Optional[bool] = None,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -459,7 +451,6 @@ class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
             dtype,
             mrope_section=mrope_section,
             mrope_interleaved=mrope_interleaved,
-            deterministic=deterministic,
         )
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
@@ -511,7 +502,6 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
         dtype: torch.dtype,
         mrope_section: Optional[List[int]] = None,
         mrope_interleaved: bool = False,
-        deterministic: Optional[bool] = None,
     ) -> None:
         super().__init__(
             head_size,
@@ -522,7 +512,6 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
             dtype,
             mrope_section=mrope_section,
             mrope_interleaved=mrope_interleaved,
-            deterministic=deterministic,
         )
         self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(apply_rotary_emb)
 

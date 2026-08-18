@@ -354,7 +354,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         mscale: float = 1,
         mscale_all_dim: float = 0,
         device: Optional[str] = None,
-        deterministic: Optional[bool] = None,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.extrapolation_factor = extrapolation_factor
@@ -372,13 +371,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         self.sin_cached = None
         self.device = device if device is not None else get_device()
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            dtype,
-            deterministic=deterministic,
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
         if _is_hip:
             self._forward_method = self.forward_native
@@ -555,21 +548,13 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
         low_freq_factor: float,
         high_freq_factor: float,
         orig_max_position: int,
-        *,
-        deterministic: Optional[bool] = None,
     ) -> None:
         self.scaling_factor = scaling_factor
         self.low_freq_factor = low_freq_factor
         self.high_freq_factor = high_freq_factor
         self.orig_max_position = orig_max_position
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            dtype,
-            deterministic=deterministic,
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
@@ -605,17 +590,9 @@ class Llama4VisionRotaryEmbedding(RotaryEmbedding):
         base: int,
         is_neox_style: bool,
         dtype: torch.dtype,
-        *,
-        deterministic: Optional[bool] = None,
     ):
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            dtype,
-            deterministic=deterministic,
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
@@ -678,18 +655,10 @@ class DynamicNTKAlphaRotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         scaling_alpha: float,
         dtype: torch.dtype,
-        *,
-        deterministic: Optional[bool] = None,
     ) -> None:
         self.scaling_alpha = scaling_alpha
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            dtype,
-            deterministic=deterministic,
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
@@ -884,18 +853,10 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
         is_neox_style: bool,
         scaling_factor: float,
         dtype: torch.dtype,
-        *,
-        deterministic: Optional[bool] = None,
     ) -> None:
         self.scaling_factor = scaling_factor
         super().__init__(
-            head_size,
-            rotary_dim,
-            max_position_embeddings,
-            base,
-            is_neox_style,
-            dtype,
-            deterministic=deterministic,
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
@@ -932,8 +893,6 @@ class Gemma4RotaryEmbedding(RotaryEmbedding):
         base: float,
         is_neox_style: bool,
         dtype: torch.dtype,
-        *,
-        deterministic: Optional[bool] = None,
     ) -> None:
         # Store angles before calling super().__init__
         # rotary_dim is already scaled by partial_rotary_factor in get_rope
@@ -948,7 +907,6 @@ class Gemma4RotaryEmbedding(RotaryEmbedding):
             base,
             is_neox_style,
             dtype,
-            deterministic=deterministic,
         )
 
     def _compute_inv_freq(self, base: float) -> torch.Tensor:
