@@ -92,6 +92,14 @@ def _empty_f32(device: torch.device) -> torch.Tensor:
 
 # Split-K accumulators are per-step internal scratch. Reuse them across calls
 # with the same geometry: fixed addresses are also CUDA-graph friendly.
+#
+# This module-global cache is only a fallback for standalone callers (tests,
+# benchmarks): it keeps one (b + num_sm_parts)-row FP32 pair per geometry
+# forever, which across a CUDA-graph capture sweep (one entry per captured
+# batch size) holds hundreds of MiB of dead weight, and two runners sharing
+# a geometry would race on the same tensors.  Production callers (the DSV4
+# attention backend) pass their own per-runner workspace via
+# ``split_accum_buffers`` instead.
 _SCRATCH: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
@@ -111,6 +119,45 @@ def _get_scratch(b: int, s_q: int, h_q: int, device: torch.device, head_dim_v: i
         cached = (lse_accum, o_accum)
         _SCRATCH[key] = cached
     return cached
+
+
+def _slice_accum_buffers(
+    lse_arena: torch.Tensor,
+    o_arena: torch.Tensor,
+    total_num_splits: int,
+    b: int,
+    s_q: int,
+    h_q: int,
+    head_dim_v: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prefix-slice a caller-owned split-K workspace for one call.
+
+    Every batch size only ever touches accumulator rows ``[0, b + parts)``, so
+    a single arena sized for the largest batch serves all smaller batches as a
+    prefix slice — one stable allocation instead of one per geometry.
+    """
+    if lse_arena.dtype != torch.float32 or o_arena.dtype != torch.float32:
+        raise ValueError("split_accum_buffers must be float32 tensors")
+    if lse_arena.device != device or o_arena.device != device:
+        raise ValueError("split_accum_buffers must live on the query device")
+    if lse_arena.ndim != 3 or o_arena.ndim != 4:
+        raise ValueError(
+            "split_accum_buffers must be (rows, s_q, h_q) and "
+            "(rows, s_q, h_q, head_dim_v)"
+        )
+    if lse_arena.shape[0] < total_num_splits or o_arena.shape[0] < total_num_splits:
+        raise ValueError(
+            f"split_accum_buffers need at least {total_num_splits} rows "
+            f"(batch {b} + sm parts), got {lse_arena.shape[0]}"
+        )
+    if lse_arena.shape[1:] != (s_q, h_q) or o_arena.shape[1:] != (s_q, h_q, head_dim_v):
+        raise ValueError(
+            f"split_accum_buffers trailing dims must be ({s_q}, {h_q}) and "
+            f"({s_q}, {h_q}, {head_dim_v}), got {lse_arena.shape[1:]} and "
+            f"{o_arena.shape[1:]}"
+        )
+    return lse_arena[:total_num_splits], o_arena[:total_num_splits]
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +214,7 @@ def flash_mla_with_kvcache_dsv4_mxfp4(
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    split_accum_buffers: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run fused SM90 DeepSeek-V4 sparse decode on an MXFP4 KV cache.
 
@@ -178,6 +226,14 @@ def flash_mla_with_kvcache_dsv4_mxfp4(
 
     Scheduler tensors are allocated on first call and cached in
     ``tile_scheduler_metadata`` for CUDA-graph replay.
+
+    ``split_accum_buffers`` optionally supplies a caller-owned split-K
+    workspace ``(lse_accum_rows, o_accum_rows)`` sized for the caller's
+    largest batch (``batch + num_sm_parts`` rows); each call prefix-slices
+    it.  Passing it avoids the module-global per-geometry scratch cache —
+    required from long-lived runners so a CUDA-graph capture sweep does not
+    pin one accumulator pair per captured batch size, and so two runners
+    never share scratch tensors.
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -289,7 +345,20 @@ def flash_mla_with_kvcache_dsv4_mxfp4(
     # what matters — the cached scratch and metadata buffers provide it.
     out = torch.empty((b, s_q, h_q, head_dim_v), dtype=torch.bfloat16, device=device)
     lse = torch.empty((b, s_q, h_q), dtype=torch.float32, device=device)
-    lse_accum, o_accum = _get_scratch(b, s_q, h_q, device, head_dim_v)
+    total_num_splits = b + num_sm_parts
+    if split_accum_buffers is not None:
+        lse_accum, o_accum = _slice_accum_buffers(
+            split_accum_buffers[0],
+            split_accum_buffers[1],
+            total_num_splits,
+            b,
+            s_q,
+            h_q,
+            head_dim_v,
+            device,
+        )
+    else:
+        lse_accum, o_accum = _get_scratch(b, s_q, h_q, device, head_dim_v)
 
     _get_dispatch()(
         q,

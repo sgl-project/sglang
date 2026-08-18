@@ -357,6 +357,144 @@ def test_flashmla_dsv4_mxfp4_dual_source_correctness(
 
 @pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
 @torch.inference_mode()
+def test_flashmla_dsv4_mxfp4_caller_accum_workspace_bounds_vram() -> None:
+    """A caller-supplied split-K workspace must replace the module-global
+    per-geometry scratch.
+
+    The global cache pinned one (batch + sm parts)-row FP32 accumulator pair
+    per geometry forever: a stock CUDA-graph capture sweep (one entry per
+    captured batch size) left ~0.5 GiB resident at h_q=64 (~0.85 GiB at
+    h_q=128) per runner, and two runners sharing a geometry would race on
+    the same tensors.  A runner-sized arena prefix-sliced per batch pins one
+    allocation instead; every batch size only touches accumulator rows
+    [0, batch + parts), so all captured graphs share the arena's base
+    address and replays stay correct.
+    """
+    native = _require_native()
+    assert FlashMLASchedMeta is not None
+    from sglang.kernels.ops.attention.mxfp4_dsv4_decode_sm90 import (
+        _SCRATCH,
+        _num_sm_parts,
+    )
+
+    h_q = 64
+    num_sm_parts = _num_sm_parts(1, 1, h_q, torch.device("cuda"))
+    capture_bs = [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512]
+    rows = capture_bs[-1] + num_sm_parts
+    lse_arena = torch.empty((rows, 1, h_q), dtype=torch.float32, device="cuda")
+    o_arena = torch.empty((rows, 1, h_q, _HEAD_DIM), dtype=torch.float32, device="cuda")
+
+    # Lean sweep fixtures: one max-batch cache/query sliced per batch (no
+    # dequantized reference — that FP32 copy would dwarf the scratch being
+    # measured).
+    quantize, _ = _require_codec()
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device).manual_seed(20260818)
+    max_capacity = capture_bs[-1] * _SWA_TOPK
+    raw = torch.zeros(
+        (max_capacity // _SWA_PAGE_SIZE, _SWA_PAGE_SIZE * MXFP4_BYTES_PER_TOKEN),
+        dtype=torch.uint8,
+        device=device,
+    )
+    src = (
+        torch.randn(
+            (max_capacity, _HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=gen,
+        )
+        / 10
+    )
+    quantize(
+        cache_k=src,
+        kv_buffer=raw,
+        loc=torch.arange(max_capacity, dtype=torch.int32, device=device),
+        page_size=_SWA_PAGE_SIZE,
+    )
+    del src
+    kv = raw.view(-1, _SWA_PAGE_SIZE, 1, MXFP4_BYTES_PER_TOKEN)
+    q_max = (
+        torch.randn(
+            (capture_bs[-1], 1, h_q, _HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=gen,
+        )
+        / 10
+    )
+    indices_max = torch.arange(max_capacity, dtype=torch.int32, device=device).view(
+        capture_bs[-1], 1, _SWA_TOPK
+    )
+
+    _SCRATCH.clear()
+    for b in capture_bs:
+        out, lse = native(
+            q=q_max[:b],
+            k_cache=kv,
+            indices=indices_max[:b],
+            topk_length=None,
+            attn_sink=None,
+            tile_scheduler_metadata=FlashMLASchedMeta(),
+            head_dim_v=_HEAD_DIM,
+            split_accum_buffers=(lse_arena, o_arena),
+        )
+        assert bool(torch.isfinite(out).all()) and bool(torch.isfinite(lse).all())
+
+    # The caller-owned arena fully replaces the module-global scratch: the
+    # sweep over 15 captured batch sizes leaves it empty.  The default path
+    # (no buffers — standalone callers) pins one accumulator pair per
+    # geometry instead, which is exactly the unbounded accumulation the
+    # arena exists to avoid (~440 MiB of FP32 across this sweep at h_q=64).
+    assert not _SCRATCH
+    for b in (2, 8, 32):
+        native(
+            q=q_max[:b],
+            k_cache=kv,
+            indices=indices_max[:b],
+            topk_length=None,
+            attn_sink=None,
+            tile_scheduler_metadata=FlashMLASchedMeta(),
+            head_dim_v=_HEAD_DIM,
+        )
+    assert len(_SCRATCH) == 3
+    _SCRATCH.clear()
+
+    # Same arena, second sweep: results identical to the global-scratch path
+    # (the prefix slicing must not change numerics), and the arena tensors
+    # are reused, not reallocated.
+    out_ref, _ = _run_native(
+        native, _build_case(h_q=h_q, batch_size=8), FlashMLASchedMeta()
+    )
+    case8 = _build_case(h_q=h_q, batch_size=8)
+    out_arena, _ = native(
+        q=case8.q,
+        k_cache=case8.kv,
+        indices=case8.indices,
+        topk_length=case8.topk_length,
+        attn_sink=case8.attn_sink,
+        tile_scheduler_metadata=FlashMLASchedMeta(),
+        head_dim_v=_HEAD_DIM,
+        softmax_scale=case8.sm_scale,
+        split_accum_buffers=(lse_arena, o_arena),
+    )
+    torch.testing.assert_close(out_arena, out_ref, atol=_OUTPUT_ATOL, rtol=_OUTPUT_RTOL)
+
+    # An undersized or wrong-shaped arena must fail loudly, never truncate
+    # silently.
+    with pytest.raises(ValueError, match="rows"):
+        native(
+            q=case8.q,
+            k_cache=case8.kv,
+            indices=case8.indices,
+            topk_length=case8.topk_length,
+            attn_sink=case8.attn_sink,
+            tile_scheduler_metadata=FlashMLASchedMeta(),
+            split_accum_buffers=(lse_arena[:4], o_arena[:4]),
+        )
+
+
+@pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
+@torch.inference_mode()
 def test_flashmla_dsv4_mxfp4_multirequest_parts_no_deadlock() -> None:
     """Batches larger than the SM-part count used to deadlock the GPU.
 

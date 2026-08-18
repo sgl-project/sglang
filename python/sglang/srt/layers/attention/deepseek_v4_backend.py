@@ -590,6 +590,22 @@ class DeepseekV4AttnBackend(
         # Tracks whether the last call was inside a CUDA-graph capture, to
         # detect the start of a new capture session (see forward()).
         self._mxfp4_capture_active = False
+        # Split-K accumulator workspace for the MXFP4 fused decode, owned by
+        # this runner (never the module-global scratch in the op): one
+        # prefix-sliced arena per query-head count, sized for the largest
+        # decode batch this runner can produce.  A capture sweep then pins
+        # one arena instead of one accumulator pair per captured batch size
+        # (~0.5 GiB at h_q=64 on a stock capture list), and two runners
+        # sharing a process never race on the same scratch tensors.
+        draft_factor = self.speculative_num_draft_tokens or 1
+        self._mxfp4_accum_bcap = (
+            max(1, model_runner.server_args.max_running_requests or 1) * draft_factor
+        )
+        # h_q -> (lse rows, s_q, h_q) / (rows, s_q, h_q, d_v) float32 arenas.
+        self._mxfp4_accum_arenas: dict = {}
+        # Superseded arenas stay referenced until shutdown: CUDA graphs
+        # captured against them keep recording their addresses.
+        self._mxfp4_accum_retired: list = []
         self.online_c128_mtp = OnlineC128MTPController(self)
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
@@ -1774,6 +1790,42 @@ class DeepseekV4AttnBackend(
 
         raise NotImplementedError("ragged attention")
 
+    def _mxfp4_decode_accum_arena(self, h_q: int, b: int) -> tuple:
+        """(lse, o) split-K arena for the MXFP4 decode at ``h_q`` heads.
+
+        Rows are sized for ``max(batch capacity, current batch) + sm parts``;
+        every smaller batch prefix-slices the same allocation, so addresses
+        stay CUDA-graph stable without one accumulator pair per batch size.
+        An oversized batch (eager fallback beyond the configured capacity)
+        grows the arena; the previous one is retired but kept referenced, as
+        already-captured graphs still address it.
+        """
+        from sglang.kernels.ops.attention.mxfp4_dsv4_decode_sm90 import _num_sm_parts
+
+        arena = self._mxfp4_accum_arenas.get(h_q)
+        num_sm_parts = _num_sm_parts(b, 1, h_q, self.device)
+        rows_needed = max(b, self._mxfp4_accum_bcap) + num_sm_parts
+        if arena is None or arena[0].shape[0] < rows_needed:
+            if arena is not None:
+                logger.warning(
+                    "MXFP4 decode batch %d exceeds the accumulator arena "
+                    "(%d rows, capacity %d); reallocating",
+                    b,
+                    arena[0].shape[0],
+                    self._mxfp4_accum_bcap,
+                )
+                self._mxfp4_accum_retired.append(arena)
+            arena = (
+                torch.empty(
+                    (rows_needed, 1, h_q), dtype=torch.float32, device=self.device
+                ),
+                torch.empty(
+                    (rows_needed, 1, h_q, 512), dtype=torch.float32, device=self.device
+                ),
+            )
+            self._mxfp4_accum_arenas[h_q] = arena
+        return arena
+
     def _forward_mxfp4_decode_flashmla(
         self,
         q: torch.Tensor,
@@ -1864,6 +1916,7 @@ class DeepseekV4AttnBackend(
             extra_k_cache=extra_cache_4d,
             extra_indices_in_kvcache=extra_indices_3d,
             extra_topk_length=extra_lengths,
+            split_accum_buffers=self._mxfp4_decode_accum_arena(h_q, bs),
         )
         return o.squeeze(1)
 
