@@ -1114,6 +1114,20 @@ impl MetricsRegistry {
     /// read `admission_wait` as queue time and silently redefining it would
     /// misreport every one of them.
     ///
+    /// Two scope limits worth knowing before reading the number:
+    ///
+    /// ADMITTED REQUESTS ONLY. `acquire` returns `Err` for a request shed
+    /// because the wait queue is at its depth cap, so it never reaches this
+    /// marker. Under sustained saturation the histogram therefore samples the
+    /// survivors — the sheds are counted by
+    /// `sgl_router_backpressure_rejected_total`, not timed here.
+    ///
+    /// FIRST SELECTION ONLY. The plain-mode retry loop reselects a worker and
+    /// claims a fresh slot on a retryable dispatch failure, but that happens
+    /// after this marker, so re-selection cost lands in
+    /// `sgl_router_dispatch_seconds` instead. A fleet where retries are common
+    /// therefore shows selection cost split across the two.
+    ///
     /// Uses [`ADMISSION_WAIT_BUCKETS`] — it contains the parking wait, so it
     /// needs that grid's tall top, not the phase ladder's 5 s.
     pub fn observe_admit(&self, model_id: &str, seconds: f64) {
@@ -1170,10 +1184,13 @@ impl MetricsRegistry {
     /// `sgl_router_retries_exhausted_total` and the response counters.
     ///
     /// SPANS RETRIES. The marker sits after the retry loop, so one sample covers
-    /// every attempt plus backoff, not a single connect. That is the honest
-    /// number for TTFT attribution — the client waited for all of it — but it
-    /// means a retried request inflates this histogram's tail. Read it against
-    /// `sgl_router_retries_total` before concluding the engine got slower.
+    /// every attempt plus backoff, not a single connect — and, because the loop
+    /// reselects a worker per attempt, the re-selection cost that
+    /// `sgl_router_admit_seconds` stops measuring after the first claim. That is
+    /// the honest number for TTFT attribution — the client waited for all of it
+    /// — but it means a retried request inflates this histogram's tail. Read it
+    /// against `sgl_router_retries_total` before concluding the engine got
+    /// slower.
     ///
     /// Uses [`TTFT_OVERHEAD_BUCKETS`], not [`ROUTER_PHASE_BUCKETS`]: under engine
     /// saturation this parks for seconds and needs the tall grid.
@@ -1694,7 +1711,7 @@ impl MetricsRegistry {
 
         // admit histogram
         out.push_str(
-            "# HELP sgl_router_admit_seconds Worker selection (prompt hashing, radix-tree walk, oracle consult, candidate scoring) plus slot claim and any parking, in seconds; the admission term of sgl_router_ttft_overhead_seconds. Strict superset of sgl_router_admission_wait_seconds, which sees only requests that parked.\n",
+            "# HELP sgl_router_admit_seconds Worker selection (prompt hashing, radix-tree walk, oracle consult, candidate scoring) plus slot claim and any parking, in seconds; the admission term of sgl_router_ttft_overhead_seconds. Strict superset of sgl_router_admission_wait_seconds, which sees only requests that parked. Admitted requests only (sheds are counted by sgl_router_backpressure_rejected_total), and first selection only (retry re-selection lands in sgl_router_dispatch_seconds).\n",
         );
         out.push_str("# TYPE sgl_router_admit_seconds histogram\n");
         let guard = self.admit_seconds.lock();
