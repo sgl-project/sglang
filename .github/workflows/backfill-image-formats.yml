@@ -88,17 +88,18 @@ jobs:
             echo ""
             echo "=== $(date '+%H:%M:%S') ${image_ref} ==="
 
-            # Verify OCI base exists
-            if ! skopeo inspect "docker://${image_ref}" >/dev/null 2>&1; then
+            # Verify OCI base exists. docker manifest inspect uses docker's
+            # credential store (docker login) and does not require skopeo.
+            if ! docker manifest inspect "${image_ref}" >/dev/null 2>&1; then
               echo "  ERROR: base image not found: ${image_ref}"
               return 1
             fi
             local oci_digest
-            oci_digest=$(skopeo inspect "docker://${image_ref}" | jq -r '.Digest')
+            oci_digest=$(docker manifest inspect "${image_ref}" | jq -r '.config.digest // empty')
             echo "  OCI digest: ${oci_digest}"
 
             # zstd: pull then re-export with zstd compression (same as CI zstd step)
-            if skopeo inspect "docker://${image_ref}-zstd" >/dev/null 2>&1; then
+            if docker manifest inspect "${image_ref}-zstd" >/dev/null 2>&1; then
               echo "  [zstd] already exists"
             else
               echo "  [zstd] backfilling..."
@@ -115,7 +116,7 @@ jobs:
             fi
 
             # nydus: nydusify convert (same as CI nydus step)
-            if skopeo inspect "docker://${image_ref}-nydus" >/dev/null 2>&1; then
+            if docker manifest inspect "${image_ref}-nydus" >/dev/null 2>&1; then
               echo "  [nydus] already exists"
             else
               echo "  [nydus] backfilling..."
