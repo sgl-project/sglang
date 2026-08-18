@@ -533,6 +533,22 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # UniBoost tail-aware prefill admission boosting (--schedule-policy uniboost).
+    # Boost decay rate gamma (1/s); <= 0 falls back to fcfs.
+    SGLANG_UNIBOOST_GAMMA = EnvFloat(10.0)
+    # Estimated prefill cost per uncached prompt token, in microseconds.
+    SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN = EnvFloat(64.0)
+    # Allow uniboost with tp_size > 1 (experimental; see schedule_policy.py).
+    SGLANG_UNIBOOST_ALLOW_TP = EnvBool(False)
+    # gamma-Ada: adapt gamma online to the observed latency-tail shape.
+    SGLANG_UNIBOOST_GAMMA_ADA = EnvBool(False)
+    SGLANG_UNIBOOST_GAMMA_MIN = EnvFloat(1.0)
+    SGLANG_UNIBOOST_GAMMA_MAX = EnvFloat(200.0)
+    SGLANG_UNIBOOST_GAMMA_ADA_INTERVAL_S = EnvFloat(5.0)
+    SGLANG_UNIBOOST_GAMMA_ADA_WINDOW = EnvInt(2000)
+    SGLANG_UNIBOOST_GAMMA_ADA_MIN_SAMPLES = EnvInt(200)
+    SGLANG_UNIBOOST_GAMMA_ADA_BETA = EnvFloat(0.3)
+    SGLANG_UNIBOOST_TAIL_SENSITIVITY = EnvFloat(4.0)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output

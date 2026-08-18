@@ -26,9 +26,12 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 """Request scheduler policy"""
 
+import math
 import os
 import random
-from collections import Counter, defaultdict
+import threading
+import time
+from collections import Counter, defaultdict, deque
 from contextlib import contextmanager
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
@@ -39,6 +42,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
     Req,
     ScheduleBatch,
     split_cached_prefix_by_tier,
@@ -61,7 +65,7 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
     UnifiedMambaTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -135,6 +139,198 @@ def estimate_prefill_extend_tile_metrics(
     }
 
 
+class GammaAdaController:
+    """Online estimator for the UniBoost boost parameter ``gamma`` (gamma-Ada).
+
+    Watches the observed end-to-end response-time distribution and adapts
+    ``gamma`` to the workload's tail shape, so the scheduler need not have a
+    per-workload gamma tuned by hand:
+
+    * a **heavy** tail (a few requests far slower than the p95 body) means
+      shortest-job-first-style boosting helps, so gamma is pushed **down**
+      toward ``gamma_min`` (more SJF);
+    * a **light/flat** tail (p99 close to p95) means reordering buys little and
+      FCFS best protects the tail, so gamma is pushed **up** toward
+      ``gamma_max``.
+
+    The tail shape is summarized by the log-linear slope of the response-time
+    CDF over the paper's ``[t95, t99]`` band. With ``r = t99 / t95 >= 1`` the
+    excess ``r - 1`` is the slope proxy (0 for a flat tail, growing as the
+    tail fattens); a heavier tail implies a smaller target gamma via
+
+        target = gamma_max / (1 + tail_sensitivity * max(r - 1, 0)).
+
+    The target is EMA-smoothed into the live gamma so the control loop cannot
+    oscillate. Pure and side-effect free apart from its own ring buffer, so it
+    is unit-testable without a scheduler or GPU.
+
+    Threading model (async refit, off the scheduler's critical path):
+
+    * ``record()`` runs on the scheduler thread and is a single bounded
+      ``deque.append`` -- O(1), lock-free, GIL-atomic in CPython;
+    * ``start()`` spawns one daemon thread that wakes every ``interval_s``
+      seconds and does the percentile scan + EMA re-fit there;
+    * the scheduler only *reads* ``self.gamma`` -- a plain float attribute
+      load, atomic in CPython -- so the hot path takes no locks and does no
+      percentile math. ``self.gamma = ...`` in the refit thread is likewise a
+      single attribute store, so readers see either the old or the new float,
+      never a torn value.
+    """
+
+    __slots__ = (
+        "gamma",
+        "gamma_min",
+        "gamma_max",
+        "beta",
+        "tail_sensitivity",
+        "interval_s",
+        "min_samples",
+        "refit_count",
+        "_samples",
+        "_last_update_t",
+        "_thread",
+        "_stop_event",
+    )
+
+    def __init__(
+        self,
+        *,
+        gamma_init: float,
+        gamma_min: float = 1.0,
+        gamma_max: float = 200.0,
+        beta: float = 0.3,
+        tail_sensitivity: float = 4.0,
+        interval_s: float = 5.0,
+        window: int = 2000,
+        min_samples: int = 200,
+    ) -> None:
+        # gamma_min must stay strictly positive: b_gamma divides by gamma.
+        self.gamma_min = max(float(gamma_min), 1e-6)
+        self.gamma_max = max(float(gamma_max), self.gamma_min)
+        self.gamma = min(max(float(gamma_init), self.gamma_min), self.gamma_max)
+        self.beta = min(max(float(beta), 0.0), 1.0)
+        self.tail_sensitivity = max(float(tail_sensitivity), 0.0)
+        self.interval_s = max(float(interval_s), 0.0)
+        self.min_samples = max(int(min_samples), 1)
+        self._samples = deque(maxlen=max(int(window), self.min_samples))
+        self._last_update_t = 0.0
+        self.refit_count = 0
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    def record(self, latency_s: float) -> None:
+        """Record one completed request's end-to-end latency (seconds).
+
+        Scheduler-thread hot path: a single bounded ``deque.append`` (O(1),
+        no lock; safe against the refit thread under the GIL).
+        """
+        if latency_s > 0.0:
+            self._samples.append(float(latency_s))
+
+    # -- async refit thread (keeps percentile math off the scheduler) -------
+
+    def start(self) -> None:
+        """Start the background refit daemon thread. Idempotent."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="uniboost-gamma-ada", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self, timeout: float = 2.0) -> None:
+        """Stop the background refit thread (used by tests; daemon otherwise)."""
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+        self._thread = None
+
+    def _run(self) -> None:
+        # Wait *first* so startup never refits an empty window; a non-positive
+        # interval still yields a short sleep instead of a busy loop.
+        wait_s = self.interval_s if self.interval_s > 0.0 else 0.05
+        while not self._stop_event.wait(wait_s):
+            try:
+                self._refit_once()
+            except Exception:
+                logger.exception(
+                    "UniBoost gamma-Ada refit failed; keeping gamma=%.4g",
+                    self.gamma,
+                )
+
+    @staticmethod
+    def _percentile(sorted_vals, q: float) -> float:
+        """Linear-interpolated percentile q in [0,1] over a sorted list."""
+        n = len(sorted_vals)
+        if n == 1:
+            return sorted_vals[0]
+        pos = q * (n - 1)
+        lo = int(pos)
+        hi = min(lo + 1, n - 1)
+        frac = pos - lo
+        return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+
+    def _target_gamma(self) -> float:
+        # sorted(deque) snapshots in one C call, so concurrent appends from
+        # the scheduler thread cannot interleave mid-copy under the GIL.
+        vals = sorted(self._samples)
+        t95 = self._percentile(vals, 0.95)
+        t99 = self._percentile(vals, 0.99)
+        if t95 <= 0.0:
+            return self.gamma_max
+        ratio = t99 / t95
+        excess = ratio - 1.0 if ratio > 1.0 else 0.0
+        target = self.gamma_max / (1.0 + self.tail_sensitivity * excess)
+        if target < self.gamma_min:
+            return self.gamma_min
+        if target > self.gamma_max:
+            return self.gamma_max
+        return target
+
+    def _refit_once(self):
+        """One percentile scan + EMA re-fit; runs on the refit thread.
+
+        Returns the new (EMA-smoothed, clamped) gamma, or ``None`` when fewer
+        than ``min_samples`` latencies have been observed (clean no-op).
+        """
+        if len(self._samples) < self.min_samples:
+            return None
+        target = self._target_gamma()
+        gamma = (1.0 - self.beta) * self.gamma + self.beta * target
+        # Stay strictly positive and in range regardless of float drift.
+        if gamma < self.gamma_min:
+            gamma = self.gamma_min
+        elif gamma > self.gamma_max:
+            gamma = self.gamma_max
+        # Single attribute store: atomic for scheduler-thread readers.
+        self.gamma = gamma
+        self.refit_count += 1
+        logger.info(
+            "UniBoost gamma-Ada refit #%d: gamma=%.4g /s (target %.4g, n=%d)",
+            self.refit_count,
+            gamma,
+            target,
+            len(self._samples),
+        )
+        return gamma
+
+    def maybe_update(self, now: float):
+        """Synchronous, interval-gated re-fit with an explicit clock.
+
+        Kept for tests and manual driving; the production path is the
+        ``start()`` daemon thread, whose wake cadence provides the interval.
+        Returns the new gamma when it updates, else ``None``.
+        """
+        if now - self._last_update_t < self.interval_s:
+            return None
+        if len(self._samples) < self.min_samples:
+            return None
+        self._last_update_t = now
+        return self._refit_once()
+
+
 def match_prefix_for_req(
     tree_cache: BasePrefixCache,
     req: Req,
@@ -202,6 +398,7 @@ class CacheAwarePolicy(Enum):
 
     LPM = "lpm"  # longest prefix match
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
+    UNIBOOST = "uniboost"  # tail-aware admission boosting (UniBoost)
 
 
 class CacheAgnosticPolicy(Enum):
@@ -234,6 +431,16 @@ class SchedulePolicy:
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
 
+        # UniBoost (tail-aware admission boosting) state; inert unless the
+        # schedule policy is "uniboost".
+        self.uniboost_gamma = envs.SGLANG_UNIBOOST_GAMMA.get()
+        self.uniboost_alpha_s_per_token = (
+            envs.SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN.get() / 1e6
+        )
+        self.uniboost_gamma_controller: Optional[GammaAdaController] = None
+        if self.policy == CacheAwarePolicy.UNIBOOST:
+            self._init_uniboost()
+
     def calc_priority(
         self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
     ) -> None:
@@ -259,6 +466,14 @@ class SchedulePolicy:
             return
 
         if isinstance(policy, CacheAwarePolicy):
+            if policy == CacheAwarePolicy.UNIBOOST:
+                self._refresh_uniboost_gamma()
+                if not self.tree_cache.disable:
+                    # Populates req.num_matched_prefix_tokens for the
+                    # cache-aware effective-work estimate.
+                    self._compute_prefix_matches(waiting_queue, policy)
+                self._sort_by_uniboost(waiting_queue)
+                return
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
             )
@@ -302,6 +517,10 @@ class SchedulePolicy:
         try:
             policy_enum = CacheAwarePolicy(policy)
             if getattr(tree_cache, "disable", True):
+                if policy_enum == CacheAwarePolicy.UNIBOOST:
+                    # UniBoost still works without a prefix cache: every
+                    # prompt token counts as uncached work.
+                    return policy_enum
                 # If tree_cache is disabled, using CacheAgnosticPolicy policy
                 return CacheAgnosticPolicy.FCFS
             return policy_enum
@@ -439,6 +658,139 @@ class SchedulePolicy:
                 x.time_stats.wait_queue_entry_time,
             )
         )
+
+    # ------------------------------------------------------------------
+    # UniBoost (tail-aware admission boosting, ICML'26 "beyond prediction")
+    # ------------------------------------------------------------------
+    def _init_uniboost(self) -> None:
+        """Validate/arm UniBoost; falls back to fcfs when unsafe or misconfigured."""
+        tp_size = get_global_server_args().tp_size
+        if tp_size > 1 and not envs.SGLANG_UNIBOOST_ALLOW_TP.get():
+            logger.warning(
+                "UniBoost is disabled for tp_size=%s: the boost priority mixes "
+                "per-rank wall-clock arrival stamps with request-dependent "
+                "offsets, so TP ranks could disagree on queue order and break "
+                "lockstep scheduling. Falling back to fcfs. Set "
+                "SGLANG_UNIBOOST_ALLOW_TP=1 to override (experimental).",
+                tp_size,
+            )
+            self.policy = CacheAgnosticPolicy.FCFS
+            return
+        if self.uniboost_gamma <= 0.0:
+            logger.warning(
+                "UniBoost requested but SGLANG_UNIBOOST_GAMMA=%s is not > 0; "
+                "falling back to fcfs",
+                self.uniboost_gamma,
+            )
+            self.policy = CacheAgnosticPolicy.FCFS
+            return
+        if envs.SGLANG_UNIBOOST_GAMMA_ADA.get():
+            self.uniboost_gamma_controller = GammaAdaController(
+                gamma_init=self.uniboost_gamma,
+                gamma_min=envs.SGLANG_UNIBOOST_GAMMA_MIN.get(),
+                gamma_max=envs.SGLANG_UNIBOOST_GAMMA_MAX.get(),
+                beta=envs.SGLANG_UNIBOOST_GAMMA_ADA_BETA.get(),
+                tail_sensitivity=envs.SGLANG_UNIBOOST_TAIL_SENSITIVITY.get(),
+                interval_s=envs.SGLANG_UNIBOOST_GAMMA_ADA_INTERVAL_S.get(),
+                window=envs.SGLANG_UNIBOOST_GAMMA_ADA_WINDOW.get(),
+                min_samples=envs.SGLANG_UNIBOOST_GAMMA_ADA_MIN_SAMPLES.get(),
+            )
+            # Percentile scans + refits happen on this daemon thread; the
+            # scheduler's critical path only appends samples and reads gamma.
+            self.uniboost_gamma_controller.start()
+        logger.info(
+            "UniBoost tail-aware admission boosting ENABLED: gamma=%.4g /s, "
+            "alpha=%.1f us/token, gamma-Ada=%s",
+            self.uniboost_gamma,
+            self.uniboost_alpha_s_per_token * 1e6,
+            "on" if self.uniboost_gamma_controller is not None else "off",
+        )
+
+    def _uniboost_boost_value(self, work_tokens: int) -> float:
+        """Soft priority boost b_gamma(w) in seconds (UniBoost).
+
+        ``b_gamma(w) = (1/gamma) * ln(1 / (1 - e^{-gamma w}))`` on the effective
+        work ``w = alpha * uncached_tokens`` (in seconds). Decreasing and convex
+        in w: large when little work remains (short jobs get pulled forward),
+        decaying to ~0 as work grows (long jobs drift back to their FCFS rank so
+        they are never starved).
+        """
+        w = self.uniboost_alpha_s_per_token * max(work_tokens, 0)
+        if w <= 0.0:
+            # No uncached work => maximal boost; clamp to a large finite value
+            # so the sort key stays orderable.
+            return 1e9
+        gamma = self.uniboost_gamma
+        gw = gamma * w
+        # 1 - e^{-gw} in (0, 1]; guard the tiny-gw underflow with expm1.
+        denom = -math.expm1(-gw)  # == 1 - e^{-gw}, accurate for small gw
+        if denom <= 0.0:
+            return 1e9
+        return -math.log(denom) / gamma
+
+    def _uniboost_priority(self, req: Req, now: float) -> float:
+        """Phi(i) = arrival_i - b_gamma(effective_work_i); lower = serve sooner."""
+        arrival = req.time_stats.wait_queue_entry_time or now
+        prompt_len = len(req.origin_input_ids) + len(req.output_ids)
+        # Cache-aware effective work: subtract the radix-matched prefix so a
+        # request whose prompt is mostly a cache hit is treated as short work
+        # (UniBoost cache extension w_tilde = max(w, s_pre - h)).
+        uncached = prompt_len - int(req.num_matched_prefix_tokens)
+        return arrival - self._uniboost_boost_value(uncached)
+
+    def _sort_by_uniboost(self, waiting_queue: List[Req]) -> None:
+        """Reorder the prefill waiting queue by tail-aware boost priority.
+
+        Sorts in place ahead of the PrefillAdder admission loop (which consumes
+        ``waiting_queue`` order). Recomputed each pass so a waiting request's
+        boost reflects the current clock and cache state.
+        """
+        if len(waiting_queue) < 2:
+            return
+        now = time.perf_counter()
+        waiting_queue.sort(key=lambda r: self._uniboost_priority(r, now))
+
+    def _refresh_uniboost_gamma(self) -> None:
+        """gamma-Ada: pick up the latest gamma computed by the refit thread.
+
+        Called once per prefill scheduling pass. This is a single float
+        attribute read (atomic in CPython) -- no locks and no percentile math
+        on the scheduler's critical path; the heavy lifting runs on the
+        controller's daemon thread (see GammaAdaController.start).
+        """
+        controller = self.uniboost_gamma_controller
+        if controller is None:
+            return
+        self.uniboost_gamma = controller.gamma
+
+    def uniboost_record_finished(self, reqs: List[Req]) -> None:
+        """gamma-Ada hook: record end-to-end latencies of finished requests.
+
+        Called from Scheduler.process_batch_result. Each request is recorded at
+        most once; aborted requests are excluded so cancellations do not skew
+        the tail estimate. No-op unless gamma-Ada is enabled. Recording is an
+        O(1) lock-free deque append per finished request; all percentile math
+        happens later on the controller's own refit thread.
+        """
+        controller = self.uniboost_gamma_controller
+        if controller is None:
+            return
+        now = time.perf_counter()
+        for req in reqs:
+            if not req.finished():
+                continue
+            if req.uniboost_latency_recorded:
+                continue
+            req.uniboost_latency_recorded = True
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                continue
+            arrival = req.time_stats.wait_queue_entry_time
+            if arrival <= 0.0:
+                continue
+            end = req.time_stats.completion_time
+            if end <= 0.0:
+                end = now
+            controller.record(end - arrival)
 
     @staticmethod
     def _sort_by_routing_key(

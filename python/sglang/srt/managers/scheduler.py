@@ -3943,6 +3943,10 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
+        # UniBoost gamma-Ada: observe finished request latencies for the
+        # adaptive boost-gamma controller (no-op unless enabled).
+        self.policy.uniboost_record_finished(batch.reqs)
+
         self._record_step_counters(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)

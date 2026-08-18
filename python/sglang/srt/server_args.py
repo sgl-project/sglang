@@ -837,6 +837,7 @@ class ServerArgs:
                 "lof",
                 "priority",
                 "routing-key",
+                "uniboost",
             ],
         ),
         NS("schedule"),
