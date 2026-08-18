@@ -583,7 +583,9 @@ class TransformersBase(nn.Module):
         self.skip_substrs: list[str] = []
         self.ignore_unexpected_prefixes: list[str] = []
         self.ignore_unexpected_suffixes: list[str] = []
-        self.skip_substrs.extend([".attn.bias", ".attn.masked_bias", ".masked_bias"])
+        self.skip_substrs.extend(
+            [".attn.bias", ".attn.masked_bias", ".attention.bias", ".masked_bias"]
+        )
         self.ignore_unexpected_prefixes.extend(["classifier.", "score."])
 
         if self.quant_config is not None:
