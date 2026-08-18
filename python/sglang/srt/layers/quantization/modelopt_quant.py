@@ -117,11 +117,12 @@ logger = logging.getLogger(__name__)
 def _sglang_fp4_gemm_fake(
     input: torch.Tensor,
     weight: torch.Tensor,
-    input_sf: torch.Tensor,
+    input_sf: Optional[torch.Tensor],
     weight_sf: torch.Tensor,
     alpha: torch.Tensor,
     out_dtype: torch.dtype,
     out_features: int,
+    quant_mode: str = "w4a4",
 ) -> torch.Tensor:
     M = input.shape[-2]
     N = int(out_features)
@@ -132,11 +133,12 @@ def _sglang_fp4_gemm_fake(
 def fp4_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
-    input_sf: torch.Tensor,
+    input_sf: Optional[torch.Tensor],
     weight_sf: torch.Tensor,
     alpha: torch.Tensor,
     out_dtype: torch.dtype,
     out_features: int,
+    quant_mode: str = "w4a4",
 ) -> torch.Tensor:
     if not enable_flashinfer_fp4_gemm:
         raise RuntimeError(
@@ -145,9 +147,23 @@ def fp4_gemm(
     fp4_backend = get_fp4_gemm_runner_backend()
     # Use the remapping logic to convert SGLang backend names to FlashInfer API names
     backend = fp4_backend.get_flashinfer_backend()
-    return flashinfer_fp4_gemm(
-        input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
-    )
+    if quant_mode == "w4a4":
+        return flashinfer_fp4_gemm(
+            input, weight, input_sf, weight_sf, alpha, out_dtype, backend=backend
+        )
+    elif quant_mode == "w4a16":
+        from flashinfer import mm_bf16_fp4
+
+        return mm_bf16_fp4(
+            input,
+            weight,
+            weight_sf,
+            alpha,
+            backend=backend,
+            out_dtype=out_dtype,
+        )
+    else:
+        raise ValueError(f"Unsupported FlashInfer FP4 GEMM quant mode: {quant_mode}")
 
 
 if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
@@ -1616,6 +1632,14 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
     def __init__(self, quant_config: ModelOptFp4Config):
         self.quant_config = quant_config
+        self.quant_mode = (
+            "w4a16"
+            if (
+                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
+                and get_fp4_gemm_runner_backend().is_flashinfer_cutedsl()
+            )
+            else "w4a4"
+        )
 
     def create_weights(
         self,
@@ -1710,6 +1734,22 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
+
+        if self.quant_mode == "w4a16":
+            from flashinfer import prepare_bf16_fp4_weights
+
+            weight, weight_scale, alpha = prepare_bf16_fp4_weights(
+                layer.weight,
+                swizzle_blockscale(layer.weight_scale),
+                weight_scale_2.reshape(1),
+                backend=get_fp4_gemm_runner_backend().get_flashinfer_backend(),
+            )
+            copy_or_rebind_param(layer, "weight", weight)
+            copy_or_rebind_param(layer, "weight_scale_interleaved", weight_scale)
+            copy_or_rebind_param(layer, "alpha", alpha)
+            return
+        elif self.quant_mode != "w4a4":
+            raise ValueError(f"Unsupported FP4 GEMM quant mode: {self.quant_mode}")
 
         # alpha / input_scale_inv stay as scalar Parameters. Aliasing them into
         # the [N_partitions] source slot breaks fused-QKV linears whose
@@ -1899,55 +1939,76 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        # `_accepts_prequantized_fp4` is the explicit opt-in so an accidental
-        # tuple from unrelated code can't silently bypass quantization.
-        if getattr(layer, "_accepts_prequantized_fp4", False) and isinstance(x, tuple):
-            x_fp4, x_scale_interleaved = x
-            x_m = x_fp4.shape[0]
-            output_dtype = layer.params_dtype
-        else:
-            # NVFP4_AWQ: apply the per-input-channel pre_quant_scale.
+        if self.quant_mode == "w4a4":
+            # `_accepts_prequantized_fp4` is the explicit opt-in so an accidental
+            # tuple from unrelated code can't silently bypass quantization.
+            if getattr(layer, "_accepts_prequantized_fp4", False) and isinstance(
+                x, tuple
+            ):
+                x_fp4, x_scale_interleaved = x
+                x_m = x_fp4.shape[0]
+                output_dtype = layer.params_dtype
+            else:
+                # NVFP4_AWQ: apply the per-input-channel pre_quant_scale.
+                if self.quant_config.is_awq:
+                    x = x * layer.pre_quant_scale
+                x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
+                x_m, _ = x.shape
+                output_dtype = x.dtype
+
+            output_size = layer.output_size_per_partition
+            w_n, _ = layer.weight.shape
+            output_shape = [x_m, output_size]
+
+            assert x_fp4.dtype == torch.uint8
+            assert layer.weight.dtype == torch.uint8
+            assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
+            assert layer.alpha.dtype == torch.float32
+
+            # Pad activations to match weight K-dimension padding
+            weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
+            x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
+
+            w = layer.weight
+            w_scale_interleaved = layer.weight_scale_interleaved
+            if enable_flashinfer_fp4_gemm:
+                w = layer.weight.T
+                w_scale_interleaved = layer.weight_scale_interleaved.T
+
+            out = fp4_gemm(
+                x_fp4,
+                w,
+                x_scale_interleaved,
+                w_scale_interleaved,
+                layer.alpha,
+                output_dtype,
+                w_n,
+            )
+
+            # Slice output to remove N-dimension padding
+            out = slice_nvfp4_output(out, output_size)
+
+            if bias is not None:
+                out = out + bias
+            return out.view(*output_shape)
+        elif self.quant_mode == "w4a16":
             if self.quant_config.is_awq:
                 x = x * layer.pre_quant_scale
-            x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)
-            x_m, _ = x.shape
-            output_dtype = x.dtype
-
-        output_size = layer.output_size_per_partition
-        w_n, _ = layer.weight.shape
-        output_shape = [x_m, output_size]
-
-        assert x_fp4.dtype == torch.uint8
-        assert layer.weight.dtype == torch.uint8
-        assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
-        assert layer.alpha.dtype == torch.float32
-
-        # Pad activations to match weight K-dimension padding
-        weights_padding_cols = getattr(layer, "weights_padding_cols", 0)
-        x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, weights_padding_cols)
-
-        w = layer.weight
-        w_scale_interleaved = layer.weight_scale_interleaved
-        if enable_flashinfer_fp4_gemm:
-            w = layer.weight.T
-            w_scale_interleaved = layer.weight_scale_interleaved.T
-
-        out = fp4_gemm(
-            x_fp4,
-            w,
-            x_scale_interleaved,
-            w_scale_interleaved,
-            layer.alpha,
-            output_dtype,
-            w_n,
-        )
-
-        # Slice output to remove N-dimension padding
-        out = slice_nvfp4_output(out, output_size)
-
-        if bias is not None:
-            out = out + bias
-        return out.view(*output_shape)
+            out = fp4_gemm(
+                x.reshape(-1, x.shape[-1]),
+                layer.weight,
+                None,
+                layer.weight_scale_interleaved,
+                layer.alpha,
+                torch.bfloat16,
+                layer.output_size_per_partition,
+                self.quant_mode,
+            )
+            if bias is not None:
+                out = out + bias
+            return out.view(*x.shape[:-1], layer.output_size_per_partition)
+        else:
+            raise ValueError(f"Unsupported FP4 GEMM quant mode: {self.quant_mode}")
 
 
 def deinterleave_w13(weight: torch.Tensor, *, up_first: bool = False) -> torch.Tensor:
