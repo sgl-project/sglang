@@ -335,10 +335,70 @@ class TestTritonAttention(CustomTestCase):
         self.assertEqual(
             ea._get_block_sizes_for_extend_attention(256, 256)[3:], expected
         )
-        # head_dim > 256: falls back to the default on all HIP archs
-        self.assertEqual(
-            ea._get_block_sizes_for_extend_attention(576, 576)[3:], (64, 64, 4)
-        )
+        # head_dim > 256 falls back to the default unless the automatic
+        # Triton-3.7 gfx950 Lq=576/Lv=512 spill workaround applies.
+        with unittest.mock.patch.object(ea, "_is_triton_ge_37", True):
+            expected = (64, 32, 4) if ea._is_gfx95 else (64, 64, 4)
+            self.assertEqual(
+                ea._get_block_sizes_for_extend_attention(576, 512)[3:],
+                expected,
+            )
+        with unittest.mock.patch.object(ea, "_is_triton_ge_37", False):
+            self.assertEqual(
+                ea._get_block_sizes_for_extend_attention(576, 512)[3:],
+                (64, 64, 4),
+            )
+
+    def test_extend_attention_triton37_lq576_n32(self):
+        from sglang.kernels.ops.attention import extend_attention as ea
+
+        if not (ea._is_gfx95 and ea._is_triton_ge_37):
+            self.skipTest("Triton >=3.7 gfx950-only spill workaround")
+
+        device = get_device()
+        dtype = torch.bfloat16
+        extend_lens = [32, 23]
+        prefix_lens = [64, 96]
+        h_q, h_kv, l_q, l_v = 12, 1, 576, 512
+        n_ext, n_prefix = sum(extend_lens), sum(prefix_lens)
+
+        q = torch.randn(n_ext, h_q, l_q, dtype=dtype, device=device)
+        k = torch.randn(n_ext, h_kv, l_q, dtype=dtype, device=device)
+        v = torch.randn(n_ext, h_kv, l_v, dtype=dtype, device=device)
+        k_buffer = torch.randn(n_prefix, h_kv, l_q, dtype=dtype, device=device)
+        v_buffer = torch.randn(n_prefix, h_kv, l_v, dtype=dtype, device=device)
+        qo_indptr = torch.tensor([0, 32, 55], dtype=torch.int32, device=device)
+        kv_indptr = torch.tensor([0, 64, 160], dtype=torch.int32, device=device)
+        kv_indices = torch.arange(n_prefix, dtype=torch.int64, device=device)
+        reference = torch.empty(n_ext, h_q, l_v, dtype=dtype, device=device)
+        candidate = torch.empty_like(reference)
+
+        def run(output):
+            extend_attention_fwd(
+                q,
+                k,
+                v,
+                output,
+                k_buffer,
+                v_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                None,
+                True,
+                None,
+                max(extend_lens),
+                1.0,
+                1.0,
+                sm_scale=1.0 / (l_q**0.5),
+                extend_seq_lens_cpu=extend_lens,
+            )
+
+        with unittest.mock.patch.object(ea, "_is_triton_ge_37", False):
+            run(reference)
+        with unittest.mock.patch.object(ea, "_is_triton_ge_37", True):
+            run(candidate)
+        torch.testing.assert_close(candidate, reference, atol=2e-2, rtol=1e-2)
 
     def test_compact_extend_attention_tile_count(self):
         self.assertEqual(

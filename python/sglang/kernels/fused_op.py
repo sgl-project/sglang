@@ -84,7 +84,7 @@ import msgspec
 import torch
 from torch import nn
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.spec import (
     CapabilityRequirement,
