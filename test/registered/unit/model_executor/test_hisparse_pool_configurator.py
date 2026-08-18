@@ -31,6 +31,9 @@ class TestHiSparsePoolConfigurator(CustomTestCase):
         override = get_context().override_server_args(
             enable_hisparse=enable_hisparse,
             hisparse_config=f'{{"host_to_device_ratio": {host_to_device_ratio}}}',
+            # Resolves the backing to private-host, whose indexer expansion is
+            # host_to_device_ratio -- the ratio these cases scale.
+            disable_radix_cache=True,
             enable_hierarchical_cache=False,
             disaggregation_mode="null",
             dsa_prefill_backend="flashmla_sparse",

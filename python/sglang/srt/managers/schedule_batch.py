@@ -147,7 +147,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.hisparse_protocol import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
     from sglang.srt.session.session_controller import Session
@@ -1334,6 +1334,8 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        # The HiCache backing releases the tree lock at admission, not at finish.
+        self.hisparse_prefix_lock_released = False
 
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
@@ -1897,6 +1899,7 @@ class Req(ReqDllmMixin):
         self.lock_receipt = DecLockRefParams()
         self.swa_prefix_lock_released = False
         self.swa_branching_seqlen = None
+        self.hisparse_prefix_lock_released = False
         self.extend_range = None
         self.dllm_initialized = False
         self.is_retracted = True
@@ -3475,12 +3478,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum = None
 
         if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.map_last_loc_to_buffer(
-                self.seq_lens,
-                self.out_cache_loc,
-                self.req_pool_indices,
-                self.seq_lens_cpu,
-                self.req_pool_indices_cpu,
+            self.hisparse_coordinator.prepare_decode_batch(
+                seq_lens=self.seq_lens,
+                out_cache_loc=self.out_cache_loc,
+                req_pool_indices=self.req_pool_indices,
+                seq_lens_cpu=self.seq_lens_cpu,
+                req_pool_indices_cpu=self.req_pool_indices_cpu,
             )
 
         if get_exec().mamba.enable_mamba_extra_buffer:

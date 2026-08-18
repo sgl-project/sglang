@@ -94,6 +94,7 @@ from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheAck
+    from sglang.srt.managers.hisparse_protocol import HiSparseEvictionHooks
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -933,6 +934,10 @@ class UnifiedRadixCache(BasePrefixCache):
         receipt its acquire returned, so it never drops a lock it never took."""
         self.dec_lock_ref(req.last_node, req.lock_receipt, skip_swa=skip_swa)
 
+    def dec_req_lock(self, req: Req, *, skip_swa: bool = False) -> None:
+        """Release a request's prefix lock at HiSparse admission."""
+        self._dec_req_lock(req, skip_swa=skip_swa)
+
     def dec_swa_lock_only(
         self,
         node_id: NodeId,
@@ -955,6 +960,46 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
+    def set_hisparse_eviction_hooks(
+        self, hooks: Optional[HiSparseEvictionHooks]
+    ) -> None:
+        """Register HiSparse's device-eviction callbacks (HiCache backing only).
+
+        Lives on the tree core, which is where device KV is actually released;
+        see `HiSparseEvictionHooks`.
+        """
+        self.tree_core.set_hisparse_eviction_hooks(hooks)
+
+    def _hisparse_evicted_prefix_blocks_insert(
+        self, req: Req, kv_len_to_handle: int
+    ) -> bool:
+        """Handle a finishing HiSparse request whose prefix has eviction holes.
+
+        Its protected prefix [0, cache_protected_len) is tree-owned and HiCache
+        may have demoted part of it, leaving a -1 sentinel in `req_to_token`. The
+        standard insert cannot run on such a row: the walk would dedup-free and
+        un-evict against -1 values and splice them into the tree as real KV. The
+        request-owned tail is still valid device KV, but with the prefix chain
+        holed there is nothing to attach it under, so it is freed.
+
+        Returns False when the prefix is intact -- then the standard path runs and
+        the decode output becomes a reusable prefix, which is the common case and
+        what makes multi-turn reuse work.
+
+        TODO: when the prefix IS holed, the tail could still be salvaged as a host
+        node under the demoted prefix instead of freed, recovering decode-output
+        reuse for those requests.
+        """
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.kv.req_pool_idx, :kv_len_to_handle
+        ]
+        if not bool((kv_indices[: req.kv.cache_protected_len] < 0).any().item()):
+            return False
+        self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
+        for comp in self._components_tuple:
+            comp.cleanup_after_caching_req(req, is_finished=True)
+        return True
+
     @rank_consensus(same_params=["req.rid", "is_insert", "kv_len_to_handle"])
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int, **kwargs
@@ -966,6 +1011,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self.free_kv_row(req.kv, [(0, kv_len_to_handle)])
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(req, is_finished=True)
+            return
+
+        if (
+            is_insert
+            and req.hisparse_prefix_lock_released
+            and self._hisparse_evicted_prefix_blocks_insert(req, kv_len_to_handle)
+        ):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
@@ -1074,7 +1126,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.free_kv_row(req.kv, [(req.kv.cache_protected_len, kv_len_to_handle)])
 
         # Synthetic profiling requests may own KV without locking a tree node.
-        if req.last_node is not None:
+        if req.last_node is not None and not req.hisparse_prefix_lock_released:
             self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
 
         if is_insert and result is not None and result.last_device_node is not None:

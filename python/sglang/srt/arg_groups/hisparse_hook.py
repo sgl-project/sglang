@@ -77,32 +77,38 @@ def validate_hisparse_kv_cache_dtype(server_args: ServerArgs) -> None:
 
 
 def validate_hisparse(server_args: ServerArgs) -> None:
-    """Validate --enable-hisparse constraints (model class, radix cache, DSA backend)."""
-
-    cfg = resolving_view(server_args)
-    if not cfg.enable_hisparse:
-        return
-
-    from sglang.srt.configs.model_config import (
-        is_deepseek_dsa,
-        is_deepseek_v4,
+    from sglang.srt.mem_cache.sparsity.factory import (
+        HiSparseBacking,
+        hisparse_backing,
     )
 
+    backing = hisparse_backing(server_args)
+    if backing is None:
+        return
+
     hf_config = model_config_of(server_args).hf_config
+    if backing is HiSparseBacking.PRIVATE_HOST:
+        if _validate_private_host_backing(server_args, hf_config):
+            return
+    else:
+        _validate_hicache_backing(server_args, hf_config)
+
+    _validate_dsa_dtype_and_backends(server_args)
+
+
+def _validate_private_host_backing(server_args: ServerArgs, hf_config) -> bool:
+    """Constraints for the private-host backing. True = skip the DSA pairing checks."""
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
+
     is_v4_hisparse = is_deepseek_v4(hf_config)
-    is_hip = get_platform().is_hip
     assert is_deepseek_dsa(hf_config) or is_v4_hisparse, (
         "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
         "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
     )
 
-    assert cfg.disable_radix_cache, (
-        "Hierarchical sparse attention currently requires --disable-radix-cache."
-    )
-
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
-    # aware checks below only apply to the DSA hisparse path.
-    if is_hip and is_v4_hisparse:
+    # aware checks only apply to the DSA hisparse path.
+    if get_platform().is_hip and is_v4_hisparse:
         # TEMPORARY GUARD: DSv4 HiSparse is not supported on the unified-KV path.
         # In unified-KV mode c4_kv_pool is None, so DeepSeekV4HiSparseTokenToKVPoolAllocator
         # cannot attach and pool init dies with a cryptic AssertionError. Fail fast
@@ -119,8 +125,76 @@ def validate_hisparse(server_args: ServerArgs) -> None:
                 "Either set SGLANG_HACK_FLASHMLA_BACKEND=triton, or run without "
                 "--enable-hisparse."
             )
-        return
+        return True
 
+    return False
+
+
+def _validate_hicache_backing(server_args: ServerArgs, hf_config) -> None:
+    """Constraints for the HiCache backing.
+
+    Everything rejected here is a path that reaches HiSparse's decode without
+    going through its admission, its swap-in, or its eviction bookkeeping -- so
+    it would read masked or reused KV rather than fail.
+    """
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    cfg = resolving_view(server_args)
+
+    if not is_deepseek_dsa(hf_config):
+        raise ValueError(
+            "--enable-hisparse on the HiCache backing only supports DSA models "
+            "(e.g. DeepSeek V3.2, GLM-5). DeepSeek V4 is private-host only: add "
+            "--disable-radix-cache."
+        )
+
+    if cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "--enable-hisparse on the HiCache backing does not support "
+            f"speculative decoding (--speculative-algorithm={cfg.speculative_algorithm}) "
+            "yet: the draft worker shares req_to_token with the target, so it "
+            "would read the eviction sentinel or a reused slot for any prefix "
+            "the tree evicted. Use --disable-radix-cache for the private-host "
+            "backing, or drop speculative decoding."
+        )
+
+    if cfg.enable_mixed_chunk:
+        raise ValueError(
+            "--enable-hisparse on the HiCache backing does not support "
+            "--enable-mixed-chunk (mixed batches route decode through "
+            "forward_extend, which lacks the dual-source swap-in)."
+        )
+
+    if cfg.enable_streaming_session or cfg.enable_session_radix_cache:
+        raise ValueError(
+            "--enable-hisparse on the HiCache backing does not support streaming "
+            "sessions (session lock ownership conflicts with releasing the tree "
+            "lock at admission)."
+        )
+
+    if cfg.disaggregation_mode != "null":
+        raise ValueError(
+            "--enable-hisparse on the HiCache backing does not support PD "
+            "disaggregation (the decode side bypasses admission). Use "
+            "--disable-radix-cache for the private-host backing, which has a "
+            "direct-to-host admission path."
+        )
+
+    if cfg.pp_size > 1:
+        raise ValueError(
+            "--enable-hisparse on the HiCache backing does not support pipeline "
+            "parallelism (pp_size > 1) yet."
+        )
+
+    if cfg.hicache_mem_layout not in ("page_first", "layer_first"):
+        raise ValueError(
+            "--enable-hisparse requires --hicache-mem-layout page_first or "
+            f"layer_first (got '{cfg.hicache_mem_layout}'; "
+            "page_first_direct breaks the swap-in host addressing)."
+        )
+
+
+def _validate_dsa_dtype_and_backends(server_args: ServerArgs) -> None:
     if resolved_view(server_args).kv_cache_dtype not in (
         "bfloat16",
         "auto",
