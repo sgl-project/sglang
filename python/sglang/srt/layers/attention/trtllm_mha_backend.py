@@ -21,9 +21,8 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend, SharedReadEnds
 from sglang.srt.layers.attention.flashinfer_backend import (
-    FlashInferAttnBackend,
     FlashInferMultiStepDraftBackend,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import (
@@ -93,7 +92,7 @@ class TRTLLMMHAMetadata:
     encoder_row_map: torch.Tensor = None
 
 
-class TRTLLMHAAttnBackend(FlashInferAttnBackend):
+class TRTLLMHAAttnBackend(AttentionBackend):
     """TRTLLM MHA attention kernel from flashinfer."""
 
     # Build the page table on-device from seq_lens (incl. the SWA-translated table
@@ -113,12 +112,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self,
         model_runner: ModelRunner,
         skip_prefill: bool = False,
-        kv_indptr_buf: Optional[torch.Tensor] = None,
-        kv_last_page_len_buf: Optional[torch.Tensor] = None,
         speculative_step_id: int = 0,
     ):
-        # Capture workspace size before super().__init__() to preserve user's
-        # SGLANG_FLASHINFER_WORKSPACE_SIZE setting (may be overridden by parent)
+        super().__init__()
+
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+        self.kv_cache_quant_method = self.token_to_kv_pool.get_kv_cache_quant_method()
+
         env_var = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE
         workspace_size_bytes = (
             env_var.get()
@@ -126,9 +126,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             else DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
         )
 
-        super().__init__(
-            model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
-        )
         self.decode_kv_access = self.kv_cache_quant_method.resolve_attention_access(
             "decode", "trtllm_mha"
         )
@@ -186,6 +183,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # SWA hybrid models split the KV cache into full and SWA pools with
         # separate index spaces; SWA layers need a translated page_table.
         self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
+        self.use_sliding_window_kv_pool = self._swa_kv_pool is not None
         # Raw full->swa index mapping tensor for the fused cuda-graph
         # metadata kernel (gather + // page_size happen on device).
         if self._swa_kv_pool is not None:
@@ -261,6 +259,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             "trtllm_mha_default_kv_scale",
             lambda: torch.ones(1, dtype=torch.float32, device=self.device),
         )
+
+    def _kv_write_scales(self, layer: RadixAttention):
+        if self.kv_cache_quant_method.needs_global_scale():
+            return None, None
+        return layer.k_scale, layer.v_scale
 
     def _check_decode_kv_access(self) -> None:
         supported_kinds = {
@@ -1423,8 +1426,6 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
             self.attn_backends[i] = TRTLLMHAAttnBackend(
                 model_runner,
                 skip_prefill=True,
-                kv_indptr_buf=self.kv_indptr[i],
-                kv_last_page_len_buf=self.kv_last_page_len,
                 speculative_step_id=i,
             )
 
