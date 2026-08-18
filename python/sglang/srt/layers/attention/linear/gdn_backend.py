@@ -464,7 +464,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        self.enable_mis = get_exec().features.enable_mis
+        self.enable_mis = getattr(model_runner.server_args, "enable_mis", False)
         self.mis_metadata: Optional[GDNMISMetadata] = None
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
