@@ -53,15 +53,15 @@ def _arg(path: str) -> str:
 
 
 def _quote_path_flags(flags: List[str]) -> List[str]:
-    """Shell-quote the directory carried by every ``-I``/``-L`` flag.
+    """Shell-quote the path carried by compiler path flags.
 
     Applied once, at the end, wherever the flag came from -- this layer, the
-    toolchain, or the caller -- so a directory with a space in it stays one
-    argument. Anything else is passed through untouched.
+    toolchain, or the caller -- so a path with spaces or shell metacharacters
+    stays one argument. Anything else is passed through untouched.
     """
     quoted: List[str] = []
     for flag in flags:
-        for prefix in ("-I", "-L"):
+        for prefix in ("-I", "-L", "-ccbin="):
             if flag.startswith(prefix) and len(flag) > len(prefix):
                 quoted.append(prefix + _arg(flag[len(prefix) :]))
                 break
