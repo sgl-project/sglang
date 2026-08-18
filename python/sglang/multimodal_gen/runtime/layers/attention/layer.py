@@ -287,14 +287,7 @@ class DynamicVarlenMaskMeta:
 def prepare_attention_backend_override(
     layer: nn.Module, target: AttentionBackendEnum
 ) -> None:
-    """Build and cache the attention impl for ``target`` on this layer.
-
-    Pure preparation: nothing on the layer is mutated, so a raise here (layer
-    doesn't support the target, backend unavailable on this platform, ...)
-    leaves the layer untouched. The caller applies the switch afterwards with
-    :func:`apply_attention_backend_override`, giving all-layers-or-none
-    semantics across a transformer.
-    """
+    """Build and cache the impl for ``target``; may raise, mutates nothing."""
     if target in layer._attn_impl_by_backend:
         return
     backend_cls = get_attn_backend(
@@ -318,11 +311,7 @@ def prepare_attention_backend_override(
 def apply_attention_backend_override(
     layer: nn.Module, target: AttentionBackendEnum | None
 ) -> None:
-    """Flip the layer's attention impl to ``target`` (None = construction default).
-
-    Infallible once :func:`prepare_attention_backend_override` succeeded for the
-    target: it only swaps to an impl already present in the layer's cache.
-    """
+    """Flip to a prepared impl (None = construction default); cannot fail."""
     target = target or layer._default_attn_backend
     if target is layer.backend:
         return
@@ -382,7 +371,6 @@ class UlyssesAttention(nn.Module):
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
         self.backend = attn_backend.get_enum()
-        # Per-request backend switching (see prepare/apply_attention_backend_override).
         self._default_attn_backend = self.backend
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
         self._supported_attention_backends = supported_attention_backends
@@ -640,7 +628,6 @@ class LocalAttention(nn.Module):
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
         self.backend = attn_backend.get_enum()
-        # Per-request backend switching (see prepare/apply_attention_backend_override).
         self._default_attn_backend = self.backend
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
         self._supported_attention_backends = supported_attention_backends
@@ -800,7 +787,6 @@ class USPAttention(nn.Module):
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
         self.backend = attn_backend.get_enum()
-        # Per-request backend switching (see prepare/apply_attention_backend_override).
         self._default_attn_backend = self.backend
         self._attn_impl_by_backend = {self.backend: self.attn_impl}
         self._supported_attention_backends = supported_attention_backends

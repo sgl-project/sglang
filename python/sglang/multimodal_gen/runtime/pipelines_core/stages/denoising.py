@@ -242,9 +242,8 @@ class DenoisingStepState:
     attn_metadata: Any | None
 
 
-# Backends a request may switch to via SamplingParams.attention_backend_override.
-# Deliberately limited to exact/drop-in dense kernels: the sparse family needs
-# per-model mask configs and per-step metadata, and stays a server-level choice.
+# Only exact/drop-in dense kernels: the sparse family needs per-model mask
+# configs and per-step metadata, and stays a server-level choice.
 REQUEST_SWITCHABLE_ATTENTION_BACKENDS = frozenset(
     {
         AttentionBackendEnum.FA,
@@ -328,9 +327,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             dtype=torch.float16,
             selected_attention_backend=selected_attention_backend,
         )
-        # Per-request attention backend override state (see
-        # _maybe_override_attention_backend). The metadata head size is kept so
-        # the stage-level metadata backend can be re-resolved per batch.
+        # head size kept so the metadata backend can be re-resolved per batch
         self._attn_backend_default = self.attn_backend
         self._attn_metadata_head_size = attn_head_size
         self._attention_backend_active_override: AttentionBackendEnum | None = None
@@ -528,15 +525,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             self._maybe_torch_compile(transformer)
 
     def _maybe_override_attention_backend(self, batch: Req) -> None:
-        """Apply the per-request attention backend override at the batch boundary.
-
-        ``attention_backend_override`` participates in the dynamic-batch
-        signature, so the flip below never lands mid-batch. Incompatible server
-        settings reject the request (fail-fast) rather than silently running
-        the default backend. The switch is two-phase: every layer's impl is
-        prepared first (no mutation, may raise), then all layers flip, so a
-        rejected request leaves the transformers untouched.
-        """
+        """Two-phase per-request backend switch: prepare all layers (may
+        raise, mutates nothing), then flip all — a rejected request leaves the
+        transformers untouched. Safe at this batch boundary because the field
+        is in the dynamic-batch signature."""
         target = self._parse_attention_backend_override(
             batch.sampling_params.attention_backend_override
         )
@@ -589,10 +581,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _validate_attention_backend_override(
         self, target: AttentionBackendEnum, layers: list[nn.Module]
     ) -> type:
-        """Fail fast on server settings incompatible with a per-request switch.
-
-        Returns the resolved backend class for the stage-level metadata slot.
-        """
+        """Reject incompatible server settings; returns the resolved backend cls."""
         args = self.server_args
         reasons: list[str] = []
         if args.enable_breakable_cuda_graph:
@@ -781,12 +770,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _cache_dit_knob(
         self, key: str, env_value: Any, env_secondary_value: Any, *, secondary: bool
     ) -> Any:
-        """Resolve one DBCache knob: request overrides win over env defaults.
-
-        The secondary transformer inherits the request's primary override for
-        keys its own ``secondary`` dict leaves unset, mirroring how the
-        SGLANG_CACHE_DIT_SECONDARY_* env values inherit the primary ones.
-        """
+        """One DBCache knob: request > env; secondary inherits request primary."""
         overrides = self._cache_dit_request_overrides
         if not secondary:
             return overrides.get(key, env_value)
@@ -858,18 +842,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     ) -> None:
         """Enable cache-dit on the transformers for this batch (idempotent).
 
-        This method should be called after the transformer is fully loaded
-        and before torch.compile is applied.
-
-        The switch and knobs are per-request (``enable_cache_dit`` /
-        ``cache_dit_params`` in SamplingParams); the SGLANG_CACHE_DIT_*
-        environment values act as server-wide defaults for requests that leave
-        them unset. Both fields participate in the dynamic-batch signature, so
-        mount/unmount/remount transitions are safe at this batch boundary.
-
-        For dual-transformer models (e.g., Wan2.2), this enables cache-dit on both
-        transformers with (potentially) different configurations.
-
+        Must run after the transformer is fully loaded and before
+        torch.compile. Per-request switch/knobs (env values are the defaults);
+        both fields are in the dynamic-batch signature, so mount/unmount
+        transitions are safe at this batch boundary. Dual-transformer models
+        (e.g. Wan2.2) get per-transformer configs.
         """
         requested = self._cache_dit_requested_for_batch(batch)
         if self.server_args.enable_breakable_cuda_graph:
@@ -889,8 +866,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             if requested
             else None
         )
-        # This request opts out or changes knobs: unmount first, then fall
-        # through to the mount path (or the opt-out return below).
+        # opt-out or knob change: unmount, then remount below (or return)
         if self._cache_dit_enabled and desired_key != self._cache_dit_active_key:
             self._unmount_cache_dit()
         # NOTE: When a new request arrives, we need to refresh the cache-dit context.
@@ -1331,13 +1307,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _init_cfg_gate_state(
         self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
-        """Initialize optional CFG residual reuse for the current denoising loop.
-
-        The fraction is per-request (``SamplingParams.cfg_gate_step``); the
-        SGLANG_DIFFUSION_CFG_GATE_STEP env value is the server-wide default for
-        requests that leave it unset. The state is rebuilt per denoising loop,
-        so no cross-request transition is needed.
-        """
+        """Initialize optional CFG residual reuse for the current denoising loop."""
         fraction = batch.sampling_params.cfg_gate_step
         if fraction is None:
             fraction = envs.SGLANG_DIFFUSION_CFG_GATE_STEP

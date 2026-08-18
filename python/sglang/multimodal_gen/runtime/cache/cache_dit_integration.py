@@ -192,11 +192,8 @@ def get_scm_mask(
     return mask
 
 
-# Per-request Cache-DiT knobs accepted in ``SamplingParams.cache_dit_params``.
-# Each value overrides the corresponding SGLANG_CACHE_DIT_* default for that
-# request only. ``secondary`` nests the same DBCache knobs for the second
-# transformer of dual-DiT models (it inherits the request's primary values,
-# then the SGLANG_CACHE_DIT_SECONDARY_* defaults, for keys it leaves unset).
+# Keys accepted in SamplingParams.cache_dit_params; "secondary" nests the
+# DBCache knobs for the second transformer of dual-DiT models.
 CACHE_DIT_REQUEST_KNOB_KEYS = frozenset(
     {
         "Fn_compute_blocks",
@@ -222,11 +219,7 @@ CACHE_DIT_REQUEST_PARAM_KEYS = (
 
 
 def resolve_cache_dit_request_overrides(raw: dict | None) -> dict:
-    """Validate ``SamplingParams.cache_dit_params`` and return a normalized copy.
-
-    Raises ``ValueError`` on unknown keys so a typo fails the request instead
-    of silently running with default knobs.
-    """
+    """Validate cache_dit_params and return a copy; unknown keys fail the request."""
     if raw is None:
         return {}
     if not isinstance(raw, dict):

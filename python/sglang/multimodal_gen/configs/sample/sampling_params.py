@@ -206,11 +206,9 @@ class SamplingParams:
     guidance_rescale: float = 0.0
     cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
-    # CFG gating (lossy): after this fraction of the denoising steps, reuse the
-    # cached cond-uncond residual instead of running the unconditional branch.
-    # ``None`` follows the SGLANG_DIFFUSION_CFG_GATE_STEP server default;
-    # 1.0 disables gating for this request. Participates in the dynamic-batch
-    # signature. No-op for requests without classifier-free guidance.
+    # CFG gating (lossy): reuse the cached cond-uncond residual after this
+    # fraction of the steps. None = follow the SGLANG_DIFFUSION_CFG_GATE_STEP
+    # server default; 1.0 = off for this request.
     cfg_gate_step: float | None = None
 
     progressive_mode: str = "fullres"
@@ -228,28 +226,16 @@ class SamplingParams:
         None  # TeaCacheParams or WanTeaCacheParams, set by model-specific subclass
     )
 
-    # Cache-DiT parameters (block-level residual caching; see
-    # runtime/cache/cache_dit_integration.py). ``None`` falls back to the
-    # process-wide SGLANG_CACHE_DIT_ENABLED default; True/False opts this
-    # request in/out explicitly. Both fields intentionally participate in the
-    # dynamic-batch signature, so requests with different Cache-DiT settings
-    # never share a batch and mount/unmount transitions stay safe at batch
-    # boundaries.
+    # Cache-DiT (lossy). None = follow the SGLANG_CACHE_DIT_ENABLED server
+    # default; True/False = explicit per-request opt-in/out.
     enable_cache_dit: bool | None = None
-    # Per-request knob overrides applied on top of the SGLANG_CACHE_DIT_*
-    # defaults, e.g. {"residual_diff_threshold": 0.12, "scm_preset": "fast",
-    # "secondary": {"max_warmup_steps": 2}}. Valid keys:
-    # CACHE_DIT_REQUEST_PARAM_KEYS in runtime/cache/cache_dit_integration.py.
+    # Per-request knob overrides on top of the SGLANG_CACHE_DIT_* defaults.
+    # Valid keys: CACHE_DIT_REQUEST_PARAM_KEYS in cache_dit_integration.py.
     cache_dit_params: dict[str, Any] | None = None
 
-    # Per-request attention backend switch for the DiT denoise loop. ``None``
-    # keeps the server-selected backend; valid values are the exact/drop-in
-    # dense kernels ("fa", "torch_sdpa", "sage_attn", "sage_attn_3" — see
-    # REQUEST_SWITCHABLE_ATTENTION_BACKENDS). Sage variants are lossy
-    # (quantized attention). Incompatible server settings (breakable CUDA
-    # graphs, torch.compile, sparse server backends, non-ring-capable target
-    # under ring parallelism) reject the request instead of silently falling
-    # back. Participates in the dynamic-batch signature.
+    # Per-request DiT attention backend ("fa", "torch_sdpa", "sage_attn",
+    # "sage_attn_3"; sage is lossy). Incompatible server settings reject the
+    # request; see DenoisingStage._maybe_override_attention_backend.
     attention_backend_override: str | None = None
 
     # Spectrum parameters

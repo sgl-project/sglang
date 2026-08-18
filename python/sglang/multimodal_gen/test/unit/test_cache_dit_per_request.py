@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-request Cache-DiT control: SamplingParams switch/knobs and the
-mount/refresh/unmount transitions in DenoisingStage.
-
-These tests run CPU-only: the cache-dit mount/refresh/unmount entry points are
-patched at the denoising-module boundary and the tests assert on the
-transition decisions and the resolved CacheDitConfig knobs.
-"""
+"""Per-request Cache-DiT: request-param validation and the mount/refresh/
+unmount transitions in DenoisingStage (CPU-only, mount boundary patched)."""
 
 import unittest
 from types import SimpleNamespace

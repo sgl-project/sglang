@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-request attention backend override: SamplingParams switch, fail-fast
-validation against incompatible server settings, and the two-phase
-(prepare-then-apply) layer switching.
-
-CPU-only: the layer-flip and selector entry points are patched at module
-boundaries; the tests assert on orchestration decisions.
-"""
+"""Per-request attention backend override: fail-fast validation and the
+two-phase layer switching (CPU-only, layer/selector boundaries patched)."""
 
 import unittest
 from types import SimpleNamespace
