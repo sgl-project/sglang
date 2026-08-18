@@ -30,6 +30,7 @@ import os
 import shutil
 import tempfile
 import unittest
+import unittest.mock
 
 import torch
 
@@ -385,6 +386,29 @@ class TestResolutionIsReproducible(CustomTestCase):
                 )
                 self.assertEqual(self._comparable(first), snapshot)
 
+    def test_the_gate_refuses_a_second_resolution(self):
+        """A record that has been resolved is left exactly as it was.
+
+        Every publishing process calls the gate, and in a child the record
+        arrived already resolved -- so this is the property that keeps the
+        child agreeing with the parent. The handlers are not written to survive
+        a second pass over their own output (the DP-attention step derives the
+        chunked prefill size *from* the chunked prefill size), which is why the
+        gate refuses rather than re-deriving.
+        """
+        for label, config, kwargs in _SHAPES:
+            with self.subTest(shape=label):
+                self._restore_process_state(self._pristine_state)
+                model_path = self._config_dir(config)
+                resolved = self._resolved(model_path, **kwargs)
+                snapshot = self._comparable(resolved)
+                declarations = list(getattr(resolved, "_resolved_overrides", []))
+                resolved.resolve_once()
+                self.assertEqual(self._comparable(resolved), snapshot)
+                self.assertEqual(
+                    list(getattr(resolved, "_resolved_overrides", [])), declarations
+                )
+
     def test_the_declaration_provenance_is_reproducible(self):
         model_path = self._config_dir()
         first = self._resolved(model_path)
@@ -403,16 +427,17 @@ class TestResolutionIsReproducible(CustomTestCase):
 
 
 class TestTheResolutionSeamHasOneCaller(CustomTestCase):
-    """The pipeline is entered from exactly one place.
+    """The pipeline is entered from exactly one place, and that place decides
+    whether it runs at all.
 
-    Step 12 moves the call from ``__post_init__`` to ``publish`` so the record
-    stays raw; that is a one-line move only while the seam has a single caller.
-    A second entry point would also mean resolution could run twice on one
-    instance, which the strict ``__setattr__`` guard turns into an
-    ``AttributeError`` rather than a silent re-resolve.
+    ``resolve_once`` is the gate: the handlers are not written to survive a
+    second pass over their own output, so a record must go through the pipeline
+    at most once. Keeping the pipeline itself down to a single caller is what
+    makes that gate impossible to bypass -- and what keeps the remaining move
+    (construction time to publish time) a matter of who calls the gate.
     """
 
-    def test_only_post_init_runs_the_pipeline(self):
+    def test_only_the_gate_runs_the_pipeline(self):
         import ast
         from pathlib import Path
 
@@ -449,10 +474,44 @@ class TestTheResolutionSeamHasOneCaller(CustomTestCase):
         # __post_init__, or another class growing a same-named __post_init__
         # all show up here.
         self.assertEqual(
-            [("srt/server_args.py", "ServerArgs.__post_init__")],
+            [("srt/server_args.py", "ServerArgs.resolve_once")],
             callers,
             "the resolution pipeline must be entered exactly once, from "
-            f"ServerArgs.__post_init__; found: {callers}",
+            f"ServerArgs.resolve_once; found: {callers}",
+        )
+
+    def test_the_gate_is_reached_from_construction_and_from_publish(self):
+        """Both entries go through the gate, so neither can resolve twice."""
+        import ast
+        from pathlib import Path
+
+        import sglang
+
+        package_root = Path(next(iter(sglang.__path__)))
+        callers = []
+        for path in sorted(package_root.rglob("*.py")):
+            try:
+                tree = ast.parse(path.read_text())
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                # `self.resolve_once()` at construction; publish looks the
+                # attribute up first, so it appears as a bare name call.
+                called = (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "resolve_once"
+                ) or (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "resolve_once"
+                )
+                if called:
+                    callers.append(path.relative_to(package_root).as_posix())
+        self.assertEqual(
+            ["srt/runtime_context.py", "srt/server_args.py"],
+            sorted(set(callers)),
+            f"the resolution gate grew or lost a caller: {sorted(set(callers))}",
         )
 
 

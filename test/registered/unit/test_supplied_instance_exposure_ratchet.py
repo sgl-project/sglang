@@ -118,6 +118,7 @@ _LATE_RESOLUTION_DYNAMIC_SITES = {
     "parser/template_detection.py": frozenset({"reasoning_parser", "tool_call_parser"}),
 }
 
+
 # Resolution also branches on ambient environment; those shapes are explicit
 # entries so the written set is the same on every host. `SGLANG_IS_IN_CI`
 # makes resolution fill `soft_watchdog_timeout`.
