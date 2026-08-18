@@ -205,6 +205,8 @@ jobs:
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
+          # Fail fast on any command error, undefined variable, or pipe failure.
+          set -euo pipefail
           cd test
           python3 run_suite.py --hw npu --suite ${{ inputs.self_name }} \
             --auto-partition-id ${{ matrix.partition }} \

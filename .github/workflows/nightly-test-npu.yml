@@ -284,7 +284,7 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  # The acc-2 suite is split across 3 parallel partition jobs via the single `partitions` input.
+  # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:
     name: nightly-acc-2-npu-a3
     if: ${{ !cancelled() }}
@@ -295,7 +295,7 @@ jobs:
       test_type: 'accuracy'
       test_suite: nightly-acc-2-npu-a3
       is_nightly_pipeline_job: true
-      partitions: '{"size":3,"arr":[0,1,2]}'
+      partitions: '{"size":4,"arr":[0,1,2,3]}'
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false
