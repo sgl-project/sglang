@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use super::sidecar::{FeatureStore, MmSidecarEntry, Sidecar, park_features_in_shm};
+use crate::message::config::MmSpec;
 use crate::message::ids::Rid;
 use crate::message::request::MmRequest;
 use crate::tokenizer_manager::tokenizer::TextTokenizer;
@@ -58,19 +59,15 @@ pub struct Context {
 
 impl Context {
     pub fn new(
-        spec_json: &str,
+        spec: MmSpec,
         tokenizer: Option<Arc<dyn TextTokenizer>>,
         sidecar: Sidecar,
     ) -> Result<Self, String> {
-        let feature_shm = serde_json::from_str::<serde_json::Value>(spec_json)
-            .ok()
-            .and_then(|v| v.get("feature_shm").and_then(|b| b.as_bool()))
-            .unwrap_or(false);
         Ok(Self {
-            family: sglang_mm::registry::pipeline_from_spec(spec_json)?,
+            family: sglang_mm::registry::build_pipeline(spec.pipeline)?,
             tokenizer,
             sidecar,
-            feature_shm,
+            feature_shm: spec.feature_shm,
         })
     }
 }

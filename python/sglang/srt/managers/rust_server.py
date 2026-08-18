@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.rust_extensions._server import Server, ServerArgs
+    from sglang.srt.rust_extensions._server import MmSpec, Server, ServerArgs
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -45,8 +45,10 @@ logger = logging.getLogger(__name__)
 
 class NativeMmSpec(msgspec.Struct, frozen=True, kw_only=True):
     """Resolved parameters of the native Rust MM pipeline for one model,
-    consumed by the Rust worker pool (:meth:`rust_json`) and the drain
-    adapter (:meth:`NativeMmHost.build_native_mm`)."""
+    consumed by the Rust worker pool (as the typed extension ``MmSpec``, see
+    :meth:`RustServer._build_mm_spec`), the ``_multimodal`` parity API
+    (:meth:`rust_json`) and the drain adapter
+    (:meth:`NativeMmHost.build_native_mm`)."""
 
     family: str
     feature_shm: bool
@@ -73,7 +75,9 @@ class NativeMmSpec(msgspec.Struct, frozen=True, kw_only=True):
         return 3 * self.temporal_patch_size * self.patch_size * self.patch_size
 
     def rust_json(self) -> str:
-        """The subset `sglang_mm::registry::pipeline_from_spec` parses."""
+        """The subset `sglang_mm::registry::pipeline_from_spec` parses — the
+        JSON form the ``_multimodal`` parity API takes; the server itself is
+        handed the typed ``MmSpec`` instead."""
         fields = (f for f in self.__struct_fields__ if f not in self.DRAIN_ONLY)
         return msgspec.json.encode({f: getattr(self, f) for f in fields}).decode()
 
@@ -443,7 +447,7 @@ class RustServer:
                     f"(supported: {', '.join(supported)}; "
                     "images only). Unset SGLANG_RUST_SERVER to serve this model."
                 )
-            server.start_mm_workers(mm_spec.rust_json(), mm_host.mm_workers)
+            server.start_mm_workers(cls._build_mm_spec(mm_spec), mm_host.mm_workers)
 
         # Narrow the scheduler thread only after the server threads are launched.
         if launch_cores is not None:
@@ -703,6 +707,34 @@ class RustServer:
                 "Rust egress closed; dropped batch of %d requests during shutdown",
                 len(rids),
             )
+
+    @staticmethod
+    def _build_mm_spec(spec: NativeMmSpec) -> MmSpec:
+        """The typed MM handoff for ``Server.start_mm_workers``: the
+        :class:`NativeMmSpec` fields the Rust pipeline consumes, as the Rust
+        extension's own ``MmSpec`` class (same required-keyword contract as
+        :meth:`_build_server_args`; ``family`` / ``resample`` become the
+        extension's ``MmFamily`` / ``MmResample`` enums)."""
+        from sglang.srt.rust_extensions import load_rust_extension
+
+        ext = load_rust_extension("sglang.srt.rust_extensions._server")
+        family = {"qwen_vl": ext.MmFamily.QwenVl}[spec.family]
+        resample = {"aten_u8": ext.MmResample.AtenU8, "pil": ext.MmResample.Pil}[
+            spec.resample
+        ]
+        return ext.MmSpec(
+            family=family,
+            feature_shm=spec.feature_shm,
+            image_token_id=spec.image_token_id,
+            patch_size=spec.patch_size,
+            merge_size=spec.merge_size,
+            temporal_patch_size=spec.temporal_patch_size,
+            min_pixels=spec.min_pixels,
+            max_pixels=spec.max_pixels,
+            image_mean=spec.image_mean,
+            image_std=spec.image_std,
+            resample=resample,
+        )
 
     @staticmethod
     def _build_server_args(scheduler: Scheduler) -> ServerArgs:

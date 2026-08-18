@@ -1,12 +1,13 @@
 //! Runtime configuration: the rust-server boot knobs
 //! ([`RustServerServerArgs`]), the scheduler's typed `server_args` handoff
-//! ([`ServerArgs`] / [`ModelConfig`]), and the [`RuntimeConfig`] pairing
-//! them for `runtime::start`.
+//! ([`ServerArgs`] / [`ModelConfig`]), the [`RuntimeConfig`] pairing them for
+//! `runtime::start`, and the native MM pipeline handoff ([`MmSpec`]).
 //!
 //! [`ServerArgs`] / [`ModelConfig`] / [`DefaultSamplingParams`] /
-//! [`DisaggregationMode`] are also `#[pyclass]`es: the Python scheduler
-//! (`RustServer._build_server_args`) constructs them directly by keyword and
-//! hands the `ServerArgs` to `Server`. There is one schema — this file — and
+//! [`DisaggregationMode`] / [`MmSpec`] / [`MmFamily`] / [`MmResample`] are
+//! also `#[pyclass]`es: the Python scheduler (`RustServer._build_server_args`
+//! / `_build_mm_spec`) constructs them directly by keyword and hands them to
+//! `Server`. There is one schema — this file — and
 //! pyo3 enforces it at construction: every field is a required, typed
 //! constructor argument, so a drifted caller fails at boot rather than running
 //! on a silently-defaulted knob. The `#[pyo3::pymethods]` constructors below
@@ -367,6 +368,116 @@ impl DefaultSamplingParams {
             top_k,
             min_p,
             repetition_penalty,
+        }
+    }
+}
+
+/// The native MM pipeline handoff, built by `RustServer._build_mm_spec` from
+/// the resolved `NativeMmSpec` and passed to `Server.start_mm_workers`. Same
+/// contract as [`ServerArgs`]: every field is a required, typed constructor
+/// keyword, so a drifted Python caller fails at boot.
+#[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
+#[derive(Clone, Debug)]
+pub struct MmSpec {
+    /// Park feature buffers in POSIX shm rather than inline. Set by the Python
+    /// launcher (`NativeMmHost._use_feature_shm`) exactly when the scheduler
+    /// broadcasts across TP ranks and will unwrap `ShmPointerMMData`.
+    pub feature_shm: bool,
+    /// The family pipeline and its resolved processor parameters.
+    pub pipeline: sglang_mm::registry::PipelineSpec,
+}
+
+#[pyo3::pymethods]
+impl MmSpec {
+    /// The parameter list is flat because every family so far shares the
+    /// Qwen-VL processor geometry; a family with different knobs adds its own
+    /// keywords and match arm here.
+    #[new]
+    #[pyo3(signature = (*,
+        family,
+        feature_shm,
+        image_token_id,
+        patch_size,
+        merge_size,
+        temporal_patch_size,
+        min_pixels,
+        max_pixels,
+        image_mean,
+        image_std,
+        resample,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn py_new(
+        family: MmFamily,
+        feature_shm: bool,
+        image_token_id: i32,
+        patch_size: usize,
+        merge_size: usize,
+        temporal_patch_size: usize,
+        min_pixels: usize,
+        max_pixels: usize,
+        image_mean: [f32; 3],
+        image_std: [f32; 3],
+        resample: MmResample,
+    ) -> Self {
+        use sglang_mm::registry::PipelineSpec;
+        let pipeline = match family {
+            MmFamily::QwenVl => PipelineSpec::QwenVl(sglang_mm::qwen_vl::QwenVlSpec {
+                image_token_id,
+                patch_size,
+                merge_size,
+                temporal_patch_size,
+                min_pixels,
+                max_pixels,
+                image_mean,
+                image_std,
+                resample: resample.into(),
+            }),
+        };
+        Self {
+            feature_shm,
+            pipeline,
+        }
+    }
+}
+
+/// Which `sglang_mm` family pipeline serves the model — one variant per
+/// [`sglang_mm::registry::PipelineSpec`] arm. Exposed to Python as an enum
+/// (`MmFamily.QwenVl`); `NativeMmFamily.name` maps onto it at handoff.
+#[pyo3::pyclass(
+    eq,
+    frozen,
+    from_py_object,
+    module = "sglang.srt.rust_extensions._server"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmFamily {
+    QwenVl,
+}
+
+/// The HF image processor the native resize must reproduce bit-exactly (see
+/// [`sglang_mm::qwen_vl::Resampler`]). Exposed to Python as an enum
+/// (`MmResample.AtenU8` / `.Pil`); `NativeMmFamily.image_processors` maps each
+/// processor class onto it.
+#[pyo3::pyclass(
+    eq,
+    frozen,
+    from_py_object,
+    module = "sglang.srt.rust_extensions._server"
+)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MmResample {
+    /// `Qwen2VLImageProcessor` / `…Fast` — torchvision on a uint8 tensor.
+    AtenU8,
+    /// `Qwen2VLImageProcessorPil`, behind `--disable-fast-image-processor`.
+    Pil,
+}
+
+impl From<MmResample> for sglang_mm::qwen_vl::Resampler {
+    fn from(r: MmResample) -> Self {
+        match r {
+            MmResample::AtenU8 => Self::AtenU8,
+            MmResample::Pil => Self::Pil,
         }
     }
 }

@@ -24,8 +24,8 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyBytes;
 
 use crate::message::config::{
-    DefaultSamplingParams, DisaggregationMode, ModelConfig, RuntimeConfig, RustServerServerArgs,
-    ServerArgs,
+    DefaultSamplingParams, DisaggregationMode, MmFamily, MmResample, MmSpec, ModelConfig,
+    RuntimeConfig, RustServerServerArgs, ServerArgs,
 };
 use crate::utils::runtime;
 
@@ -212,14 +212,14 @@ impl Server {
         )
     }
 
-    /// Spawn the MM worker pool for the pipeline in `spec_json` (built from the
-    /// resolved processor config; see `NativeMmHost.resolve_native_spec`).
-    /// Image-only requests are processed entirely in Rust and parked for
-    /// [`Server::take_mm`]; anything the pipeline cannot serve is rejected back to
-    /// the client — there is no Python fallback.
-    fn start_mm_workers(&self, spec_json: &str, workers: usize) -> PyResult<()> {
+    /// Spawn the MM worker pool for the pipeline in `spec` (built from the
+    /// resolved processor config; see `NativeMmHost.resolve_native_spec` and
+    /// `RustServer._build_mm_spec`). Image-only requests are processed entirely
+    /// in Rust and parked for [`Server::take_mm`]; anything the pipeline cannot
+    /// serve is rejected back to the client — there is no Python fallback.
+    fn start_mm_workers(&self, spec: MmSpec, workers: usize) -> PyResult<()> {
         let ctx = multi_modality::worker::Context::new(
-            spec_json,
+            spec,
             self.rt.tokenizer.clone(),
             self.rt.mm_sidecar.clone(),
         )
@@ -310,6 +310,9 @@ fn _server(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DefaultSamplingParams>()?;
     m.add_class::<ModelConfig>()?;
     m.add_class::<ServerArgs>()?;
+    m.add_class::<MmFamily>()?;
+    m.add_class::<MmResample>()?;
+    m.add_class::<MmSpec>()?;
     m.add_class::<Server>()?;
     m.add_class::<RequestBatch>()?;
     m.add_class::<MmEncodeResult>()?;
