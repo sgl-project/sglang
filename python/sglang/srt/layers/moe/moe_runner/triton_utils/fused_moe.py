@@ -574,8 +574,9 @@ def _fused_moe_kernel_sequence(
         assert (
             activation == "silu"
             and is_gated
-            and gemm1_alpha is None
-            and gemm1_limit is None
+            # Neither set means plain silu, both set means swiglu(alpha, limit).
+            # The epilogue has no form for limit without alpha.
+            and (gemm1_alpha is None) == (gemm1_limit is None)
             and swiglu_limit is None
             and b1 is None
             and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
@@ -628,6 +629,8 @@ def _fused_moe_kernel_sequence(
         b_use_tma=up_moe_use_tma,
         filter_expert=filter_expert,
         fuse_swiglu=fuse_swiglu_interleaved,
+        swiglu_alpha=gemm1_alpha,
+        swiglu_limit=gemm1_limit,
     )
 
     if hooks and hooks.after_gate_up:

@@ -7,6 +7,8 @@ import math
 import torch
 from torch import nn
 
+from sglang.multimodal_gen.runtime.layers.magi2_mhc_kernel import mhc_mix_output
+
 
 def sinkhorn_knopp(h: torch.Tensor, *, num_iters: int, eps: float) -> torch.Tensor:
     m = torch.exp(h - h.amax(dim=(-2, -1), keepdim=True))
@@ -55,6 +57,8 @@ class Magi2MHC(nn.Module):
 
     def mix_input(self, streams: torch.Tensor, h_pre: torch.Tensor) -> torch.Tensor:
         gate = torch.sigmoid(self.alpha_pre * self.matmul_scale * h_pre + self.bias_pre)
+        # Left in torch: inductor fuses this into its consumer, where a custom op
+        # is opaque and cannot be fused (measured 5s/clip slower as a kernel).
         return torch.einsum("tn,tnc->tc", gate.to(streams.dtype), streams)
 
     def mix_output(
@@ -68,11 +72,15 @@ class Magi2MHC(nn.Module):
         post = 2.0 * torch.sigmoid(
             self.alpha_post * self.matmul_scale * h_post + self.bias_post
         )
+        # Left in torch: a fused kernel measured 0.2% end to end, inside the noise.
         res = sinkhorn_knopp(
             self.alpha_res * self.matmul_scale * h_res.float() + self.bias_res,
             num_iters=self.sinkhorn_iters,
             eps=self.eps,
         )
+        if streams.is_cuda:
+            return mhc_mix_output(streams, block_out, post, res)
+
         mixed = torch.einsum("tij,tjc->tic", res.to(streams.dtype), streams)
         written = torch.einsum("tn,tc->tnc", post.to(streams.dtype), block_out)
         return mixed + written

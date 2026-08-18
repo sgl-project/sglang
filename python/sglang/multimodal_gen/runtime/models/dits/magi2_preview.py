@@ -58,7 +58,9 @@ class Magi2PreviewDiT(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
 
     _fsdp_shard_conditions = [is_block]
-    _compile_conditions = []
+    # Per block, not the whole stack: fusing the mHC and norm chains is the win, and
+    # the expert GEMMs inside stay uncompiled.
+    _compile_conditions = [is_block]
     param_names_mapping: dict = {}
     # Adapters/mHC are fp32 and blocks bf16, so FSDP gathers per-parameter dtypes.
     _fsdp_mixed_dtype_params = True

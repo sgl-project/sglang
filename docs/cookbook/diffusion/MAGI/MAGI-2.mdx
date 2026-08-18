@@ -124,6 +124,11 @@ compare against the 100-step figures in section 8:
 | `--tp-size 2 --ulysses-degree 2` | 206s | 120-133 GB |
 | `--tp-size 4 --ulysses-degree 1` | 608s | 135 GB |
 
+The memory column is per-rank device memory observed during denoise, which is a
+different metric from the runtime's own `Max peak` quoted in section 8; read the
+rows against each other, not across sections. The `--tp-size` rows predate the
+startup rejection and cannot be reproduced without removing that check.
+
 Slower *and* larger, so put the whole degree in `--ulysses-degree`.
 
 ## 4. Serve MAGI-2-preview
@@ -257,15 +262,21 @@ sglang serve \
 ```
 
 `--dit-layerwise-offload` streams DiT blocks with asynchronous host-to-device
-prefetch overlap and selects only the DiT layerwise group. Raise
-`--dit-layerwise-resident-layers` to pin leading blocks on GPU across denoise
-steps when VRAM allows; resident layers are transferred once instead of being
-re-streamed every step, which trades memory for latency more efficiently than
-raising the prefetch size.
+prefetch overlap and selects only the DiT layerwise group. Measured at 896x512
+over 20 steps, it moves peak from 96202 MiB to 83594 MiB and costs 1.5 s — 13% of
+peak memory for 1.2% of latency, because the prefetch overlaps transfers with
+compute. This is the lever to reach for first.
 
-For coarser placement, `--cpu-offload-components` selects whole components, for
-example `--cpu-offload-components dit text_encoder`. The video VAE, turbo
-decoder, and audio VAE are kept resident by MAGI-2's deployment configuration.
+Raise `--dit-layerwise-resident-layers` to pin leading blocks on GPU across
+denoise steps when VRAM allows; resident layers are transferred once instead of
+being re-streamed every step, which trades memory for latency more efficiently
+than raising the prefetch size.
+
+`--cpu-offload-components dit` did not reduce peak on the same measurement (96202
+MiB either way): the DiT has to be resident through denoise, so whole-component
+offload has nothing to move. `--performance-mode memory` likewise lands within a
+couple of percent of `speed` on both time and peak. Neither is a substitute for
+the layerwise flag here.
 
 The Qwen3.5 text encoder is 52 GiB and stays on the host regardless of these
 flags, and its forward runs there too. Staging it onto a card costs 42-84 s for a
@@ -323,26 +334,43 @@ audio-video sequence, both of which depend heavily on GPU model, interconnect,
 offload policy, and the selected quality tier. Benchmark your own topology before
 sizing a deployment; the figures below are one data point, not a target.
 
-Measured on four H20Z (139 GiB each), two-stage 1080p tier, 100 preview steps
-plus 5 refiner steps, one 10-second clip, `--ulysses-degree 4`:
+Measured on four H20Z (143771 MiB each), two-stage 1080p tier, 100 preview steps
+plus 5 refiner steps, one 10-second clip, `--ulysses-degree 4`. The compiled column
+adds `--enable-torch-compile --regional-compile` and is the configuration to deploy;
+both columns are steady state, so the first clip of a process costs more while its
+graphs build:
 
-| Phase | Time |
-| --- | --- |
-| Text encoding | 17.6 s |
-| Preview denoise (100 steps) | 452.8 s |
-| Preview-to-refiner handoff | &lt;0.1 s |
-| Refiner denoise (5 steps) | 101.6 s |
-| Decode (video and audio) | 15.5 s |
-| **Total** | **592 s** (the ~4 s residual is per-step scheduling and latent transforms) |
+| Phase | Eager | Compiled |
+| --- | ---: | ---: |
+| Text encoding | 20.1 s | 9.8 s |
+| Preview denoise (100 steps) | 459.8 s | 316.2 s |
+| Preview-to-refiner handoff | &lt;0.1 s | &lt;0.1 s |
+| Refiner denoise (5 steps) | 104.2 s | 61.0 s |
+| Decode (video and audio) | 17.0 s | 12.4 s |
+| **Total** | **606 s** | **413 s** |
+| Peak memory | 131902 MiB | 85274 MiB |
+
+Regional compile is worth 27% of the clip and 46 GiB of peak, so reach for it first.
+Plain `--enable-torch-compile` without `--regional-compile` compiles the whole
+transformer and fails on sm90: inductor autotunes the multi-head MoE GEMMs and asks
+262144 bytes of shared memory against the 232448 available. Pair the two flags.
+
+Expect a couple of percent of drift between processes on a shared machine; compare
+configurations within one run rather than against this table.
+
+Eager, the same clip at the preview-only tier is **478 s**, so the second stage costs
+about 128 s: 104 s of refiner denoise plus a decode that grows from 2.4 s to 17.0 s
+with the larger canvas. Compiled, that second stage is about 81 s. Supplying a
+conditioning image costs a further 17-24 s at either tier, for the extra 1680 patch
+tokens.
 
 Weight loading is separate and paid once per process: roughly 5 minutes for both
 DiTs, the expert tensors dominating.
 
-Text encoding is the first clip of a batch, so it is cold. The encoder runs on the
-host and its weights are memory-mapped from storage, so later clips in the same
-process take 9 s rather than 17 s. Longer prompts cost more: a 1900-token caption
-takes about 24 s against 9 s for a one-line prompt.
+That text-encoding figure is a cold first clip. The encoder runs on the host and its
+weights are memory-mapped from storage, so later clips in the same process take
+about 9 s. Longer prompts cost more: a 1900-token caption takes about 24 s.
 
-The preview pass at 4.5 s/step dominates everything else, so step count is the
-first knob to reach for when trading quality against latency. The refiner is
-5 steps against the preview's 100 and is not worth tuning first.
+The preview pass — 4.6 s/step eager, 3.4 s/step compiled — dominates, so step count
+is the first knob for trading quality against latency; the refiner's 5 steps are not
+worth tuning first.

@@ -47,7 +47,7 @@ class Magi2RefinerDiT(CachableDiT, LayerwiseOffloadableModuleMixin):
     """MAGI-2's refiner denoiser."""
 
     _fsdp_shard_conditions = [is_block]
-    _compile_conditions = []
+    _compile_conditions = [is_block]
     param_names_mapping: dict = {}
     layer_names = ["blocks"]
     _fsdp_mixed_dtype_params = True

@@ -10,6 +10,9 @@ from sglang.multimodal_gen.configs.sample.magi2 import (
     MAGI2_NEGATIVE_PROMPT,
     Magi2SamplingParams,
 )
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    VideoGenerationsRequest,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.magi2 import (
     build_layout,
     build_timesteps,
@@ -107,6 +110,34 @@ class TestShippedDefaults(unittest.TestCase):
 
     def test_text_conditioning_skips_two_layers(self):
         self.assertEqual(Magi2TextEncoderArchConfig().skip_layer, 2)
+
+
+class TestVideoRequestLowering(unittest.TestCase):
+    """The video API is the only public entry point, so its synthesized timing
+    defaults have to reach this fixed-length model as *unset*."""
+
+    def _lower(self, request):
+        generic = {
+            "prompt": request.prompt,
+            "fps": request.fps if request.fps is not None else 24,
+            "num_frames": request.num_frames,
+        }
+        if generic["num_frames"] is None:
+            generic["num_frames"] = generic["fps"] * (request.seconds or 4)
+        return Magi2SamplingParams.lower_video_request_kwargs(request, generic)
+
+    def test_bare_prompt_request_keeps_the_shipped_clip_length(self):
+        lowered = self._lower(VideoGenerationsRequest(prompt="x"))
+        self.assertNotIn("num_frames", lowered)
+        self.assertNotIn("fps", lowered)
+        params = Magi2SamplingParams(**lowered)
+        self.assertEqual((params.num_frames, params.fps), (249, 25))
+
+    def test_explicit_timing_is_preserved(self):
+        lowered = self._lower(
+            VideoGenerationsRequest(prompt="x", num_frames=241, fps=24)
+        )
+        self.assertEqual((lowered["num_frames"], lowered["fps"]), (241, 24))
 
 
 if __name__ == "__main__":

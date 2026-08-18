@@ -384,6 +384,9 @@ def fused_moe_kernel(
     LORA_PRESERVE_BASE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
     FUSE_SWIGLU: tl.constexpr = False,
+    SWIGLU_ALPHA: tl.constexpr = 0.0,
+    SWIGLU_LIMIT: tl.constexpr = 0.0,
+    HAS_SWIGLU_ALPHA: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -633,25 +636,36 @@ def fused_moe_kernel(
         acc_pairs = tl.reshape(accumulator, (BLOCK_SIZE_M, BLOCK_SIZE_N // 2, 2))
         gate_b, up_b = tl.split(acc_pairs)
         gate_f = gate_b.to(tl.float32)
-        # __expf(-x) == ex2.approx(x * -log2(e)); folding the negation into
-        # the constant (0fBFB8AA3B == -log2(e)) flips the sign exactly.
-        exp_neg = tl.inline_asm_elementwise(
-            "{ mul.ftz.f32 $0, $1, 0fBFB8AA3B; ex2.approx.ftz.f32 $0, $0; }",
-            "=f,f",
-            [gate_f],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
-        silu_f = tl.inline_asm_elementwise(
-            "div.approx.ftz.f32 $0, $1, $2;",
-            "=f,f,f",
-            [gate_f, 1.0 + exp_neg],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
-        )
-        out_act = (silu_f * up_b.to(tl.float32)).to(compute_type)
+        if HAS_SWIGLU_ALPHA:
+            # Accurate ops, not the approximate asm below: the unfused swiglu path
+            # this replaces uses tl.sigmoid on an fp32 tile.
+            gate_c = tl.minimum(gate_f, SWIGLU_LIMIT)
+            up_c = tl.maximum(
+                tl.minimum(up_b.to(tl.float32), SWIGLU_LIMIT), -SWIGLU_LIMIT
+            )
+            out_act = (gate_c * tl.sigmoid(SWIGLU_ALPHA * gate_c) * (up_c + 1.0)).to(
+                compute_type
+            )
+        else:
+            # __expf(-x) == ex2.approx(x * -log2(e)); folding the negation into
+            # the constant (0fBFB8AA3B == -log2(e)) flips the sign exactly.
+            exp_neg = tl.inline_asm_elementwise(
+                "{ mul.ftz.f32 $0, $1, 0fBFB8AA3B; ex2.approx.ftz.f32 $0, $0; }",
+                "=f,f",
+                [gate_f],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
+            silu_f = tl.inline_asm_elementwise(
+                "div.approx.ftz.f32 $0, $1, $2;",
+                "=f,f,f",
+                [gate_f, 1.0 + exp_neg],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
+            out_act = (silu_f * up_b.to(tl.float32)).to(compute_type)
         offs_half = pid_n * (BLOCK_SIZE_N // 2) + tl.arange(0, BLOCK_SIZE_N // 2)
         if c_sorted:
             c_ptrs = (
@@ -803,6 +817,8 @@ def invoke_fused_moe_kernel(
     mask_output: bool = False,
     lora_preserve_base: bool = False,
     fuse_swiglu: bool = False,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -1029,6 +1045,9 @@ def invoke_fused_moe_kernel(
             MASK_OUTPUT=mask_output,
             LORA_PRESERVE_BASE=lora_preserve_base,
             FUSE_SWIGLU=fuse_swiglu,
+            SWIGLU_ALPHA=float(swiglu_alpha or 0.0),
+            SWIGLU_LIMIT=float(swiglu_limit or 0.0),
+            HAS_SWIGLU_ALPHA=swiglu_alpha is not None,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
             **config,

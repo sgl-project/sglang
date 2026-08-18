@@ -180,8 +180,12 @@ def _read_rows(handle, name: str, *, row_range: tuple[int, int] | None) -> torch
 
 
 def _fuse_w13(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    """Disk layout is ``(E, head_dim, intermediate)`` (magi2_core/model/magi2_preview.py:2547-2566); the kernel wants the transpose, gate first."""
-    fused = torch.cat((gate.transpose(1, 2), up.transpose(1, 2)), dim=1)
+    """Disk layout is ``(E, head_dim, intermediate)``; the kernel wants the transpose,
+    with gate and up interleaved so the fused epilogue splits them in-register."""
+    experts, _, intermediate = gate.shape
+    fused = torch.stack((gate.transpose(1, 2), up.transpose(1, 2)), dim=2).reshape(
+        experts, 2 * intermediate, -1
+    )
     # fused_experts' Triton path asserts contiguity.
     assert fused.is_contiguous(), "w13_weight must be contiguous"
     return fused

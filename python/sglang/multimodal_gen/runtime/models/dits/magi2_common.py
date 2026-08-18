@@ -7,6 +7,7 @@ import math
 import msgspec
 import torch
 from torch import nn
+from torch.utils.weak import WeakTensorKeyDictionary
 
 from sglang.multimodal_gen.runtime.layers.moe_multihead import (
     SWIGLU7_ALPHA,
@@ -151,15 +152,25 @@ def gather_packed_rows(local: torch.Tensor, *, plan) -> torch.Tensor:
     return gather_seq(local.unsqueeze(0), plan.orig_len, dim=1).squeeze(0)
 
 
+_MODALITY_RUNS = WeakTensorKeyDictionary()
+
+
 def modality_runs(modality_ids: torch.Tensor) -> list[tuple[int, int, int]]:
+    """Memoized per tensor, since the scan syncs with the host and every block of a
+    forward reads the same layout. Weak keys, so a finished request is not retained."""
+    runs = _MODALITY_RUNS.get(modality_ids)
+    if runs is not None:
+        return runs
     # Only the boundary positions cross to the host, not the tags themselves.
     changes = (modality_ids[1:] != modality_ids[:-1]).nonzero().flatten() + 1
     edges = [0, *changes.tolist(), int(modality_ids.numel())]
-    return [
+    runs = [
         (start, end - start, int(modality_ids[start]))
         for start, end in zip(edges, edges[1:])
         if end > start
     ]
+    _MODALITY_RUNS[modality_ids] = runs
+    return runs
 
 
 class Magi2ModalityRMSNorm(nn.Module):
@@ -190,10 +201,11 @@ class Magi2ModalityRMSNorm(nn.Module):
         if modality_ids.numel() == 1:
             return (x * weight[int(modality_ids[0])]).to(dtype)
 
-        # In place: a per-token weight gather would materialize a full fp32 copy.
-        for start, count, modality in modality_runs(modality_ids):
-            x.narrow(0, start, count).mul_(weight[modality])
-        return x.to(dtype)
+        # Gathered, not a run loop: the loop's boundary scan crosses to the host,
+        # which both syncs and breaks the compiled graph in every MoE layer.
+        gathered = weight.index_select(0, modality_ids)
+        # q_norm/k_norm pass [T, heads, dim], so the gather needs the head axis.
+        return (x * gathered.reshape(-1, *(1,) * (x.dim() - 2), self.width)).to(dtype)
 
 
 class Magi2ModalityLinear(nn.Module):

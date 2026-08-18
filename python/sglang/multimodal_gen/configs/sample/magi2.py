@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
@@ -100,3 +100,19 @@ class Magi2SamplingParams(SamplingParams):
             raise ValueError("num_inference_steps must be >= 1")
         if self.refiner_num_inference_steps < 1:
             raise ValueError("refiner_num_inference_steps must be >= 1")
+
+    @classmethod
+    def lower_video_request_kwargs(
+        cls,
+        request: Any,
+        kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        # The video API synthesizes num_frames as fps * seconds from its own 24fps
+        # 4s defaults, which a fixed-length 10s model rejects. Drop both unless the
+        # caller set them, so this type's 249 @ 25 applies.
+        kwargs = dict(kwargs)
+        if request.fps is None:
+            kwargs.pop("fps", None)
+        if request.num_frames is None:
+            kwargs.pop("num_frames", None)
+        return kwargs

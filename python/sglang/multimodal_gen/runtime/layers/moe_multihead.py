@@ -107,6 +107,9 @@ class Magi2MultiHeadExperts(nn.Module):
             torch.empty(num_local_experts, head_dim, intermediate_size)
         )
 
+    # Opaque to dynamo: autotuning these GEMMs asks more shared memory than sm90
+    # has, so a compiled region containing them fails to build.
+    @torch._dynamo.disable()
     def forward(
         self,
         tokens: torch.Tensor,
@@ -138,8 +141,8 @@ class Magi2MultiHeadExperts(nn.Module):
             apply_router_weight_on_input=False,
             # The router already applied route_scale; setting this double-applies it.
             routed_scaling_factor=None,
-            # gate and up are separate accumulators, not interleaved columns.
-            gate_up_interleaved=False,
+            # w13_weight interleaves gate and up rows for the fused epilogue.
+            gate_up_interleaved=True,
             gemm1_alpha=SWIGLU7_ALPHA,
             gemm1_clamp_limit=SWIGLU7_LIMIT,
         )
@@ -149,6 +152,7 @@ class Magi2MultiHeadExperts(nn.Module):
             self.w2.bfloat16(),
             topk_output,
             runner_config,
+            fuse_swiglu_interleaved=True,
         ).type_as(tokens)
 
 

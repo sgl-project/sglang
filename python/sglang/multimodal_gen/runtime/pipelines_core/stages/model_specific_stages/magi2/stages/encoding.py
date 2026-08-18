@@ -39,6 +39,10 @@ class Magi2TextEncodingStage(PipelineStage):
         self.tokenizer = tokenizer
         self.tokenizer_kwargs = tokenizer_kwargs
         self.skip_layer = skip_layer
+        # Cached on the prompt text, which every rank has: if one rank hit the cache
+        # and another missed, _encode_and_share's broadcast would hang.
+        self._negative_prompt: str | None = None
+        self._negative_embeds: list[torch.Tensor] | None = None
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
@@ -88,15 +92,17 @@ class Magi2TextEncodingStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         use_guidance = server_args.pipeline_config.should_use_guidance
-        prompts = [batch.prompt]
-        if use_guidance:
-            prompts.append(batch.negative_prompt or "")
 
-        embeds = self._encode_and_share(prompts)
+        # One call per prompt: batching pads the caption to the negative prompt's length.
+        embeds = self._encode_and_share([batch.prompt])
 
         batch.prompt_embeds = [embeds[0]]
         if use_guidance:
-            batch.negative_prompt_embeds = [embeds[1]]
+            negative = batch.negative_prompt or ""
+            if negative != self._negative_prompt:
+                self._negative_embeds = self._encode_and_share([negative])
+                self._negative_prompt = negative
+            batch.negative_prompt_embeds = list(self._negative_embeds)
 
         counts = batch.extra["magi2_ref_patch_counts"]
         if counts:

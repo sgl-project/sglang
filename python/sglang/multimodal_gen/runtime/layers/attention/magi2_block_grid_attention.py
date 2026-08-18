@@ -18,6 +18,15 @@ _TILE = 128
 # Each distinct sequence length compiles its own graph, hence SEQ_BUCKET.
 _flex_attention = torch.compile(flex_attention, dynamic=False)
 
+try:
+    from magi_attention.api import flex_flash_attn_func
+
+    _HAS_FFA = True
+except ImportError:
+    # Optional: the flex path below is equivalent, just 2.5x slower here.
+    flex_flash_attn_func = None
+    _HAS_FFA = False
+
 
 class Magi2BlockGrid(msgspec.Struct, frozen=True):
     """Frozen so it can key the mask cache."""
@@ -157,6 +166,54 @@ def build_mask_mod(*, grid: Magi2BlockGrid, device: torch.device):
     return mask_mod
 
 
+@functools.lru_cache(maxsize=4)
+def cached_ffa_ranges(
+    *, grid: Magi2BlockGrid, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``mask_mod`` as (q, k) token-range pairs: 1.4 MB against the BlockMask's 123 MB.
+
+    A block's neighbours along ``w`` are consecutive block ids, so each ``(t, h)``
+    offset collapses to one contiguous key range.
+    """
+    counts = _block_token_counts(grid=grid, device=device)
+    starts = F.pad(counts.cumsum(0), (1, 0)).to(torch.int32)
+    nt, nh, nw = grid.block_grid_thw
+    radius_t, radius_h, radius_w = grid.radius_thw
+
+    ids = torch.arange(nt * nh * nw, dtype=torch.int64, device=device)
+    block_t, block_h, block_w = ids // (nh * nw), ids // nw % nh, ids % nw
+    offs_t = torch.arange(-radius_t, radius_t + 1, device=device)
+    offs_h = torch.arange(-radius_h, radius_h + 1, device=device)
+
+    near_t = block_t[:, None, None] + offs_t[None, :, None]
+    near_h = block_h[:, None, None] + offs_h[None, None, :]
+    inside = (near_t >= 0) & (near_t < nt) & (near_h >= 0) & (near_h < nh)
+    base = (near_t.clamp(0, nt - 1) * nh + near_h.clamp(0, nh - 1)) * nw
+    lo = (block_w - radius_w).clamp(min=0)[:, None, None]
+    hi = (block_w + radius_w).clamp(max=nw - 1)[:, None, None]
+
+    q_lo = starts[ids][:, None, None].expand_as(base)[inside]
+    q_hi = starts[ids + 1][:, None, None].expand_as(base)[inside]
+    q_ranges = [torch.stack((q_lo, q_hi), dim=-1)]
+    k_ranges = [
+        torch.stack((starts[base + lo][inside], starts[base + hi + 1][inside]), dim=-1)
+    ]
+
+    num_video, num_valid = grid.num_video_tokens, grid.num_valid_tokens
+    extra = []
+    if num_valid > num_video:
+        # Only video->video is grid-local, so every video query sees the whole tail.
+        extra.append(((0, num_video), (num_video, num_valid)))
+    if grid.seq_len > num_video:
+        # Tail and pad queries attend densely; a fully masked pad row would be NaN.
+        extra.append(((num_video, grid.seq_len), (0, num_valid)))
+    for (q0, q1), (k0, k1) in extra:
+        q_ranges.append(torch.tensor([[q0, q1]], dtype=torch.int32, device=device))
+        k_ranges.append(torch.tensor([[k0, k1]], dtype=torch.int32, device=device))
+
+    return torch.cat(q_ranges), torch.cat(k_ranges)
+
+
 def _tile_coord_bounds(
     *, grid: Magi2BlockGrid, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -176,28 +233,71 @@ def _tile_coord_bounds(
     return lo, hi, has_tail
 
 
-def _tile_occupancy(*, grid: Magi2BlockGrid, device: torch.device) -> torch.Tensor:
-    """A superset of the true mask, which ``mask_mod`` then masks elementwise."""
-    lo, hi, has_tail = _tile_coord_bounds(grid=grid, device=device)
+def _tile_near(*, grid: Magi2BlockGrid, device: torch.device) -> torch.Tensor:
+    """Tile pairs whose video block ranges come within ``radius_thw`` on every axis."""
+    lo, hi, _ = _tile_coord_bounds(grid=grid, device=device)
     near = torch.ones((grid.num_tiles, grid.num_tiles), dtype=torch.bool, device=device)
     for axis, radius in enumerate(grid.radius_thw):
         near &= (lo[axis][:, None] - radius <= hi[axis][None, :]) & (
             hi[axis][:, None] + radius >= lo[axis][None, :]
         )
+    return near
+
+
+def _tile_occupancy(*, grid: Magi2BlockGrid, device: torch.device) -> torch.Tensor:
+    """A superset of the true mask, which ``mask_mod`` then masks elementwise."""
+    _, _, has_tail = _tile_coord_bounds(grid=grid, device=device)
+    near = _tile_near(grid=grid, device=device)
     return near | has_tail[:, None] | has_tail[None, :]
+
+
+def _tile_kinds(
+    *, grid: Magi2BlockGrid, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Which tiles hold one block of video, only tail, or any pad key."""
+    lo, hi, has_tail = _tile_coord_bounds(grid=grid, device=device)
+    positions = torch.arange(grid.num_tiles * _TILE, device=device)
+    tiled = positions.view(grid.num_tiles, _TILE)
+    has_video = (tiled < grid.num_video_tokens).any(-1)
+    has_pad = (tiled >= grid.num_valid_tokens).any(-1)
+    # lo == hi on every axis means all of the tile's video tokens sit in one block,
+    # which holds for a full block but not for a ragged edge one.
+    single_block = ((lo == hi).all(0)) & has_video
+    return single_block & ~has_tail & ~has_pad, ~has_video & ~has_pad, has_pad
+
+
+def _tile_full(*, grid: Magi2BlockGrid, device: torch.device) -> torch.Tensor:
+    """Tile pairs with no masked element, so the kernel can skip ``mask_mod`` on them."""
+    video, tail, has_pad = _tile_kinds(grid=grid, device=device)
+    both_video = video[:, None] & video[None, :] & _tile_near(grid=grid, device=device)
+    # A tail token on either side clears the video-only test for the whole pair.
+    with_tail = (tail[:, None] & (video | tail)[None, :]) | (
+        video[:, None] & tail[None, :]
+    )
+    return (both_video | with_tail) & ~has_pad[None, :]
+
+
+def _rows_to_blockmask_args(keep: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    counts = keep.sum(-1, dtype=torch.int32)
+    # Keep all num_tiles columns rather than trimming to counts.max(): from_kv_blocks
+    # sizes its transposed-mask buffer from kv_indices.shape[-1].
+    indices = keep.to(torch.int8).argsort(dim=-1, descending=True, stable=True)
+    return counts[None, None], indices.to(torch.int32)[None, None].contiguous()
 
 
 @functools.lru_cache(maxsize=2)
 def cached_block_mask(*, grid: Magi2BlockGrid, device: torch.device) -> BlockMask:
     """Built sparsely because ``create_block_mask`` materializes a dense [seq_len, seq_len] bool first."""
     allow = _tile_occupancy(grid=grid, device=device)
-    counts = allow.sum(-1, dtype=torch.int32)
-    # kv_indices must keep all num_tiles columns, not counts.max(): from_kv_blocks
-    # sizes its transposed-mask buffer from kv_indices.shape[-1].
-    indices = allow.to(torch.int8).argsort(dim=-1, descending=True, stable=True)
+    full = _tile_full(grid=grid, device=device) & allow
+    full_counts, full_indices = _rows_to_blockmask_args(full)
+    # Only the ragged and pad-bearing pairs are left to mask elementwise.
+    counts, indices = _rows_to_blockmask_args(allow & ~full)
     return BlockMask.from_kv_blocks(
-        kv_num_blocks=counts[None, None],
-        kv_indices=indices.to(torch.int32)[None, None].contiguous(),
+        kv_num_blocks=counts,
+        kv_indices=indices,
+        full_kv_num_blocks=full_counts,
+        full_kv_indices=full_indices,
         BLOCK_SIZE=(_TILE, _TILE),
         mask_mod=build_mask_mod(grid=grid, device=device),
         seq_lengths=(grid.seq_len, grid.seq_len),
@@ -224,6 +324,9 @@ class Magi2BlockGridAttention(nn.Module):
         self.enable_gqa = self.num_kv_heads != num_heads
         self.dense_fallback = dense_fallback
 
+    # Opaque to dynamo: the mask is compiled by _flex_attention above, and an outer
+    # region would recompile it per sequence length instead of per bucket.
+    @torch._dynamo.disable()
     def forward(
         self,
         q: torch.Tensor,
@@ -245,16 +348,42 @@ class Magi2BlockGridAttention(nn.Module):
             # Per-tensor: the packed helper asserts q/k/v share a shape, and this is GQA.
             q, k, v = (_usp_input_all_to_all(t[None], head_dim=2)[0] for t in (q, k, v))
 
-        out = self._attend(
-            q=q.transpose(0, 1)[None],
-            k=k.transpose(0, 1)[None],
-            v=v.transpose(0, 1)[None],
-            grid=grid,
-        )
-        out = out[0].transpose(0, 1)
+        if _HAS_FFA and not self.dense_fallback:
+            # FFA takes the packed [S, H, D] layout directly, with no transpose.
+            out = self._attend_ffa(q=q, k=k, v=v, grid=grid)
+        else:
+            out = self._attend(
+                q=q.transpose(0, 1)[None],
+                k=k.transpose(0, 1)[None],
+                v=v.transpose(0, 1)[None],
+                grid=grid,
+            )[0].transpose(0, 1)
 
         if ulysses:
             out = _usp_output_all_to_all(out[None], head_dim=2)[0]
+        return out
+
+    def _attend_ffa(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        grid: Magi2BlockGrid,
+    ) -> torch.Tensor:
+        q_ranges, k_ranges = cached_ffa_ranges(grid=grid, device=q.device)
+        out, _ = flex_flash_attn_func(
+            q,
+            k,
+            v,
+            q_ranges,
+            k_ranges,
+            softmax_scale=self.softmax_scale,
+            # Measured free (41.99 vs 41.06 ms) and keeps runs reproducible.
+            deterministic=True,
+            disable_fwd_atomic_reduction=True,
+            auto_range_merge=True,
+        )
         return out
 
     def _attend(

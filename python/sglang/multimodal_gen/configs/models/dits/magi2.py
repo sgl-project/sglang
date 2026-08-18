@@ -70,6 +70,11 @@ class Magi2PreviewArchConfig(DiTArchConfig):
 class Magi2PreviewConfig(DiTConfig):
     arch_config: Magi2PreviewArchConfig = field(default_factory=Magi2PreviewArchConfig)
 
+    # The compiled regions are elementwise and reduction chains, not GEMMs, so
+    # autotuning only adds compile time and asks the MoE GEMMs for more shared
+    # memory than sm90 has.
+    torch_compile_mode: str = "default"
+
 
 @dataclass
 class Magi2RefinerArchConfig(DiTArchConfig):

@@ -15,6 +15,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.torch_compile import (
+    ActiveTargetCompiledCallable,
+    build_torch_compile_kwargs,
+    resolve_torch_compile_mode,
+)
 
 
 class Magi2DecodingStage(PipelineStage):
@@ -33,6 +38,7 @@ class Magi2DecodingStage(PipelineStage):
         self.video_vae = video_vae
         self.audio_vae = audio_vae
         self.turbo_vae = turbo_vae
+        self._compiled_decode = ActiveTargetCompiledCallable()
         self.latents_mean = torch.tensor(latents_mean).view(1, -1, 1, 1, 1)
         self.latents_std = torch.tensor(latents_std).view(1, -1, 1, 1, 1)
 
@@ -40,7 +46,9 @@ class Magi2DecodingStage(PipelineStage):
     def role_affinity(self) -> RoleType:
         return RoleType.DECODER
 
-    def _decode_video(self, batch: Req, *, use_turbo: bool) -> torch.Tensor:
+    def _decode_video(
+        self, batch: Req, *, use_turbo: bool, server_args: ServerArgs
+    ) -> torch.Tensor:
         _, channels, frames, height, width = batch.raw_latent_shape
         grid = (
             batch.latents.reshape(frames, height, width, channels)
@@ -57,8 +65,26 @@ class Magi2DecodingStage(PipelineStage):
             else self.video_vae
         )
         weight = next(decoder.parameters())
+        decode = self._decode_fn(decoder, server_args)
         with torch.no_grad():
-            return decoder.decode(grid.to(device=weight.device, dtype=weight.dtype))
+            return decode(grid.to(device=weight.device, dtype=weight.dtype))
+
+    def _decode_fn(self, decoder, server_args: ServerArgs):
+        """The decoder runs 9 windowed calls per clip, so a compiled graph
+        amortizes inside one request."""
+        if not server_args.enable_torch_compile:
+            return decoder.decode
+
+        mode = resolve_torch_compile_mode(
+            "SGLANG_VAE_TORCH_COMPILE_MODE",
+            "SGLANG_TORCH_COMPILE_MODE",
+            default="default",
+        )
+        return self._compiled_decode.get_or_compile(
+            decoder,
+            decoder.decode,
+            compile_kwargs=build_torch_compile_kwargs(mode=mode),
+        )
 
     def _decode_audio(self, latents: torch.Tensor | None) -> torch.Tensor | None:
         if latents is None or latents.numel() == 0:
@@ -73,7 +99,9 @@ class Magi2DecodingStage(PipelineStage):
         batch.latents = batch.latents.contiguous()
         torch.cuda.empty_cache()
 
-        pixels = self._decode_video(batch, use_turbo=config.use_turbo_vae)
+        pixels = self._decode_video(
+            batch, use_turbo=config.use_turbo_vae, server_args=server_args
+        )
         # The refiner gets zero audio tokens, so the latent stays where handoff put it.
         audio_latents = (
             batch.extra["magi2_preview_audio_latents"]
