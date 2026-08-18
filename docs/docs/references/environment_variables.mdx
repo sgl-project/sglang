@@ -1709,6 +1709,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Sanitize NaN logits before sampling kernels and emit a throttled warning.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSPARK_ENABLE_CAPTURE_DERIVED_SPS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Measure the DSpark verify-budget SPS cost table by timing the CUDA graphs at the end of capture, instead of the uninitialized flat table that pins the budget to verify-all. Applies only to <code>SGLANG_RAGGED_VERIFY_MODE=compact</code>; a table supplied with <code>--speculative-dspark-sps-table-path</code> takes precedence and disables it. Adds a few seconds to startup and nothing to serving.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 
