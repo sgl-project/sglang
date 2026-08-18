@@ -1305,12 +1305,16 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+        from sglang.srt.layers.cp.utils import (
+            get_glm_dsa_cp_layer_shard_info,
+            get_glm_dsa_shared_info,
+        )
 
         (
             dsa_cp_layer_shard_rank,
             dsa_cp_layer_shard_size,
         ) = get_glm_dsa_cp_layer_shard_info(self)
+        dsa_shared_rank, dsa_shared_size = get_glm_dsa_shared_info(self)
         pool_kwargs = {}
         if get_memory().enable_hisparse:
             PoolCls = HiSparseDSATokenToKVPool
@@ -1319,6 +1323,28 @@ class KVCacheConfigurator:
             pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                 self.server_args
             ).host_to_device_ratio
+        elif dsa_shared_rank is not None:
+            from sglang.srt.mem_cache.dsa_cache_shared import (
+                SharedDSATokenToKVPool,
+            )
+            from sglang.srt.mem_cache.dsa_shared_demand import (
+                get_indexer_pool_cache_layer_ids,
+            )
+
+            PoolCls = SharedDSATokenToKVPool
+            pool_kwargs["shared_rank"] = dsa_shared_rank
+            pool_kwargs["shared_size"] = dsa_shared_size
+            share_indexer = not self.server_args.disable_dsa_shared_indexer_cache
+            pool_kwargs["share_indexer"] = share_indexer
+            pool_kwargs["indexer_cache_layer_ids"] = (
+                get_indexer_pool_cache_layer_ids(
+                    self.model_config.hf_config,
+                    self.layer_info.start_layer,
+                    self.layer_info.end_layer,
+                )
+                if share_indexer
+                else ()
+            )
         elif dsa_cp_layer_shard_rank is not None:
             # DSA cache layer split: shard KV/indexer layers across CP ranks.
             from sglang.srt.mem_cache.dsa_cache_layer_split import (

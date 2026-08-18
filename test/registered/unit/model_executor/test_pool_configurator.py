@@ -79,6 +79,10 @@ def _make_model_runner(
     disaggregation_decode_extra_slots=0,
     kv_lora_rank=512,
     qk_rope_head_dim=64,
+    enable_dsa_shared_kv_cache=False,
+    disable_dsa_shared_indexer_cache=False,
+    dsa_prefill_backend="flashmla_kv",
+    dsa_decode_backend="flashmla_kv",
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -140,6 +144,10 @@ def _make_model_runner(
         enable_hisparse=False,
         enable_hierarchical_cache=False,
         enable_dsa_cache_layer_split=False,
+        enable_dsa_shared_kv_cache=enable_dsa_shared_kv_cache,
+        disable_dsa_shared_indexer_cache=disable_dsa_shared_indexer_cache,
+        dsa_prefill_backend=dsa_prefill_backend,
+        dsa_decode_backend=dsa_decode_backend,
         kv_cache_dtype="auto",
     )
     mr.server_args = get_server_args()
@@ -615,6 +623,254 @@ class TestEagleConfigurator(CustomTestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+    def test_shared_dsa_prices_replicated_eagle_draft_layers(self):
+        """Shared target layers are sharded, but EAGLE draft layers are not."""
+        num_layers = 32
+        draft_layers = 4
+        mr = _make_model_runner(
+            self,
+            num_layers=num_layers,
+            use_mla_backend=True,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            max_running_requests=32,
+            speculative_num_draft_tokens=4,
+            enable_dsa_shared_kv_cache=True,
+            dsa_prefill_backend="flashmla_sparse",
+        )
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_head_dim=128,
+        )
+        hf_config.get_text_config = lambda: hf_config
+        mr.model_config.hf_config = hf_config
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_standalone.return_value = False
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = draft_layers
+
+        with (
+            mock_cpu_env(),
+            get_parallel().override(attn_cp_size=8),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+
+        # mock_cpu_env prices every stored element at two bytes. The target owns
+        # ceil(32 / 8) layers; all four draft layers remain fully replicated.
+        full_layer_bytes = (512 + 64) * KV_SIZE + (128 + 4) * KV_SIZE
+        expected = full_layer_bytes * (4 + draft_layers)
+        self.assertEqual(cfg._cell_size, expected)
+
+    def test_shared_dsa_replicated_indexer_prices_full_indexer_layers(self):
+        num_layers = 32
+        mr = _make_model_runner(
+            self,
+            num_layers=num_layers,
+            use_mla_backend=True,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            max_running_requests=32,
+            speculative_num_draft_tokens=4,
+            enable_dsa_shared_kv_cache=True,
+            disable_dsa_shared_indexer_cache=True,
+        )
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_head_dim=128,
+        )
+        hf_config.get_text_config = lambda: hf_config
+        mr.model_config.hf_config = hf_config
+
+        with (
+            mock_cpu_env(),
+            get_parallel().override(attn_cp_size=8),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+
+        main_bytes_per_layer = (512 + 64) * KV_SIZE
+        indexer_bytes_per_layer = (128 + 4) * KV_SIZE
+        expected = main_bytes_per_layer * 4 + indexer_bytes_per_layer * num_layers
+        self.assertEqual(cfg._cell_size, expected)
+        self.assertEqual(cfg._indexer_pool_cache_num_layers, 0)
+
+    def test_shared_dsa_uses_model_mtp_layers_before_aux_config_is_ready(self):
+        num_layers = 78
+        mr = _make_model_runner(
+            self,
+            num_layers=num_layers,
+            use_mla_backend=True,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            max_running_requests=32,
+            speculative_num_draft_tokens=4,
+            enable_dsa_shared_kv_cache=True,
+        )
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_head_dim=128,
+        )
+        hf_config.get_text_config = lambda: hf_config
+        mr.model_config.hf_config = hf_config
+        mr.model_config.num_nextn_predict_layers = 1
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_standalone.return_value = False
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = None
+
+        with (
+            mock_cpu_env(),
+            get_parallel().override(attn_cp_size=8),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+
+        full_layer_bytes = (512 + 64) * KV_SIZE + (128 + 4) * KV_SIZE
+        self.assertEqual(cfg._cell_size, full_layer_bytes * (10 + 1))
+
+    def test_shared_dsa_prices_flashmla_demand_workspace(self):
+        num_layers = 78
+        max_running_requests = 32
+        max_current_rows = 4
+        mr = _make_model_runner(
+            self,
+            num_layers=num_layers,
+            use_mla_backend=True,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            max_running_requests=max_running_requests,
+            speculative_num_draft_tokens=max_current_rows,
+            enable_dsa_shared_kv_cache=True,
+        )
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_head_dim=128,
+        )
+        hf_config.get_text_config = lambda: hf_config
+        mr.model_config.hf_config = hf_config
+
+        with (
+            mock_cpu_env(),
+            get_parallel().override(attn_cp_size=8),
+        ):
+            from sglang.srt.mem_cache.dsa_shared_demand import (
+                get_flashmla_shared_demand_workspace_bytes,
+            )
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+
+        self.assertEqual(
+            cfg._fixed_bytes,
+            get_flashmla_shared_demand_workspace_bytes(
+                num_layers=num_layers,
+                num_request_slots=max_running_requests,
+                max_current_rows=max_current_rows,
+            ),
+        )
+
+    def test_shared_dsa_draft_worker_does_not_price_target_demand_workspace(self):
+        mr = _make_model_runner(
+            self,
+            num_layers=1,
+            use_mla_backend=True,
+            max_running_requests=32,
+            speculative_num_draft_tokens=4,
+            enable_dsa_shared_kv_cache=True,
+        )
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_head_dim=128,
+        )
+        hf_config.get_text_config = lambda: hf_config
+        mr.model_config.hf_config = hf_config
+        mr.is_draft_worker = True
+
+        with (
+            mock_cpu_env(),
+            get_parallel().override(attn_cp_size=8),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+
+        self.assertEqual(cfg._fixed_bytes, 0)
+
+    def test_shared_dsa_prices_pool_cache_with_token_pool_pages(self):
+        num_layers = 32
+        producer_layers = 8
+        page_size = 64
+        max_tokens = 64 * 100
+        mr = _make_model_runner(
+            self,
+            num_layers=num_layers,
+            use_mla_backend=True,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            page_size=page_size,
+            enable_dsa_shared_kv_cache=True,
+            dsa_prefill_backend="flashmla_sparse",
+        )
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            index_topk=2048,
+            index_head_dim=128,
+            index_topk_pattern=[
+                "C" if layer_id < producer_layers else "S"
+                for layer_id in range(num_layers)
+            ],
+        )
+        hf_config.get_text_config = lambda: hf_config
+        mr.model_config.hf_config = hf_config
+
+        with (
+            mock_cpu_env(),
+            get_parallel().override(attn_cp_size=8),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+
+        logical_pages = (max_tokens + page_size + 1) // page_size
+        page_bytes = page_size * (128 + 4)
+        expected_pool_bytes = (
+            producer_layers * logical_pages * (page_bytes + 8) + producer_layers * 4
+        )
+        self.assertEqual(
+            cfg._variable_bytes_for_tokens(max_tokens), expected_pool_bytes
+        )
+
+        exact_budget = cfg._cell_size * max_tokens + expected_pool_bytes
+        self.assertEqual(
+            cfg.calculate_pool_sizes(exact_budget, page_size).max_total_num_tokens,
+            max_tokens,
+        )
+        self.assertEqual(
+            cfg.calculate_pool_sizes(exact_budget - 1, page_size).max_total_num_tokens,
+            max_tokens - page_size,
+        )
 
     @patch(
         "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",

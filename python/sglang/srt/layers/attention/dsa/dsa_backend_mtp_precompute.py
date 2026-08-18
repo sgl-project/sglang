@@ -52,6 +52,8 @@ class PrecomputedMetadata:
 
     # FlashMLA (optional)
     flashmla_metadata: Optional[torch.Tensor] = None
+    # Stable req_pool_idx aligned with every flattened FlashMLA Q row.
+    shared_cache_request_slots: Optional[torch.Tensor] = None
 
 
 def compute_cu_seqlens(seqlens: torch.Tensor) -> torch.Tensor:
@@ -182,6 +184,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 max_len=max_len,
                 max_seqlen_k=max_len,
                 flashmla_metadata=flashmla_metadata,
+                shared_cache_request_slots=req_pool_indices[:bs],
             )
 
         # Convert to int32 and compute cumsum
@@ -227,6 +230,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             max_len=max_len,
             max_seqlen_k=max_len,
             flashmla_metadata=flashmla_metadata,
+            shared_cache_request_slots=req_pool_indices[:bs],
         )
 
     def _precompute_target_verify_mode(
@@ -314,6 +318,9 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 max_len=-1,
                 max_seqlen_k=max_seqlen_k,
                 flashmla_metadata=flashmla_metadata,
+                shared_cache_request_slots=req_pool_indices[:bs].repeat_interleave(
+                    self.speculative_num_draft_tokens
+                ),
             )
 
         # Cache seqlens with draft tokens
@@ -374,6 +381,9 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
             max_len=-1,  # Not used in this mode
             max_seqlen_k=max_seqlen_k,
             flashmla_metadata=flashmla_metadata,
+            shared_cache_request_slots=req_pool_indices[:bs].repeat_interleave(
+                self.speculative_num_draft_tokens
+            ),
         )
 
 

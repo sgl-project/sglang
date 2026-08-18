@@ -758,6 +758,222 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             server_args._validate_hisparse_kv_cache_dtype()
 
 
+class TestDSASharedCacheArgs(unittest.TestCase):
+    @staticmethod
+    def _make_args(**overrides):
+        values = dict(
+            model_path="dummy",
+            enable_dsa_shared_kv_cache=True,
+            disaggregation_mode="null",
+            tp_size=8,
+            attn_cp_size=8,
+            dp_size=1,
+            nnodes=1,
+            attention_backend="dsa",
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            disaggregation_transfer_backend="mooncake",
+            pp_size=1,
+            max_running_requests=32,
+            quantization="w4afp8",
+            kv_cache_dtype="fp8_e4m3",
+            page_size=64,
+            dsa_prefill_backend="flashmla_kv",
+            dsa_decode_backend="flashmla_kv",
+        )
+        values.update(overrides)
+        args = ServerArgs(**values)
+        args.cuda_graph_config = CudaGraphConfig()
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"], index_topk=2048
+        )
+        args.get_model_config = lambda: SimpleNamespace(hf_config=hf_config)
+        return args
+
+    @staticmethod
+    def _adjust(args, *, cuda=True, capability=(9, 0)):
+        with (
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa",
+                return_value=True,
+            ),
+            patch("sglang.srt.server_args.is_cuda", return_value=cuda),
+            patch("torch.cuda.get_device_capability", return_value=capability),
+        ):
+            args._handle_model_specific_adjustments()
+
+    def test_accepts_release_configuration(self):
+        args = self._make_args()
+
+        self._adjust(args)
+
+        self.assertTrue(args.enable_dsa_shared_kv_cache)
+
+    def test_requires_explicit_bounded_max_running_requests(self):
+        for value in (None, 0, 33):
+            with self.subTest(max_running_requests=value):
+                args = self._make_args(max_running_requests=value)
+                with self.assertRaisesRegex(
+                    ValueError, r"--max-running-requests.*\[1, 32\]"
+                ):
+                    self._adjust(args)
+
+    def test_accepts_max_running_requests_bounds(self):
+        for value in (1, 32):
+            with self.subTest(max_running_requests=value):
+                args = self._make_args(max_running_requests=value)
+                self._adjust(args)
+                self.assertEqual(args.max_running_requests, value)
+
+    def test_rejects_layer_split_at_the_same_time(self):
+        args = self._make_args(enable_dsa_cache_layer_split=True)
+
+        with self.assertRaisesRegex(ValueError, "cannot be enabled together"):
+            self._adjust(args)
+
+    def test_requires_nvidia_cuda(self):
+        args = self._make_args()
+
+        with self.assertRaisesRegex(ValueError, "requires NVIDIA CUDA"):
+            self._adjust(args, cuda=False)
+
+    def test_accepts_mixed_prefill_decode_worker(self):
+        args = self._make_args()
+
+        self._adjust(args)
+
+        self.assertTrue(args.enable_dsa_shared_kv_cache)
+
+    def test_shared_indexer_is_enabled_by_default(self):
+        args = self._make_args()
+
+        self._adjust(args)
+
+        self.assertFalse(args.disable_dsa_shared_indexer_cache)
+
+    def test_accepts_replicated_indexer_fallback(self):
+        args = self._make_args(disable_dsa_shared_indexer_cache=True)
+
+        self._adjust(args)
+
+        self.assertTrue(args.disable_dsa_shared_indexer_cache)
+
+    def test_rejects_replicated_indexer_flag_without_shared_main(self):
+        args = self._make_args(
+            enable_dsa_shared_kv_cache=False,
+            disable_dsa_shared_indexer_cache=True,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError, "requires --enable-dsa-shared-kv-cache"
+        ):
+            self._adjust(args)
+
+    def test_rejects_pd_workers(self):
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                args = self._make_args(disaggregation_mode=mode)
+                with self.assertRaisesRegex(ValueError, "mixed Prefill/Decode"):
+                    self._adjust(args)
+
+    def test_requires_interleave_prefill_cp(self):
+        args = self._make_args(cp_strategy="zigzag")
+
+        with self.assertRaisesRegex(ValueError, "--cp-strategy interleave"):
+            self._adjust(args)
+
+    def test_requires_pp1(self):
+        args = self._make_args(pp_size=2)
+        with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
+            self._adjust(args)
+
+    def test_requires_multiple_cp_ranks(self):
+        args = self._make_args(tp_size=1, attn_cp_size=1)
+
+        with self.assertRaisesRegex(ValueError, "attn-cp-size greater than 1"):
+            self._adjust(args)
+
+    def test_release_scope_requires_glm52_architecture(self):
+        args = self._make_args()
+        args.get_model_config = lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"], index_topk=2048
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "GLM-5.2"):
+            self._adjust(args)
+
+    def test_release_scope_requires_tp8_cp8(self):
+        for field, value in (("tp_size", 4), ("attn_cp_size", 4)):
+            with self.subTest(field=field):
+                args = self._make_args(**{field: value})
+                with self.assertRaisesRegex(ValueError, "TP8/CP8"):
+                    self._adjust(args)
+
+    def test_release_scope_requires_single_node_dp1_sm90_dsa(self):
+        cases = (
+            ({"nnodes": 2}, "single node"),
+            ({"dp_size": 2}, "DP1"),
+            ({"attention_backend": "flashinfer"}, "attention backend.*dsa"),
+        )
+        for overrides, message in cases:
+            with self.subTest(overrides=overrides):
+                args = self._make_args(**overrides)
+                with self.assertRaisesRegex(ValueError, message):
+                    self._adjust(args)
+
+        args = self._make_args()
+        with self.assertRaisesRegex(ValueError, "SM90"):
+            self._adjust(args, capability=(10, 0))
+
+    def test_release_scope_requires_flashmla_fp8_page64_w4afp8(self):
+        cases = (
+            ("quantization", "fp8"),
+            ("kv_cache_dtype", "bfloat16"),
+            ("page_size", 32),
+            ("dsa_prefill_backend", "flashmla_sparse"),
+            ("dsa_decode_backend", "flashmla_sparse"),
+        )
+        for field, value in cases:
+            with self.subTest(field=field):
+                args = self._make_args(**{field: value})
+                with self.assertRaisesRegex(ValueError, "release scope"):
+                    self._adjust(args)
+
+    def test_rejects_hisparse(self):
+        args = self._make_args(enable_hisparse=True)
+
+        with self.assertRaisesRegex(ValueError, "HiSparse"):
+            self._adjust(args)
+
+    def test_accepts_speculative_decoding(self):
+        args = self._make_args(
+            speculative_algorithm="EAGLE",
+            speculative_num_draft_tokens=4,
+        )
+
+        self._adjust(args)
+
+        self.assertEqual(args.speculative_algorithm, "EAGLE")
+        self.assertTrue(args.enable_dsa_shared_kv_cache)
+
+    def test_rejects_more_than_four_speculative_draft_tokens(self):
+        args = self._make_args(
+            speculative_algorithm="EAGLE",
+            speculative_num_draft_tokens=5,
+        )
+
+        with self.assertRaisesRegex(ValueError, "at most four"):
+            self._adjust(args)
+
+    def test_rejects_hierarchical_cache(self):
+        args = self._make_args(enable_hierarchical_cache=True)
+
+        with self.assertRaisesRegex(ValueError, "does not yet support"):
+            self._adjust(args)
+
+
 class TestFa4PageSizeAutoForce(CustomTestCase):
     """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
     must trigger for `--attention-backend fa4` (combined) too, not only for the

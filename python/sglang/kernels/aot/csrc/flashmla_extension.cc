@@ -49,6 +49,59 @@ static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::option
       static_cast<float>(sm_scale));
 }
 
+static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+sgl_sparse_decode_shared_fwd(
+    const at::Tensor& q,
+    const at::Tensor& kv,
+    const at::Tensor& indices,
+    const std::optional<at::Tensor>& topk_length,
+    const std::optional<at::Tensor>& attn_sink,
+    std::optional<at::Tensor> tile_scheduler_metadata,
+    std::optional<at::Tensor> num_splits,
+    const std::optional<at::Tensor>& extra_kv,
+    const std::optional<at::Tensor>& extra_indices,
+    const std::optional<at::Tensor>& extra_topk_length,
+    int64_t d_v,
+    double sm_scale,
+    const at::Tensor& shared_kv_row_cache,
+    const at::Tensor& shared_kv_cache_tags,
+    const std::optional<at::Tensor>& shared_kv_request_slots,
+    int64_t shared_kv_cache_rows_per_request,
+    int64_t shared_kv_num_request_slots,
+    int64_t shared_kv_cache_epoch,
+    const std::optional<at::Tensor>& shared_kv_cache_generation_tensor,
+    int64_t shared_kv_local_row_begin,
+    int64_t shared_kv_local_row_end,
+    const std::optional<at::Tensor>& shared_kv_current_rows,
+    const std::optional<at::Tensor>& shared_kv_current_row_ids,
+    const std::optional<at::Tensor>& shared_kv_current_row_counts) {
+  return sparse_attn_decode_interface(
+      q,
+      kv,
+      indices,
+      topk_length,
+      attn_sink,
+      tile_scheduler_metadata,
+      num_splits,
+      extra_kv,
+      extra_indices,
+      extra_topk_length,
+      static_cast<int>(d_v),
+      static_cast<float>(sm_scale),
+      shared_kv_row_cache,
+      shared_kv_cache_tags,
+      shared_kv_request_slots,
+      shared_kv_cache_rows_per_request,
+      shared_kv_num_request_slots,
+      shared_kv_cache_epoch,
+      shared_kv_cache_generation_tensor,
+      shared_kv_local_row_begin,
+      shared_kv_local_row_end,
+      shared_kv_current_rows,
+      shared_kv_current_row_ids,
+      shared_kv_current_row_counts);
+}
+
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_dense_decode_fwd(
     at::Tensor q,
     const at::Tensor& kcache,
@@ -104,6 +157,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_kv, Tensor? extra_indices, "
       "Tensor? extra_topk_length, int d_v, float sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?)");
   m.impl("sparse_decode_fwd", torch::kCUDA, &sgl_sparse_decode_fwd);
+
+  m.def(
+      "sparse_decode_shared_fwd(Tensor q, Tensor kv, Tensor indices, Tensor? topk_length, Tensor? attn_sink, "
+      "Tensor? tile_scheduler_metadata, Tensor? num_splits, Tensor? extra_kv, Tensor? extra_indices, "
+      "Tensor? extra_topk_length, int d_v, float sm_scale, Tensor shared_kv_row_cache, Tensor "
+      "shared_kv_cache_tags, Tensor? shared_kv_request_slots, "
+      "int shared_kv_cache_rows_per_request, int shared_kv_num_request_slots, "
+      "int shared_kv_cache_epoch, Tensor? shared_kv_cache_generation_tensor, "
+      "int shared_kv_local_row_begin, int "
+      "shared_kv_local_row_end, Tensor? shared_kv_current_rows=None, "
+      "Tensor? shared_kv_current_row_ids=None, Tensor? "
+      "shared_kv_current_row_counts=None) -> (Tensor, Tensor, Tensor?, Tensor?)");
+  m.impl("sparse_decode_shared_fwd", torch::kCUDA, &sgl_sparse_decode_shared_fwd);
 
   m.def(
       "dense_decode_fwd(Tensor q, Tensor kcache, int head_size_v, Tensor seqlens_k, Tensor block_table, float "

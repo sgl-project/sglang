@@ -1133,6 +1133,18 @@ class ServerArgs:
         "Split DSA (DeepSeek Sparse Attention) GPU KV/indexer cache layers across context-parallel ranks to reduce per-rank KV memory. Currently only supported with the mooncake transfer backend (mooncake / mooncake_tcp); mori/nixl support will be added later by the community.",
         NS("parallel"),
     ] = False
+    enable_dsa_shared_kv_cache: A[
+        bool,
+        "Share DSA Main-KV and Indexer cache pages across context-parallel "
+        "ranks on mixed Prefill/Decode workers.",
+        NS("parallel"),
+    ] = False
+    disable_dsa_shared_indexer_cache: A[
+        bool,
+        "Keep a full local DSA Indexer cache on every rank while sharing only "
+        "Main KV. This trades KV capacity for lower Indexer read overhead.",
+        NS("parallel"),
+    ] = False
     enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True), NS("parallel")] = (
         False
     )
@@ -5266,6 +5278,97 @@ class ServerArgs:
                 "--enable-dsa-cache-layer-split is only supported for DSA "
                 "(DeepSeek Sparse Attention) models."
             )
+        if (
+            self.disable_dsa_shared_indexer_cache
+            and not self.enable_dsa_shared_kv_cache
+        ):
+            raise ValueError(
+                "--disable-dsa-shared-indexer-cache requires "
+                "--enable-dsa-shared-kv-cache."
+            )
+        if self.enable_dsa_shared_kv_cache:
+            if not is_cuda():
+                raise ValueError("--enable-dsa-shared-kv-cache requires NVIDIA CUDA.")
+            if self.enable_dsa_cache_layer_split:
+                raise ValueError(
+                    "--enable-dsa-shared-kv-cache and "
+                    "--enable-dsa-cache-layer-split cannot be enabled together."
+                )
+            if not is_deepseek_dsa(hf_config):
+                raise ValueError(
+                    "--enable-dsa-shared-kv-cache is only supported for DSA "
+                    "(DeepSeek Sparse Attention) models."
+                )
+            if model_arch != "GlmMoeDsaForCausalLM":
+                raise ValueError(
+                    "--enable-dsa-shared-kv-cache release support is limited "
+                    "to GLM-5.2 (GlmMoeDsaForCausalLM)."
+                )
+            if self.attn_cp_size <= 1:
+                raise ValueError(
+                    "--enable-dsa-shared-kv-cache requires "
+                    "--attn-cp-size greater than 1."
+                )
+            if self.tp_size != 8 or self.attn_cp_size != 8:
+                raise ValueError(
+                    "--enable-dsa-shared-kv-cache release support requires " "TP8/CP8."
+                )
+            if self.nnodes != 1:
+                raise ValueError(
+                    "--enable-dsa-shared-kv-cache release support requires a "
+                    "single node (--nnodes 1)."
+                )
+            if self.dp_size != 1:
+                raise ValueError(
+                    "--enable-dsa-shared-kv-cache release support requires DP1."
+                )
+            import torch
+
+            if torch.cuda.get_device_capability()[0] != 9:
+                raise ValueError(
+                    "--enable-dsa-shared-kv-cache release support requires SM90."
+                )
+            requested_attention_backends = {
+                "--attention-backend": self.attention_backend,
+                "--prefill-attention-backend": self.prefill_attention_backend,
+                "--decode-attention-backend": self.decode_attention_backend,
+            }
+            invalid_attention_backends = [
+                f"{name}={backend!r}"
+                for name, backend in requested_attention_backends.items()
+                if backend not in (None, "dsa")
+            ]
+            if invalid_attention_backends:
+                raise ValueError(
+                    "--enable-dsa-shared-kv-cache release scope requires the "
+                    "attention backend to resolve to dsa; got "
+                    + ", ".join(invalid_attention_backends)
+                    + "."
+                )
+            release_settings = {
+                "--quantization": (self.quantization, "w4afp8"),
+                "--kv-cache-dtype": (self.kv_cache_dtype, "fp8_e4m3"),
+                "--page-size": (self.page_size, 64),
+                "--dsa-prefill-backend": (
+                    self.dsa_prefill_backend,
+                    "flashmla_kv",
+                ),
+                "--dsa-decode-backend": (
+                    self.dsa_decode_backend,
+                    "flashmla_kv",
+                ),
+            }
+            invalid_release_settings = [
+                f"{name}={actual!r} (expected {expected!r})"
+                for name, (actual, expected) in release_settings.items()
+                if actual != expected
+            ]
+            if invalid_release_settings:
+                raise ValueError(
+                    "--enable-dsa-shared-kv-cache release scope requires "
+                    + ", ".join(invalid_release_settings)
+                    + "."
+                )
 
         if self.enable_cp_decode_attn_tp:
             from sglang.srt.layers.cp.cp_decode_attn_tp import (
@@ -5387,6 +5490,45 @@ class ServerArgs:
                     )
                     self._set_default_dsa_backends(major)
 
+                if self.enable_dsa_shared_kv_cache:
+                    if (
+                        self.max_running_requests is None
+                        or not 1 <= self.max_running_requests <= 32
+                    ):
+                        raise ValueError(
+                            "--enable-dsa-shared-kv-cache requires an explicit "
+                            "--max-running-requests in [1, 32]."
+                        )
+                    if self.disaggregation_mode != "null":
+                        raise ValueError(
+                            "--enable-dsa-shared-kv-cache currently supports "
+                            "only mixed Prefill/Decode workers "
+                            "(--disaggregation-mode null)."
+                        )
+                    if int(resolved_view(self).attn_cp_size) <= 1:
+                        raise ValueError(
+                            "--enable-dsa-shared-kv-cache requires "
+                            "--attn-cp-size greater than 1."
+                        )
+                    if self.enable_hisparse:
+                        raise ValueError(
+                            "--enable-dsa-shared-kv-cache is incompatible "
+                            "with HiSparse."
+                        )
+                    if (
+                        self.speculative_algorithm is not None
+                        and self.speculative_num_draft_tokens is not None
+                        and self.speculative_num_draft_tokens > 4
+                    ):
+                        raise ValueError(
+                            "--enable-dsa-shared-kv-cache supports at most four "
+                            "speculative draft tokens."
+                        )
+                    if self.enable_hierarchical_cache:
+                        raise ValueError(
+                            "--enable-dsa-shared-kv-cache does not yet support "
+                            "hierarchical cache."
+                        )
                 if self.enable_prefill_cp:
                     assert (
                         self.disaggregation_mode != "decode"
@@ -5437,7 +5579,18 @@ class ServerArgs:
                         "prefill context parallelism, and CP + PP has not been "
                         "validated for this feature."
                     )
-
+                if self.enable_dsa_shared_kv_cache and (
+                    not self.enable_prefill_cp or self.cp_strategy != "interleave"
+                ):
+                    raise ValueError(
+                        "--enable-dsa-shared-kv-cache requires "
+                        "--enable-prefill-cp and --cp-strategy interleave."
+                    )
+                if self.enable_dsa_shared_kv_cache and self.pp_size > 1:
+                    raise ValueError(
+                        "--enable-dsa-shared-kv-cache is not supported with "
+                        "pipeline parallelism (pp_size > 1)."
+                    )
             else:
                 # DeepSeek V3/R1/V3.1
                 if self.cuda_graph_config.prefill.backend != Backend.DISABLED:

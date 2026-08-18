@@ -7,6 +7,44 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-flashmla)
 
+# Keep the Shared-KV specialization as a patch over the exact pinned FlashMLA
+# source. It is exposed through a separate operator; the normal operator keeps
+# the original argument list and selects the compile-time disabled hooks.
+find_package(Git REQUIRED)
+set(SGLANG_FLASHMLA_SHARED_PATCH
+    "${CMAKE_CURRENT_LIST_DIR}/flashmla_shared_demand_cache.patch")
+execute_process(
+    COMMAND "${GIT_EXECUTABLE}" apply --unidiff-zero --check
+            "${SGLANG_FLASHMLA_SHARED_PATCH}"
+    WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}"
+    RESULT_VARIABLE SGLANG_FLASHMLA_SHARED_PATCH_CHECK_RESULT
+    OUTPUT_QUIET
+    ERROR_QUIET
+)
+if(SGLANG_FLASHMLA_SHARED_PATCH_CHECK_RESULT EQUAL 0)
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" apply --unidiff-zero
+                "${SGLANG_FLASHMLA_SHARED_PATCH}"
+        WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}"
+        RESULT_VARIABLE SGLANG_FLASHMLA_SHARED_PATCH_RESULT
+    )
+    if(NOT SGLANG_FLASHMLA_SHARED_PATCH_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to apply Shared-KV FlashMLA demand-cache patch")
+    endif()
+else()
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" apply --unidiff-zero --reverse --check
+                "${SGLANG_FLASHMLA_SHARED_PATCH}"
+        WORKING_DIRECTORY "${repo-flashmla_SOURCE_DIR}"
+        RESULT_VARIABLE SGLANG_FLASHMLA_SHARED_PATCH_REVERSE_RESULT
+        OUTPUT_QUIET
+        ERROR_QUIET
+    )
+    if(NOT SGLANG_FLASHMLA_SHARED_PATCH_REVERSE_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to apply Shared-KV FlashMLA demand-cache patch")
+    endif()
+endif()
+
 # flashmla submodule pin: NVIDIA/cutlass @ 147f5673d0c1c3dcf66f78d677fd647e4a020219
 FetchContent_Declare(
     repo-flashmla-cutlass
