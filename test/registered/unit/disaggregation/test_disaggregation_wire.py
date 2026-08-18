@@ -34,6 +34,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
 )
@@ -302,17 +303,17 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             device="cpu",
             enable_overlap=False,
         )
-        server_args = SimpleNamespace(
+        # The draft-input shape comes from the spec bag.
+        override = get_context().override_server_args(
             speculative_eagle_topk=1,
             speculative_num_steps=5,
             enable_multi_layer_eagle=False,
-            disaggregation_mode="null",
         )
+        override.install()
+        self.addCleanup(override.restore)
         last_tokens = torch.tensor([11, 12], dtype=torch.int64)
 
-        draft_input = build_eagle_disagg_draft_input(
-            batch, server_args, last_tokens, None
-        )
+        draft_input = build_eagle_disagg_draft_input(batch, last_tokens, None)
         self.assertTrue(torch.equal(draft_input.dsa_topk_indices, torch.stack(seeds)))
 
         for invalid_seed in (
@@ -320,9 +321,7 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             torch.full((3,), -1, dtype=torch.int32),
         ):
             batch.reqs[1].output_dsa_topk_indices = invalid_seed
-            draft_input = build_eagle_disagg_draft_input(
-                batch, server_args, last_tokens, None
-            )
+            draft_input = build_eagle_disagg_draft_input(batch, last_tokens, None)
             self.assertIsNone(draft_input.dsa_topk_indices)
 
     def test_pd_decode_fused_topk_remaps_wire_positions_to_local_slots(self):
@@ -347,24 +346,24 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
             req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
             seq_lens=torch.tensor([4, 4], dtype=torch.int32),
         )
-        server_args = SimpleNamespace(
+        override = get_context().override_server_args(
             speculative_eagle_topk=1,
             speculative_num_steps=5,
             enable_multi_layer_eagle=False,
             disaggregation_mode="decode",
             enable_hisparse=False,
         )
+        override.install()
+        self.addCleanup(override.restore)
 
         with envs.SGLANG_DSA_FUSE_TOPK.override(True), patch(
             "sglang.srt.layers.attention.dsa.utils.is_cuda", return_value=True
         ):
             self.assertTrue(
-                should_use_dsa_fused_topk(
-                    server_args, seed_dsa_topk_from_draft_extend=True
-                )
+                should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend=True)
             )
             draft_input = build_eagle_disagg_draft_input(
-                batch, server_args, torch.tensor([11, 12], dtype=torch.int64), None
+                batch, torch.tensor([11, 12], dtype=torch.int64), None
             )
 
         self.assertEqual(

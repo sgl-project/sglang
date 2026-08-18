@@ -11,7 +11,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
 )
-from sglang.srt.runtime_context import get_exec, get_memory, get_schedule
+from sglang.srt.runtime_context import get_disagg, get_exec, get_memory, get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import (
@@ -235,7 +235,10 @@ class BaseSpecWorker(ABC):
         target_model_runner = self.target_worker.model_runner
         target_model_runner.mtp_draft_device_pools = ()
         spec_algorithm = target_model_runner.spec_algorithm
-        if not get_memory().enable_hierarchical_cache:
+        if not (
+            get_memory().enable_hierarchical_cache
+            or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
+        ):
             return HiCacheDraftPlan()
 
         draft_runners = self._draft_model_runners()

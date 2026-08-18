@@ -2522,20 +2522,6 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
     return {}
 
 
-def _cutlass_moe_env_override(view: Any) -> dict:
-
-    if envs.SGLANG_CUTLASS_MOE.get():
-        logger.warning(
-            "SGLANG_CUTLASS_MOE is deprecated, use --moe-runner-backend=cutlass and/or --speculative-moe-runner-backend=cutlass instead"
-        )
-        assert view.quantization in [
-            "fp8",
-            "mxfp8",
-        ], "cutlass MoE is only supported with fp8/mxfp8 quantization"
-        return {"moe_runner_backend": "cutlass"}
-    return {}
-
-
 # Every A2A backend that forces expert parallelism to span the TP group.
 _A2A_EP_SPANNING_BACKENDS = frozenset(
     {
@@ -2561,12 +2547,6 @@ def _a2a_backend_overrides(view: Any) -> dict:
             "requires the DeepEP or MegaMOE backend."
         )
         moe_a2a_backend = "deepep"
-    if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get() and moe_a2a_backend != "megamoe":
-        moe_a2a_backend = "megamoe"
-        logger.info(
-            "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE is set, "
-            "auto-configuring --moe-a2a-backend megamoe."
-        )
     if moe_a2a_backend != view.moe_a2a_backend:
         return {"moe_a2a_backend": moe_a2a_backend}
     return {}
