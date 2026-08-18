@@ -47,6 +47,35 @@ def test_mlp_reuses_srt_activation_without_server_context(monkeypatch):
     assert isinstance(mlp.act_fn, SiluAndMul)
 
 
+def test_attention_keeps_diffusion_one_pass_qk_norm(monkeypatch):
+    monkeypatch.setattr(qwen3, "get_tp_world_size", lambda: 1)
+    monkeypatch.setattr(
+        qwen3, "QKVParallelLinear", lambda **kwargs: torch.nn.Identity()
+    )
+    monkeypatch.setattr(
+        qwen3, "RowParallelLinear", lambda **kwargs: torch.nn.Identity()
+    )
+    monkeypatch.setattr(qwen3, "get_rope", lambda *args, **kwargs: torch.nn.Identity())
+    monkeypatch.setattr(
+        qwen3, "LocalAttention", lambda *args, **kwargs: torch.nn.Identity()
+    )
+    config = SimpleNamespace(
+        head_dim=128,
+        rms_norm_eps=1e-6,
+        _supported_attention_backends=(),
+    )
+
+    attention = qwen3.Qwen3Attention(
+        config,
+        hidden_size=256,
+        num_heads=2,
+        num_kv_heads=1,
+    )
+
+    assert isinstance(attention.q_norm, qwen3.MMGenRMSNorm)
+    assert isinstance(attention.k_norm, qwen3.MMGenRMSNorm)
+
+
 def test_default_position_ids_batch_shape():
     model = Qwen3ForCausalLM.__new__(Qwen3ForCausalLM)
     torch.nn.Module.__init__(model)
