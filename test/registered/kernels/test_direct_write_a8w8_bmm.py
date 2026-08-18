@@ -53,13 +53,17 @@ class TestDirectWriteA8W8Bmm(CustomTestCase):
     def _make_inputs(self, M):
         device = "cuda"
         # attn_output: (tokens, heads, kv_lora) bf16 — matches production X.
-        attn_output = torch.randn(M, self.H, self.K, dtype=torch.bfloat16, device=device)
+        attn_output = torch.randn(
+            M, self.H, self.K, dtype=torch.bfloat16, device=device
+        )
         # w_vc: (heads, kv_lora, vdim) fp8; WQ passed as (heads, vdim, kv_lora).
         w_vc = (torch.randn(self.H, self.K, self.N, device=device) * 0.1).to(
             torch.float8_e4m3fn
         )
         # per-batched-tensor weight scale (see module NOTE).
-        w_scale = torch.rand(self.H, 1, 1, dtype=torch.float32, device=device) * 0.05 + 0.01
+        w_scale = (
+            torch.rand(self.H, 1, 1, dtype=torch.float32, device=device) * 0.05 + 0.01
+        )
         return attn_output, w_vc, w_scale
 
     def _original_path(self, attn_output, w_vc, w_scale):
