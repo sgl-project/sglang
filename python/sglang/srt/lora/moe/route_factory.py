@@ -38,26 +38,21 @@ class MoeLoraRoutes:
     shared_token: RouteView | None = None
 
     def raw(self, is_shared_outer: bool) -> RouteView:
-        route = self.raw_shared_outer if is_shared_outer else self.raw_per_expert
-        if route is None:
-            raise ValueError(
-                f"the execution plan did not request raw {_ownership_name(is_shared_outer)}"
-            )
-        return route
+        if is_shared_outer:
+            return self._require(self.raw_shared_outer, "raw_shared_outer")
+        return self._require(self.raw_per_expert, "raw_per_expert")
 
     def aligned(self, is_shared_outer: bool) -> RouteView:
-        route = (
-            self.aligned_shared_outer if is_shared_outer else self.aligned_per_expert
-        )
+        if is_shared_outer:
+            return self._require(self.aligned_shared_outer, "aligned_shared_outer")
+        return self._require(self.aligned_per_expert, "aligned_per_expert")
+
+    @staticmethod
+    def _require(route: RouteView | None, field: str) -> RouteView:
+        """Name the FIELD, so the message is greppable straight to the slot."""
         if route is None:
-            raise ValueError(
-                f"the execution plan did not request aligned {_ownership_name(is_shared_outer)}"
-            )
+            raise ValueError(f"the execution plan did not request {field}")
         return route
-
-
-def _ownership_name(is_shared_outer: bool) -> str:
-    return "shared_outer" if is_shared_outer else "per_expert"
 
 
 def _pair_route(
