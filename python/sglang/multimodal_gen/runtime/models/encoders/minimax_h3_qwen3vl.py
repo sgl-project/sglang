@@ -44,6 +44,7 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
     layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
 
     supports_dp_encode = True
+    supported_checkpoint_quantization_methods = frozenset({"fp8"})
 
     @staticmethod
     def should_materialize_checkpoint_weight(name: str) -> bool:
@@ -61,7 +62,11 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                 "MiniMax H3 Qwen3-VL config must be trimmed to "
                 f"{selected_layer} language layers before construction"
             )
-        self.model = Qwen3VLModel(arch, use_tensor_parallel=True)
+        self.model = Qwen3VLModel(
+            arch,
+            quant_config=config.quant_config,
+            use_tensor_parallel=True,
+        )
         # H3 consumes the unnormalized output immediately after layer 49.
         self.model.language_model.norm = nn.Identity()
         self.image_token_id = int(arch.image_token_id)
