@@ -3,7 +3,6 @@ import glob
 import os
 import re
 from collections.abc import Callable, Generator, Iterable
-from contextlib import nullcontext
 from typing import cast
 
 import torch
@@ -16,11 +15,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 )
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
-    get_tp_group,
 )
-from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    patch_tensor_parallel_group,
+    use_tensor_parallel_group,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -36,6 +33,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
+    EncoderTensorParallelMixin,
     TextEncoder,
     finalize_encoder_folding,
     get_folding_tp_group,
@@ -408,20 +406,10 @@ class TextEncoderLoader(ComponentLoader):
         else:
             model_device = local_torch_device
 
-        # Parallel folding: build + shard the encoder over the folding group (the
-        # idle DiT replica during the encoding stage) instead of the default TP
-        # group, so every encoder folds without threading the group through each layer.
-        fold_ctx = nullcontext()
-        if getattr(model_config, "parallel_folding_mode", None) is not None:
-            folding_group = get_folding_tp_group(model_config)
-            if (
-                isinstance(folding_group, GroupCoordinator)
-                and folding_group is not get_tp_group()
-            ):
-                fold_ctx = patch_tensor_parallel_group(folding_group)
-
-        # patch tp group with folding group to achieve TP among folding group
-        with fold_ctx, set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
+        encoder_tp_group = get_folding_tp_group(model_config)
+        with use_tensor_parallel_group(encoder_tp_group), set_default_torch_dtype(
+            PRECISION_TO_TYPE[dtype]
+        ):
             with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
@@ -434,6 +422,13 @@ class TextEncoderLoader(ComponentLoader):
                 )
                 model_config.enable_image_understanding = enable_image_understanding
                 model = model_cls(model_config)
+
+            if not isinstance(model, EncoderTensorParallelMixin):
+                raise TypeError(
+                    f"Native encoder {model_cls.__name__} must inherit "
+                    "EncoderTensorParallelMixin"
+                )
+            model.bind_encoder_tp_group(encoder_tp_group)
 
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
