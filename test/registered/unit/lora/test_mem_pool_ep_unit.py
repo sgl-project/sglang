@@ -918,7 +918,6 @@ class TestModuleLevelHelpers(unittest.TestCase):
             num_experts=8,
             num_local_experts=2,
             num_fused_shared_experts=0,
-            # No runner recorded itself, so the dispatcher infers from the configured backend.
             runner_backend=None,
         )
         parallel = types.SimpleNamespace(moe_ep_size=4, moe_ep_rank=1)
@@ -945,10 +944,7 @@ class TestModuleLevelHelpers(unittest.TestCase):
                 )
 
     def test_runner_backend_wins_over_configured_backend(self):
-        # On ROCm, compressed-tensors W4A16 selects CompressedTensorsWNA16TritonMoE, which
-        # builds a Triton runner even though the configured backend resolved to AITER. A
-        # non-AITER runner overrides the inference; an AITER one leaves it alone, so the
-        # mirror-image mismatch is not silently changed here.
+        """A non-AITER built runner should only narrow configured AITER inference."""
         backends = _load_moe_backend_enum()
         parallel = types.SimpleNamespace(moe_ep_size=4, moe_ep_rank=1)
         state = types.SimpleNamespace(backend=backends.AITER)
@@ -977,8 +973,7 @@ class TestModuleLevelHelpers(unittest.TestCase):
             )
 
     def test_moe_runner_records_its_backend_on_the_shared_config(self):
-        # The dispatcher can only follow the built runner because MoeRunner writes itself onto
-        # the same MoeRunnerConfig the dispatcher is constructed from a line later.
+        """MoeRunner should record its backend on the shared config."""
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
         from sglang.srt.layers.moe.utils import MoeRunnerBackend

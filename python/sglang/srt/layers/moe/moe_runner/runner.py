@@ -99,8 +99,7 @@ class MoeRunner:
                     f"{a2a_backend_name}, but none is registered."
                 )
 
-        # Last, so a construction that raised above leaves no backend recorded for a runner
-        # that does not exist.
+        # Record only successfully constructed runners.
         config.runner_backend = runner_backend
 
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None
