@@ -68,7 +68,9 @@ class TestGetLmHeadScheme(CustomTestCase):
         with patch(_GET_LINEAR_SCHEME, return_value="scheme") as mock_resolve:
             scheme = config.get_lm_head_scheme(head, "lm_head")
         self.assertEqual(scheme, "scheme")
-        mock_resolve.assert_called_once_with(layer=head, layer_name="lm_head")
+        mock_resolve.assert_called_once_with(
+            layer=head, layer_name="lm_head", matched_target="re:.*lm_head"
+        )
 
     def test_exact_target_resolves(self):
         config = _config(["lm_head"])
@@ -93,6 +95,48 @@ class TestGetLmHeadScheme(CustomTestCase):
     def test_no_layer_name_is_none(self):
         config = _config(["re:.*lm_head"])
         self.assertIsNone(config.get_lm_head_scheme(_Head(), None))
+
+    def test_prefixed_head_with_plain_target_resolves(self):
+        """Bug regression: `check_equal_or_regex_match` accepts the dotted
+        suffix ("lm_head" target for a "language_model.lm_head" prefix) but
+        `find_matched_target`'s name pass is exact/regex only, so re-deriving
+        the match downstream raised ValueError at load instead of resolving
+        the scheme. The suffix match must be carried through."""
+        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+            CompressedTensorsW8A8Fp8,
+        )
+
+        config = _config(["lm_head"])
+        with patch(
+            "sglang.srt.layers.quantization.compressed_tensors."
+            "compressed_tensors.CompressedTensorsConfig._check_scheme_supported",
+            return_value=True,
+        ):
+            scheme = config.get_lm_head_scheme(_Head(), "language_model.lm_head")
+        self.assertIsInstance(scheme, CompressedTensorsW8A8Fp8)
+
+    def test_block_quantized_head_is_rejected(self):
+        """Bug regression: a block-FP8 head resolves to a weight_scale whose
+        first dim is vocab/block_n, which the vocab-parallel weight loader
+        (asserting dim0 == vocab size on output_dim=0 params) cannot load
+        even at TP=1. Reject loudly instead of asserting mid-load."""
+        block_weights = dict(_FP8_WEIGHTS, strategy="block", block_structure=[128, 128])
+        config = CompressedTensorsConfig.from_config(
+            {
+                "format": "float-quantized",
+                "quant_method": "compressed-tensors",
+                "ignore": [],
+                "config_groups": {
+                    "group_0": {
+                        "targets": ["re:.*lm_head"],
+                        "weights": block_weights,
+                        "input_activations": _FP8_DYNAMIC_ACTS,
+                    }
+                },
+            }
+        )
+        with self.assertRaises(NotImplementedError):
+            config.get_lm_head_scheme(_Head(), "lm_head")
 
 
 class TestGetQuantMethodLmHead(CustomTestCase):

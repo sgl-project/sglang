@@ -834,7 +834,10 @@ class CompressedTensorsConfig(QuantizationConfig):
             )
 
     def get_linear_scheme(
-        self, layer: torch.nn.Module, layer_name: Optional[str] = None
+        self,
+        layer: torch.nn.Module,
+        layer_name: Optional[str] = None,
+        matched_target: Optional[str] = None,
     ) -> Optional[CompressedTensorsLinearScheme]:
         """
         compressed-tensors supports non uniform in the following way:
@@ -856,7 +859,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         # need to make accelerate optional in ct to do this
 
         # Use the new get_scheme_dict method to extract QuantizationArgs
-        scheme_dict = self.get_scheme_dict(layer, layer_name)
+        scheme_dict = self.get_scheme_dict(layer, layer_name, matched_target)
         weight_quant = None
         input_quant = None
         scheme_format = None
@@ -930,17 +933,45 @@ class CompressedTensorsConfig(QuantizationConfig):
             layer_name, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):
             return None
-        if not check_equal_or_regex_match(
-            layer_name=layer_name, targets=self.target_scheme_map.keys()
-        ):
+        # check_equal_or_regex_match also accepts dotted-suffix targets
+        # (e.g. target "lm_head" for a "language_model.lm_head" prefix), which
+        # find_matched_target's exact/regex name pass would miss — so the match
+        # made here is carried through instead of being re-derived downstream.
+        matched_target = next(
+            (
+                target
+                for target in self.target_scheme_map
+                if check_equal_or_regex_match(layer_name=layer_name, targets=[target])
+            ),
+            None,
+        )
+        if matched_target is None:
             return None
-        return self.get_linear_scheme(layer=layer, layer_name=layer_name)
+        weights = self.target_scheme_map[matched_target].get("weights")
+        if weights is not None and weights.block_structure:
+            # The vocab-parallel weight loader shards output_dim=0 params by
+            # vocab index; a block weight_scale's first dim is vocab/block_n,
+            # which that loader cannot shard or even load at TP=1.
+            raise NotImplementedError(
+                "Block-quantized lm_head is not supported; use channel or "
+                "tensor weight scales for the head."
+            )
+        return self.get_linear_scheme(
+            layer=layer, layer_name=layer_name, matched_target=matched_target
+        )
 
     def get_scheme_dict(
-        self, layer: torch.nn.Module, layer_name: str | None = None
+        self,
+        layer: torch.nn.Module,
+        layer_name: str | None = None,
+        matched_target: str | None = None,
     ) -> dict[str, QuantizationArgs | str | None] | None:
         """
         Extract the QuantizationArgs for a given layer.
+
+        A caller that already resolved the layer's target (e.g. via
+        suffix-aware matching) passes it as ``matched_target`` to skip
+        ``find_matched_target``'s stricter exact/regex lookup.
 
         Returns:
             dict with {
@@ -956,12 +987,13 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         # Will be empty for models with only sparsity
         if self.target_scheme_map:
-            matched_target = find_matched_target(
-                layer_name=layer_name,
-                module=layer,
-                targets=self.target_scheme_map.keys(),
-                fused_mapping=self.packed_modules_mapping,
-            )
+            if matched_target is None:
+                matched_target = find_matched_target(
+                    layer_name=layer_name,
+                    module=layer,
+                    targets=self.target_scheme_map.keys(),
+                    fused_mapping=self.packed_modules_mapping,
+                )
 
             return self.target_scheme_map[matched_target]
 
