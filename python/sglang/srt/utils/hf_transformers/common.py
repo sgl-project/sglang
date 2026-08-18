@@ -36,6 +36,8 @@ from sglang.srt.configs import (
     InklingMMConfig,
     InklingModelConfig,
     InklingVisionConfig,
+    InternS2MobiusConfig,
+    InternS2MobiusTextConfig,
     InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
@@ -50,6 +52,8 @@ from sglang.srt.configs import (
     MiniCPMV4_6VisionConfig,
     MiniMaxM3VLConfig,
     MultiModalityConfig,
+    MuseGlimmerAssistantConfig,
+    MuseGlimmerConfig,
     NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
@@ -99,6 +103,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Step3VLConfig,
         LongcatFlashConfig,
         Olmo3Config,
+        MuseGlimmerConfig,
+        MuseGlimmerAssistantConfig,
         KimiK3Config,
         KimiLinearConfig,
         Qwen3NextConfig,
@@ -116,6 +122,8 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         Qwen3_5TextConfig,
         Qwen3_5MoeTextConfig,
         InternS2PreviewConfig,
+        InternS2MobiusConfig,
+        InternS2MobiusTextConfig,
         JetNemotronConfig,
         JetVLMConfig,
         KimiK25Config,
@@ -280,6 +288,64 @@ def check_gguf_file(model: Union[str, os.PathLike]) -> bool:
     return header == b"GGUF"
 
 
+def resolve_hf_gguf_reference(
+    model: str, revision: Optional[str] = None
+) -> Optional[str]:
+    """Download a .gguf named by Hub reference and return its local path.
+
+    owner/repo/path/inside/repo.gguf   -> exactly that file
+    owner/repo                         -> the only .gguf in the repo
+    """
+    from sglang.srt.utils import is_remote_url
+
+    if not model or os.path.exists(model) or is_remote_url(model):
+        return None
+
+    parts = model.strip("/").split("/")
+    if len(parts) < 2:
+        return None
+
+    from huggingface_hub import hf_hub_download
+
+    if len(parts) > 2 and model.endswith(".gguf"):
+        repo_id = "/".join(parts[:2])
+        filename = "/".join(parts[2:])
+        return hf_hub_download(repo_id, filename, revision=revision)
+
+    if len(parts) != 2:
+        return None
+
+    from huggingface_hub import HfApi
+
+    try:
+        files = [
+            s.rfilename for s in HfApi().repo_info(model, revision=revision).siblings
+        ]
+    except Exception:
+        return None
+    if any(f == "config.json" for f in files):
+        return None
+
+    candidates = [f for f in files if f.endswith(".gguf")]
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        listing = "\n  ".join(f"{model}/{f}" for f in sorted(candidates))
+        raise ValueError(
+            f"{model} contains {len(candidates)} .gguf files; name the one to "
+            f"serve:\n  {listing}"
+        )
+    return hf_hub_download(model, candidates[0], revision=revision)
+
+
+def gguf_sidecar_dir(
+    gguf_path: Union[str, os.PathLike], sentinel: str
+) -> Optional[Path]:
+    """Directory containing *sentinel* next to a .gguf file, if there is one."""
+    directory = Path(gguf_path).parent
+    return directory if (directory / sentinel).is_file() else None
+
+
 # ---------------------------------------------------------------------------
 # Rope / text config helpers
 # ---------------------------------------------------------------------------
@@ -299,7 +365,8 @@ def get_rope_config(config):
     """
     rope_params = getattr(config, "rope_parameters", None)
     if rope_params is not None:
-        return rope_params["rope_theta"], rope_params
+        rope_theta = rope_params.get("rope_theta", getattr(config, "rope_theta", 10000))
+        return rope_theta, rope_params
     return getattr(config, "rope_theta", 10000), getattr(config, "rope_scaling", None)
 
 
@@ -487,6 +554,19 @@ def get_generation_config(
     revision: Optional[str] = None,
     **kwargs,
 ):
+    if check_gguf_file(model):
+        sidecar = gguf_sidecar_dir(model, "generation_config.json")
+        if sidecar is not None:
+            model = str(sidecar)
+        else:
+            from .gguf_native import (
+                build_gguf_generation_config,
+                has_native_gguf_support,
+            )
+
+            if has_native_gguf_support(model):
+                return build_gguf_generation_config(model)
+
     try:
         return GenerationConfig.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs

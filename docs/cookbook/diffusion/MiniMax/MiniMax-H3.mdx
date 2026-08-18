@@ -65,7 +65,8 @@ behavior such as Cache-DiT is documented separately below.
 
 **Deployment Profile** exposes resident and FSDP placement on B200, B300,
 H200, and H100. Resident is the latency-oriented default; FSDP reduces DiT
-weight residency at the cost of per-block parameter collectives. **Online
+weight residency at the cost of per-block parameter collectives. On H200 it
+also selects the verified 2-node cross-node topology. **Online
 Quantization** appears only on B200 and B300. AMD keeps its resident AITER
 recipe, while RTX 5090 uses its dedicated layerwise-offload profile.
 
@@ -172,6 +173,52 @@ Face repository requires authentication, export a Hugging Face token in the
 server environment.
 
 For MiniMax-H3, `--performance-mode speed` deliberately keeps the DiT eager. The current `torch.compile` path changes the model's numerical output, so it is not enabled implicitly by any recommended lossless preset. An explicit `--enable-torch-compile true` remains available for controlled experiments, but it should not be used to generate consistency ground truth.
+
+### Advanced: precomputed AdaLN cache
+
+The [model card](https://huggingface.co/MiniMaxAI/MiniMax-H3) notes that about
+13B H3 parameters are AdaLN branches whose outputs can be precomputed for
+inference. The public base checkpoint contains the original branches, not a
+ready-to-use cache. SGLang therefore keeps the standard path as the default.
+
+<Warning>
+This is an experimental deployment path. It is intentionally disabled unless
+you provide an explicitly generated cache; end-to-end numerical and peak-memory
+validation remains required before using it in production.
+</Warning>
+
+When an inference-only deployment has a fixed sampling schedule, build a cache
+from the already materialized transformer directory on CUDA, then pass it to
+the usual `sglang serve` command. This does not alter the denoising formula:
+the cache stores the BF16 outputs of the original AdaLN linears.
+
+```bash Command
+python -m sglang.multimodal_gen.tools.build_minimax_h3_adaln_cache \
+  --transformer-path "$TRANSFORMER_PATH" \
+  --model-variant fl2va \
+  --mode t2va \
+  --num-inference-steps 50 \
+  --flow-shift 12 \
+  --audio-flow-shift 3 \
+  --output /models/minimax-h3-fl2va-adaln-50step.safetensors
+
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --minimax-h3-adaln-cache-path /models/minimax-h3-fl2va-adaln-50step.safetensors \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --ulysses-degree 2 \
+  --port 30010
+```
+
+`$TRANSFORMER_PATH` is the `FL2VA/transformer` or `Ref2VA/transformer`
+directory in the normal SGLang/Hugging Face snapshot; the builder never
+downloads a second copy. A cache only covers the scheduler settings used to
+create it, including its mode, step count, flow shifts, and condition noise
+values. SGLang rejects a request outside that coverage instead of silently
+changing conditioning. Cache mode supports the matching unquantized checkpoint
+only.
 
 ## 4. Generate video and audio
 
@@ -382,7 +429,78 @@ Poll and download any conditioned request with the same job-status and
 content endpoints used in the T2VA example. Server-local `file://` URIs must
 refer to files visible inside the SGLang server environment.
 
-## 5. Sampling and output controls
+## 5. LoRA recipes
+
+H3 accepts both native fused adapters and standard Diffusers/PEFT adapters.
+Native adapters target modules such as `blocks.*.attn.qkv_proj`; PEFT adapters
+may instead provide separate `to_q`, `to_k`, and `to_v` projections and the
+`default` adapter namespace. SGLang normalizes both layouts.
+
+The following FL2VA adapters have distinct purposes:
+
+| Recipe | Repository and pinned file | Request setting | Prompt requirement |
+| --- | --- | --- | --- |
+| Recommended speed/quality balance | [`larryvrh/MiniMax-H3-Turbo-Lora`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora), `minimax_h3_turbo_v4_step600_ema.safetensors` | `num_inference_steps: 9` (8 denoiser evaluations), `lora_scale: 1.0` | None |
+| Most aggressive speed preset (standard PEFT layout) | [`lightx2v/Minimax-h3-Turbo`](https://huggingface.co/lightx2v/Minimax-h3-Turbo), `minimax_h3_fl2v_turbo_4step_v0.1.safetensors` | `num_inference_steps: 5` (4 denoiser evaluations), `lora_scale: 1.0`, `lora_alpha: 8` | None |
+| Realistic people style | [`fal/MiniMax-H3-Realism-People-LoRA`](https://huggingface.co/fal/MiniMax-H3-Realism-People-LoRA), `h3-realism-people-t2v-i2v-r2v.safetensors` | Keep the normal `num_inference_steps: 50` schedule; start with `lora_scale: 0.7` | Include `r34l1sm` in the prompt |
+
+The H3 request field controls the number of sigma grid points, including the
+terminal zero; the denoising loop therefore runs one fewer model evaluation.
+This is why an adapter described as 8-step uses `9`, and a 4-step adapter uses
+`5`, in the request.
+
+All three use the same launch shape. Pinning the filename is required for
+repositories that publish multiple revisions, and is also recommended for a
+reproducible single-file recipe:
+
+```bash Command
+LORA_REPO=larryvrh/MiniMax-H3-Turbo-Lora
+LORA_FILE=minimax_h3_turbo_v4_step600_ema.safetensors
+LORA_NAME=h3-turbo-v4
+LORA_SCALE=1.0
+LORA_ALPHA_ARGS=()
+# LightX2V only: LORA_ALPHA_ARGS=(--lora-alpha 8)
+
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --num-gpus 4 \
+  --ulysses-degree 4 \
+  --performance-mode speed \
+  --lora-path "$LORA_REPO" \
+  --lora-weight-name "$LORA_FILE" \
+  --lora-nickname "$LORA_NAME" \
+  --lora-scale "$LORA_SCALE" \
+  "${LORA_ALPHA_ARGS[@]}" \
+  --lora-merge-mode auto \
+  --port 30010
+```
+
+`auto` merges an adapter into ordinary resident weights to avoid per-step LoRA
+matmuls, but keeps the dynamic path for FSDP-sharded weights where a full
+gather can increase peak memory. Use `dynamic` when one resident server must
+switch repeatedly between base and LoRA output.
+
+Use the filename, scale, and request schedule from the table together. The
+4-evaluation LightX2V recipe is the more aggressive latency/quality tradeoff.
+Its checkpoint has rank 128 but omits the training alpha from both the file and
+repository metadata, so `--lora-alpha 8` is required to reproduce the author's
+reference implementation. Start with the Larry 8-evaluation recipe when
+preserving fine visual detail is more important than minimum latency.
+
+These adapters were trained for the **FL2VA** partition and apply to `t2va` or
+`fl2va` requests. Do not use them with the separate `ref2va` weights unless
+the adapter author explicitly provides Ref2VA-compatible weights. Also avoid
+stacking a distilled adapter with `quality: "high"`: both alter denoising, and
+that combination has not been quality-validated.
+
+<Warning>
+LoRAs trained for a pruned or structurally modified ComfyUI graph are not
+automatically compatible with the native H3 weights. Use only adapters whose
+architecture and target modules match the full native H3 checkpoint.
+</Warning>
+
+## 6. Sampling and output controls
 
 MiniMax-H3 supports more than one output per prompt. The video API accepts
 `num_outputs_per_prompt` (or OpenAI-compatible `n`) from 1 through 10. Offline
@@ -532,7 +650,7 @@ task profile. A real B200 request has completed, but the `quality: "high"`
 path above remains fail-closed to the audited 4×H200 workload.
 </Warning>
 
-## 6. Runtime feature recipes
+## 7. Runtime feature recipes
 
 <Tabs>
 
@@ -544,7 +662,9 @@ listed hardware and topology; it is not inherited by a similar GPU family.
 
 | Feature | Validation status | Notes |
 | --- | --- | --- |
-| Ulysses sequence parallelism | Verified: 8× B200, 4× H200, 4× H100, and Ulysses1/2/4/8 on MI300X and MI355X | Use `--ulysses-degree`; Ring is not compatible with H3's packed multi-segment attention. |
+| Ulysses sequence parallelism | Verified: 8× B200, 4× H200, 4× H100, and Ulysses1/2/4/8 on MI300X and MI355X | Use `--ulysses-degree`. Combine with Ring for cross-node scaling; see the next row. |
+| Ring sequence parallelism (cross-node) | Verified: 2 nodes of 8× H200 each (Ulysses8 × Ring2) | Use `--ring-degree` together with `--nnodes`/`--node-rank`/`--dist-init-addr`. Ring shards the sequence across nodes while Ulysses shards heads within a node; H3's packed multi-segment attention only supports Ring across the node boundary, not within a single node's Ulysses group. Requires `--encoder-parallel replicate` — `auto`'s fold decision is not node-boundary aware. See the benchmark section below. |
+| SageAttention | Supported | Use `--attention-backend sage_attn` to select the native packed varlen path; install the SageAttention dependency first. |
 | Tensor parallelism | Verified: B200 TP2 + Ulysses4; H100 TP2 + Ulysses2 and TP4 + Ulysses1 | `--tp-size` may be combined with Ulysses when the TP-local head count remains divisible by the Ulysses degree. On 4×H100, TP2 + Ulysses2 is the measured speed default. |
 | FSDP inference | Verified: 4× B200 and 4× H100 + Ulysses4 | Preserves H3's mixed BF16/FP32 parameter policy. B200 completed the exact eager comparison; H100 completed consecutive real requests at about 57 GB peak memory per GPU. |
 | Resident components | Verified: B200, H200, 4×H100 with TP, and 1/2/4/8× MI300X and MI355X | This is the recommended single-request latency path when the complete workload fits. |
@@ -618,11 +738,34 @@ The picker exposes this option only on the B200 and B300 topologies used for
 real H3 validation runs.
 </Warning>
 
+The Qwen3-VL text encoder can be replaced independently of the DiT. To reduce
+its resident memory, point the text-encoder component at the serialized FP8
+checkpoint used in validation:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --component-paths.text_encoder Qwen/Qwen3-VL-32B-Instruct-FP8 \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --ulysses-degree 2 \
+  --performance-mode speed \
+  --port 30010
+```
+
+`--text-encoder-path` is accepted as a shorter alias. No separate quantization
+flag is required: SGLang reads the checkpoint's `quantization_config` and
+fails closed if the native encoder does not support that format. The language
+linear layers use FP8 while embeddings, normalization, and the vision tower
+remain BF16. This is an approximate serve-time choice and is incompatible with
+the strict `quality="high"` deployment contract.
+
 </Tab>
 
 </Tabs>
 
-## 7. Configuration notes
+## 8. Configuration notes
 
 - MiniMax-H3 produces the canonical 24 fps output; request duration is expressed through `target.duration_seconds`.
 - `target.duration_seconds` must be between 4 and 15 seconds, inclusive. The command picker defaults to the verified 5-second profile.
@@ -638,10 +781,10 @@ real H3 validation runs.
 - For throughput-oriented serving, select **DP (batched throughput)**. The picker pairs `--encoder-parallel dp` with an editable `--batching-max-size` greater than 1; compatible requests are distributed across ranks, while every rank keeps a full encoder replica. Encoder DP requires TP1 and DiT DP1, so it is disabled for the H100 TP2 + Ulysses2 and RTX 5090 TP2 recipes. It provides no benefit for a batch of one and is not bitwise-identical to the folded deployment.
 - Use explicit **Fold** to prioritize single-request latency and encoder memory on a measured high-bandwidth single-node topology. Use **Replicate** as the compatibility path when folding or encoder DP is unsuitable.
 - `--use-fsdp-inference true` shards only the DiT. MiniMax-H3 preserves the original FP32 dtype of its patch, time, and output projections during FSDP all-gather, so this path does not trade numerical correctness for memory. On 4×H100, prefer TP2 + Ulysses2 for speed; use FSDP as an explicit capacity policy rather than assuming it is faster.
-- `speed` keeps model components resident, `auto` applies the model-aware 120 GiB residency threshold, and `memory` enables the memory-saving placement policy. Explicit `--layerwise-offload-components` overrides that placement list. DiT residency/prefetch knobs are scoped to the DiT; the text encoder and video VAE decoder use one-layer prefetch and zero residency, while the H3 video VAE encoder stays resident. When `memory` is combined with explicit FSDP, H3 instead keeps the sharded DiT on GPU and layerwise-offloads the text encoder and executable VAE decoder blocks. Use `speed` only after confirming that the complete target workload fits.
+- `speed` keeps model components resident, while `auto` applies the model-aware 120 GiB residency threshold. `memory` prioritizes avoiding OOM and includes the executable VAE decoder in its default layerwise set. A measured recipe with sufficient headroom can opt into `--component-residency vae=resident`; the 2×H100 CI recipe does this because the VAE's 4.8 GiB/GPU cost avoids repeated decoder transfers during tiled decode. DiT residency and prefetch knobs remain scoped to the DiT. Use `speed` only after confirming that the complete target workload fits.
 - Breakable CUDA graph execution is an explicit opt-in, not part of the recommended `speed` preset. It requires `--enable-breakable-cuda-graph`, every served size in `--warmup-resolutions`, and `--bcg-text-buckets` that cover the live H3 condition sequence. The validated 1344×768 Ref2VA recipe uses 5504; other task profiles and reference sets may need a different value. It preserves eager output for matching captured signatures, but graph capture consumes additional GPU memory and may provide little latency benefit when Ulysses attention and collectives dominate, so benchmark it on the target topology before enabling it.
 
-## 8. Benchmarks
+## 9. Benchmarks
 
 The picker exposes resident and FSDP profiles on NVIDIA datacenter GPUs. GPU
 counts are properties of the selected recipes, not a claim that every platform
@@ -652,7 +795,7 @@ the configurations with collected measurements:
 | --- | --- | --- |
 | B300 | 8× Ulysses8 resident | 8× FSDP + Ulysses8; the 8-GPU sweep is not a minimum-GPU claim. |
 | B200 | 8× Ulysses8 resident | 4× FSDP + Ulysses4 |
-| H200 | 4× Ulysses4 resident | 4× FSDP + Ulysses4; 4× TP2 + Ulysses2 |
+| H200 | 4× Ulysses4 resident | 4× FSDP + Ulysses4; 4× TP2 + Ulysses2; 2 nodes × 8× Ulysses8×Ring2 cross-node |
 | H100 | 4× TP2 + Ulysses2 resident | 4× TP4 + Ulysses1; 4× FSDP + Ulysses4 |
 | MI300X / MI355X | 8× Ulysses8 resident | 1×, 2×, and 4× scaling runs |
 | RTX 5090 | 2× TP2 + layerwise offload | — |
@@ -757,6 +900,72 @@ TP2 + Ulysses2 shards the DiT weights and holds peak memory about 30 GB per
 GPU lower, which is why it remains the 80 GB H100 recipe. Matching the warmup
 request to the served resolution removes the cold first-request cost on both
 topologies (about 10 s end-to-end on this workload).
+
+### H200 cross-node scaling
+
+Long references and long durations grow the packed sequence length, and
+Ulysses alone cannot scale sequence parallelism past the GPU count of one
+node without either violating head-count divisibility or exposing
+all-to-all traffic across the slower inter-node link. H3 combines
+node-local Ulysses with cross-node Ring: Ring's point-to-point KV rotation
+is designed to overlap with attention compute, which fits a slower
+cross-node link better than an all-to-all does.
+
+**Hardware.** 2 nodes × 8× NVIDIA H200 SXM, same cluster, InfiniBand
+between nodes.
+
+**Serve command.** The cross-node cell the picker emits for H200, run
+identically on both nodes with `--node-rank` set to 0 and 1:
+
+```bash Command
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant ref2va \
+  --num-gpus 16 \
+  --nnodes 2 \
+  --node-rank {{NODE_RANK}} \
+  --dist-init-addr {{NODE0_IP}}:20000 \
+  --sp-degree 16 \
+  --ulysses-degree 8 \
+  --ring-degree 2 \
+  --encoder-parallel replicate \
+  --performance-mode speed \
+  --host 0.0.0.0 \
+  --port 30010
+```
+
+**What was measured.** A controlled denoise-stage comparison on identical
+hardware: 8× H200 single-node (Ulysses8, no Ring) versus the same 16-GPU
+cross-node command above (Ulysses8 × Ring2), holding prompt, seed, and
+step count fixed:
+
+| Task | Single-node (Ulysses8) | Cross-node (Ulysses8 × Ring2) | Change |
+| --- | ---: | ---: | ---: |
+| T2VA denoise/step | 0.749 s | 0.477 s | −36.3% |
+| Ref2VA/V2V denoise/step | 2.572 s | 1.494 s | −41.9% |
+
+The gain grows with sequence length because Ring's per-hop communication
+cost stays roughly constant while attention compute grows quadratically
+with sequence length, so V2V's longer packed sequence benefits more than
+T2VA's shorter one. With the point-to-point KV rotation pipelined against
+attention compute, one V2V request's full denoise stage completed in
+68.1–68.3 seconds versus 128.6 seconds on the single-node 8-GPU baseline
+(−47.0%), with byte-identical output to the unpipelined cross-node path.
+
+Cross-node determinism was confirmed separately: the same request run
+twice against the same cross-node deployment produced byte-identical
+output. A cross-node run's output is not expected to bit-match a
+single-node run of the same prompt and seed — Ring's online-softmax merge
+across hops accumulates floating-point operations in a different order
+than single-node attention, which is an expected source of bit-level
+difference, not a correctness regression.
+
+<Warning>
+`--encoder-parallel auto`'s fold decision is not yet node-boundary aware
+and attempts to fold the text encoder across nodes, which crashes the
+Ref2VA reference-conditioned encoder. Always pass
+`--encoder-parallel replicate` explicitly for cross-node H3 deployments.
+</Warning>
 
 ### H100 topology comparison
 

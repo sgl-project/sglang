@@ -5,8 +5,12 @@ from typing import Optional
 import torch
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
-from sglang.srt.layers.moe.utils import speculative_moe_backend_context
+from sglang.srt.layers.moe.utils import (
+    draft_model_build_scope,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -66,8 +70,11 @@ class StandaloneDraftWorker(EagleDraftWorker):
             self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
 
-        # Load draft model weights only.
-        with empty_context():
+        # Load draft model weights only. The standalone draft is a real model
+        # whose MoE gates run during construction; the scope routes their
+        # fusion decision to the speculative leaf (it does not swap
+        # runner_backend — the draft's forwards run outside that context).
+        with empty_context(), draft_model_build_scope():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -75,12 +82,14 @@ class StandaloneDraftWorker(EagleDraftWorker):
                 ps=replace(ps, pp_rank=0),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
+                # The draft runs at absolute target positions.
+                context_length=target_worker.model_runner.model_config.context_len,
             )
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
         self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
+            draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
         self.tree_mask_mode = default_tree_mask_mode()
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
@@ -155,7 +164,7 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )

@@ -24,7 +24,7 @@ limitations under the License.
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace {
+namespace sglang {
 
 static inline void
 _set_device_and_stream(SparseMlaQ8Kv8PrefillParams& params, tvm::ffi::TensorView q, int64_t cuda_stream) {
@@ -240,4 +240,4 @@ void sparse_prefill_q8kv8_dispatch_topk_length(
   _run_q8kv8(params, true, false);
 }
 
-}  // namespace
+}  // namespace sglang

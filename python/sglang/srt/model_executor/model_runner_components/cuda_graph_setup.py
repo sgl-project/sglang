@@ -8,9 +8,11 @@ from typing import TYPE_CHECKING, Optional
 import msgspec
 
 from sglang.srt.configs.model_config import ModelImpl
+from sglang.srt.distributed import get_world_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     prealloc_symmetric_memory_pool,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
@@ -47,24 +49,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
 logger = logging.getLogger(__name__)
-
-# Measured immediately before prefill graph construction, after model weights,
-# KV cache, and the eager runner's static buffers have been allocated.  Below
-# this budget, compiling/capturing a multi-bucket prefill graph is likely to
-# OOM or make no forward progress for large models.  Keep an explicitly chosen
-# backend untouched: an operator may intentionally trade KV capacity for it.
-_MIN_AUTO_PREFILL_CUDA_GRAPH_FREE_MEMORY_GB = 4.0
-
-
-def should_skip_auto_prefill_cuda_graph_for_memory(
-    available_memory_gb: float,
-    cuda_graph_config_locked: set[tuple[str, str]],
-) -> bool:
-    """Return whether an auto-selected prefill graph lacks capture headroom."""
-    return (
-        (Phase.PREFILL, "backend") not in cuda_graph_config_locked
-        and available_memory_gb < _MIN_AUTO_PREFILL_CUDA_GRAPH_FREE_MEMORY_GB
-    )
 
 
 class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
@@ -124,6 +108,57 @@ def capture_cuda_graphs(
     # runners point at it) and the eager fallback when a cg runner can't run a
     # batch.
     eager_runner = EagerRunner(model_runner)
+
+    if model_runner.is_draft_worker:
+        moe_runner_backend = (
+            model_runner.server_args.speculative_moe_runner_backend
+            or model_runner.server_args.moe_runner_backend
+        )
+        moe_a2a_backend = (
+            model_runner.server_args.speculative_moe_a2a_backend
+            or model_runner.server_args.moe_a2a_backend
+        )
+    else:
+        moe_runner_backend = model_runner.server_args.moe_runner_backend
+        moe_a2a_backend = model_runner.server_args.moe_a2a_backend
+
+    uses_deep_gemm_moe_runner = moe_runner_backend == "deep_gemm"
+    if moe_runner_backend == "auto" and model_runner.model_config.quantization in (
+        "fp8",
+        "mxfp8",
+    ):
+        from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+        uses_deep_gemm_moe_runner = Fp8MoEMethod.is_deepgemm_moe_runner_backend_enabled(
+            MoeRunnerBackend(moe_runner_backend),
+            MoeA2ABackend(moe_a2a_backend),
+        )
+
+    if (
+        model_runner.device == "cuda"
+        and envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.get().lower() == "auto"
+        and uses_deep_gemm_moe_runner
+    ):
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            set_masked_standard_layout_memory_budget,
+        )
+
+        world_group = get_world_group()
+        available_memory_gb = get_available_gpu_memory(
+            model_runner.device,
+            model_runner.gpu_id,
+            distributed=world_group.world_size > 1,
+            cpu_group=world_group.cpu_group,
+        )
+        budget_bytes = set_masked_standard_layout_memory_budget(
+            int(available_memory_gb * (1 << 30))
+        )
+        logger.info(
+            "DeepGEMM masked layout budget: %.2f GiB from %.2f GiB free.",
+            budget_bytes / (1 << 30),
+            available_memory_gb,
+        )
 
     # cuda-graph capture: prefill before decode, so both coalesce onto the
     # eager buffer allocated above. (capture_prefill_graph routes prefill
@@ -226,8 +261,7 @@ def capture_prefill_graph(
     if (
         model_runner.spec_algorithm.is_eagle()
         and not model_runner.is_draft_worker
-        and get_server_return_hidden_states_mode(model_runner.server_args)
-        < CaptureHiddenMode.FULL
+        and get_server_return_hidden_states_mode() < CaptureHiddenMode.FULL
         and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     ):
         logger.info(
@@ -343,20 +377,6 @@ def capture_prefill_graph(
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
-    if should_skip_auto_prefill_cuda_graph_for_memory(
-        before_mem,
-        getattr(model_runner.server_args, "_cuda_graph_config_locked", set()),
-    ):
-        logger.warning(
-            "Disabling auto-selected prefill CUDA graph: only %.2f GiB is free "
-            "after model/KV/eager-buffer allocation; at least %.2f GiB is "
-            "required for capture. Set an explicit prefill CUDA graph backend "
-            "to override this safety gate.",
-            before_mem,
-            _MIN_AUTO_PREFILL_CUDA_GRAPH_FREE_MEMORY_GB,
-        )
-        return result(eager_runner)
-
     role = "draft" if model_runner.is_draft_worker else "target"
     capture_name = f"{role} prefill"
     logger.info(
@@ -393,6 +413,14 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         capture_time=0,
     )
 
+    # A PD prefill server never replays the target-verify graph, and its pool
+    # is built without the spec-verify scratch the capture would need.
+    if (
+        model_runner.spec_algorithm.is_speculative()
+        and not model_runner.is_draft_worker
+        and model_runner.server_args.disaggregation_mode == "prefill"
+    ):
+        return no_capture
     if not model_runner.is_generation:
         # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
         return no_capture

@@ -65,8 +65,8 @@ FetchContent_Populate(repo-fmt)
 # Triton kernel
 FetchContent_Declare(
     repo-triton
-    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.6.0.tar.gz
-    URL_HASH SHA256=be270ed11ca5a8fbd9d7941c5bbe9a23a9f6e2ffd372c8398346928bee464774
+    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.7.1.tar.gz
+    URL_HASH SHA256=7d998625d1035ac496d06a81117727647169422ee67b8889609f06fd5367c491
 )
 FetchContent_Populate(repo-triton)
 
@@ -206,14 +206,22 @@ if (ENABLE_BELOW_SM90)
 endif()
 
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+    # sm_100f is available in CUDA 12.9+ and covers all sm_100, sm_103, sm_107, sm_10x
+    if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.9")
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_100f,code=sm_100f"
+        )
+    else()
+        list(APPEND SGL_KERNEL_CUDA_FLAGS
+            "-gencode=arch=compute_100a,code=sm_100a"
+        )
+    endif()
     list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_100a,code=sm_100a"
         "-gencode=arch=compute_120a,code=sm_120a"
     )
     # refer sm_121, sm_110 and sm_101 description  https://github.com/pytorch/pytorch/pull/156176
     if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "13.0")
         list(APPEND SGL_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_103a,code=sm_103a"
             "--compress-mode=size"
         )
         if (CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
