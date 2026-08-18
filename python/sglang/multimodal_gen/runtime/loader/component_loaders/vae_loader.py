@@ -5,7 +5,9 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 
-from sglang.checkpoint_quantization import resolve_checkpoint_quant_spec
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
