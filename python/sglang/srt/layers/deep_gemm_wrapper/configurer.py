@@ -35,5 +35,24 @@ def _compute_enable_deep_gemm():
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
 DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_sm100_supported()
-DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
+DEEPGEMM_MASKED_FP8_BACKEND = (
+    envs.SGLANG_DEEPGEMM_MASKED_FP8_BACKEND.get().lower()
+)
+if DEEPGEMM_MASKED_FP8_BACKEND not in ("native", "flashinfer", "cake"):
+    raise ValueError(
+        "SGLANG_DEEPGEMM_MASKED_FP8_BACKEND must be one of: "
+        "native, flashinfer, cake"
+    )
+
+# FlashInfer's batch DeepGEMM API and the Cake backend share the public
+# float32 groupwise-scale ABI. Keep the existing Blackwell UE8M0 path exactly
+# unchanged for the default native backend.
+DEEPGEMM_MASKED_FP8_STANDARD_SCALES = DEEPGEMM_MASKED_FP8_BACKEND != "native"
+DEEPGEMM_SCALE_UE8M0 = (
+    DEEPGEMM_BLACKWELL and not DEEPGEMM_MASKED_FP8_STANDARD_SCALES
+)
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
+DEEPGEMM_MASKED_NEED_TMA_ALIGNED_SCALES = (
+    DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+    and not DEEPGEMM_MASKED_FP8_STANDARD_SCALES
+)

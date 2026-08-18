@@ -8,6 +8,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_BLACKWELL,
+    DEEPGEMM_MASKED_FP8_BACKEND,
+    DEEPGEMM_MASKED_NEED_TMA_ALIGNED_SCALES,
+    DEEPGEMM_MASKED_FP8_STANDARD_SCALES,
     DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
@@ -66,6 +69,40 @@ def grouped_gemm_nt_f8f8bf16_masked(
 
     lhs = _ensure_cuda(lhs)
     rhs = _ensure_cuda(rhs)
+
+    if DEEPGEMM_MASKED_FP8_BACKEND != "native":
+        if recipe_a is not None or recipe_b is not None:
+            raise ValueError(
+                f"{DEEPGEMM_MASKED_FP8_BACKEND} masked FP8 backend does not "
+                "support FP4/MXFP8 recipes"
+            )
+        if overlap_args is not None:
+            raise ValueError(
+                f"{DEEPGEMM_MASKED_FP8_BACKEND} masked FP8 backend does not "
+                "support GEMM overlap"
+            )
+
+        from flashinfer.gemm import batch_deepgemm_fp8_nt_groupwise
+
+        flashinfer_backend = (
+            "deepgemm"
+            if DEEPGEMM_MASKED_FP8_BACKEND == "flashinfer"
+            else "cake"
+        )
+        logger.info_once(
+            "Using FlashInfer batch DeepGEMM API backend=%s for masked FP8 MoE",
+            flashinfer_backend,
+        )
+        return batch_deepgemm_fp8_nt_groupwise(
+            lhs[0],
+            rhs[0],
+            lhs[1],
+            rhs[1],
+            masked_m,
+            expected_m,
+            out=out,
+            backend=flashinfer_backend,
+        )
 
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
