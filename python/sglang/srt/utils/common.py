@@ -98,7 +98,11 @@ from typing_extensions import Literal
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    configured_tp_size,
+    get_exec,
+    get_parallel,
+)
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 if TYPE_CHECKING:
@@ -3578,10 +3582,12 @@ def bind_or_assign(target, source):
 
 # TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
 # TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
-def is_no_spec_infer_or_topk_one(server_args):
-    return server_args.speculative_eagle_topk is None or (
-        server_args.speculative_eagle_topk == 1
-        and (server_args.page_size == 1 or server_args.page_size is None)
+def is_no_spec_infer_or_topk_one(cfg):
+    """``cfg`` is a resolving config view, not the published record: the
+    resolution pipeline is the only caller, and it asks mid-resolution."""
+    return cfg.speculative_eagle_topk is None or (
+        cfg.speculative_eagle_topk == 1
+        and (cfg.page_size == 1 or cfg.page_size is None)
     )
 
 
@@ -3752,7 +3758,7 @@ def require_mlp_tp_gather(server_args: ServerArgs):
         else:
             return (
                 get_parallel().moe_dense_tp_size
-                > server_args.tp_size // get_parallel().dp_size
+                > configured_tp_size() // get_parallel().dp_size
             )
     else:
         return False
@@ -3778,7 +3784,7 @@ def require_attn_tp_gather(server_args: ServerArgs):
         or get_parallel().moe_dense_tp_size is not None
     ):
         if get_parallel().enable_dp_attention:
-            return get_parallel().dp_size < server_args.tp_size
+            return get_parallel().dp_size < configured_tp_size()
         else:
             return True
     else:
@@ -3797,7 +3803,7 @@ def require_mlp_sync(server_args: ServerArgs):
 
 def get_cuda_graph_batch_size_alignment(server_args: ServerArgs) -> int:
     alignment = 1
-    if server_args.enable_two_batch_overlap:
+    if get_exec().overlap.enable_two_batch_overlap:
         alignment *= 2
     if require_gathered_buffer(server_args):
         alignment *= get_parallel().attn_tp_size

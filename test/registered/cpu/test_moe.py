@@ -3,6 +3,7 @@ import math
 import pytest
 
 # TODO: use interface in cpu.py
+import sgl_kernel  # noqa: F401
 import torch
 
 from sglang.srt.layers.amx_utils import CPUQuantMethod
