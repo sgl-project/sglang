@@ -103,6 +103,46 @@ def write_cache_indices(
             pt += extend_len
 
 
+def write_page_tail_indices(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    write_ends: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Fill ``req_to_token[:, write_end : ceil(write_end)]`` with the remaining
+    slots of the last page.
+
+    The allocator hands out whole pages, so those slots already belong to the
+    request, but the row write only covers the requested tokens -- the tail
+    keeps whatever the previous occupant of the row left there. Anything that
+    slices the row by a page-ceiled length would read those stale indices.
+
+    Slots inside a page are consecutive, so the tail is just the last written
+    index plus 1, 2, ... The scatter has a fixed ``(bs, page_size - 1)`` shape:
+    lanes past the page ceiling rewrite the last real entry with its own value,
+    so no shape here depends on the data.
+    """
+    if page_size == 1:
+        return
+
+    device = req_to_token.device
+    steps = torch.arange(page_size - 1, device=device, dtype=write_ends.dtype)
+    last_pos = (write_ends - 1).clamp(min=0)
+    last_val = req_to_token[req_pool_indices, last_pos]
+
+    positions = write_ends[:, None] + steps[None, :]
+    ceilings = ((write_ends + page_size - 1) // page_size * page_size)[:, None]
+    in_page = positions < ceilings
+
+    positions = torch.where(in_page, positions, last_pos[:, None])
+    values = torch.where(
+        in_page,
+        last_val[:, None] + steps[None, :].to(last_val.dtype) + 1,
+        last_val[:, None],
+    )
+    req_to_token[req_pool_indices[:, None].expand_as(positions), positions] = values
+
+
 def get_last_loc(
     req_to_token: torch.Tensor,
     req_pool_indices_tensor: torch.Tensor,
@@ -359,6 +399,12 @@ def alloc_for_extend(
         prefix_tensors,
         batch.req_to_token_pool,
     )
+    write_page_tail_indices(
+        batch.req_to_token_pool.req_to_token,
+        req_pool_indices_device,
+        batch.seq_lens,
+        alloc_page_size,
+    )
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.
     if _is_npu:
@@ -549,6 +595,12 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     batch.req_to_token_pool.write(
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
+    )
+    write_page_tail_indices(
+        batch.req_to_token_pool.req_to_token,
+        batch.req_pool_indices,
+        locs + 1,
+        _alloc_page_size(batch),
     )
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.

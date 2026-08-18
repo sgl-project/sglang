@@ -73,17 +73,19 @@ def page_aligned_decode_alloc_lens(
 def get_req_to_token_extra_context_len() -> int:
     """req_to_token row headroom beyond the model context length.
 
-    Sized to hold the decode over-allocation; the spec v2 page>1 topk>1 holey
-    draft footprint can outgrow the default num_draft_tokens headroom. The row
-    headroom and the pools it sits next to derive from the same bag leaves, so
-    they cannot disagree after a post-publish override.
+    Sized to hold the page-ceiled row write and the decode over-allocation; the
+    spec v2 page>1 topk>1 holey draft footprint can outgrow the default
+    num_draft_tokens headroom. The row headroom and the pools it sits next to
+    derive from the same bag leaves, so they cannot disagree after a
+    post-publish override.
     """
-    # FIXME(lsyin): temporary fix for the context length issue under spec decoding
     extra = 4 + (max_speculative_num_draft_tokens() or 0)
     page_size = get_schedule().page_size
+    if page_size > 1:
+        # The row is written out to the page ceiling (write_page_tail_indices),
+        # so near the context limit it can overshoot by page_size - 1; without
+        # the headroom that write silently lands in the neighbor row.
+        extra = max(extra, page_size - 1)
     if get_spec().speculative_algorithm is not None and page_size > 1:
-        # kv_allocated_len is page-aligned (eagle_prepare_for_decode), so near
-        # the context limit the aligned reserve can overshoot by page_size - 1;
-        # without the headroom the row write silently lands in the neighbor row.
         extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)
     return extra
