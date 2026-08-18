@@ -41,6 +41,10 @@ class MpsPlatform(Platform):
         return torch.device("mps")
 
     @classmethod
+    def set_device(cls, device: torch.device) -> None:
+        pass
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         raise NotImplementedError
 

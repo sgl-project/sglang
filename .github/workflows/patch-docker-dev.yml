@@ -4,15 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       pr_numbers:
-        description: "Comma-separated PR numbers to apply (e.g. 18962,19010)"
+        description: "Comma-separated PR numbers, merged in the order listed (e.g. 18962,19010). Empty = fast-forward the base image to latest main."
         required: false
         default: ""
       image_tag:
-        description: "Base image tag to patch (e.g. dev-x86, dev-x86-cu13)"
+        description: "Base image tag to patch (e.g. dev, dev-cu13, dev-cu12)"
+        required: true
+      output_tag:
+        description: "Tag to publish as. Overwrites it if it already exists."
         required: true
 
 concurrency:
-  group: patch-docker-${{ inputs.image_tag }}
+  # Keyed on the tag being written, which is the only resource two runs contend for.
+  group: patch-docker-${{ inputs.output_tag }}
   cancel-in-progress: true
 
 jobs:
@@ -20,6 +24,28 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     runs-on: x64-docker-build-node
     steps:
+      - name: Resolve and validate image tags
+        env:
+          # Inject via env so a crafted input cannot break out of the script.
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          OUTPUT_TAG: ${{ inputs.output_tag }}
+        run: |
+          # Whole-string checks. A '^...$' regex anchors per LINE, so a
+          # multi-line value would pass and then inject extra GITHUB_ENV lines.
+          validate_tag() {
+            case "$2" in
+              ""|[!a-zA-Z0-9_]*|*[!a-zA-Z0-9._-]*)
+                echo "::error::${1} is not a valid Docker tag"
+                exit 1
+                ;;
+            esac
+          }
+          validate_tag image_tag "${IMAGE_TAG}"
+          validate_tag output_tag "${OUTPUT_TAG}"
+
+          echo "BASE_IMAGE=lmsysorg/sglang:${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "OUT_IMAGE=lmsysorg/sglang:${OUTPUT_TAG}" >> "$GITHUB_ENV"
+
       - name: Cleanup workspace (remove root-owned files from prior runs)
         run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
 
@@ -28,91 +54,150 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Login to Docker Hub
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Pull base image and extract commit
+      - name: Extract base commit
         run: |
-          IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
-          docker pull "${IMAGE}"
-          if BASE_SHA=$(docker run --rm "${IMAGE}" git -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null); then
-            echo "Image built from commit: ${BASE_SHA}"
-          else
-            BASE_SHA=""
-            echo "::warning::Image has no .git directory — cannot extract base commit"
+          docker pull "${BASE_IMAGE}"
+          # --entrypoint skips the CUDA base image's banner, which goes to
+          # stdout and would otherwise be captured as part of the SHA.
+          BASE_SHA=$(docker run --rm --entrypoint git "${BASE_IMAGE}" \
+            -C /sgl-workspace/sglang rev-parse HEAD 2>/dev/null | tail -n 1)
+          # A banner line reaching GITHUB_ENV breaks the step, as above.
+          case "${BASE_SHA}" in *[!0-9a-f]*) BASE_SHA="" ;; esac
+          [ "${#BASE_SHA}" -eq 40 ] || BASE_SHA=""
+          if [ -z "${BASE_SHA}" ]; then
+            echo "::error::Cannot read the base commit of ${BASE_IMAGE}; the patch is computed against it"
+            exit 1
           fi
+          echo "Image built from commit: ${BASE_SHA}"
           echo "BASE_SHA=${BASE_SHA}" >> "$GITHUB_ENV"
+          # Pulled only for the rev-parse above; buildx pulls the base itself.
+          docker image rm "${BASE_IMAGE}" || true
 
-      - name: Generate patches
+      - name: Generate patch
+        env:
+          PR_NUMBERS: ${{ inputs.pr_numbers }}
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git fetch origin main
-          mkdir -p /tmp/patch-ctx
+          git fetch origin "${BASE_SHA}"
 
-          if [ -n "${{ inputs.pr_numbers }}" ]; then
-            IFS=',' read -ra PRS <<< "${{ inputs.pr_numbers }}"
+          # Per-run paths: the concurrency group keys on output_tag, so two runs
+          # with different tags can land on this runner at the same time.
+          WORK="/tmp/patch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rm -rf "${WORK}"
+          mkdir -p "${WORK}/ctx"
+          git worktree prune
+          # Merge onto the image's own commit so the patch context matches the
+          # image tree exactly and cannot drift. Conflicts then surface here in
+          # seconds instead of failing the build after a multi-GB pull.
+          git worktree add --detach "${WORK}/base-tree" "${BASE_SHA}"
+          echo "PATCH_CTX=${WORK}/ctx" >> "$GITHUB_ENV"
+
+          # -c rather than --global: leave no identity behind on the runner.
+          merge_into_base() {
+            git -C "${WORK}/base-tree" \
+              -c user.email=ci@sglang.local -c user.name="sglang CI" \
+              merge --no-edit "$1"
+          }
+
+          if [ -n "${PR_NUMBERS}" ]; then
+            IFS=',' read -ra PRS <<< "${PR_NUMBERS}"
             for pr in "${PRS[@]}"; do
               pr=$(echo "${pr}" | xargs)
-              echo "Fetching PR #${pr}"
+              case "${pr}" in
+                ""|*[!0-9]*)
+                  echo "::error::'${pr}' is not a PR number"
+                  exit 1
+                  ;;
+              esac
+              echo "Merging PR #${pr}"
               git fetch origin "pull/${pr}/head:pr-${pr}"
-              MERGE_BASE=$(git merge-base origin/main "pr-${pr}")
-              echo "  PR #${pr}: merge-base=${MERGE_BASE}"
-              git diff "${MERGE_BASE}..pr-${pr}" > "/tmp/patch-ctx/${pr}.patch"
-              echo "  PR #${pr}: $(wc -l < /tmp/patch-ctx/${pr}.patch) lines"
+              merge_into_base "pr-${pr}" || {
+                echo "::error::PR #${pr} conflicts with base image commit ${BASE_SHA}"
+                git -C "${WORK}/base-tree" diff --name-only --diff-filter=U
+                exit 1
+              }
             done
-          elif [ -n "${BASE_SHA}" ]; then
-            echo "Generating diff: image ${BASE_SHA} → latest main"
-            git fetch origin "${BASE_SHA}"
-            git diff "${BASE_SHA}..origin/main" > /tmp/patch-ctx/main.patch
-            echo "  main: $(wc -l < /tmp/patch-ctx/main.patch) lines"
           else
-            echo "::error::No PR numbers specified and image has no .git — cannot generate diff against main"
+            echo "Fast-forwarding to latest main"
+            merge_into_base origin/main || {
+              echo "::error::Cannot merge latest main into base image commit ${BASE_SHA}"
+              git -C "${WORK}/base-tree" diff --name-only --diff-filter=U
+              exit 1
+            }
+          fi
+
+          git -C "${WORK}/base-tree" diff --binary "${BASE_SHA}"..HEAD > "${WORK}/ctx/merged.patch"
+          if [ ! -s "${WORK}/ctx/merged.patch" ]; then
+            echo "::error::Patch is empty - nothing to apply on top of ${BASE_IMAGE}"
             exit 1
           fi
+          PATCH_STAT=$(git -C "${WORK}/base-tree" diff --shortstat "${BASE_SHA}"..HEAD | xargs)
+          echo "Patch: ${PATCH_STAT}"
+          echo "PATCH_STAT=${PATCH_STAT}" >> "$GITHUB_ENV"
 
-          TOTAL=$(cat /tmp/patch-ctx/*.patch | wc -l)
-          if [ "${TOTAL}" -eq 0 ]; then
-            echo "::warning::All patches are empty — image is already up to date"
-            echo "SKIP_BUILD=true" >> "$GITHUB_ENV"
-          fi
-
-      - name: Build patched image
-        if: env.SKIP_BUILD != 'true'
+      - name: Build and push patched image
         run: |
-          IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
-
-          cat <<'DOCKERFILE' > /tmp/patch-ctx/Dockerfile
+          cat <<'DOCKERFILE' > "${PATCH_CTX}/Dockerfile"
           ARG BASE_IMAGE
           FROM ${BASE_IMAGE}
-          COPY *.patch /tmp/patches/
+          COPY merged.patch /tmp/merged.patch
+          # git apply, not patch: no fuzz is needed given the exact context, and
+          # it handles renames, mode changes and binary files.
           RUN cd /sgl-workspace/sglang \
-              && for p in /tmp/patches/*.patch; do \
-                   if [ ! -s "${p}" ]; then \
-                     echo "Skipping ${p} (empty)"; \
-                   else \
-                     echo "Applying ${p}..." \
-                     && patch -p1 --fuzz=2 --no-backup-if-mismatch -f < "${p}" \
-                     || { echo "ERROR: Failed to apply ${p}"; exit 1; }; \
-                   fi; \
-                 done \
-              && rm -rf /tmp/patches
+              && git apply --binary -v -p1 /tmp/merged.patch \
+              && rm -f /tmp/merged.patch \
+              && python3 -m compileall -q -f python/sglang \
+              && ( find python -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true )
           DOCKERFILE
 
-          docker build \
+          # Each platform patches its own arch of the base manifest list, so the
+          # output stays a list. A single-arch base fails here on purpose: the
+          # output would not be pullable on the other arch.
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
             --no-cache \
-            --build-arg BASE_IMAGE="${IMAGE}" \
-            -t "${IMAGE}" \
-            /tmp/patch-ctx/
+            --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+            -t "${OUT_IMAGE}" \
+            --push \
+            "${PATCH_CTX}/"
 
-      - name: Push patched image
-        if: env.SKIP_BUILD != 'true'
+      - name: Write summary
+        env:
+          PR_NUMBERS: ${{ inputs.pr_numbers }}
         run: |
-          IMAGE="lmsysorg/sglang:${{ inputs.image_tag }}"
-          docker push "${IMAGE}"
+          if [ -n "${PR_NUMBERS}" ]; then
+            SOURCE="PRs: ${PR_NUMBERS}"
+          else
+            SOURCE="latest main"
+          fi
+          {
+            echo "### Patched \`${OUT_IMAGE}\`"
+            echo "- **Base image:** \`${BASE_IMAGE}\`"
+            echo "- **Base commit:** \`${BASE_SHA}\`"
+            echo "- **Source:** ${SOURCE}"
+            echo "- **Patch:** ${PATCH_STAT}"
+            echo "- **Platforms:** \`linux/amd64,linux/arm64\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "### Patched \`${IMAGE}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Base commit:** \`${BASE_SHA:-unknown (no .git)}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Source:** ${{ inputs.pr_numbers && format('PRs: {0}', inputs.pr_numbers) || 'latest main' }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Clean up
+        if: always()
+        run: |
+          # Per-run paths are never reclaimed by a later run, so drop them here.
+          WORK="/tmp/patch-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git worktree remove --force "${WORK}/base-tree" 2>/dev/null || true
+          rm -rf "${WORK}"
+          git worktree prune 2>/dev/null || true
+          docker buildx prune --filter "until=72h" -f || true

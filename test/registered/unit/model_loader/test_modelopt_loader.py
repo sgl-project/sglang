@@ -6,6 +6,7 @@ applies NVIDIA Model Optimizer quantization to models during loading.
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -25,7 +26,12 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4A16LinearMethod,
 )
-from sglang.srt.model_loader.loader import DefaultModelLoader, ModelOptModelLoader
+from sglang.srt.model_loader.loader import (
+    DefaultModelLoader,
+    ModelOptModelLoader,
+    get_model_loader,
+)
+from sglang.srt.model_loader.weight_utils import get_quant_config
 from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import get_device
@@ -605,6 +611,86 @@ class TestParseQuantHfConfig(CustomTestCase):
         self.assertEqual(result["quant_method"], "gptq")
         self.assertNotIn("quant_algo", result)
 
+    def test_inherited_draft_modelopt_fp4_accepts_fp8_checkpoint(self):
+        # ServerArgs has already copied the target's modelopt_fp4 request to the
+        # draft. Compatible FP8 metadata must not replace it with plain fp8.
+        self.model_config.quantization = "modelopt_fp4"
+        self.model_config.is_draft_model = True
+        self.model_config.is_draft_quantization_explicit = False
+        with (
+            patch.object(
+                self.model_config,
+                "_parse_quant_hf_config",
+                return_value={"quant_method": "fp8"},
+            ),
+            patch.object(
+                self.model_config,
+                "_find_quant_modelslim_config",
+                return_value=None,
+            ),
+        ):
+            self.model_config._verify_quantization()
+
+        # Keeping modelopt_fp4 selects online FP8-to-NVFP4 conversion for
+        # eligible MoE experts; this test stops at quantization-method routing.
+        self.assertEqual(self.model_config.quantization, "modelopt_fp4")
+
+
+class TestModelOptFp4LoaderSelection(CustomTestCase):
+    def test_draft_modelopt_fp4_uses_checkpoint_exclusions(self):
+        cases = (
+            # Excluded MTP experts are unpacked, so an explicit draft request
+            # replaces the serialized config with online weight quantization.
+            ("explicit embedded draft", True, ["mtp.layers.0*"], False),
+            # MTP experts present in the serialized checkpoint stay serialized.
+            ("explicit serialized draft", True, [], True),
+            # Inherited target quantization does not override draft exclusions.
+            ("inherited embedded draft", False, ["mtp.layers.0*"], True),
+        )
+        for name, is_explicit, ignored_layers, is_serialized in cases:
+            with self.subTest(name=name):
+                model_config = SimpleNamespace(
+                    model_path="target-model",
+                    quantization="modelopt_fp4",
+                    is_draft_model=True,
+                    is_draft_quantization_explicit=is_explicit,
+                    hf_config=SimpleNamespace(
+                        quantization_config={
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                            "ignore": ignored_layers,
+                        }
+                    ),
+                )
+
+                config = get_quant_config(model_config, LoadConfig(), {})
+
+                self.assertEqual(config.get_name(), "modelopt_fp4")
+                self.assertEqual(config.is_checkpoint_nvfp4_serialized, is_serialized)
+
+    def test_unquantized_modelopt_fp4_preserves_modelopt_workflows(self):
+        model_config = SimpleNamespace(
+            quantization="modelopt_fp4",
+            _is_already_quantized=lambda: False,
+        )
+
+        # Online conversion runs through the regular per-layer weight loaders.
+        online_loader = get_model_loader(LoadConfig(), model_config)
+        self.assertIsInstance(online_loader, DefaultModelLoader)
+        self.assertNotIsInstance(online_loader, ModelOptModelLoader)
+
+        # Explicit ModelOpt checkpoint/export workflows still need its loader.
+        for option in (
+            "modelopt_checkpoint_restore_path",
+            "modelopt_checkpoint_save_path",
+            "modelopt_export_path",
+        ):
+            with self.subTest(option=option):
+                loader = get_model_loader(
+                    LoadConfig(**{option: "/tmp/modelopt"}), model_config
+                )
+                self.assertIsInstance(loader, ModelOptModelLoader)
+
 
 class TestModelOptMixedPrecisionConfig(CustomTestCase):
     def test_minimax_mixed_precision_resolves_runtime_names_and_mxfp8(self):
@@ -734,7 +820,11 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         return_value=True,
     )
     def test_explicit_nvfp4_per_token_activation_false_overrides_env(self, _):
-        config = ModelOptFp4Config(use_per_token_activation=False)
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            use_per_token_activation=False,
+        )
 
         self.assertFalse(config.use_per_token_activation)
 

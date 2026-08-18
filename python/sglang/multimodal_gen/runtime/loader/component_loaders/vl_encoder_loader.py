@@ -3,7 +3,6 @@ from typing import Any
 
 import requests
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -59,12 +58,15 @@ class VisionLanguageEncoderLoader(ComponentLoader):
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
             )
+            target_device = self.target_device(
+                server_args.should_start_component_on_cpu("vision_language_encoder")
+            )
             model = GlmImageForConditionalGeneration.from_pretrained(
                 component_model_path,
                 config=config,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
-            ).to(get_local_torch_device())
+            ).to(target_device)
             return model
         else:
             raise ValueError(
