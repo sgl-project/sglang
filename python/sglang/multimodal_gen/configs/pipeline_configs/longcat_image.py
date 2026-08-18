@@ -8,6 +8,7 @@ from sglang.multimodal_gen.configs.models import DiTConfig, EncoderConfig, VAECo
 from sglang.multimodal_gen.configs.models.dits.longcat_image import (
     LongCatImageDitConfig,
 )
+from sglang.multimodal_gen.configs.models.encoders.qwen_image import Qwen2_5VLConfig
 from sglang.multimodal_gen.configs.models.vaes.longcat_image import (
     LongCatImageVAEConfig,
 )
@@ -15,6 +16,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
     TextConditioningOutput,
+)
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -220,18 +224,6 @@ def longcat_postprocess_text(outputs, text_inputs, pipeline_config):
 
 
 @dataclass
-class LongCatImageEncoderConfig(EncoderConfig):
-    """Encoder config for the in-stage-loaded HF Qwen2.5-VL text encoder.
-
-    The encoder weights are loaded by `LongCatPromptRewriteStage` (not via
-    `TextEncoderLoader`), so this config only supplies the fields the standard
-    `TextEncodingStage` reads — primarily `tokenizer_kwargs`.
-    """
-
-    tokenizer_kwargs: dict = field(default_factory=lambda: {})
-
-
-@dataclass
 class LongCatImagePipelineConfig(ImagePipelineConfig):
     """Configuration for the LongCat-Image T2I pipeline."""
 
@@ -246,15 +238,19 @@ class LongCatImagePipelineConfig(ImagePipelineConfig):
     dit_config: DiTConfig = field(default_factory=LongCatImageDitConfig)
     vae_config: VAEConfig = field(default_factory=LongCatImageVAEConfig)
 
-    # The Qwen2.5-VL text encoder (~7B) is loaded in bf16; the encoder is loaded
-    # in-stage by LongCatPromptRewriteStage, not via TextEncoderLoader.
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
-        default_factory=lambda: (LongCatImageEncoderConfig(),)
+        default_factory=lambda: (Qwen2_5VLConfig(),)
     )
     postprocess_text_funcs: tuple[Callable, ...] = field(
         default_factory=lambda: (longcat_postprocess_text,)
     )
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            keep_resident_min_available_gb=70,
+            keep_resident_components=("text_encoder", "vae"),
+        )
 
     # --- LatentPreparationStage hooks ---
 
