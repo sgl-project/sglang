@@ -247,7 +247,7 @@ async def init_multi_tokenizer() -> ServerArgs:
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
-        model_path=server_args.model_path,
+        model_path=get_model().model_path,
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
@@ -293,9 +293,9 @@ async def lifespan(fast_api_app: FastAPI):
             "sglang",
             trace_modules=server_args.trace_modules,
         )
-        if server_args.disaggregation_mode == "prefill":
+        if get_disagg().disaggregation_mode == "prefill":
             thread_label = "Prefill" + thread_label
-        elif server_args.disaggregation_mode == "decode":
+        elif get_disagg().disaggregation_mode == "decode":
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
 
@@ -380,7 +380,7 @@ async def lifespan(fast_api_app: FastAPI):
     # Execute custom warmups
     if server_args.warmups is not None:
         await execute_warmups(
-            server_args.disaggregation_mode,
+            get_disagg().disaggregation_mode,
             server_args.warmups.split(","),
             _global_state.tokenizer_manager,
         )
@@ -393,7 +393,7 @@ async def lifespan(fast_api_app: FastAPI):
     try:
         if (
             getattr(fast_api_app, "is_single_tokenizer_mode", False)
-            and server_args.grpc_port is not None
+            and get_serving().grpc_port is not None
             and not (server_args.smg_grpc_mode or server_args.grpc_mode)
         ):
             grpc_handle = _start_native_grpc_server_for_runtime(
@@ -401,6 +401,7 @@ async def lifespan(fast_api_app: FastAPI):
                 tokenizer_manager=_global_state.tokenizer_manager,
                 template_manager=_global_state.template_manager,
                 scheduler_info=_global_state.scheduler_info,
+                grpc_port=get_serving().grpc_port,
             )
             if server_args.sidecar is not None:
                 from sglang.srt.entrypoints.sidecar import start_sidecar
@@ -480,6 +481,13 @@ v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
 
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_model,
+    get_parallel,
+    get_serving,
+)
 
 elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
@@ -678,10 +686,7 @@ async def health_generate(request: Request) -> Response:
             sampling_params=sampling_params,
             log_metrics=False,
         )
-        if (
-            _global_state.tokenizer_manager.server_args.disaggregation_mode
-            != DisaggregationMode.NULL.value
-        ):
+        if get_disagg().disaggregation_mode != DisaggregationMode.NULL.value:
             gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
             gri.bootstrap_room = 0
     else:
@@ -736,11 +741,21 @@ async def model_info():
     model_config = _global_state.tokenizer_manager.model_config
     result = {
         "model_path": _global_state.tokenizer_manager.model_path,
+        # Manager-owned, and moved by a weight update alongside `model_path`:
+        # this is where a client reads the identity the server answers under.
+        "served_model_name": _global_state.tokenizer_manager.served_model_name,
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
         "weight_version": _global_state.tokenizer_manager.config_value(
             "weight_version"
+        ),
+        "load_format": _global_state.tokenizer_manager.config_value("load_format"),
+        "reasoning_parser": _global_state.tokenizer_manager.config_value(
+            "reasoning_parser"
+        ),
+        "tool_call_parser": _global_state.tokenizer_manager.config_value(
+            "tool_call_parser"
         ),
         "has_image_understanding": model_config.is_image_understandable_model,
         "has_audio_understanding": model_config.is_audio_understandable_model,
@@ -780,7 +795,14 @@ async def get_server_info():
 
 @app.get("/server_info")
 async def server_info():
-    """Get the server information."""
+    """The startup configuration, plus live scheduler state.
+
+    The `ServerArgs` fields here are the record: what the launcher was given,
+    with resolution written back into it. Fields the control plane changes
+    after publication -- the model a weight update swapped in, its load format,
+    an operator-set weight version -- are reported by `/model_info`, and the
+    HiCache mirror by `GET /hicache/storage-backend`.
+    """
     # Returns internal states per DP.
     internal_states: List[Dict[Any, Any]] = (
         await _global_state.tokenizer_manager.get_internal_state()
@@ -791,9 +813,7 @@ async def server_info():
     # server_args.model_config is not serializable but should be excluded by asdict.
     return msgspec_to_builtins(
         {
-            **_global_state.tokenizer_manager.resolved_config_dict(
-                dataclasses.asdict(server_args)
-            ),
+            **dataclasses.asdict(server_args),
             **_global_state.scheduler_info,
             "startup_time": _global_state.tokenizer_manager.startup_time,
             "internal_states": internal_states,
@@ -2156,7 +2176,10 @@ async def _send_disaggregation_warmup_requests(
         headers=headers,
     ) as session:
         return await asyncio.gather(
-            *(send_request(session, dp_rank) for dp_rank in range(server_args.dp_size))
+            *(
+                send_request(session, dp_rank)
+                for dp_rank in range(get_parallel().dp_size)
+            )
         )
 
 
@@ -2214,13 +2237,13 @@ def _execute_server_warmup(server_args: ServerArgs):
         },
     }
     if server_args.skip_tokenizer_init:
-        json_data["input_ids"] = [[10, 11, 12] for _ in range(server_args.dp_size)]
+        json_data["input_ids"] = [[10, 11, 12] for _ in range(get_parallel().dp_size)]
         # TODO Workaround the bug that embedding errors for list of size 1
-        if server_args.dp_size == 1:
+        if get_parallel().dp_size == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
     elif (
         is_vlm
-        and server_args.disaggregation_mode == "null"
+        and get_disagg().disaggregation_mode == "null"
         and model_info["is_generation"]
     ):
         served_model_name = ""
@@ -2230,9 +2253,9 @@ def _execute_server_warmup(server_args: ServerArgs):
             # _global_state.tokenizer_manager is not initialized in the rust server,
             # so we need to get the model name from the model_info
             served_model_name = model_info.get(
-                "model_path", server_args.served_model_name
+                "model_path", get_serving().served_model_name
             )
-            served_model_name = served_model_name or server_args.model_path
+            served_model_name = served_model_name or get_model().model_path
         # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
         # Only use chat completions format for generation models, not embedding models
         json_data = {
@@ -2260,9 +2283,9 @@ def _execute_server_warmup(server_args: ServerArgs):
             "temperature": 0.0,
         }
     else:
-        json_data["text"] = ["The capital city of France is"] * server_args.dp_size
+        json_data["text"] = ["The capital city of France is"] * get_parallel().dp_size
         # TODO Workaround the bug that embedding errors for list of size 1
-        if server_args.dp_size == 1:
+        if get_parallel().dp_size == 1:
             json_data["text"] = json_data["text"][0]
 
     # Config debug dumping
@@ -2276,7 +2299,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     # Send a warmup request
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
-        if server_args.disaggregation_mode == "null":
+        if get_disagg().disaggregation_mode == "null":
             res = requests.post(
                 url + request_name,
                 json=json_data,
@@ -2304,13 +2327,13 @@ def _execute_server_warmup(server_args: ServerArgs):
             if not failed_status_codes:
                 logger.info(
                     "Disaggregation warmup requests completed for all %s DP ranks",
-                    server_args.dp_size,
+                    get_parallel().dp_size,
                 )
                 logger.info("End of disaggregation warmup")
             else:
                 logger.info(
                     "Disaggregation warmup failed (mode=%s), status codes: %s",
-                    server_args.disaggregation_mode,
+                    get_disagg().disaggregation_mode,
                     failed_status_codes,
                 )
             # In rust-server mode there is no TokenizerManager (readiness is
@@ -2364,10 +2387,10 @@ def _wait_and_warmup(
         logger.debug(
             "[Elastic EP] Skipping server warmup for elastic joiner "
             "(ep_join_mode=%s)",
-            server_args.ep_join_mode,
+            get_exec().moe.ep_join_mode,
         )
 
-    if not server_args.skip_server_warmup and not skip_elastic_joiner_warmup:
+    if not get_serving().skip_server_warmup and not skip_elastic_joiner_warmup:
         if not execute_warmup_func(server_args):
             return
     else:
@@ -2379,7 +2402,7 @@ def _wait_and_warmup(
     logger.info("The server is fired up and ready to roll!")
 
     if server_args.delete_ckpt_after_loading:
-        delete_directory(server_args.model_path)
+        delete_directory(get_model().model_path)
 
     if server_args.debug_tensor_dump_input_file:
         kill_process_tree(os.getpid())
@@ -2707,6 +2730,7 @@ def _start_native_grpc_server_for_runtime(
     tokenizer_manager,
     template_manager,
     scheduler_info,
+    grpc_port,
 ):
     from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
     from sglang.srt.rust_extensions import load_rust_extension
@@ -2722,13 +2746,11 @@ def _start_native_grpc_server_for_runtime(
 
     grpc_handle = grpc_native.start_server(
         host=server_args.host,
-        port=server_args.grpc_port,
+        port=grpc_port,
         runtime_handle=runtime_handle,
         worker_threads=server_args.grpc_worker_threads,
     )
-    logger.info(
-        f"Native gRPC server started on {server_args.host}:{server_args.grpc_port}"
-    )
+    logger.info(f"Native gRPC server started on {server_args.host}:{grpc_port}")
     return grpc_handle
 
 
@@ -2786,7 +2808,7 @@ def launch_server(
         # and /get_model_info endpoints are static (200 as soon as the server
         # binds, before any forward pass), so without this the first real request
         # pays the cold-start cost (observed as a >60s first generation).
-        if not server_args.skip_server_warmup:
+        if not get_serving().skip_server_warmup:
             _execute_server_warmup(server_args)
         logger.info("The server is fired up and ready to roll!")
         if launch_callback is not None:
