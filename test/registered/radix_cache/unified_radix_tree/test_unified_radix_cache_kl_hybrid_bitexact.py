@@ -69,7 +69,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=790, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=1150, stage="base-b", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
@@ -297,6 +297,84 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
             max_new_tokens=512,
             sampling_temperature=0,
         )
+
+
+class TestUnifiedHybridMTPBitExact(CustomTestCase):
+    """Same exactness bar with MTP driving the decode loop.
+
+    Speculative decoding advances several tokens per forward, so a track
+    boundary can be crossed inside a verify step and the checkpoint is written
+    from the verify path. #29792 was a wrong-slot pick in the non-spec save;
+    nothing exercises the spec-side save today.
+
+    Two settings are load-bearing rather than incidental:
+
+    `--speculative-num-steps 2` matches the two MTP heads this checkpoint
+    ships; a third step has no weights and the draft head refuses to start.
+
+    `SGLANG_OPT_USE_INKLING_SHEARED_BIAS=0` is required for the exact bar. The
+    sheared relative-bias path shears on `max_seqlen_q`, so a verify pass
+    (several queries) lands the same absolute (q, k) pair on a different tile
+    than a prefill pass and one output element differs. Measured on this
+    checkpoint: with the sheared path on, 12 of 16 tokens diverge from the
+    first token past a tile boundary, up to 8.1e-03; with it off, every token
+    reads exactly 0. Tracked in
+    https://github.com/sgl-project/sglang/issues/34899 -- when the shear is
+    made query-count invariant this override should be dropped, and this class
+    is what will prove it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = _MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = _base_args() + [
+            "--speculative-algorithm",
+            "EAGLE",
+            "--enable-multi-layer-eagle",
+            "--speculative-num-steps",
+            "2",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "3",
+            "--chunked-prefill-size",
+            "16384",
+        ]
+        if _MODEL_REVISION:
+            other_args += ["--revision", _MODEL_REVISION]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env={
+                **os.environ,
+                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+                "SGLANG_OPT_USE_INKLING_SHEARED_BIAS": "0",
+            },
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "process", None) is not None:
+            kill_process_tree(cls.process.pid)
+
+    def _run(self, helper):
+        helper(
+            self.base_url,
+            {self.model: {"kl_div": KL_DIV_THRESHOLD}},
+            self.model,
+            max_samples=32,
+            max_new_tokens=MAX_NEW_TOKENS,
+            trust_remote_code=True,
+        )
+
+    def test_logprobs_match(self):
+        self._run(assert_logprobs_match)
+
+    def test_decode_cache_hit(self):
+        self._run(assert_decode_cache_hit)
 
 
 if __name__ == "__main__":

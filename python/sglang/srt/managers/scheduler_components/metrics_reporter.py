@@ -459,6 +459,14 @@ class SchedulerMetricsReporter:
             num_attn_heads * head_dim * act_bytes * num_layers
         )
 
+    @staticmethod
+    def _prefill_attention_pairs(batch) -> float:
+        """Causal query-key pairs: each chunk against its cached prefix, plus
+        the causal pairs within the chunk itself."""
+        prefix_pairs = sum(c * p for c, p in zip(batch.extend_lens, batch.prefix_lens))
+        within_chunk_pairs = sum(c * (c + 1) / 2.0 for c in batch.extend_lens)
+        return float(prefix_pairs + within_chunk_pairs)
+
     def _estimate_prefill_perf(self, batch) -> Tuple[float, float, float]:
         if batch is None or batch.extend_lens is None:
             return 0.0, 0.0, 0.0
@@ -466,17 +474,20 @@ class SchedulerMetricsReporter:
         if tokens == 0:
             return 0.0, 0.0, 0.0
 
-        # Causal prefill token-context product.
-        context_product = tokens * (tokens + 1) / 2.0
+        context_product = self._prefill_attention_pairs(batch)
         flops = (
             tokens * self._linear_flops_per_token
             + self._attn_dot_flops_coeff * context_product
         )
 
+        # The chunk's queries share one pass over the cached prefix, so charge the
+        # prefix KV once per chunk -- not once per query-key pair.
+        prefix_kv_tokens = float(sum(batch.prefix_lens))
         read_bytes = (
             tokens * self._weight_read_bytes_per_token
             + tokens * self._qkv_act_bytes_per_token
             + tokens * self._prefill_attn_act_read_per_token
+            + prefix_kv_tokens * self._kv_cache_bytes_per_token
         )
         write_bytes = (
             tokens * self._kv_cache_bytes_per_token
@@ -512,8 +523,8 @@ class SchedulerMetricsReporter:
 
     def _prefill_sol_suffix(self, batch, elapsed_s: float) -> str:
         """Hook: model-specific speed-of-light % suffix for the prefill log line.
-        ``batch`` carries the per-request extend/prefix lengths a subclass needs
-        for an exact attention pair-count. No model arch here, so returns "";
+        Call ``_prefill_attention_pairs(batch)`` for the exact causal
+        attention pair-count. No model arch here, so returns "";
         a subclass may override it."""
         return ""
 
