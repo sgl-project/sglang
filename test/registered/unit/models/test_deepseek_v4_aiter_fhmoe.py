@@ -2,6 +2,7 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import sglang.srt.layers.quantization.fp8 as fp8
@@ -13,9 +14,12 @@ from sglang.srt.layers.moe.moe_runner.aiter import (
     AiterRunnerInput,
 )
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd")
+
+pytestmark = pytest.mark.skipif(not is_hip(), reason="AITER FHMoE requires AMD ROCm")
 
 
 def test_dsv4_topk_appends_semantic_shared_expert_384():
@@ -248,3 +252,7 @@ def test_aiter_runner_forwards_heterogeneous_contract():
     assert captured["shared_w2_scale"] is shared[3]
     assert captured["shared_expert_id"] == 384
     assert captured["gate_mode"] == "interleave"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
