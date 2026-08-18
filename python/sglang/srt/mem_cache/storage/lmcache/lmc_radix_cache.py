@@ -27,6 +27,10 @@ try:
         StoreMetadata,
     )
     from lmcache.integration.sglang.utils import lmcache_get_config
+    from lmcache.integration.vllm.vllm_multi_process_adapter import (
+        ExtraConfigDefault,
+        _resolve_extra_config,
+    )
 except ImportError as e:
     raise RuntimeError(
         "LMCache is not installed. Please install it by running `pip install lmcache`"
@@ -112,23 +116,38 @@ class LMCRadixCache(RadixCache):
         cli_lmc_cfg = get_memory().lmcache_config_file or ""
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+
+        # Detect MLA/DSA (kv_buffer) vs MHA (k_buffer/v_buffer) and build a
+        # flat kv_caches list. For DSA, the indexer buffer
+        # (index_k_with_scale_buffer) is appended so both layer groups are
+        # registered with LMCache. Follows the FlexKV connector pattern
+        # (flexkv_connector.py:141-153).
+        indexer_buffers = getattr(kvcache, "index_k_with_scale_buffer", None)
+        if hasattr(kvcache, "kv_buffer"):
+            # MLA/DSA: fused KV, single buffer per layer
+            kv_caches = list(kvcache.kv_buffer)
+            use_mla = True
+            kv_cache_dim = kv_caches[0].shape[-1]
+            if indexer_buffers is not None:
+                kv_caches = kv_caches + list(indexer_buffers)
+        elif hasattr(kvcache, "k_buffer"):
+            # MHA: separate K and V buffers, concatenated layer-first
+            kv_caches = list(kvcache.k_buffer) + list(kvcache.v_buffer)
+            use_mla = False
+            kv_cache_dim = None
+        else:
+            raise AttributeError(
+                f"Unsupported KV cache type {type(kvcache).__name__}: "
+                "expected kv_buffer (MLA/DSA) or k_buffer/v_buffer (MHA)."
+            )
+
         connector_kwargs = dict(
             sgl_config=model_config,
             tp_size=tp_size,
             rank=rank,
-            # NOTE: The original implementation accessed private buffers via
-            # `_kvcache.k_buffer` / `.v_buffer`. We prefer public accessors when
-            # available; fall back to private fields if needed.
-            k_pool=getattr(
-                kvcache,
-                "k_buffer",
-                getattr(self.token_to_kv_pool_allocator._kvcache, "k_buffer"),
-            ),
-            v_pool=getattr(
-                kvcache,
-                "v_buffer",
-                getattr(self.token_to_kv_pool_allocator._kvcache, "v_buffer"),
-            ),
+            kv_caches=kv_caches,
+            use_mla=use_mla,
+            kv_cache_dim=kv_cache_dim,
             tp_group=tp_group.device_group if tp_group is not None else None,
         )
 
@@ -138,6 +157,13 @@ class LMCRadixCache(RadixCache):
         # MP (multi-process) is the default. XPU defaults to IP (in-process
         # layerwise) because the MP connector shares the KV cache via CUDA IPC
         # (``Tensor._share_cuda_``), which is unavailable on XPU.
+        #
+        # NOTE: MLA/DSA models must use MP mode. The layerwise (IP) path
+        # iterates per-layer with a single uniform shape and has no
+        # awareness of layer groups — incompatible with MLA's fused
+        # single-buffer layout and DSA's dual-buffer layout.
+        # CreateGPUConnector also enforces this by rejecting
+        # use_layerwise=True when metadata.use_mla is set.
         self._mode = LMCacheMode.IP if self.device.type == "xpu" else LMCacheMode.MP
         if self._mode is LMCacheMode.MP:
             if not cli_lmc_cfg:
@@ -146,10 +172,23 @@ class LMCRadixCache(RadixCache):
                     "supplies mp_host / mp_port)."
                 )
             lm_cfg = lmcache_get_config(cli_lmc_cfg)
+            # Resolve mq_timeout / heartbeat_interval from extra_config
+            # (keys prefixed with ``lmcache.mp.``), mirroring the vLLM
+            # adapter. Falls back to the default (300 s / 10 s) when
+            # extra_config is absent — the SGLang adapter historically did
+            # not process extra_config, so this is a no-op for existing
+            # configs.
+            resolved = _resolve_extra_config(lm_cfg.extra_config)
+            mp_mq_timeout = resolved[ExtraConfigDefault.mq_timeout.name]
+            mp_heartbeat_interval = resolved[
+                ExtraConfigDefault.heartbeat_interval.name
+            ]
             self.lmcache_connector = LMCacheMPConnector(
                 page_size=params.page_size,
                 host=lm_cfg.mp_host,
                 port=lm_cfg.mp_port,
+                mq_timeout=mp_mq_timeout,
+                heartbeat_interval=mp_heartbeat_interval,
                 **connector_kwargs,
             )
         elif self._mode is LMCacheMode.IP:
@@ -436,8 +475,13 @@ class LMCRadixCache(RadixCache):
     def cache_finished_req(
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ) -> None:
-        """On request completion, insert device KV into radix and store to LMCache."""
+        """On request completion, insert device KV into radix and store to LMCache.
 
+        ``common.release_kv_cache`` calls this with ``kv_len_to_handle``;
+        we forward it to the parent.  After the parent inserts the request
+        KV into the radix tree, we fire an async LMCache store of the
+        committed prefix.
+        """
         super().cache_finished_req(
             req, is_insert=is_insert, kv_len_to_handle=kv_len_to_handle
         )
@@ -466,7 +510,12 @@ class LMCRadixCache(RadixCache):
             MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
         )
         new_last_node = match_result.last_device_node
-        assert new_last_node is not None
+        if new_last_node is None:
+            raise ValueError(
+                f"match_prefix returned no device node for req {req.rid} "
+                f"after cache_finished_req insert — radix tree is in an "
+                f"inconsistent state"
+            )
 
         self.inc_lock_ref(new_last_node)
         store_md = StoreMetadata(
