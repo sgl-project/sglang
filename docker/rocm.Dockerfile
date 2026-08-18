@@ -73,6 +73,11 @@ ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
+# Work around ROCM-21485: the CUDA/ROCm IPC path leaks GPU memory (a freed IPC
+# block is not returned to the driver). Legacy IPC mode releases it. Verified on
+# ROCm 7.2.1 and 7.2.4; scoped to this flavor so rocm700 / rocm720 keep current
+# IPC behavior.
+ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 
 # ===============================
 # Base image 950 and args
@@ -109,6 +114,11 @@ ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
+# Work around ROCM-21485: the CUDA/ROCm IPC path leaks GPU memory (a freed IPC
+# block is not returned to the driver). Legacy IPC mode releases it. Verified on
+# ROCm 7.2.1 and 7.2.4; scoped to this flavor so rocm700 / rocm720 keep current
+# IPC behavior.
+ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 
 # Local source stage: with BRANCH_TYPE=local the build context is copied here and
 # used instead of git clone (mirrors docker/Dockerfile's local_src stage).
@@ -180,14 +190,16 @@ ARG UBUNTU_CODENAME=jammy
 # Optional Ubuntu mirror override + apt hardening.
 # - UBUNTU_MIRROR is empty by default (no behaviour change for local builds).
 #   When set (typically in CI), all http://*archive.ubuntu.com and
-#   http://*security.ubuntu.com entries in /etc/apt/sources.list are rewritten
-#   to point at the given base URL, e.g.
+#   http://*security.ubuntu.com entries in every /etc/apt source file are
+#   rewritten to point at the given base URL, e.g.
 #     --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com
 #     --build-arg UBUNTU_MIRROR=https://tw.archive.ubuntu.com
 #     --build-arg UBUNTU_MIRROR=http://internal-cache.example.com
 #   This mirrors the pattern already used in docker/Dockerfile (NVIDIA) and
 #   docker/npu.Dockerfile, and lets CI runners that cannot reach Canonical's
-#   port-80 mirror IPs still complete `apt-get update`.
+#   port-80 mirror IPs still complete `apt-get update`. Every file, not just
+#   sources.list: the noble base used by rocm724 keeps its URIs in the deb822
+#   /etc/apt/sources.list.d/ubuntu.sources instead.
 # - The 80-net-hardening apt config adds retries + per-request timeout so that
 #   transient mirror flakes don't immediately fail a build (apt's default is 0
 #   retries).
@@ -195,8 +207,11 @@ ARG UBUNTU_MIRROR=
 USER root
 
 RUN if [ -n "$UBUNTU_MIRROR" ]; then \
-        sed -i "s|http://[^[:space:]/]*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
-        sed -i "s|http://[^[:space:]/]*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
+        find /etc/apt -type f \( -name '*.list' -o -name '*.sources' \) \
+          -exec sed -i \
+            -e "s|http://[^[:space:]/]*archive.ubuntu.com|$UBUNTU_MIRROR|g" \
+            -e "s|http://[^[:space:]/]*security.ubuntu.com|$UBUNTU_MIRROR|g" \
+            {} + ; \
     fi && \
     printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
         > /etc/apt/apt.conf.d/80-net-hardening
@@ -263,12 +278,14 @@ RUN case "${GPU_ARCH}" in \
 
 # Populate the PIP_CONSTRAINT file, which only the rocm724 stages define, so that
 # resolving AITER and SGLang dependencies cannot replace the torch stack above.
-# 'triton' is deliberately left out because AITER installs its own pinned wheel
-# after all other Python dependencies.
+# Triton is deliberately left out, under every spelling: AITER installs its own
+# pinned wheel after all other Python dependencies, and pinning the triton-rocm
+# that step uninstalls would leave the shipped image constraining pip to a
+# distribution that is neither installed nor on PyPI.
 RUN case "${GPU_ARCH}" in \
       *-rocm724) \
         python3 -m pip freeze \
-          | grep -E '^(torch|torchvision|torchaudio|triton-rocm|pytorch-triton-rocm)(==| @ )' \
+          | grep -E '^(torch|torchvision|torchaudio)(==| @ )' \
           > /etc/sglang/constraints/torch-rocm.txt \
         && cat /etc/sglang/constraints/torch-rocm.txt \
         ;; \
@@ -410,7 +427,8 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
          export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[${all_extras}]"; \
        fi
 
-# AITER stream handling on torch 2.11 (rocm720 and rocm724). Runs here rather
+# AITER stream handling for torch.Stream (required on torch 2.11 / rocm724;
+# also applied to rocm720, where it is a no-op on torch 2.9.1). Runs here rather
 # than next to the AITER clone because it shares its logic with the CI installer
 # via a script from the sglang checkout, which only exists from this point on.
 # AITER is installed editable, so patching its source after the install still
@@ -783,7 +801,9 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
 # The installer above uninstalls the triton-rocm that torch 2.11 hard-requires,
 # so torch is left naming a distribution nothing provides. See the script for
 # why neither leaving triton-rocm installed nor leaving the metadata stale works.
-RUN python3 /sgl-workspace/sglang/scripts/ci/amd/patch_torch_triton_requirement.py
+# Guarded because only rocm724's torch pins triton-rocm; the other flavors have
+# nothing here to repair, and their metadata is not this flavor's to rewrite.
+RUN case "${GPU_ARCH}" in *-rocm724) python3 /sgl-workspace/sglang/scripts/ci/amd/patch_torch_triton_requirement.py ;; esac
 
 # Validate the stack that actually ships, after the Triton swap above. The
 # earlier check ran before it, so it could not catch a broken Triton wiring, and
@@ -849,10 +869,6 @@ EOF
 ENV SGLANG_DISABLE_CUDNN_CHECK=1
 ENV HIP_FORCE_DEV_KERNARG=1
 ENV HSA_NO_SCRATCH_RECLAIM=1
-# Work around ROCM-21485: the CUDA/ROCm IPC path leaks GPU memory (a freed IPC
-# block is not returned to the driver). Legacy IPC mode releases it. Verified on
-# ROCm 7.2.1 and 7.2.4.
-ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 ENV SGLANG_INT4_WEIGHT=0
 ENV SGLANG_MOE_PADDING=1

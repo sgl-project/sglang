@@ -17,10 +17,13 @@ is usable:
 
 So rewrite the one requirement line to name the Triton actually present.
 
+Match any pinned triton / triton-rocm, not just the wheel's original
+triton-rocm==3.6.0: the image build already rewrote that line, so a
+version-specific pattern would no-op on the CI rebuild path this also runs on,
+leaving torch naming a Triton that installer just replaced.
+
 Both docker/rocm.Dockerfile and scripts/ci/amd/amd_ci_install_dependency.sh run
-this, because the CI rebuild path re-runs AITER's Triton installer and moves the
-version out from under the image's copy. Self-skips on flavors whose torch never
-named triton-rocm.
+this. Self-skips on flavors whose torch never pinned triton/triton-rocm.
 """
 
 import importlib.metadata as metadata
@@ -28,25 +31,33 @@ import pathlib
 import re
 import sys
 
-PATTERN = r"^Requires-Dist: triton-rocm==3\.6\.0(?P<marker>\s*;.*)?$"
+PATTERN = (
+    r"^Requires-Dist: (?P<name>triton|triton-rocm)==(?P<version>[^\s;]+)"
+    r"(?P<marker>\s*;.*)?$"
+)
 
 
 def main(argv: list[str]) -> int:
     path = pathlib.Path(metadata.distribution("torch")._path) / "METADATA"
     source = path.read_text()
 
-    if not re.search(PATTERN, source, flags=re.MULTILINE):
-        print(f"{path} does not require triton-rocm==3.6.0; nothing to rewrite")
+    match = re.search(PATTERN, source, flags=re.MULTILINE)
+    if match is None:
+        print(f"{path} does not pin triton/triton-rocm; nothing to rewrite")
         return 0
 
     triton_version = metadata.version("triton")
+    if match.group("name") == "triton" and match.group("version") == triton_version:
+        print(f"torch already requires triton=={triton_version}")
+        return 0
+
     updated, count = re.subn(
         PATTERN,
         lambda match: f"Requires-Dist: triton=={triton_version}{match.group('marker') or ''}",
         source,
         flags=re.MULTILINE,
     )
-    assert count == 1, f"FATAL: {path} names triton-rocm==3.6.0 {count} times"
+    assert count == 1, f"FATAL: {path} pins triton/triton-rocm {count} times"
     path.write_text(updated)
     print(f"torch now requires triton=={triton_version}")
     return 0
