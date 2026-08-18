@@ -99,7 +99,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
     @staticmethod
     def _get_transfer_protocol():
         protocol = os.getenv("ASCEND_MF_TRANSFER_PROTOCOL")
-        allowed_protocols = {"device_rdma", "sdma"}
+        allowed_protocols = {"device_rdma", "sdma", "device_urma", "device_uboe"}
         if protocol and protocol.lower() in allowed_protocols:
             return protocol.lower()
         else:

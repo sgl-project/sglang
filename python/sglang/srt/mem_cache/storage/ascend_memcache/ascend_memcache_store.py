@@ -354,6 +354,8 @@ class AscendMemcacheStore(HiCacheStorage):
                 self.register_buffer(self.mem_pool_host.v_buffer)
                 if getattr(self.mem_pool_host, "index_k_buffer", None) is not None:
                     self.register_buffer(self.mem_pool_host.index_k_buffer)
+                if getattr(self.mem_pool_host, "index_k_scale_buffer", None) is not None:
+                    self.register_buffer(self.mem_pool_host.index_k_scale_buffer)
         except TypeError as err:
             logger.error("Failed to register buffer to Ascend Memcache Store: %s", err)
             raise TypeError("Ascend Memcache Store Register Buffer Error.") from err
@@ -391,6 +393,36 @@ class AscendMemcacheStore(HiCacheStorage):
             and self.mem_pool_host is not None
             and getattr(self.mem_pool_host, "layout", None) == "page_first_kv_split"
         )
+
+    def _mla_has_index_scale(self) -> bool:
+        """Whether the MLA host pool carries the quantized-Indexer FP32 scale cache."""
+        return self._mla_uses_kv_split() and getattr(
+            self.mem_pool_host, "index_k_scale_buffer", None
+        ) is not None
+
+    def _mla_has_index_k(self) -> bool:
+        """Whether the MLA host pool carries the DSA Indexer K cache."""
+        return self._mla_uses_kv_split() and getattr(
+            self.mem_pool_host, "index_k_buffer", None
+        ) is not None
+
+    def _mla_fp8_packed_kv(self) -> bool:
+        """FP8 DSA packs K/V into one buffer; v has no separate component key."""
+        return self._mla_uses_kv_split() and getattr(
+            self.mem_pool_host, "dsa_kv_cache_store_fp8", False
+        )
+
+    def _mla_key_multiplier(self) -> int:
+        """Number of per-page memcache component keys for the MLA backend.
+
+        Order matters and must match get_page_buffer_meta's ptr order:
+        k, [v], [index_k], [scale]. v is skipped for FP8-packed DSA where the
+        device v_buffer is empty and never transferred.
+        """
+        if not self._mla_uses_kv_split():
+            return 1
+        base = 1 if self._mla_fp8_packed_kv() else 2
+        return base + int(self._mla_has_index_k()) + int(self._mla_has_index_scale())
 
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
@@ -573,7 +605,12 @@ class AscendMemcacheStore(HiCacheStorage):
         for key_ in keys:
             key_list.append(f"{key_}_{self.mla_suffix}_k")
             if self._mla_uses_kv_split():
-                key_list.append(f"{key_}_{self.mla_suffix}_v")
+                if not self._mla_fp8_packed_kv():
+                    key_list.append(f"{key_}_{self.mla_suffix}_v")
+                if self._mla_has_index_k():
+                    key_list.append(f"{key_}_{self.mla_suffix}_index_k")
+                if self._mla_has_index_scale():
+                    key_list.append(f"{key_}_{self.mla_suffix}_scale")
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
@@ -599,7 +636,7 @@ class AscendMemcacheStore(HiCacheStorage):
 
         if key_multiplier is None:
             if self.is_mla_backend:
-                key_multiplier = 2 if self._mla_uses_kv_split() else 1
+                key_multiplier = self._mla_key_multiplier()
             else:
                 key_multiplier = 2
                 if self.storage_config and self.storage_config.should_split_heads:
@@ -795,7 +832,7 @@ class AscendMemcacheStore(HiCacheStorage):
         hit_keys = sum(1 for r in get_result if r > 0)
 
         if self.is_mla_backend:
-            key_multiplier = 2 if self._mla_uses_kv_split() else 1
+            key_multiplier = self._mla_key_multiplier()
         else:
             key_multiplier = 2
 
@@ -824,8 +861,13 @@ class AscendMemcacheStore(HiCacheStorage):
             for key in page_keys:
                 query_keys.append(f"{key}_{self.mla_suffix}_k")
                 if self._mla_uses_kv_split():
-                    query_keys.append(f"{key}_{self.mla_suffix}_v")
-            key_multiplier = 2 if self._mla_uses_kv_split() else 1
+                    if not self._mla_fp8_packed_kv():
+                        query_keys.append(f"{key}_{self.mla_suffix}_v")
+                    if self._mla_has_index_k():
+                        query_keys.append(f"{key}_{self.mla_suffix}_index_k")
+                    if self._mla_has_index_scale():
+                        query_keys.append(f"{key}_{self.mla_suffix}_scale")
+            key_multiplier = self._mla_key_multiplier()
         else:
             query_keys = []
             if self.storage_config and self.storage_config.should_split_heads:
