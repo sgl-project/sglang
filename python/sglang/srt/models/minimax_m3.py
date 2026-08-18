@@ -218,12 +218,7 @@ class _FusedQKVIndexProj(nn.Module):
                 "weight_scale_inv", nn.Parameter(weight_scale_inv, requires_grad=False)
             )
             self.weight_scale_inv.format_ue8m0 = True
-            # The loader skips this module (see ``_qm``), so it won't run
-            # process_weights_after_loading: derive the backend state here.
             if convert_mxfp8_to_block:
-                # Same conversion the loader pass applies to unfused layers
-                # (block-fp8 requant + flag flips + bpreshuffle + optional
-                # cached-BF16 decode copy).
                 quant_method.process_weights_after_loading_block_quant(self)
             else:
                 quant_method._process_mxfp8_linear_weight_scale(self)
