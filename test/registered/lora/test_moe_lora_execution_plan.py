@@ -323,7 +323,7 @@ class TestWholePipelineValidation(unittest.TestCase):
             down_only.route_requirements(),
             frozenset(
                 (
-                    RouteRequirement.RAW,
+                    RouteRequirement.RAW_PER_EXPERT,
                     RouteRequirement.ALIGNED_PER_EXPERT,
                 )
             ),
@@ -333,7 +333,9 @@ class TestWholePipelineValidation(unittest.TestCase):
         indexed_gate_up = _plan(gate_up_a=_a(Site.GATE_UP, LoraAFamily.INDEXED))
         self.assertEqual(
             indexed_gate_up.route_requirements(),
-            frozenset((RouteRequirement.RAW, RouteRequirement.ALIGNED_PER_EXPERT)),
+            frozenset(
+                (RouteRequirement.RAW_PER_EXPERT, RouteRequirement.ALIGNED_PER_EXPERT)
+            ),
         )
 
 
@@ -394,7 +396,7 @@ class TestRouteRequirementUnion(unittest.TestCase):
             frozenset(
                 (
                     RouteRequirement.ALIGNED_PER_EXPERT,
-                    RouteRequirement.RAW,
+                    RouteRequirement.RAW_SHARED_OUTER,
                 )
             ),
         )

@@ -55,13 +55,16 @@ class BridgeLayout(str, Enum):
 class RouteRequirement(str, Enum):
     """Route representations consumed by a whole execution plan.
 
-    ``RAW`` materializes no derived metadata; consumers derive keys directly
-    from the source tensors.  The other values are distinct products and may
-    coexist.  In particular, a shared-outer forward can require both aligned
+    The ``RAW_*`` pair materializes no derived metadata; consumers derive keys
+    directly from the source tensors.  Every value names its ownership, so a
+    plan that consumes only one form does not get the other built, and asking
+    for the form it did not request raises.  The values are distinct products
+    and may coexist.  In particular, a shared-outer forward can require both aligned
     per-expert and aligned shared-outer pair plans.
     """
 
-    RAW = "raw"
+    RAW_PER_EXPERT = "raw_per_expert"
+    RAW_SHARED_OUTER = "raw_shared_outer"
     ALIGNED_PER_EXPERT = "aligned_per_expert"
     ALIGNED_SHARED_OUTER = "aligned_shared_outer"
     SHARED_TOKEN_PLAN = "shared_token_plan"
@@ -106,6 +109,12 @@ class LateOverlap(str, Enum):
     DOWN_A = "down_a"
     DOWN_B = "down_b"
     DOWN_A_B = "down_a_b"
+
+
+def _raw_requirement(is_shared_outer: bool) -> RouteRequirement:
+    if is_shared_outer:
+        return RouteRequirement.RAW_SHARED_OUTER
+    return RouteRequirement.RAW_PER_EXPERT
 
 
 def _aligned_requirement(is_shared_outer: bool) -> RouteRequirement:
@@ -171,7 +180,7 @@ class LoraASpec:
 
     def route_requirements(self) -> frozenset[RouteRequirement]:
         if self.family is LoraAFamily.INDEXED:
-            return frozenset((RouteRequirement.RAW,))
+            return frozenset((_raw_requirement(self.is_shared_outer),))
         if self.family is LoraAFamily.TOKEN_DEDUP_GROUPED:
             return frozenset((RouteRequirement.SHARED_TOKEN_PLAN,))
         return frozenset((_aligned_requirement(self.is_shared_outer),))
@@ -206,7 +215,7 @@ class LoraBSpec:
         if self.family is LoraBFamily.INDEXED_PAIRS:
             # Descriptor-only: keys are derived inline from the raw source
             # tensors; no aligned pair plan is required for this stage.
-            return frozenset((RouteRequirement.RAW,))
+            return frozenset((_raw_requirement(self.is_shared_outer),))
         return frozenset((_aligned_requirement(self.is_shared_outer),))
 
 
@@ -280,8 +289,10 @@ class FinalizeSpec:
         if self.family is FinalizeFamily.MATERIALIZED:
             return frozenset()
         # The shared-rank finalizer derives its fixed-top-k keys from the raw
-        # route; it never consumes LoRABatchInfo.
-        return frozenset((RouteRequirement.RAW,))
+        # route; it never consumes LoRABatchInfo. consumed_down_b is set here
+        # by the exactly-one-owner rule, and its ownership is the one the
+        # finalizer reads back.
+        return frozenset((_raw_requirement(self.consumed_down_b.is_shared_outer),))
 
 
 @pydantic_dataclass(frozen=True, slots=True, kw_only=True, config=_STRICT)

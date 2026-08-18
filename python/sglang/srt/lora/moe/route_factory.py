@@ -238,7 +238,7 @@ def build_routes(
 
     use_pdl = is_arch_support_pdl()
     values: dict[str, object] = {}
-    if RouteRequirement.RAW in requirements:
+    if RouteRequirement.RAW_PER_EXPERT in requirements:
         values["raw_per_expert"] = build_virtual_expert_routing(
             topk_ids,
             token_slots,
@@ -248,8 +248,9 @@ def build_routes(
             view=ROUTE_RAW,
             use_pdl=use_pdl,
         )
-        # Shared-outer: one LoRA expert per adapter, with the local expert
-        # count restoring the ownership bound (see _aligned_pair_route).
+    if RouteRequirement.RAW_SHARED_OUTER in requirements:
+        # One LoRA expert per adapter, with the local expert count restoring
+        # the ownership bound (see _aligned_pair_route).
         values["raw_shared_outer"] = build_virtual_expert_routing(
             topk_ids,
             token_slots,
