@@ -227,3 +227,7 @@ def test_peak_memory_bounded():
 
     assert unchunked_peak >= 2 * per_image_bytes * len(images)
     assert bounded_peak <= 4 * chunk_bytes
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
