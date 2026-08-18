@@ -413,7 +413,12 @@ class TestAiterAllreduceFusionGate(CustomTestCase):
                 mock.patch.object(
                     comm,
                     "get_parallel",
-                    lambda: types.SimpleNamespace(tp_size=tp_world_size),
+                    # The gate also reads moe_ep_size/moe_tp_size to detect
+                    # hybrid EP+TP, so the mock has to carry them. 1 means "not
+                    # hybrid", which is the dense-TP case these tests cover.
+                    lambda: types.SimpleNamespace(
+                        tp_size=tp_world_size, moe_ep_size=1, moe_tp_size=1
+                    ),
                 )
             )
             # the gate reads get_exec().comm.enable_aiter_allreduce_fusion
