@@ -69,8 +69,7 @@ on:
           # 8-GPU Kimi-K2.6 (MI30x + MI35x)
           - nightly-8-gpu-kimi-k26
           - nightly-8-gpu-mi35x-kimi-k26
-          # 8-GPU Qwen3-235B (MI30x + MI35x MXFP4)
-          - nightly-8-gpu-qwen3-235b
+          # 8-GPU Qwen3-235B-MXFP4 (MI35x only)
           - nightly-8-gpu-mi35x-qwen3-235b-mxfp4
           # 8-GPU Qwen 3.5 (MI30x + MI35x)
           - nightly-8-gpu-qwen35
@@ -1349,41 +1348,12 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
   # ==============================================================================
-  # 8-GPU Qwen3-235B (MI30x + MI35x MXFP4)
+  # 8-GPU Qwen3-235B-MXFP4 (MI35x only)
+  #
+  # The MI30x BF16 + FP8 counterpart was dropped: Qwen3MoeForCausalLM keeps a
+  # nightly heartbeat through the 30B-A3B jobs, and MXFP4 on this architecture
+  # is covered nowhere else.
   # ==============================================================================
-
-  nightly-8-gpu-qwen3-235b:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-qwen3-235b,'))
-    runs-on: linux-mi300-8gpu-sglang
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.sha }}
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Setup docker
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-          ENABLE_CACHE_HOST: "1"
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
-
-      - name: Accuracy Test + Performance Test (8-GPU Qwen3)
-        timeout-minutes: 120
-        run: |
-          > github_summary.md  # Clear summary file
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-8-gpu-qwen3-235b --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
 
   nightly-8-gpu-mi35x-qwen3-235b-mxfp4:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-qwen3-235b-mxfp4,'))
@@ -1912,8 +1882,7 @@ jobs:
       # 8-GPU Kimi-K2.6 (MI30x + MI35x)
       - nightly-8-gpu-kimi-k26
       - nightly-8-gpu-mi35x-kimi-k26
-      # 8-GPU Qwen3-235B (MI30x + MI35x MXFP4)
-      - nightly-8-gpu-qwen3-235b
+      # 8-GPU Qwen3-235B-MXFP4 (MI35x only)
       - nightly-8-gpu-mi35x-qwen3-235b-mxfp4
       # 8-GPU Qwen 3.5 (MI30x + MI35x)
       - nightly-8-gpu-qwen35
