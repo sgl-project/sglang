@@ -117,6 +117,8 @@ class UnifiedTreeNode:
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
         self.hash_value = None
+        # Namespace-aware hashes used only for external KV events.
+        self.event_hash_value: Optional[list[str]] = None
         self.hit_count = 0
         self.priority = priority
         self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
@@ -1065,6 +1067,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
+        )
 
         for component in self.components:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
@@ -1867,10 +1872,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 comp_xfers[comp.component_type] = t
         return kv_xfer, comp_xfers
 
-    def prefetch_anchor_info(self, node_id: NodeId) -> Optional[str]:
-        """The anchor node's key extra_key."""
+    def prefetch_anchor_info(
+        self, node_id: NodeId
+    ) -> tuple[Optional[str], Optional[str]]:
+        """The anchor node's key extra_key and cache_salt."""
         node = self.node_by_id(node_id)
-        return node.key.extra_key if node.key else None
+        if node.key is None:
+            return None, None
+        return node.key.extra_key, node.key.cache_salt
 
     def _build_backup_kv_action(
         self, node: UnifiedTreeNode, write_back: bool = False
@@ -1949,19 +1958,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         rebuild is deferred to the orchestration layer."""
         node = self.node_by_id(node_id)
         cache_actions: list[CacheAction | ComponentAction] = []
-        # Pin every node whose host slots the in-flight DMA reads (including
-        # aux-only nodes) against reclaim until the ack.
-        for xfers in ([kv_xfer], *comp_xfers.values()):
-            for xfer in xfers:
-                for nid in xfer.nodes_to_load or ():
-                    pinned = self.node_by_id(nid)
-                    # One live load-back per node; only the same anchor may
-                    # re-pin (a node can sit in Full and aux transfer lists).
-                    assert pinned.load_back_pending_id in (None, node_id), (
-                        f"node {nid} pinned by load-back "
-                        f"{pinned.load_back_pending_id}, new anchor {node_id}"
-                    )
-                    pinned.load_back_pending_id = node_id
+        if self.is_write_back:
+            # Write-back may reclaim a duplicate host copy while H->D DMA is
+            # still reading it, so pin every source node until the ack.
+            for xfers in ([kv_xfer], *comp_xfers.values()):
+                for xfer in xfers:
+                    for nid in xfer.nodes_to_load or ():
+                        pinned = self.node_by_id(nid)
+                        # One live load-back per node; only the same anchor may
+                        # re-pin (a node can sit in Full and aux transfer lists).
+                        assert pinned.load_back_pending_id in (None, node_id), (
+                            f"node {nid} pinned by load-back "
+                            f"{pinned.load_back_pending_id}, new anchor {node_id}"
+                        )
+                        pinned.load_back_pending_id = node_id
         kv_xfer.device_indices = device_indices
         self.components_by_type[BASE_COMPONENT_TYPE].commit_hicache_transfer(
             node,
@@ -1982,14 +1992,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return cache_actions
 
     def finish_load_back(self, anchor_node_id: NodeId) -> None:
-        """Clear the in-flight H->D marks along the anchor's root path at ack
-        time; split fragments stay on the path, so the walk covers them."""
+        """Finalize H->D load-back state along the anchor's root path.
+
+        Write-back clears source-node pins at ack time. Write-through does not
+        use those pins, but still refreshes duplicate tracking after the device
+        copies become visible. Split fragments stay on the path, so the walk
+        covers them.
+        """
         node = self.node_by_id(anchor_node_id)
         while node is not None and node is not self.root_node:
-            if node.load_back_pending_id == anchor_node_id:
+            if self.is_write_back:
+                if node.load_back_pending_id != anchor_node_id:
+                    node = node.parent
+                    continue
                 node.load_back_pending_id = None
-                # The loaded copies become tracked duplicates only now.
-                self._update_duplicate_tracking(node)
+            self._update_duplicate_tracking(node)
             node = node.parent
 
     def mark_write_through_pending(self, node_id: NodeId) -> None:

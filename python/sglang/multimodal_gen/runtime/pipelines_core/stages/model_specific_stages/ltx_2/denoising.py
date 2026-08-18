@@ -101,6 +101,48 @@ class LTX2GuidancePassSpec:
     disable_v2a_cross_attn: bool = False
 
 
+def _prepare_ltx2_rope_coords_for_bcg(
+    *,
+    enabled: bool,
+    current_model,
+    latent_model_input: torch.Tensor,
+    audio_latent_model_input: torch.Tensor,
+    video_coords: torch.Tensor | None,
+    audio_coords: torch.Tensor | None,
+    num_frames: int,
+    height: int,
+    width: int,
+    audio_num_frames: int,
+    fps: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Build missing LTX-2 RoPE coordinates before CUDA graph capture.
+
+    The legacy LTX-2.3 one-stage path normally builds these tensors inside the
+    model forward. That performs an unpinned host-to-device copy, which CUDA
+    graph capture rejects. Preparing the same coordinates before entering the
+    graph preserves the eager values and makes both legacy and two-stage LTX
+    forwards capturable.
+    """
+    if not enabled:
+        return video_coords, audio_coords
+    if video_coords is None:
+        video_coords = current_model.rope.prepare_video_coords(
+            batch_size=int(latent_model_input.shape[0]),
+            num_frames=num_frames,
+            height=height,
+            width=width,
+            device=latent_model_input.device,
+            fps=fps,
+        )
+    if audio_coords is None:
+        audio_coords = current_model.audio_rope.prepare_audio_coords(
+            batch_size=int(audio_latent_model_input.shape[0]),
+            num_frames=audio_num_frames,
+            device=audio_latent_model_input.device,
+        )
+    return video_coords, audio_coords
+
+
 class LTX2DenoisingStage(DenoisingStage):
     """
     LTX-2 specific denoising stage that handles joint video and audio generation.
@@ -1169,28 +1211,19 @@ class LTX2DenoisingStage(DenoisingStage):
                 audio_latent_model_input,
                 num_frames=audio_num_frames_latent,
             )
-            if server_args.enable_breakable_cuda_graph:
-                # The in-model RoPE coordinate construction builds host
-                # tensors (torch.tensor(list, device=cuda)), which is an
-                # unpinned H2D copy and therefore illegal inside CUDA graph
-                # capture. Build the coords outside the captured region with
-                # the exact same rope helpers (start_frame=0 == the sp<=1
-                # in-model path), so values are bit-identical.
-                if video_coords is None:
-                    video_coords = step.current_model.rope.prepare_video_coords(
-                        batch_size=int(latent_model_input.shape[0]),
-                        num_frames=ctx.latent_num_frames_for_model,
-                        height=ctx.latent_height,
-                        width=ctx.latent_width,
-                        device=latent_model_input.device,
-                        fps=batch.fps,
-                    )
-                if audio_coords is None:
-                    audio_coords = step.current_model.audio_rope.prepare_audio_coords(
-                        batch_size=int(audio_latent_model_input.shape[0]),
-                        num_frames=audio_num_frames_latent,
-                        device=audio_latent_model_input.device,
-                    )
+        video_coords, audio_coords = _prepare_ltx2_rope_coords_for_bcg(
+            enabled=server_args.enable_breakable_cuda_graph,
+            current_model=step.current_model,
+            latent_model_input=latent_model_input,
+            audio_latent_model_input=audio_latent_model_input,
+            video_coords=video_coords,
+            audio_coords=audio_coords,
+            num_frames=ctx.latent_num_frames_for_model,
+            height=ctx.latent_height,
+            width=ctx.latent_width,
+            audio_num_frames=audio_num_frames_latent,
+            fps=batch.fps,
+        )
 
         batch_size = int(latent_model_input.shape[0])
         use_raw_sigma_timestep = ctx.use_ltx23_hq_timestep_semantics

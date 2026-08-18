@@ -165,10 +165,12 @@ def ltx2_ada_values9(
 
     batch, seq, _ = timestep.shape
     rows = int(batch * seq)
-    outs = tuple(
-        torch.empty((batch, seq, hidden), device=timestep.device, dtype=timestep.dtype)
-        for _ in range(9)
+    # Each returned output is a disjoint, contiguous view, so one allocation
+    # avoids nine allocator round trips per transformer block.
+    output_storage = torch.empty(
+        (9, batch, seq, hidden), device=timestep.device, dtype=timestep.dtype
     )
+    outs = tuple(output_storage.unbind(dim=0))
     _ltx2_ada_values9_kernel[(rows,)](
         timestep,
         scale_shift_table,

@@ -256,12 +256,11 @@ class TransformerBlock(nn.Module):
         self,
         hidden_states: torch.FloatTensor,
         rotary_pos_emb: Optional[torch.FloatTensor] = None,
-        pack_info: dict = {},
     ):
         norm_hidden_states = self.norm1(_vit_norm_input(self.norm1, hidden_states)).to(
             hidden_states.dtype
         )
-        attn_output = self.attn(norm_hidden_states, rotary_pos_emb, pack_info)
+        attn_output = self.attn(norm_hidden_states, rotary_pos_emb)
         if self.use_scale:
             hidden_states = _scaled_residual_add(
                 hidden_states, attn_output, self.scale1

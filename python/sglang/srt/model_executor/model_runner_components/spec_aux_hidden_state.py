@@ -146,6 +146,13 @@ def _resolve_dflash_aux_hidden_state(
             draft_num_layers=int(draft_num_layers),
         )
 
+        # Native export uses HF layer-output ids; shift them.
+        draft_architectures = (
+            getattr(draft_model_config.hf_config, "architectures", None) or []
+        )
+        if "MuseGlimmerAssistantModel" in draft_architectures:
+            target_layer_ids = [i + 1 for i in target_layer_ids]
+
         if spec_algorithm.is_dspark():
             from sglang.srt.speculative.dspark_components.dspark_config import (
                 parse_dspark_draft_config,
@@ -190,6 +197,9 @@ def _resolve_dflash_draft_cell_size(
     try:
         _, draft_kv_cache_dtype = configure_kv_cache_dtype(
             server_args_kv_cache_dtype=server_args.kv_cache_dtype,
+            speculative_draft_kv_cache_dtype=(
+                server_args.speculative_draft_kv_cache_dtype
+            ),
             model=None,
             model_dtype=draft_model_config.dtype,
             is_draft_worker=True,

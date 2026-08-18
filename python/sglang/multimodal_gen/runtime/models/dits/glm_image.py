@@ -987,7 +987,6 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         # 3. Transformer blocks
-        self._supported_attention_backends = arch_config._supported_attention_backends
         self.transformer_blocks = nn.ModuleList(
             [
                 GlmImageTransformerBlock(

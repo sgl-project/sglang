@@ -68,8 +68,11 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.models.dits.ideogram import (
     Ideogram4ColumnParallelLinear,
     Ideogram4MergedColumnParallelLinear,
+    Ideogram4RMSNorm,
     Ideogram4RowParallelLinear,
     Ideogram4Transformer2DModel,
+    _gate_residual,
+    _norm_scale,
 )
 from sglang.multimodal_gen.runtime.models.encoders.ideogram import (
     IdeogramQwen3VLTextEncoder,
@@ -192,6 +195,24 @@ def _fake_ideogram_pipeline(transformer, unconditional_transformer):
 
 
 class TestIdeogram4(unittest.TestCase):
+    def test_lossless_norm_postprocess_preserves_cpu_reference(self):
+        norm = Ideogram4RMSNorm(16, eps=1e-5)
+        x = torch.randn(1, 7, 16)
+        update = torch.randn_like(x)
+        scale = torch.randn(1, 1, 16)
+        gate = torch.randn_like(scale)
+
+        self.assertTrue(
+            torch.equal(_norm_scale(x, scale, norm, False), norm(x) * (1 + scale))
+        )
+        self.assertTrue(
+            torch.equal(
+                _gate_residual(update, gate, x, norm, False),
+                x + torch.tanh(gate) * norm(update),
+            )
+        )
+        self.assertEqual(set(norm.state_dict()), {"weight"})
+
     def test_ideogram_dit_supports_layerwise_offload(self):
         self.assertTrue(
             issubclass(Ideogram4Transformer2DModel, LayerwiseOffloadableModuleMixin)
@@ -741,12 +762,12 @@ class TestIdeogram4(unittest.TestCase):
             ["transformer", "unconditional_transformer"],
         )
 
-    def test_ideogram_attention_backend_is_passed_from_config(self):
+    def test_ideogram_attention_backend_is_declared_by_runtime_model(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
 
         config = Ideogram4DiTConfig()
         self.assertEqual(
-            config.arch_config._supported_attention_backends,
+            Ideogram4Transformer2DModel._supported_attention_backends,
             {AttentionBackendEnum.FA, AttentionBackendEnum.TORCH_SDPA},
         )
         prev_args = server_args_module._global_server_args
@@ -763,7 +784,7 @@ class TestIdeogram4(unittest.TestCase):
 
         self.assertEqual(
             model.supported_attention_backends,
-            config.arch_config._supported_attention_backends,
+            Ideogram4Transformer2DModel._supported_attention_backends,
         )
         self.assertEqual(
             model.layers[0].attention.attn.backend,

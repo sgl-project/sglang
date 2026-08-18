@@ -311,6 +311,80 @@ class ReasoningRequestForwardingTestCase(unittest.TestCase):
         self.assertFalse(parser_cls.call_args.kwargs["force_reasoning"])
 
 
+class SkipSpecialTokensForwardingTestCase(CustomTestCase):
+    """The skip_special_tokens override from _process_messages must reach the
+    engine sampling params; muse's channel markers die in detok otherwise."""
+
+    def _create_responses_sampling_params(self, serving):
+        serving.default_chat_template_kwargs = None
+        rendered = MessageProcessingResult(
+            prompt="prompt",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+        captured = {}
+
+        async def fake_generate(
+            request_id,
+            request_prompt,
+            adapted_request,
+            sampling_params,
+            context,
+            **kwargs,
+        ):
+            captured["sampling_params"] = sampling_params
+            context.append_output(
+                {
+                    "text": "done",
+                    "meta_info": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "cached_tokens": 0,
+                    },
+                }
+            )
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        request = ResponsesRequest(
+            model="x",
+            input="answer",
+            request_id="resp_skip_special",
+            store=False,
+        )
+
+        with (
+            patch.object(
+                serving, "_apply_conversation_template", return_value=rendered
+            ),
+            patch(
+                "sglang.srt.entrypoints.openai.serving_responses.ReasoningParser"
+            ) as parser_cls,
+        ):
+            parser_cls.return_value.parse_non_stream.return_value = (None, "done")
+            response = asyncio.run(serving.create_responses(request))
+
+        self.assertEqual(response.status, "completed")
+        return captured["sampling_params"]
+
+    def test_marker_preserving_parser_disables_skip_special_tokens(self):
+        serving = make_serving()
+        serving.reasoning_parser = "muse"
+        params = self._create_responses_sampling_params(serving)
+        self.assertFalse(params["skip_special_tokens"])
+
+    def test_default_parser_keeps_skip_special_tokens(self):
+        serving = make_serving()
+        params = self._create_responses_sampling_params(serving)
+        # The chat request's True is a synthesized default (ResponsesRequest has
+        # no such field), so leave it unset for --preferred-sampling-params.
+        self.assertNotIn("skip_special_tokens", params)
+
+
 class InputItemNormalizationTestCase(CustomTestCase):
     def test_function_call_becomes_assistant_tool_call(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(

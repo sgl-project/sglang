@@ -1,13 +1,17 @@
 import sys
+from types import ModuleType
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
 from sglang.kernels.ops.diffusion.bitexact_gate import (
     BitExactFusionGate,
+    flashinfer_rmsnorm_diagnostic_hint,
     tensors_equal,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -74,6 +78,81 @@ def test_tensors_equal_supports_sequences():
         (torch.tensor([1.0]), torch.tensor([2.0])),
         (torch.tensor([1.0]), torch.tensor([3.0])),
     )
+
+
+class TestBitExactFallbackDiagnostics(CustomTestCase):
+    def test_mismatch_warning_is_actionable_and_diagnostic_is_lazy(self):
+        logger = MagicMock()
+        diagnostic = MagicMock(return_value="backend=CuTe DSL")
+        gate = BitExactFusionGate("diagnostic")
+
+        matched = gate.accept_or_fallback(
+            torch.tensor([1.0]),
+            torch.tensor([1.0]),
+            logger=logger,
+            diagnostic_hint=diagnostic,
+        )
+        self.assertTrue(torch.equal(matched, torch.tensor([1.0])))
+        diagnostic.assert_not_called()
+        logger.warning_once.assert_not_called()
+
+        gate = BitExactFusionGate("diagnostic")
+        fallback = gate.accept_or_fallback(
+            torch.tensor([1.0]),
+            torch.tensor([2.0]),
+            logger=logger,
+            diagnostic_hint=diagnostic,
+        )
+
+        self.assertTrue(torch.equal(fallback, torch.tensor([2.0])))
+        diagnostic.assert_called_once_with()
+        warning = logger.warning_once.call_args.args[0]
+        self.assertIn("Correctness is preserved", warning)
+        self.assertIn("reference kernel or reduction-order change", warning)
+        self.assertIn("backend=CuTe DSL", warning)
+
+    def test_diagnostic_failure_cannot_break_the_eager_fallback(self):
+        logger = MagicMock()
+
+        def broken_diagnostic():
+            raise RuntimeError("diagnostics unavailable")
+
+        gate = BitExactFusionGate("diagnostic")
+        fallback = gate.accept_or_fallback(
+            torch.tensor([1.0]),
+            torch.tensor([2.0]),
+            logger=logger,
+            diagnostic_hint=broken_diagnostic,
+        )
+
+        self.assertTrue(torch.equal(fallback, torch.tensor([2.0])))
+        self.assertTrue(gate.disabled)
+        self.assertIn("Correctness is preserved", logger.warning_once.call_args.args[0])
+
+    def test_flashinfer_rmsnorm_hint_reports_backend_and_versions(self):
+        flashinfer = ModuleType("flashinfer")
+        flashinfer_norm = ModuleType("flashinfer.norm")
+        flashinfer_norm._USE_CUDA_NORM = False
+        versions = {
+            "flashinfer-python": "0.6.12",
+            "flashinfer-cubin": "0.6.12",
+            "flashinfer-jit-cache": "0.6.12+cu130",
+        }
+
+        with (
+            patch.dict(
+                sys.modules,
+                {"flashinfer": flashinfer, "flashinfer.norm": flashinfer_norm},
+            ),
+            patch("importlib.metadata.version", side_effect=versions.__getitem__),
+            patch.dict("os.environ", {"FLASHINFER_USE_CUDA_NORM": "0"}),
+        ):
+            hint = flashinfer_rmsnorm_diagnostic_hint()
+
+        self.assertIn("backend=CuTe DSL", hint)
+        self.assertIn("FLASHINFER_USE_CUDA_NORM=0", hint)
+        for package, version in versions.items():
+            self.assertIn(f"{package}={version}", hint)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ import triton.language as tl
 from sglang.srt.distributed import (
     GroupCoordinator,
     get_attn_cp_group,
+    get_attn_cp_overlap_group,
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
@@ -30,7 +31,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.runtime_context import (
     configured_attn_cp_size,
     configured_moe_dp_size,
+    get_device,
+    get_exec,
     get_flags,
+    get_parallel,
 )
 from sglang.srt.utils import get_bool_env_var, is_hip
 
@@ -344,9 +348,9 @@ def initialize_dp_attention(
     dp.max_len_with_idle = (
         getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
     )
-    enable_dp_attention = server_args.enable_dp_attention
-    dp_size = server_args.dp_size
-    attn_cp_size = server_args.attn_cp_size
+    enable_dp_attention = get_parallel().enable_dp_attention
+    dp_size = get_parallel().dp_size
+    attn_cp_size = configured_attn_cp_size()
 
     dp.enabled = enable_dp_attention
 
@@ -358,15 +362,15 @@ def initialize_dp_attention(
     )
     _ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
 
-    if server_args.elastic_ep_backend is not None and server_args.max_ep_size:
-        _ATTN_DP_RANK = tp_rank + server_args.ep_join_rank_offset
+    if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
+        _ATTN_DP_RANK = tp_rank + get_parallel().ep_join_rank_offset
         if server_args.is_ep_scale_joiner:
             dp.joiner_skip_all_gather = True
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
         dtype=model_config.dtype,
-        device=torch.device(server_args.device),
+        device=torch.device(get_device().device),
     )
 
 
@@ -967,6 +971,14 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attn_cp_group().all_gather_into_tensor(output, input)
+
+
+def attn_cp_overlap_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
+    return get_attn_cp_overlap_group().all_gather_into_tensor(output, input)
+
+
+def attn_cp_overlap_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+    return get_attn_cp_overlap_group().reduce_scatter_tensor(output, input)
 
 
 def get_moe_cp_group() -> GroupCoordinator:

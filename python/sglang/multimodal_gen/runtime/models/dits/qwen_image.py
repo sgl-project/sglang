@@ -21,6 +21,7 @@ from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     mark_fused_gelu_site,
 )
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_transformer_block
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_tp_world_size,
@@ -1315,7 +1316,7 @@ class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
     param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
-    _fsdp_shard_conditions = QwenImageDitConfig().arch_config._fsdp_shard_conditions
+    _fsdp_shard_conditions = [is_transformer_block]
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:

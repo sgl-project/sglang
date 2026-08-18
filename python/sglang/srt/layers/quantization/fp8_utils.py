@@ -11,6 +11,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     sglang_per_token_group_quant_fp8_row_padded,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import get_exec, get_parallel
@@ -23,6 +24,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
     fp8_min,
+    get_w8a8_channelwise_fp8_config,
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -38,6 +40,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
+    get_device_sm,
     get_hip_version,
     is_blackwell_supported,
     is_cuda,
@@ -276,6 +279,7 @@ class Fp8GemmRunnerBackend(Enum):
     AUTO = "auto"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_DEEPGEMM = "flashinfer_deepgemm"
     CUTLASS = "cutlass"
     DEEP_GEMM = "deep_gemm"
@@ -290,6 +294,9 @@ class Fp8GemmRunnerBackend(Enum):
 
     def is_flashinfer_cutlass(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
+
+    def is_flashinfer_cutedsl(self) -> bool:
+        return self == Fp8GemmRunnerBackend.FLASHINFER_CUTEDSL
 
     def is_flashinfer_deepgemm(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_DEEPGEMM
@@ -312,6 +319,7 @@ class Mxfp8DenseGemmBackend(Enum):
     `Fp8GemmRunnerBackend`."""
 
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     DEEP_GEMM = "deep_gemm"
     GFX95_DOT_SCALED = "gfx95_dot_scaled"
@@ -320,8 +328,14 @@ class Mxfp8DenseGemmBackend(Enum):
     def is_flashinfer_cutlass(self) -> bool:
         return self == Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
 
+    def is_flashinfer_cutedsl(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+
     def is_flashinfer_trtllm(self) -> bool:
         return self == Mxfp8DenseGemmBackend.FLASHINFER_TRTLLM
+
+    def is_flashinfer(self) -> bool:
+        return self.value.startswith("flashinfer_")
 
     def is_deep_gemm(self) -> bool:
         return self == Mxfp8DenseGemmBackend.DEEP_GEMM
@@ -533,6 +547,28 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
             )
         return Mxfp8DenseGemmBackend.FLASHINFER_TRTLLM
 
+    if backend.is_flashinfer_cutedsl():
+        if not (
+            is_blackwell_supported()
+            and is_flashinfer_available()
+            and _raw_flashinfer_mm_mxfp8.is_backend_supported(
+                "cute-dsl", get_device_sm()
+            )
+        ):
+            raise RuntimeError(
+                "MXFP8 dense GEMM requested via --fp8-gemm-backend=flashinfer_cutedsl, "
+                "but that kernel requires an SM100/SM103 GPU and FlashInfer."
+            )
+        return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
+
+    if backend.is_flashinfer_cutlass():
+        if not (is_blackwell_supported() and is_flashinfer_available()):
+            raise RuntimeError(
+                "MXFP8 dense GEMM requested via --fp8-gemm-backend=flashinfer_cutlass, "
+                "but that kernel requires Blackwell GPUs and FlashInfer."
+            )
+        return Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
+
     if backend.is_deep_gemm():
         if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             raise RuntimeError(
@@ -546,6 +582,8 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
         return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
 
     if is_blackwell_supported() and is_flashinfer_available():
+        if _raw_flashinfer_mm_mxfp8.is_backend_supported("cute-dsl", get_device_sm()):
+            return Mxfp8DenseGemmBackend.FLASHINFER_CUTEDSL
         return Mxfp8DenseGemmBackend.FLASHINFER_CUTLASS
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
@@ -570,6 +608,8 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="trtllm")
     elif backend.is_flashinfer_cutlass():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cutlass")
+    elif backend.is_flashinfer_cutedsl():
+        return partial(flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl")
     elif backend.is_unsupported():
         return _unsupported_mxfp8_linear
 
@@ -728,14 +768,6 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
         backend = "cutlass"
 
     backend = Fp8GemmRunnerBackend(backend)
-
-    if (
-        backend.is_auto()
-        and server_args.quantization == "mxfp8"
-        and _is_sm100_supported
-        and is_flashinfer_available()
-    ):
-        backend = Fp8GemmRunnerBackend.FLASHINFER_CUTLASS
 
     FP8_GEMM_RUNNER_BACKEND = backend
 
@@ -1246,12 +1278,6 @@ def flashinfer_mxfp8_blockscaled_linear(
             output_dtype = input_2d.dtype
         else:
             output_dtype = torch.bfloat16
-
-    # At small M the persistent CUTLASS kernel is 2-5x slower than the
-    # CuTe-DSL swap-AB/split-K kernels (both consume the same swizzled
-    # 1D scales).
-    if backend == "cutlass" and q_input.shape[0] <= 64:
-        backend = "cute-dsl"
 
     if backend == "trtllm":
         weight_scale_t = weight_scale.view(-1)
@@ -1764,6 +1790,12 @@ def apply_fp8_linear(
     use_cutlass_channelwise_gemm = (
         channelwise_cutlass and cutlass_compatible_b and not use_triton_w8a8_fp8_kernel
     )
+    # Consider a tuned Triton tile only where the shape would otherwise go to
+    # CUTLASS (that is the path the offline sweep tuned against). On by default;
+    # SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 is the kill switch.
+    use_tuned_triton_channelwise = (
+        use_cutlass_channelwise_gemm and envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.get()
+    )
     native_scalar_a_scale = use_cutlass_channelwise_gemm and (
         _is_sm90_supported or _is_sm100_supported or _is_sm120_supported
     )
@@ -1842,11 +1874,37 @@ def apply_fp8_linear(
                     )
 
     if channelwise_cutlass:
+        # A tuned config exists only for shapes where tuned Triton beat the
+        # CUTLASS dispatch on this GPU; otherwise this is None and the backend
+        # choice below is unchanged. weight is [K, N] here.
+        tuned_config = (
+            get_w8a8_channelwise_fp8_config(
+                N=weight.shape[1], K=weight.shape[0], M=qinput.shape[0]
+            )
+            if use_tuned_triton_channelwise
+            else None
+        )
         if not use_cutlass_channelwise_gemm:
             # Massage the input to be 2D
             qinput = qinput.view(-1, qinput.shape[-1])
             output = triton_scaled_mm(
                 qinput, weight, x_scale, weight_scale, output_dtype, bias
+            )
+        elif tuned_config is not None:
+            qinput = qinput.view(-1, qinput.shape[-1])
+            output = triton_scaled_mm(
+                qinput,
+                weight,
+                x_scale,
+                weight_scale,
+                output_dtype,
+                bias,
+                block_size_m=tuned_config["BLOCK_SIZE_M"],
+                block_size_n=tuned_config["BLOCK_SIZE_N"],
+                block_size_k=tuned_config["BLOCK_SIZE_K"],
+                use_heuristic=False,
+                num_warps=tuned_config["num_warps"],
+                num_stages=tuned_config["num_stages"],
             )
         else:
             output = fp8_scaled_mm(

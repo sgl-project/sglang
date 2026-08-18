@@ -782,13 +782,14 @@ class TestDSV4LivePrefixMetadata(CustomTestCase):
             tilelang=False,
             aiter=False,
             torch_fallback=False,
-            topk_torch=False,
+            topk_backend="sgl-kernel",
             topk_v2=False,
             hisparse=False,
             cuda_graph=True,
         ):
             backend.enable_deepseek_v4_fp4_indexer = fp4
             backend.hisparse_coordinator = object() if hisparse else None
+            backend.dsa_topk_backend = deepseek_v4_backend.DSATopKBackend(topk_backend)
             with (
                 mock.patch.object(deepseek_v4_backend, "_is_sm100", sm100),
                 mock.patch.object(deepseek_v4_backend, "_is_xpu", xpu),
@@ -806,11 +807,6 @@ class TestDSV4LivePrefixMetadata(CustomTestCase):
                     deepseek_v4_backend.envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH,
                     "get",
                     return_value=torch_fallback,
-                ),
-                mock.patch.object(
-                    deepseek_v4_backend.envs.SGLANG_TOPK_TRANSFORM_512_TORCH,
-                    "get",
-                    return_value=topk_torch,
                 ),
                 mock.patch.object(
                     deepseek_v4_backend.envs.SGLANG_OPT_USE_TOPK_V2,
@@ -842,7 +838,8 @@ class TestDSV4LivePrefixMetadata(CustomTestCase):
             {"tilelang": True},
             {"aiter": True},
             {"torch_fallback": True},
-            {"topk_torch": True},
+            {"topk_backend": "torch"},
+            {"topk_backend": "flashinfer"},
             {"hisparse": True},
         ):
             with self.subTest(override=override):

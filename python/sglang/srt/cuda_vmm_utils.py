@@ -281,20 +281,28 @@ def make_device_allocation_prop(
     elif not isinstance(handle_types, int):
         raise ValueError("handle_types must be 'auto', an integer, or None")
 
-    handle_types = int(handle_types)
+    handle_type_value = int(handle_types)
     valid_handle_types = {
-        int(drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE),
-        int(drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
-        int(drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC),
+        int(drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE): (
+            drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE
+        ),
+        int(drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR): (
+            drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        ),
+        int(drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC): (
+            drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        ),
     }
-    if handle_types not in valid_handle_types:
-        raise ValueError(f"invalid CUDA handle-type value: {handle_types}")
+    if handle_type_value not in valid_handle_types:
+        raise ValueError(f"invalid CUDA handle-type value: {handle_type_value}")
 
     prop = drv.CUmemAllocationProp()
     prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
     prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
     prop.location.id = int(device_id)
-    prop.requestedHandleTypes = handle_types
+    # cuda-bindings 13.0.x requires the generated enum here; newer releases
+    # also accept a plain int, which previously hid this compatibility issue.
+    prop.requestedHandleTypes = valid_handle_types[handle_type_value]
     prop.allocFlags.gpuDirectRDMACapable = int(gpu_direct_rdma)
     return prop
 
