@@ -726,7 +726,6 @@ class ModelRunner:
             self._token_oracle_manager = None
             return
         self._token_oracle_manager = install_token_oracle_from_env(
-            server_args=self.server_args,
             vocab_size=self.model_config.vocab_size,
         )
 
@@ -784,7 +783,6 @@ class ModelRunner:
         if self.spec_algorithm.is_speculative():
             return resolve_num_tokens_per_req(
                 phase="target_verify",
-                server_args=self.server_args,
                 spec_algorithm=self.spec_algorithm,
                 is_draft_worker=self.is_draft_worker,
                 num_draft_tokens=num_draft_tokens,

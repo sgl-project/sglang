@@ -338,8 +338,9 @@ export const config = {
   // Verification: RTX 5090 / RTX PRO 6000 cells were measured across their
   // whole overlay envelope; the h200/gb300 badges carry the source page's
   // validation, which covers the overlay defaults (plus plain MTP on gb300) —
-  // non-default overlay picks there are valid but unmeasured. DGX Spark stays
-  // unverified (SM121 / aarch64 unvalidated).
+  // non-default overlay picks there are valid but unmeasured. DGX Spark was
+  // measured across its whole overlay envelope too, but to a weaker standard
+  // (boot-and-serve only — see the cell block comment below).
   //
   // Cells carry NO --mamba-full-memory-ratio: the ratio depends on workload,
   // S, D and kv_bytes_per_token, so the page's calculator computes it live
@@ -480,21 +481,30 @@ export const config = {
     },
     // DGX Spark (GB10, SM121): single node, 128GB coherent unified memory
     // shared with the CPU — every checkpoint fits, so all three quants get a
-    // cell. FlashInfer attention comes from the SM120 pair; the platform gets
-    // its own operating point at 8192-token prefill chunks, 0.95 static
-    // fraction, and prefill CUDA graphs disabled. Unvalidated on SM121 /
-    // aarch64.
+    // cell. These cells reuse the RTX PRO 6000 recipe verbatim rather than a
+    // separate SM121 operating point: both cards are SM12x Blackwell, and
+    // GB10's 128GB unified pool is larger than the 6000's 96GB, so a recipe
+    // that fits the smaller card has headroom here.
+    //
+    // Validated on GB10 (SM121 / aarch64): all 36 configurations booted and
+    // served at ISL 8192 / OSL 1024, concurrency 1. Boot-and-serve only -- no
+    // throughput or acceptance-length numbers were taken, so this is a weaker
+    // standard than the SM120 pair's validation, and the Deploy-panel Note says
+    // so.
     {
       match: { hw: "dgx-spark", variant: "default", quant: "nvfp4", nodes: "single" },
+      // All 12 overlay combinations served on GB10. DSPARK here also
+      // exercises the 4-bit `lm_head` this checkpoint quantizes, with no shape
+      // error.
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--kv-cache-dtype fp8_e4m3",
-        "--mem-fraction-static 0.95",
+        "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
-        "--chunked-prefill-size 8192",
-        "--disable-prefill-cuda-graph",
+        "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -503,15 +513,16 @@ export const config = {
     },
     {
       match: { hw: "dgx-spark", variant: "default", quant: "fp8", nodes: "single" },
+      // All 12 overlay combinations served on GB10.
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--kv-cache-dtype fp8_e4m3",
-        "--mem-fraction-static 0.95",
+        "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
-        "--chunked-prefill-size 8192",
-        "--disable-prefill-cuda-graph",
+        "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
@@ -520,15 +531,17 @@ export const config = {
     },
     {
       match: { hw: "dgx-spark", variant: "default", quant: "bf16", nodes: "single" },
+      // All 12 overlay combinations served on GB10. Heaviest checkpoint, so
+      // it holds the sweep's tightest cell: DSPARK + float32 + extra_buffer.
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--kv-cache-dtype fp8_e4m3",
-        "--mem-fraction-static 0.95",
+        "--mem-fraction-static 0.85",
         "--attention-backend flashinfer",
-        "--chunked-prefill-size 8192",
-        "--disable-prefill-cuda-graph",
+        "--chunked-prefill-size 2048",
         "--reasoning-parser qwen3",
         "--tool-call-parser qwen3_coder",
         "--host {{HOST_IP}}",
