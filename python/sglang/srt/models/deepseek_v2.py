@@ -192,6 +192,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
     is_wint4afp8_or_wint4a16_config,
+    quant_blocks_shared_experts_fusion,
 )
 from sglang.srt.runtime_context import (
     attention_backends,
@@ -305,9 +306,7 @@ class DeepseekV2MLP(nn.Module):
                 "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
-        self.use_fused_clamp_act_mul = (
-            _is_hip and envs.SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL.get()
-        )
+        self.use_fused_clamp_act_mul = _is_hip
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
 
@@ -758,8 +757,7 @@ class DeepseekV2MoE(nn.Module):
 
             fc1_n = self.shared_experts.gate_up_proj.output_size_per_partition
             if (
-                envs.SGLANG_ENABLE_NVFP4_GEMM_SWIGLU_FUSION.get()
-                and is_sm100_supported()
+                is_sm100_supported()
                 and isinstance(
                     self.shared_experts.gate_up_proj.quant_method,
                     ModelOptFp4LinearMethod,
@@ -3018,6 +3016,14 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         ``install_shared_experts_fusion_decision``), so it takes the config and
         quantization it is asked about rather than reading an instance.
         """
+        # Need to disable if quant precision mismatch, even if
+        # --enforce-shared-experts-fusion is specified
+        if quant_blocks_shared_experts_fusion(quant_config):
+            return (
+                "Quantization keeps shared experts at a higher precision than the "
+                "routed experts, so they cannot be fused into the quantized "
+                "routed-expert path."
+            )
         if get_exec().moe.enforce_shared_experts_fusion:
             return None
         if is_sbo_enabled() or is_tbo_enabled():

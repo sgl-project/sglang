@@ -319,7 +319,6 @@ sgl-eval run aime25 \\
 
     // ----- Card 5: "PD Disaggregation" -----
     pdDisagg: {
-      showWhen: (base) => base.specAlgorithm !== "DSPARK",
       incompatibleSpeculativeAlgorithms: ["DSPARK"],
       modes: [
         { id: "off",     label: "Off" },
