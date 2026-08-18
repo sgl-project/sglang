@@ -124,6 +124,14 @@ def auto_residency_skip_reason(server_args: ServerArgs) -> str | None:
         return "diffusers backend"
     if server_args.enable_breakable_cuda_graph:
         return "breakable CUDA graph captures during warmup"
+    if server_args.enable_torch_compile:
+        # Compile warmup runs a deliberately stripped memory layout: the DiT
+        # is temporarily layerwise-offloaded (offload_during_compile) and
+        # _move_resident_components_for_warmup evicts resident aux components
+        # for the denoise. Peaks measured there are far below a real
+        # request's, and the post-promotion re-warm (also a warmup layout)
+        # cannot catch the difference.
+        return "torch.compile warmup uses a stripped memory layout"
     if envs.SGLANG_CACHE_DIT_ENABLED:
         return "cache-dit enabled"
     if server_args.batching_max_size > 1:
@@ -184,7 +192,20 @@ async def maybe_apply_auto_residency(
         "Server warmup complete; adjusting component residency for the "
         "default workload (--performance-mode auto)."
     )
-    response = await forward(AutoResidencyReq(action="apply"))
+    # Same fail-open contract as the warmup itself: implicit warmups must
+    # never abort startup, explicit --warmup-resolutions ones must succeed.
+    fail_open = server_args.warmup_resolutions is None
+    try:
+        response = await forward(AutoResidencyReq(action="apply"))
+    except Exception as e:
+        if not fail_open:
+            raise
+        logger.warning(
+            "Auto residency apply request failed; continuing on the original "
+            "strategy: %s",
+            e,
+        )
+        return
     status = _auto_residency_status(response)
     if status == PROMOTION_STATUS_ROLLBACK_FAILED:
         raise RuntimeError(f"auto residency rollback failed: {response.error}")
@@ -202,7 +223,9 @@ async def maybe_apply_auto_residency(
     # moves promoted components, rebuilds compile caches invalidated by the
     # placement change, and proves the promoted layout fits before ready.
     try:
-        await run_async_client_warmup(server_args, forward, fail_open=False)
+        await run_async_client_warmup(
+            server_args, forward, fail_open=False, rewarm=True
+        )
     except Exception as e:
         logger.warning(
             "Post-promotion re-warmup failed (%s); rolling back auto residency", e
@@ -215,8 +238,11 @@ async def maybe_apply_auto_residency(
             raise RuntimeError(
                 f"auto residency rollback failed: {rollback.error}"
             ) from e
-        # restore warm caches for the original strategy before turning ready
-        await run_async_client_warmup(server_args, forward, fail_open=True)
+        # restore warm caches for the original strategy before turning ready,
+        # keeping the caller's fail-open contract
+        await run_async_client_warmup(
+            server_args, forward, fail_open=fail_open, rewarm=True
+        )
 
 
 def format_warmup_req(req_or_group: Any) -> str:
@@ -249,6 +275,7 @@ def build_client_warmup_reqs(
     server_args: ServerArgs,
     *,
     warmup_input_path: str | None = None,
+    rewarm: bool = False,
 ) -> list[Req]:
     warmup_reqs = build_warmup_reqs(
         server_args,
@@ -261,6 +288,10 @@ def build_client_warmup_reqs(
     for req in warmup_reqs:
         if req.is_warmup:
             req.extra["warmup_total"] = warmup_total
+        if rewarm:
+            # a repeat pass after an auto-residency change: keep it out of
+            # the scheduler's warmup progress accounting (already at N/N)
+            req.extra["server_warmup_rewarm"] = True
     return warmup_reqs
 
 
@@ -269,6 +300,7 @@ async def run_async_client_warmup(
     forward: Callable[[Req], Awaitable[OutputBatch]],
     *,
     fail_open: bool = False,
+    rewarm: bool = False,
 ) -> None:
     try:
         warmup_input_path = None
@@ -276,7 +308,7 @@ async def run_async_client_warmup(
             warmup_input_path = prepare_warmup_image_path(server_args)
 
         for req in build_client_warmup_reqs(
-            server_args, warmup_input_path=warmup_input_path
+            server_args, warmup_input_path=warmup_input_path, rewarm=rewarm
         ):
             response = await forward(req)
             if response.error is not None:
@@ -391,6 +423,18 @@ class SchedulerWarmupMixin:
         is_warmup: bool,
     ) -> None:
         if not is_warmup:
+            return
+
+        req = get_first_generation_req(req_or_group)
+        if req is not None and req.extra.get("server_warmup_rewarm"):
+            # auto-residency re-warm passes repeat already-counted requests;
+            # advancing the bar again would log N+1/N in CI
+            if output_batch.error is not None:
+                logger.warning(
+                    "%s processing failed: %s",
+                    self._format_warmup_req(req_or_group),
+                    output_batch.error,
+                )
             return
 
         server_based_warmup = is_server_based_warmup(req_or_group)

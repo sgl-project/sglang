@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
+    is_layerwise_offloaded_module,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     is_dit_component_name,
@@ -62,6 +63,21 @@ PROMOTION_STATUS_SKIPPED = "skipped"
 PROMOTION_STATUS_PROMOTED = "promoted"
 PROMOTION_STATUS_ROLLED_BACK = "rolled_back"
 PROMOTION_STATUS_ROLLBACK_FAILED = "rollback_failed"
+
+
+class AutoResidencyRollbackError(RuntimeError):
+    """A promotion failed AND undoing the already-applied part also failed.
+
+    The rank is in a mixed residency state that only a restart fixes; callers
+    must abort startup instead of continuing on a half-rolled-back replica.
+    """
+
+
+def describe_error(error: BaseException) -> str:
+    """Never-empty error text (str(AssertionError()) is "" and would be
+    dropped by any truthiness filter)."""
+    text = str(error)
+    return f"{type(error).__name__}: {text}" if text else type(error).__name__
 
 
 class WarmupMemoryRecord(msgspec.Struct, frozen=True):
@@ -135,17 +151,25 @@ class AppliedPromotion(msgspec.Struct, frozen=True):
 def resolve_default_workload(server_args: ServerArgs) -> DefaultWorkload:
     """Resolve the default request shape promotion is optimized for."""
     from sglang.multimodal_gen.runtime.warmup_request_builder import (
+        _apply_warmup_frame_contract,
         get_model_sampling_defaults,
     )
 
     defaults = get_model_sampling_defaults(server_args)
+    # __post_init__ already applied the model's _default_width/_default_height
     width = defaults.width
     height = defaults.height
     if (width is None or height is None) and defaults.supported_resolutions:
-        width, height = defaults.supported_resolutions[0]
+        # worst-case the target with the largest supported shape
+        width, height = max(
+            defaults.supported_resolutions, key=lambda size: size[0] * size[1]
+        )
     num_frames = defaults.num_frames or 1
     if num_frames > 1:
-        num_frames = server_args.pipeline_config.adjust_num_frames(num_frames)
+        # same contract the warmup requests and real requests get
+        num_frames = _apply_warmup_frame_contract(
+            server_args, defaults, num_frames=num_frames
+        )
     return DefaultWorkload(
         width=width,
         height=height,
@@ -173,12 +197,15 @@ def estimate_default_workload_peak_bytes(
     3. One usable size: scale everything above the pre-forward allocated
        baseline (conservative; may block promotion but never over-promotes).
 
-    Returns None when there is no usable measurement (no records, or any
-    warmup forward failed -- a failed warmup means the measured peak does not
-    cover the full request path).
+    Returns None when the estimate cannot be trusted: no records, any warmup
+    forward failed (its peak does not cover the full request path), or the
+    target workload is unknown (an unknown target would silently equate the
+    area/frame-capped warmup peak with the real serving peak).
     """
     records = list(records)
     if not records or any(not record.succeeded for record in records):
+        return None
+    if target_units is None:
         return None
 
     peak_by_units: dict[int, int] = {}
@@ -187,9 +214,6 @@ def estimate_default_workload_peak_bytes(
         peak_by_units[units] = max(
             peak_by_units.get(units, 0), record.peak_reserved_bytes
         )
-
-    if target_units is None:
-        return max(peak_by_units.values())
 
     covering_peaks = [
         peak for units, peak in peak_by_units.items() if units >= target_units
@@ -240,15 +264,11 @@ def _module_weight_bytes(module: nn.Module) -> int:
 
 
 def _layerwise_offloaded_bytes(module: LayerwiseOffloadableModuleMixin) -> int:
-    total = 0
-    for manager in module.layerwise_offload_managers:
-        if not manager.enabled:
-            continue
-        total += sum(
-            tensor.numel() * tensor.element_size()
-            for _, tensor in manager.iter_cpu_weights()
-        )
-    return total
+    return sum(
+        manager.offloaded_weight_bytes()
+        for manager in module.layerwise_offload_managers
+        if manager.enabled
+    )
 
 
 def component_resident_size_bytes(module: nn.Module, residency_mode: str) -> int:
@@ -288,6 +308,13 @@ def collect_promotion_candidates(
         if explicit_residency_mode_of(name) is not None:
             continue
         if is_fsdp_managed_module(module):
+            continue
+        if mode == COMPONENT_OFFLOAD and is_layerwise_offloaded_module(module):
+            # The module is layerwise-managed despite its configured mode
+            # (e.g. the offload_during_compile window); flipping the flag
+            # would be a silent no-op while the manager keeps streaming.
+            continue
+        if mode == LAYERWISE_OFFLOAD and not is_layerwise_offloaded_module(module):
             continue
         promoted_bytes = component_resident_size_bytes(module, mode)
         if promoted_bytes <= 0:
@@ -391,6 +418,11 @@ def plan_auto_residency(*, reports: list[RankResidencyReport]) -> AutoResidencyP
     promoted_bytes = 0
     for candidate in ordered:
         next_bytes = promoted_bytes + candidate.promoted_weight_bytes
+        # Known conservatism: estimated_peak already contains whatever part
+        # of this component was on GPU at the measured peak (streamed
+        # layers, keep-ready components), so those bytes are counted twice.
+        # The error is in the safe direction; refining it needs per-phase
+        # peaks.
         if estimated_peak + next_bytes + reserve <= budget:
             promotions.append(candidate)
             promoted_bytes = next_bytes
@@ -418,7 +450,9 @@ def apply_promotions(
 
     Raises on failure after undoing the promotions already applied, so a
     caller observing an exception knows this rank is back on the original
-    strategy.
+    strategy -- unless the undo itself fails, which raises
+    ``AutoResidencyRollbackError`` (the rank is in a mixed state and startup
+    must abort).
     """
     applied: list[AppliedPromotion] = []
     try:
@@ -427,6 +461,20 @@ def apply_promotions(
             if not isinstance(module, nn.Module):
                 raise RuntimeError(
                     f"promotion target {candidate.component_name!r} is missing"
+                )
+            if candidate.residency_mode == LAYERWISE_OFFLOAD and not isinstance(
+                module, LayerwiseOffloadableModuleMixin
+            ):
+                raise RuntimeError(
+                    f"promotion target {candidate.component_name!r} lost its "
+                    "layerwise offload capability between planning and apply"
+                )
+            if candidate.residency_mode == COMPONENT_OFFLOAD and (
+                is_layerwise_offloaded_module(module)
+            ):
+                raise RuntimeError(
+                    f"promotion target {candidate.component_name!r} became "
+                    "layerwise-managed between planning and apply"
                 )
             # Record before acting so a mid-promotion failure rolls back the
             # partially promoted component as well.
@@ -440,10 +488,17 @@ def apply_promotions(
                 candidate.component_name, feature_name=AUTO_RESIDENCY_FEATURE_NAME
             )
             if candidate.residency_mode == LAYERWISE_OFFLOAD:
-                assert isinstance(module, LayerwiseOffloadableModuleMixin)
                 module.disable_offload()
-    except Exception:
-        rollback_promotions(applied=applied, modules=modules, server_args=server_args)
+    except Exception as apply_error:
+        try:
+            rollback_promotions(
+                applied=applied, modules=modules, server_args=server_args
+            )
+        except Exception as rollback_error:
+            raise AutoResidencyRollbackError(
+                f"promotion failed ({describe_error(apply_error)}) and rollback "
+                f"failed ({describe_error(rollback_error)})"
+            ) from apply_error
         raise
     return applied
 
@@ -454,19 +509,39 @@ def rollback_promotions(
     modules: Mapping[str, object],
     server_args: ServerArgs,
 ) -> None:
-    """Restore the original residency for previously applied promotions."""
+    """Restore the original residency for previously applied promotions.
+
+    Every promotion is undone even when one of them fails; the collected
+    failures are re-raised at the end so one broken component cannot leave
+    the later (earlier-applied) ones promoted.
+    """
+    errors: list[str] = []
     for promotion in reversed(list(applied)):
-        server_args.release_required_component_residency(promotion.component_name)
-        module = modules.get(promotion.component_name)
-        if not isinstance(module, nn.Module):
-            continue
-        if promotion.residency_mode == LAYERWISE_OFFLOAD:
-            assert isinstance(module, LayerwiseOffloadableModuleMixin)
-            module.enable_offload()
-        else:
-            module.to("cpu")
+        try:
+            server_args.release_required_component_residency(
+                promotion.component_name,
+                feature_name=AUTO_RESIDENCY_FEATURE_NAME,
+            )
+            module = modules.get(promotion.component_name)
+            if not isinstance(module, nn.Module):
+                continue
+            if promotion.residency_mode == LAYERWISE_OFFLOAD:
+                if not isinstance(module, LayerwiseOffloadableModuleMixin):
+                    raise RuntimeError("lost layerwise offload capability")
+                module.enable_offload()
+            elif is_layerwise_offloaded_module(module):
+                # A layerwise manager owns this module's placement (e.g. the
+                # offload_during_compile window); moving it to CPU behind the
+                # manager would strand its bookkeeping.
+                pass
+            else:
+                module.to("cpu")
+        except Exception as e:
+            errors.append(f"{promotion.component_name}: {describe_error(e)}")
     if torch.get_device_module().is_available():
         torch.get_device_module().empty_cache()
+    if errors:
+        raise RuntimeError("; ".join(errors))
 
 
 def format_plan_summary(
@@ -526,16 +601,13 @@ def format_applied_changes(*, plan: AutoResidencyPlan) -> str:
     )
 
 
-def plan_summary_payload(
-    *, plan: AutoResidencyPlan, workload: DefaultWorkload, status: str
-) -> dict:
-    """Structured decision summary returned to the warmup orchestrator."""
+def plan_summary_payload(*, plan: AutoResidencyPlan, status: str) -> dict:
+    """Minimal decision payload for the warmup orchestrator.
+
+    The orchestrator only branches on ``status``; the human-readable detail
+    lives in the logged ``format_plan_summary`` line.
+    """
     return {
         "status": status,
-        "skip_reason": plan.skip_reason,
-        "target_workload": workload.describe(),
-        "estimated_peak_bytes": plan.estimated_peak_bytes,
-        "reserve_bytes": plan.reserve_bytes,
-        "budget_bytes": plan.budget_bytes,
         "promoted": [candidate.component_name for candidate in plan.promotions],
     }
