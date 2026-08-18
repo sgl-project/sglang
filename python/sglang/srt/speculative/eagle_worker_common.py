@@ -219,7 +219,7 @@ def prepare_for_draft(
     num_steps: int,
 ):
 
-    if not batch.forward_mode.is_idle():
+    if not batch.forward_mode.is_idle() and len(batch.seq_lens) > 0:
         bs = len(batch.seq_lens)
 
         # Assign cache locations (draft-write targets).
