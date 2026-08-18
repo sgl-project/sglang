@@ -3978,6 +3978,18 @@ class ServerArgs:
                 "final group. Got "
                 f"tp_size={self.tp_size}, dcp_size={self.dcp_size}."
             )
+        if (
+            self.dcp_size > 1
+            and self.disaggregation_mode != "prefill"
+            and (self.decode_attention_backend or self.attention_backend) == "fa3"
+            and self.use_mla_backend()
+        ):
+            raise ValueError(
+                "--attention-backend fa3 has no DCP decode path for MLA "
+                "models (it returns no LSE for the cross-dcp-rank reduction) "
+                "and crashes at decode cuda-graph capture. With --dcp-size > 1 "
+                "use a DCP-aware backend such as flashinfer or triton."
+            )
         if self.dcp_comm_backend in ("a2a", "fi_a2a") and self.dcp_size <= 1:
             raise ValueError(
                 f"--dcp-comm-backend {self.dcp_comm_backend} only affects the "
@@ -5917,6 +5929,9 @@ class ServerArgs:
         else:
             # MLA architecture
             if is_hopper_with_cuda_12_3():
+                # fa3 has no DCP decode path; flashinfer's MLA backend does.
+                if self.dcp_size > 1:
+                    return "flashinfer"
                 return "fa3"
             elif is_sm100_supported():
                 return "flashinfer"
