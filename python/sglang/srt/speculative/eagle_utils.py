@@ -15,7 +15,10 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_reserve_per_decode,
+    page_aligned_decode_alloc_lens,
+)
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
     is_cpu,
@@ -907,26 +910,12 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
 
-    cur_kv_lens = [0] * bs
-    nxt_kv_lens = [0] * bs
-    num_needed_tokens = 0
-    for i, r in enumerate(batch.reqs):
-        cur = r.kv.kv_allocated_len
-        # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
-        # kv_committed_len is honest (bonus committed in resolve, not here),
-        # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
-        # Whole-page accounting: the paged allocator hands out full pages, so
-        # round nxt up to the page boundary or the unaligned tail is allocated
-        # but never recorded — a stranded-tail leak at page_size > 1.
-        nxt = max(
-            cur,
-            (r.kv_committed_len + double_alloc + page_size - 1)
-            // page_size
-            * page_size,
-        )
-        cur_kv_lens[i] = cur
-        nxt_kv_lens[i] = nxt
-        num_needed_tokens += nxt - cur
+    cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
+        batch.reqs,
+        reserve=double_alloc,
+        page_size=page_size,
+    )
+    for r in batch.reqs:
         r.decode_batch_idx += 1
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
