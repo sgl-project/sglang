@@ -23,7 +23,7 @@
 #include <cstdint>
 #include <iterator>
 
-namespace {
+namespace sglang {
 
 namespace impl = device::topk;
 using impl::TopKProblem;
@@ -215,19 +215,32 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
 
   // for small batch, we will fuse in the cluster case
   if (problem.seq_len <= kReg4MaxSeqLen) {
-    if (blockIdx.y == worker_rank) Register4::forward<kPDL>(problem, &smem);
+    if (blockIdx.y != worker_rank) return;
+    Register4::forward<kPDL>(problem, &smem);
+    device::PDLWaitPrimary<kPDL>();
+    __syncthreads();
   } else if (problem.seq_len <= params.cluster_floor) {
-    if (blockIdx.y == worker_rank) Streaming::forward<kPDL>(problem, &smem);
+    if (blockIdx.y != worker_rank) return;
+    Streaming::forward<kPDL>(problem, &smem);
+    device::PDLWaitPrimary<kPDL>();
+    __syncthreads();
   } else {
     auto cluster = cooperative_groups::this_cluster();
     problem.out = cluster.map_shared_rank(topk_indices, worker_rank);
     Cluster::forward<kPDL>(problem, &smem);  // write to peer's output shared memory
+    device::PDLWaitPrimary<kPDL>();
     cluster.sync();
+    if (blockIdx.y != worker_rank) return;
   }
 
-  device::PDLWaitPrimary<kPDL>();
-  __syncthreads();
-  if (blockIdx.y == worker_rank) problem_transform(problem, params.get_output_ptr(blockIdx.x));
+  // Only the elected worker reaches here, and it mapped `topk_indices` to
+  // itself, so `problem.out` is this block's own buffer. Stating that keeps the
+  // shared::cluster address out of the load problem_transform issues -- which is
+  // load-bearing, not an optimization: without it cicc segfaults on CUDA 13.1+
+  // for sm_90a (issue #32830, previously worked around by copying `problem` in
+  // #32910). Verified: dropping this line reproduces the crash on 13.1/13.2/13.3.
+  __builtin_assume(problem.out == topk_indices);
+  problem_transform(problem, params.get_output_ptr(blockIdx.x));
 }
 
 // --- Plan: choose cluster_threshold from the seq_len distribution -----------
@@ -455,4 +468,4 @@ struct TopKKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

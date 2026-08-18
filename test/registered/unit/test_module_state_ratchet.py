@@ -1,17 +1,10 @@
 """Ratchet guard: module-level runtime state in the flag-owning layers may
 only shrink.
 
-Runtime flags live on ``get_flags()`` groups (``moe`` / ``dp`` / ``capture``),
-where they get lifecycle reset, typo-safe writes, and the transactional
-test-override primitive. A new module-level global written through a
-``global`` statement in these modules recreates the pattern this replaced:
-state with ad-hoc lifecycle that leaks across unit-test teardowns and cannot
-be overridden scoped.
-
-The pin lists the survivors by name: the DP-attention topology values (owned
-by the parallel vertical) and the TBO comm stream (a resource, owned by the
-resources vertical). Migrating one of them must shrink its pin; adding a name
-fails the ratchet.
+Runtime flags belong on ``get_flags()`` groups, which have lifecycle reset and
+a scoped test-override primitive; a module-level ``global`` has neither and
+leaks across test teardowns. ``_PINNED_GLOBALS`` names the survivors --
+migrating one must shrink it, adding one fails the ratchet.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci

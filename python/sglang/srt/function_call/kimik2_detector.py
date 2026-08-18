@@ -430,12 +430,16 @@ class KimiK2Detector(BaseFormatDetector):
         tools: Union[List[Tool], None] = None,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
         thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
     ) -> Optional[StructuralTag]:
         if not (
             tools and (tool_choice == "required" or isinstance(tool_choice, ToolChoice))
         ):
             return super().get_structural_tag(
-                tools=tools, tool_choice=tool_choice, thinking_mode=thinking_mode
+                tools=tools,
+                tool_choice=tool_choice,
+                thinking_mode=thinking_mode,
+                parallel_tool_calls=parallel_tool_calls,
             )
         if get_model_structural_tag is None:
             return None

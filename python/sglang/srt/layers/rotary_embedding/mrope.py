@@ -18,7 +18,7 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale_simple,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import attention_backends, get_exec
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
@@ -42,7 +42,6 @@ if _is_xpu:
     from sgl_kernel import multimodal_rotary_embedding
 
 from sglang.kernels.ops.attention.mrope import apply_interleaved_rope_triton
-from sglang.srt.runtime_context import get_server_args
 
 
 def apply_interleaved_rope(x: torch.Tensor, mrope_section: list) -> torch.Tensor:
@@ -132,7 +131,7 @@ class MRotaryEmbedding(RotaryEmbedding):
             self.register_buffer("axis_map", axis_map, persistent=False)
         else:
             self.axis_map = None
-        if get_server_args().rl_on_policy_target is not None:
+        if get_exec().deterministic.rl_on_policy_target is not None:
             self._forward_method = self.forward_native
 
     def get_cos_sin_with_position(self, positions):
@@ -144,7 +143,9 @@ class MRotaryEmbedding(RotaryEmbedding):
         last_dim = cos_sin.size()[-1]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if self.mrope_interleaved:
-            if support_triton(get_server_args().attention_backend):
+            # Runs in prefill and decode: both halves must support triton.
+            prefill_backend, decode_backend = attention_backends()
+            if support_triton(prefill_backend) and support_triton(decode_backend):
                 cos = apply_interleaved_rope_triton(cos, self.mrope_section)
                 sin = apply_interleaved_rope_triton(sin, self.mrope_section)
             else:
@@ -223,7 +224,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cpu_amx_available:
-            return torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
+            torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
                 positions,
                 query,
                 key,
@@ -233,6 +234,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                 self.mrope_interleaved,
                 self.is_neox_style,
             )
+            return query, key
         return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
     def forward_cuda(
@@ -243,6 +245,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert positions.ndim == 1 or positions.ndim == 2
+        self._match_cos_sin_cache_dtype(query)
         if positions.ndim == 2 and self.mrope_section:
             return self.forward_triton(positions, query, key)
         return self.forward_native(positions, query, key, fused_set_kv_buffer_arg)

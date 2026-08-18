@@ -22,6 +22,7 @@ from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
     process_cached_tokens_details_from_ret,
+    process_hidden_states_for_response,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
     should_include_usage,
@@ -127,7 +128,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return_prompt_token_ids=request.return_token_ids,
             rid=request.rid,
             session_id=request.session_id,
-            extra_key=self._compute_extra_key(request),
+            extra_key=request.extra_key,
+            cache_salt=request.cache_salt,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
@@ -392,10 +394,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
             if request.return_hidden_states and hidden_states:
                 for index, choice_hidden_states in hidden_states.items():
                     if choice_hidden_states:
-                        last_token_hidden_states = (
-                            choice_hidden_states[-1]
-                            if len(choice_hidden_states) > 1
-                            else []
+                        response_hidden_states = process_hidden_states_for_response(
+                            choice_hidden_states, request.return_hidden_states
                         )
                         hidden_states_chunk = CompletionStreamResponse(
                             id=content["meta_info"]["id"],
@@ -405,7 +405,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                                 CompletionResponseStreamChoice(
                                     index=index,
                                     text="",
-                                    hidden_states=last_token_hidden_states,
+                                    hidden_states=response_hidden_states,
                                     finish_reason=None,
                                 )
                             ],

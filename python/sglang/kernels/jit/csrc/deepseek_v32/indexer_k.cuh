@@ -24,7 +24,7 @@
 #include <bit>
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 using deepseek_v4::fp8::pack_fp8;
 
@@ -426,4 +426,4 @@ struct FusedKIndexerNormRopeStoreKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

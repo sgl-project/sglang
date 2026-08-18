@@ -2,7 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -78,13 +78,15 @@ class EncoderConfig(ModelConfig):
 
     # Parallel folding: during the encoding stage the whole DiT replica is idle,
     # so TP-shard the encoder across those otherwise-unused GPUs instead of
-    # running it on a single rank
-    parallel_folding_mode: str | None = None
+    # running it on a single rank. None = replicated, else the group to fold
+    # over ("sp"|"world"); resolved by finalize_encoder_folding.
+    parallel_folding_mode: Literal["sp", "world"] | None = None
 
 
 @dataclass
 class TextEncoderConfig(EncoderConfig):
     arch_config: ArchConfig = field(default_factory=TextEncoderArchConfig)
+    generation_config: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

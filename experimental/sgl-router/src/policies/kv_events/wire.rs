@@ -5,7 +5,7 @@
 //! `msgspec.msgpack`. Two struct families are involved:
 //!
 //! * `EventBatch` (the outer payload) — declared with
-//!   `array_like=True, omit_defaults=True, gc=False` (no tag).
+//!   `array_like=True, gc=False` (no tag).
 //! * `KVCacheEvent` (each inner event variant) — additionally declared
 //!   with `tag=True`.
 //!
@@ -17,9 +17,6 @@
 //!   of each inner event array, so an event is
 //!   `[class_name_str, field1, field2, ...]`. The outer `EventBatch`
 //!   array does **not** carry a tag prefix.
-//! * `omit_defaults=True` allows trailing fields whose values equal their
-//!   declared defaults to be dropped from the array. The decoder therefore
-//!   accepts variable-length sequences for each struct shape.
 //!
 //! This module deserializes those bytes into Rust types and exposes a single
 //! [`decode_event_batch`] entry point.
@@ -32,7 +29,7 @@ use serde::Deserialize;
 /// Top-level batch payload published by SGLang.
 ///
 /// Wire shape (`EventBatch`, `array_like`):
-/// `[ts: f64, events: [...], attn_dp_rank: int_or_nil_or_omitted]`.
+/// `[ts: f64, events: [...], attn_dp_rank: int_or_nil]`.
 /// SGLang declares `attn_dp_rank` as a Python `Optional[int]`; we decode
 /// it as `u32` since DP ranks are non-negative and bounded by the
 /// publisher's `dp_size`.
@@ -43,7 +40,8 @@ pub struct KvEventBatch {
     /// Ordered list of cache events in this batch.
     pub events: Vec<KvCacheEvent>,
     /// Optional DP-attention rank that produced this batch. `None` if the
-    /// publisher emitted nil or omitted the field via `omit_defaults`.
+    /// publisher emitted nil. The decoder also accepts an omitted field for
+    /// compatibility.
     pub attn_dp_rank: Option<u32>,
 }
 
@@ -332,8 +330,8 @@ impl<'de> Deserialize<'de> for BoundedU32Vec {
 
 // ---------------------------------------------------------------------------
 // Custom Deserialize impls — msgspec encodes these structs as msgpack arrays
-// (not maps), and `omit_defaults=True` means trailing optional fields may be
-// absent. We therefore implement `Deserialize` by hand against `SeqAccess`.
+// (not maps). The visitors also accept absent trailing optional fields for
+// compatibility.
 // ---------------------------------------------------------------------------
 
 impl<'de> Deserialize<'de> for KvEventBatch {
@@ -731,8 +729,7 @@ mod tests {
 
     #[test]
     fn attn_dp_rank_omitted_decodes_as_none() {
-        // msgspec's `omit_defaults=True` may drop attn_dp_rank entirely from
-        // the wire array when it equals its default of None.
+        // Accept a payload that omits the optional trailing rank field.
         let event = build_all_blocks_cleared_bytes();
         let bytes = build_batch_bytes(5.0, &[event], None, /* include_dp_field */ false);
 

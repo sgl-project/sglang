@@ -65,6 +65,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -86,7 +87,7 @@ class HiRadixCache(RadixCache):
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
                 self.kv_cache,
-                server_args.hicache_ratio,
+                get_memory().hicache_ratio,
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
@@ -99,13 +100,18 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_minimax_sparse_pool_to_hiradix_cache.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
+            from sglang.srt.runtime_context import get_parallel
+
+            _parallel = get_parallel()
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
+                get_memory().hicache_ratio,
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=allocator_type,
+                dcp_size=_parallel.attn_dcp_size,
+                dcp_rank=_parallel.attn_dcp_rank,
             )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, DSA, and MSA models")
@@ -202,7 +208,6 @@ class HiRadixCache(RadixCache):
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
         self.load_back_threshold = 10
-
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
 
@@ -575,7 +580,6 @@ class HiRadixCache(RadixCache):
         cleanup even if queue sizes temporarily differ across ranks.
         """
         self._drain_storage_control_queues_impl(
-            n_revoke=None,
             n_storage_hit=0,
             n_backup=None,
             n_release=None,
@@ -584,7 +588,6 @@ class HiRadixCache(RadixCache):
 
     def _drain_storage_control_queues_impl(
         self,
-        n_revoke: Optional[int],
         n_storage_hit: Optional[int],
         n_backup: Optional[int],
         n_release: Optional[int],
@@ -601,10 +604,6 @@ class HiRadixCache(RadixCache):
                     break
                 drained += 1
                 yield item
-
-        def _drain_revoke():
-            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                self._revoke_pending_prefetch(req_id)
 
         def _drain_and_alloc_storage_hit():
             # The L3 hit count is now known, so reserve exactly that much host
@@ -623,6 +622,13 @@ class HiRadixCache(RadixCache):
                 if operation.is_terminated():
                     # request was aborted while the storage query was in flight
                     self._revoke_pending_prefetch(req_id)
+                    continue
+                if operation.storage_hit_count < self.prefetch_threshold:
+                    # not to prefetch if not enough benefits
+                    self._revoke_pending_prefetch(req_id)
+                    logger.debug(
+                        f"Revoking prefetch for request {req_id} due to insufficient hits ({operation.storage_hit_count})."
+                    )
                     continue
 
                 alloc_len = operation.storage_hit_count
@@ -672,7 +678,6 @@ class HiRadixCache(RadixCache):
                 host_indices = torch.cat(host_indices_list, dim=0)
                 cc.mem_pool_host.free(host_indices)
 
-        _drain_revoke()
         _drain_and_alloc_storage_hit()
         _drain_backup()
         _drain_release()
@@ -959,7 +964,12 @@ class HiRadixCache(RadixCache):
             token_ids = []
             for n in chain:
                 token_ids.extend(n.key.token_ids)
-        key = RadixKey(token_ids, top.key.extra_key, top.key.is_bigram)
+        key = RadixKey(
+            token_ids,
+            top.key.extra_key,
+            top.key.is_bigram,
+            cache_salt=top.key.cache_salt,
+        )
 
         if all(n.hash_value is not None for n in chain):
             hash_value = []
@@ -981,7 +991,41 @@ class HiRadixCache(RadixCache):
                 # write to host if the node is not backuped
                 self.write_backup(node)
 
-    def writing_check(self, write_back=False):
+    def _count_ready_acks(self, ack_queue) -> int:
+        ready_count = 0
+        for ack in ack_queue:
+            if not ack.finish_event.query():
+                break
+            ready_count += 1
+        return ready_count
+
+    def _sync_hicache_ready_counts(self) -> tuple[int, int, tuple[int, ...]]:
+        cache_controller = self.cache_controller
+        storage_queue_sizes = (
+            (
+                cache_controller.prefetch_hit_queue.qsize(),
+                cache_controller.ack_backup_queue.qsize(),
+                cache_controller.host_mem_release_queue.qsize(),
+            )
+            if self.enable_storage
+            else ()
+        )
+
+        ready_counts = torch.tensor(
+            [
+                self._count_ready_acks(cache_controller.ack_write_queue),
+                self._count_ready_acks(cache_controller.ack_load_queue),
+                *storage_queue_sizes,
+            ],
+            dtype=torch.int,
+            device="cpu",
+        )
+        self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
+
+        count_values = list(map(int, ready_counts.tolist()))
+        return count_values[0], count_values[1], tuple(count_values[2:])
+
+    def writing_check(self, write_back=False, finish_count: Optional[int] = None):
         if write_back:
             # blocking till all write back complete
             while len(self.ongoing_write_through) > 0:
@@ -989,23 +1033,26 @@ class HiRadixCache(RadixCache):
                     ack.finish_event.synchronize()
                     for ack_id in ack.node_ids:
                         self._finish_write_through_ack(ack_id, release_lock=False)
+                    self._log_write_ack_metrics(ack)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
 
-        # Every rank must enter the all_reduce below; ongoing_write_through can
-        # diverge across ranks (e.g. write_backup returning 0 on a subset under
-        # host memory pressure), so a conditional skip desyncs the NCCL op
-        # sequence and deadlocks under TP > 1. (Matches UnifiedRadixCache.)
-        finish_count = 0
-        if self.pp_rank == 0:
-            for ack in self.cache_controller.ack_write_queue:
-                if not ack.finish_event.query():
-                    break
-                finish_count += 1
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+        if finish_count is None:
+            # Every rank must enter the all_reduce below; ongoing_write_through can
+            # diverge across ranks (e.g. write_backup returning 0 on a subset under
+            # host memory pressure), so a conditional skip desyncs the NCCL op
+            # sequence and deadlocks under TP > 1. (Matches UnifiedRadixCache.)
+            finish_count = 0
+            if self.pp_rank == 0:
+                finish_count = self._count_ready_acks(
+                    self.cache_controller.ack_write_queue
+                )
+            finish_count_tensor = torch.tensor(
+                finish_count, dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = finish_count_tensor.item()
 
         if finish_count > 0:
             logger.debug(f"Process {finish_count} write back operations")
@@ -1014,18 +1061,36 @@ class HiRadixCache(RadixCache):
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id, release_lock=True)
+            self._log_write_ack_metrics(ack)
             finish_count -= 1
 
-    def loading_check(self):
-        finish_count = 0
-        if self.pp_rank == 0:
-            for ack in self.cache_controller.ack_load_queue:
-                if not ack.finish_event.query():
-                    break
-                finish_count += 1
-        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-        finish_count = finish_count_tensor.item()
+    def _log_write_ack_metrics(self, ack) -> None:
+        """Record D->H backup volume and duration for a completed write ack."""
+        if self.metrics_collector is None:
+            return
+        for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
+            if num_tokens > 0:
+                self.metrics_collector.increment_backup_num_tokens(
+                    num_tokens=num_tokens, pool=pool
+                )
+        if ack.num_bytes > 0:
+            self.metrics_collector.increment_backup_num_bytes(ack.num_bytes)
+        if ack.timing_enabled:
+            duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+            self.metrics_collector.observe_backup_duration(duration_ms / 1000.0)
+
+    def loading_check(self, finish_count: Optional[int] = None):
+        if finish_count is None:
+            finish_count = 0
+            if self.pp_rank == 0:
+                finish_count = self._count_ready_acks(
+                    self.cache_controller.ack_load_queue
+                )
+            finish_count_tensor = torch.tensor(
+                finish_count, dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = finish_count_tensor.item()
 
         if finish_count > 0:
             logger.debug(f"Process {finish_count} load operations")
@@ -1037,7 +1102,13 @@ class HiRadixCache(RadixCache):
                 self.dec_lock_ref(end_node)
 
             if self.metrics_collector is not None:
-                self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+                for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
+                    if num_tokens > 0:
+                        self.metrics_collector.increment_load_back_num_tokens(
+                            num_tokens=num_tokens, pool=pool
+                        )
+                if ack.num_bytes > 0:
+                    self.metrics_collector.increment_load_back_num_bytes(ack.num_bytes)
                 if ack.timing_enabled:
                     duration_ms = ack.start_event.elapsed_time(ack.finish_event)
                     self.metrics_collector.observe_load_back_duration(
@@ -1257,6 +1328,12 @@ class HiRadixCache(RadixCache):
         root.parent.children.pop(key, None)
         self._update_leaf_status(root.parent)
         self._update_host_leaf_status(root.parent)
+        if freed_device > 0 and self.metrics_collector is not None:
+            self.metrics_collector.increment_dropped_tokens(
+                num_tokens=freed_device,
+                reason="host_pressure",
+                pool=PoolName.KV.value,
+            )
         return freed_device
 
     def evict_host(self, num_tokens: int):
@@ -1403,6 +1480,7 @@ class HiRadixCache(RadixCache):
             new_input_tokens,
             extra_key=last_host_node.key.extra_key,
             is_bigram=self.is_eagle,
+            cache_salt=last_host_node.key.cache_salt,
         ).page_aligned(self.page_size)
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
@@ -1440,16 +1518,32 @@ class HiRadixCache(RadixCache):
         """
         return self.cache_controller.start_loading()
 
-    def flush_write_through_acks(self) -> None:
-        self.writing_check()
-
     def check_hicache_events(self):
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
-        self.writing_check()
-        self.loading_check()
-        if self.enable_storage:
-            self.drain_storage_control_queues()
+
+        if self.pp_size != 1:
+            self.writing_check()
+            self.loading_check()
+            if self.enable_storage:
+                self.drain_storage_control_queues()
+        else:
+            (
+                write_finish_count,
+                load_finish_count,
+                storage_queue_sizes,
+            ) = self._sync_hicache_ready_counts()
+            self.writing_check(finish_count=write_finish_count)
+            self.loading_check(finish_count=load_finish_count)
+
+            if self.enable_storage and storage_queue_sizes:
+                n_storage_hit, n_backup, n_release = storage_queue_sizes[:3]
+                self._drain_storage_control_queues_impl(
+                    n_storage_hit=n_storage_hit,
+                    n_backup=n_backup,
+                    n_release=n_release,
+                    log_metrics=True,
+                )
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
@@ -1464,7 +1558,6 @@ class HiRadixCache(RadixCache):
 
         qsizes = torch.tensor(
             [
-                cc.prefetch_revoke_queue.qsize(),
                 cc.prefetch_hit_queue.qsize(),
                 cc.ack_backup_queue.qsize(),
                 cc.host_mem_release_queue.qsize(),
@@ -1473,9 +1566,8 @@ class HiRadixCache(RadixCache):
         )
         self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
 
-        n_revoke, n_storage_hit, n_backup, n_release = map(int, qsizes.tolist())
+        n_storage_hit, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
-            n_revoke=n_revoke,
             n_storage_hit=n_storage_hit,
             n_backup=n_backup,
             n_release=n_release,
@@ -1688,6 +1780,7 @@ class HiRadixCache(RadixCache):
             new_input_tokens,
             extra_key=last_host_node.key.extra_key,
             is_bigram=self.is_eagle,
+            cache_salt=last_host_node.key.cache_salt,
         )
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
@@ -1807,6 +1900,9 @@ class HiRadixCache(RadixCache):
 
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
+        )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
         )
         child.parent = new_node
         child.key = child.key[split_len:]

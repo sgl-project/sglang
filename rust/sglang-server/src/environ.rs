@@ -2,7 +2,6 @@
 //! unset → default, invalid → warn + default (never an error). One shared
 //! parser per type — call sites pass their variable name + default instead of
 //! each hand-rolling a reader.
-#![allow(dead_code)] // TODO: remove when the consumer PR lands
 
 /// Python `EnvBool.parse`: true = `true/1/yes/y`, false = `false/0/no/n`
 /// (case-insensitive); anything else is invalid.

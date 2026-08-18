@@ -80,9 +80,22 @@ def check_equal_or_regex_match(layer_name: str, targets: Iterable[str]) -> bool:
     """
     Checks whether a layer_name is exactly equal or a regex match for
     if target starts with 're:' to any target in list.
+
+    A plain (non-regex) target additionally matches a dotted-path *suffix* of
+    layer_name, so a target may be written as a module suffix, e.g.
+    "self_attn.kv_b_proj" matches "model.layers.0.self_attn.kv_b_proj".
+
+    It must never match a *prefix*: llm-compressor writes parent modules into
+    the `ignore` list (e.g. "model.layers.0.mlp.experts.0"), and a plain
+    substring match would let such an entry silently swallow its quantized
+    children ("model.layers.0.mlp.experts.0.gate_proj"), dropping the layer
+    back to an unquantized method.
     """
     for target in targets:
-        if _is_equal_or_regex_match(layer_name, target, check_contains=True):
+        if target.startswith("re:"):
+            if _is_equal_or_regex_match(layer_name, target):
+                return True
+        elif target == layer_name or layer_name.endswith("." + target):
             return True
     return False
 

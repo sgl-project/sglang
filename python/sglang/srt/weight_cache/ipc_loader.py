@@ -484,9 +484,7 @@ class IpcModelLoader(BaseModelLoader):
 
             ep_size = ps.moe_ep_size
 
-            from sglang.srt.runtime_context import get_server_args
-
-            dp_size = get_server_args().dp_size
+            dp_size = get_parallel().dp_size
 
             quant_method, quant_config = self._resolve_engine_quant(model_config)
 
