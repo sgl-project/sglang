@@ -1000,17 +1000,34 @@ _BACKEND_API_PATHS = {
 
 _EMBEDDING_BACKENDS = frozenset(("sglang-embedding", "vllm-embedding"))
 
+_DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT = 60.0
 
-def flush_server_cache(base_url: str, backend: str) -> None:
+
+def flush_server_cache(
+    base_url: str,
+    backend: str,
+    flush_cache_timeout: float = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
+) -> None:
     """Flush an engine's prefix cache after benchmark warmup."""
-    cache_endpoint = (
-        "/reset_prefix_cache" if backend.startswith("vllm") else "/flush_cache"
-    )
-    response = requests.post(
-        base_url + cache_endpoint,
-        headers=get_auth_headers(),
-        verify=not insecure_ssl(),
-    )
+    if backend.startswith("vllm"):
+        response = requests.post(
+            base_url + "/reset_prefix_cache", 
+            headers=get_auth_headers(),
+            verify=not insecure_ssl(),
+        )
+    elif backend.startswith("sglang"):
+        response = requests.post(
+            base_url + "/flush_cache",
+            headers=get_auth_headers(),
+            verify=not insecure_ssl(),
+            params={"timeout": flush_cache_timeout},
+        )
+    else:
+        response = requests.post(
+            base_url + "/flush_cache", 
+            headers=get_auth_headers(),
+            verify=not insecure_ssl(),
+        )
     response.raise_for_status()
 
 
@@ -1370,6 +1387,7 @@ async def benchmark(
     profile: bool,
     pd_separated: bool = False,
     flush_cache: bool = False,
+    flush_cache_timeout: float = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
     warmup_requests: int = 1,
     use_trace_timestamps: bool = False,
     mooncake_slowdown_factor=1.0,
@@ -1479,7 +1497,7 @@ async def benchmark(
         "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
     ) or flush_cache
     if should_flush_cache:
-        flush_server_cache(base_url, backend)
+        flush_server_cache(base_url, backend, flush_cache_timeout)
 
     time.sleep(1.0)
 
@@ -2140,6 +2158,8 @@ def run_benchmark(args_: argparse.Namespace):
     # compatible with SimpleNamespace
     if not hasattr(args, "flush_cache"):
         args.flush_cache = False
+    if not hasattr(args, "flush_cache_timeout"):
+        args.flush_cache_timeout = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT
 
     # Prepare LoRA arguments
     lora_request_distribution = (
@@ -2170,6 +2190,7 @@ def run_benchmark(args_: argparse.Namespace):
             profile=args.profile,
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
+            flush_cache_timeout=args.flush_cache_timeout,
             warmup_requests=args.warmup_requests,
             use_trace_timestamps=args.use_trace_timestamps,
             mooncake_slowdown_factor=args.mooncake_slowdown_factor,
@@ -2617,6 +2638,12 @@ def cli_main():
         "--flush-cache",
         action="store_true",
         help="Flush the cache before running the benchmark",
+    )
+    parser.add_argument(
+        "--flush-cache-timeout",
+        type=_finite_positive_float,
+        default=_DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
+        help="Maximum seconds to wait for an SGLang server to become idle before flushing the cache",
     )
     parser.add_argument(
         "--warmup-requests",

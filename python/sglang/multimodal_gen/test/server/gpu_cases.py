@@ -22,6 +22,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionTestCase,
     IDEOGRAM4_CI_sampling_params,
     JOY_ECHO_T2V_CI_sampling_params,
+    LINGBOT_VIDEO_T2V_CI_sampling_params,
     LONGLIVE2_I2V_CI_sampling_params,
     LONGLIVE2_T2V_CI_sampling_params,
     MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
@@ -33,6 +34,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
     PI05_ACTION_CI_sampling_params,
     REALTIME_MODEL_sampling_params,
+    SANA_VIDEO_T2V_CI_sampling_params,
     SANA_WM_TI2V_CI_sampling_params,
     T2I_sampling_params,
     T2V_sampling_params,
@@ -52,6 +54,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+    DEFAULT_SANA_VIDEO_MODEL_NAME_FOR_TEST,
     DEFAULT_SANA_WM_STREAMING_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_WAN_2_1_I2V_14B_480P_MODEL_NAME_FOR_TEST,
@@ -234,6 +237,17 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
             modality="video",
         ),
+    ),
+    DiffusionTestCase(
+        "sana_video_2b_t2v",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SANA_VIDEO_MODEL_NAME_FOR_TEST,
+            modality="video",
+        ),
+        SANA_VIDEO_T2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
         "cosmos3_nano_t2v",
@@ -451,13 +465,28 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
+        "lingbot_video_moe_t2v",
+        DiffusionServerArgs(
+            model_path="robbyant/lingbot-video-moe-30b-a3b",
+            modality="video",
+            num_gpus=1,
+            text_encoder_cpu_offload=True,
+        ),
+        LINGBOT_VIDEO_T2V_CI_sampling_params,
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
         "lingbot_world_realtime_plastic_beach",
         DiffusionServerArgs(
             model_path="robbyant/lingbot-world-fast-diffusers",
             modality="video",
             num_gpus=1,
             extras=[
-                "--pipeline-class-name LingBotWorldCausalDMDPipeline --warmup false"
+                "--pipeline-class-name LingBotWorldCausalDMDPipeline --warmup-mode off"
             ],
             text_encoder_cpu_offload=True,
         ),
@@ -671,7 +700,9 @@ TWO_GPU_CASES = [
                 "--performance-mode",
                 "memory",
                 "--layerwise-offload-components",
-                "dit,text_encoder,vae",
+                "dit,text_encoder",
+                "--component-residency",
+                "vae=resident",
                 "--dit-offload-prefetch-size",
                 "1",
                 "--dit-layerwise-resident-layers",
@@ -897,7 +928,6 @@ TWO_GPU_CASES = [
             cfg_parallel=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
-                "--component-attention-backends transformer=fa",
             ],
         ),
         DiffusionSamplingParams(prompt=T2V_PROMPT, extras={"seed": 42}),
@@ -933,14 +963,12 @@ TWO_GPU_CASES = [
         "zimage_image_t2i_2_gpus",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            ulysses_degree=2,
         ),
     ),
     DiffusionTestCase(
         "zimage_image_t2i_2_gpus_non_square",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
-            ulysses_degree=2,
         ),
         DiffusionSamplingParams(
             prompt=T2I_sampling_params.prompt,
@@ -1064,13 +1092,44 @@ ONE_GPU_5090_CASES = _select_5090_canary_cases(ONE_GPU_5090_CANARY_CASE_IDS)
 ONE_GPU_5090_CASES.append(_make_5090_flux_layerwise_cpu_offload_case())
 
 
+# Nested unit/ tests verified to pass on AMD/ROCm as-is (no code change).
+# Enabled incrementally and AMD-only: the CUDA `multimodal-gen-unit-test`
+# lane keeps the flat glob below. Files that still need fixes/skips are added
+# in follow-up PRs. Paths are relative to the unit/ dir.
+_AMD_READY_NESTED_UNIT_TESTS = (
+    "realtime/test_causal_denoising.py",
+    "realtime/test_output_materialization.py",
+    "realtime/test_realtime_consistency_harness.py",
+    "realtime/test_realtime_control_signals.py",
+    "realtime/test_realtime_output_transport.py",
+    "realtime/test_realtime_vae.py",
+    "sana_wm/test_streaming_cached.py",
+    "sana_wm/test_streaming_stage.py",
+    "sana_wm/test_streaming_vae.py",
+    # Enabled with small test-harness stub fixes (see this PR's test edits).
+    "progressive_resolution/test_progressive.py",
+    "sana_wm/test_streaming_realtime_path.py",
+    # Stub gap already fixed upstream; only needs enabling here.
+    "realtime/test_lingbot_causal_denoising.py",
+)
+
+
 def _discover_unit_tests() -> list[str]:
     unit_dir = Path(__file__).resolve().parent.parent / "unit"
     if not unit_dir.is_dir():
         return []
-    return sorted(
-        f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()
-    )
+    # Flat unit/ tests run on every lane (unchanged). This keeps the CUDA
+    # `multimodal-gen-unit-test` job byte-identical.
+    flat = [f"../unit/{f.name}" for f in unit_dir.glob("test_*.py") if f.is_file()]
+    if not current_platform.is_hip():
+        return sorted(flat)
+    # AMD/ROCm additionally runs the vetted nested-subdir tests.
+    nested = [
+        f"../unit/{rel}"
+        for rel in _AMD_READY_NESTED_UNIT_TESTS
+        if (unit_dir / rel).is_file()
+    ]
+    return sorted(flat + nested)
 
 
 FILE_SUITES = {
@@ -1118,6 +1177,11 @@ STANDALONE_FILES = {
         "../single_test_file/test_disagg_server.py",
         "../single_test_file/test_ar_models.py",
         "../single_test_file/test_ipc_a2a_2_gpu.py",
+        "../single_test_file/test_encoder_fold_srt_2_gpu.py",
+        "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py",
+        "../single_test_file/test_dp_serving_2_gpu.py",
+        "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
+        "../single_test_file/test_usp_replicated_parity_2_gpu.py",
     ],
 }
 
@@ -1152,6 +1216,16 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_ar_models.py": 600.0,
         # no model load; the cost is the one-time JIT build of the sync kernels
         "../single_test_file/test_ipc_a2a_2_gpu.py": 240.0,
+        "../single_test_file/test_encoder_fold_srt_2_gpu.py": 240.0,
+        # ~60 s locally with a warm HF cache (load + one capture + 4 steps);
+        # padded for cold-cache CI.
+        "../single_test_file/test_diffusion_bcg_tp2_zimage_turbo.py": 180.0,
+        # zimage server startup dominates; six short requests after warmup
+        "../single_test_file/test_dp_serving_2_gpu.py": 900.0,
+        # one capture plus three replays on a 32K-element exchange
+        "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 180.0,
+        # two SDPA parity checks on 128+6 rows
+        "../single_test_file/test_usp_replicated_parity_2_gpu.py": 180.0,
     },
 }
 

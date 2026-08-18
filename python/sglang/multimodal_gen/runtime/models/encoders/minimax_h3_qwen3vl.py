@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
     MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER,
     MiniMaxH3Qwen3VLConfig,
 )
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
@@ -40,7 +41,10 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
     eight otherwise-idle ranks during encoding.
     """
 
+    layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
+
     supports_dp_encode = True
+    supported_checkpoint_quantization_methods = frozenset({"fp8"})
 
     @staticmethod
     def should_materialize_checkpoint_weight(name: str) -> bool:
@@ -58,7 +62,11 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                 "MiniMax H3 Qwen3-VL config must be trimmed to "
                 f"{selected_layer} language layers before construction"
             )
-        self.model = Qwen3VLModel(arch, use_tensor_parallel=True)
+        self.model = Qwen3VLModel(
+            arch,
+            quant_config=config.quant_config,
+            use_tensor_parallel=True,
+        )
         # H3 consumes the unnormalized output immediately after layer 49.
         self.model.language_model.norm = nn.Identity()
         self.image_token_id = int(arch.image_token_id)
@@ -68,7 +76,15 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
 
     @property
     def device(self) -> torch.device:
-        return next(self.parameters()).device
+        """Device this encoder's forward runs on.
+
+        Deliberately not `next(self.parameters()).device`. `--text-encoder-cpu-offload`
+        loads this component under an FSDP CPU offload policy, which keeps the sharded
+        parameters on CPU and all-gathers them to the accelerator for the forward. The
+        parameter device then names the storage side, not the compute side, so inputs
+        built from it stay on CPU while the forward runs on the accelerator.
+        """
+        return get_local_torch_device()
 
     @torch.no_grad()
     def forward(
@@ -136,10 +152,6 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
         call_kwargs: dict[str, Any] = {
             "input_ids": ids,
             "attention_mask": torch.ones_like(ids),
-            "output_attentions": False,
-            "output_hidden_states": False,
-            "return_dict": True,
-            "use_cache": False,
         }
         if position_ids is not None:
             call_kwargs["position_ids"] = position_ids.to(self.device)
@@ -152,7 +164,7 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             )
             call_kwargs["video_grid_thw"] = host_video_grid_thw
 
-        hidden = self.model(**call_kwargs).last_hidden_state[0].to(torch.bfloat16)
+        hidden = self(**call_kwargs).last_hidden_state[0].to(torch.bfloat16)
         expected_shape = [int(ids.shape[1]), self.hidden_dim]
         if list(hidden.shape) != expected_shape:
             raise ValueError(

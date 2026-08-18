@@ -32,6 +32,7 @@ from sglang.srt.entrypoints.engine import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.ray.scheduler_actor import SchedulerActor
+from sglang.srt.runtime_context import configured_pp_size, get_parallel
 from sglang.srt.server_args import PortArgs, ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -107,9 +108,9 @@ def _compute_world_size(server_args: ServerArgs) -> int:
 
     Normal: dp_size * tp_size * pp_size; DP attention: tp_size * pp_size.
     """
-    if server_args.enable_dp_attention:
-        return server_args.tp_size * server_args.pp_size
-    return server_args.dp_size * server_args.tp_size * server_args.pp_size
+    if get_parallel().enable_dp_attention:
+        return server_args.tp_size * configured_pp_size()
+    return get_parallel().dp_size * server_args.tp_size * configured_pp_size()
 
 
 def _resolve_bundle_indices(pg: PlacementGroup, world_size: int) -> List[int]:
@@ -230,12 +231,12 @@ class RayEngine(Engine):
     """Engine using Ray actors for scheduler processes."""
 
     def __init__(self, **kwargs):
-        placement_group = kwargs.pop("placement_group", None)
+        # Set before super().__init__(): it launches the subprocesses, which need
+        # the group to schedule the scheduler actors onto.
+        self._placement_group = kwargs.pop("placement_group", None)
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
-        server_args = ServerArgs(**kwargs)
-        server_args.override("ray.placement_group", placement_group=placement_group)
-        super().__init__(server_args=server_args)
+        super().__init__(server_args=ServerArgs(**kwargs))
 
     def shutdown(self):
         """Shutdown the engine — kill Ray scheduler actors then local processes."""
@@ -252,6 +253,8 @@ class RayEngine(Engine):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_scheduler_process_func: Callable,
+        *,
+        placement_group=None,
     ) -> tuple[SchedulerInitResult, None]:
         """Launch schedulers as Ray actors.
 
@@ -259,17 +262,17 @@ class RayEngine(Engine):
             Tuple of (RaySchedulerInitResult, None).
             scheduler_procs is None since Ray uses actors instead of mp.Process.
         """
-        pg = server_args.placement_group or ray.util.get_current_placement_group()
+        pg = placement_group or ray.util.get_current_placement_group()
         if pg is None:
             from ray.util.placement_group import (
                 placement_group as create_placement_group,
             )
 
-            if server_args.enable_dp_attention:
-                total_gpus = server_args.tp_size * server_args.pp_size
+            if get_parallel().enable_dp_attention:
+                total_gpus = server_args.tp_size * configured_pp_size()
             else:
                 total_gpus = (
-                    server_args.dp_size * server_args.tp_size * server_args.pp_size
+                    get_parallel().dp_size * server_args.tp_size * configured_pp_size()
                 )
 
             nnodes = server_args.nnodes
@@ -288,7 +291,7 @@ class RayEngine(Engine):
             )
             ray.get(pg.ready())
 
-        is_custom_pg = server_args.placement_group is not None
+        is_custom_pg = placement_group is not None
         nnodes = server_args.nnodes
         world_size = _compute_world_size(server_args)
 
@@ -311,7 +314,7 @@ class RayEngine(Engine):
             rank0_bundle_idx = int(indices_str.split(",")[0]) if indices_str else 0
             rank0_node_ip = _get_bundle_node_ip(pg, rank0_bundle_idx)
 
-        if server_args.dp_size == 1:
+        if get_parallel().dp_size == 1:
             dist_init_addr = f"{rank0_node_ip}:{port_args.nccl_port}"
             logger.info(f"dist_init_addr: {dist_init_addr}")
 
@@ -329,7 +332,7 @@ class RayEngine(Engine):
                     pp_range, tp_range, pp_per_node, tp_per_node = (
                         _calculate_rank_ranges(
                             nnodes,
-                            server_args.pp_size,
+                            configured_pp_size(),
                             server_args.tp_size,
                             node_rank=node_idx,
                         )
@@ -424,6 +427,7 @@ class RayEngine(Engine):
                     pg,
                     bundle_for_node,
                     rank0_node_ip,
+                    is_custom_pg,
                 ),
                 None,
             )
@@ -436,23 +440,26 @@ class RayEngine(Engine):
         pg,
         bundle_for_node: Optional[List[int]],
         rank0_node_ip: str,
+        is_custom_pg: bool = False,
     ) -> RaySchedulerInitResult:
         """Launch DP schedulers via RayDataParallelController."""
         from sglang.srt.ray.data_parallel_controller import (
             RayDataParallelController,
         )
 
-        if server_args.enable_dp_attention:
+        if get_parallel().enable_dp_attention:
             # DP attention folds DP into TP — total GPUs = tp_size * pp_size
-            total_gpus = server_args.tp_size * server_args.pp_size
+            total_gpus = server_args.tp_size * configured_pp_size()
         else:
-            total_gpus = server_args.dp_size * server_args.tp_size * server_args.pp_size
+            total_gpus = (
+                get_parallel().dp_size * server_args.tp_size * configured_pp_size()
+            )
         gpus_per_node = total_gpus // server_args.nnodes
         logger.info(
             f"Ray DP cluster: {server_args.nnodes} nodes, "
-            f"{gpus_per_node} GPUs/node, dp_size={server_args.dp_size}, "
-            f"tp_size={server_args.tp_size}, pp_size={server_args.pp_size}, "
-            f"enable_dp_attention={server_args.enable_dp_attention}"
+            f"{gpus_per_node} GPUs/node, dp_size={get_parallel().dp_size}, "
+            f"tp_size={server_args.tp_size}, pp_size={configured_pp_size()}, "
+            f"enable_dp_attention={get_parallel().enable_dp_attention}"
         )
 
         # Set dist_init_addr on server_args so PortArgs.init_new() can compute
@@ -461,16 +468,10 @@ class RayEngine(Engine):
             server_args,
             dist_init_addr=f"{rank0_node_ip}:{port_args.nccl_port}",
         )
-        # dataclasses.replace only copies declared fields; placement_group is
-        # a dynamic attribute that must be manually appended after the rebuild.
-        dp_server_args.override(
-            "ray.placement_group", placement_group=server_args.placement_group
-        )
-
         # Create the DP controller in-process. This blocks until all actors
         # are initialized and their event loops have started.
         controller = RayDataParallelController(
-            dp_server_args, port_args, pg, bundle_for_node, rank0_node_ip
+            dp_server_args, port_args, pg, bundle_for_node, rank0_node_ip, is_custom_pg
         )
 
         # Start the DP controller's event loop in a daemon thread.

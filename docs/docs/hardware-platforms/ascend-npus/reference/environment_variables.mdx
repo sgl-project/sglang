@@ -88,6 +88,11 @@ This document provides a list of commonly used environment variables and aims to
       </td>
       <td><code>0</code></td>
     </tr>
+    <tr>
+      <td><code>DEEPEP_HCCL_BUFFSIZE</code></td>
+      <td>Configures the HCCL buffer size (in MB) for the process groups used by <br/> DeepEP MoE All-to-All communication (the default group and <code>moe</code>-named <br/> groups), allowing the MoE communication buffer to be tuned independently from <br/> non-MoE groups. If unset, falls back to <code>HCCL_BUFFSIZE</code>, then to <code>200</code>. <br/> A larger buffer reduces All-to-All latency at the cost of more HBM usage.</td>
+      <td><code>200</code></td>
+    </tr>
   </tbody>
 </table>
 

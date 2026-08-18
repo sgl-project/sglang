@@ -16,10 +16,9 @@ from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.runtime_context import get_context  # noqa: E402
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=5, suite="stage-b-test-1-gpu-small-amd")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestDisaggregationPriorityQueueing(unittest.TestCase):
@@ -110,6 +109,9 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.pending_reqs = []
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
+        # `pop_preallocated` credits this counter; `__new__` skips the __init__
+        # that seeds it.
+        queue._num_published_destinations = 0
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._allocatable_tokens = MagicMock(return_value=1000)
@@ -242,6 +244,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
             bootstrap_room=7,
             priority=10,
             extra_key=None,
+            cache_salt=None,
             routing_key=None,
             disagg_prefill_dp_rank=None,
         )
@@ -258,6 +261,7 @@ class TestDecodePreallocQueueRebootstrapPayload(unittest.TestCase):
         self.assertTrue(all(type(x) is int for x in payload["input_ids"]))
         self.assertEqual(payload["sampling_params"]["max_new_tokens"], 1)
         self.assertEqual(payload["bootstrap_room"], 7)
+        self.assertIsNone(payload["cache_salt"])
         # The prefill /generate URL is derived from bootstrap info on the decode
         # side, not sent in the payload; and the boundary token is replayed via
         # the decode-side override, so neither belongs in the payload.
@@ -428,8 +432,6 @@ class TestDecodePrebuiltPriority(unittest.TestCase):
         scheduler.enable_overlap = False
         scheduler.spec_algorithm = MagicMock()
         scheduler.max_running_requests = 1
-        # Passed whole into the (mocked) batch's process_prebuilt; never read.
-        scheduler.server_args = SimpleNamespace()
         scheduler.future_map = MagicMock()
         scheduler.policy = MagicMock()
         scheduler.policy.calc_priority.side_effect = lambda waiting_queue, _: (
