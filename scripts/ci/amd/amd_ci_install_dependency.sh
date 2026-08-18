@@ -272,21 +272,34 @@ esac
 echo "[CI-AITER-CHECK] Container HIP=${IMAGE_HIP_VERSION}, install AITER's Triton on rebuild=${INSTALL_AITER_TRITON}"
 
 #############################################
-# 1. Extract AITER_COMMIT from correct Dockerfile block
+# 1. Extract AITER_COMMIT from the Dockerfile stage that built this image.
+# Torch 2.11 is the 724 stages; remaining HIP 7.2 is 720; else the 7.0
+# blocks. Both 720 and 724 report HIP 7.2*, so torch version has to
+# distinguish them. Using the 7.0 FROM line for every flavor would
+# silently keep gfx950/gfx942's pin when a 724 AITER_COMMIT_DEFAULT
+# diverges.
 #############################################
-if [[ "${GPU_ARCH}" == "mi35x" ]]; then
-    echo "[CI-AITER-CHECK] Using gfx950 block from Dockerfile..."
-    REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_950 AS gfx950' docker/rocm.Dockerfile \
-                        | grep 'AITER_COMMIT_DEFAULT=' \
-                        | head -n1 \
-                        | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
+if [[ "${IMAGE_TORCH_VERSION}" == 2.11.* ]]; then
+    _from_suffix="_ROCM724"
+    _stage_suffix="-rocm724"
+elif [[ "${IMAGE_HIP_VERSION}" == 7.2* ]]; then
+    _from_suffix="_ROCM720"
+    _stage_suffix="-rocm720"
 else
-    echo "[CI-AITER-CHECK] Using gfx942 block from Dockerfile..."
-    REPO_AITER_COMMIT=$(grep -F -A20 'FROM $BASE_IMAGE_942 AS gfx942' docker/rocm.Dockerfile \
-                        | grep 'AITER_COMMIT_DEFAULT=' \
-                        | head -n1 \
-                        | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
+    _from_suffix=""
+    _stage_suffix=""
 fi
+if [[ "${GPU_ARCH}" == "mi35x" ]]; then
+    _from_line="FROM \$BASE_IMAGE_950${_from_suffix} AS gfx950${_stage_suffix}"
+else
+    _from_line="FROM \$BASE_IMAGE_942${_from_suffix} AS gfx942${_stage_suffix}"
+fi
+echo "[CI-AITER-CHECK] Using ${_from_line} from Dockerfile..."
+REPO_AITER_COMMIT=$(grep -F -A20 "${_from_line}" docker/rocm.Dockerfile \
+                    | grep 'AITER_COMMIT_DEFAULT=' \
+                    | head -n1 \
+                    | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
+unset _from_suffix _stage_suffix _from_line
 
 
 if [[ -z "${REPO_AITER_COMMIT}" ]]; then
