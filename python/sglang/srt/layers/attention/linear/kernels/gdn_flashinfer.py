@@ -457,11 +457,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         tile_v = (
             16
             if route.route_id.endswith(".tile16_fullwarp")
-            else 128
-            if state_heads >= 1024
-            else 64
-            if state_heads >= 512
-            else 32
+            else 128 if state_heads >= 1024 else 64 if state_heads >= 512 else 32
         )
         entry(
             q,
