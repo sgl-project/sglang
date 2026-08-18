@@ -549,6 +549,10 @@ class Envs:
     SGLANG_UNIBOOST_GAMMA_ADA_MIN_SAMPLES = EnvInt(200)
     SGLANG_UNIBOOST_GAMMA_ADA_BETA = EnvFloat(0.3)
     SGLANG_UNIBOOST_TAIL_SENSITIVITY = EnvFloat(4.0)
+    # Frontier-K cheap matching: per scheduling pass, re-run radix prefix
+    # matching only for the top-K sorted candidates (the admission frontier);
+    # deeper entries keep their last-known match. <=0 = full-queue matching.
+    SGLANG_UNIBOOST_MATCH_TOPK = EnvInt(64)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output

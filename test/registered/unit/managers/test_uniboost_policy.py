@@ -14,7 +14,10 @@ Coverage (each case guards a distinct failure mode):
   * fallback gating -- tp_size > 1 without SGLANG_UNIBOOST_ALLOW_TP,
     gamma <= 0, and the tree-cache-disabled carve-out;
   * the finished-request recording hook -- aborts excluded, each request
-    recorded once, and calc_priority never refits synchronously.
+    recorded once, and calc_priority never refits synchronously;
+  * frontier-K matching -- per pass, radix prefix matching is bounded to the
+    top-K sorted candidates (deep queues keep last-known matches), and <=0
+    restores full-queue matching.
 """
 
 import random
@@ -78,10 +81,14 @@ class FakeDisabledTreeCache:
         return False
 
 
-def make_policy(policy_name="uniboost"):
+class FakeEnabledTreeCache(FakeDisabledTreeCache):
+    disable = False
+
+
+def make_policy(policy_name="uniboost", tree_cache=None):
     return SchedulePolicy(
         policy_name,
-        FakeDisabledTreeCache(),
+        tree_cache if tree_cache is not None else FakeDisabledTreeCache(),
         enable_hierarchical_cache=False,
         enable_priority_scheduling=False,
         schedule_low_priority_values_first=False,
@@ -317,6 +324,54 @@ class TestUniboostFallbacks(UniboostTestBase):
         # tokens count as uncached), unlike lpm/dfs-weight which fall to FCFS.
         self.assertEqual(make_policy().policy, CacheAwarePolicy.UNIBOOST)
         self.assertEqual(make_policy("lpm").policy, CacheAgnosticPolicy.FCFS)
+
+
+class TestUniboostFrontierK(UniboostTestBase):
+    """Frontier-K: per-pass radix matching is bounded to the top-K candidates.
+
+    Guards the fix for the full-queue-matching scheduler tax (20-40% goodput
+    loss at 1000+ queued requests on the hybrid-mamba radix cache in
+    real-trace replay): a future diff that re-matches the whole queue per
+    pass, or that stops matching the admission frontier, turns these red.
+    """
+
+    def queue(self, n):
+        # Higher index = later arrival; equal work so FCFS order is stable.
+        return [FakeReq(f"r{i}", 1000, 100.0 + i) for i in range(n)]
+
+    def test_matching_bounded_to_top_k(self):
+        with envs.SGLANG_UNIBOOST_MATCH_TOPK.override(8):
+            pol = make_policy(tree_cache=FakeEnabledTreeCache())
+        matched = []
+        with patch(
+            "sglang.srt.managers.schedule_policy.match_prefix_for_req",
+            side_effect=lambda tc, r, **kw: matched.append(r.rid),
+        ):
+            q = self.queue(50)
+            pol.calc_priority(q)
+        self.assertEqual(len(matched), 8)
+        # The frontier is the head of the sorted queue.
+        self.assertEqual(matched, [r.rid for r in q[:8]])
+
+    def test_zero_topk_restores_full_queue_matching(self):
+        with envs.SGLANG_UNIBOOST_MATCH_TOPK.override(0):
+            pol = make_policy(tree_cache=FakeEnabledTreeCache())
+        calls = []
+        with patch.object(
+            SchedulePolicy,
+            "_compute_prefix_matches",
+            side_effect=lambda wq, policy: calls.append(len(wq)),
+        ):
+            q = self.queue(50)
+            pol.calc_priority(q)
+        self.assertEqual(calls, [50])
+
+    def test_disabled_tree_cache_never_matches(self):
+        pol = make_policy()  # disabled cache; topk default
+        with patch("sglang.srt.managers.schedule_policy.match_prefix_for_req") as m:
+            q = self.queue(20)
+            pol.calc_priority(q)
+        m.assert_not_called()
 
 
 class TestGammaAdaWiring(UniboostTestBase):

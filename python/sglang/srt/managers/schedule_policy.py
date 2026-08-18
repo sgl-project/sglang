@@ -438,6 +438,7 @@ class SchedulePolicy:
             envs.SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN.get() / 1e6
         )
         self.uniboost_gamma_controller: Optional[GammaAdaController] = None
+        self.uniboost_match_topk = envs.SGLANG_UNIBOOST_MATCH_TOPK.get()
         if self.policy == CacheAwarePolicy.UNIBOOST:
             self._init_uniboost()
 
@@ -468,11 +469,15 @@ class SchedulePolicy:
         if isinstance(policy, CacheAwarePolicy):
             if policy == CacheAwarePolicy.UNIBOOST:
                 self._refresh_uniboost_gamma()
-                if not self.tree_cache.disable:
-                    # Populates req.num_matched_prefix_tokens for the
-                    # cache-aware effective-work estimate.
+                tree_disabled = self.tree_cache.disable
+                if not tree_disabled and self.uniboost_match_topk <= 0:
+                    # Legacy: full per-pass prefix matching over the queue
+                    # (populates req.num_matched_prefix_tokens for the
+                    # cache-aware effective-work estimate).
                     self._compute_prefix_matches(waiting_queue, policy)
                 self._sort_by_uniboost(waiting_queue)
+                if not tree_disabled and self.uniboost_match_topk > 0:
+                    self._uniboost_refresh_frontier(waiting_queue)
                 return
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
@@ -749,6 +754,30 @@ class SchedulePolicy:
             return
         now = time.perf_counter()
         waiting_queue.sort(key=lambda r: self._uniboost_priority(r, now))
+
+    def _uniboost_refresh_frontier(self, waiting_queue: List[Req]) -> None:
+        """Frontier-K refresh: re-match only the top-K sorted candidates.
+
+        Policy-side matches are advisory (admission re-matches authoritatively
+        when building the prefill batch), and stale matches are conservative:
+        a waiting request's cached prefix can only have grown since its last
+        match (barring eviction), so a stale value under-boosts but never
+        starves. Deep-queue entries therefore keep their last-known
+        num_matched_prefix_tokens (new arrivals: 0 = all work uncached) and
+        per-pass radix walks are bounded to K regardless of queue depth.
+        Full-queue per-pass matching cost the hybrid-mamba radix cache 20-40%
+        goodput at 1000+ queued requests in real-trace replay.
+        """
+        k = min(self.uniboost_match_topk, len(waiting_queue))
+        if k <= 0:
+            return
+        for r in waiting_queue[:k]:
+            match_prefix_for_req(self.tree_cache, r, include_req=True)
+        if k > 1:
+            now = time.perf_counter()
+            waiting_queue[:k] = sorted(
+                waiting_queue[:k], key=lambda r: self._uniboost_priority(r, now)
+            )
 
     def _refresh_uniboost_gamma(self) -> None:
         """gamma-Ada: pick up the latest gamma computed by the refit thread.
