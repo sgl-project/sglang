@@ -322,11 +322,20 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
     n_sigs = len(sana._SANA_LN_MOD.verified_sigs)
     _sana_ln_modulate(norm, x, scale, shift)
     assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs
-    # the fusion engages on non-default streams (the BCG warmup/capture path)
-    with torch.cuda.stream(torch.cuda.Stream()):
+    # The fusion engages on non-default streams (the BCG warmup/capture path).
+    # x/scale/shift were filled on the default stream, so the side stream must
+    # wait for that work before reading them -- without this the fused kernel
+    # can read a half-written tensor, the first-sight torch.equal check fails,
+    # and the gate disables itself *permanently*, which then breaks every later
+    # parametrization too. It only loses the race when the GPU is contended,
+    # which is why it shows up on shared CI runners and not on an idle box.
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
         out = _sana_ln_modulate(norm, x, scale, shift)
         assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs + 1  # verified
         out2 = _sana_ln_modulate(norm, x, scale, shift)  # verified-sig lane
+    torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
     assert torch.equal(out, _sana_eager_ln_modulate(norm, x, scale, shift))
     assert torch.equal(out2, out) and not sana._SANA_LN_MOD.disabled
