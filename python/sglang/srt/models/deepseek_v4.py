@@ -1779,7 +1779,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, norm is not None
 
-        if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
+        if _is_hip:
             from aiter.ops.mhc import mhc_pre
 
             post, comb, y = mhc_pre(
@@ -1860,7 +1860,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
             return mhc_post(x, residual, post, comb)
 
-        elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
+        elif _is_hip:
             from aiter.ops.mhc import mhc_post
 
             result = torch.empty_like(residual)
@@ -2036,7 +2036,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         _use_tp_attn_a2a_scatter = (
             not _use_cp
-            and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
         )
@@ -3211,10 +3210,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
-        if _is_npu or not (
-            envs.SGLANG_DSV4_MHC_PREWARM.get()
-            and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
-        ):
+        if _is_npu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             return
         layer = next(
             (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),

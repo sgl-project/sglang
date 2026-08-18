@@ -356,9 +356,7 @@ stay in **FP8** — keep `SGLANG_DSV4_FP4_EXPERTS=0`. It requires a `sgl-deep-ge
 build with SM90 FP8 MegaMoE support. **Please use the latest image for this
 feature.**
 
-Enable the MegaMoE path with `--moe-a2a-backend megamoe` — or equivalently set
-`SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1`, which auto-configures the same backend:
-
+Enable the MegaMoE path with `--moe-a2a-backend megamoe`
 ```bash Command
 SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096 \
 SGLANG_DSV4_FP4_EXPERTS=0 \

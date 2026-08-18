@@ -2547,12 +2547,6 @@ def _a2a_backend_overrides(view: Any) -> dict:
             "requires the DeepEP or MegaMOE backend."
         )
         moe_a2a_backend = "deepep"
-    if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get() and moe_a2a_backend != "megamoe":
-        moe_a2a_backend = "megamoe"
-        logger.info(
-            "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE is set, "
-            "auto-configuring --moe-a2a-backend megamoe."
-        )
     if moe_a2a_backend != view.moe_a2a_backend:
         return {"moe_a2a_backend": moe_a2a_backend}
     return {}

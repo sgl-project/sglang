@@ -75,7 +75,9 @@ class _MockTokenizerManager:
         self.model_path = self.server_args.model_path
         # The manager tracks the served name itself; a weight update rewrites it.
         self.served_model_name = "test-model"
-        self._config_updates = []
+        # Stands in for the context's resolved leaves: an override replaces the
+        # field's one live value, the seed stays on server_args.
+        self._config_overrides = {}
 
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
@@ -114,10 +116,9 @@ class _MockTokenizerManager:
         self.request_logger = Mock(log_requests=False, log_requests_level=0)
 
     def config_value(self, name: str):
-        """The manager's overlay accessor: no control-plane update recorded."""
-        for _source, fields in reversed(self._config_updates):
-            if name in fields:
-                return fields[name]
+        """The value in effect for one config field."""
+        if name in self._config_overrides:
+            return self._config_overrides[name]
         return getattr(self.server_args, name)
 
 
@@ -160,15 +161,12 @@ class ServingChatTestCase(unittest.TestCase):
         self.fastapi_request.headers = {}
 
     def test_parsers_follow_the_control_plane_overlay(self):
-        """Template detection records the parsers on the manager, not on its
-        ServerArgs — the instance keeps what the launcher passed."""
+        """Template detection records the parsers through `override`, so they
+        answer from the bags; `ServerArgs` keeps the launcher's seed."""
         self.tm.server_args.tool_call_parser = "auto"
         self.tm.server_args.reasoning_parser = "auto"
-        self.tm._config_updates.append(
-            (
-                "template-detection",
-                {"tool_call_parser": "qwen25", "reasoning_parser": None},
-            )
+        self.tm._config_overrides.update(
+            {"tool_call_parser": "qwen25", "reasoning_parser": None}
         )
 
         chat = OpenAIServingChat(self.tm, self.template_manager)
@@ -180,9 +178,7 @@ class ServingChatTestCase(unittest.TestCase):
     def test_the_xgrammar_gate_follows_the_overlay(self):
         """A detected `reasoning_parser` must gate xgrammar, not the seed's "auto"."""
         self.tm.server_args.reasoning_parser = "auto"
-        self.tm._config_updates.append(
-            ("template-detection", {"reasoning_parser": "qwen3"})
-        )
+        self.tm._config_overrides["reasoning_parser"] = "qwen3"
         chat = OpenAIServingChat(self.tm, self.template_manager)
         self.assertEqual(chat.reasoning_parser, "qwen3")
         # the gate reads the same value the parser was built from

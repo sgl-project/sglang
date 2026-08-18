@@ -40,7 +40,7 @@ For how to launch the image, see [Install → Method 3: Using Docker](../../../d
 
 </Accordion>
 
-Pick your hardware, then the deployment shape and operating point. Node count follows the hardware recipe (B200 2×8, GB200 4×4, H100 4×8, B300 1×8, H200 2×8 — 4×8 on Unified High-Throughput, GB300 2×4, MI350X/MI355X 1×8), so it is not a separate choice.
+Pick your hardware, then the deployment shape and operating point. Node count follows the hardware recipe (B200 2×8, GB200 4×4, H100 4×8, B300 1×8, H200 2×8 — 4×8 on Unified High-Throughput, GB300 2×4, MI350X/MI355X 1×8), so it is not a separate choice. If you serve the NVFP4 checkpoint (`nvidia/Kimi-K3-NVFP4`, the **Quantization** row in the panel below), use the `lmsysorg/sglang:dev-dev-kimi-k3-nvfp4` image.
 
 **PD Mode** — `Unified` serves prefill and decode together. `Prefill` / `Decode` split them into dedicated pools (see [PD disaggregation](#3-4-pd-disaggregation)); `Prefill` ships two strategies, both chunked at 16k. On the 8-GPU platforms (B300 1×8, GB300 2×4), `Default` is TP8 and `Long-Context` is `--pp-size 8 --tp-size 1`. On the 16-GPU platforms (B200 2×8, GB200 4×4), both are `--pp-size 16 --tp-size 1` and differ only in `--mem-fraction-static` (0.85 vs 0.90) — deep PP is the throughput shape there, not just the long-context one (see [Deep PP](#deep-pp-for-prefill)).
 
@@ -160,7 +160,7 @@ Speculation: DSPARK holds block size + 1 (= 8) intermediate states per request �
 - No `--enable-symm-mem` under DCP (force-disabled for decode-graph correctness).
 - Explicit `tokenspeed_mla` force-rewrites `--kv-cache-dtype` to fp8; the default `cutedsl_mla` serves either dtype.
 - Calculator ratios run well above 1 here (`r > 1` is legal): `bfloat16` state buys admission, `fp8` KV buys context.
-- Don't use EP with an a2a backend: a2a buffers reclaim the KV that DCP buys. Compose only to measure. a2a backend is set when `SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1` or `--moe-a2a-backend` is set.
+- Don't use EP with an a2a backend: a2a buffers reclaim the KV that DCP buys. Compose only to measure. a2a backend is set when `--moe-a2a-backend` is set.
 
 No cell has a serving round in this exact shape — treat them as starting points to verify.
 

@@ -2123,7 +2123,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_data_parallelism_and_a2a_passes(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
-            _a2a_backend_overrides,
             _a2a_ep_size,
             _data_parallelism_defaults,
         )
@@ -2140,27 +2139,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {},
         )
-
-        with patch("sglang.srt.environ.envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE") as e:
-            e.get.return_value = False
-            self.assertEqual(
-                _a2a_backend_overrides(
-                    ResolvedView(
-                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
-                    )
-                ),
-                {"moe_a2a_backend": "deepep"},
-            )
-            e.get.return_value = True
-            # megamoe env wins over the waterfill override (chained, last write)
-            self.assertEqual(
-                _a2a_backend_overrides(
-                    ResolvedView(
-                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
-                    )
-                ),
-                {"moe_a2a_backend": "megamoe"},
-            )
 
         self.assertEqual(
             _a2a_ep_size(
