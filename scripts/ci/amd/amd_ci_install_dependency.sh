@@ -40,12 +40,13 @@ else
 fi
 
 # Install the required dependencies in CI.
-# ROCm 7.2.4 images ship torch 2.11, which srt_hip cannot satisfy (it pins
-# compressed-tensors 0.15.0, requiring torch<2.11). Select the rocm724 extras.
+# ROCm 7.2 images ship torch 2.11, which srt_hip cannot satisfy (it pins
+# compressed-tensors 0.15.0, requiring torch<2.11). Select the torch 2.11
+# extras based on the installed torch version rather than the ROCm patch level.
 IMAGE_TORCH_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.__version__)')
 IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
 if [[ "${IMAGE_TORCH_VERSION}" == 2.11.* ]]; then
-  EXTRAS="${EXTRAS/dev_hip/dev_hip_rocm724}"
+  EXTRAS="${EXTRAS/dev_hip/dev_hip_torch211}"
 fi
 echo "Image torch ${IMAGE_TORCH_VERSION}, HIP ${IMAGE_HIP_VERSION}; installing python extras: [${EXTRAS}]"
 
