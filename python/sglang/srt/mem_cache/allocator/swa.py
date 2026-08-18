@@ -374,6 +374,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.swa_free_group = []
             self.free_swa(torch.cat(swa_free_group))
 
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Free a complete page-aligned request segment without device unique."""
+        if free_index.numel() == 0:
+            return
+
+        if self.page_size == 1:
+            self.free_swa(free_index)
+            return
+
+        assert start_pos % self.page_size == 0
+        assert free_index.numel() % self.page_size == 0
+        swa_indices = self.full_to_swa_index_mapping[free_index]
+        self.swa_attn_allocator.free_segment(swa_indices, start_pos=start_pos)
+        self.full_to_swa_index_mapping.index_fill_(0, free_index.to(torch.int64), 0)
+
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
         pages = torch.unique(indices // self.page_size)
         page_offsets = torch.arange(

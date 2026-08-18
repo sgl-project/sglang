@@ -97,10 +97,16 @@ def free_swa_out_of_window_slots(
         new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
 
     if new_swa_evicted_seqlen > req.kv.swa_evicted_seqlen:
+        old_swa_evicted_seqlen = req.kv.swa_evicted_seqlen
         free_slots = req_to_token_pool.req_to_token[
-            req.req_pool_idx, req.kv.swa_evicted_seqlen : new_swa_evicted_seqlen
+            req.req_pool_idx, old_swa_evicted_seqlen:new_swa_evicted_seqlen
         ]
-        token_to_kv_pool_allocator.free_swa(free_slots)
+        if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+            token_to_kv_pool_allocator.free_swa_segment(
+                free_slots, start_pos=old_swa_evicted_seqlen
+            )
+        else:
+            token_to_kv_pool_allocator.free_swa(free_slots)
         req.kv.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 
