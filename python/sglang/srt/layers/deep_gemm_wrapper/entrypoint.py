@@ -90,8 +90,14 @@ def grouped_gemm_nt_f8f8bf16_masked(
             else "cake"
         )
         logger.info_once(
-            "Using FlashInfer batch DeepGEMM API backend=%s for masked FP8 MoE",
+            "Using FlashInfer batch DeepGEMM API backend=%s for masked FP8 MoE "
+            "(B=%d, M=%d, N=%d, K=%d, expected_m=%d)",
             flashinfer_backend,
+            num_groups,
+            lhs[0].shape[1],
+            n,
+            k,
+            expected_m,
         )
         return batch_deepgemm_fp8_nt_groupwise(
             lhs[0],
