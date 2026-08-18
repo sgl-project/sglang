@@ -365,17 +365,17 @@ def test_f_b_public_api() -> None:
     )
 
 
-def test_f_b_batch_two_dispatch_is_guarded(monkeypatch) -> None:
-    for name in (
-        "SGLANG_K3_KDA_FB_C2_WPE",
-        "SGLANG_K3_KDA_FB_C2_COOP_FA",
-    ):
-        monkeypatch.delenv(name, raising=False)
+def test_f_b_batch_two_dispatch_is_guarded() -> None:
     assert _fb_build_options(1) == {}
     assert _fb_build_options(4) == {}
     options = _fb_build_options(2)
-    assert options["waves_per_eu"] == 2
-    assert options["cooperative_f_a"] is False
+    assert options == {
+        "waves_per_eu": 3,
+        "cooperative_f_a": True,
+        "parallel_front": True,
+        "fused_norm_reduce": True,
+        "projection_fdot2": True,
+    }
 
 
 @pytest.mark.parametrize("batch", [1, 8, 16])

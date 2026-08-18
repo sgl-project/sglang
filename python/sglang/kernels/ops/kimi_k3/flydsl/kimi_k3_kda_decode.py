@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import functools
-import os
 from collections.abc import Iterable
 
 import torch
@@ -26,24 +25,15 @@ _CONV_WIDTH = 4
 
 
 def _fb_build_options(batch: int) -> dict[str, int | bool]:
-    """C2-only experiment hook; defaults preserve the upstream #4495 kernel."""
-    force = os.environ.get("SGLANG_K3_KDA_FB_FORCE_OPTIONS", "0") == "1"
-    if batch != 2 and not force:
+    """Use the validated gfx950 winner only for the exact-C2 bucket."""
+    if batch != 2:
         return {}
     return {
-        "waves_per_eu": int(os.environ.get("SGLANG_K3_KDA_FB_C2_WPE", "2")),
-        "cooperative_f_a": os.environ.get("SGLANG_K3_KDA_FB_C2_COOP_FA", "0")
-        == "1",
-        "parallel_front": os.environ.get("SGLANG_K3_KDA_FB_C2_PARALLEL_FRONT", "0")
-        == "1",
-        "fused_norm_reduce": os.environ.get(
-            "SGLANG_K3_KDA_FB_C2_FUSED_NORM_REDUCE", "0"
-        )
-        == "1",
-        "projection_fdot2": os.environ.get(
-            "SGLANG_K3_KDA_FB_C2_PROJECTION_FDOT2", "0"
-        )
-        == "1",
+        "waves_per_eu": 3,
+        "cooperative_f_a": True,
+        "parallel_front": True,
+        "fused_norm_reduce": True,
+        "projection_fdot2": True,
     }
 
 
