@@ -160,7 +160,6 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_parallel,
-    get_server_args,
 )
 
 if not _is_hip:
@@ -2713,7 +2712,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             return (
                 "DeepSeek V4 heterogeneous shared-expert fusion does not support EPLB."
             )
-        if getattr(get_server_args(), "cpu_offload_gb", 0):
+        if get_exec().offload.cpu_offload_gb:
             return "DeepSeek V4 heterogeneous shared-expert fusion does not support weight offload."
         expected_geometry = {
             "n_routed_experts": 384,

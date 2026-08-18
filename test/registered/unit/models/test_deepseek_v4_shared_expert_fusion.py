@@ -110,13 +110,6 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
         )
         stack.enter_context(
             patch.object(
-                deepseek_v4,
-                "get_server_args",
-                return_value=SimpleNamespace(cpu_offload_gb=0),
-            )
-        )
-        stack.enter_context(
-            patch.object(
                 deepseek_v4.envs.SGLANG_USE_AITER_MOE_GU_ITLV,
                 "get",
                 return_value=True,
