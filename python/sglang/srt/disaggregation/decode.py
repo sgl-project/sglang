@@ -2227,7 +2227,6 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
-            self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             self.process_decode_queue()
 
             # Get the next batch to run
@@ -2271,7 +2270,6 @@ class SchedulerDisaggregationDecodeMixin:
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
-            self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             self.process_decode_queue()
 
             # Get the next batch to run
