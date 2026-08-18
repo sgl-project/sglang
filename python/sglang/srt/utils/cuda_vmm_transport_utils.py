@@ -33,6 +33,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.runtime_context import (
     configured_tp_size,
+    get_mm,
     get_parallel,
 )
 from sglang.srt.utils.cuda_ipc_transport_utils import (
@@ -933,7 +934,7 @@ class CudaVmmFeatureTransport:
 
     def __init__(self, server_args, mm_processor) -> None:
         self.pool: CudaVmmMemoryPool | None = None
-        if server_args.mm_feature_transport != "cuda_vmm":
+        if get_mm().mm_feature_transport != "cuda_vmm":
             return
         if mm_processor is None:
             raise RuntimeError(

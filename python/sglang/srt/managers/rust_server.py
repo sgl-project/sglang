@@ -27,6 +27,10 @@ from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
     msgpack_decode_explained,
 )
+from sglang.srt.runtime_context import (
+    get_mm,
+    get_serving,
+)
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
     NestedRowColumns,
@@ -216,9 +220,7 @@ class NativeMmHost:
 
         # `--mm-process-config {"image": {...}}`: only pixel-limit overrides are
         # mirrored natively, anything else disables the pipeline.
-        image_overrides = dict(
-            (self.server_args.mm_process_config or {}).get("image", {})
-        )
+        image_overrides = dict((get_mm().mm_process_config or {}).get("image", {}))
         if not set(image_overrides) <= {"min_pixels", "max_pixels"}:
             return None
 
@@ -386,7 +388,7 @@ class RustServer:
         # Refuse rather than run: silently dropping it means generating with
         # sampling the operator did not configure, and `/get_model_info` would go on
         # advertising values no request ever receives.
-        if server_args.preferred_sampling_params:
+        if get_serving().preferred_sampling_params:
             raise ValueError(
                 "SGLANG_RUST_SERVER does not yet apply --preferred-sampling-params "
                 "(the Python TokenizerManager merges it into every request; the rust "
