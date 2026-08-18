@@ -20,9 +20,9 @@ export SGLANG_NPU_PROFILING_BS=4
 # export SGLANG_NPU_PROFILING=1
 export SGLANG_NPU_PROFILING_PATH="/home/hanwlax/workspace/progress/kimi_k3/profiling"
 SGLANG_REPO_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-SGL_KERNEL_NPU_REPO_DIR=${SGL_KERNEL_NPU_REPO_DIR:-/home/hanwlax/test-codes/sgl-kernel-npu}
-export PYTHONPATH="${SGLANG_REPO_DIR}/python:${SGL_KERNEL_NPU_REPO_DIR}/python/sgl_kernel_npu:${PYTHONPATH:-}"
-KDA_COMMIT_MODULE="${SGL_KERNEL_NPU_REPO_DIR}/python/sgl_kernel_npu/sgl_kernel_npu/mamba/kda_state_commit.py"
+CODEX_SGL_KERNEL_NPU_REPO_DIR=${CODEX_SGL_KERNEL_NPU_REPO_DIR:-/home/hanwlax/test-codes/sgl-kernel-npu}
+export PYTHONPATH="${SGLANG_REPO_DIR}/python:${CODEX_SGL_KERNEL_NPU_REPO_DIR}/python/sgl_kernel_npu:${PYTHONPATH:-}"
+KDA_COMMIT_MODULE="${CODEX_SGL_KERNEL_NPU_REPO_DIR}/python/sgl_kernel_npu/sgl_kernel_npu/mamba/kda_state_commit.py"
 if [[ ! -f "${KDA_COMMIT_MODULE}" ]] || ! grep -q '^def commit_kda_extended_conv_state' "${KDA_COMMIT_MODULE}"; then
     echo "Missing direct KDA state-commit kernel: ${KDA_COMMIT_MODULE}" >&2
     exit 2
