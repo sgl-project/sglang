@@ -16,10 +16,13 @@ from sglang.srt.mem_cache.mamba_slot_fused import (
     fused_clear_conv_slots,
     fused_copy_conv_slots,
 )
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+
+DEVICE = get_device()
 
 CONV_LEN = 3
 # Representative hybrid conv-state trailing dims (a couple of KV-projection
@@ -80,10 +83,12 @@ def _ref_copy(convs, src, dst):
         t[:, dst] = t[:, src]
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "fused conv-slot kernels need CUDA")
+@unittest.skipUnless(
+    DEVICE in ("cuda", "xpu"), "fused conv-slot Triton kernels need CUDA or XPU"
+)
 class TestMambaSlotFused(CustomTestCase):
     def test_clear_matches_reference(self):
-        dev = "cuda"
+        dev = DEVICE
         for dims, num_layers, pool in CONFIGS:
             for n in sorted({1, pool // 3, pool}):  # single / partial / all slots
                 with self.subTest(dims=dims, num_layers=num_layers, pool=pool, n=n):
@@ -93,7 +98,7 @@ class TestMambaSlotFused(CustomTestCase):
                     got = [t.clone() for t in base]
                     _ref_clear(ref, idx)
                     fused_clear_conv_slots(build_conv_slot_descriptor(got), idx)
-                    torch.cuda.synchronize()
+                    torch.get_device_module(dev).synchronize()
                     for r, g in zip(ref, got):
                         self.assertTrue(torch.equal(r, g))
                     # Cleared slots are exactly zero; the rest is untouched.
@@ -104,7 +109,7 @@ class TestMambaSlotFused(CustomTestCase):
                         self.assertTrue(torch.equal(g[:, keep], b[:, keep]))
 
     def test_copy_matches_reference(self):
-        dev = "cuda"
+        dev = DEVICE
         for dims, num_layers, pool in CONFIGS:
             with self.subTest(dims=dims, num_layers=num_layers, pool=pool):
                 base = _make_convs(dims, num_layers, pool, dev, seed=1)
@@ -116,7 +121,7 @@ class TestMambaSlotFused(CustomTestCase):
                 got = [t.clone() for t in base]
                 _ref_copy(ref, src, dst)
                 fused_copy_conv_slots(build_conv_slot_descriptor(got), src, dst)
-                torch.cuda.synchronize()
+                torch.get_device_module(dev).synchronize()
                 for r, g in zip(ref, got):
                     self.assertTrue(torch.equal(r, g))
 
@@ -126,7 +131,7 @@ class TestMambaSlotFused(CustomTestCase):
         # kernel reads real strides, so it must handle this; the whole envelope
         # buffer (including the other streams' bytes in each slot) must be
         # bit-exact vs the reference, proving no cross-stream clobber.
-        dev = "cuda"
+        dev = DEVICE
         num_layers, pool = 2, 48
         dims = [128, 256, 6144]
         envelope = sum(CONV_LEN * d for d in dims)
@@ -148,7 +153,7 @@ class TestMambaSlotFused(CustomTestCase):
             ),
             idx,
         )
-        torch.cuda.synchronize()
+        torch.get_device_module(dev).synchronize()
         self.assertTrue(torch.equal(ref_buf, got_buf))
 
         # copy on the same strided layout
@@ -164,31 +169,31 @@ class TestMambaSlotFused(CustomTestCase):
             src,
             dst,
         )
-        torch.cuda.synchronize()
+        torch.get_device_module(dev).synchronize()
         self.assertTrue(torch.equal(ref_buf, got_buf))
 
     def test_empty_indices_is_noop(self):
-        dev = "cuda"
+        dev = DEVICE
         base = _make_convs(HETERO_DIMS, 1, 16, dev, seed=2)
         got = [t.clone() for t in base]
         empty = torch.empty(0, dtype=torch.int64, device=dev)
         desc = build_conv_slot_descriptor(got)
         fused_clear_conv_slots(desc, empty)
         fused_copy_conv_slots(desc, empty, empty)
-        torch.cuda.synchronize()
+        torch.get_device_module(dev).synchronize()
         for b, g in zip(base, got):
             self.assertTrue(torch.equal(b, g))
 
     def test_int32_indices_accepted(self):
         # deferred-clear/COW indices are staged as int32; the wrappers must upcast.
-        dev = "cuda"
+        dev = DEVICE
         base = _make_convs(HETERO_DIMS, 1, 32, dev, seed=3)
         idx = torch.tensor([1, 5, 9], dtype=torch.int32, device=dev)
         ref = [t.clone() for t in base]
         got = [t.clone() for t in base]
         _ref_clear(ref, idx.long())
         fused_clear_conv_slots(build_conv_slot_descriptor(got), idx)
-        torch.cuda.synchronize()
+        torch.get_device_module(dev).synchronize()
         for r, g in zip(ref, got):
             self.assertTrue(torch.equal(r, g))
 
