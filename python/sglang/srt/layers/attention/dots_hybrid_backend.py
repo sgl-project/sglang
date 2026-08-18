@@ -11,7 +11,6 @@ from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
-    normalize_page_table_rows,
 )
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 
@@ -19,6 +18,90 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+def _normalize_page_table_rows(
+    page_table: torch.Tensor, batch_size: int
+) -> torch.Tensor:
+    """Match Dots' pre-planned SWA table to the live DP-padded batch."""
+    if page_table.shape[0] >= batch_size:
+        return page_table[:batch_size]
+    return torch.cat(
+        [
+            page_table,
+            page_table.new_zeros(
+                (batch_size - page_table.shape[0], page_table.shape[1])
+            ),
+        ],
+        dim=0,
+    )
+
+
+def _metadata_mismatches_dp_padded_batch(metadata, forward_batch) -> bool:
+    """True when pre-planned attention metadata no longer matches the live batch.
+
+    EAGLE plans draft metadata before ModelRunner runs DP/MLP padding. Dummy
+    request rows then change ``batch_size`` / ``out_cache_loc``, leaving
+    page tables and SWA write targets short. Rebuilding is required; slicing
+    or zero-padding the stale tensors is not enough for DSA + SWA.
+    """
+    if metadata is None:
+        return False
+    bs = forward_batch.batch_size
+    from sglang.srt.layers.attention.flashattention_backend import (
+        FlashAttentionMetadata,
+    )
+
+    if isinstance(metadata, FlashAttentionMetadata):
+        if metadata.page_table is not None and metadata.page_table.shape[0] != bs:
+            return True
+        if (
+            metadata.swa_page_table is not None
+            and metadata.swa_page_table.shape[0] != bs
+        ):
+            return True
+        if (
+            metadata.cache_seqlens_int32 is not None
+            and metadata.cache_seqlens_int32.shape[0] != bs
+        ):
+            return True
+        swa_loc = metadata.swa_out_cache_loc
+        out_loc = forward_batch.out_cache_loc
+        return (
+            swa_loc is not None
+            and out_loc is not None
+            and swa_loc.shape[0] != out_loc.shape[0]
+        )
+
+    from sglang.srt.layers.attention.dsa_backend import DSAMetadata
+
+    if isinstance(metadata, DSAMetadata):
+        return metadata.cache_seqlens_int32.shape[0] != bs
+    return False
+
+
+def _dp_padding_changed_batch_size(forward_batch) -> bool:
+    original_bs = forward_batch._original_batch_size
+    return original_bs is not None and original_bs != forward_batch.batch_size
+
+
+def _maybe_rebuild_dots_metadata(backend, forward_batch) -> None:
+    """Eager-only rebuild when DP padding invalidated a Dots pre-plan."""
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_is_capture_mode,
+    )
+
+    if get_is_capture_mode():
+        return
+    if backend._dp_rebuilt_batch_id == id(forward_batch):
+        return
+    stale = _metadata_mismatches_dp_padded_batch(
+        backend.forward_metadata, forward_batch
+    ) or _dp_padding_changed_batch_size(forward_batch)
+    if not stale:
+        return
+    backend.init_forward_metadata(forward_batch)
+    backend._dp_rebuilt_batch_id = id(forward_batch)
 
 
 @dataclass
@@ -40,6 +123,7 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
         self.req_to_token_pool = backend.req_to_token_pool
         self.needs_cpu_seq_lens = True
         self._prefill_metadata: DotsSWAMLAPrefillMetadata | None = None
+        self._dp_rebuilt_batch_id: int | None = None
 
     def __getattr__(self, name):
         return getattr(self.backend, name)
@@ -76,6 +160,18 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
 
         return isinstance(self.selected_backend(forward_batch), FlashAttentionBackend)
 
+    def maybe_rebuild_metadata_after_dp_padding(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        """Rebuild FA + SWA-prefill metadata after eager DP dummy-row padding."""
+        self._active_backend = self.selected_backend(forward_batch)
+        _maybe_rebuild_dots_metadata(self, forward_batch)
+
+    def normalize_forward_metadata_for_dp_padding(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        self.maybe_rebuild_metadata_after_dp_padding(forward_batch)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self._active_backend = self.selected_backend(forward_batch)
         self.backend.init_forward_metadata(forward_batch)
@@ -102,11 +198,6 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
     def on_after_cuda_graph_warmup(self):
         self.backend.on_after_cuda_graph_warmup()
 
-    def normalize_forward_metadata_for_dp_padding(
-        self, forward_batch: ForwardBatch
-    ) -> None:
-        self.backend.normalize_forward_metadata_for_dp_padding(forward_batch)
-
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: int | None
     ):
@@ -115,6 +206,7 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
         )
 
     def forward(self, q, k, v, layer, forward_batch, save_kv_cache=True, **kwargs):
+        self.maybe_rebuild_metadata_after_dp_padding(forward_batch)
         return self.backend.forward(
             q, k, v, layer, forward_batch, save_kv_cache, **kwargs
         )
@@ -217,18 +309,19 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
         )
 
         backend = self.selected_backend(forward_batch)
-        metadata = backend.forward_metadata
-        block_table = metadata.swa_page_table
-        if block_table is None:
-            raise RuntimeError("Dots SWA latent decode requires an SWA page table.")
         if backend.page_size != 64:
             raise RuntimeError(
                 "Dots SWA latent decode requires page_size=64, "
                 f"got {backend.page_size}."
             )
 
+        self.maybe_rebuild_metadata_after_dp_padding(forward_batch)
+        metadata = backend.forward_metadata
+        block_table = metadata.swa_page_table
+        if block_table is None:
+            raise RuntimeError("Dots SWA latent decode requires an SWA page table.")
         bs = forward_batch.batch_size
-        block_table = normalize_page_table_rows(block_table, bs)
+        block_table = _normalize_page_table_rows(block_table, bs)
         cache_seqlens = metadata.cache_seqlens_int32
         if cache_seqlens.shape[0] != bs:
             cache_seqlens = forward_batch.seq_lens[:bs].to(torch.int32)
@@ -261,6 +354,7 @@ class DotsHybridAttnBackend(AttentionBackend):
         self.req_to_token_pool = swa_backend.req_to_token_pool
         # SWA latent expansion uses host sequence-length mirrors.
         self.needs_cpu_seq_lens = True
+        self._dp_rebuilt_batch_id: int | None = None
 
     @staticmethod
     def _is_swa_layer(layer: RadixAttention) -> bool:
@@ -275,6 +369,34 @@ class DotsHybridAttnBackend(AttentionBackend):
             if isinstance(self.swa_backend, HybridAttnBackend)
             else self.swa_backend
         )
+
+    def maybe_rebuild_metadata_after_dp_padding(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        """Rebuild both DSA and SWA plans after eager DP dummy-row padding."""
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        if get_is_capture_mode():
+            return
+        if self._dp_rebuilt_batch_id == id(forward_batch):
+            return
+        dsa_stale = _metadata_mismatches_dp_padded_batch(
+            self.dsa_backend.forward_metadata, forward_batch
+        )
+        swa_backend = self.selected_swa_backend(forward_batch)
+        swa_stale = _metadata_mismatches_dp_padded_batch(
+            swa_backend.forward_metadata, forward_batch
+        )
+        if dsa_stale or swa_stale or _dp_padding_changed_batch_size(forward_batch):
+            self.init_forward_metadata(forward_batch)
+            self._dp_rebuilt_batch_id = id(forward_batch)
+
+    def normalize_forward_metadata_for_dp_padding(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        self.maybe_rebuild_metadata_after_dp_padding(forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.dsa_backend.init_forward_metadata(forward_batch)
@@ -305,12 +427,6 @@ class DotsHybridAttnBackend(AttentionBackend):
         self.dsa_backend.on_after_cuda_graph_warmup()
         self.swa_backend.on_after_cuda_graph_warmup()
 
-    def normalize_forward_metadata_for_dp_padding(
-        self, forward_batch: ForwardBatch
-    ) -> None:
-        self.dsa_backend.normalize_forward_metadata_for_dp_padding(forward_batch)
-        self.swa_backend.normalize_forward_metadata_for_dp_padding(forward_batch)
-
     def forward(
         self,
         q: torch.Tensor,
@@ -321,6 +437,7 @@ class DotsHybridAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
+        self.maybe_rebuild_metadata_after_dp_padding(forward_batch)
         return self.backend_for_layer(layer).forward(
             q, k, v, layer, forward_batch, save_kv_cache, **kwargs
         )

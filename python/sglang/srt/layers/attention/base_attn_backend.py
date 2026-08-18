@@ -33,23 +33,6 @@ class SharedReadEnds(Enum):
         return max(items, key=lambda x: x.value)
 
 
-def normalize_page_table_rows(
-    page_table: torch.Tensor, batch_size: int
-) -> torch.Tensor:
-    """Match a pre-planned page table to DP-normalized request rows."""
-    if page_table.shape[0] >= batch_size:
-        return page_table[:batch_size]
-    return torch.cat(
-        [
-            page_table,
-            page_table.new_zeros(
-                (batch_size - page_table.shape[0], page_table.shape[1])
-            ),
-        ],
-        dim=0,
-    )
-
-
 class AttentionBackend(ABC):
     """The base class of attention backends.
 
@@ -122,15 +105,6 @@ class AttentionBackend(ABC):
 
         Default: no-op.
         """
-
-    def normalize_forward_metadata_for_dp_padding(
-        self, forward_batch: ForwardBatch
-    ) -> None:
-        """Refresh metadata when speculative DP padding adds request rows.
-
-        Sparse backends retain their pre-planned schedules by default.
-        """
-        return None
 
     def draft_extend_metadata_captured_in_graph(self) -> bool:
         """True when :py:meth:`init_forward_metadata_in_graph` fully rebuilds

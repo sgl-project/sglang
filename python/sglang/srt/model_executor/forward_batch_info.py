@@ -514,9 +514,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
-    # Whether speculative DP padding was applied during initialization.
-    mlp_sync_prepared: bool = False
-
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
     num_token_non_padded_cpu: int = None
@@ -849,28 +846,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
             if model_runner.server_args.enable_lora:
                 model_runner.lora_manager.reset_lora_batch()
-            if (
-                ret.global_num_tokens_cpu is not None
-                and ret.spec_info is not None
-                and ret.spec_info.is_draft_input()
-            ):
-                from sglang.srt.speculative.spec_info import SpecInputType
-
-                ret.prepare_mlp_sync_batch(model_runner)
-                # Preserve the normalized idle shape across draft steps.
-                ret._original_batch_size = ret.batch_size
-                ret._original_num_tokens = ret.positions.shape[0]
-                # Idle batches need the same [N, topk, steps] layout as drafts.
-                if ret.spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT:
-                    draft_cache_rows = (
-                        ret.batch_size
-                        * ret.spec_info.num_tokens_per_req
-                        * model_runner.server_args.speculative_num_steps
-                    )
-                    if ret.out_cache_loc.shape[0] < draft_cache_rows:
-                        ret.out_cache_loc = ret._pad_tensor_to_size(
-                            ret.out_cache_loc, draft_cache_rows
-                        )
             return ret
 
         # Override the positions with diffusion LLM or spec_info
@@ -1502,7 +1477,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 child._pad_inputs_to_size(
                     model_runner, child.tbo_padded_len, child.batch_size
                 )
-        self.mlp_sync_prepared = True
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
         # padding
@@ -1643,7 +1617,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._pad_inputs_to_size(model_runner, tokens_padded, self.batch_size)
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
-        execution_num_tokens = self.positions.shape[0]
         if self._original_forward_mode is not None:
             self.forward_mode = self._original_forward_mode
         if self._original_batch_size is not None:
@@ -1663,12 +1636,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
-                # Retain scheduler- or DP-created dummy rows on idle ranks.
-                num_tokens = max(
-                    self.hidden_states_backup.shape[0],
-                    self._original_num_tokens or 0,
-                    execution_num_tokens if self._original_batch_size == 0 else 0,
-                )
+                num_tokens = self.hidden_states_backup.shape[0]
                 self.positions = self.positions[:num_tokens]
                 self.seq_lens = self.seq_lens[:bs]
                 self.req_pool_indices = self.req_pool_indices[:bs]
@@ -1696,17 +1664,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         :bs
                     ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
-            elif self.forward_mode.is_idle() and self.spec_info.is_draft_input():
-                # Draft workers consume normalized idle rows after DP sync.
-                num_tokens = max(
-                    self._original_num_tokens or 0,
-                    execution_num_tokens if self._original_batch_size == 0 else 0,
-                )
-                if logits_output.next_token_logits is not None:
-                    logits_output.next_token_logits = logits_output.next_token_logits[
-                        :num_tokens
-                    ]
-                logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
                 if logits_output.next_token_logits is not None:
                     logits_output.next_token_logits = logits_output.next_token_logits[
@@ -1730,9 +1687,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
-
-        # Re-pad reused eager draft batches on the next step.
-        self.mlp_sync_prepared = False
 
     @property
     def can_run_tbo(self):

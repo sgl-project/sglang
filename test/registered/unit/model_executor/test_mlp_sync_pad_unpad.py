@@ -130,7 +130,6 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual(fb.req_pool_indices.shape[0], padded)
         torch.testing.assert_close(fb.positions[:3], torch.tensor([6, 7, 8]))
 
-        fb.mlp_sync_prepared = True
         logits_output = _logits_output(padded)
         fb.post_forward_mlp_sync_batch(logits_output)
 
@@ -142,7 +141,6 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual(logits_output.next_token_logits.shape[0], 3)
         # Seeded sampling asserts positions rows == sampled (real) rows.
         self.assertEqual(fb.positions.shape[0], fb.batch_size)
-        self.assertFalse(fb.mlp_sync_prepared)
 
     def test_extend_post_forward_unpads_positions(self):
         fb = ForwardBatch(
@@ -203,34 +201,6 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         self.assertEqual(fb.extend_seq_lens_cpu, [4])
         self.assertEqual(fb.extend_prefix_lens_cpu, [0])
         self.assertEqual(fb.extend_logprob_start_lens_cpu, [0])
-
-    def test_empty_draft_keeps_normalized_dummy_logits(self):
-        spec_info = MagicMock()
-        spec_info.is_draft_input.return_value = True
-        fb = ForwardBatch(
-            forward_mode=ForwardMode.IDLE,
-            batch_size=1,
-            input_ids=torch.tensor([0]),
-            req_pool_indices=torch.tensor([0]),
-            seq_lens=torch.tensor([1]),
-            seq_lens_sum=1,
-            out_cache_loc=torch.tensor([0]),
-            positions=torch.tensor([0]),
-            seq_lens_cpu=torch.tensor([1]),
-            spec_info=spec_info,
-        )
-        # Simulate an idle rank with a retained scheduler dummy row.
-        fb._original_batch_size = 1
-        fb._original_num_tokens = 1
-        fb.hidden_states_backup = torch.empty((0, 8))
-        logits_output = SimpleNamespace(
-            next_token_logits=torch.randn(1, 16), hidden_states=torch.randn(1, 8)
-        )
-
-        fb.post_forward_mlp_sync_batch(logits_output)
-
-        self.assertEqual(logits_output.next_token_logits.shape[0], 1)
-        self.assertEqual(logits_output.hidden_states.shape[0], 1)
 
 
 if __name__ == "__main__":

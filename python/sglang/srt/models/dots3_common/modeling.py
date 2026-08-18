@@ -1015,13 +1015,19 @@ class Dots3AttentionMLA(nn.Module):
             backend = get_attn_backend()
             from sglang.srt.layers.attention.dots_hybrid_backend import (
                 DotsHybridAttnBackend,
+                DotsSWAMLAAttnBackend,
             )
 
+            if isinstance(backend, (DotsHybridAttnBackend, DotsSWAMLAAttnBackend)):
+                backend.maybe_rebuild_metadata_after_dp_padding(forward_batch)
             if isinstance(backend, DotsHybridAttnBackend):
                 backend = backend.selected_swa_backend(forward_batch)
             metadata = backend.forward_metadata
             swa_loc = metadata.swa_out_cache_loc
-            if swa_loc is None:
+            if (
+                swa_loc is None
+                or swa_loc.shape[0] != forward_batch.out_cache_loc.shape[0]
+            ):
                 swa_loc = get_token_to_kv_pool().translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
                 )

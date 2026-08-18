@@ -3119,21 +3119,6 @@ class FlashAttentionBackend(AttentionBackend):
         self.forward_metadata = metadata
         self.forward_metadata_spec_decode_expand = metadata_expand
 
-    def normalize_forward_metadata_for_dp_padding(
-        self, forward_batch: ForwardBatch
-    ) -> None:
-        """Rebuild eager metadata when DP padding changes the batch size."""
-        metadata = self.forward_metadata
-        page_table = metadata.page_table if metadata is not None else None
-        original_bs = forward_batch._original_batch_size
-        if (
-            original_bs is not None
-            and original_bs != forward_batch.batch_size
-            and page_table is not None
-            and page_table.shape[0] != forward_batch.batch_size
-        ):
-            self.init_forward_metadata(forward_batch)
-
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
