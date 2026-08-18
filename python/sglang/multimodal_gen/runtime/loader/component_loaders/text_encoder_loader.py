@@ -2,24 +2,31 @@ import dataclasses
 import glob
 import os
 import re
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
+from itertools import chain
 from typing import cast
 
 import torch
-import torch.distributed as dist
 from torch import nn
-from torch.distributed import init_device_mesh
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
+from sglang.multimodal_gen.configs.models import EncoderConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
 )
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    use_tensor_parallel_group,
+)
+from sglang.multimodal_gen.runtime.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
-from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
 from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
     skip_init_modules,
@@ -30,19 +37,116 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     pt_weights_iterator,
     safetensors_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    EncoderTensorParallelMixin,
+    TextEncoder,
+    finalize_encoder_folding,
+    get_folding_tp_group,
+)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_config,
     get_diffusers_component_config,
+    load_dict,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
+from sglang.multimodal_gen.runtime.utils.quantization_utils import get_quant_config
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
+
+
+def _configure_text_encoder_quantization(
+    model_config: EncoderConfig,
+    model_cls: type[nn.Module],
+    component_config: dict,
+    component_model_path: str,
+) -> None:
+    if getattr(model_cls, "manages_checkpoint_quantization", False):
+        # Preserve model-owned formats such as Ideogram's bitsandbytes state.
+        # Those models parse metadata, construct layers, and attach quant states
+        # themselves; running the generic lifecycle as well would process twice.
+        return
+
+    quant_config = get_quant_config(
+        component_config,
+        component_model_path,
+    )
+    model_config.quant_config = quant_config
+    if quant_config is None:
+        return
+    if not issubclass(model_cls, TextEncoder):
+        raise ValueError(
+            "A quantized text-encoder checkpoint requires an in-tree native "
+            "TextEncoder; "
+            f"got {model_cls.__name__}"
+        )
+    quant_method = quant_config.get_name()
+    supported_methods = model_cls.supported_checkpoint_quantization_methods
+    if quant_method not in supported_methods:
+        raise ValueError(
+            f"{model_cls.__name__} does not support text-encoder checkpoints "
+            f"quantized with {quant_method!r}; supported methods: "
+            f"{sorted(supported_methods)}"
+        )
+
+
+def _module_tensor_device(module: nn.Module) -> torch.device | None:
+    """Return the device of a module's own tensors.
+
+    Quantized linear layers are expected to keep their parameters and buffers
+    together.  Failing explicitly is safer than staging only part of a layer.
+    """
+
+    devices = {
+        tensor.device
+        for tensor in chain(
+            module.parameters(recurse=False),
+            module.buffers(recurse=False),
+        )
+    }
+    if len(devices) > 1:
+        raise ValueError(
+            f"Cannot stage {type(module).__name__} with tensors on multiple "
+            f"devices: {sorted(map(str, devices))}"
+        )
+    return next(iter(devices), None)
+
+
+def _process_quantized_text_encoder_weights(
+    model: nn.Module,
+    process_device: torch.device,
+) -> int:
+    processed_layers = 0
+    for module in model.modules():
+        if not isinstance(module, LinearBase):
+            continue
+        quant_method = module.quant_method
+        if quant_method is None or isinstance(quant_method, UnquantizedLinearMethod):
+            continue
+
+        origin_device = _module_tensor_device(module)
+        should_stage = origin_device is not None and origin_device != process_device
+        if should_stage:
+            module.to(process_device)
+        try:
+            quant_method.process_weights_after_loading(module)
+            processed_layers += 1
+        finally:
+            # Post-load methods may replace parameters or register buffers. Move
+            # the complete layer back so component residency remains authoritative.
+            if should_stage:
+                module.to(origin_device)
+    if processed_layers == 0:
+        raise ValueError(
+            "The text-encoder checkpoint declares quantization, but the model "
+            "did not construct any quantized linear layers"
+        )
+    return processed_layers
 
 
 class TextEncoderLoader(ComponentLoader):
@@ -66,33 +170,6 @@ class TextEncoderLoader(ComponentLoader):
 
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
-
-    def should_offload(self, server_args, model_config: ModelConfig | None = None):
-        should_offload = server_args.text_encoder_cpu_offload
-        if not should_offload:
-            return False
-        # _fsdp_shard_conditions is in arch_config, not directly on model_config
-        arch_config = (
-            getattr(model_config, "arch_config", model_config) if model_config else None
-        )
-        fsdp_shard_conditions = (
-            getattr(arch_config, "_fsdp_shard_conditions", []) if arch_config else []
-        )
-        use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
-        return use_cpu_offload
-
-    def customized_load_kwargs_for_component(
-        self, server_args: ServerArgs, component_name: str
-    ) -> dict[str, bool]:
-        if ComponentLoader._is_component_set_as_layerwise_load(
-            server_args, component_name
-        ):
-            logger.info(
-                "Loading %s on CPU first because it is selected for layerwise offload",
-                component_name,
-            )
-            return {"cpu_offload_flag": True}
-        return {}
 
     def load_native(
         self,
@@ -172,6 +249,7 @@ class TextEncoderLoader(ComponentLoader):
         model_name_or_path: str,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
+        key_filter: Callable[[str], bool] | None = None,
     ) -> tuple[str, list[str], bool]:
         """Prepare weights for the model.
 
@@ -204,7 +282,10 @@ class TextEncoderLoader(ComponentLoader):
 
         if use_safetensors:
             hf_weights_files = filter_duplicate_safetensors_files(
-                hf_weights_files, hf_folder, index_file
+                hf_weights_files,
+                hf_folder,
+                index_file,
+                key_filter=key_filter,
             )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
@@ -225,20 +306,39 @@ class TextEncoderLoader(ComponentLoader):
         self,
         source: "Source",
         to_cpu: bool,
+        key_filter: Callable[[str], bool] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """get an iterator for the model weights based on the load format."""
+        source_key_filter: Callable[[str], bool] | None
+        if key_filter is None:
+            source_key_filter = None
+        else:
+
+            def include_source_weight(name: str) -> bool:
+                return key_filter(source.prefix + name)
+
+            source_key_filter = include_source_weight
+
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
+            key_filter=source_key_filter,
         )
         if use_safetensors:
             weights_iterator = safetensors_weights_iterator(
                 hf_weights_files,
                 to_cpu=to_cpu,
+                key_filter=source_key_filter,
             )
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files, to_cpu=to_cpu)
+            if source_key_filter is not None:
+                weights_iterator = (
+                    (name, tensor)
+                    for name, tensor in weights_iterator
+                    if source_key_filter(name)
+                )
 
         # apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
@@ -249,6 +349,10 @@ class TextEncoderLoader(ComponentLoader):
         model_path: str,
         to_cpu: bool,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
+        key_filter = cast(
+            Callable[[str], bool] | None,
+            getattr(model, "should_materialize_checkpoint_weight", None),
+        )
         primary_weights = TextEncoderLoader.Source(
             model_path,
             prefix="",
@@ -258,6 +362,7 @@ class TextEncoderLoader(ComponentLoader):
         yield from self._get_weights_iterator(
             primary_weights,
             to_cpu,
+            key_filter,
         )
 
         secondary_weights = cast(
@@ -268,6 +373,7 @@ class TextEncoderLoader(ComponentLoader):
             yield from self._get_weights_iterator(
                 source,
                 to_cpu,
+                key_filter,
             )
 
     def load_customized(
@@ -275,7 +381,7 @@ class TextEncoderLoader(ComponentLoader):
         component_model_path: str,
         server_args: ServerArgs,
         component_name: str,
-        cpu_offload_flag: bool | None = None,
+        component_starts_on_cpu: bool | None = None,
     ):
         """Load the text encoders based on the model path, and inference args."""
         diffusers_pretrained_config = get_config(
@@ -293,6 +399,9 @@ class TextEncoderLoader(ComponentLoader):
 
         encoder_config = server_args.pipeline_config.text_encoder_configs[encoder_index]
         encoder_config.update_model_arch(model_config)
+        encoder_config.generation_config = load_dict(
+            os.path.join(component_model_path, "generation_config.json")
+        )
 
         if encoder_index == 0:
             for key, value in diffusers_pretrained_config.__dict__.items():
@@ -302,6 +411,27 @@ class TextEncoderLoader(ComponentLoader):
         )
         if post_diffusers_config_update is not None:
             post_diffusers_config_update()
+        model_cls, _ = ModelRegistry.resolve_model_cls(
+            getattr(encoder_config, "architectures", [])
+        )
+        _configure_text_encoder_quantization(
+            encoder_config,
+            model_cls,
+            model_config,
+            component_model_path,
+        )
+        # real dims are populated now; resolve fold vs replicate
+        finalize_encoder_folding(
+            encoder_config,
+            server_args.encoder_parallel,
+            prefer_dp=(
+                server_args.batching_max_size > 1
+                and (server_args.tp_size or 1) == 1
+                and (server_args.dp_size or 1) == 1
+                and issubclass(model_cls, TextEncoder)
+                and model_cls.supports_dp_encode
+            ),
+        )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
             encoder_index
         ]
@@ -311,7 +441,8 @@ class TextEncoderLoader(ComponentLoader):
             encoder_config,
             server_args,
             encoder_dtype,
-            cpu_offload_flag=cpu_offload_flag,
+            component_starts_on_cpu=component_starts_on_cpu,
+            component_name=component_name,
         )
 
     @staticmethod
@@ -342,39 +473,69 @@ class TextEncoderLoader(ComponentLoader):
         model_config: EncoderConfig,
         server_args: ServerArgs,
         dtype: str = "fp16",
-        cpu_offload_flag: bool | None = None,
+        component_starts_on_cpu: bool | None = None,
+        component_name: str = "text_encoder",
     ):
-        # Determine CPU offload behavior and target device
-
         local_torch_device = get_local_torch_device()
+        quant_config = model_config.quant_config
+        param_dtype = PRECISION_TO_TYPE[dtype]
+        if quant_config is not None:
+            if param_dtype not in quant_config.get_supported_act_dtypes():
+                raise ValueError(
+                    f"Text-encoder quantization method {quant_config.get_name()!r} "
+                    f"does not support activation dtype {param_dtype}"
+                )
+            if current_platform.is_mps():
+                raise ValueError(
+                    f"Text-encoder quantization method {quant_config.get_name()!r} "
+                    "is not supported on MPS"
+                )
+            if current_platform.is_cuda():
+                capability = current_platform.get_device_capability()
+                if (
+                    capability is not None
+                    and capability.to_int() < quant_config.get_min_capability()
+                ):
+                    raise ValueError(
+                        f"Text-encoder quantization method {quant_config.get_name()!r} "
+                        "requires CUDA compute capability "
+                        f">= {quant_config.get_min_capability() / 10:.1f}; got "
+                        f"{capability.to_int() / 10:.1f}"
+                    )
 
         if not current_platform.is_cpu():
-            fsdp_cpu_offload = self.should_offload(server_args, model_config)
-            should_offload = (
-                cpu_offload_flag if cpu_offload_flag is not None else fsdp_cpu_offload
+            component_starts_on_cpu = (
+                component_starts_on_cpu
+                if component_starts_on_cpu is not None
+                else server_args.should_start_component_on_cpu(component_name)
             )
         else:
-            fsdp_cpu_offload = False
-            should_offload = False
+            component_starts_on_cpu = False
 
         if (
             getattr(
                 model_config.arch_config, "requires_gpu_resident_text_encoder", False
             )
-            and should_offload
+            and component_starts_on_cpu
         ):
+            server_args.require_component_resident(
+                component_name, feature_name="bitsandbytes 4-bit text encoder"
+            )
             logger.warning(
                 "Keeping bitsandbytes 4-bit text encoder GPU-resident; CUDA "
                 "weights and quant states are required for this checkpoint."
             )
-            should_offload = False
+            component_starts_on_cpu = False
 
-        if should_offload and not current_platform.is_mps():
+        if component_starts_on_cpu and not current_platform.is_mps():
             model_device = torch.device("cpu")
         else:
             model_device = local_torch_device
 
-        with set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
+        encoder_tp_group = get_folding_tp_group(model_config)
+        with use_tensor_parallel_group(encoder_tp_group), set_default_torch_dtype(
+            PRECISION_TO_TYPE[dtype]
+        ):
             with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
@@ -388,37 +549,36 @@ class TextEncoderLoader(ComponentLoader):
                 model_config.enable_image_understanding = enable_image_understanding
                 model = model_cls(model_config)
 
+            if not isinstance(model, EncoderTensorParallelMixin):
+                raise TypeError(
+                    f"Native encoder {model_cls.__name__} must inherit "
+                    "EncoderTensorParallelMixin"
+                )
+            model.bind_encoder_tp_group(encoder_tp_group)
+
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
                 self._get_all_weights(
                     model,
                     model_path,
-                    to_cpu=should_offload,
+                    to_cpu=component_starts_on_cpu,
                 )
             )
 
-            if should_offload:
-                # Disable FSDP for MPS as it's not compatible
+            if quant_config is not None:
+                processed_layers = _process_quantized_text_encoder_weights(
+                    model,
+                    local_torch_device,
+                )
+                logger.info(
+                    "Processed %d %s text-encoder linear layers",
+                    processed_layers,
+                    quant_config.get_name(),
+                )
+
+            if component_starts_on_cpu:
                 if current_platform.is_mps():
-                    logger.info(
-                        "Disabling FSDP sharding for MPS platform as it's not compatible"
-                    )
                     model = model.to(local_torch_device)
-                elif fsdp_cpu_offload:
-                    mesh = init_device_mesh(
-                        current_platform.device_type,
-                        mesh_shape=(1, dist.get_world_size()),
-                        mesh_dim_names=("offload", "replicate"),
-                    )
-                    shard_model(
-                        model,
-                        cpu_offload=True,
-                        reshard_after_forward=True,
-                        mesh=mesh["offload"],
-                        fsdp_shard_conditions=model_config.arch_config._fsdp_shard_conditions
-                        or getattr(model, "_fsdp_shard_conditions", None),
-                        pin_cpu_memory=server_args.pin_cpu_memory,
-                    )
                 else:
                     model = model.to("cpu")
             else:

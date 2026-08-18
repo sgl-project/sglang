@@ -6,34 +6,68 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs_func as assign_extend_cache_locs_func,
+)
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
-from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
+from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
+    GrammarTree,
+    build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
-    generate_token_bitmask,
     move_accept_tokens_to_target_kvcache,
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_extend_cache_locs_func as assign_extend_cache_locs_func,
-)
+from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
+
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
 
 USE_FULL_MASK = True
+
+
+def _derive_tree_links(
+    mask: np.ndarray, bs: int, draft_token_num: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Host-side (retrive_next_token, retrive_next_sibling), matching what
+    reconstruct_indices_from_tree_mask produces on device.
+
+    ``mask[b, i, j]`` marks node j as an ancestor of node i, so i's immediate parent
+    is the largest such j < i, and both links follow from the parents alone.
+    """
+    tree = mask.reshape(bs, draft_token_num, draft_token_num)
+    node_order = np.arange(draft_token_num)
+    ancestors = tree & (node_order < node_order[:, None])
+    parents = np.where(ancestors.any(-1), (ancestors * node_order).argmax(-1), -1)
+
+    next_token = np.full((bs, draft_token_num), -1, dtype=np.int64)
+    next_sibling = np.full((bs, draft_token_num), -1, dtype=np.int64)
+    for b in range(bs):
+        # Descending scan, so every k > i is already recorded when i is reached.
+        earliest_child_of = {}
+        for i in reversed(range(draft_token_num)):
+            next_token[b, i] = earliest_child_of.get(i, -1)
+            parent = int(parents[b, i])
+            if parent >= 0:
+                next_sibling[b, i] = earliest_child_of.get(parent, -1)
+                earliest_child_of[parent] = i
+    return torch.from_numpy(next_token), torch.from_numpy(next_sibling)
 
 
 class NGRAMWorker(BaseSpecWorker):
@@ -49,20 +83,18 @@ class NGRAMWorker(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         self.server_args = server_args
         self.enable_overlap = not server_args.disable_overlap_schedule
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.tp_rank = tp_rank
-        self.page_size = server_args.page_size
+        self.tp_rank = ps.tp_rank
+        self.page_size = get_schedule().page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
@@ -93,12 +125,13 @@ class NGRAMWorker(BaseSpecWorker):
         self.speculative_num_steps = server_args.speculative_num_steps
         # req_to_token_pool / token_to_kv_pool_allocator are set in
         # alloc_memory_pool(), after the target pools are allocated.
-        self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
+        self.device = server_args.device
 
         self.adaptive_controller = None
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
+        self.grammar_tree_host: Optional[tuple] = None
 
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
@@ -157,10 +190,6 @@ class NGRAMWorker(BaseSpecWorker):
         self._precomputed_cache_all_total_ct = 0
         self._bonus_prediction_last1000 = deque(maxlen=1000)
         self._precomputed_cache_last1000 = deque(maxlen=1000)
-
-    @property
-    def target_worker(self) -> TpModelWorker:
-        return self._target_worker
 
     @property
     def draft_worker(self) -> Optional[EagleDraftWorkerBase]:
@@ -582,47 +611,61 @@ class NGRAMWorker(BaseSpecWorker):
         bs = len(batch.reqs)
         stride = self.draft_token_num
 
-        prev_token_ids, prev_accept_lens = (
-            batch.spec_info.accept_tokens,
-            batch.spec_info.accept_lens,
-        )
-        if not prev_token_ids.is_cpu:
-            prev_token_ids = prev_token_ids.cpu()
-            prev_accept_lens = prev_accept_lens.cpu()
-        # In the ordinary path these tokens also update the online trie. With
-        # precompute they are used only to build the next precompute context.
-        self.prev_token_ids = prev_token_ids.tolist()
-        self.prev_accept_lens = prev_accept_lens.tolist()
-
-        self.ngram_corpus.synchronize()
-        req_ids = []
-        batch_tokens = []
-        total_lens = []
-        assert len(batch.reqs) == len(self.prev_accept_lens)
         # Overlap mode processes results one iteration behind, so the last
         # round's accepted tokens are not yet in req.output_ids and must be
         # spliced in from spec_info. Sync mode and grammar batches process
         # results before the next draft prep, so output_ids is already
         # complete and splicing would duplicate the tail.
-        use_prev_tokens = self.enable_overlap and not batch.has_grammar
-        i = 0
-        for req in batch.reqs:
+        use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
+
+        # Accept-independent prep, hoisted above the blocking .cpu() below.
+        req_ids = [req.rid for req in batch.reqs]
+        # Only the last max_trie_depth tokens can match; the ids are
+        # array.array, so list() the tails for list concat below.
+        input_tails = [
+            list(req.origin_input_ids[-self.max_trie_depth :]) for req in batch.reqs
+        ]
+        output_tails = [
+            list(req.output_ids[-self.max_trie_depth :]) for req in batch.reqs
+        ]
+        base_lens = [
+            len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs
+        ]
+
+        if use_prev_tokens:
+            prev_token_ids, prev_accept_lens = (
+                batch.spec_info.accept_tokens,
+                batch.spec_info.accept_lens,
+            )
+            if not prev_token_ids.is_cpu:
+                prev_token_ids = prev_token_ids.cpu()
+                prev_accept_lens = prev_accept_lens.cpu()
+            # Worker-level staging: written here at draft prep, consumed by
+            # _update_ngram_corpus after verify within the same forward call.
+            self.prev_token_ids = prev_token_ids.tolist()
+            self.prev_accept_lens = prev_accept_lens.tolist()
+            assert bs == len(self.prev_accept_lens)
+        else:
+            # _update_ngram_corpus still reads the staging; fill it empty.
+            self.prev_token_ids = []
+            self.prev_accept_lens = [0] * bs
+
+        self.ngram_corpus.synchronize()
+        batch_tokens = []
+        total_lens = []
+        for i in range(bs):
             prev_tokens = (
                 self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
                 if use_prev_tokens
                 else []
             )
             check_token = self._efficient_concat_last_n(
-                list(req.origin_input_ids),
-                list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,
+                input_tails[i],
+                output_tails[i] + prev_tokens,
                 self.max_trie_depth,
             )
-            req_ids.append(req.rid)
             batch_tokens.append(check_token)
-            i += 1
-            total_lens.append(
-                len(req.origin_input_ids) + len(req.output_ids) + len(prev_tokens)
-            )
+            total_lens.append(base_lens[i] + len(prev_tokens))
         req_drafts, mask = self.ngram_corpus.batch_get(
             req_ids, batch_tokens, total_lens
         )
@@ -654,15 +697,24 @@ class NGRAMWorker(BaseSpecWorker):
             batch, draft_tokens, tree_mask
         )
         if not used_precomputed_drafts:
+            # Pre-sync: only needs seq_lens_cpu, so build before the blocking
+            # accept sync inside _prepare_draft_tokens.
+            ones_masks = None
+            if USE_FULL_MASK and not _is_cpu:
+                ones_masks = [
+                    torch.ones(
+                        (self.draft_token_num, batch.seq_lens_cpu[i]),
+                        device=self.device,
+                    )
+                    for i in range(bs)
+                ]
+
             req_drafts, mask = self._prepare_draft_tokens(batch)
-
-            if self.enable_precompute:
-                # Bootstrap precompute from the ordinary batch_get tree.
-                self._precomputed_draft_tokens_np = req_drafts.copy()
-                self._precomputed_tree_mask_np = mask.copy()
-
             tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
             draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
+
+        # Staged for the grammar bitmask, derived after the verify launch below.
+        self.grammar_tree_host = (mask, req_drafts) if batch.has_grammar else None
 
         # generate positions and some indices using tree_mask
         reconstruct_indices_from_tree_mask(
@@ -676,29 +728,27 @@ class NGRAMWorker(BaseSpecWorker):
             self.draft_token_num,
         )
 
+        # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
+        # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
         # Precompute keeps the compact tree mask for FA3/FA4's cascade page-table
         # builder. The legacy path still materializes the backend-agnostic full mask.
         is_compact_mask = self.enable_precompute
-        if USE_FULL_MASK and not is_compact_mask:
-            compact_tree_mask = tree_mask.reshape(
-                bs, self.draft_token_num, self.draft_token_num
-            )
-            full_tree_mask = []
+        if USE_FULL_MASK and not _is_cpu and not is_compact_mask:
+            tree_mask = []
+            mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
             for i in range(bs):
-                seq_len = batch.seq_lens_cpu[i]
-                req_mask = torch.ones(
-                    (self.draft_token_num, seq_len), device=self.device
-                )
                 req_mask = torch.cat(
                     (
-                        req_mask,
-                        compact_tree_mask[i],
+                        ones_masks[i],
+                        torch.from_numpy(mask[i]).to(
+                            device=self.device, non_blocking=True
+                        ),
                     ),
                     dim=1,
                 ).to(torch.bool)
-                full_tree_mask.append(req_mask.flatten())
-            tree_mask = torch.cat(full_tree_mask, dim=0)
+                tree_mask.append(req_mask.flatten())
+            tree_mask = torch.cat(tree_mask, dim=0)
 
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.input_ids = draft_tokens
@@ -728,11 +778,14 @@ class NGRAMWorker(BaseSpecWorker):
     def _update_ngram_corpus(self, batch: ScheduleBatch):
         batch_tokens = []
         i, stride = 0, self.draft_token_num
-        # Precompute accepts a one-iteration-lagged online trie so this update
-        # never needs the previous verify result. The ordinary NGRAM path keeps
-        # the original splice and its fresher corpus.
+        # Same splice condition as _prepare_draft_tokens: only overlap mode
+        # has accepted tokens missing from req.output_ids.
+        # In precompute fully overlap mode, we can accept some output ids are
+        # lagged behind in order to delay the sync.
         use_prev_tokens = (
-            self.enable_overlap and not self.enable_precompute and not batch.has_grammar
+            self.enable_overlap
+            and not self.enable_precompute
+            and not batch.grammar_needs_sync()
         )
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
@@ -746,7 +799,7 @@ class NGRAMWorker(BaseSpecWorker):
                 else []
             )
             put_ids = self._efficient_concat_last_n(
-                list(req.origin_input_ids),
+                list(req.origin_input_ids[-self.max_trie_depth :]),
                 list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,
                 self.max_trie_depth,
             )
@@ -874,14 +927,6 @@ class NGRAMWorker(BaseSpecWorker):
         accept_lens = torch.ones(bs, dtype=torch.int32, device=self.device)
 
         if batch.forward_mode.is_target_verify():
-            # Prepare grammar data on CPU if needed
-            if batch.has_grammar:
-                retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
-                retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
-                draft_tokens_cpu = verify_input.draft_token.view(
-                    verify_input.retrieve_next_token.shape
-                ).cpu()
-
             batch_result = self.target_worker.forward_batch_generation(
                 batch, is_verify=True
             )
@@ -892,25 +937,26 @@ class NGRAMWorker(BaseSpecWorker):
             )
 
             verify_input: NgramVerifyInput = batch.spec_info
-            vocab_mask = None
+            grammar_mask = None
             if batch.has_grammar:
-                # Generate the logit mask for structured output.
-                # Overlap the CPU operations for bitmask generation with the forward pass.
-                vocab_mask = generate_token_bitmask(
-                    batch.reqs,
-                    verify_input,
-                    retrieve_next_token_cpu,
-                    retrieve_next_sibling_cpu,
-                    draft_tokens_cpu,
-                    batch.sampling_info.vocab_size,
+                # From the host tree rather than the device output: no readback to
+                # wait on, and deriving here keeps it under the verify forward.
+                mask, req_drafts = self.grammar_tree_host
+                retrieve_next_token_cpu, retrieve_next_sibling_cpu = _derive_tree_links(
+                    mask, bs, self.draft_token_num
                 )
-
-                if vocab_mask is not None:
-                    assert verify_input.grammar is not None
-                    vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
-                    # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
-                    # and will be applied to produce wrong results
-                    batch.sampling_info.vocab_mask = None
+                grammar_mask = build_grammar_vocab_mask(
+                    reqs=batch.reqs,
+                    tree=GrammarTree.from_host(
+                        retrieve_next_token_cpu,
+                        retrieve_next_sibling_cpu,
+                        torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),
+                    ),
+                    sampling_info=batch.sampling_info,
+                    device=verify_input.retrieve_next_token.device,
+                    # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
+                    barrier=None,
+                )
 
             # Sample
             maybe_detect_nan(
@@ -923,7 +969,7 @@ class NGRAMWorker(BaseSpecWorker):
                 predict,
                 accept_lens,
                 accept_index,
-            ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+            ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,
@@ -945,15 +991,11 @@ class NGRAMWorker(BaseSpecWorker):
                 self.token_to_kv_pool_allocator,
             )
             if batch.return_logprob:
-                # The last arg is the accept_index row width minus 1. NGRAM's
-                # accept_index is (bs, draft_token_num) -- the tree depth is not
-                # bounded by spec_steps like EAGLE's (bs, spec_steps + 1).
-                compute_spec_v2_logprobs(
+                compute_spec_logprobs(
                     batch,
                     logits_output,
                     predict,
-                    accept_index,
-                    self.draft_token_num - 1,
+                    accept_index=accept_index,
                 )
 
             if on_publish is not None:

@@ -5,8 +5,12 @@ from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 import torch
 import torch.nn as nn
 
-from sglang.jit_kernel.dsv4 import linear_bf16_fp32, triton_create_paged_compress_data
-from sglang.jit_kernel.dsv4.compress_old import (
+from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.attention.dsv4 import (
+    linear_bf16_fp32,
+    triton_create_paged_compress_data,
+)
+from sglang.kernels.ops.attention.dsv4.compress_old import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
@@ -14,16 +18,14 @@ from sglang.jit_kernel.dsv4.compress_old import (
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
-from sglang.srt.layers.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
-)
-from sglang.srt.layers.dp_attention import get_attention_cp_size
+from sglang.srt.layers.cp.utils import cp_materialize_global_token_order
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
-from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_finish,
+    cp_all_gather_rerange_launch,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
 )
@@ -31,15 +33,9 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_npu, set_weight_attrs
+from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_tgemm = None
-if _use_aiter:
-    from aiter.tuned_gemm import tgemm
-
-    _tgemm = tgemm
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -106,7 +102,7 @@ class CompressorBackendMixin:
             if not is_paged:
                 raise NotImplementedError("HIP fused compressor expects paged metadata")
 
-            from sglang.srt.layers.attention.dsv4.fused_compress_triton import (
+            from sglang.kernels.ops.attention.dsv4.fused_compress_triton import (
                 hip_compress_forward,
                 hip_compress_fused_norm_rope_hadamard_inplace,
                 hip_compress_fused_norm_rope_inplace,
@@ -185,15 +181,12 @@ class CompressorBackendMixin:
         )
         if out_loc.shape[0] > new_compressed_kv.shape[0]:
             out_loc = out_loc[: new_compressed_kv.shape[0]]
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            token_to_kv_pool.set_extra_key_buffer_fused(
-                layer_id=layer_id,
-                loc=out_loc,
-                cache_k=new_compressed_kv,
-            )
-        else:
-            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
-            token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
+
+        token_to_kv_pool.set_extra_key_buffer_fused(
+            layer_id=layer_id,
+            loc=out_loc,
+            cache_k=new_compressed_kv,
+        )
 
     def forward_indexer_compressor(
         self,
@@ -217,21 +210,11 @@ class CompressorBackendMixin:
                 loc=out_loc,
                 cache_k=new_compressed_kv,
             )
-        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        else:
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
                 loc=out_loc,
                 cache_k=new_compressed_kv,
-            )
-        else:
-            new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
-                new_compressed_kv
-            )
-            token_to_kv_pool.set_index_k_scale_buffer(
-                layer_id=layer_id,
-                loc=out_loc,
-                index_k=new_compressed_kv_fp8,
-                index_k_scale=new_compressed_kv_scale,
             )
 
 
@@ -287,10 +270,13 @@ def create_paged_compressor_data(
 
     def get_raw_loc(positions: torch.Tensor) -> torch.Tensor:
         positions = positions.masked_fill(positions < 0, 0)
-        loc = req_to_token[req_pool_indices, positions]
-        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)
-        swa_pages = swa_loc // swa_page_size
-        state_loc = swa_pages * ring_size + swa_loc % ring_size
+        if compress_ratio == 128:
+            state_loc = req_pool_indices * ring_size + positions % ring_size
+        else:
+            loc = req_to_token[req_pool_indices, positions]
+            swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)
+            swa_pages = swa_loc // swa_page_size
+            state_loc = swa_pages * ring_size + swa_loc % ring_size
         return (state_loc // compress_ratio).to(torch.int32)
 
     is_overlap = is_overlap_compress(compress_ratio)
@@ -345,7 +331,7 @@ def create_paged_compressor_data(
     return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
 
 
-class Compressor(MultiPlatformOp):
+class Compressor(BaseFusedOp):
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -422,19 +408,44 @@ class Compressor(MultiPlatformOp):
         assert isinstance(ret, CompressStatePool)
         return ret
 
+    def _pending_key(self):
+        return ("kv_score", self.layer_id, self.is_in_indexer)
+
+    def prelaunch_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
+        """Compute kv_score and start its CP all-gather, without waiting.
+
+        kv_score only needs `x`, which the attention already has at entry, so the
+        gather can be issued before the q/kv projections and collected later in
+        compute_kv_score -- that projection work is what hides it. Caller must
+        guarantee a matching compute_kv_score in the same op (see
+        DeepseekV4Attention._forward_prepare).
+        """
+        if not _is_hip:
+            return
+        comm_stream = getattr(forward_batch, "_cp_prefetch_comm_stream", None)
+        if comm_stream is None or not dsa_use_prefill_cp(forward_batch):
+            return
+        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        # Keyed by forward_batch: each TBO ubatch carries its own, so the two
+        # ubatches cannot collect each other's gather.
+        pending = forward_batch.__dict__.setdefault("_cp_pending_gathers", {})
+        pending[self._pending_key()] = cp_all_gather_rerange_launch(
+            kv_score, get_parallel().attn_cp_size, comm_stream, self._pending_key()
+        )
+
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        if _tgemm is not None and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
-            # v1 compress goes through fused_compress_triton, which promotes
-            # bf16->fp32 internally, so skip the .float() cast.
-            kv_score = _tgemm.mm(x, self.wkv_gate.weight, otype=x.dtype)
-        else:
-            kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        if _is_hip:
+            pending = getattr(forward_batch, "_cp_pending_gathers", None)
+            handle = pending.pop(self._pending_key(), None) if pending else None
+            if handle is not None:
+                return cp_all_gather_rerange_finish(handle)
+
+        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
-            kv_score = cp_all_gather_rerange_output(
+            kv_score = cp_materialize_global_token_order(
                 kv_score,
-                get_parallel().attn_cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
@@ -479,17 +490,10 @@ class Compressor(MultiPlatformOp):
             return x.new_empty(0, self.head_dim)
 
         if dsa_use_prefill_cp(forward_batch):
-            x = cp_all_gather_rerange_output(
+            x = cp_materialize_global_token_order(
                 x,
-                get_attention_cp_size(),
                 forward_batch,
                 torch.cuda.current_stream(),
             )
 
         return get_attn_backend().forward_compress(self, x, forward_batch)
-
-
-if _is_hip and not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
-    from sglang.srt.layers.attention.dsv4.compress_hip import (  # noqa: F811
-        CompressorHip as Compressor,
-    )

@@ -94,7 +94,7 @@ class TestInputEmbedsChunkedAndRetract(CustomTestCase):
                     "--disable-radix-cache",
                     "--chunked-prefill-size",
                     str(CHUNKED_PREFILL_SIZE),
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "4",
                 ],
             )

@@ -22,10 +22,14 @@ Current coverage:
 
 import asyncio
 import dataclasses
+import json
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.entrypoints import http_server
+from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -33,7 +37,28 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _call_server_info_with(server_args: ServerArgs) -> dict:
+def _stub_tokenizer_manager(
+    server_args: ServerArgs, get_internal_state=None
+) -> TokenizerManager:
+    """A manager carrying the state `/server_info` and its writers read.
+
+    `__new__` skips `__init__`, which would open the ZMQ sockets and start
+    the handle loop.
+    """
+    tokenizer_manager = TokenizerManager.__new__(TokenizerManager)
+    tokenizer_manager.server_args = server_args
+    tokenizer_manager.model_path = server_args.model_path
+    tokenizer_manager.served_model_name = server_args.served_model_name
+    tokenizer_manager.startup_time = None
+    tokenizer_manager.get_internal_state = get_internal_state
+    return tokenizer_manager
+
+
+def _call_server_info_with(
+    server_args: ServerArgs,
+    internal_states: list[dict] | None = None,
+    config_updates: dict | None = None,
+) -> dict:
     """Invoke `http_server.server_info()` against a stub global state.
 
     Bypasses the FastAPI HTTP layer (no TestClient): the handler is an
@@ -41,25 +66,37 @@ def _call_server_info_with(server_args: ServerArgs) -> dict:
     `SimpleNamespace` stub via `set_global_state` and awaiting the
     coroutine directly is enough to exercise the handler logic without
     booting a model server.
+
+    `config_updates` are applied the way production applies them -- through
+    `record_config_updates`, in a process that has published -- rather than
+    planted on the stub. The endpoint answers the record and does not read that
+    log, so what the real writer buys is that an assertion on the record is not
+    satisfied for free by an update that never landed.
     """
 
     async def _fake_internal_state():
-        return [{"max_req_input_len": 1024}]
+        return internal_states or [{"max_req_input_len": 1024}]
 
+    tokenizer_manager = _stub_tokenizer_manager(server_args, _fake_internal_state)
     stub_state = SimpleNamespace(
-        tokenizer_manager=SimpleNamespace(
-            server_args=server_args,
-            get_internal_state=_fake_internal_state,
-        ),
+        tokenizer_manager=tokenizer_manager,
         scheduler_info={"max_req_input_len": 1024},
     )
     prior_state = http_server.get_global_state()
     http_server.set_global_state(stub_state)
+    published = False
+    if config_updates:
+        # The writer runs in a published process, as it does in production.
+        publish(server_args, role="tokenizer")
+        published = True
+        tokenizer_manager.record_config_updates("test", **config_updates)
     try:
         return asyncio.run(http_server.server_info())
     finally:
         # Restore so a later test in the same process isn't surprised.
         http_server._global_state = prior_state
+        if published:
+            reset_context()
 
 
 class TestServerInfoKvEventsField(CustomTestCase):
@@ -229,6 +266,39 @@ class TestServerInfoKvEventsField(CustomTestCase):
                 self.assertIsNone(info["kv_events"])
 
 
+class TestServerInfoControlPlaneUpdates(CustomTestCase):
+    """/server_info answers what was asked for, not what is in effect."""
+
+    def test_the_readback_reports_the_record_not_the_control_plane(self):
+        # A runtime weight-version change is reported by /model_info and its
+        # gRPC / Engine twins; this endpoint reports what the operator supplied.
+        server_args = ServerArgs(model_path="dummy", weight_version="v1")
+        payload = _call_server_info_with(
+            server_args, config_updates={"weight_version": "v2"}
+        )
+        self.assertEqual(payload["weight_version"], "v1")
+        self.assertEqual(server_args.weight_version, "v1")
+
+    def test_the_recorded_update_reaches_the_readback_overlay(self):
+        """The update the case above records is one `/server_info` could see.
+
+        `resolved_config_dict` is the overlay the endpoint dropped; an update
+        that never reached it would satisfy the assertion above for free.
+        """
+        server_args = ServerArgs(model_path="dummy", weight_version="v1")
+        tokenizer_manager = _stub_tokenizer_manager(server_args)
+        publish(server_args, role="tokenizer")
+        try:
+            tokenizer_manager.record_config_updates("test", weight_version="v2")
+            self.assertEqual(tokenizer_manager.config_value("weight_version"), "v2")
+            overlaid = tokenizer_manager.resolved_config_dict(
+                dataclasses.asdict(server_args)
+            )
+            self.assertEqual(overlaid["weight_version"], "v2")
+        finally:
+            reset_context()
+
+
 class TestServerInfoExistingFieldsPreserved(CustomTestCase):
     """Regression guard: the new `kv_events` field is additive — none of
     the fields existing consumers depend on may be silently dropped.
@@ -290,6 +360,31 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
         # And the new structured block is separately present:
         self.assertIn("kv_events", info)
         self.assertIsNotNone(info["kv_events"])
+
+    def test_lora_refs_are_json_serializable_dicts(self):
+        lora_ref = LoRARef(
+            lora_id="lora-id",
+            lora_name="adapter",
+            lora_path="/tmp/adapter",
+            pinned=True,
+        )
+        args = ServerArgs(model_path="dummy")
+        args.lora_paths = [lora_ref]
+
+        info = _call_server_info_with(
+            args,
+            internal_states=[{"lora_paths": [lora_ref]}],
+        )
+
+        expected = {
+            "lora_id": "lora-id",
+            "lora_name": "adapter",
+            "lora_path": "/tmp/adapter",
+            "pinned": True,
+        }
+        self.assertEqual(info["lora_paths"], [expected])
+        self.assertEqual(info["internal_states"][0]["lora_paths"], [expected])
+        json.dumps(info)
 
 
 if __name__ == "__main__":

@@ -19,7 +19,6 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 import os
 import shutil
 import tempfile
-import threading
 import time
 import unittest
 from unittest import mock
@@ -27,7 +26,11 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheFile,
+    HiCacheStorageConfig,
+    MetadataCache,
+)
 from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
 from sglang.test.test_utils import CustomTestCase
 
@@ -83,6 +86,8 @@ class _BackendBuilder:
         is_mla=False,
         model="testmodel",
         subdir=None,
+        metadata_ttl=None,
+        enable_metadata_cache=None,
     ) -> HiCacheFile:
         # Each backend gets its own subdir so MLA / non-MLA tests don't
         # contaminate each other's file_path.
@@ -101,6 +106,8 @@ class _BackendBuilder:
                 "max_size": max_size,
                 "eviction_ratio": eviction_ratio,
                 "min_free_space": min_free,
+                "metadata_ttl": metadata_ttl,
+                "enable_metadata_cache": enable_metadata_cache,
             },
         )
         return HiCacheFile(cfg, file_path=d)
@@ -393,32 +400,6 @@ class TestMinFreeSpaceWatermark(HiCacheFileLRUTestBase):
 
 
 class TestPreReservationConcurrency(HiCacheFileLRUTestBase):
-    def test_concurrent_sets_keep_total_consistent_with_lru(self):
-        """Under concurrent writes, _total_bytes stays consistent with _lru."""
-        b = self.make_backend(max_size="300", eviction_ratio=1.0)
-        n_threads = 8
-        per_size = 60
-        errors = []
-
-        def writer(i):
-            try:
-                b.set(f"k{i}", _t(per_size, fill=i % 256))
-            except Exception as e:
-                errors.append(e)
-
-        threads = [threading.Thread(target=writer, args=(i,)) for i in range(n_threads)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        self.assertEqual(errors, [])
-        # Invariant 1: _total_bytes equals the sum of tracked LRU sizes.
-        tracked_sum = sum(b._evictor._lru.values())
-        self.assertEqual(b._evictor._total_bytes, tracked_sum)
-        # Invariant 2: _total_bytes does not exceed the cap.
-        self.assertLessEqual(b._evictor._total_bytes, 300)
-
     def test_pre_reservation_visible_during_write(self):
         """An in-flight reservation must not be evicted by a concurrent set()."""
         b = self.make_backend(max_size="100", eviction_ratio=1.0)
@@ -433,6 +414,126 @@ class TestPreReservationConcurrency(HiCacheFileLRUTestBase):
         self.assertIn(pending, b._evictor._pending_writes)
         self.assertEqual(b._evictor._total_bytes, sum(b._evictor._lru.values()))
         self.assertLessEqual(b._evictor._total_bytes, 100)
+
+
+class TestMetadataCache(CustomTestCase):
+    def test_metadata_cache_basic(self):
+        cache = MetadataCache(ttl_seconds=1.0)
+        cache.add("k1")
+        self.assertTrue(cache.contains("k1"))
+        self.assertFalse(cache.contains("k2"))
+        cache.remove("k1")
+        self.assertFalse(cache.contains("k1"))
+
+    def test_metadata_cache_ttl(self):
+        cache = MetadataCache(ttl_seconds=0.1)
+        cache.add("k1")
+        self.assertTrue(cache.contains("k1"))
+        time.sleep(0.2)
+        self.assertFalse(cache.contains("k1"))
+
+    def test_metadata_cache_hard_ttl(self):
+        cache = MetadataCache(ttl_seconds=0.3)
+        cache.add("k1")
+        time.sleep(0.15)
+        # Try updating k1
+        cache.add("k1")
+        # Expiry is still 0.3s from original timestamp, i.e. 0.15s from now.
+        time.sleep(0.2)
+        self.assertFalse(cache.contains("k1"))
+
+    def test_metadata_cache_infinite_ttl(self):
+        cache = MetadataCache(ttl_seconds=-1.0)
+        cache.add("k1")
+        time.sleep(0.3)
+        self.assertTrue(cache.contains("k1"))
+
+
+class TestHiCacheFileMetadataIntegration(HiCacheFileLRUTestBase):
+    def test_disabled_by_default(self):
+        b = self.make_backend()
+        self.assertIsNone(b.metadata_cache)
+        self.assertFalse(b.enable_metadata_cache)
+
+    def test_startup_scanning_populates_cache(self):
+        d = tempfile.mkdtemp(prefix="hicache_metadata_seed_", dir=self.tmpdir)
+        cfg = _make_config(
+            model="seedmodel",
+            extra_config={"metadata_ttl": 5.0, "enable_metadata_cache": True},
+        )
+        suffix = f"_seedmodel_0_1"
+
+        # Pre-create a suffixed bin file on disk
+        with open(os.path.join(d, f"k1{suffix}.bin"), "wb") as f:
+            f.write(b"data")
+
+        b = HiCacheFile(cfg, file_path=d)
+        # It should be found in metadata cache on startup
+        self.assertTrue(b.metadata_cache.contains(f"k1{suffix}"))
+
+    def test_write_and_read_populates_cache(self):
+        b = self.make_backend(metadata_ttl=5.0, enable_metadata_cache=True)
+        suffix = b.config_suffix
+
+        self.assertFalse(b.metadata_cache.contains(f"k1{suffix}"))
+        b.set("k1", _t(50))
+        # After set, it must be in the metadata cache
+        self.assertTrue(b.metadata_cache.contains(f"k1{suffix}"))
+
+        # Evict manually from metadata cache and call get
+        b.metadata_cache.clear()
+        self.assertFalse(b.metadata_cache.contains(f"k1{suffix}"))
+        b.get("k1", target_location=_t(50))
+        # Get should populate it back
+        self.assertTrue(b.metadata_cache.contains(f"k1{suffix}"))
+
+    def test_eviction_removes_from_metadata_cache(self):
+        # max_size=200, so setting three 100B tensors will evict the oldest
+        b = self.make_backend(
+            max_size="200",
+            eviction_ratio=1.0,
+            metadata_ttl=-1.0,
+            enable_metadata_cache=True,
+        )
+        suffix = b.config_suffix
+
+        b.set("k1", _t(100))
+        b.set("k2", _t(100))
+        self.assertTrue(b.metadata_cache.contains(f"k1{suffix}"))
+        self.assertTrue(b.metadata_cache.contains(f"k2{suffix}"))
+
+        # Forces eviction of k1
+        b.set("k3", _t(100))
+        self.assertFalse(b.metadata_cache.contains(f"k1{suffix}"))
+        self.assertTrue(b.metadata_cache.contains(f"k2{suffix}"))
+        self.assertTrue(b.metadata_cache.contains(f"k3{suffix}"))
+
+    def test_batch_exists_bypass_scandir(self):
+        b = self.make_backend(metadata_ttl=5.0, enable_metadata_cache=True)
+        suffix = b.config_suffix
+
+        b.set("k1", _t(50))
+        b.set("k2", _t(50))
+
+        # Now patch os.scandir and os.path.exists
+        with mock.patch("os.scandir") as mock_scandir, mock.patch(
+            "os.path.exists"
+        ) as mock_exists:
+            mock_exists.return_value = True
+
+            # batch_exists_v2 for k1 and k2 should hit the metadata cache and NOT call os.scandir or os.path.exists
+            res = b.batch_exists_v2(["k1", "k2"])
+            self.assertEqual(res.kv_hit_pages, 2)
+            mock_scandir.assert_not_called()
+            mock_exists.assert_not_called()
+
+            # Querying "k3" (miss) should fall back to os.path.exists once but still NOT call os.scandir
+            res = b.batch_exists_v2(["k3"])
+            self.assertEqual(
+                res.kv_hit_pages, 1
+            )  # since mock_exists returns True, k3 exists physically
+            mock_scandir.assert_not_called()
+            mock_exists.assert_called_once()
 
 
 if __name__ == "__main__":

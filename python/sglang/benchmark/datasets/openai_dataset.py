@@ -97,7 +97,7 @@ def sample_openai_requests(
             tools_tokens = len(tokenizer.encode(tools_str))
             prompt_len += tools_tokens
 
-        # Pass messages list directly - bench_serving handles List[Dict] prompts
+        # Pass messages list directly - the serving benchmark handles List[Dict] prompts
         filtered_dataset.append(
             DatasetRow(
                 prompt=messages,

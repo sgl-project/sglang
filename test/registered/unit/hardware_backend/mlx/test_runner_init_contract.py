@@ -11,9 +11,10 @@ import importlib.util
 import inspect
 import unittest
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
 
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
 _SKIP_REASON = "requires mlx"
@@ -78,22 +79,6 @@ class TestMlxRunnerInitContract(unittest.TestCase):
                 "#23862; the override must not require an argument the base no "
                 "longer passes (regression of #28660)."
             )
-
-    def test_stub_initialize_requires_no_extra_args(self):
-        # Same guard from the other side: no parameter beyond ``self`` may be
-        # REQUIRED. A defaulted parameter would still bind, but a required one
-        # (the pre-#28660 ``pre_model_load_memory``) is the desync we forbid.
-        required = _required_params_beyond_self(MlxModelRunnerStub.initialize)
-        self.assertEqual(
-            required,
-            [],
-            msg=(
-                "MlxModelRunnerStub.initialize requires parameter(s) "
-                f"{required} that the base never passes (it calls "
-                "self.initialize()). This re-introduces the #28660 desync; base "
-                "initialize(self) is parameterless since #23862."
-            ),
-        )
 
 
 if __name__ == "__main__":

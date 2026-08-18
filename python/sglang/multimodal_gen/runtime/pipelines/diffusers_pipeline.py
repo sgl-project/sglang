@@ -24,8 +24,8 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentResidencyStrategy,
     get_global_component_residency_manager,
 )
-from sglang.multimodal_gen.runtime.models.vision_utils import (
-    load_image as load_vision_image,
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    resolve_diffusers_pipeline_offload,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_precision
+from sglang.multimodal_gen.runtime.utils.vision import load_image as load_vision_image
 
 logger = init_logger(__name__)
 
@@ -457,11 +458,22 @@ class DiffusersPipeline(ComposedPipelineBase):
                 raise
 
         # Use CPU offload (all-or-nothing in diffusers) if any component offload is requested.
+        explicit_pipeline_offload = resolve_diffusers_pipeline_offload(
+            server_args.component_residency
+        )
         any_offload = (
-            server_args.dit_cpu_offload
-            or server_args.text_encoder_cpu_offload
-            or server_args.image_encoder_cpu_offload
-            or server_args.vae_cpu_offload
+            explicit_pipeline_offload
+            if explicit_pipeline_offload is not None
+            else any(
+                server_args.should_cpu_offload_component(component_name)
+                for component_name in {
+                    *pipe.components,
+                    "transformer",
+                    "text_encoder",
+                    "image_encoder",
+                    "vae",
+                }
+            )
         )
         if any_offload:
             device = get_local_torch_device()

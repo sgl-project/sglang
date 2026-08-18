@@ -83,10 +83,39 @@ class VBenchDataset(BaseDataset):
         self.cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "sglang")
         self.items = self._load_data()
 
+    @staticmethod
+    def _normalize_task_name(task_name: Any) -> Any:
+        """Normalize enum-style task values to legacy benchmark task-name strings."""
+        enum_to_task_name = {
+            "T2V": "text-to-video",
+            "I2V": "image-to-video",
+            "TI2V": "image-to-video",
+            "T2I": "text-to-image",
+            "I2I": "image-to-image",
+            "TI2I": "image-to-image",
+        }
+
+        # Handle Enum-like objects, e.g., ModelTaskType.T2I
+        enum_name = getattr(task_name, "name", None)
+        if isinstance(enum_name, str):
+            return enum_to_task_name.get(enum_name, task_name)
+
+        # Handle direct string inputs or enum string repr
+        if isinstance(task_name, str):
+            if task_name in enum_to_task_name:
+                return enum_to_task_name[task_name]
+            if "." in task_name:
+                suffix = task_name.split(".")[-1]
+                return enum_to_task_name.get(suffix, task_name)
+
+        return task_name
+
     def _load_data(self) -> List[Dict[str, Any]]:
-        if self.args.task_name in ("text-to-video", "text-to-image", "video-to-video"):
+        task_name = self._normalize_task_name(self.args.task_name)
+
+        if task_name in ("text-to-video", "text-to-image", "video-to-video"):
             return self._load_t2v_prompts()
-        elif self.args.task_name in ("image-to-video", "image-to-image"):
+        elif task_name in ("image-to-video", "image-to-image"):
             return self._load_i2v_data()
         else:
             raise ValueError(
@@ -281,6 +310,7 @@ class VBenchDataset(BaseDataset):
             height=self.args.height,
             num_frames=self.args.num_frames,
             fps=self.args.fps,
+            num_inference_steps=self.args.num_inference_steps,
             image_paths=[item["image_path"]] if "image_path" in item else None,
         )
 

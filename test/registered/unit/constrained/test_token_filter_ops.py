@@ -19,7 +19,7 @@ register_cpu_ci(2.0, "base-a-test-cpu")
 # Conditionally import Triton path
 _has_cuda = torch.cuda.is_available()
 if _has_cuda:
-    from sglang.srt.constrained.triton_ops.token_filter_ops import (
+    from sglang.kernels.ops.grammar.token_filter_ops import (
         set_token_filter_triton,
     )
 
