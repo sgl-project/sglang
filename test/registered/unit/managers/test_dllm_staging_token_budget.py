@@ -6,6 +6,9 @@ per staging row every round, so long-output workloads drive it negative long
 before the KV pool fills). Uncapped, the fallback can grant a staging row more
 than ``block_size`` tokens, producing a variable-length row that crashes the
 denoise algorithms' uniform-block reshape (``view(B, block_size)``).
+
+The fallback must grant a whole block or nothing: a sub-block grant is just as
+unusable as an oversized one, since ``view(B, block_size)`` admits neither.
 """
 
 import unittest
@@ -57,16 +60,34 @@ class TestDllmStagingTokenBudgetFallbackCap(CustomTestCase):
         )
         self.assertEqual(adder._get_dllm_remain_tokens(), self.BLOCK_SIZE)
 
-    def test_fallback_cap_does_not_inflate_a_smaller_dllm_budget(self):
-        # The cap is min(rem_dllm_tokens, block_size), not a blanket
-        # block_size: when the dLLM budget itself is below one block, the
-        # fallback must not grant more than that budget.
+    def test_fallback_refuses_a_sub_block_dllm_budget(self):
+        # A partial grant is as unusable as an oversized one: the denoise
+        # reshape needs whole block_size rows, so a budget below one block
+        # must yield 0 (NO_TOKEN) rather than a ragged row.
         adder = _make_adder(
             rem_dllm_tokens=16,
             dllm_block_size=self.BLOCK_SIZE,
             available_tokens=-100,
         )
-        self.assertEqual(adder._get_dllm_remain_tokens(), 16)
+        self.assertEqual(adder._get_dllm_remain_tokens(), 0)
+
+    def test_fallback_refuses_a_zero_dllm_budget(self):
+        # Nothing left to grant at all.
+        adder = _make_adder(
+            rem_dllm_tokens=0,
+            dllm_block_size=self.BLOCK_SIZE,
+            available_tokens=-100,
+        )
+        self.assertEqual(adder._get_dllm_remain_tokens(), 0)
+
+    def test_fallback_grants_exactly_one_block_at_the_boundary(self):
+        # Exactly one block is available: grant it whole, don't round down.
+        adder = _make_adder(
+            rem_dllm_tokens=self.BLOCK_SIZE,
+            dllm_block_size=self.BLOCK_SIZE,
+            available_tokens=-100,
+        )
+        self.assertEqual(adder._get_dllm_remain_tokens(), self.BLOCK_SIZE)
 
     def test_normal_budget_path_is_unaffected(self):
         # With rem_total_tokens still positive the pre-existing
