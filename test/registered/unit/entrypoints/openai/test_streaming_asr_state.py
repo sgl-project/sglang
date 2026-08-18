@@ -97,6 +97,22 @@ class TestStreamingASRState(CustomTestCase):
         self.assertEqual(delta, "world")
         self.assertEqual(state.emitted_text, "hello world")
 
+    def test_temporary_prefix_shrink_does_not_repeat_words(self):
+        state = self._state()
+        self.assertEqual(
+            state.update("alpha beta gamma one two three four five"),
+            "alpha beta gamma",
+        )
+        self.assertEqual(
+            state.update("alpha beta one two three four five"),
+            "",
+        )
+
+        delta = state.update("alpha beta gamma delta one two three four five")
+
+        self.assertEqual(delta, "delta")
+        self.assertEqual(state.emitted_text, "alpha beta gamma delta")
+
 
 class TestChunkedStreamingASRSSE(CustomTestCase):
     def _stream_deltas(self, transcripts: List[str]) -> List[str]:

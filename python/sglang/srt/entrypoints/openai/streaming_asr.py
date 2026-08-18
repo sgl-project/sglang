@@ -61,11 +61,18 @@ class StreamingASRState:
         old_confirmed = self.confirmed_text
         words = new_transcript.split()
         if len(words) > self.unfixed_token_num:
-            self.confirmed_text = " ".join(words[: -self.unfixed_token_num])
+            new_confirmed = " ".join(words[: -self.unfixed_token_num])
         else:
-            self.confirmed_text = ""
+            new_confirmed = ""
         self.full_transcript = new_transcript
         self.chunk_index += 1
+        rollback_suffix = old_confirmed[len(new_confirmed) :]
+        is_prefix_rollback = old_confirmed.startswith(new_confirmed) and (
+            not needs_space(new_confirmed, rollback_suffix)
+        )
+        if is_prefix_rollback:
+            return ""
+        self.confirmed_text = new_confirmed
         prefix_len = len(old_confirmed)
         suffix = self.confirmed_text[prefix_len:]
         suffix_starts_at_boundary = not needs_space(old_confirmed, suffix)
