@@ -666,9 +666,7 @@ class C4IndexerBackendMixin:
         seq_len_sum = sum(gather_c4_lens_cpu)
         max_seq_len = max(gather_c4_lens_cpu)
         c4_page_size = indexer_metadata.c4_page_size
-        max_seqlen_k = (
-            (max_seq_len + c4_page_size - 1) // c4_page_size * c4_page_size
-        )
+        max_seqlen_k = (max_seq_len + c4_page_size - 1) // c4_page_size * c4_page_size
         plan = NonPagedIndexerPlan(
             page_table=request_page_table,
             gather_seq_lens=gather_seq_lens,

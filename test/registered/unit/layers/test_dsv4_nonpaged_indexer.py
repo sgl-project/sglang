@@ -203,9 +203,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
                 self.assertEqual(plan.max_seq_len, expected_gather_c4_len)
                 self.assertEqual(plan.max_seqlen_k, 64)
                 torch.testing.assert_close(plan.page_table, page_table[:1])
-                torch.testing.assert_close(
-                    plan.ke, c4_seq_lens[:logical_query_rows]
-                )
+                torch.testing.assert_close(plan.ke, c4_seq_lens[:logical_query_rows])
                 torch.testing.assert_close(
                     plan.gather_seq_lens,
                     torch.tensor([expected_gather_c4_len], dtype=torch.int32),
@@ -228,9 +226,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         request_0_table = torch.tensor([[3, 1, 4]], dtype=torch.int32).repeat(4, 1)
         request_1_table = torch.tensor([[9, 7, 8]], dtype=torch.int32).repeat(3, 1)
         page_table = torch.cat((request_0_table, request_1_table), dim=0)
-        c4_seq_lens = torch.tensor(
-            [127, 128, 129, 130, 63, 64, 65], dtype=torch.int32
-        )
+        c4_seq_lens = torch.tensor([127, 128, 129, 130, 63, 64, 65], dtype=torch.int32)
 
         threshold = envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS
         with (
@@ -572,9 +568,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         initial_topk_plan = torch.tensor(
             [[100, 3], [0, 9], [1, 11], [2, 0]], dtype=torch.int32
         )
-        rebuilt_topk_plan = torch.tensor(
-            [[200, 2], [0, 9], [1, 11]], dtype=torch.int32
-        )
+        rebuilt_topk_plan = torch.tensor([[200, 2], [0, 9], [1, 11]], dtype=torch.int32)
 
         nonpaged_plan = NonPagedIndexerPlan(
             page_table=page_table[:1],
@@ -586,9 +580,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             max_seqlen_k=64,
             query_rows=logical_query_rows,
         )
-        q_indexer = torch.zeros(
-            (physical_query_rows, 2, 128), dtype=torch.float32
-        )
+        q_indexer = torch.zeros((physical_query_rows, 2, 128), dtype=torch.float32)
         weights = torch.ones((physical_query_rows, 2, 1), dtype=torch.float32)
         logits = torch.zeros((logical_query_rows, 16), dtype=torch.float32)
         c4_sparse_page_indices = torch.full(
@@ -618,9 +610,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         deep_gemm = SimpleNamespace(
             get_num_sms=MagicMock(return_value=1),
             get_paged_mqa_logits_metadata=MagicMock(
-                return_value=torch.zeros(
-                    (physical_query_rows, 2), dtype=torch.int32
-                )
+                return_value=torch.zeros((physical_query_rows, 2), dtype=torch.int32)
             ),
             fp8_paged_mqa_logits=MagicMock(),
         )
