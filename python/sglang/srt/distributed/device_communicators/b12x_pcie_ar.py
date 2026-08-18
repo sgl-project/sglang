@@ -43,7 +43,9 @@ somewhere -- capping at 64 KiB recovers a 2.9x decode regression on the 8-rank s
 and costs 46% decode throughput on the 2+2 split.
 """
 
+import inspect
 import logging
+from contextlib import contextmanager, nullcontext
 from typing import Optional, Tuple
 
 import torch
@@ -72,6 +74,62 @@ _PROBE_ITERS = 10
 # One-shot must beat NCCL by this margin to keep a size; without it the cap lands in
 # the noise band where the two are interchangeable.
 _PROBE_MARGIN = 1.05
+
+# Channels are stream-affine, and SGLang reduces on more than one stream (the
+# default stream, then a capture stream per CUDA graph phase). b12x >= 1.x makes
+# the caller own that mapping, so reserve a few and hand them out in first-seen
+# order. Streams beyond this keep the NCCL path rather than reusing a channel,
+# which would be a correctness bug, not a slowdown.
+_MAX_STREAM_CHANNELS = 8
+
+
+class _StreamChannels:
+    """Maps each CUDA stream to its own b12x channel, or does nothing on older b12x.
+
+    b12x >= 1.x refuses to pick a channel implicitly once the pool spans ranks:
+    channels are stream-affine, so two ranks that silently bound different ones
+    would not be reducing with each other. It wants names every rank agrees on,
+    allocated collectively up front. Older releases kept this mapping internally
+    and have no such parameter, so there the kwargs stay empty.
+
+    First-seen order is safe to assign from: ranks run the same forward on the
+    same streams in the same order, so rank 3 and rank 5 give a given stream the
+    same channel without talking to each other.
+    """
+
+    def __init__(self, pool, *, group: ProcessGroup):
+        self._pool = pool
+        self._by_stream: dict[int, str] = {}
+        self._enabled = "channel_id" in inspect.signature(pool.for_stream).parameters
+        if not self._enabled:
+            self._ids: list[str] = []
+            return
+
+        ranks = "-".join(str(r) for r in dist.get_process_group_ranks(group))
+        self._ids = [f"sglang-b12x-{ranks}-{i}" for i in range(_MAX_STREAM_CHANNELS)]
+        # Collective: the pool allocates IPC buffers in sorted id order, so every
+        # rank has to ask for the same set before any of them binds one.
+        pool.prepare_channels(self._ids)
+
+    def kwargs(self, stream=None) -> Optional[dict]:
+        """Channel kwargs for ``stream`` (default: the calling one), or None when none is left.
+
+        ``stream`` is explicit for graph capture, which asks for the channel of
+        the stream it is about to switch to, not the one it is still on.
+        """
+        if not self._enabled:
+            return {}
+
+        stream = stream or torch.cuda.current_stream()
+        key = stream.cuda_stream
+        channel_id = self._by_stream.get(key)
+        if channel_id is None:
+            if len(self._by_stream) >= len(self._ids):
+                return None
+            channel_id = self._ids[len(self._by_stream)]
+            self._by_stream[key] = channel_id
+            self._pool.for_stream(stream, channel_id=channel_id)
+        return {"channel_id": channel_id}
 
 
 def _import_pcie_all_reduce():
@@ -116,6 +174,7 @@ class B12xPCIeCommunicator:
         self.oneshot_max_size = 0
         self._oneshot = None
         self._dma = None
+        self._channels = None
 
         world_size = dist.get_world_size(group=group)
         if world_size not in _SUPPORTED_WORLD_SIZES:
@@ -144,9 +203,10 @@ class B12xPCIeCommunicator:
             self._oneshot = oneshot_pool_cls.from_exchange_group(
                 exchange_group=group, device=device
             )
-            # Channels are stream-affine: bind one for the current stream up front so
-            # CUDA graph capture does not hit an unbound channel.
-            self._oneshot.for_stream()
+            self._channels = _StreamChannels(self._oneshot, group=group)
+            # Bind the current stream up front so graph capture does not open with
+            # an unbound channel.
+            self._channels.kwargs()
             self.max_size = int(self._oneshot.max_size)
         except Exception as e:
             logger.warning("b12x PCIe one-shot all-reduce init failed: %s", e)
@@ -200,7 +260,9 @@ class B12xPCIeCommunicator:
                     fn=lambda t: dist.all_reduce(t, group=group), buf=buf, group=group
                 )
                 b12x_us = _time_all_reduce(
-                    fn=self._oneshot.all_reduce, buf=buf, group=group
+                    fn=lambda t: self._oneshot.all_reduce(t, **(self._channels.kwargs() or {})),
+                    buf=buf,
+                    group=group,
                 )
                 if b12x_us * _PROBE_MARGIN > nccl_us:
                     break
@@ -254,7 +316,10 @@ class B12xPCIeCommunicator:
         return inp.numel() * inp.element_size() <= self.oneshot_max_size
 
     def b12x_all_reduce(self, inp: torch.Tensor) -> Optional[torch.Tensor]:
-        return self._oneshot.all_reduce(inp)
+        channel = self._channels.kwargs()
+        if channel is None:
+            return None
+        return self._oneshot.all_reduce(inp, **channel)
 
     # ---- fused all-reduce + residual add + RMSNorm ------------------------
 
@@ -272,7 +337,12 @@ class B12xPCIeCommunicator:
         weight: torch.Tensor,
         eps: float,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self._oneshot.all_reduce_fused_add_rms_norm(inp, residual, weight, eps)
+        channel = self._channels.kwargs()
+        if channel is None:
+            return None
+        return self._oneshot.all_reduce_fused_add_rms_norm(
+            inp, residual, weight, eps, **channel
+        )
 
     # ---- DMA ring (large messages) ----------------------------------------
 
@@ -280,6 +350,23 @@ class B12xPCIeCommunicator:
         if self.disabled or self._dma is None:
             return False
         return self._dma.should_allreduce(inp)
+
+    @contextmanager
+    def capture(self, *, stream=None):
+        """Own a channel for the graph being captured on ``stream``.
+
+        b12x >= 1.x will not record a one-shot into a CUDA graph unless the pool
+        is holding the channel that graph will replay on -- a graph pins its
+        channel, so the binding has to exist before the first node is recorded.
+        Older releases had no such requirement and get a no-op here.
+        """
+        channel = None if self._channels is None else self._channels.kwargs(stream)
+        if not channel:
+            yield
+            return
+
+        with self._oneshot.capture(stream, **channel):
+            yield
 
     def b12x_dma_all_reduce(self, inp: torch.Tensor) -> torch.Tensor:
         return self._dma.all_reduce(inp)

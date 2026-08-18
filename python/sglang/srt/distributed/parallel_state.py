@@ -618,6 +618,15 @@ class GroupCoordinator:
         # is already collected in init() and we can capture the quick allreduce directly.
         ca_comm = self.ca_comm
         maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
+        # b12x >= 1.x refuses to record a one-shot into a graph outside its own
+        # capture context: the graph pins a channel, so the pool has to know which
+        # one before any node lands in it.
+        b12x_comm = self.b12x_comm
+        maybe_b12x_context = (
+            nullcontext()
+            if b12x_comm is None or b12x_comm.disabled
+            else b12x_comm.capture(stream=stream)
+        )
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
@@ -625,7 +634,7 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with self.device_module.stream(stream), maybe_ca_context:
+        with self.device_module.stream(stream), maybe_ca_context, maybe_b12x_context:
             # In graph mode, we have to be very careful about the collective
             # operations. The current status is:
             #     allreduce \ Mode   |  Eager  |  Graph  |
