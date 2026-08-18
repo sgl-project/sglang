@@ -213,10 +213,12 @@ struct AllReduceParams {
   void* const* __restrict__ graph_params;
   uint8_t* pull_workspaces[kWorldSize];    // must be symmetric memory
   uint8_t* push_workspaces[kWorldSize];    // must be symmetric memory
+  uint8_t* gather_workspaces[kWorldSize];  // must be symmetric memory
   Semaphore* pull_semaphores[kWorldSize];  // must be symmetric memory
   Counter* push_counter;
-  uint8_t* pull_mc_workspace;  // must be a multicast address
-  int64_t push_buffer_stride;  // per-buffer bytes; each rank holds 2 * world_size buffers
+  uint8_t* pull_mc_workspace;   // must be a multicast address
+  int64_t push_buffer_stride;   // per-buffer bytes; each rank holds 2 * world_size buffers
+  int64_t gather_phase_stride;  // bytes per sentinel-gather phase (two phases per rank)
 };
 
 template <typename T, uint32_t kWorldSize, bool kUsePDL>
@@ -343,7 +345,7 @@ struct AllReducePullImpl {
   using vec_t = device::AlignedVector<T2, kVecSize>;
   static_assert(kWorldSize <= kMaxWorldSize);
 
-  template <bool kFence>
+  template <bool kFence, uint32_t kRounds = 2>
   static SGL_DEVICE uint32_t sync_enter_pull(const AllReduceParams<kWorldSize>& params) {
     uint32_t current_counter_val = 0;
     if (const auto tx = threadIdx.x; tx < kWorldSize) {
@@ -351,7 +353,7 @@ struct AllReducePullImpl {
       const auto bx = blockIdx.x;
       const auto semaphore = &params.pull_semaphores[tx][bx];
       const auto counter = semaphore->counter_ptr();
-      const auto current = tx == params.rank ? counter->inc(2 * kWorldSize) : 0;
+      const auto current = tx == params.rank ? counter->inc(kRounds * kWorldSize) : 0;
       current_counter_val = current;
       if constexpr (kFence) {
         semaphore->put_release();
@@ -480,16 +482,103 @@ struct AllReducePullImpl {
     reduce_impl<true>(local_num_vecs, data, params.output, mc_addr);
     sync_exit_pull<true>(params, counter);
   }
+
+  static SGL_DEVICE void forward_2shot_lamport(const AllReduceParams<kWorldSize>& params) {
+    static_assert(kMode != PullMode::Multicast, "lamport 2shot gathers through the sentinel plane, not multimem");
+    const auto total_num_vecs = device::div_ceil(params.num_elements, kElemsPerVec);
+    const auto avg_vecs = total_num_vecs / kWorldSize;
+    const auto rem_vecs = total_num_vecs % kWorldSize;
+    const auto local_vec_bias = avg_vecs * params.rank + min(params.rank, rem_vecs);
+    const auto local_num_vecs = avg_vecs + (params.rank < rem_vecs ? 1 : 0);
+    __shared__ uint32_t s_phase;
+    if (threadIdx.x == 0) {
+      const auto semaphore = &params.pull_semaphores[params.rank][blockIdx.x];
+      s_phase = (semaphore->counter_ptr()->get() / kWorldSize) % 2;
+    }
+    __syncthreads();
+
+    uint8_t* gather[kWorldSize];
+#pragma unroll
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      gather[i] = params.gather_workspaces[i] + s_phase * params.gather_phase_stride;
+    }
+    void* data[kWorldSize];
+    if constexpr (kMode == PullMode::Graph) {
+#pragma unroll
+      for (uint32_t i = 0; i < kWorldSize; ++i) {
+        data[i] = reinterpret_cast<vec_t*>(params.graph_params[i]) + local_vec_bias;
+      }
+    } else {
+#pragma unroll
+      for (uint32_t i = 0; i < kWorldSize; ++i) {
+        data[i] = reinterpret_cast<vec_t*>(params.pull_workspaces[i]) + local_vec_bias;
+      }
+    }
+
+    sync_enter_pull<false, 1>(params);
+
+    const auto num_threads = blockDim.x * gridDim.x;
+    const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // shot 1: reduce our shard from every peer, push it to every peer's gather
+    for (auto vid = global_tid; vid < local_num_vecs; vid += num_threads) {
+      vec_t vec[kWorldSize];
+#pragma unroll
+      for (uint32_t i = 0; i < kWorldSize; ++i) {
+        vec[i].load(data[i], vid);
+      }
+      auto out_vec = reduce(vec);
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        clear_pos_zero(out_vec[j].x);
+        clear_pos_zero(out_vec[j].y);
+      }
+#pragma unroll
+      for (uint32_t i = 0; i < kWorldSize; ++i) {
+        st_relaxed_16B(out_vec, gather[i], local_vec_bias + vid);
+      }
+    }
+    // shot 2: poll the whole result out of our own gather region, restoring the
+    // pos_zero marker behind us so the phase comes back around empty
+    vec_t pos_zero_vec;
+    {
+      const auto z = get_pos_zero<T>();
+#pragma unroll
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        pos_zero_vec[j].x = z;
+        pos_zero_vec[j].y = z;
+      }
+    }
+    const auto local_gather = gather[params.rank];
+    for (auto vid = global_tid; vid < total_num_vecs; vid += num_threads) {
+      vec_t vec;
+      do {
+        bool has_zero = false;
+        ld_relaxed_16B(vec, local_gather, vid);
+#pragma unroll
+        for (uint32_t j = 0; j < kVecSize; ++j) {
+          has_zero |= is_pos_zero(vec[j].x);
+          has_zero |= is_pos_zero(vec[j].y);
+        }
+        if (!has_zero) break;
+      } while (true);
+      st_global_16B(vec, params.output, vid);
+      st_global_16B(pos_zero_vec, local_gather, vid);
+    }
+    device::PDLTriggerSecondary<kUsePDL>();
+  }
 };
 
 template <typename Impl, uint32_t kWorldSize, int kShot>
 __global__ __launch_bounds__(1024, 1)  //
     void all_reduce_kernel(const __grid_constant__ AllReduceParams<kWorldSize> params) {
-  static_assert(kShot == 1 || kShot == 2, "invalid shot");
+  static_assert(kShot == 1 || kShot == 2 || kShot == 3, "invalid shot");
   if constexpr (kShot == 1) {
     return Impl::forward_1shot(params);
-  } else {
+  } else if constexpr (kShot == 2) {
     return Impl::forward_2shot(params);
+  } else {
+    return Impl::forward_2shot_lamport(params);
   }
 }
 
@@ -538,7 +627,10 @@ struct AllReduceKernel {
   static Tensor run(CommunicatorRef ref, Tensor in_, std::string algo, std::variant<TensorView, bool> pull_arg) {
     using namespace host;
     const auto& data = *ref.get();
-    RuntimeCheck(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push", "Invalid algo: ", algo);
+    RuntimeCheck(
+        algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_lamport",
+        "Invalid algo: ",
+        algo);
     RuntimeCheck(data.world_size == kWorldSize, "Mismatch world size");
     RuntimeCheck(in_.IsContiguous(), "Input tensor must be contiguous");
     RuntimeCheck(is_type<T>(in_.dtype()), "Input dtype mismatch");
@@ -563,10 +655,12 @@ struct AllReduceKernel {
         .push_counter = data.push_counter,
         .pull_mc_workspace = data.pull_mc_workspace,
         .push_buffer_stride = data.push_bytes,
+        .gather_phase_stride = data.gather_bytes / 2,
     };
     for (uint32_t i = 0; i < kWorldSize; ++i) {
       params.pull_workspaces[i] = data.pull_workspaces[i];
       params.push_workspaces[i] = data.push_workspaces[i];
+      params.gather_workspaces[i] = data.gather_workspaces[i];
       params.pull_semaphores[i] = data.pull_semaphores[i];
     }
     const int64_t nbytes = num_elems_int64 * sizeof(T);
@@ -585,7 +679,6 @@ struct AllReduceKernel {
     }
 
     using enum PullMode;
-    RuntimeCheck(nbytes <= data.pull_bytes, "Input size ", nbytes, " exceeds pull workspace size ", data.pull_bytes);
     const auto pull_mode = use_graph ? Graph : std::get<bool>(pull_arg) ? Multicast : Eager;
     RuntimeCheck(pull_mode != Multicast || data.pull_mc_workspace != nullptr, "Multicast requires an mc workspace");
 
@@ -609,6 +702,20 @@ struct AllReduceKernel {
     };
 
     const auto local_workspace = data.pull_workspaces[data.rank];
+    if (algo == "2shot_lamport") {
+      RuntimeCheck(pull_mode != Multicast, "2shot_lamport has no multicast form");
+      const int64_t phase_bytes = data.gather_bytes / 2;
+      RuntimeCheck(nbytes <= phase_bytes, "Input size ", nbytes, " exceeds gather phase size ", phase_bytes);
+      if (!use_graph) {
+        RuntimeCheck(nbytes <= data.pull_bytes, "Staging size ", nbytes, " exceeds pull workspace ", data.pull_bytes);
+        cuda_memcpy(local_workspace, in_.data_ptr());
+      }
+      const auto kernel = (pull_mode == Graph) ? kernel_pull<3, Graph> : kernel_pull<3, Eager>;
+      LaunchKernel(num_blocks, choose_block_size(num_vecs), stream)  //
+          .enable_pdl(kUsePDL)(kernel, params);
+      return out;
+    }
+    RuntimeCheck(nbytes <= data.pull_bytes, "Input size ", nbytes, " exceeds pull workspace size ", data.pull_bytes);
     if (algo == "1shot_pull") {
       // first copy to workspace
       if (!use_graph) cuda_memcpy(local_workspace, in_.data_ptr());

@@ -21,6 +21,7 @@ class AllReduceAlgo(enum.Enum):
     ONE_SHOT_PUSH = enum.auto()
     ONE_SHOT_PULL = enum.auto()
     TWO_SHOT_PULL = enum.auto()
+    TWO_SHOT_LAMPORT = enum.auto()
 
     def is_push(self) -> bool:
         return self == AllReduceAlgo.ONE_SHOT_PUSH
@@ -34,6 +35,7 @@ _ALGO_NAMES = {
     AllReduceAlgo.ONE_SHOT_PUSH: "1shot_push",
     AllReduceAlgo.ONE_SHOT_PULL: "1shot_pull",
     AllReduceAlgo.TWO_SHOT_PULL: "2shot_pull",
+    AllReduceAlgo.TWO_SHOT_LAMPORT: "2shot_lamport",
 }
 
 # ``pull_arg`` of the all-reduce kernel: a row of the graph-params pointer
@@ -76,6 +78,7 @@ class Communicator(tvm_ffi.Object):
         push_workspaces: List[torch.Tensor],
         pull_workspaces: List[torch.Tensor],
         pull_semaphores: List[torch.Tensor],
+        gather_workspaces: List[torch.Tensor],
         push_counter: torch.Tensor,
         pull_mc_workspace: int | None,
     ) -> None:
@@ -86,6 +89,10 @@ class Communicator(tvm_ffi.Object):
                                 symmetric memory.
         :param pull_semaphores: per-rank ``[num_pull_blocks, 128]`` uint8
                                 views of symmetric memory.
+        :param gather_workspaces: per-rank ``[gather_bytes]`` uint8 views of
+                                  symmetric memory, holding two sentinel-gather
+                                  phases for ``2shot_lamport``. Must be
+                                  zero-filled (the sentinel) before first use.
         :param push_counter: local ``[num_push_blocks, 4]`` uint8 tensor.
         :param pull_mc_workspace: multicast address of the pull workspace,
                                   or None when multicast is unavailable.
@@ -96,6 +103,7 @@ class Communicator(tvm_ffi.Object):
             push_workspaces,
             pull_workspaces,
             pull_semaphores,
+            gather_workspaces,
             push_counter,
             pull_mc_workspace,
         )
