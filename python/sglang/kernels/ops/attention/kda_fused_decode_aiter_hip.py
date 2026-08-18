@@ -20,15 +20,17 @@ def enabled() -> bool:
 
 def _ops():
     try:
-        from aiter.ops.flydsl.kimi_k3_kda_decode import (
-            flydsl_kimi_k3_kda_decode_with_f_b,
-            is_flydsl_kimi_k3_kda_decode_supported,
+        from sglang.kernels.ops.kimi_k3.flydsl.source import load_module
+
+        module = load_module(
+            "sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_kda_decode",
+            "aiter.ops.flydsl.kimi_k3_kda_decode",
         )
     except (ImportError, ModuleNotFoundError):
         return None, None
     return (
-        flydsl_kimi_k3_kda_decode_with_f_b,
-        is_flydsl_kimi_k3_kda_decode_supported,
+        module.flydsl_kimi_k3_kda_decode_with_f_b,
+        module.is_flydsl_kimi_k3_kda_decode_supported,
     )
 
 
