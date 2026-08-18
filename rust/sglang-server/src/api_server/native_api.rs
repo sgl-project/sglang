@@ -7,7 +7,10 @@
 //! generate-request submission (`submit`); the shared `AppState` lives in the
 //! parent `api_server` module.
 
-use std::{convert::Infallible, time::Instant};
+use std::{
+    convert::Infallible,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Json, Router,
@@ -34,6 +37,43 @@ use crate::message::{
     ChunkEvent, EgressItem, GenerateBody, GenerateRequest, RequestKind, SamplingParams,
 };
 use crate::utils::response::{error_response, error_value};
+
+/// API-local timing for one request.
+///
+/// Python records time-to-first-token on the first output batch and end-to-end
+/// latency when that request finishes. Keep both measurements here even though
+/// `/generate` currently exposes only `e2e_latency`; this avoids putting
+/// API-only timestamps onto scheduler messages.
+#[derive(Clone, Debug)]
+struct RequestTiming {
+    created_at: Instant,
+    time_to_first_token: Option<Duration>,
+    e2e_latency: Option<Duration>,
+}
+
+impl RequestTiming {
+    fn new() -> Self {
+        Self {
+            created_at: Instant::now(),
+            time_to_first_token: None,
+            e2e_latency: None,
+        }
+    }
+
+    fn observe_first_output(&mut self) {
+        self.time_to_first_token
+            .get_or_insert_with(|| self.created_at.elapsed());
+    }
+
+    fn finish(&mut self) {
+        self.e2e_latency
+            .get_or_insert_with(|| self.created_at.elapsed());
+    }
+
+    fn terminal_latencies(&self) -> Option<(Duration, Duration)> {
+        Some((self.time_to_first_token?, self.e2e_latency?))
+    }
+}
 
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<AppState> {
@@ -174,7 +214,7 @@ async fn generate(
     // tokenization / multimodal preprocessing / scheduler dispatch. Start at the
     // equivalent boundary: into_requests() has normalized the body, while prefetch
     // and every downstream stage are still ahead of us.
-    let created_at = Instant::now();
+    let timing = RequestTiming::new();
     // Media I/O (URL downloads, file reads) happens here, on the API runtime
     // — never on the MM worker pool (see `prefetch`).
     if let Err(e) = super::prefetch::prefetch_all(&mut payloads).await {
@@ -186,9 +226,9 @@ async fn generate(
             .into_iter()
             .next()
             .expect("into_requests yields >=1 payload");
-        generate_single(&state, payload, stream, created_at).await
+        generate_single(&state, payload, stream, timing).await
     } else {
-        generate_batch(&state, payloads, stream, created_at).await
+        generate_batch(&state, payloads, stream, timing).await
     }
 }
 
@@ -201,7 +241,7 @@ async fn generate_single(
     state: &AppState,
     req: GenerateRequest,
     stream: bool,
-    created_at: Instant,
+    timing: RequestTiming,
 ) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // `frame_value` just reads them — no tokenizer needed here.
@@ -221,14 +261,13 @@ async fn generate_single(
         // A single request is a 1-element batch without the `index` field — reuse
         // the same stream so the frame/abort/truncation logic lives in one place.
         use futures::StreamExt;
-        let s = generation_event_stream(vec![(rid_str, rx, created_at)], guard, incremental, false)
+        let s = generation_event_stream(vec![(rid_str, rx, timing)], guard, incremental, false)
             .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
         Sse::new(s).into_response()
     } else {
         // Unary: fold to the terminal, respond once. Disarm only on a real terminal
         // (a truncation leaves the guard armed so the scheduler work is aborted).
-        let (status, value, terminal) =
-            drain_unary(&mut rx, rid_str.client_facing(), created_at).await;
+        let (status, value, terminal) = drain_unary(&mut rx, rid_str.client_facing(), timing).await;
         if terminal {
             guard.disarm(&rid_str);
         }
@@ -241,13 +280,18 @@ async fn generate_single(
 async fn drain_unary(
     rx: &mut mpsc::Receiver<EgressItem>,
     rid_str: &str,
-    created_at: Instant,
+    mut timing: RequestTiming,
 ) -> (StatusCode, serde_json::Value, bool) {
     let mut acc = OutputAccumulator::default();
     while let Some(item) = rx.recv().await {
         match item {
-            EgressItem::Frame(out) => acc.fold(&out),
+            EgressItem::Frame(out) => {
+                timing.observe_first_output();
+                acc.fold(&out);
+            }
             EgressItem::Done(out) => {
+                timing.observe_first_output();
+                timing.finish();
                 acc.fold(&out);
                 let final_out = acc.into_output();
                 // A validation abort carries its own HTTP status + diagnostic.
@@ -261,10 +305,11 @@ async fn drain_unary(
                     return (status, error_value(code, message), true);
                 }
                 let mut value = frame_value(&final_out, rid_str);
-                add_e2e_latency(&mut value, created_at);
+                add_e2e_latency(&mut value, &timing);
                 return (StatusCode::OK, value, true);
             }
             EgressItem::Error(e) => {
+                timing.finish();
                 let code = e.http_status();
                 let status =
                     StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -292,7 +337,7 @@ async fn generate_batch(
     state: &AppState,
     requests: Vec<GenerateRequest>,
     stream: bool,
-    created_at: Instant,
+    timing: RequestTiming,
 ) -> Response {
     // No cross-item rid collision to worry about: `into_requests` rejected duplicate
     // rids within this batch, and `Rid::from_client` made each one unique against
@@ -303,7 +348,7 @@ async fn generate_batch(
         match submit(state, RequestKind::Generate(Box::new(req)), stream).await {
             Ok((rid, rx)) => {
                 guard.arm(rid.clone());
-                receivers.push((rid, rx, created_at));
+                receivers.push((rid, rx, timing.clone()));
             }
             Err(resp) => return resp,
         }
@@ -322,10 +367,10 @@ async fn generate_batch(
         // preserves input order for the final JSON array, while each drain observes
         // its own terminal output promptly (important for per-item e2e_latency).
         let drained = futures::future::join_all(receivers.into_iter().map(
-            |(rid_str, mut rx, request_created_at)| async move {
+            |(rid_str, mut rx, request_timing)| async move {
                 let client_rid = rid_str.client_facing().to_owned();
                 let (_status, value, terminal) =
-                    drain_unary(&mut rx, &client_rid, request_created_at).await;
+                    drain_unary(&mut rx, &client_rid, request_timing).await;
                 (rid_str, value, terminal)
             },
         ))
@@ -363,7 +408,7 @@ async fn recv_indexed(
 /// `with_index` tags each frame (batch only), `incremental` = delta vs cumulative,
 /// `guard` aborts unfinished on drop.
 fn generation_event_stream(
-    receivers: Vec<(Rid, mpsc::Receiver<EgressItem>, Instant)>,
+    receivers: Vec<(Rid, mpsc::Receiver<EgressItem>, RequestTiming)>,
     mut guard: AbortGuard,
     incremental: bool,
     with_index: bool,
@@ -376,9 +421,9 @@ fn generation_event_stream(
             .iter()
             .map(|(rid, _, _)| rid.clone())
             .collect();
-        let created_at: Vec<Instant> = receivers
+        let mut timings: Vec<RequestTiming> = receivers
             .iter()
-            .map(|(_, _, created_at)| *created_at)
+            .map(|(_, _, timing)| timing.clone())
             .collect();
         let mut accs: Vec<OutputAccumulator> =
             (0..n).map(|_| OutputAccumulator::default()).collect();
@@ -410,6 +455,7 @@ fn generation_event_stream(
             for item in items {
                 match item {
                     EgressItem::Frame(out) => {
+                        timings[i].observe_first_output();
                         accs[i].fold(&out);
                         if incremental {
                             yield stream_frame_string(out, &accs[i], true, rid_strs[i].client_facing(), idx(i));
@@ -418,10 +464,15 @@ fn generation_event_stream(
                         }
                     }
                     EgressItem::Done(out) => {
+                        timings[i].observe_first_output();
+                        timings[i].finish();
                         accs[i].fold(&out);
                         terminal = Some(out);
                     }
-                    EgressItem::Error(e) => failed = Some(e),
+                    EgressItem::Error(e) => {
+                        timings[i].finish();
+                        failed = Some(e);
+                    }
                     EgressItem::Control(_) | EgressItem::Data(_) => {} // never on /generate
                 }
             }
@@ -440,7 +491,7 @@ fn generation_event_stream(
                         incremental,
                         rid_strs[i].client_facing(),
                         idx(i),
-                        created_at[i],
+                        &timings[i],
                     ),
                 };
                 guard.disarm(&rid_strs[i]); // terminal → not re-pushed
@@ -459,8 +510,12 @@ fn generation_event_stream(
 /// attached only when the request finishes. The Rust native API owns the same
 /// lifecycle boundary, so it adds the value while handling the terminal egress
 /// item rather than putting API-only timing onto every scheduler `ChunkEvent`.
-fn add_e2e_latency(value: &mut serde_json::Value, created_at: Instant) {
-    value["meta_info"]["e2e_latency"] = serde_json::json!(created_at.elapsed().as_secs_f64());
+fn add_e2e_latency(value: &mut serde_json::Value, timing: &RequestTiming) {
+    let (time_to_first_token, e2e_latency) = timing
+        .terminal_latencies()
+        .expect("a successful terminal output has complete request timing");
+    debug_assert!(time_to_first_token <= e2e_latency);
+    value["meta_info"]["e2e_latency"] = serde_json::json!(e2e_latency.as_secs_f64());
 }
 
 /// Render a terminal streaming frame. Intermediate cumulative frames keep the
@@ -472,10 +527,10 @@ fn terminal_stream_frame_string(
     incremental: bool,
     rid_str: &str,
     index: Option<usize>,
-    created_at: Instant,
+    timing: &RequestTiming,
 ) -> String {
     let mut value = super::frame::stream_frame_value(out, acc, incremental, rid_str);
-    add_e2e_latency(&mut value, created_at);
+    add_e2e_latency(&mut value, timing);
     tag_value(value, index)
 }
 
@@ -523,12 +578,47 @@ mod tests {
     fn timed_receiver(
         rid: u64,
         rx: mpsc::Receiver<EgressItem>,
-    ) -> (Rid, mpsc::Receiver<EgressItem>, Instant) {
+    ) -> (Rid, mpsc::Receiver<EgressItem>, RequestTiming) {
         (
             Rid::from(rid.to_string()),
             rx,
-            Instant::now() - Duration::from_millis(10),
+            RequestTiming {
+                created_at: Instant::now() - Duration::from_millis(10),
+                time_to_first_token: None,
+                e2e_latency: None,
+            },
         )
+    }
+
+    #[test]
+    fn request_timing_records_ttft_once_and_e2e_on_finish() {
+        let mut timing = RequestTiming {
+            created_at: Instant::now() - Duration::from_millis(10),
+            time_to_first_token: None,
+            e2e_latency: None,
+        };
+        assert!(timing.terminal_latencies().is_none());
+
+        timing.observe_first_output();
+        let time_to_first_token = timing.time_to_first_token.unwrap();
+        timing.observe_first_output();
+        assert_eq!(
+            timing.time_to_first_token,
+            Some(time_to_first_token),
+            "later output must not overwrite TTFT"
+        );
+
+        timing.finish();
+        let (recorded_ttft, e2e_latency) = timing.terminal_latencies().unwrap();
+        assert_eq!(recorded_ttft, time_to_first_token);
+        assert!(e2e_latency >= recorded_ttft);
+
+        timing.finish();
+        assert_eq!(
+            timing.terminal_latencies(),
+            Some((recorded_ttft, e2e_latency)),
+            "later terminal handling must not overwrite E2E latency"
+        );
     }
 
     /// The native unary response uses the same names and meanings as Python's
@@ -554,8 +644,12 @@ mod tests {
         .await
         .unwrap();
 
-        let created_at = Instant::now() - Duration::from_millis(20);
-        let (status, value, terminal) = drain_unary(&mut rx, "client-rid", created_at).await;
+        let timing = RequestTiming {
+            created_at: Instant::now() - Duration::from_millis(20),
+            time_to_first_token: None,
+            e2e_latency: None,
+        };
+        let (status, value, terminal) = drain_unary(&mut rx, "client-rid", timing).await;
         assert_eq!(status, StatusCode::OK);
         assert!(terminal);
         assert_eq!(value["meta_info"]["id"], "client-rid");
@@ -568,6 +662,11 @@ mod tests {
         assert!(
             value["meta_info"]["e2e_latency"].as_f64().unwrap() >= 0.020,
             "latency is expressed in seconds from request creation"
+        );
+        assert!(
+            value["meta_info"].get("ttft").is_none()
+                && value["meta_info"].get("time_to_first_token").is_none(),
+            "TTFT is recorded internally but is not part of this PR's API"
         );
     }
 
