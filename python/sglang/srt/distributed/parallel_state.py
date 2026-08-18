@@ -1923,6 +1923,7 @@ def init_model_parallel_group(
 
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
+_NPU_FUSED_MATMUL_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 _ATTN_CP_OVERLAP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
@@ -1953,6 +1954,13 @@ def get_attn_tp_group() -> GroupCoordinator:
         _ATTN_TP is not None
     ), "attention tensor model parallel group is not initialized"
     return _ATTN_TP
+
+
+def get_npu_fused_matmul_tp_group() -> GroupCoordinator:
+    assert _NPU_FUSED_MATMUL_TP is not None, (
+        "NPU fused-matmul tensor parallel group is not initialized"
+    )
+    return _NPU_FUSED_MATMUL_TP
 
 
 def get_attn_cp_group() -> GroupCoordinator:
@@ -2088,7 +2096,13 @@ def graph_capture(stream=None):
     ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP), id(_PP)}
-            for group in (_DCP, _ATTN_TP, _MOE_EP, _MOE_TP):
+            for group in (
+                _DCP,
+                _ATTN_TP,
+                _NPU_FUSED_MATMUL_TP,
+                _MOE_EP,
+                _MOE_TP,
+            ):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -2582,6 +2596,49 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
+    # Current CANN collective-matmul kernels support at most eight ranks.
+    # When attention TP is wider, replicate only the K3 shared-expert weights
+    # across contiguous TP8 subgroups. Each subgroup owns disjoint token rows,
+    # so this preserves DP4/attention-TP16 while making AG+MM and MM+RS legal.
+    global _NPU_FUSED_MATMUL_TP
+    assert _NPU_FUSED_MATMUL_TP is None, (
+        "NPU fused-matmul tensor parallel group is already initialized"
+    )
+    if envs.SGLANG_NPU_FUSED_COLLECTIVE_MATMUL.get():
+        fused_tp_size = min(attn_tp_size, 8)
+        if attn_tp_size % fused_tp_size != 0:
+            raise RuntimeError(
+                f"attention TP {attn_tp_size} must be divisible by fused "
+                f"collective-matmul TP {fused_tp_size}"
+            )
+        if fused_tp_size == attn_tp_size:
+            _NPU_FUSED_MATMUL_TP = _ATTN_TP
+        else:
+            group_ranks = []
+            for tp_group_idx in range(num_tensor_model_parallel_groups):
+                for cp_dp_combined_idx in range(attn_cp_size * attn_dp_size):
+                    st = (
+                        tp_group_idx * tensor_model_parallel_size
+                        + cp_dp_combined_idx * attn_tp_size
+                    )
+                    en = st + attn_tp_size
+                    for subgroup_st in range(st, en, fused_tp_size):
+                        group_ranks.append(
+                            list(range(subgroup_st, subgroup_st + fused_tp_size))
+                        )
+            _NPU_FUSED_MATMUL_TP = init_model_parallel_group(
+                group_ranks,
+                get_world_group().local_rank,
+                backend,
+                use_pynccl=False,
+                use_custom_allreduce=False,
+                use_torch_symm_mem_allreduce=False,
+                group_name="npu_fused_matmul_tp",
+                recovered_rank=recovered_rank,
+                rank_offset=rank_offset,
+                max_world_size=max_world_size,
+            )
+
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
     moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
@@ -2961,6 +3018,14 @@ def destroy_model_parallel():
     _ATTN_CP = None
 
     global _ATTN_TP
+    global _NPU_FUSED_MATMUL_TP
+    if (
+        _NPU_FUSED_MATMUL_TP
+        and _NPU_FUSED_MATMUL_TP is not _ATTN_TP
+        and _NPU_FUSED_MATMUL_TP is not _TP
+    ):
+        _NPU_FUSED_MATMUL_TP.destroy()
+    _NPU_FUSED_MATMUL_TP = None
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None

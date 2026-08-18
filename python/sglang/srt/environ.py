@@ -863,6 +863,8 @@ class Envs:
     # Keep K3 shared experts and dense MLPs sharded over attention TP.
     SGLANG_K3_SHARED_EXPERTS_ATTN_TP = EnvBool(False)
     SGLANG_K3_DENSE_MLP_ATTN_TP = EnvBool(False)
+    # Fuse attention-TP collectives with dynamic-int8 dense matmuls.
+    SGLANG_NPU_FUSED_COLLECTIVE_MATMUL = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"

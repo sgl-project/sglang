@@ -19,6 +19,7 @@ from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.distributed import (
     divide,
+    get_npu_fused_matmul_tp_group,
     get_pp_group,
     get_tp_group,
     tensor_model_parallel_all_reduce,
@@ -367,6 +368,32 @@ class KimiK3MLP(nn.Module):
             hidden_states = hidden_states + prefix_sum
         return hidden_states
 
+    def supports_npu_fused_collective_matmul(self) -> bool:
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            supports_npu_fused_collective_matmul,
+        )
+
+        return supports_npu_fused_collective_matmul(
+            self.gate_up_proj
+        ) and supports_npu_fused_collective_matmul(self.down_proj)
+
+    def forward_npu_fused_collective(
+        self, local_hidden_states: torch.Tensor, group
+    ) -> torch.Tensor:
+        """Shared MLP with AG+gate/up GEMM and down GEMM+RS fused by CANN."""
+        from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+            npu_fused_all_gather_linear,
+            npu_fused_linear_reduce_scatter,
+        )
+
+        gate_up = npu_fused_all_gather_linear(
+            self.gate_up_proj, local_hidden_states, group
+        )
+        hidden_states = self.act_fn(gate_up)
+        return npu_fused_linear_reduce_scatter(
+            self.down_proj, hidden_states, group
+        )
+
 
 def _add3(
     a: torch.Tensor,
@@ -564,13 +591,22 @@ class KimiK3MoE(nn.Module):
             and self._dp_attention
             and get_parallel().attn_tp_size > 1
         )
+        self._shared_experts_comm_group = (
+            get_npu_fused_matmul_tp_group()
+            if (
+                _is_npu
+                and envs.SGLANG_NPU_FUSED_COLLECTIVE_MATMUL.get()
+                and self._shared_experts_attn_tp_comm
+            )
+            else get_parallel().attn_tp_group
+        )
         shared_experts_tp_kwargs = {}
         if self._shared_experts_tp1:
             shared_experts_tp_kwargs = dict(tp_rank=0, tp_size=1)
         elif self._shared_experts_attn_tp_comm:
             shared_experts_tp_kwargs = dict(
-                tp_rank=get_parallel().attn_tp_rank,
-                tp_size=get_parallel().attn_tp_size,
+                tp_rank=self._shared_experts_comm_group.rank_in_group,
+                tp_size=self._shared_experts_comm_group.world_size,
             )
         if self.num_shared_experts is not None and self.num_shared_experts > 0:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
@@ -587,6 +623,14 @@ class KimiK3MoE(nn.Module):
             )
         else:
             self.shared_experts = None
+
+        self._npu_fused_shared_experts = (
+            _is_npu
+            and self._shared_experts_attn_tp_comm
+            and self.shared_experts is not None
+            and self._shared_experts_comm_group.world_size in (2, 4, 8)
+            and self.shared_experts.supports_npu_fused_collective_matmul()
+        )
 
         # SBO (single batch overlap): the shared experts read a fixed slab of
         # weights the routed path never touches (bf16 — the checkpoint leaves
@@ -985,15 +1029,23 @@ class KimiK3MoE(nn.Module):
         if not self._shared_experts_attn_tp_comm:
             return hidden_states, False
 
-        group = get_parallel().attn_tp_group
+        group = self._shared_experts_comm_group
         # SP-MoE presents one contiguous token shard per attention-TP rank;
-        # the DP local buffer is the full reassembled per-replica batch.
-        gathered_hidden_states = get_local_dp_buffer(group)
-        attn_tp_all_gather_into_tensor(gathered_hidden_states, hidden_states)
+        # a TP8 fused-matmul subgroup reassembles only its half-replica rows.
+        if group is get_parallel().attn_tp_group:
+            gathered_hidden_states = get_local_dp_buffer(group)
+            attn_tp_all_gather_into_tensor(gathered_hidden_states, hidden_states)
+        else:
+            gathered_hidden_states = torch.empty(
+                (hidden_states.shape[0] * group.world_size, hidden_states.shape[1]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            group.all_gather_into_tensor(gathered_hidden_states, hidden_states)
         return gathered_hidden_states, True
 
-    @staticmethod
     def _finalize_shared_experts_output(
+        self,
         gathered_shared_output: torch.Tensor,
         hidden_states: torch.Tensor,
         needs_reduce_scatter: bool,
@@ -1003,11 +1055,20 @@ class KimiK3MoE(nn.Module):
             return gathered_shared_output
 
         shared_output = torch.empty_like(hidden_states)
-        attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
+        group = self._shared_experts_comm_group
+        if group is get_parallel().attn_tp_group:
+            attn_tp_reduce_scatter_tensor(shared_output, gathered_shared_output)
+        else:
+            group.reduce_scatter_tensor(shared_output, gathered_shared_output)
         return shared_output
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run TP-sharded shared experts while DeepEP tokens stay scattered."""
+        if self._npu_fused_shared_experts:
+            return self.shared_experts.forward_npu_fused_collective(
+                hidden_states, self._shared_experts_comm_group
+            )
+
         shared_input, needs_reduce_scatter = self._prepare_shared_experts_input(
             hidden_states
         )
@@ -1043,16 +1104,23 @@ class KimiK3MoE(nn.Module):
             if self.shared_experts is None or hidden_states.shape[0] == 0:
                 return
             if self._sbo_shared_overlap:
-                shared_input, shared_output_needs_reduce_scatter = (
-                    self._prepare_shared_experts_input(hidden_states)
-                )
                 current_stream = torch.cuda.current_stream()
-                # Keep HCCL collectives on the current stream. The alternate
-                # stream only executes the shared-expert MLP.
+                if self._npu_fused_shared_experts:
+                    shared_input = hidden_states
+                else:
+                    shared_input, shared_output_needs_reduce_scatter = (
+                        self._prepare_shared_experts_input(hidden_states)
+                    )
                 shared_input.record_stream(self.alt_stream)
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
-                    shared_output = self.shared_experts(shared_input)
+                    if self._npu_fused_shared_experts:
+                        # CANN's graph-safe collective matmuls follow the
+                        # current side stream, preserving SBO while removing
+                        # the explicit attention-TP AG/RS pair.
+                        shared_output = self._forward_shared_experts(shared_input)
+                    else:
+                        shared_output = self.shared_experts(shared_input)
                     shared_event = self.alt_stream.record_event()
             else:
                 shared_output = self._forward_shared_experts(hidden_states)

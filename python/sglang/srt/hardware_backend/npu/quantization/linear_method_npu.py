@@ -131,6 +131,73 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         if hasattr(layer, "weight_offset"):
             layer.weight_offset.data = layer.weight_offset.data.flatten()
 
+        # The fused collective-matmul operators require FP32 per-channel
+        # scales, while regular npu_quant_matmul accepts the BF16 scales from
+        # ModelSlim.  Convert once after loading instead of on every token.
+        if envs.SGLANG_NPU_FUSED_COLLECTIVE_MATMUL.get():
+            scale = layer.weight_scale.detach().float().contiguous()
+            if hasattr(layer, "_npu_collective_weight_scale"):
+                layer._npu_collective_weight_scale = scale
+            else:
+                layer.register_buffer(
+                    "_npu_collective_weight_scale", scale, persistent=False
+                )
+
+    @staticmethod
+    def _collective_weight_scale(layer: torch.nn.Module) -> torch.Tensor:
+        scale = getattr(layer, "_npu_collective_weight_scale", None)
+        if scale is None:
+            # Keep this fallback for callers that enable the optimization
+            # after weight post-processing. It runs only on the first warmup,
+            # before NPUGraph capture.
+            scale = layer.weight_scale.detach().float().contiguous()
+            layer.register_buffer(
+                "_npu_collective_weight_scale", scale, persistent=False
+            )
+        return scale
+
+    def apply_all_gather_mm(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        hcom: str,
+        world_size: int,
+    ) -> torch.Tensor:
+        quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
+        output, _ = torch.ops.npu.npu_all_gather_base_mm(
+            quant_out,
+            layer.weight,
+            hcom,
+            world_size,
+            x1_scale=dynamic_scale.flatten(),
+            x2_scale=self._collective_weight_scale(layer),
+            # gather_output=False faults in the current CANN quantized AIV
+            # path, so retain the unused gathered tensor.
+            gather_output=True,
+            output_dtype=x.dtype,
+            comm_mode="aiv",
+        )
+        return output
+
+    def apply_mm_reduce_scatter(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        hcom: str,
+        world_size: int,
+    ) -> torch.Tensor:
+        quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x)
+        return torch.ops.npu.npu_mm_reduce_scatter_base(
+            quant_out,
+            layer.weight,
+            hcom,
+            world_size,
+            x1_scale=dynamic_scale.flatten(),
+            x2_scale=self._collective_weight_scale(layer),
+            output_dtype=x.dtype,
+            comm_mode="aiv",
+        )
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -153,6 +220,57 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             bias=bias,
             output_dtype=original_dtype,
         )
+
+
+def _get_w8a8_dynamic_kernel(layer: torch.nn.Module):
+    scheme = getattr(layer, "scheme", None)
+    kernel = getattr(scheme, "kernel", None)
+    if isinstance(kernel, NPUW8A8Int8DynamicLinearMethod):
+        return kernel
+    return None
+
+
+def supports_npu_fused_collective_matmul(layer: torch.nn.Module) -> bool:
+    """Whether a linear has the exact dynamic-int8 contract of the fused ops."""
+    return (
+        envs.SGLANG_NPU_FUSED_COLLECTIVE_MATMUL.get()
+        and getattr(layer, "bias", None) is None
+        and _get_w8a8_dynamic_kernel(layer) is not None
+    )
+
+
+def get_npu_hccl_comm_name(group) -> str:
+    """Resolve and cache the HCCL handle used by CANN collective matmuls."""
+    hcom = getattr(group, "_npu_fused_matmul_hcom", None)
+    if hcom is None:
+        backend = group.device_group._get_backend(torch.device("npu"))
+        # ProcessGroupHCCL expects the global rank here, including for a
+        # subgroup; rank_in_group is only the rank encoded inside the handle.
+        hcom = backend.get_hccl_comm_name(group.rank)
+        group._npu_fused_matmul_hcom = hcom
+    return hcom
+
+
+def npu_fused_all_gather_linear(
+    layer: torch.nn.Module, x: torch.Tensor, group
+) -> torch.Tensor:
+    kernel = _get_w8a8_dynamic_kernel(layer)
+    if kernel is None:
+        raise TypeError("linear is not ModelSlim W8A8_DYNAMIC")
+    return kernel.apply_all_gather_mm(
+        layer, x, get_npu_hccl_comm_name(group), group.world_size
+    )
+
+
+def npu_fused_linear_reduce_scatter(
+    layer: torch.nn.Module, x: torch.Tensor, group
+) -> torch.Tensor:
+    kernel = _get_w8a8_dynamic_kernel(layer)
+    if kernel is None:
+        raise TypeError("linear is not ModelSlim W8A8_DYNAMIC")
+    return kernel.apply_mm_reduce_scatter(
+        layer, x, get_npu_hccl_comm_name(group), group.world_size
+    )
 
 
 class NPUMXFP8LinearMethod(_NPULinearMethodBase):
