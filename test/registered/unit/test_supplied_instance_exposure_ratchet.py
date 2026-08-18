@@ -769,27 +769,24 @@ class TestSuppliedInstanceExposure(CustomTestCase):
                     and not tgt.attr.startswith("_")
                 ):
                     targets.add(tgt.attr)
-        # The deprecated-alias normalization loop writes through a *name
-        # tuple* (`for attr in (...): setattr(self, attr, "dsv4")`), which no
-        # assignment scan sees; its field set is pinned here with a drift
-        # guard on the tuple itself.
+        # The deprecated-alias normalization declares through `**renamed`, so
+        # the keyword scan sees no names; its field set is pinned here.
         alias_fields = {
             "attention_backend",
             "decode_attention_backend",
             "prefill_attention_backend",
             "speculative_draft_attention_backend",
         }
+        deprecated = next(
+            node
+            for node in ast.walk(sa_class)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_handle_deprecated_args"
+        )
         found_tuples = [
             {elt.value for elt in node.iter.elts if isinstance(elt, ast.Constant)}
-            for node in ast.walk(sa_class)
-            if isinstance(node, ast.For)
-            and isinstance(node.iter, ast.Tuple)
-            and any(
-                isinstance(inner, ast.Call)
-                and isinstance(inner.func, ast.Name)
-                and inner.func.id == "setattr"
-                for inner in ast.walk(node)
-            )
+            for node in ast.walk(deprecated)
+            if isinstance(node, ast.For) and isinstance(node.iter, ast.Tuple)
         ]
         self.assertIn(
             alias_fields,

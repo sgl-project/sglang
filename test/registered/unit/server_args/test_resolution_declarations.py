@@ -1,15 +1,19 @@
 """Resolution writes are recorded, not just applied.
 
 The projection that replaces field materialization reads the declaration stash,
-so a resolution write that only assigns the field is invisible to it. The
-converted fields are therefore pinned two ways: no bare assignment survives in
-the source, and after resolution every one of them agrees with what the stash
-says. The second check is the one that keeps the transition honest -- while
-`_declare` still writes the field immediately, a stash entry and a field can
-only disagree if some other code assigned the field behind the stash's back.
+so a resolution write that only assigns the field is invisible to it. Every
+resolver declares now -- the record's handlers through `self._declare`, the
+hooks and hardware defaults through `declare_resolution` -- and that is pinned
+two ways: no bare assignment to a field survives anywhere a ServerArgs instance
+is in reach, and after resolution every declared field agrees with what the
+stash says. The second check is the one that keeps the transition honest --
+while a declaration still writes the field immediately, a stash entry and a
+field can only disagree if something assigned the field behind the stash's
+back.
 """
 
 import ast
+import dataclasses
 import json
 import os
 import pathlib
@@ -26,130 +30,9 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _SRT = pathlib.Path(sglang.__file__).resolve().parent / "srt"
 
-# Fields whose resolution writes go through `_declare`. The set grows one batch
-# at a time; a field joins it in the commit that converts its writes.
-_DECLARED_FIELDS = frozenset(
-    {
-        "_speculative_draft_quantization_explicitly_set",
-        "allowed_media_domains",
-        "attention_backend",
-        "attn_cp_size",
-        "chunked_prefill_size",
-        "cp_strategy",
-        "cuda_graph_backend_prefill",
-        "cuda_graph_config",
-        "cuda_graph_max_bs_prefill",
-        "custom_weight_loader",
-        "debug_cuda_graph",
-        "decode_attention_backend",
-        "deepep_mode",
-        "detokenizer_worker_num",
-        "device",
-        "disable_cuda_graph",
-        "disable_custom_all_reduce",
-        "disable_overlap_schedule",
-        "disable_radix_cache",
-        "disaggregation_bootstrap_port",
-        "disaggregation_decode_extra_slots",
-        "disaggregation_ib_device",
-        "disaggregation_mode",
-        "disaggregation_transfer_backend",
-        "dp_size",
-        "dsa_prefill_cp_mode",
-        "elastic_ep_initial_size",
-        "enable_aiter_allreduce_fusion",
-        "enable_deterministic_inference",
-        "enable_dp_attention",
-        "enable_dp_attention_local_control_broadcast",
-        "enable_dp_lm_head",
-        "enable_dsa_prefill_context_parallel",
-        "enable_dynamic_batch_tokenizer",
-        "enable_flashinfer_allreduce_fusion",
-        "enable_flexkv",
-        "enable_hierarchical_cache",
-        "enable_lmcache",
-        "enable_lora",
-        "enable_mixed_chunk",
-        "enable_page_major_kv_layout",
-        "enable_prefill_context_parallel",
-        "enable_prefill_cp",
-        "enable_prefill_delayer",
-        "enable_return_hidden_states",
-        "enable_symm_mem",
-        "enable_tokenizer_batch_encode",
-        "enable_torch_symm_mem",
-        "encoder_transfer_backend",
-        "enforce_disable_flashinfer_allreduce_fusion",
-        "enforce_shared_experts_fusion",
-        "ep_dispatch_algorithm",
-        "ep_join_mode",
-        "ep_size",
-        "eplb_algorithm",
-        "expert_distribution_recorder_buffer_size",
-        "expert_distribution_recorder_mode",
-        "flashinfer_allreduce_fusion_backend",
-        "grammar_backend",
-        "grpc_port",
-        "hicache_io_backend",
-        "hicache_mem_layout",
-        "hicache_ratio",
-        "image_processor_backend",
-        "is_embedding",
-        "keep_mm_feature_on_device",
-        "limit_mm_data_per_request",
-        "linear_attn_decode_backend",
-        "linear_attn_verify_backend",
-        "load_balance_method",
-        "load_format",
-        "mamba_ssm_dtype",
-        "max_running_requests",
-        "mem_fraction_static",
-        "mm_feature_transport",
-        "mm_process_config",
-        "model_path",
-        "moe_a2a_backend",
-        "moe_dense_tp_size",
-        "moe_dp_size",
-        "moe_runner_backend",
-        "mooncake_ib_device",
-        "optimistic_prefill_attempts",
-        "page_size",
-        "pp_size",
-        "pre_warm_nccl",
-        "preferred_sampling_params",
-        "prefill_attention_backend",
-        "prefill_cp_mode",
-        "prefill_delayer_max_delay_passes",
-        "prefill_delayer_token_usage_low_watermark",
-        "prefill_only_disable_kv_cache",
-        "quantization",
-        "random_seed",
-        "remote_instance_weight_loader_start_seed_via_transfer_engine",
-        "return_hidden_states_mode",
-        "sampling_backend",
-        "schedule_conservativeness",
-        "served_model_name",
-        "skip_server_warmup",
-        "smg_grpc_mode",
-        "soft_watchdog_timeout",
-        "speculative_adaptive",
-        "speculative_algorithm",
-        "speculative_draft_attention_backend",
-        "speculative_draft_load_format",
-        "speculative_draft_model_path",
-        "speculative_draft_model_quantization",
-        "speculative_draft_model_revision",
-        "speculative_draft_window_size",
-        "speculative_eagle_topk",
-        "speculative_num_draft_tokens",
-        "speculative_num_steps",
-        "tokenizer_path",
-        "tool_call_parser",
-        "torch_compile_max_bs",
-        "triton_attention_num_kv_splits",
-        "uses_mamba_radix_cache",
-    }
-)
+# Every field of the record: resolution has no bare-assignment writer left, so
+# the scan states that as a whole rather than a converted-so-far list.
+_RESOLVED_FIELDS = frozenset(field.name for field in dataclasses.fields(ServerArgs))
 
 # Shapes the agreement check runs on. Each needs a real config.json:
 # `model_path="dummy"` takes the pipeline's early return.
@@ -247,6 +130,7 @@ def _server_args_writers(tree, path):
     would let a field look converted while a second writer still assigns it.
     """
     names = {"self"} if path.name == "server_args.py" else set()
+    # A parameter *named* `server_args` counts with or without the annotation.
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
@@ -263,6 +147,9 @@ def _server_args_writers(tree, path):
                 continue
             if text == "ServerArgs":
                 names.add(arg.arg)
+        names |= {
+            arg.arg for arg in args.posonlyargs + args.args if arg.arg == "server_args"
+        }
     return names
 
 
@@ -284,12 +171,22 @@ def _bare_assignments():
                 targets = [node.target]
             else:
                 continue
+            # Destructured targets count: `(sa.a, sa.b) = f()` writes two
+            # fields and is not an `ast.Attribute` at the top level. The EAGLE
+            # auto-sizing wrote three fields that way, so they never reached
+            # the stash and the bags published `None`.
+            flat = []
             for target in targets:
+                if isinstance(target, (ast.Tuple, ast.List)):
+                    flat.extend(target.elts)
+                else:
+                    flat.append(target)
+            for target in flat:
                 if (
                     isinstance(target, ast.Attribute)
                     and isinstance(target.value, ast.Name)
                     and target.value.id in names
-                    and target.attr in _DECLARED_FIELDS
+                    and target.attr in _RESOLVED_FIELDS
                 ):
                     found.append(
                         f"{path.relative_to(_SRT)}:{node.lineno} "
@@ -345,7 +242,7 @@ class TestResolutionDeclarations(CustomTestCase):
             server_args = self._resolve(shape)
             overlay = _stash_overlay(server_args)
             for field, declared in overlay.items():
-                if field not in _DECLARED_FIELDS:
+                if field not in _RESOLVED_FIELDS:
                     continue
                 actual = getattr(server_args, field)
                 if actual != declared:
@@ -430,7 +327,7 @@ class TestResolutionDeclarations(CustomTestCase):
         """A green agreement check over an empty stash would prove nothing."""
         declared = set()
         for shape in _SHAPES:
-            declared |= set(_stash_overlay(self._resolve(shape))) & _DECLARED_FIELDS
+            declared |= set(_stash_overlay(self._resolve(shape))) & _RESOLVED_FIELDS
         missing = sorted(_REACHED_BY_SHAPES - declared)
         self.assertEqual(
             missing,
