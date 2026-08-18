@@ -1002,6 +1002,12 @@ class DeepseekV4AttnBackend(
         batch_size = len(seq_lens)
         num_tokens = num_tokens_per_req * batch_size
         swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(out_cache_loc)
+        if swa_out_cache_loc is None and out_cache_loc is not None:
+            # Eager-only miss (no graph state / oversized batch): translate once
+            # per step instead of per layer at store time.
+            swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                out_cache_loc
+            ).to(torch.int32)
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
 
@@ -1036,8 +1042,8 @@ class DeepseekV4AttnBackend(
     def _fill_cuda_graph_swa_out_cache_loc(
         self, out_cache_loc: Optional[torch.Tensor]
     ) -> Optional[torch.Tensor]:
-        # None (buffer absent / too small) -> per-layer fallback; capture must
-        # only ever record the static buffer's address.
+        # None (buffer absent / too small) is an eager-only miss: capture and
+        # replay always fit the pre-sized buffer.
         buf = self.cuda_graph_swa_out_cache_loc
         if (
             buf is None
@@ -1538,8 +1544,8 @@ class DeepseekV4AttnBackend(
         Prefer the value cached by the metadata init: in-graph for
         decode/verify, the hoisted cuda_graph_swa_out_cache_loc buffer for
         draft-extend. Translate at store time when nothing matching is cached
-        (eager paths without the init or the buffer, or a batch re-padded
-        after init). Idle always falls back: its metadata may be stale, and
+        (paths that skip the init, or a batch re-padded after init). Idle
+        always falls back: its metadata may be stale, and
         translating the zero-padded out_cache_loc writes to the dummy slot.
         """
         out_cache_loc = forward_batch.out_cache_loc
