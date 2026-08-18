@@ -20,24 +20,16 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from sglang.kernels.ops.diffusion.fused_gate_rmsnorm import (
+from sglang.kernels.ops.diffusion import (
     mount_fused_gate_rmsnorm,
-    unmount_fused_gate_rmsnorm,
-)
-from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     mount_fused_linear_gelu,
-    unmount_fused_linear_gelu,
-)
-from sglang.kernels.ops.diffusion.fused_ln_modulate import (
     mount_fused_ln_modulate,
-    unmount_fused_ln_modulate,
-)
-from sglang.kernels.ops.diffusion.hunyuan_qknorm import (
     mount_hunyuan_qknorm,
-    unmount_hunyuan_qknorm,
-)
-from sglang.kernels.ops.diffusion.ltx2_rmsnorm_modulate import (
     mount_ltx2_rms_norm_modulate,
+    unmount_fused_gate_rmsnorm,
+    unmount_fused_linear_gelu,
+    unmount_fused_ln_modulate,
+    unmount_hunyuan_qknorm,
     unmount_ltx2_rms_norm_modulate,
 )
 from sglang.multimodal_gen import envs
