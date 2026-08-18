@@ -125,6 +125,7 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
+_fused_topk_deepseek = None
 
 # Epsilon added to the top-k weight sum before renormalization, matching the
 # DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
@@ -143,6 +144,18 @@ _RENORMALIZE_SUM_EPSILON = 1e-20
 # default because it is a numerics-affecting change that must be validated with
 # an accuracy run before becoming the default.
 _skip_hip_pad_mask = get_bool_env_var("SGLANG_MORI_NO_PAD_MASK", "False")
+
+
+def _flashinfer_fused_topk_supports_device(device: torch.device) -> bool:
+    """Return whether FlashInfer's DeepSeek top-k kernel supports ``device``."""
+    support_check = getattr(
+        _fused_topk_deepseek, "is_compute_capability_supported", None
+    )
+    if support_check is None:
+        return True
+
+    major, minor = torch.cuda.get_device_capability(device)
+    return support_check(major * 10 + minor)
 
 
 if _is_cuda:
@@ -1487,6 +1500,7 @@ def biased_grouped_topk_gpu(
     if (
         _is_cuda
         and fused_topk_deepseek is not None
+        and _flashinfer_fused_topk_supports_device(gating_output.device)
         and is_power_of_two(num_experts)
         # flashinfer constraints (applied to routed experts only)
         and topk_routed <= 8

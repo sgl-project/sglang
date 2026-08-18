@@ -1,13 +1,42 @@
 import sys
 
 import pytest
+import sglang.srt.layers.moe.topk as topk_module
 import torch
-
 from sglang.srt.layers.moe.topk import biased_grouped_topk_gpu, biased_grouped_topk_impl
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=40, stage="nightly", runner_config="1-gpu-large")
+
+
+@pytest.mark.parametrize(
+    "compute_capability,expected",
+    [((8, 6), False), ((8, 9), True), ((9, 0), True)],
+)
+def test_flashinfer_fused_topk_checks_device_support(
+    monkeypatch, compute_capability, expected
+):
+    class Kernel:
+        @staticmethod
+        def is_compute_capability_supported(capability):
+            return capability in {89, 90}
+
+    monkeypatch.setattr(topk_module, "_fused_topk_deepseek", Kernel())
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device: compute_capability
+    )
+
+    assert (
+        topk_module._flashinfer_fused_topk_supports_device(torch.device("cuda"))
+        is expected
+    )
+
+
+def test_flashinfer_fused_topk_without_support_metadata_is_accepted(monkeypatch):
+    monkeypatch.setattr(topk_module, "_fused_topk_deepseek", object())
+
+    assert topk_module._flashinfer_fused_topk_supports_device(torch.device("cuda"))
 
 
 @pytest.mark.parametrize(
