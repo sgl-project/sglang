@@ -875,7 +875,7 @@ def fused_topk(
                 num_token_non_padded=num_token_non_padded,
             )
         # ===== END TO BE REFACTORED ====
-        elif _is_cuda and envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
+        elif _is_cuda:
             # Unified Triton router (subsumes the AOT topk_softmax CUDA kernel).
             from sglang.kernels.ops.moe.moe_fused_gate import (
                 moe_fused_gate as _jit_moe_fused_gate,
@@ -915,7 +915,7 @@ def fused_topk(
                 topk_weights *= (
                     routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 )
-        elif _is_cuda and envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
+        elif _is_cuda:
             # Unified Triton router (subsumes the AOT topk_sigmoid CUDA kernel).
             from sglang.kernels.ops.moe.moe_fused_gate import (
                 moe_fused_gate as _jit_moe_fused_gate,
@@ -1937,6 +1937,7 @@ def _post_process_topk_ids(
     )
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     recorder_topk_ids = None
+    _fold_pad_into_append = False
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
@@ -1983,7 +1984,19 @@ def _post_process_topk_ids(
         # contribution to the hidden state is still zero regardless of the id.
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
-        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
+        #
+        # Fold: when the fused append+remap kernel runs below (aiter per-rank
+        # shared-slot path, EPLB off) it folds this padded fill itself
+        # (pad_fill_id=0 -> remap(0)=0, bit-identical), so skip the separate
+        # _fill_padded_rows launch here.
+        _fold_pad_into_append = (
+            num_fused_shared_experts > 0
+            and _use_aiter
+            and use_per_rank_shared_slots
+            and not _eplb_remap_enabled()
+        )
+        if not _fold_pad_into_append:
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
@@ -2038,6 +2051,9 @@ def _post_process_topk_ids(
             1.0,  # shared-expert weight on the aiter path
             shared_id_base,
             num_local_routed,
+            num_token_non_padded=(
+                num_token_non_padded if _fold_pad_into_append else None
+            ),
         )
     elif _aiter_append:
         M, N = router_logits.shape
@@ -2172,16 +2188,8 @@ def select_experts(
         if scoring_func not in ("sqrtsoftplus", "sigmoid"):
             assert not apply_routed_scaling_factor_on_output, "Not implemented"
 
-        # Keep sigmoid flag-off byte-identical: only use the JIT gate when the flag is on.
-        use_jit_fused_gate = envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get()
-        if scoring_func == "sqrtsoftplus" or (
-            scoring_func == "sigmoid" and use_jit_fused_gate
-        ):
-            _biased_topk = (
-                biased_topk_jit_kernel_impl if use_jit_fused_gate else biased_topk_impl
-            )
-
-            topk_weights, topk_ids = _biased_topk(
+        if scoring_func == "sqrtsoftplus" or scoring_func == "sigmoid":
+            topk_weights, topk_ids = biased_topk_jit_kernel_impl(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 correction_bias=correction_bias,
