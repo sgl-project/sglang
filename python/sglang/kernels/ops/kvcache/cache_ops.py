@@ -42,6 +42,58 @@ def concat_and_cast_mha_k_kernel(
     tl.store(dst_rope_ptr, src_rope)
 
 
+@triton.jit
+def concat_and_cast_mha_k_pad_kernel(
+    k_ptr,
+    k_nope_ptr,
+    k_rope_ptr,
+    head_cnt: tl.constexpr,
+    k_stride0: tl.constexpr,
+    k_stride1: tl.constexpr,
+    nope_stride0: tl.constexpr,
+    nope_stride1: tl.constexpr,
+    rope_stride0: tl.constexpr,
+    nope_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+):
+    """
+    concat_and_cast_mha_k_kernel for a head count that is not a power of two.
+    tl.arange needs a power-of-two extent, so walk HEAD_BLOCK == next_power_of_2(head_cnt)
+    lanes and mask the tail.
+    """
+    pid_loc = tl.program_id(0)
+    head_range = tl.arange(0, HEAD_BLOCK)
+    head_mask = head_range < head_cnt
+
+    k_head_ptr = k_ptr + pid_loc * k_stride0 + head_range[:, None] * k_stride1
+
+    nope_offs = tl.arange(0, nope_dim)
+
+    src_nope_ptr = (
+        k_nope_ptr
+        + pid_loc * nope_stride0
+        + head_range[:, None] * nope_stride1
+        + nope_offs[None, :]
+    )
+    dst_nope_ptr = k_head_ptr + nope_offs[None, :]
+
+    nope_mask = tl.broadcast_to(head_mask[:, None], (HEAD_BLOCK, nope_dim))
+    src_nope = tl.load(src_nope_ptr, mask=nope_mask, other=0)
+    tl.store(dst_nope_ptr, src_nope, mask=nope_mask)
+
+    rope_offs = tl.arange(0, rope_dim)
+    src_rope_ptr = k_rope_ptr + pid_loc * rope_stride0 + rope_offs[None, :]
+    dst_rope_ptr = k_head_ptr + nope_dim + rope_offs[None, :]
+    rope_mask = tl.broadcast_to(head_mask[:, None], (HEAD_BLOCK, rope_dim))
+    src_rope = tl.load(src_rope_ptr)
+    tl.store(
+        dst_rope_ptr,
+        tl.broadcast_to(src_rope, (HEAD_BLOCK, rope_dim)),
+        mask=rope_mask,
+    )
+
+
 def concat_and_cast_mha_k_triton(
     k: torch.Tensor,
     k_nope: torch.Tensor,
@@ -64,6 +116,26 @@ def concat_and_cast_mha_k_triton(
     nope_dim = k_nope.shape[-1]
     rope_dim = k_rope.shape[-1]
     grid = (k.shape[0],)
+
+    head_cnt = k.shape[1]
+    if head_cnt != triton.next_power_of_2(head_cnt):
+        # Not the power of two concat_and_cast_mha_k_kernel's tl.arange needs;
+        # Kimi-K3's 96 heads give 12 at TP8.
+        concat_and_cast_mha_k_pad_kernel[grid](
+            k,
+            k_nope,
+            k_rope,
+            head_cnt,
+            k.stride(0),
+            k.stride(1),
+            k_nope.stride(0),
+            k_nope.stride(1),
+            k_rope.stride(0),
+            nope_dim,
+            rope_dim,
+            HEAD_BLOCK=triton.next_power_of_2(head_cnt),
+        )
+        return
 
     concat_and_cast_mha_k_kernel[grid](
         k,

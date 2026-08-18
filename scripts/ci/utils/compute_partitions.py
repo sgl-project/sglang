@@ -88,7 +88,8 @@ def discover_files(repo_root: str) -> list[str]:
         for f in glob.glob(
             os.path.join(test_dir, "registered", "**", "*.py"), recursive=True
         )
-        if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
+        # Same exclusion as run_suite.py: pytest+package structure files.
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
     ]
     jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
     files += glob.glob(

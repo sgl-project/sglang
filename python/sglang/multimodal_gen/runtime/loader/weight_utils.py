@@ -91,6 +91,12 @@ def get_lock(model_name_or_path: str | Path, cache_dir: str | None = None):
     hash_name = hashlib.sha256(model_name.encode()).hexdigest()
     # add hash to avoid conflict with old users' lock files
     lock_file_name = hash_name + model_name + ".lock"
+    # Linux filesystems commonly cap one filename at 255 bytes. Absolute
+    # snapshot paths can exceed that even though the full path is valid.
+    # The digest is already collision-resistant, so fall back to it alone
+    # while preserving the historical name for ordinary paths.
+    if len(os.fsencode(lock_file_name)) > 255:
+        lock_file_name = hash_name + ".lock"
     # mode 0o666 is required for the filelock to be shared across users
     lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
     return lock
@@ -228,6 +234,10 @@ def safetensors_weights_iterator(
         use_runai_model_streamer = (
             HAS_RUNAI_MODEL_STREAMER and envs.SGLANG_USE_RUNAI_MODEL_STREAMER
         )
+    if key_filter is not None:
+        # streamer filters after materializing all tensors, so it cannot skip
+        # a checkpoint partition at load time
+        use_runai_model_streamer = False
 
     # Validate files before loading
     corrupted_files, duplicate_files_by_key = _scan_safetensors_files(hf_weights_files)
