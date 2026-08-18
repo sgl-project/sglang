@@ -9,6 +9,7 @@ from torch import nn
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
@@ -409,10 +410,19 @@ class DSparkDraftMixin:
             )
         if self.logits_mup_width_multiplier:
             hidden = hidden / self.logits_mup_width_multiplier
-        weight = self.lm_head.weight
-        if hidden.dtype != weight.dtype:
-            hidden = hidden.to(weight.dtype)
-        local_logits = torch.matmul(hidden, weight.T)
+        quant_method = getattr(self.lm_head, "quant_method", None)
+        if should_apply_lm_head_quant_method(self.lm_head, quant_method):
+            # Quantized LM heads keep packed weights (for example NVFP4 stores
+            # [vocab, hidden / 2] uint8 values), so ``weight.T`` is not a
+            # matrix with the model hidden size.  Use the layer's quantized
+            # GEMM implementation just as the regular logits processor does.
+            local_logits = quant_method.apply(self.lm_head, hidden, None)
+        else:
+            weight = self.lm_head.weight
+            if hidden.dtype != weight.dtype:
+                hidden = hidden.to(weight.dtype)
+            local_logits = torch.matmul(hidden, weight.T)
+
         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
         return base_logits, None
 
