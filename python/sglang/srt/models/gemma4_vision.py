@@ -30,7 +30,17 @@ from sglang.srt.layers.clippable_linear import (
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix, get_device_capability, is_cuda, is_hip
+from sglang.srt.utils import (
+    add_prefix,
+    cpu_has_amx_support,
+    get_device_capability,
+    is_cpu,
+    is_cuda,
+    is_hip,
+)
+
+_is_cpu = is_cpu()
+_is_cpu_amx_available = _is_cpu and cpu_has_amx_support()
 
 # ---------------------------------------------------------------------------
 # 2-D Multidimensional RoPE (matches HF Gemma4RotaryEmbedding for vision)
@@ -173,7 +183,9 @@ class Gemma4VisionAttention(nn.Module):
             num_heads=self.num_heads_per_partition,
             num_kv_heads=self.num_kv_heads_per_partition,
             dropout=0.0,
-            flatten_batch=True,
+            # sdpa asserts bsz == 1 under flatten_batch, which batched video
+            # frames violate; Gemma 4 passes its own 4-D mask regardless
+            flatten_batch=backend != "sdpa",
             softmax_in_single_precision=False,
             softmax_scale=1.0,
         )
@@ -198,6 +210,8 @@ class Gemma4VisionAttention(nn.Module):
             # ROCm: use triton_attn to avoid SDPA flatten_batch issues
             # with multi-image/video inputs
             return "triton_attn"
+        # not amx_attn: VisionAMXAttention swallows softmax_scale and the mask
+        # in **kwargs, and the CPU flash_attn hardcodes sm_scale
         return "sdpa"
 
     def forward(
@@ -219,10 +233,15 @@ class Gemma4VisionAttention(nn.Module):
         k = self.k_norm(k.reshape(-1, self.head_dim)).reshape(k.shape)
         v = self.v_norm(v.reshape(-1, self.head_dim)).reshape(v.shape)
 
-        cos_flat = cos.reshape(bsz * seq_len, 1, self.head_dim)
-        sin_flat = sin.reshape(bsz * seq_len, 1, self.head_dim)
-        q = _apply_multidimensional_rope(q, cos_flat, sin_flat)
-        k = _apply_multidimensional_rope(k, cos_flat, sin_flat)
+        if _is_cpu_amx_available:
+            cos = cos.reshape(bsz * seq_len, self.head_dim)
+            sin = sin.reshape(bsz * seq_len, self.head_dim)
+            torch.ops.sgl_kernel.apply_multidimensional_rope_cpu(q, k, cos, sin)
+        else:
+            cos_flat = cos.reshape(bsz * seq_len, 1, self.head_dim)
+            sin_flat = sin.reshape(bsz * seq_len, 1, self.head_dim)
+            q = _apply_multidimensional_rope(q, cos_flat, sin_flat)
+            k = _apply_multidimensional_rope(k, cos_flat, sin_flat)
 
         if attention_mask is not None:
             attn_mask_4d = (
