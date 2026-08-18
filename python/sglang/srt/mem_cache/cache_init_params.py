@@ -45,6 +45,7 @@ class CacheInitParams:
     chunked_prefill_size: Optional[int] = None
 
     sliding_window_size: Optional[int] = None
+    enable_draft_swa_sidecar: bool = False
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None

@@ -8,7 +8,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Set
 
 import torch
 
@@ -85,10 +85,13 @@ class PoolHitPolicy(str, Enum):
 
     ALL_PAGES      : every page in [0, kv_hit) must exist (e.g. DSA).
     TRAILING_PAGES : only the last N pages must exist (e.g. Mamba/SWA states).
+    RECOMPUTE_TRAILING : if the trailing sidecar is missing, reuse the prefix
+                         before that tail and regenerate the tail.
     """
 
     ALL_PAGES = "all_pages"
     TRAILING_PAGES = "trailing_pages"
+    RECOMPUTE_TRAILING = "recompute_trailing"
 
 
 @dataclass
@@ -118,16 +121,41 @@ class SidecarPoolSpec:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
 
 
+def resolve_pool_hit_boundary(
+    *,
+    kv_pages: int,
+    transfer: PoolTransfer,
+    has_component: Callable[[int], bool],
+) -> tuple[int, bool]:
+    """Return reusable prefix pages and whether the sidecar itself is present."""
+    if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+        boundary = next((i for i in range(kv_pages) if not has_component(i)), kv_pages)
+        return boundary, boundary > 0
+
+    trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+    for prefix_len in range(kv_pages, 0, -1):
+        if all(
+            has_component(i)
+            for i in range(max(0, prefix_len - trailing), prefix_len)
+        ):
+            return prefix_len, True
+
+    if transfer.hit_policy == PoolHitPolicy.RECOMPUTE_TRAILING:
+        return max(0, kv_pages - trailing), False
+    return 0, False
+
+
 @dataclass
 class PoolTransferResult:
     """Tracks how many pages were successfully processed per pool."""
 
     kv_hit_pages: int
     extra_pool_hit_pages: dict[str, int]
+    recompute_tail_pages: int = 0
 
     @classmethod
     def empty(cls) -> PoolTransferResult:
-        return cls(0, {})
+        return cls(0, {}, 0)
 
     def update_kv_hit_pages(self, kv_hit_pages: int) -> None:
         """Accumulate kv_hit_pages across batches (max = last successful batch)."""
@@ -624,30 +652,26 @@ class HiCacheFile(HiCacheStorage):
 
         hit_count: dict[str, int] = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
+        recompute_tail_pages = 0
 
         for transfer in pool_transfers or []:
             if final_pages == 0:
                 break
             name = transfer.name
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                boundary = next(
-                    (i for i in range(kv_pages) if not has_component(i, name)), kv_pages
-                )
-            else:  # trailing_pages
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                boundary = 0
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        has_component(i, name)
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        boundary = prefix_len
-                        break
-            if boundary:
+            boundary, sidecar_hit = resolve_pool_hit_boundary(
+                kv_pages=kv_pages,
+                transfer=transfer,
+                has_component=lambda i: has_component(i, name),
+            )
+            if sidecar_hit:
                 hit_count[name] = boundary
+            elif transfer.hit_policy == PoolHitPolicy.RECOMPUTE_TRAILING:
+                recompute_tail_pages = max(
+                    recompute_tail_pages, kv_pages - boundary
+                )
             final_pages = min(final_pages, boundary)
 
-        return PoolTransferResult(final_pages, hit_count)
+        return PoolTransferResult(final_pages, hit_count, recompute_tail_pages)
 
     def _log_key(self, pool_name: str, key: str) -> str:
         return key if pool_name == PoolName.KV else f"{key}.{pool_name}"

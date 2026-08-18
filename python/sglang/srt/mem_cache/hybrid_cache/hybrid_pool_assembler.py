@@ -1110,7 +1110,7 @@ def build_swa_draft_pools(
     spec = SidecarPoolSpec(
         pool_name=PoolName.DRAFT_SWA,
         indices_from_pool=PoolName.SWA,
-        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        hit_policy=PoolHitPolicy.RECOMPUTE_TRAILING,
     )
     entry = build_pool_entry(
         name=PoolName.DRAFT_SWA,

@@ -12,12 +12,140 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DraftSWASidecarLayout,
     use_dsv4_dspark_draft_swa_sidecar,
 )
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    resolve_pool_hit_boundary,
+)
+from sglang.srt.mem_cache.unified_cache.components.draft_swa_sidecar_component import (
+    DraftSWASidecarComponent,
+)
+from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestDSV4DraftSWASidecar(unittest.TestCase):
+    def test_all_pages_keeps_partial_prefix_semantics(self):
+        transfer = PoolTransfer(
+            name=PoolName.DRAFT_SWA,
+            hit_policy=PoolHitPolicy.ALL_PAGES,
+        )
+
+        boundary, sidecar_hit = resolve_pool_hit_boundary(
+            kv_pages=10,
+            transfer=transfer,
+            has_component=lambda i: i < 6,
+        )
+
+        self.assertEqual(boundary, 6)
+        self.assertTrue(sidecar_hit)
+
+    def test_storage_miss_recomputes_one_trailing_page(self):
+        transfer = PoolTransfer(
+            name=PoolName.DRAFT_SWA,
+            keys=["tail"],
+            hit_policy=PoolHitPolicy.RECOMPUTE_TRAILING,
+        )
+
+        boundary, sidecar_hit = resolve_pool_hit_boundary(
+            kv_pages=10,
+            transfer=transfer,
+            has_component=lambda _: False,
+        )
+
+        self.assertEqual(boundary, 9)
+        self.assertFalse(sidecar_hit)
+
+    def test_storage_hit_reuses_full_prefix(self):
+        transfer = PoolTransfer(
+            name=PoolName.DRAFT_SWA,
+            keys=["tail"],
+            hit_policy=PoolHitPolicy.RECOMPUTE_TRAILING,
+        )
+
+        boundary, sidecar_hit = resolve_pool_hit_boundary(
+            kv_pages=10,
+            transfer=transfer,
+            has_component=lambda i: i == 9,
+        )
+
+        self.assertEqual(boundary, 10)
+        self.assertTrue(sidecar_hit)
+
+    def test_dependent_component_tracks_coverage_without_owning_slots(self):
+        root = SimpleNamespace(parent=None, component_data=[None, None, None])
+        swa_data = SimpleNamespace(
+            metadata={},
+            value=torch.arange(256),
+            host_value=torch.arange(256),
+        )
+        node = SimpleNamespace(
+            parent=root,
+            component_data=[None, swa_data, None],
+        )
+        cache = SimpleNamespace(
+            page_size=256,
+            sliding_window_size=128,
+            tree_core=SimpleNamespace(root_node=root),
+        )
+        component = DraftSWASidecarComponent(cache)
+
+        component.mark_device(node)
+        component.mark_host(node)
+
+        self.assertTrue(component.has_device_window(node))
+        self.assertTrue(component.has_host_window(node))
+        component.clear_device(node)
+        self.assertFalse(component.has_device_window(node))
+        self.assertIsNotNone(swa_data.value)
+
+    def test_missing_sidecar_match_requires_recomputable_tail(self):
+        root = SimpleNamespace(parent=None, component_data=[None, None, None])
+        swa_data = SimpleNamespace(
+            metadata={},
+            value=torch.arange(256),
+            host_value=None,
+        )
+        node = SimpleNamespace(
+            parent=root,
+            key=list(range(256)),
+            component_data=[None, swa_data, None],
+        )
+        cache = SimpleNamespace(
+            page_size=256,
+            sliding_window_size=128,
+            tree_core=SimpleNamespace(root_node=root),
+        )
+        sidecar = DraftSWASidecarComponent(cache)
+        swa = object.__new__(SWAComponent)
+        swa.sliding_window_size = 128
+        swa.tree_core = SimpleNamespace(
+            has_swa_host_pool=False,
+            enable_hicache=False,
+        )
+        swa.draft_swa_sidecar = sidecar
+
+        exact_match = swa.create_match_validator_for_key(
+            match_device_only=True,
+            match_key_len=256,
+        )
+        match_with_tail = swa.create_match_validator_for_key(
+            match_device_only=True,
+            match_key_len=512,
+        )
+
+        self.assertFalse(exact_match(node))
+        self.assertTrue(match_with_tail(node))
+        sidecar.mark_device(node)
+        covered_exact_match = swa.create_match_validator_for_key(
+            match_device_only=True,
+            match_key_len=256,
+        )
+        self.assertTrue(covered_exact_match(node))
+
     def test_rollout_defaults_on_and_keeps_explicit_fallback(self):
         spec = SimpleNamespace(is_dspark=lambda: True)
         with (

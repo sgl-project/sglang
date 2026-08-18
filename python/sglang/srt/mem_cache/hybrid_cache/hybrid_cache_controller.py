@@ -606,6 +606,10 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+        operation.pool_storage_result.recompute_tail_pages = max(
+            operation.pool_storage_result.recompute_tail_pages,
+            hit_result.recompute_tail_pages,
+        )
 
         return (
             hash_value[:kv_hit_pages],

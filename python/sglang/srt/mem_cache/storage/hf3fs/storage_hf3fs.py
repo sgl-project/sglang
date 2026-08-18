@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    resolve_pool_hit_boundary,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsClient
@@ -683,6 +684,7 @@ class HiCacheHF3FS(HiCacheStorage):
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
+        recompute_tail_pages = 0
 
         for transfer in pool_transfers or []:
             if final_pages == 0:
@@ -699,27 +701,20 @@ class HiCacheHF3FS(HiCacheStorage):
                 self.rank, component_keys, namespace=ctx.namespace
             )
 
-            boundary = 0
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                try:
-                    boundary = exists_results.index(False)
-                except ValueError:
-                    boundary = kv_pages
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        exists_results[i]
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        boundary = prefix_len
-                        break
-
-            if boundary:
+            boundary, sidecar_hit = resolve_pool_hit_boundary(
+                kv_pages=kv_pages,
+                transfer=transfer,
+                has_component=lambda i: exists_results[i],
+            )
+            if sidecar_hit:
                 hit_count[pool_name] = boundary
+            elif transfer.hit_policy == PoolHitPolicy.RECOMPUTE_TRAILING:
+                recompute_tail_pages = max(
+                    recompute_tail_pages, kv_pages - boundary
+                )
             final_pages = min(final_pages, boundary)
 
-        return PoolTransferResult(final_pages, hit_count)
+        return PoolTransferResult(final_pages, hit_count, recompute_tail_pages)
 
     def _pool_batch_get(self, transfer: PoolTransfer) -> List[bool]:
         pool_name = transfer.name

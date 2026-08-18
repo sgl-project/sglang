@@ -74,6 +74,7 @@ class SWAComponent(TreeComponent):
         self.full_window_pages = (
             self.sliding_window_size + params.page_size - 1
         ) // params.page_size
+        self.draft_swa_sidecar = getattr(cache, "draft_swa_sidecar", None)
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
 
@@ -203,9 +204,21 @@ class SWAComponent(TreeComponent):
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
+        return self.create_match_validator_for_key(
+            match_device_only=match_device_only,
+            match_key_len=None,
+        )
+
+    def create_match_validator_for_key(
+        self,
+        *,
+        match_device_only: bool,
+        match_key_len: Optional[int],
+    ) -> Callable[[UnifiedTreeNode], bool]:
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
         state = {"len": float("inf")}
+        matched_len = 0
 
         # unified_kv never caches the SWA ring (per-request, not content-stable),
         # so SWA bookkeeping must not gate the match here.
@@ -214,6 +227,8 @@ class SWAComponent(TreeComponent):
         )
 
         def validator(node: UnifiedTreeNode) -> bool:
+            nonlocal matched_len
+            matched_len += len(node.key)
             cd = node.component_data[ct]
             # HiCache: a host-only tombstone is a valid match boundary too
             # — load_back will restore SWA from host before use.
@@ -223,7 +238,23 @@ class SWAComponent(TreeComponent):
                     return True
                 return False
             state["len"] += len(node.key)
-            return state["len"] >= sliding_window_size
+            if state["len"] < sliding_window_size:
+                return False
+            if self.draft_swa_sidecar is None:
+                return True
+
+            covered = (
+                self.draft_swa_sidecar.has_device_window(node)
+                if match_device_only
+                else self.draft_swa_sidecar.has_loadable_window(node)
+            )
+            if covered:
+                return True
+            return (
+                match_key_len is not None
+                and match_key_len - matched_len
+                >= self.draft_swa_sidecar.window_span
+            )
 
         return validator
 
@@ -469,6 +500,8 @@ class SWAComponent(TreeComponent):
             child.component_data[self.component_type].metadata.get("uuid")
         )
         child.component_data[self.component_type].metadata.pop("uuid", None)
+        if self.draft_swa_sidecar is not None:
+            self.draft_swa_sidecar.redistribute_on_node_split(new_parent, child)
 
     def evict_component(
         self,
@@ -493,6 +526,8 @@ class SWAComponent(TreeComponent):
             freed = len(cd.value)
             self.tree_core.component_evictable_size_[ct] -= freed
             cd.value = None
+            if self.draft_swa_sidecar is not None:
+                self.draft_swa_sidecar.clear_device(node)
 
         # Host layer
         host_lru = self.tree_core.host_lru_lists[ct]
@@ -500,6 +535,8 @@ class SWAComponent(TreeComponent):
             host_freed = len(cd.host_value)
             host_frees[ct].append(cd.host_value)
             cd.host_value = None
+            if self.draft_swa_sidecar is not None:
+                self.draft_swa_sidecar.clear_host(node)
             if host_lru.in_list(node):
                 host_lru.remove_node(node)
 
@@ -1153,6 +1190,10 @@ class SWAComponent(TreeComponent):
             self.tree_core.set_component_device_value(
                 action.node_id, self.component_type, swa_value
             )
+            if self.draft_swa_sidecar is not None:
+                self.draft_swa_sidecar.mark_device(
+                    self.tree_core.node_by_id(action.node_id)
+                )
             return
         if isinstance(action, SWARebuild):
             # Translate the node's source full value to SWA and store it on the node.
@@ -1160,6 +1201,10 @@ class SWAComponent(TreeComponent):
             self.tree_core.set_component_device_value(
                 action.node_id, self.component_type, swa_value
             )
+            if self.draft_swa_sidecar is not None:
+                self.draft_swa_sidecar.mark_device(
+                    self.tree_core.node_by_id(action.node_id)
+                )
             return
         raise AssertionError(
             f"SWAComponent: unhandled ComponentAction {type(action).__name__}"
