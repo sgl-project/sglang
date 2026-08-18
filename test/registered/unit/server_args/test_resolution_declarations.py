@@ -9,7 +9,9 @@ is in reach, and after resolution every declared field agrees with what the
 stash says. The second check is the one that keeps the transition honest --
 while a declaration still writes the field immediately, a stash entry and a
 field can only disagree if something assigned the field behind the stash's
-back.
+back. A third check runs the other way: every field resolution moved has to
+be explained by the stash, which covers the spellings a source scan cannot
+see.
 """
 
 import ast
@@ -172,9 +174,7 @@ def _bare_assignments():
             else:
                 continue
             # Destructured targets count: `(sa.a, sa.b) = f()` writes two
-            # fields and is not an `ast.Attribute` at the top level. The EAGLE
-            # auto-sizing wrote three fields that way, so they never reached
-            # the stash and the bags published `None`.
+            # fields and is not an `ast.Attribute` at the top level.
             flat = []
             for target in targets:
                 if isinstance(target, (ast.Tuple, ast.List)):
@@ -234,6 +234,45 @@ class TestResolutionDeclarations(CustomTestCase):
             [],
             "a converted field is assigned directly, so the projection would "
             "not see this write:\n  " + "\n  ".join(bare),
+        )
+
+    def test_the_stash_accounts_for_every_change_resolution_made(self):
+        """The other direction: a field resolution moved is in the stash.
+
+        The source scan states that no *assignment* escapes, which leaves the
+        spellings a source scan cannot see -- a computed name, a write through
+        a helper the scan does not recognize as holding the record. This
+        compares the resolved value against what the caller supplied (or the
+        field's default) and asks the stash to explain every difference, which
+        is what the projection has to be able to do.
+        """
+        unexplained = []
+        for shape in _SHAPES:
+            supplied = {"random_seed": 42, **shape}
+            server_args = self._resolve(shape)
+            overlay = _stash_overlay(server_args)
+            for field in dataclasses.fields(server_args):
+                if field.name in ("model_path", "device") or field.name in overlay:
+                    continue
+                if field.name in supplied:
+                    before = supplied[field.name]
+                elif field.default is not dataclasses.MISSING:
+                    before = field.default
+                elif field.default_factory is not dataclasses.MISSING:
+                    before = field.default_factory()
+                else:
+                    continue
+                after = getattr(server_args, field.name, None)
+                if after != before:
+                    unexplained.append(
+                        f"{shape} -> {field.name}: {before!r} -> {after!r}"
+                    )
+        self.assertEqual(
+            unexplained,
+            [],
+            "resolution moved these fields without declaring them, so the "
+            "projection would answer with the unresolved value:\n  "
+            + "\n  ".join(unexplained),
         )
 
     def test_the_stash_agrees_with_the_fields_it_declared(self):
