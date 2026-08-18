@@ -608,13 +608,17 @@ class DSparkWorkerV2(BaseSpecWorker):
         return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
-        if batch.global_num_tokens is None or not self._verify_planner.is_compact_mode:
+        if not self._verify_planner.is_compact_mode:
             return None
-        global_bs = max(batch.global_num_tokens)
-        if global_bs <= 0:
-            return None
+        # Every DP rank must replay the same ragged CUDA-graph family during
+        # idle participation.  An idle rank can expose [0] (or no local
+        # token-count metadata), but it still needs one dummy request slot;
+        # returning None would make the graph runner fall back to a token-keyed
+        # graph and fail before the collective can complete.
+        global_bs = max(batch.global_num_tokens or [0])
+        tier_num_reqs = max(int(global_bs), 1)
         return idle_ragged_layout(
-            tier_num_reqs=global_bs,
+            tier_num_reqs=tier_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
             device=self.device,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
