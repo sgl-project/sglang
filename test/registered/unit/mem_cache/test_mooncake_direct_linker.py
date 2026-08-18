@@ -3,6 +3,7 @@ from array import array
 from queue import Queue
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
@@ -10,9 +11,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
-    DevicePoolEntry,
-    DevicePoolGroup,
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -21,6 +20,7 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
 )
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
     MambaComponent,
 )
@@ -29,6 +29,8 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     LinkerTransferPhase,
 )
 from sglang.srt.mem_cache.unified_cache_linker import (
+    DevicePoolEntry,
+    DevicePoolGroup,
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -355,7 +357,12 @@ def test_deepseek_v4_device_pool_group_maps_sparse_sidecars():
     kvcache.compress_state_pools = [state_pool(), None, state_pool()]
     kvcache.indexer_compress_state_pools = [state_pool(), None, state_pool()]
 
-    group = resolve_hybrid_device_pool_group(kvcache, 2, None)
+    group = resolve_hybrid_device_pool_group(
+        kvcache=kvcache,
+        page_size=2,
+        params=SimpleNamespace(req_to_token_pool=None),
+        components={ComponentType.FULL, ComponentType.SWA},
+    )
     assert group.num_layers == 3
     assert set(group.entry_map) == {
         PoolName.SWA,
@@ -377,7 +384,7 @@ def test_deepseek_v4_device_pool_group_maps_sparse_sidecars():
     assert c4_pool.get_prepared_layer_range_meta([0], 1) is None
 
 
-def test_qwen35_device_pool_group_maps_full_and_mamba_layers():
+def test_mamba_strategy_rejects_direct_linker():
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
     kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
@@ -401,20 +408,45 @@ def test_qwen35_device_pool_group_maps_full_and_mamba_layers():
         translate_mamba_indices=lambda indices: indices,
     )
 
-    group = resolve_hybrid_device_pool_group(kvcache, 2, req_pool)
-    pools = group.entry_map
-    assert group.num_layers == 4
-    assert set(pools) == {PoolName.KV, PoolName.MAMBA}
+    with pytest.raises(ValueError, match="does not support the direct external linker"):
+        resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=2,
+            params=SimpleNamespace(req_to_token_pool=req_pool),
+            components={ComponentType.FULL, ComponentType.MAMBA},
+        )
+
+
+def test_dsa_device_pool_group_uses_assembler_strategy():
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+    kvcache = DSATokenToKVPool.__new__(DSATokenToKVPool)
+    kvcache.page_size = 2
+    kvcache.layer_num = 2
+    kvcache.kv_buffer = [
+        torch.zeros((8, 3), dtype=torch.uint8),
+        torch.zeros((8, 5), dtype=torch.uint8),
+    ]
+    kvcache.index_key_cache = SimpleNamespace(
+        buffer=[
+            torch.zeros((4, 7), dtype=torch.uint8),
+            torch.zeros((4, 11), dtype=torch.uint8),
+        ]
+    )
+
+    group = resolve_hybrid_device_pool_group(
+        kvcache=kvcache,
+        page_size=2,
+        params=SimpleNamespace(req_to_token_pool=None),
+        components={ComponentType.FULL},
+    )
+
+    assert group.num_layers == 2
+    assert set(group.entry_map) == {PoolName.KV, PoolName.INDEXER}
     assert group.sources == {
         PoolName.KV: PoolName.KV,
-        PoolName.MAMBA: PoolName.MAMBA,
+        PoolName.INDEXER: PoolName.KV,
     }
-    assert pools[PoolName.MAMBA].translate_indices(torch.tensor([1])).tolist() == [1]
-    assert pools[PoolName.KV].get_prepared_layer_range_meta([0], 1) is None
-    assert pools[PoolName.MAMBA].get_prepared_layer_range_meta([0], 0) is None
-    pointers, sizes = pools[PoolName.KV].get_page_buffer_meta(torch.tensor([0, 1]))
-    assert len(pointers) == 4
-    assert sizes == [24, 40, 56, 88]
 
 
 def test_device_pool_group_allows_partial_side_pool_load():
@@ -466,39 +498,12 @@ def test_swa_linker_finish_maps_or_releases_slots():
     assert swa_allocator.freed[0].tolist() == [20, 21]
 
 
-def test_mamba_linker_load_allocates_cache_and_request_slots():
-    allocator = _Allocator(slots=torch.tensor([7, 8]))
-    req_pool = SimpleNamespace(mamba_allocator=allocator, mamba_ckpt_pool=None)
+def test_mamba_component_rejects_external_linker():
     component = MambaComponent.__new__(MambaComponent)
-    component.cache = SimpleNamespace(
-        req_to_token_pool=req_pool,
-        evict=lambda params: None,
-    )
-
-    transfer = component.build_external_linker_transfer(
-        LinkerTransferPhase.LOAD, None, ["a", "b"]
-    )
-    assert transfer.keys == ["b", "b"]
-    assert transfer.device_indices.tolist() == [7, 8]
-
-    req = SimpleNamespace(
-        mamba_pool_idx=None,
-        mamba_cow_src_index=torch.tensor([99]),
-        mamba_needs_clear=True,
-    )
-    full = PoolTransfer(name=PoolName.KV, device_indices=torch.tensor([1]))
-    component.finish_external_linker_load(
-        req, full, transfer, prefix_len=2, success=True
-    )
-    assert req.mamba_pool_idx.item() == 8
-    assert req.mamba_cow_src_index is None
-    assert not req.mamba_needs_clear
-
-    failed = PoolTransfer(name=PoolName.MAMBA, device_indices=torch.tensor([9, 10]))
-    component.finish_external_linker_load(
-        req, full, failed, prefix_len=2, success=False
-    )
-    assert allocator.freed[-1].tolist() == [9, 10]
+    with pytest.raises(AssertionError, match="does not support external linker mode"):
+        component.build_external_linker_transfer(
+            LinkerTransferPhase.LOAD, None, ["a", "b"]
+        )
 
 
 def test_insert_filters_overlapping_full_and_swa_load_pages():

@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache_linker import UnifiedCacheLinker
@@ -76,12 +76,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         server_args,
         params: CacheInitParams,
         *,
+        components,
         storage=None,
     ):
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.pool_group = resolve_hybrid_device_pool_group(
-            kvcache, self.page_size, params.req_to_token_pool
+            kvcache=kvcache,
+            page_size=self.page_size,
+            params=params,
+            components=components,
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
