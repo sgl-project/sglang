@@ -1962,12 +1962,21 @@ def get_video_bytes(video_file: Union[str, bytes, VideoData]) -> bytes:
     raise ValueError(f"Unsupported video input type: {type(video_file)}")
 
 
-def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
+def load_video(
+    video_file: Union[str, bytes, VideoData, VideoDecoderWrapper], use_gpu: bool = True
+):
     if isinstance(video_file, VideoData):
         # preprocess_kwargs is consumed by the multimodal processor, not here.
         video_file = video_file.url
 
     if isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
+        return video_file
+
+    # Already-decoded input: a caller that constructed the decoder itself (or is
+    # re-entering with this function's own return value) must not be rejected.
+    # _normalize_video_input has no case for VideoDecoderWrapper, so without this
+    # the call falls through to "Unsupported video input type".
+    if isinstance(video_file, VideoDecoderWrapper):
         return video_file
 
     source = _normalize_video_input(video_file)
