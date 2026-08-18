@@ -113,6 +113,11 @@ class AttentionBackend(ABC):
         :py:meth:`init_forward_metadata_out_graph` call."""
         return False
 
+    # Opt in when this backend's DRAFT_EXTEND_V2 out-graph metadata init is a
+    # pure function of pre-verify state (it may read verify products by shape
+    # only), so the init can be staged before the verify launch.
+    supports_draft_extend_metadata_staging: bool = False
+
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 
