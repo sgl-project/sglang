@@ -256,21 +256,6 @@ class MoeLoraRunner:
                 "resident BF16 provider"
             )
 
-        # The resident weight layout needs no check: reaching here at all means
-        # --moe-runner-backend lora (layers.py gates the engine on is_lora),
-        # and that same flag sets the layer's use_deep_gemm (fused_moe_triton/
-        # layer.py), which makes the quant method build a DEEP_GEMM runner
-        # (unquant.py) -- so the canonical gate-first [E, 2I, H] BF16 residents
-        # are guaranteed by construction.
-        #
-        # Architecture, on the other hand, is a real gate, and it is a CLOSED
-        # set rather than a floor. Every base GEMM we ship is built on one of
-        # two instruction families: WGMMA on SM90, tcgen05 on SM100. DeepGEMM
-        # requires exactly the same two (its configurer rejects sm < 90 and
-        # rejects SM120 by name). SM120 is the case a ">= SM90" floor gets
-        # wrong -- consumer Blackwell reports major 12 and has NEITHER family,
-        # while architecture_for_capability and _kernel_class_for both test
-        # major >= 10 and would hand it the GB300 tables and a tcgen05 kernel.
         major, minor = torch.cuda.get_device_capability()
         if major not in (9, 10):
             raise NotImplementedError(
@@ -327,12 +312,6 @@ class MoeLoraRunner:
                 "expected 'expert_major' or 'route_major'"
             )
         if vendor == "cutedsl":
-            if torch.cuda.get_device_capability()[0] not in (9, 10):
-                raise NotImplementedError(
-                    "the CuTeDSL MoE LoRA providers implement SM90 (WGMMA) and "
-                    "SM100 (tcgen05) only; this device is "
-                    f"sm{''.join(map(str, torch.cuda.get_device_capability()))}"
-                )
             from sglang.srt.lora.moe.base_gemm_provider.cutedsl_bf16 import (
                 CuteDslBf16ContiguousProvider,
                 CuteDslBf16Provider,

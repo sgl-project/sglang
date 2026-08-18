@@ -234,12 +234,7 @@ class TestRowDomainConfig:
         from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
         assert MoeLoraRunner.select_provider_cls("route_major", "deepgemm") is not None
-        try:
-            assert (
-                MoeLoraRunner.select_provider_cls("route_major", "cutedsl") is not None
-            )
-        except NotImplementedError:
-            pass  # known pair, device-gated (needs SM90+)
+        assert MoeLoraRunner.select_provider_cls("route_major", "cutedsl") is not None
         # a vendor in the row-order slot must not silently resolve
         with pytest.raises(ValueError, match="row order"):
             MoeLoraRunner.select_provider_cls("cutedsl_contiguous", "cutedsl")
