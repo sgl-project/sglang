@@ -1843,9 +1843,7 @@ def apply_fp8_linear(
         # When accepted: per_tensor_activations is False for a 2-D scale, so it
         # flows to the per-channel bpreshuffle / rowwise GEMM below (or the safe
         # unfused fallback when the weight is not per-channel).
-        is_per_token_scale = (
-            _use_aiter and input_scale.shape == (input_2d.shape[0], 1)
-        )
+        is_per_token_scale = _use_aiter and input_scale.shape == (input_2d.shape[0], 1)
         if is_per_token_scale:
             x_scale = input_scale
         else:
