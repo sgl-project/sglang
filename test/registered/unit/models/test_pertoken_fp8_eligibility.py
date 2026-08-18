@@ -5,11 +5,16 @@ Covers ``_is_per_channel_dynamic_fp8`` in
 projection's activation quant may be folded into the upstream RMSNorm and its
 ``(fp8, per-token scale)`` tuple fed straight to ``gemm_a8w8_bpreshuffle``.
 
-This is the "per-channel vs per-tensor/static eligibility" coverage requested in
-review, and it guards two real regressions:
-  * per-tensor / static-input-scale fp8 must NOT be folded (correctness), and
-  * per-channel scale stored 1-D ``[N]`` (this checkpoint's layout) MUST be
-    folded (a stricter ``dim()==2`` check silently disabled folding).
+The contract is read from the layer's own state: an explicit
+``_fp8_weight_preshuffled`` marker (set by the quant method at load, not inferred
+from the global gfx95 flag), ``input_scale is None`` (dynamic), and a
+per-channel ``weight_scale`` whose ``numel`` equals the projection's output size
+(``output_size_per_partition`` else ``output_size``), stored 1-D ``[N]`` or 2-D
+``[N, 1]``.
+
+This guards the real regressions: per-tensor / static-input-scale / block-scale
+/ non-preshuffled fp8 must NOT be folded; a scale sized to the input dim ``K``
+must NOT be accepted; a per-channel scale (1-D or 2-D) MUST be folded.
 
 Pure logic, no server/engine — runs on CPU CI.
 """
@@ -37,13 +42,26 @@ N = 2112
 K = 256
 
 
-def _make_proj(weight_scale, input_scale=None, weight_dtype=torch.float8_e4m3fn):
-    """Build a minimal proj-like object with just the attrs the predicate reads."""
+def _make_proj(
+    weight_scale,
+    input_scale=None,
+    weight_dtype=torch.float8_e4m3fn,
+    preshuffled=True,
+    out_features=N,
+):
+    """Build a minimal proj-like object with just the attrs the predicate reads.
+
+    Defaults describe an eligible per-channel dynamic fp8 proj: preshuffled
+    marker set, no static input_scale, output size == N. Individual tests flip
+    one attribute to exercise a rejection path.
+    """
     weight = torch.empty((N, K), dtype=weight_dtype)
     return types.SimpleNamespace(
         weight=weight,
         weight_scale=weight_scale,
         input_scale=input_scale,
+        output_size=out_features,
+        _fp8_weight_preshuffled=preshuffled,
     )
 
 
@@ -66,6 +84,22 @@ class TestPerChannelDynamicFp8Eligibility(CustomTestCase):
         for ws in (torch.empty(1), torch.empty(())):
             proj = _make_proj(weight_scale=ws)
             self.assertFalse(_is_per_channel_dynamic_fp8(proj))
+
+    @patch(_PRED, True)
+    def test_scale_matching_input_dim_is_rejected(self):
+        # A scale sized to the input dim K (not output channels N) must be
+        # rejected -- exact output-channel match, not "some weight dimension".
+        proj = _make_proj(weight_scale=torch.empty(K, dtype=torch.float32))
+        self.assertFalse(_is_per_channel_dynamic_fp8(proj))
+
+    @patch(_PRED, True)
+    def test_missing_preshuffle_marker_is_rejected(self):
+        # The explicit preshuffle marker must be set by the quant method at load;
+        # without it (e.g. a non-aiter build) the fold must not fire.
+        proj = _make_proj(
+            weight_scale=torch.empty(N, dtype=torch.float32), preshuffled=False
+        )
+        self.assertFalse(_is_per_channel_dynamic_fp8(proj))
 
     @patch(_PRED, True)
     def test_static_input_scale_is_rejected(self):
@@ -101,7 +135,7 @@ class TestPerChannelDynamicFp8Eligibility(CustomTestCase):
     @patch(_PRED, False)
     def test_disabled_when_bpreshuffle_unavailable(self):
         # Even a valid per-channel proj must fall back when the aiter bpreshuffle
-        # path (preshuffled weight) is not available.
+        # hardware path is not available.
         proj = _make_proj(weight_scale=torch.empty(N, dtype=torch.float32))
         self.assertFalse(_is_per_channel_dynamic_fp8(proj))
 
