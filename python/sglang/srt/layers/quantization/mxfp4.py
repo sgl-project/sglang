@@ -329,6 +329,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # Weights stay MXFP4 (e2m1 + ue8m0 g32, zero requantization);
         # activations are quantized to fp8 per-token-group-128.
         self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
+        # MegaMoE calls DeepGEMM directly instead of going through the selected
+        # MoE runner, so it needs the same unpadded checkpoint layout and
+        # DeepGEMM scale preparation even when the runner is flashinfer_mxfp4.
+        self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
@@ -379,7 +383,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
         intermediate_size_per_partition_after_pad = intermediate_size_per_partition
-        if self.use_marlin:
+        if self.use_marlin and not self.use_mega_moe:
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, 128
             )
@@ -389,7 +393,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
             )
-        elif self.use_deep_gemm:
+        elif self.use_deep_gemm or self.use_mega_moe:
             # DeepGEMM fp8_fp4 grouped GEMM consumes the checkpoint layout
             # directly (packed e2m1 K-major + ue8m0 g32 scales); no padding.
             pass
@@ -531,7 +535,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
-        if self.use_marlin:
+        if self.use_marlin and not self.use_mega_moe:
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,
             )
@@ -559,7 +563,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer._mxfp4_backend = "marlin"
             return
 
-        if self.use_deep_gemm:
+        if self.use_deep_gemm or self.use_mega_moe:
             from deep_gemm import transform_sf_into_required_layout
 
             # Packed fp4 (e2m1 x2 per byte) weights: DeepGEMM expects int8.
@@ -584,7 +588,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     num_groups=num_experts,
                     disable_ue8m0_cast=False,
                 )
-            if get_moe_a2a_backend().is_megamoe():
+            if self.use_mega_moe:
                 # MegaMoE consumes the same transformed sf, plus its own
                 # interleaved/UTCCP weight layout. K3 routes EVERY batch
                 # through mega (the megamoe backend has no a2a fallback), so
@@ -1436,6 +1440,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     layer.moe_runner_config.gemm1_alpha,
                     layer.moe_runner_config.gemm1_clamp_limit,
                     True,  # is_vnni
+                    layer.moe_runner_config.activation,  # activation
                 )
             else:
                 from sglang.srt.layers.moe.fused_moe_native import moe_forward_native

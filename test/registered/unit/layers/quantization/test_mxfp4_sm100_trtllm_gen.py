@@ -191,6 +191,9 @@ def _quant_input(x, precision, hidden_size):
 
 def _ref_trtllm(x, layer, method, precision, top_k, router_logits):
     # Direct kernel call mirroring the SM100 helper's arg list.
+    from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        trtllm_moe_enable_pdl,
+    )
     from sglang.srt.utils.common import next_power_of_2
 
     x_quant, x_scale = _quant_input(x, precision, method.hidden_size)
@@ -228,6 +231,7 @@ def _ref_trtllm(x, layer, method, precision, top_k, router_logits):
         True,
         tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
         output=out,
+        enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
     )[0]
 
 
