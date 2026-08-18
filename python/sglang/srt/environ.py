@@ -1053,6 +1053,11 @@ class Envs:
     # ===================================================================
     # Kernel selection and fused backends
     # ===================================================================
+    # Opt-in Kimi-K3 gfx950 MLA decode path: fuse identity-RoPE Q
+    # materialization, Q concat and latent KV-cache write into AITER's
+    # per-head kernel. Fail closed to the existing split/cat/cache chain.
+    SGLANG_K3_AITER_MLA_Q_CACHE_FUSION = EnvBool(False)
+
     SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
     # value, e.g. "torch" / "torch_compile" / "triton" / "aot"); unset =
