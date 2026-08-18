@@ -286,8 +286,7 @@ def _case_swa_page_indices(tc):
         block_size=block_size,
         swa_window=128,
     )
-    tc._parity(
-        dspark_attn_metadata.BuildDsparkSwaPageIndices,
+    kwargs = dict(
         req_to_token=_ri(0, n_full, (max_reqs, 400), torch.int32),
         full_to_swa_mapping=_ri(0, 20000, (n_full,), torch.int32),
         req_pool_indices_per_request=gather.req_pool_indices_per_request,
@@ -298,6 +297,13 @@ def _case_swa_page_indices(tc):
         block_size=block_size,
         swa_window=128,
         page_index_aligned_size=64,
+    )
+    kernel = dspark_attn_metadata.BuildDsparkSwaPageIndices
+    tc._parity(kernel, **kwargs)
+    tc._parity(
+        kernel,
+        **kwargs,
+        block_swa_locs=_ri(20000, 30000, (num_q,), torch.int32),
     )
 
 

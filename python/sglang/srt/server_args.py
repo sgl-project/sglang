@@ -2157,6 +2157,13 @@ class ServerArgs:
         "off the schedule is byte-for-byte unchanged.",
         NS("spec"),
     ] = False
+    speculative_dspark_draft_swa_sidecar: A[
+        bool,
+        "DSPARK DSV4 only. Keep committed draft SWA in the content-scoped sidecar "
+        "cache while routing optimistic proposal KV through step-scoped scratch. "
+        "The scratch is never inserted into radix cache or transferred by PD/HiCache.",
+        NS("spec"),
+    ] = False
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",

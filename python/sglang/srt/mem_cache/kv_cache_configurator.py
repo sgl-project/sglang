@@ -1101,6 +1101,19 @@ class KVCacheConfigurator:
         else:
             pool_cls = DeepSeekV4TokenToKVPool
 
+        draft_swa_scratch_width = 0
+        if (
+            self.is_draft_worker
+            and self.spec_algorithm.is_dspark()
+            and not _is_npu
+            and getattr(
+                self.server_args, "speculative_dspark_draft_swa_sidecar", False
+            )
+        ):
+            draft_swa_scratch_width = max(
+                (max_speculative_num_draft_tokens() or 0) - 1, 0
+            )
+
         token_to_kv_pool = pool_cls(
             max_num_reqs=max_running_requests,
             # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
@@ -1128,6 +1141,7 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             enable_hisparse=get_memory().enable_hisparse,
             online_mtp_max_draft_tokens=(max_speculative_num_draft_tokens() or 0),
+            draft_swa_scratch_width=draft_swa_scratch_width,
         )
         return token_to_kv_pool
 

@@ -1098,14 +1098,20 @@ class DeepseekV4AttnBackend(
                     self.topk,
                     self.speculative_num_steps,
                 )[self.speculative_step_id]
-            metadata.core_attn_metadata.swa_out_cache_loc = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
-                    torch.int32
-                )
-            )
-
             if self.is_dspark_draft and forward_batch.forward_mode.is_target_verify():
                 block_size = int(forward_batch.spec_info.draft_token_num)
+                if self.token_to_kv_pool.has_draft_swa_scratch:
+                    metadata.core_attn_metadata.swa_out_cache_loc = (
+                        self.token_to_kv_pool.get_draft_swa_scratch_locs(
+                            forward_batch.req_pool_indices, block_size
+                        ).to(torch.int32)
+                    )
+                else:
+                    metadata.core_attn_metadata.swa_out_cache_loc = (
+                        self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                            out_cache_loc
+                        ).to(torch.int32)
+                    )
                 seq_lens_casual = self._dspark_seq_lens_casual(
                     seq_lens=forward_batch.seq_lens, block_size=block_size
                 )
@@ -1123,6 +1129,12 @@ class DeepseekV4AttnBackend(
                 )
                 metadata.core_attn_metadata.swa_page_indices = swa_page_indices
                 metadata.core_attn_metadata.swa_topk_lengths = swa_topk_lengths
+            else:
+                metadata.core_attn_metadata.swa_out_cache_loc = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        out_cache_loc
+                    ).to(torch.int32)
+                )
 
     def _dspark_seq_lens_casual(
         self, *, seq_lens: torch.Tensor, block_size: int
@@ -1557,6 +1569,15 @@ class DeepseekV4AttnBackend(
             and cached.shape[0] == out_cache_loc.shape[0]
         ):
             return cached
+        if (
+            self.is_dspark_draft
+            and forward_batch.forward_mode.is_target_verify()
+            and self.token_to_kv_pool.has_draft_swa_scratch
+        ):
+            block_size = int(forward_batch.spec_info.draft_token_num)
+            return self.token_to_kv_pool.get_draft_swa_scratch_locs(
+                forward_batch.req_pool_indices, block_size
+            ).to(torch.int32)
         return self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
             torch.int32
         )
@@ -2014,6 +2035,13 @@ class DeepseekV4AttnBackend(
             block_size=block_size,
             swa_window=SWA_WINDOW,
             page_index_aligned_size=PAGE_INDEX_ALIGNED_SIZE,
+            block_swa_locs=(
+                self.token_to_kv_pool.get_draft_swa_scratch_locs(
+                    gather.req_pool_indices_per_request, block_size
+                )
+                if self.token_to_kv_pool.has_draft_swa_scratch
+                else None
+            ),
         )
         return swa_page_indices, swa_topk_lengths
 
