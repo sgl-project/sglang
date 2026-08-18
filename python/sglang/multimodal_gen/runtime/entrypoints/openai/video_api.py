@@ -363,6 +363,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "use_system_prompt": _extra_value(request, "use_system_prompt"),
         "use_guardrails": _extra_value(request, "use_guardrails"),
         "enable_teacache": request.enable_teacache,
+        "enable_step_reuse": request.enable_step_reuse,
         "enable_frame_interpolation": request.enable_frame_interpolation,
         "frame_interpolation_exp": request.frame_interpolation_exp,
         "frame_interpolation_scale": request.frame_interpolation_scale,
@@ -544,6 +545,7 @@ async def create_video(
     max_sequence_length: Optional[int] = Form(None),
     flow_shift: Optional[float] = Form(None),
     enable_teacache: Optional[bool] = Form(None),
+    enable_step_reuse: Optional[bool] = Form(None),
     enable_frame_interpolation: Optional[bool] = Form(None),
     frame_interpolation_exp: Optional[int] = Form(None),
     frame_interpolation_scale: Optional[float] = Form(None),
@@ -676,6 +678,7 @@ async def create_video(
             max_sequence_length=form_value("max_sequence_length", max_sequence_length),
             flow_shift=form_value("flow_shift", flow_shift),
             enable_teacache=form_value("enable_teacache", enable_teacache),
+            enable_step_reuse=form_value("enable_step_reuse", enable_step_reuse),
             enable_frame_interpolation=form_value(
                 "enable_frame_interpolation", enable_frame_interpolation
             ),

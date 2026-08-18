@@ -211,6 +211,12 @@ class SamplingParams:
     enable_spectrum: bool = False
     spectrum_params: Any = None  # SpectrumParams
 
+    # Step-reuse parameters (see runtime.cache.step_reuse). Mutually exclusive
+    # with enable_teacache/enable_spectrum: all three are alternative
+    # per-step skip-forward strategies.
+    enable_step_reuse: bool = False
+    step_reuse_params: Any = None  # StepReuseParams, set by model-specific subclass
+
     # Profiling
     profile: bool = field(default=False, metadata={"batch_sig_exclude": True})
     num_profiled_timesteps: int = field(default=5, metadata={"batch_sig_exclude": True})
@@ -564,6 +570,11 @@ class SamplingParams:
         if self.enable_teacache and self.enable_spectrum:
             raise ValueError(
                 "enable_teacache and enable_spectrum are mutually exclusive; enable only one."
+            )
+        if self.enable_step_reuse and (self.enable_teacache or self.enable_spectrum):
+            raise ValueError(
+                "enable_step_reuse is mutually exclusive with enable_teacache and "
+                "enable_spectrum; enable only one skip-forward strategy."
             )
 
         RLRolloutArgs.validate_sampling_params(self)

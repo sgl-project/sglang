@@ -30,17 +30,33 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, FrozenSet, Hashable, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    FrozenSet,
+    Hashable,
+    Optional,
+    Tuple,
+)
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+if TYPE_CHECKING:
+    import torch
+
+    from sglang.multimodal_gen.configs.models import DiTConfig
 
 logger = init_logger(__name__)
 
 ScopeKey = Tuple[Hashable, ...]
 
+FORCE_FIRST_ONE = "first_one"
 FORCE_FIRST_TWO = "first_two"
 FORCE_TERMINAL = "terminal"
-_KNOWN_FORCE_POINTS = frozenset({FORCE_FIRST_TWO, FORCE_TERMINAL})
+_KNOWN_FORCE_POINTS = frozenset({FORCE_FIRST_ONE, FORCE_FIRST_TWO, FORCE_TERMINAL})
 
 
 class StepReuseError(RuntimeError):
@@ -195,6 +211,8 @@ class StepReuseController:
         side_effects: Optional[StepSideEffectContract],
     ) -> bool:
         force = self._policy.force_real_steps
+        if FORCE_FIRST_ONE in force and step_index < 1:
+            return True
         if FORCE_FIRST_TWO in force and step_index < 2:
             return True
         if FORCE_TERMINAL in force and step_index == total_steps - 1:
@@ -288,3 +306,189 @@ class StepReuseController:
         state.real_forwards += 1
         state.total_steps_seen += 1
         return can_skip
+
+
+class StepReuseMixin:
+    """
+    Mixin providing the step-reuse skip-forward strategy for DiT models.
+
+    Mirrors ``TeaCacheMixin``'s integration pattern (see
+    ``sglang.multimodal_gen.runtime.cache.teacache``) for models that opt
+    into the generic step-reuse contract above instead of TeaCache's
+    model-tuned polynomial rescaling: a plain relative-L1 threshold on the
+    modulated input, with an explicit cap (``max_skip_steps``) on how many
+    consecutive steps may reuse one real prediction, and the first/terminal
+    step always forced real.
+
+    Example usage in a DiT model (matching ``WanTransformer3DModel``'s
+    TeaCache call sites):
+
+        class MyDiT(StepReuseMixin, BaseDiT):
+            def __init__(self, config, **kwargs):
+                super().__init__(config, **kwargs)
+                self._init_step_reuse_state()
+
+            def forward(self, hidden_states, timestep, ...):
+                # Unlike TeaCache, the skip decision is made once per real
+                # forward (opening a skip *window* of up to max_skip_steps),
+                # not re-evaluated against modulated_inp on every step -- so
+                # checking whether to skip needs no observation at all.
+                if self.should_skip_forward_for_step_reuse():
+                    return self.retrieve_step_reuse_prediction(hidden_states)
+
+                modulated_inp = temb  # or timestep_proj, model-specific
+                original_hidden_states = hidden_states.clone()
+                for block in self.blocks:
+                    hidden_states = block(hidden_states, ...)
+                self.maybe_record_step_reuse(hidden_states, original_hidden_states, modulated_inp=modulated_inp)
+                return hidden_states
+
+    Attributes:
+        is_cfg_negative: Whether currently processing the negative CFG
+            branch (mirrors ``TeaCacheMixin``, used as the scope key so
+            positive/negative branches never share a reuse decision).
+    """
+
+    config: DiTConfig
+
+    def _init_step_reuse_state(self) -> None:
+        """Initialize step-reuse state. Call this in subclass ``__init__``."""
+        self._step_reuse_controller: Optional[StepReuseController] = None
+        self._step_reuse_params_snapshot: Optional[Tuple[float, int, int]] = None
+        self.is_cfg_negative = getattr(self, "is_cfg_negative", False)
+        # Armed whenever we're not at timestep 0, so the *first* timestep-0
+        # call of a new generation task resets state exactly once,
+        # regardless of whether the positive or negative CFG branch happens
+        # to be dispatched first. (Guarding purely on
+        # "not self.is_cfg_negative", as TeaCacheMixin does, is only correct
+        # if the negative branch is always dispatched first at each
+        # timestep; this stays correct either way.)
+        self._step_reuse_reset_armed = True
+
+    def _maybe_reset_step_reuse_for_new_task(self, current_timestep: int) -> None:
+        if current_timestep == 0:
+            if self._step_reuse_reset_armed:
+                self.reset_step_reuse_state()
+                self._step_reuse_reset_armed = False
+        else:
+            self._step_reuse_reset_armed = True
+
+    def reset_step_reuse_state(self) -> None:
+        """Reset all step-reuse state at the start of each generation task."""
+        if self._step_reuse_controller is not None:
+            self._step_reuse_controller.reset_all()
+
+    def _decide_reuse_by_relative_l1(self, threshold: float) -> DecideReuseFn:
+        def _decide(state: StepReuseState, observation: torch.Tensor) -> bool:
+            previous = state.real_history[-1]
+            diff = observation - previous
+            rel_l1 = (diff.abs().mean() / previous.abs().mean()).cpu().item()
+            return rel_l1 < threshold
+
+        return _decide
+
+    def _get_step_reuse_controller(self) -> Optional[StepReuseController]:
+        """
+        Check step-reuse preconditions and return the (possibly freshly
+        built) controller, or None if step-reuse is disabled for this
+        forward pass.
+        """
+        from sglang.multimodal_gen.configs.sample.step_reuse import StepReuseParams
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        forward_context = get_forward_context()
+        forward_batch = forward_context.forward_batch
+
+        if forward_batch is None or not getattr(
+            forward_batch, "enable_step_reuse", False
+        ):
+            return None
+
+        params = getattr(forward_batch, "step_reuse_params", None) or StepReuseParams()
+        snapshot = (params.threshold, params.max_skip_steps, params.history_size)
+
+        if (
+            self._step_reuse_controller is None
+            or self._step_reuse_params_snapshot != snapshot
+        ):
+            policy = StepReusePolicy(
+                policy_name=f"step_reuse:{type(self).__name__}",
+                observation_point="modulated_input",
+                history_size=params.history_size,
+                max_skip_steps=params.max_skip_steps,
+                force_real_steps=frozenset({FORCE_FIRST_ONE, FORCE_TERMINAL}),
+            )
+            self._step_reuse_controller = StepReuseController(
+                policy, self._decide_reuse_by_relative_l1(params.threshold)
+            )
+            self._step_reuse_params_snapshot = snapshot
+
+        self._maybe_reset_step_reuse_for_new_task(forward_context.current_timestep)
+
+        return self._step_reuse_controller
+
+    def _step_reuse_scope(self) -> ScopeKey:
+        return ("cfg_negative" if self.is_cfg_negative else "cfg_positive",)
+
+    def should_skip_forward_for_step_reuse(self) -> bool:
+        """Check whether the current step may reuse the last real prediction.
+
+        Takes no observation: the reuse decision was already made when the
+        skip window was opened (inside ``maybe_record_step_reuse`` on the
+        last real forward); this only checks step-index forcing and
+        remaining skip budget.
+        """
+        # _get_step_reuse_controller's reset-on-new-request check must see
+        # the *previous* call's is_cfg_negative, so it runs before we
+        # update it below for the current call (mirrors TeaCacheMixin's
+        # _get_teacache_context / should_skip_forward_for_cached_states
+        # split).
+        controller = self._get_step_reuse_controller()
+        if controller is None:
+            return False
+
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        forward_context = get_forward_context()
+        forward_batch = forward_context.forward_batch
+        self.is_cfg_negative = forward_batch.is_cfg_negative
+
+        total_steps = forward_batch.num_inference_steps
+        step_index = forward_context.current_timestep
+        if forward_batch.do_classifier_free_guidance:
+            total_steps *= 2
+            step_index = step_index * 2 + (1 if self.is_cfg_negative else 0)
+
+        scope = self._step_reuse_scope()
+        if controller.should_reuse(scope, step_index, total_steps):
+            controller.record_reuse(scope)
+            return True
+
+        return False
+
+    def maybe_record_step_reuse(
+        self,
+        hidden_states: torch.Tensor,
+        original_hidden_states: torch.Tensor,
+        modulated_inp: torch.Tensor,
+    ) -> None:
+        """Record a real forward's prediction and residual for later reuse."""
+        controller = self._step_reuse_controller
+        if controller is None:
+            return
+        residual = hidden_states.squeeze(0) - original_hidden_states
+        controller.record_real(
+            self._step_reuse_scope(), prediction=residual, observation=modulated_inp
+        )
+
+    def retrieve_step_reuse_prediction(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply the reused residual to the current hidden states."""
+        controller = self._step_reuse_controller
+        residual = controller.get_reused_prediction(self._step_reuse_scope())
+        return hidden_states + residual

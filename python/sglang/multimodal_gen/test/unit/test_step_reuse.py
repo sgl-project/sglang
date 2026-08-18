@@ -10,6 +10,7 @@ tensor library used by a real model adapter.
 import pytest
 
 from sglang.multimodal_gen.runtime.cache.step_reuse import (
+    FORCE_FIRST_ONE,
     FORCE_FIRST_TWO,
     FORCE_TERMINAL,
     StepReuseController,
@@ -132,6 +133,17 @@ class TestReusedPredictionsNeverEnterHistory:
 
 
 class TestForcedRealSteps:
+    def test_first_one_step_is_forced_real(self):
+        controller = _make_controller(
+            max_skip_steps=5, force_real_steps=frozenset({FORCE_FIRST_ONE})
+        )
+        scope = ("req-1",)
+        controller.record_real(scope, prediction="p0", observation=1.0)
+        controller.record_real(scope, prediction="p1", observation=1.0)
+        # Unlike "first_two", only step_index=0 is forced -- step_index=1
+        # may already reuse once a skip window is open.
+        assert controller.should_reuse(scope, 1, total_steps=10) is True
+
     def test_first_two_steps_are_forced_real(self):
         controller = _make_controller(
             max_skip_steps=5, force_real_steps=frozenset({FORCE_FIRST_TWO})
