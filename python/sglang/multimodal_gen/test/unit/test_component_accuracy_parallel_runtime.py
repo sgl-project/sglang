@@ -159,19 +159,49 @@ def test_srt_owned_groups_are_not_overwritten_or_cleared():
 
 
 def test_srt_tp_groups_follow_encoder_folding_context():
-    original_tp_group = object()
+    original_diffusion_tp_group = object()
+    original_srt_tp_group = object()
+    original_srt_attention_tp_group = object()
     folding_tp_group = object()
 
     with (
-        patch.object(parallel_state, "_TP", original_tp_group),
-        patch.object(parallel_state, "_TP_STATE_PATCHED", False),
-        patch.object(srt_parallel_state, "_TP", original_tp_group),
-        patch.object(srt_parallel_state, "_ATTN_TP", original_tp_group),
+        patch.object(parallel_state, "_TP", original_diffusion_tp_group),
+        patch.object(srt_parallel_state, "_TP", original_srt_tp_group),
+        patch.object(
+            srt_parallel_state,
+            "_ATTN_TP",
+            original_srt_attention_tp_group,
+        ),
     ):
-        with parallel_state.patch_tensor_parallel_group(folding_tp_group):
+        with parallel_state.use_tensor_parallel_group(folding_tp_group):
             assert parallel_state._TP is folding_tp_group
             assert srt_parallel_state._TP is folding_tp_group
             assert srt_parallel_state._ATTN_TP is folding_tp_group
+
+        assert parallel_state._TP is original_diffusion_tp_group
+        assert srt_parallel_state._TP is original_srt_tp_group
+        assert srt_parallel_state._ATTN_TP is original_srt_attention_tp_group
+
+
+def test_encoder_folding_context_is_nested_and_restores_each_group():
+    original_tp_group = object()
+    outer_tp_group = object()
+    inner_tp_group = object()
+
+    with (
+        patch.object(parallel_state, "_TP", original_tp_group),
+        patch.object(srt_parallel_state, "_TP", original_tp_group),
+        patch.object(srt_parallel_state, "_ATTN_TP", original_tp_group),
+    ):
+        with parallel_state.use_tensor_parallel_group(outer_tp_group):
+            with parallel_state.use_tensor_parallel_group(inner_tp_group):
+                assert parallel_state._TP is inner_tp_group
+                assert srt_parallel_state._TP is inner_tp_group
+                assert srt_parallel_state._ATTN_TP is inner_tp_group
+
+            assert parallel_state._TP is outer_tp_group
+            assert srt_parallel_state._TP is outer_tp_group
+            assert srt_parallel_state._ATTN_TP is outer_tp_group
 
         assert parallel_state._TP is original_tp_group
         assert srt_parallel_state._TP is original_tp_group

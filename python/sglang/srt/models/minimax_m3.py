@@ -218,9 +218,14 @@ class _FusedQKVIndexProj(nn.Module):
                 "weight_scale_inv", nn.Parameter(weight_scale_inv, requires_grad=False)
             )
             self.weight_scale_inv.format_ue8m0 = True
+            # The loader skips this module (see ``_qm``), so run the weight
+            # post-process here instead of process_weights_after_loading.
             if convert_mxfp8_to_block:
+                # Block-fp8 conversion must run on the concatenated fused
+                # projection, just as it would on the individual projections.
                 quant_method.process_weights_after_loading_block_quant(self)
             else:
+                # Derive the backend scale layout for the native MXFP8 GEMM.
                 quant_method._process_mxfp8_linear_weight_scale(self)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
