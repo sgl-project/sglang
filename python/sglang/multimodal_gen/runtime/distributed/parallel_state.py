@@ -595,42 +595,24 @@ def model_parallel_is_initialized() -> bool:
     )
 
 
-_TP_STATE_PATCHED = False
-
-
 @contextmanager
-def patch_tensor_parallel_group(tp_group: GroupCoordinator):
-    """Patch the tp group temporarily until this function ends.
-
-    This method is for draft workers of speculative decoding to run draft model
-    with different tp degree from that of target model workers.
-
-    """
-    global _TP_STATE_PATCHED
-    assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
-
-    _TP_STATE_PATCHED = True
+def use_tensor_parallel_group(tp_group: GroupCoordinator):
+    """Use one TP group consistently across diffusion and reused SRT modules."""
     old_tp_group = get_tp_group()
     import sglang.srt.distributed.parallel_state as srt_parallel_state
 
-    patch_srt_tp = srt_parallel_state._TP is old_tp_group
-    patch_srt_attention_tp = srt_parallel_state._ATTN_TP is old_tp_group
+    old_srt_tp_group = srt_parallel_state._TP
+    old_srt_attention_tp_group = srt_parallel_state._ATTN_TP
     global _TP
     _TP = tp_group
-    if patch_srt_tp:
-        srt_parallel_state._TP = tp_group
-    if patch_srt_attention_tp:
-        srt_parallel_state._ATTN_TP = tp_group
+    srt_parallel_state._TP = tp_group
+    srt_parallel_state._ATTN_TP = tp_group
     try:
         yield
     finally:
-        # restore the original state
-        _TP_STATE_PATCHED = False
         _TP = old_tp_group
-        if patch_srt_tp and srt_parallel_state._TP is tp_group:
-            srt_parallel_state._TP = old_tp_group
-        if patch_srt_attention_tp and srt_parallel_state._ATTN_TP is tp_group:
-            srt_parallel_state._ATTN_TP = old_tp_group
+        srt_parallel_state._TP = old_srt_tp_group
+        srt_parallel_state._ATTN_TP = old_srt_attention_tp_group
 
 
 def get_tp_world_size() -> int:

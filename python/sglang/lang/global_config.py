@@ -1,12 +1,8 @@
-"""Global configurations"""
-
-# FIXME: deprecate this file and move all usage to sglang.srt.environ or sglang.__init__.py
+"""Global configuration for the frontend language API."""
 
 
 class GlobalConfig:
-    """
-    Store some global constants.
-    """
+    """Store mutable process-wide frontend settings."""
 
     def __init__(self):
         # Verbosity level
@@ -27,3 +23,5 @@ class GlobalConfig:
 
 
 global_config = GlobalConfig()
+
+__all__ = ["GlobalConfig", "global_config"]

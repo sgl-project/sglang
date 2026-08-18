@@ -66,7 +66,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
     CudaIpcTensorTransportProxy,
 )
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ImageData
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -642,11 +642,9 @@ def _k3_preprocess_config(
 )
 def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls):
     server_args = SimpleNamespace(
-        mm_feature_transport="cpu",
         image_processor_backend="auto",
         disable_fast_image_processor=False,
         skip_tokenizer_init=False,
-        mm_process_config={},
         mm_io_worker_num=0,
         mm_processor_worker_num=0,
         tokenizer_worker_num=1,
@@ -654,32 +652,35 @@ def test_kimi_processor_workers_clone_the_gpu_wrapper(processor_cls, wrapper_cls
         trust_mm_content_hashes=False,
         base_gpu_id=0,
         rl_on_policy_target=None,
-        allowed_media_domains=[],
         media_url_max_file_size_mb=64,
     )
-    processor = processor_cls(
-        hf_config=SimpleNamespace(media_placeholder_token_id=42),
-        server_args=server_args,
-        _processor=_HFProcessor(),
-        transport_mode=None,
-    )
-    try:
-        worker_processor = asyncio.run(
-            processor.mm_processor_executor.run(lambda *, processor: processor)
+    # The multimodal config comes from the bags.
+    with get_context().override_server_args(
+        mm_feature_transport="cpu", mm_process_config={}, allowed_media_domains=[]
+    ):
+        processor = processor_cls(
+            hf_config=SimpleNamespace(media_placeholder_token_id=42),
+            server_args=server_args,
+            _processor=_HFProcessor(),
+            transport_mode=None,
         )
-        assert isinstance(processor._processor, wrapper_cls)
-        assert isinstance(worker_processor, wrapper_cls)
-        assert worker_processor is not processor._processor
-        if processor_cls is KimiK3ImageProcessor:
-            fingerprint_config = processor.preprocess_fingerprint_payload()[
-                "wrapped_processor"
-            ]
-            assert isinstance(fingerprint_config, KimiK3PreprocessConfig)
-            assert fingerprint_config.patch_size == 14
-    finally:
-        processor.mm_processor_executor.shutdown()
-        processor.io_executor.shutdown()
-        processor.cpu_executor.shutdown()
+        try:
+            worker_processor = asyncio.run(
+                processor.mm_processor_executor.run(lambda *, processor: processor)
+            )
+            assert isinstance(processor._processor, wrapper_cls)
+            assert isinstance(worker_processor, wrapper_cls)
+            assert worker_processor is not processor._processor
+            if processor_cls is KimiK3ImageProcessor:
+                fingerprint_config = processor.preprocess_fingerprint_payload()[
+                    "wrapped_processor"
+                ]
+                assert isinstance(fingerprint_config, KimiK3PreprocessConfig)
+                assert fingerprint_config.patch_size == 14
+        finally:
+            processor.mm_processor_executor.shutdown()
+            processor.io_executor.shutdown()
+            processor.cpu_executor.shutdown()
 
 
 def test_kimi_k3_expands_image_placeholders_with_original_dimensions():
@@ -844,82 +845,88 @@ def test_kimi_k3_normal_cache_path_connects_real_producer_to_model_consumer():
         tokenizer_worker_num=1,
         mm_preprocess_cache_size_mb=1,
     )
-    processor = KimiK3ImageProcessor(
-        hf_config=hf_config,
-        server_args=server_args,
-        _processor=hf_processor,
-        transport_mode=None,
-    )
-    image = Image.new("RGB", (28, 28), color=(1, 2, 3))
-    encoded_image = io.BytesIO()
-    image.save(encoded_image, format="PNG")
-    image_data = ImageData(
-        url="data:image/png;base64,"
-        + base64.b64encode(encoded_image.getvalue()).decode()
-    )
-    request = SimpleNamespace(video_data=None, mm_content_hashes=None)
-
-    class _Tower(nn.Module):
-        device = torch.device("cpu")
-        patch_size = 14
-
-        def __init__(self):
-            super().__init__()
-            self.patch_embed = SimpleNamespace(
-                proj=SimpleNamespace(weight=torch.empty(1, dtype=torch.float32))
-            )
-
-        def forward(self, pixel_values, _grid_thws):
-            return pixel_values
-
-    model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
-    nn.Module.__init__(model)
-    model.use_data_parallel = False
-    model.vision_tower = _Tower()
-    model.mm_projector = _Projector()
-
+    publish(server_args, role="tokenizer")
     try:
-        with (
-            patch(
-                "sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True
-            ),
-            patch.object(
-                processor,
-                "prepare_artifact_batch",
-                wraps=processor.prepare_artifact_batch,
-            ) as prepare_artifacts,
-        ):
-            cold = asyncio.run(
-                processor.process_mm_data_async([image_data], [1, 42, 2], request)
-            )
-            hot = asyncio.run(
-                processor.process_mm_data_async([image_data], [3, 42, 4], request)
-            )
-        cold_items = pickle.loads(pickle.dumps(cold.mm_items))
-        hot_items = pickle.loads(pickle.dumps(hot.mm_items))
+        processor = KimiK3ImageProcessor(
+            hf_config=hf_config,
+            server_args=server_args,
+            _processor=hf_processor,
+            transport_mode=None,
+        )
+        image = Image.new("RGB", (28, 28), color=(1, 2, 3))
+        encoded_image = io.BytesIO()
+        image.save(encoded_image, format="PNG")
+        image_data = ImageData(
+            url="data:image/png;base64,"
+            + base64.b64encode(encoded_image.getvalue()).decode()
+        )
+        request = SimpleNamespace(video_data=None, mm_content_hashes=None)
 
-        with (
-            patch("sglang.srt.models.kimi_k3.configured_tp_size", return_value=1),
-            patch(
-                "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
-                return_value=(
-                    torch.ones((4, 3), dtype=torch.float32),
-                    torch.tensor([[1, 2, 2]], dtype=torch.int64),
+        class _Tower(nn.Module):
+            device = torch.device("cpu")
+            patch_size = 14
+
+            def __init__(self):
+                super().__init__()
+                self.patch_embed = SimpleNamespace(
+                    proj=SimpleNamespace(weight=torch.empty(1, dtype=torch.float32))
+                )
+
+            def forward(self, pixel_values, _grid_thws):
+                return pixel_values
+
+        model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
+        nn.Module.__init__(model)
+        model.use_data_parallel = False
+        model.vision_tower = _Tower()
+        model.mm_projector = _Projector()
+
+        try:
+            with (
+                patch(
+                    "sglang.srt.multimodal.processors.kimi_k3.is_cuda",
+                    return_value=True,
                 ),
-            ),
-        ):
-            cold_features = model.get_image_feature(cold_items)
-            hot_features = model.get_image_feature(hot_items)
-    finally:
-        processor.shutdown()
+                patch.object(
+                    processor,
+                    "prepare_artifact_batch",
+                    wraps=processor.prepare_artifact_batch,
+                ) as prepare_artifacts,
+            ):
+                cold = asyncio.run(
+                    processor.process_mm_data_async([image_data], [1, 42, 2], request)
+                )
+                hot = asyncio.run(
+                    processor.process_mm_data_async([image_data], [3, 42, 4], request)
+                )
+            cold_items = pickle.loads(pickle.dumps(cold.mm_items))
+            hot_items = pickle.loads(pickle.dumps(hot.mm_items))
 
-    assert prepare_artifacts.call_count == 1
-    assert cold.mm_items[0].hash == hot.mm_items[0].hash
-    assert cold.mm_items[0].offsets == hot.mm_items[0].offsets == [(3, 3)]
-    assert (
-        cold_items[0].model_specific_data[DEFERRED_PREPROCESSING_KEY].backend == "gpu"
-    )
-    torch.testing.assert_close(cold_features, hot_features)
+            with (
+                patch("sglang.srt.models.kimi_k3.configured_tp_size", return_value=1),
+                patch(
+                    "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
+                    return_value=(
+                        torch.ones((4, 3), dtype=torch.float32),
+                        torch.tensor([[1, 2, 2]], dtype=torch.int64),
+                    ),
+                ),
+            ):
+                cold_features = model.get_image_feature(cold_items)
+                hot_features = model.get_image_feature(hot_items)
+        finally:
+            processor.shutdown()
+
+        assert prepare_artifacts.call_count == 1
+        assert cold.mm_items[0].hash == hot.mm_items[0].hash
+        assert cold.mm_items[0].offsets == hot.mm_items[0].offsets == [(3, 3)]
+        assert (
+            cold_items[0].model_specific_data[DEFERRED_PREPROCESSING_KEY].backend
+            == "gpu"
+        )
+        torch.testing.assert_close(cold_features, hot_features)
+    finally:
+        reset_context()
 
 
 def test_kimi_k3_model_accepts_mixed_cached_eager_and_deferred_artifacts():
