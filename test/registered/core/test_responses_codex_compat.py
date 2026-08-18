@@ -32,6 +32,7 @@ def _request_with_namespace_tool() -> ResponsesRequest:
                         "type": "function",
                         "name": "spawn_agent",
                         "description": "Spawn a sub-agent.",
+                        "strict": True,
                         "parameters": {
                             "type": "object",
                             "properties": {"task": {"type": "string"}},
@@ -64,6 +65,10 @@ class TestNamespaceTools(CustomTestCase):
         spawn = by_name["multi_agent_v1.spawn_agent"].function
         self.assertEqual(spawn.description, "Spawn a sub-agent.")
         self.assertEqual(spawn.parameters["required"], ["task"])
+        # ``strict`` is part of the inner function definition and must survive
+        # flattening.
+        self.assertTrue(spawn.strict)
+        self.assertFalse(by_name["multi_agent_v1.send_message"].function.strict)
         # Inner without a description inherits the namespace's.
         self.assertEqual(
             by_name["multi_agent_v1.send_message"].function.description,
@@ -135,7 +140,9 @@ class TestAgentMessage(CustomTestCase):
             }
         )
         self.assertNotIn(blob, message["content"])
-        self.assertIn("[encrypted agent message content unavailable]", message["content"])
+        self.assertIn(
+            "[encrypted agent message content unavailable]", message["content"]
+        )
 
     def test_empty_agent_message_drops(self):
         message = OpenAIServingResponses._normalize_response_message_for_chat(

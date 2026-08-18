@@ -1022,6 +1022,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 description=inner.get("description")
                                 or tool.description,
                                 parameters=inner.get("parameters"),
+                                strict=bool(inner.get("strict", False)),
                             ),
                         )
                     )
@@ -1255,9 +1256,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             # model instead of being dropped (issues #33867 / #34927).
             out = message.get("output", "")
             if isinstance(out, list):
-                parts = [
-                    cls._normalize_response_content_part_for_chat(p) for p in out
-                ]
+                parts = [cls._normalize_response_content_part_for_chat(p) for p in out]
                 parts = [p for p in parts if isinstance(p, dict)]
                 if any(p.get("type") != "text" for p in parts):
                     out = parts
@@ -1269,13 +1268,14 @@ class OpenAIServingResponses(OpenAIServingChat):
                 "content": out,
             }
         if msg_type == "agent_message":
-            # Inter-agent message from a Codex multi-agent thread. Against a
-            # non-OpenAI provider both part shapes carry plaintext (the
-            # client's ``new_encrypted`` merely relocates the string; real
-            # ciphertext only travels via ``encrypted_function_args``, which
-            # Codex strips for non-OpenAI providers), so render the message
-            # as text with its routing as a header. Stateless translation —
-            # hosted ``multi_agent_call`` actions stay unsupported.
+            # Inter-agent message from a Codex multi-agent thread. It may
+            # carry plaintext ``input_text`` and/or ``encrypted_content``
+            # that is sometimes plaintext-in-disguise and sometimes real
+            # ciphertext (cross-provider threads). Plaintext is forwarded
+            # with the routing as a header; ciphertext-looking content is
+            # replaced with a visible placeholder because the server cannot
+            # decrypt it. Stateless translation — hosted ``multi_agent_call``
+            # actions stay unsupported.
             texts: list[str] = []
             for part in message.get("content") or []:
                 if not isinstance(part, dict):
@@ -2448,11 +2448,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 type="function_call",
                 id=state["item_id"],
                 status="completed",
-                **(
-                    {"namespace": state["namespace"]}
-                    if state.get("namespace")
-                    else {}
-                ),
+                **({"namespace": state["namespace"]} if state.get("namespace") else {}),
             )
             events = [
                 _send_event(

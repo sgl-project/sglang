@@ -315,3 +315,114 @@ class MultiToolCallStreamingOrderTestCase(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CustomToolStreamingTestCase(CustomTestCase):
+    """Wire-level regression for custom (freeform) tool streaming: the wrapped
+    {"input": ...} JSON buffers across deltas (it cannot be unwrapped
+    incrementally) and surfaces as one unwrapped input delta + done at close,
+    with the completed snapshot carrying the custom_tool_call item."""
+
+    def test_custom_tool_call_stream_event_sequence(self):
+        import json as _json
+
+        from sglang.srt.function_call.core_types import (
+            StreamingParseResult,
+            ToolCallItem,
+        )
+
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = "qwen3_coder"
+
+        request = ResponsesRequest(
+            model="x",
+            input="patch it",
+            stream=True,
+            store=False,
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "freeform patch tool",
+                }
+            ],
+        )
+
+        patch_text = "*** Begin Patch\n*** End Patch\n"
+        wrapped = _json.dumps({"input": patch_text})
+        scripted = [
+            StreamingParseResult(
+                normal_text="",
+                calls=[
+                    ToolCallItem(
+                        tool_index=0, name="apply_patch", parameters=wrapped[:12]
+                    )
+                ],
+            ),
+            StreamingParseResult(
+                normal_text="",
+                calls=[ToolCallItem(tool_index=0, parameters=wrapped[12:])],
+            ),
+        ]
+        script_iter = iter(scripted)
+
+        def fake_parse_stream_chunk(delta):
+            sp = next(script_iter)
+            return sp.normal_text, sp.calls
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_responses.FunctionCallParser"
+        ) as parser_cls:
+            parser_cls.return_value.detector.supports_structural_tag.return_value = True
+            parser_cls.return_value.parse_stream_chunk.side_effect = (
+                fake_parse_stream_chunk
+            )
+            parser_cls.return_value.parse_stream_end.return_value = ("", [])
+            fixture = StreamFixture(serving, request)
+            events = fixture.run(
+                [
+                    engine_chunk(" " * 5, 5),
+                    engine_chunk(" " * 12, 12, finish=True),
+                ]
+            )
+
+        types = event_types(events)
+        payloads = event_payloads(events)
+
+        # Ordering: item added -> unwrapped input delta -> input done -> item done.
+        added_idx = types.index("response.output_item.added")
+        delta_idx = types.index("response.custom_tool_call_input.delta")
+        done_idx = types.index("response.custom_tool_call_input.done")
+        item_done_idx = types.index("response.output_item.done")
+        self.assertLess(added_idx, delta_idx)
+        self.assertLess(delta_idx, done_idx)
+        self.assertLess(done_idx, item_done_idx)
+        # Custom tools must not leak function-call argument deltas.
+        self.assertNotIn("response.function_call_arguments.delta", types)
+        self.assertNotIn("response.function_call_arguments.done", types)
+
+        added = payloads[added_idx]["item"]
+        self.assertEqual(added["type"], "custom_tool_call")
+        self.assertEqual(added["name"], "apply_patch")
+        self.assertTrue(added["id"].startswith("ctc_"))
+
+        # The delta/done carry the UNWRAPPED freeform string.
+        self.assertEqual(payloads[delta_idx]["delta"], patch_text)
+        self.assertEqual(payloads[done_idx]["input"], patch_text)
+        self.assertEqual(payloads[done_idx]["item_id"], added["id"])
+
+        item_done = payloads[item_done_idx]["item"]
+        self.assertEqual(item_done["type"], "custom_tool_call")
+        self.assertEqual(item_done["input"], patch_text)
+        self.assertEqual(item_done["status"], "completed")
+
+        completed = find_completed_event(events)
+        ctc_items = [
+            item
+            for item in completed["response"]["output"]
+            if item["type"] == "custom_tool_call"
+        ]
+        self.assertEqual(len(ctc_items), 1)
+        self.assertEqual(ctc_items[0]["name"], "apply_patch")
+        self.assertEqual(ctc_items[0]["input"], patch_text)
