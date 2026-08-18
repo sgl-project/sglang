@@ -8,7 +8,9 @@ from typing import Any, Dict, List, Optional
 
 from safetensors import safe_open
 
-from sglang.checkpoint_quantization import resolve_checkpoint_quant_spec
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
+)
 from sglang.multimodal_gen.runtime.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
