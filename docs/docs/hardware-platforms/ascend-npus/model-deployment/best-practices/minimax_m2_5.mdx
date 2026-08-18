@@ -405,7 +405,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=204800
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
-export SGLANG_NPU_FUSED_MOE_MODE=2
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 export TASK_QUEUE_ENABLE=1
@@ -428,6 +427,7 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 8192 \
     --cuda-graph-bs 1 2 3 4 5 6 \
     --moe-a2a-backend ascend_fuseep \
+    --fuseep-mode 2 \
     --deepep-mode auto \
     --quantization modelslim \
     --speculative-algorithm EAGLE3 \
@@ -509,7 +509,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=204800
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_EXTERNAL_MODEL_PACKAGE=custom_eagle3
-export SGLANG_NPU_FUSED_MOE_MODE=2
 export SGLANG_SET_CPU_AFFINITY=1
 export STREAMS_PER_DEVICE=32
 export TASK_QUEUE_ENABLE=1
@@ -531,6 +530,7 @@ python3 -m sglang.launch_server \
     --max-prefill-tokens 8192 \
     --cuda-graph-bs 1 2 4 8 12 16 20 \
     --moe-a2a-backend ascend_fuseep \
+    --fuseep-mode 2 \
     --deepep-mode auto \
     --quantization modelslim \
     --speculative-algorithm EAGLE3 \

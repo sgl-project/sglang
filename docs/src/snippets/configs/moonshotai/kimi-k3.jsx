@@ -161,6 +161,39 @@ export const config = {
   // cell is showing, so turning speculation on does not triple the cell count.
   overlayDims: [
     {
+      // Checkpoint choice, orthogonal to the cell grid: MXFP4 is the shipping
+      // default, NVFP4 is NVIDIA's ModelOpt mixed checkpoint (NVFP4 SiTU routed
+      // experts + FP8_PB_WO 128x128 block-FP8 attention). NVFP4 swaps the model
+      // slug (modelNames) and pins the TRT-LLM MoE runner — the auto resolution
+      // never engages TRT-LLM deferred finalize and the NVFP4 MoE raises
+      // NotImplementedError at CUDA-graph capture, while flashinfer_cutlass has
+      // no SiTU kernel. The DSPARK overlay needs no change: the same draft
+      // checkpoint serves on top of the NVFP4 base.
+      id: "quant",
+      title: "Quantization",
+      default: "mxfp4",
+      options: [
+        { id: "mxfp4", label: "MXFP4", subtitle: "Moonshot AI checkpoint" },
+        {
+          id: "nvfp4",
+          label: "NVFP4",
+          subtitle: "NVIDIA checkpoint",
+          // The NVFP4 MoE kernels (FlashInfer TRT-LLM) are Blackwell-only.
+          disabled: (s) => !["b200", "gb200", "b300", "gb300"].includes(s.hw),
+          disableReason:
+            "The nvidia/Kimi-K3-NVFP4 checkpoint needs Blackwell: its routed experts run on FlashInfer TRT-LLM NVFP4 kernels (SiTU), which do not exist for Hopper or AMD.",
+          // B200's Balanced/High-Throughput cells pin flashinfer_mxfp4; Hopper
+          // pins marlin (unreachable here — NVFP4 is Blackwell-gated). Replace
+          // whatever the cell pins with the one working NVFP4 runner.
+          stripPrefixes: ["--moe-runner-backend"],
+          flags: ["--moe-runner-backend flashinfer_trtllm"],
+          hints: [
+            "Use docker image lmsysorg/sglang:dev-dev-kimi-k3-nvfp4 (CUDA 13).",
+          ],
+        },
+      ],
+    },
+    {
       id: "mmTransport",
       title: "VLM Transport",
       default: "auto",
@@ -201,7 +234,9 @@ export const config = {
       title: "Spec Decode",
       default: "dspark",
       options: [
-        { id: "none", label: "Non-Spec" },
+        { id: "none", label: "Non-Spec",
+          env: (s) => (["mi350x", "mi355x"].includes(s.hw) ? ["SGLANG_MLA_DECODE_TUNE=1"] : []),
+        },
         {
           id: "dspark",
           label: "DSPARK",
@@ -333,6 +368,7 @@ export const config = {
 
   modelNames: {
     default: "moonshotai/Kimi-K3",
+    nvfp4: "nvidia/Kimi-K3-NVFP4",
   },
 
   placeholders: {
@@ -377,8 +413,14 @@ export const config = {
     gb300:  "lmsysorg/sglang:kimi-k3",
     b200:   "lmsysorg/sglang:kimi-k3",
     gb200:  "lmsysorg/sglang:kimi-k3",
-    mi350x: "lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727",
-    mi355x: "lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727",
+    mi350x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260817",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260817",
+    // NVFP4 needs a build with sgl-project/sglang#35077; the purpose-built dev
+    // image is cut from that PR's head (CUDA 13).
+    "b300|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
+    "gb300|nvfp4": "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
+    "b200|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
+    "gb200|nvfp4": "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
   },
   // Pre-selects the issue template's `model` field on "Submit verified cell".
   github: {
