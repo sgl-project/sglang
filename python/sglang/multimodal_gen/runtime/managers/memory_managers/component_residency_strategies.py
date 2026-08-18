@@ -174,7 +174,12 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
         self.wait_for_use(module, use, state)
         tensor = _module_reference_tensor(module)
         if tensor is not None and tensor.device.type != "cpu":
-            module.to("cpu", non_blocking=True)
+            # XPU: an async copy into pageable host memory can reach the backend
+            # memcpy with a null argument, and cannot overlap anything anyway.
+            _non_blocking = True
+            if current_platform.is_xpu():
+                _non_blocking = False
+            module.to("cpu", non_blocking=_non_blocking)
         self._ready_events.pop(use.component_name, None)
 
     def finish_request(
