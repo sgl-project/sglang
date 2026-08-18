@@ -357,6 +357,10 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     # The re-clone above discards the image's patched torch_utils.py, and this
     # rebuild path is exactly when it is needed most (validating a new AITER
     # commit), so re-apply the same patch the Dockerfile applies.
+    #
+    # 7.2* mirrors the Dockerfile's *-rocm720|*-rocm724 guard. The patch is
+    # required on the torch 2.11 of 7.2.4 and is a no-op on the torch 2.9.1 of
+    # 7.2.0, where torch.Stream already exists.
     if [[ "${IMAGE_HIP_VERSION}" == 7.2* ]]; then
         docker exec ci_sglang python3 \
             /sglang-checkout/scripts/ci/amd/patch_aiter_torch_stream.py
@@ -380,12 +384,11 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
             bash .github/scripts/install_triton.sh
         "
     fi
-    AITER_TRITON_MODE="1"
-
-    # build AITER
+    # build AITER against the Triton already in the image, whether that is the
+    # base image's or the one install_triton.sh just put there.
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
-        AITER_USE_SYSTEM_TRITON=${AITER_TRITON_MODE} GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
     "
 
     if [[ "${INSTALL_AITER_TRITON}" == "true" ]]; then

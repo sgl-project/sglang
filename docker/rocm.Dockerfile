@@ -71,6 +71,10 @@ ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
+# Deliberately still set in the shipped image, not just during the build: a later
+# `pip install` that resolves torch would otherwise pull the PyPI CUDA build over
+# this ROCm one, and the constraint turns that into a resolution error instead.
+# It names only torch / torchvision / torchaudio, so nothing else is constrained.
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 # Work around ROCM-21485: the CUDA/ROCm IPC path leaks GPU memory (a freed IPC
@@ -112,6 +116,10 @@ ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # Pin the ROCm torch stack for every pip invocation in this flavor. The file is
 # filled in after the torch 2.11 upgrade below; it must already exist (empty is
 # valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
+# Deliberately still set in the shipped image, not just during the build: a later
+# `pip install` that resolves torch would otherwise pull the PyPI CUDA build over
+# this ROCm one, and the constraint turns that into a resolution error instead.
+# It names only torch / torchvision / torchaudio, so nothing else is constrained.
 ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
 RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 # Work around ROCM-21485: the CUDA/ROCm IPC path leaks GPU memory (a freed IPC
@@ -373,10 +381,15 @@ ARG BUILD_TYPE=all
 # pip install RUN so it does not affect AITER, sgl-model-gateway, TileLang, FHT, MORI, etc.
 ARG SETUPTOOLS_SCM_PRETEND_VERSION
 
+# Single source for the torchao pin: the install below and the rocm724 gate that
+# asserts it both read this. python/pyproject_other.toml carries the same pin as
+# the package-level dependency; keep the two in step when bumping.
+ARG TORCHAO_VERSION=0.9.0
+
 RUN pip install IPython \
     && pip install orjson \
     && pip install python-multipart \
-    && pip install torchao==0.9.0 \
+    && pip install torchao=="${TORCHAO_VERSION}" \
     && pip install pybind11
 
 # Rust toolchain — needed by setuptools-rust to build the sglang-mm extension
@@ -443,7 +456,7 @@ RUN python -m pip cache purge
 
 RUN if [ "${GPU_ARCH##*-}" = "rocm724" ]; then \
       python3 -m pip check \
-      && python3 -c "import importlib.metadata as m; import torch, torchao, torchaudio, torchvision, triton; expected={'torch':'2.11.','torchao':'0.9.','torchaudio':'2.11.','torchvision':'0.26.'}; actual={'torch':torch.__version__,'torchao':m.version('torchao'),'torchaudio':torchaudio.__version__,'torchvision':torchvision.__version__,'triton':triton.__version__}; assert torch.version.hip, actual; assert all(actual[name].startswith(version) for name, version in expected.items()), actual; print('Validated ROCm stack:', actual, 'HIP', torch.version.hip)" \
+      && python3 -c "import importlib.metadata as m; import torch, torchao, torchaudio, torchvision, triton; expected={'torch':'2.11.','torchao':'${TORCHAO_VERSION}','torchaudio':'2.11.','torchvision':'0.26.'}; actual={'torch':torch.__version__,'torchao':m.version('torchao'),'torchaudio':torchaudio.__version__,'torchvision':torchvision.__version__,'triton':triton.__version__}; assert torch.version.hip, actual; assert all(actual[name].startswith(version) for name, version in expected.items()), actual; print('Validated ROCm stack:', actual, 'HIP', torch.version.hip)" \
       && if pip list --format=freeze | grep -Eq '^nvidia-.*-cu[0-9]+'; then \
            echo "ERROR: NVIDIA CUDA runtime packages were installed into the ROCm image"; \
            exit 1; \
@@ -805,62 +818,10 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
 # nothing here to repair, and their metadata is not this flavor's to rewrite.
 RUN case "${GPU_ARCH}" in *-rocm724) python3 /sgl-workspace/sglang/scripts/ci/amd/patch_torch_triton_requirement.py ;; esac
 
-# Validate the stack that actually ships, after the Triton swap above. The
-# earlier check ran before it, so it could not catch a broken Triton wiring, and
-# the components installed in between are free to move torch underneath us.
-#
-# This gate checks torch's own recorded requirements rather than running `pip
-# check` over the whole environment: TileLang publishes metadata this image
-# cannot satisfy (it requires torch-c-dlpack-ext, and an apache-tvm-ffi range
-# that its own build pins outside of), so a whole-environment check fails here
-# for reasons that have nothing to do with the torch stack. The earlier gate
-# still runs `pip check`, since it sits before the TileLang build.
-RUN <<'EOF'
-set -eu
-case "${GPU_ARCH}" in
-  *-rocm724) ;;
-  *) echo "[Final] Not a ROCm 7.2.4 flavor (GPU_ARCH=${GPU_ARCH}), skip"; exit 0 ;;
-esac
-python3 -m pip check || echo "[Final] pip check reported the above; only the torch stack is enforced"
-python3 - <<'PY'
-import importlib.metadata as metadata
-import re
-
-import torch
-from packaging.requirements import Requirement
-
-assert torch.__version__.startswith("2.11."), torch.__version__
-assert torch.version.hip, torch.__version__
-
-installed = {}
-for dist in metadata.distributions():
-    name = dist.metadata["Name"]
-    if name:
-        installed[re.sub(r"[-_.]+", "-", name).lower()] = dist.version
-
-unmet = []
-for spec in metadata.distribution("torch").requires or []:
-    requirement = Requirement(spec)
-    if requirement.marker and not requirement.marker.evaluate({"extra": ""}):
-        continue
-    version = installed.get(re.sub(r"[-_.]+", "-", requirement.name).lower())
-    if version is None:
-        unmet.append(f"{requirement} -> not installed")
-    elif not requirement.specifier.contains(version, prereleases=True):
-        unmet.append(f"{requirement} -> {version}")
-assert not unmet, f"torch requirements are unsatisfied: {unmet}"
-
-cuda = sorted(name for name in installed if re.fullmatch(r"nvidia-.*-cu[0-9]+", name))
-assert not cuda, f"NVIDIA CUDA runtime packages in a ROCm image: {cuda}"
-
-print(
-    "[Final] torch", torch.__version__,
-    "HIP", torch.version.hip,
-    "triton", metadata.version("triton"),
-    "triton-kernels", metadata.version("triton-kernels"),
-)
-PY
-EOF
+# Validate the stack that actually ships, after the Triton swap above. See the
+# script for why it checks torch's own requirements instead of enforcing a
+# whole-environment `pip check` here.
+RUN case "${GPU_ARCH}" in *-rocm724) python3 /sgl-workspace/sglang/scripts/ci/amd/check_torch_rocm_stack.py ;; esac
 
 # -----------------------
 # Performance environment variable.

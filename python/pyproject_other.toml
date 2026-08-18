@@ -108,6 +108,10 @@ tracing = [
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
 # => base docker rocm/vllm-dev:20250114, not from public vllm whl
+#
+# srt_hip_rocm724 below is the torch 2.11 variant of this list and differs only
+# in its compressed-tensors and torch pins. A dependency added here has to be
+# added there too; nothing enforces that.
 srt_hip = [
   # Pin to 0.15.0: 0.16.0 needs torch>=2.10 (incompatible with ROCm torch
   # 2.9.1). An open-ended `<0.16.0` made pip backtrack into an unbuildable
@@ -119,6 +123,7 @@ srt_hip = [
   "wave-lang==3.8.2",
 ]
 
+# Kept in step with srt_hip above by hand; only the two pins below differ.
 srt_hip_rocm724 = [
   # ROCm 7.2.4 uses torch 2.11. compressed-tensors 0.15.0 requires
   # torch<2.11, while 0.16.0 supports torch>=2.10.
