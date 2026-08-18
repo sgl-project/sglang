@@ -82,9 +82,8 @@ def get_req_to_token_extra_context_len() -> int:
     extra = 4 + (max_speculative_num_draft_tokens() or 0)
     page_size = get_schedule().page_size
     if page_size > 1:
-        # The row is written out to the page ceiling (write_page_tail_indices),
-        # so near the context limit it can overshoot by page_size - 1; without
-        # the headroom that write silently lands in the neighbor row.
+        # write_page_tail_indices writes out to the page ceiling, which lands in
+        # the neighbor row at the context limit without this headroom.
         extra = max(extra, page_size - 1)
     if get_spec().speculative_algorithm is not None and page_size > 1:
         extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)

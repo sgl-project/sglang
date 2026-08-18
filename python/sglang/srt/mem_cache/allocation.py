@@ -109,19 +109,8 @@ def write_page_tail_indices(
     write_ends: torch.Tensor,
     page_size: int,
 ) -> None:
-    """Fill ``req_to_token[:, write_end : ceil(write_end)]`` with the remaining
-    slots of the last page.
-
-    The allocator hands out whole pages, so those slots already belong to the
-    request, but the row write only covers the requested tokens -- the tail
-    keeps whatever the previous occupant of the row left there. Anything that
-    slices the row by a page-ceiled length would read those stale indices.
-
-    Slots inside a page are consecutive, so the tail is just the last written
-    index plus 1, 2, ... The scatter has a fixed ``(bs, page_size - 1)`` shape:
-    lanes past the page ceiling rewrite the last real entry with its own value,
-    so no shape here depends on the data.
-    """
+    # The row write stops at the requested tokens, so the tail of the last page
+    # -- allocated, and consecutive with the last slot -- keeps stale indices.
     if page_size == 1:
         return
 
@@ -134,6 +123,8 @@ def write_page_tail_indices(
     ceilings = ((write_ends + page_size - 1) // page_size * page_size)[:, None]
     in_page = positions < ceilings
 
+    # Lanes past the ceiling fold onto the last real entry and rewrite it with
+    # its own value, keeping the scatter a fixed (bs, page_size - 1) shape.
     positions = torch.where(in_page, positions, last_pos[:, None])
     values = torch.where(
         in_page,

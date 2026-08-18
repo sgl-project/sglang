@@ -35,8 +35,8 @@ class TestWritePageTailIndices(CustomTestCase):
         self.assertEqual(rtt[0, :8].tolist(), [40, 41, 42, 43, 44, 45, 46, 47])
 
     def test_matches_naive_reference_over_random_batches(self):
-        """Covers page-aligned ends, empty rows, page_size 1 and untouched rows:
-        the comparison is over the whole pool, not just the written rows."""
+        # Comparing the whole pool subsumes page-aligned ends, empty rows,
+        # page_size 1 and untouched rows -- no separate case needed for those.
         generator = torch.Generator().manual_seed(0)
         num_rows = 4
         for page_size in (1, 2, 4, 8, 16):
@@ -53,8 +53,6 @@ class TestWritePageTailIndices(CustomTestCase):
                 rtt = torch.randint(
                     0, 1000, (num_rows, _ROW_WIDTH), generator=generator
                 ).to(torch.int32)
-                # Lay the written region out the way a paged allocation does:
-                # consecutive slots starting at some page base.
                 for row, end in zip(req_pool_indices.tolist(), write_ends.tolist()):
                     base = (
                         int(torch.randint(0, 8, (1,), generator=generator)) * page_size
