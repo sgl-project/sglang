@@ -38,6 +38,8 @@ _flashinfer_chunk_gated_delta_rule = None
 _flashinfer_gated_delta_rule_mtp = None
 _flashinfer_gated_delta_rule_decode = None
 _flashinfer_gated_delta_rule_mtp_bf16 = None
+_cake_gdn_decode_api = None
+_cake_gdn_decode_api_checked = False
 
 
 def maybe_build_flashinfer_checkpoint_plan(
@@ -128,6 +130,21 @@ def is_flashinfer_gdn_prefill_available() -> bool:
     return bool(available and prefill_fn is not None)
 
 
+def _get_cake_gdn_decode_api():
+    """Return the optional public Cake GDN loader without compiling a kernel."""
+
+    global _cake_gdn_decode_api, _cake_gdn_decode_api_checked
+    if not _cake_gdn_decode_api_checked:
+        _cake_gdn_decode_api_checked = True
+        try:
+            from flashinfer.jit import cake_gdn_noncp_decode
+
+            _cake_gdn_decode_api = cake_gdn_noncp_decode
+        except ImportError:
+            _cake_gdn_decode_api = None
+    return _cake_gdn_decode_api
+
+
 # ---------------------------------------------------------------------------
 # Kernel implementation
 # ---------------------------------------------------------------------------
@@ -164,6 +181,24 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         sm_major = torch.cuda.get_device_capability()[0]
         self.use_state_pool = sm_major >= 10
         self.supports_target_verify = sm_major in (9, 10)
+        self._cake_gdn_api = None
+        self._cake_gdn_arch = None
+        self._cake_gdn_entries = {}
+        self._cake_gdn_outputs = {}
+        self._cake_gdn_logged_routes = set()
+
+        if self.use_state_pool:
+            cake_gdn_api = _get_cake_gdn_decode_api()
+            if cake_gdn_api is not None:
+                capability = torch.cuda.get_device_capability()
+                try:
+                    self._cake_gdn_arch = cake_gdn_api.arch_for_compute_capability(
+                        *capability
+                    )
+                except cake_gdn_api.CakeGDNUnsupportedError:
+                    pass
+                else:
+                    self._cake_gdn_api = cake_gdn_api
 
         if sm_major == 9 and self._prefill_fn is None:
             raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
@@ -206,6 +241,218 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         logger.info("Using FlashInfer GDN kernels")
 
+    @staticmethod
+    def _is_cake_strided_layout(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        state: torch.Tensor,
+        *,
+        batch_size: int,
+        seq_len: int,
+        num_q_heads: int,
+        num_v_heads: int,
+    ) -> bool:
+        """Match the dense-inner, runtime-strided public Cake tensor ABI."""
+
+        return (
+            tuple(q.shape) == (batch_size, seq_len, num_q_heads, 128)
+            and tuple(k.shape) == (batch_size, seq_len, num_q_heads, 128)
+            and tuple(v.shape) == (batch_size, seq_len, num_v_heads, 128)
+            and tuple(a.shape) == (batch_size, seq_len, num_v_heads)
+            and tuple(b.shape) == (batch_size, seq_len, num_v_heads)
+            and state.ndim == 4
+            and tuple(state.shape[1:]) == (num_v_heads, 128, 128)
+            and tuple(q.stride()[2:]) == (128, 1)
+            and tuple(k.stride()[2:]) == (128, 1)
+            and tuple(v.stride()[2:]) == (128, 1)
+            and q.stride(1) >= num_q_heads * 128
+            and k.stride(1) >= num_q_heads * 128
+            and v.stride(1) >= num_v_heads * 128
+            and q.stride(0) >= seq_len * q.stride(1)
+            and k.stride(0) >= seq_len * k.stride(1)
+            and v.stride(0) >= seq_len * v.stride(1)
+            and a.stride(2) == 1
+            and b.stride(2) == 1
+            and a.stride(1) >= num_v_heads
+            and b.stride(1) >= num_v_heads
+            and a.stride(0) >= seq_len * a.stride(1)
+            and b.stride(0) >= seq_len * b.stride(1)
+            and tuple(state.stride()[1:]) == (128 * 128, 128, 1)
+            and state.stride(0) >= num_v_heads * 128 * 128
+        )
+
+    def _cake_output_buffer(
+        self,
+        q: torch.Tensor,
+        *,
+        layer_id: int,
+        batch_size: int,
+        seq_len: int,
+        num_v_heads: int,
+    ) -> torch.Tensor:
+        stream_handle = int(torch.cuda.current_stream(q.device).cuda_stream)
+        key = (
+            q.device.index,
+            stream_handle,
+            layer_id,
+            batch_size,
+            seq_len,
+            num_v_heads,
+        )
+        output = self._cake_gdn_outputs.get(key)
+        if output is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Cake GDN output buffer was not prepared before CUDA Graph capture"
+                )
+            output = torch.empty(
+                batch_size,
+                seq_len,
+                num_v_heads,
+                128,
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+            self._cake_gdn_outputs[key] = output
+        return output
+
+    def _try_cake_decode(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        state: torch.Tensor,
+        state_indices: torch.Tensor,
+        A_log: torch.Tensor,
+        a: torch.Tensor,
+        dt_bias: torch.Tensor,
+        b: torch.Tensor,
+        layer_id: Optional[int],
+        disable_state_update: bool,
+        intermediate_state: Optional[torch.Tensor],
+        cache_steps: int,
+    ) -> Optional[torch.Tensor]:
+        """Launch an exact promoted Cake row, or return None when unsupported."""
+
+        if self._cake_gdn_api is None or layer_id is None:
+            return None
+        batch_size, seq_len, num_q_heads, head_size = q.shape
+        num_v_heads = v.shape[2]
+        tensors = (q, k, v, state, state_indices, A_log, a, dt_bias, b)
+        if (
+            head_size != 128
+            or v.shape[-1] != 128
+            or any(tensor.device != q.device for tensor in tensors)
+            or any(tensor.dtype != torch.bfloat16 for tensor in (q, k, v, state, a, b))
+            or A_log.dtype != torch.float32
+            or dt_bias.dtype != torch.float32
+            or tuple(A_log.shape) != (num_v_heads,)
+            or tuple(dt_bias.shape) != (num_v_heads,)
+            or not A_log.is_contiguous()
+            or not dt_bias.is_contiguous()
+            or state_indices.dtype != torch.int32
+            or tuple(state_indices.shape) != (batch_size,)
+            or not state_indices.is_contiguous()
+            or not self._is_cake_strided_layout(
+                q,
+                k,
+                v,
+                a,
+                b,
+                state,
+                batch_size=batch_size,
+                seq_len=seq_len,
+                num_q_heads=num_q_heads,
+                num_v_heads=num_v_heads,
+            )
+        ):
+            return None
+
+        cache_intermediate_states = intermediate_state is not None
+        if cache_intermediate_states:
+            expected_cache_shape = (
+                batch_size,
+                cache_steps,
+                num_v_heads,
+                128,
+                128,
+            )
+            if (
+                tuple(intermediate_state.shape) != expected_cache_shape
+                or intermediate_state.dtype != torch.bfloat16
+                or intermediate_state.device != q.device
+                or not intermediate_state.is_contiguous()
+            ):
+                return None
+
+        try:
+            route = self._cake_gdn_api.select_cake_gdn_decode_variant(
+                arch=self._cake_gdn_arch,
+                batch_size=batch_size,
+                io_dtype="bfloat16",
+                state_dtype="bfloat16",
+                head_size=128,
+                layout="pretranspose",
+                num_k_heads=num_q_heads,
+                num_q_heads=num_q_heads,
+                num_v_heads=num_v_heads,
+                scale=128**-0.5,
+                seq_len=seq_len,
+                use_qk_l2norm=True,
+                strided_inputs=True,
+                disable_state_update=disable_state_update,
+                cache_intermediate_states=cache_intermediate_states,
+                cache_steps=cache_steps,
+            )
+        except self._cake_gdn_api.CakeGDNUnsupportedError:
+            return None
+
+        entry = self._cake_gdn_entries.get(route.variant_name)
+        if entry is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Cake GDN kernel was not loaded before CUDA Graph capture"
+                )
+            entry = self._cake_gdn_api.load_cake_gdn_kernel(
+                route.variant_name, self._cake_gdn_arch
+            )
+            self._cake_gdn_entries[route.variant_name] = entry
+
+        output = self._cake_output_buffer(
+            q,
+            layer_id=layer_id,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_v_heads=num_v_heads,
+        )
+        state_heads = batch_size * num_v_heads
+        tile_v = 128 if state_heads >= 1024 else 64 if state_heads >= 512 else 32
+        entry(
+            q,
+            k,
+            v,
+            state,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            output,
+            intermediate_state if intermediate_state is not None else output,
+            state_indices,
+            state_indices,
+            batch_size * num_v_heads * (128 // tile_v),
+            1,
+            1,
+        )
+        if route.route_id not in self._cake_gdn_logged_routes:
+            self._cake_gdn_logged_routes.add(route.route_id)
+            logger.info("Using %s", route.route_id)
+        return output.view(1, batch_size * seq_len, num_v_heads, 128)
+
     # ---- decode ----
 
     def decode(
@@ -236,6 +483,23 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         b_fi = b.view(batch_size, 1, num_v_heads)
 
         if self.use_state_pool:
+            output_cake = self._try_cake_decode(
+                q=query_fi,
+                k=key_fi,
+                v=value_fi,
+                state=ssm_states,
+                state_indices=cache_indices,
+                A_log=A_log.detach(),
+                a=a_fi,
+                dt_bias=dt_bias.detach(),
+                b=b_fi,
+                layer_id=kwargs.get("layer_id"),
+                disable_state_update=False,
+                intermediate_state=None,
+                cache_steps=0,
+            )
+            if output_cake is not None:
+                return output_cake
             output_fi, _ = self._decode_fn(
                 q=query_fi,
                 k=key_fi,
@@ -415,6 +679,24 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             # per-call batch id, while SGLang's speculative state cache is
             # pool-scoped and may include an extra dummy slot.
             intermediate_states_buffer_mtp = intermediate_states_buffer[:batch_size]
+
+        output_cake = self._try_cake_decode(
+            q=query_mtp,
+            k=key_mtp,
+            v=value_mtp,
+            state=ssm_states,
+            state_indices=cache_indices,
+            A_log=A_log.detach(),
+            a=a_mtp,
+            dt_bias=dt_bias.detach(),
+            b=b_mtp,
+            layer_id=kwargs.get("layer_id"),
+            disable_state_update=True,
+            intermediate_state=intermediate_states_buffer_mtp,
+            cache_steps=cache_steps,
+        )
+        if output_cake is not None:
+            return output_cake
 
         output_fi, _ = self._mtp_fn(
             q=query_mtp,

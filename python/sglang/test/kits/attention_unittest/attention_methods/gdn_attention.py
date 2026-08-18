@@ -55,6 +55,7 @@ class GDNAttentionCase:
     page_size: int
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
+    linear_attn_decode_backend: str | None = None
     linear_attn_prefill_backend: str | None = None
 
     @property
@@ -254,7 +255,7 @@ class MockGDNModelRunner(ModelRunner):
             enable_deterministic_inference=False,
             enable_mis=False,
             linear_attn_backend="triton",
-            linear_attn_decode_backend=None,
+            linear_attn_decode_backend=case.linear_attn_decode_backend,
             linear_attn_prefill_backend=case.linear_attn_prefill_backend,
             max_running_requests=None,
             revision=None,
@@ -863,6 +864,8 @@ def make_gdn_case_with_prefix_lens(
         page_size=case.page_size,
         prefix_lens=prefix_lens,
         extend_lens=extend_lens,
+        linear_attn_decode_backend=case.linear_attn_decode_backend,
+        linear_attn_prefill_backend=case.linear_attn_prefill_backend,
     )
 
 

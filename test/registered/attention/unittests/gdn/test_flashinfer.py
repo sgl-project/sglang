@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import torch
 
@@ -346,6 +347,84 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         prefix_lens=(0, 64, 128),
         extend_lens=(64, 65, 129),
     )
+    CAKE_DECODE_CASE = GDNAttentionCase(
+        name="flashinfer_cake_gdn_decode_b4_t1",
+        backend="flashinfer",
+        forward_mode=ForwardMode.DECODE,
+        num_k_heads=16,
+        num_v_heads=32,
+        page_size=16,
+        prefix_lens=(4, 7, 10, 13),
+        linear_attn_decode_backend="flashinfer",
+        linear_attn_prefill_backend="flashinfer",
+    )
+    CAKE_VERIFY_CASE = GDNAttentionCase(
+        name="flashinfer_cake_gdn_verify_b8_t4",
+        backend="flashinfer",
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        num_k_heads=16,
+        num_v_heads=32,
+        page_size=16,
+        prefix_lens=(4, 5, 6, 7, 8, 9, 10, 11),
+        extend_lens=(4,) * 8,
+        linear_attn_decode_backend="flashinfer",
+        linear_attn_prefill_backend="flashinfer",
+    )
+
+    def _cake_api_or_skip(self):
+        try:
+            from flashinfer.jit import cake_gdn_noncp_decode
+        except ImportError:
+            self.skipTest("public FlashInfer Cake GDN loader is unavailable")
+        return cake_gdn_noncp_decode
+
+    def test_cake_exact_decode_eager_and_cuda_graph(self):
+        cake_api = self._cake_api_or_skip()
+        with mock.patch.object(
+            cake_api,
+            "load_cake_gdn_kernel",
+            wraps=cake_api.load_cake_gdn_kernel,
+        ) as load_kernel:
+            run_gdn_attention_case(
+                self,
+                self.CAKE_DECODE_CASE,
+                head_k_dim=self.HEAD_DIM,
+                head_v_dim=self.HEAD_DIM,
+            )
+            run_gdn_cuda_graph_decode_case(
+                self,
+                self.CAKE_DECODE_CASE,
+                head_k_dim=self.HEAD_DIM,
+                head_v_dim=self.HEAD_DIM,
+                cuda_graph_capture_batch_size=4,
+            )
+        self.assertGreater(load_kernel.call_count, 0)
+
+    def test_cake_exact_verify_eager_and_cuda_graph(self):
+        cake_api = self._cake_api_or_skip()
+        with mock.patch.object(
+            cake_api,
+            "load_cake_gdn_kernel",
+            wraps=cake_api.load_cake_gdn_kernel,
+        ) as load_kernel:
+            run_gdn_eagle_verify_case(
+                self,
+                self.CAKE_VERIFY_CASE,
+                topk=1,
+                spec_kind="frozen_kv_mtp",
+                head_k_dim=self.HEAD_DIM,
+                head_v_dim=self.HEAD_DIM,
+            )
+            run_gdn_eagle_verify_cuda_graph_case(
+                self,
+                self.CAKE_VERIFY_CASE,
+                topk=1,
+                spec_kind="frozen_kv_mtp",
+                head_k_dim=self.HEAD_DIM,
+                head_v_dim=self.HEAD_DIM,
+                cuda_graph_capture_batch_size=8,
+            )
+        self.assertGreater(load_kernel.call_count, 0)
 
     def test_prefill_tracked_state_checkpoints(self):
         fixture = build_gdn_attention_fixture(
