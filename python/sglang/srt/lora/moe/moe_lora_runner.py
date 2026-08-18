@@ -99,7 +99,14 @@ if TYPE_CHECKING:
 
 
 @dataclass(slots=True)
-class _GateUpLoraState:
+class _LoraStageState:
+    """One stage's LoRA side-branch results: A's rank, B's delta.
+
+    A mutable box because ``run_parallel`` returns only the COMPUTE closure's
+    value, and a side closure cannot rebind its enclosing local. ``None`` also
+    means "this plan has no such stage", which callers check.
+    """
+
     rank: torch.Tensor | None = None
     delta: torch.Tensor | None = None
 
@@ -110,17 +117,6 @@ class _DownAInput:
 
     rows: torch.Tensor
     pair_to_row: torch.Tensor | None = None
-
-
-_EARLY_PARALLEL_REGION = {
-    EarlyOverlap.GATE_UP_A: "early_gate_up_a",
-    EarlyOverlap.GATE_UP_A_B: "early_gate_up_a_b",
-}
-_LATE_PARALLEL_REGION = {
-    LateOverlap.DOWN_A: "late_down_a",
-    LateOverlap.DOWN_B: "late_down_b",
-    LateOverlap.DOWN_A_B: "late_down_a_b",
-}
 
 
 class MoeLoraBatch(msgspec.Struct, kw_only=True):
@@ -774,8 +770,8 @@ class MoeLoraRunner:
         topk_ids: torch.Tensor,
         batch: MoeLoraBatch,
         num_tokens: int,
-    ) -> tuple[_GateUpLoraState, object, torch.Tensor]:
-        state = _GateUpLoraState()
+    ) -> tuple[_LoraStageState, object, torch.Tensor]:
+        state = _LoraStageState()
 
         def gate_up_a() -> None:
             state.rank = self._run_gate_up_a(
@@ -813,7 +809,7 @@ class MoeLoraRunner:
         elif plan.early_overlap is EarlyOverlap.GATE_UP_A:
             ws, gateup = run_parallel(
                 self.workspace,
-                name=_EARLY_PARALLEL_REGION[EarlyOverlap.GATE_UP_A],
+                name=plan.early_overlap.value,
                 device=hidden_states.device,
                 compute=base,
                 side=gate_up_a,
@@ -828,7 +824,7 @@ class MoeLoraRunner:
 
             ws, gateup = run_parallel(
                 self.workspace,
-                name=_EARLY_PARALLEL_REGION[EarlyOverlap.GATE_UP_A_B],
+                name=plan.early_overlap.value,
                 device=hidden_states.device,
                 compute=base,
                 side=gate_up_a_b,
@@ -846,7 +842,7 @@ class MoeLoraRunner:
         routes: MoeLoraRoutes,
         ws,
         gateup_out: torch.Tensor,
-        gate_up: _GateUpLoraState,
+        gate_up: _LoraStageState,
         topk_ids: torch.Tensor,
         batch: MoeLoraBatch,
         num_tokens: int,
@@ -1030,13 +1026,12 @@ class MoeLoraRunner:
         torch.Tensor,
         torch.Tensor | None,
     ]:
-        rank_holder: dict[str, torch.Tensor | None] = {"value": None}
-        delta_holder: dict[str, torch.Tensor | None] = {"value": None}
+        state = _LoraStageState()
 
         def down_a() -> None:
             if down_a_input is None:
                 raise RuntimeError("standalone down A requires pair activation")
-            rank_holder["value"] = self._run_down_a(
+            state.rank = self._run_down_a(
                 plan,
                 launch_config,
                 routes,
@@ -1045,14 +1040,13 @@ class MoeLoraRunner:
             )
 
         def down_b() -> None:
-            rank = rank_holder["value"]
-            if rank is None:
+            if state.rank is None:
                 raise RuntimeError("down B ran before down A")
-            delta_holder["value"] = self._run_down_b(
+            state.delta = self._run_down_b(
                 plan,
                 launch_config,
                 routes,
-                rank,
+                state.rank,
                 batch,
             )
 
@@ -1060,7 +1054,7 @@ class MoeLoraRunner:
             return self._run_base_down(provider, ws, act_out)
 
         if plan.late_overlap is LateOverlap.NONE:
-            if rank_holder["value"] is None:
+            if state.rank is None:
                 down_a()
             if plan.down_b_scatter:
                 # Experiment reordering (plan-validated to this serial
@@ -1070,10 +1064,16 @@ class MoeLoraRunner:
                 # finalize runs in no-pair-delta mode.  The [T, K, H]
                 # pair-major delta buffer is never allocated on this path.
                 down_out = base()
-                rank = rank_holder["value"]
-                assert rank is not None
+                assert state.rank is not None
                 self._run_down_b_scatter(
-                    plan, launch_config, provider, routes, ws, down_out, rank, batch
+                    plan,
+                    launch_config,
+                    provider,
+                    routes,
+                    ws,
+                    down_out,
+                    state.rank,
+                    batch,
                 )
             else:
                 if plan.down_b is not None:
@@ -1082,7 +1082,7 @@ class MoeLoraRunner:
         elif plan.late_overlap is LateOverlap.DOWN_A:
             down_out = run_parallel(
                 self.workspace,
-                name=_LATE_PARALLEL_REGION[LateOverlap.DOWN_A],
+                name=plan.late_overlap.value,
                 device=act_out.device,
                 compute=base,
                 side=down_a,
@@ -1090,11 +1090,11 @@ class MoeLoraRunner:
             if plan.down_b is not None:
                 down_b()
         elif plan.late_overlap is LateOverlap.DOWN_B:
-            if rank_holder["value"] is None:
+            if state.rank is None:
                 down_a()
             down_out = run_parallel(
                 self.workspace,
-                name=_LATE_PARALLEL_REGION[LateOverlap.DOWN_B],
+                name=plan.late_overlap.value,
                 device=act_out.device,
                 compute=base,
                 side=down_b,
@@ -1107,16 +1107,15 @@ class MoeLoraRunner:
 
             down_out = run_parallel(
                 self.workspace,
-                name=_LATE_PARALLEL_REGION[LateOverlap.DOWN_A_B],
+                name=plan.late_overlap.value,
                 device=act_out.device,
                 compute=base,
                 side=down_a_b,
             )
 
-        rank = rank_holder["value"]
-        if rank is None:
+        if state.rank is None:
             raise RuntimeError("execution plan did not produce down-A output")
-        return down_out, rank, delta_holder["value"]
+        return down_out, state.rank, state.delta
 
     def _allocate_output(
         self,
