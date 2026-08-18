@@ -599,6 +599,4 @@ def mamba_chunk_scan_combined(*args, **kwargs):
 
 def mamba_prefill_requires_chunk_metadata() -> bool:
     """Whether the selected prefill backend needs logical chunks unconditionally."""
-    return bool(
-        getattr(_mamba_ssu_backend, "prefill_requires_chunk_metadata", False)
-    )
+    return bool(getattr(_mamba_ssu_backend, "prefill_requires_chunk_metadata", False))
