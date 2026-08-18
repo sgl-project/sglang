@@ -59,7 +59,10 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
 <Note>
   The RTX 5090 and RTX PRO 6000 cells above — including every Speculative
   Decoding / Serving Strategy / SSM dtype combination — were validated at
-  ISL 8192 / OSL 1024, concurrency 1. The other platforms' recipes carry their
+  ISL 8192 / OSL 1024, concurrency 1. The DGX Spark cells cover that same full
+  combination set, but to a weaker standard: each was confirmed to **boot and
+  serve** at ISL 8192 / OSL 1024, concurrency 1, with no throughput or
+  acceptance-length numbers taken. The remaining platforms' recipes carry their
   original validation, which covers the default overlay picks (plus MTP on
   GB300); non-default overlay picks there are valid but unmeasured.
 </Note>
@@ -179,9 +182,17 @@ checkpoint's calibration scales automatically.
   requires a FlashInfer build whose prefill `plan` accepts `uniform_q_len`
   (newer than 0.6.15.post1); otherwise run spec with `--attention-backend triton`.
   On DGX Spark the 128GB is unified memory shared with the host CPU, so all
-  three checkpoints fit; its cells use 8192-token prefill chunks,
-  `--mem-fraction-static 0.95`, and `--disable-prefill-cuda-graph`. The SM121
-  recipe is not yet validated on that platform.
+  three checkpoints fit, and its cells reuse the RTX PRO 6000 recipe verbatim
+  rather than a separate operating point. **Validated on SM121 / aarch64**: all
+  36 configurations (3 checkpoints x Speculative Decoding x Serving Strategy x
+  Mamba SSM Dtype) booted and served on GB10 under `lmsysorg/sglang:qwen38-27b`
+  at ISL 8192 / OSL 1024, concurrency 1. That is boot-and-serve coverage only —
+  no throughput or acceptance-length numbers — and it includes the FlashInfer `plan` /
+  `uniform_q_len` path above, which raised no arity error on that image. Two
+  host quirks when reproducing on GB10: docker GPU access is CDI-only
+  (`--device nvidia.com/gpu=all`, as no `nvidia` runtime is registered), and
+  `nvidia-smi` reports `Not Supported` for memory because it is unified with the
+  CPU — gate a relaunch on `MemAvailable` in `/proc/meminfo` instead.
 - **H200 (SM90)**: BF16 and FP8 only — the card has no FP4 tensor cores, so the
   NVFP4 checkpoint's MLP would fall back to the Marlin W4A16 weight-only path
   and its cell is greyed out. The H200 recipes use 32768-token prefill chunks
@@ -238,8 +249,7 @@ checkpoint's calibration scales automatically.
 - `--chunked-prefill-size 2048`: decode steps stall behind each prefill chunk
   on hybrid GDN models, and 8192-token chunks stall them ~600ms at a time.
   2048 keeps decode inter-token latency smooth under mixed load and also
-  improves single-wave TTFT. (DGX Spark is the exception: its cells run
-  8192-token chunks.)
+  improves single-wave TTFT.
 
 ## 3. Agent Harnesses
 
