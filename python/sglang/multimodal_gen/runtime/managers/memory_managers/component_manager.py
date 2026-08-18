@@ -87,7 +87,11 @@ def build_component_residency_strategy(
             f"Component {component_name!r} resolved to layerwise-offload, but its "
             "loaded module did not enable layerwise offload"
         )
-    if residency_mode == COMPONENT_OFFLOAD and is_fsdp_managed_module(module):
+    if (
+        residency_mode == COMPONENT_OFFLOAD
+        and is_fsdp_managed_module(module)
+        and not getattr(module, "_sglang_fsdp_cpu_offload", False)
+    ):
         raise ComponentResidencyError(
             f"Component {component_name!r} resolved to component-offload, but it "
             "was loaded as an FSDP-managed module"
