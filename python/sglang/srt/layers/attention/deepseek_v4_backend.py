@@ -1025,8 +1025,8 @@ class DeepseekV4AttnBackend(
             is_prefill=True,
         )
         if swa_out_cache_loc is not None:
-            # Stamp the hoisted SWA write locations so store_cache's cached
-            # path is captured instead of a per-layer in-graph translate.
+            # Captures store_cache's cached path instead of a per-layer
+            # in-graph mapping translate.
             core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
         return DSV4Metadata(
             core_attn_metadata=core_attn_metadata,
@@ -1036,9 +1036,8 @@ class DeepseekV4AttnBackend(
     def _fill_cuda_graph_swa_out_cache_loc(
         self, out_cache_loc: Optional[torch.Tensor]
     ) -> Optional[torch.Tensor]:
-        """Refill the SWA write-target buffer from live out_cache_loc, returning
-        the [:n] view; None (-> per-layer fallback) when the buffer is absent or
-        too small, so capture never records a temporary tensor's address."""
+        # None (buffer absent / too small) -> per-layer fallback; capture must
+        # only ever record the static buffer's address.
         buf = self.cuda_graph_swa_out_cache_loc
         if (
             buf is None
@@ -1475,8 +1474,8 @@ class DeepseekV4AttnBackend(
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
         if self.is_draft_runner:
-            # SWA write-target buffer for the draft-extend graph; bound as a
-            # [:num_tokens] view and refilled outside the graph each step.
+            # Draft-extend SWA write-target buffer; bound as a [:num_tokens]
+            # view and refilled outside the graph each step.
             self.cuda_graph_swa_out_cache_loc = torch.zeros(
                 max_num_tokens, dtype=torch.int32, device=self.device
             )
