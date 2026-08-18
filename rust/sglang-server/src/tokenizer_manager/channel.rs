@@ -55,6 +55,20 @@ pub struct RequestColumns {
     pub ids_total: usize,
 }
 
+impl RequestColumns {
+    /// Concatenate the `ids` cells into `buf`, which must be exactly
+    /// `ids_total` bytes — the pyo3 boundary hands in the freshly allocated
+    /// `PyBytes` so the ids are copied once, straight to their destination.
+    pub fn copy_ids_into(&self, mut buf: &mut [u8]) {
+        debug_assert_eq!(buf.len(), self.ids_total);
+        for cell in &self.ids {
+            let (dst, rest) = buf.split_at_mut(cell.len());
+            dst.copy_from_slice(cell);
+            buf = rest;
+        }
+    }
+}
+
 impl ToSchedulerTx {
     /// Non-blocking push. Returns `false` on a full ring (backpressure) so the
     /// caller can fail the request rather than block a worker thread.
@@ -117,7 +131,7 @@ fn push_msg(batch: &mut RequestColumns, m: SchedulerRequest) {
     batch.ids.push(m.ids);
 }
 
-/// Egress: scheduler output (`push_chunk`) → Rust egress dispatcher.
+/// Egress: scheduler output (`push_decode_result_batch`) → Rust egress dispatcher.
 /// The single producer is the Python thread; the consumer is the dispatcher.
 #[derive(Clone)]
 pub struct FromSchedulerTx {

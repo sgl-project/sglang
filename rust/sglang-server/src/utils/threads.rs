@@ -55,7 +55,7 @@ pub(super) fn plan_cores(cfg: &RuntimeConfig) -> Option<CorePlan> {
         _ => return None,
     };
     if cores.len()
-        < cfg.rust_server_args.api_worker_num
+        < cfg.rust_server_args.http_api_worker_num
             + cfg.server_args.tokenizer_worker_num
             + cfg.server_args.detokenizer_worker_num
     {
@@ -68,7 +68,7 @@ pub(super) fn plan_cores(cfg: &RuntimeConfig) -> Option<CorePlan> {
     let mut it = cores.into_iter();
     let api: Vec<CoreId> = it
         .by_ref()
-        .take(cfg.rust_server_args.api_worker_num)
+        .take(cfg.rust_server_args.http_api_worker_num)
         .collect();
     let tok = it
         .by_ref()

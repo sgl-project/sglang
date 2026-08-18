@@ -23,7 +23,7 @@ use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct RustServerServerArgs {
     pub http_addr: SocketAddr,
-    pub api_worker_num: usize,
+    pub http_api_worker_num: usize,
     pub to_scheduler_cap: usize,
     pub from_scheduler_cap: usize,
     pub channel_cap: usize,
@@ -36,7 +36,7 @@ impl Default for RustServerServerArgs {
     fn default() -> Self {
         Self {
             http_addr: "127.0.0.1:30000".parse().unwrap(),
-            api_worker_num: 2,
+            http_api_worker_num: 2,
             to_scheduler_cap: 8192,
             from_scheduler_cap: 8192,
             channel_cap: 8192,
@@ -543,7 +543,7 @@ impl ServerArgs {
 
     /// Pinned API threads for the embedded HTTP api-server. Python `server_args`
     /// has no such field — this is derived: enough to cover the widest pool.
-    pub fn api_worker_num(&self) -> usize {
+    pub fn http_api_worker_num(&self) -> usize {
         4.max(self.tokenizer_worker_num)
             .max(self.detokenizer_worker_num)
     }

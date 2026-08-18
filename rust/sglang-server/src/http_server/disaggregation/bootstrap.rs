@@ -443,7 +443,7 @@ mod tests {
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
-                api_worker_num: 1,
+                http_api_worker_num: 1,
                 ..Default::default()
             },
             server_args: Arc::new(server_args),

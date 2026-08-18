@@ -1,6 +1,6 @@
 //! Runtime bootstrap: wires channels, pins CPU-bound pools, starts the tokio
 //! API server, and returns a handle the Python boundary uses for
-//! `recv_requests` (ingress drain) and `push_batch` (egress push).
+//! `recv_requests` (ingress drain) and `push_decode_result_batch` (egress push).
 //!
 //! Thread layout:
 //!   * API server   — tokio multi-thread runtime (I/O bound), pinned core set A
@@ -303,7 +303,7 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
             .spawn(move || {
                 let mut builder = tokio::runtime::Builder::new_multi_thread();
                 builder
-                    .worker_threads(cfg.rust_server_args.api_worker_num)
+                    .worker_threads(cfg.rust_server_args.http_api_worker_num)
                     .enable_all();
                 if let Some(cores) = api_cores {
                     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -370,7 +370,7 @@ mod tests {
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
-                api_worker_num: 1,
+                http_api_worker_num: 1,
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
@@ -410,7 +410,7 @@ mod tests {
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
-                api_worker_num: 1,
+                http_api_worker_num: 1,
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
@@ -455,7 +455,7 @@ mod tests {
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
-                api_worker_num: 1,
+                http_api_worker_num: 1,
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
@@ -516,7 +516,7 @@ mod tests {
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr: addr,
-                api_worker_num: 1,
+                http_api_worker_num: 1,
                 ..Default::default()
             },
             server_args: Arc::new(server_args),

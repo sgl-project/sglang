@@ -488,8 +488,10 @@ class RustServer:
         the same `TokenizedGenerateReqInput` / control objects the zmq path
         produces, so the IPC schema is tracked automatically) and its `input_ids`
         slice is wrapped as the `array("q")` the scheduler expects. `recv_requests`
-        releases the GIL for the drain + concat, so this never holds the GIL
-        across a wait — same contract as `zmq.NOBLOCK`.
+        never waits: the ring drain is `try_recv` (returns the instant the ring
+        is dry, capped at `max_recv`) and the rest is one memcpy per header
+        plus one for the concatenated ids — same contract as `zmq.NOBLOCK`.
+        Parking for work is :meth:`wait_ingress`, which does release the GIL.
         """
         limit = max_recv if max_recv > 0 else self._max_per_poll
         batch = self.server.recv_requests(limit)
@@ -557,7 +559,7 @@ class RustServer:
         # rendering happens in Rust.
         encoded = msgspec.msgpack.encode(payload, enc_hook=str)
 
-        self.server.push_result(recv_req.rid, encoded)
+        self.server.push_control_result(recv_req.rid, encoded)
 
     def push_generation(self, payload: BatchTokenIDOutput) -> None:
         """Egress redirect for generation output (replaces the zmq detokenizer).
@@ -702,7 +704,7 @@ class RustServer:
         header = msgspec.msgpack.encode(header_cols)
         # Pass the raw column list; the Rust side concatenates it into the frame
         # with the GIL released.
-        if not self.server.push_batch(header, data_cols):
+        if not self.server.push_decode_result_batch(header, data_cols):
             logger.warning(
                 "Rust egress closed; dropped batch of %d requests during shutdown",
                 len(rids),

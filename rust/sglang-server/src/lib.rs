@@ -27,15 +27,16 @@ use crate::message::config::{
     DefaultSamplingParams, DisaggregationMode, MmFamily, MmResample, MmSpec, ModelConfig,
     RuntimeConfig, RustServerServerArgs, ServerArgs,
 };
-use crate::utils::runtime;
+use crate::utils::{logging, runtime};
+
+/// A `ValueError` for a boot-time failure, as `"{context}: {err}"`.
+fn value_error(context: &str, err: impl std::fmt::Display) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(format!("{context}: {err}"))
+}
 
 /// One drained MM result (see [`Server::take_mm`]), consumed by
 /// `RustServer.build_native_mm` to build the scheduler's
-/// `MultimodalProcessorOutput`. Every per-item `Vec` below has one entry per
-/// image, in prompt order, and they line up index-for-index. Exactly one of
-/// `features`/`shm_names` is `Some`: inline features for single-rank serving
-/// (zero-copy into numpy), or one POSIX segment name per item when the scheduler
-/// broadcasts across TP ranks and Python wraps each in a `ShmPointerMMData`.
+/// `MultimodalProcessorOutput`.
 #[pyclass(frozen, get_all)]
 struct MmEncodeResult {
     /// *Generic.* All items' `pixel_values` concatenated, flat `f32` of logical
@@ -108,9 +109,9 @@ impl Server {
     ) -> PyResult<Self> {
         // `server_args` already arrived typed (pyo3 rejected any missing/extra/
         // mistyped field when Python constructed it); only value checks remain.
-        server_args.validate().map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("server_args: {e}"))
-        })?;
+        server_args
+            .validate()
+            .map_err(|e| value_error("server_args", e))?;
         // The HTTP listen address, tokenizer source/threads/shards all live in
         // `server_args`; resolve them from there so the scheduler doesn't re-pass
         // them. The explicit params stay as optional overrides (per-DP-rank port,
@@ -118,14 +119,12 @@ impl Server {
         let http_addr: SocketAddr = http_addr
             .unwrap_or_else(|| server_args.bind())
             .parse()
-            .map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("bad http_addr: {e}"))
-            })?;
+            .map_err(|e| value_error("bad http_addr", e))?;
 
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr,
-                api_worker_num: server_args.api_worker_num(),
+                http_api_worker_num: server_args.http_api_worker_num(),
                 to_scheduler_cap,
                 from_scheduler_cap,
                 channel_cap,
@@ -133,16 +132,13 @@ impl Server {
             },
             server_args: std::sync::Arc::new(server_args),
         };
-        let rt = runtime::start(cfg).map_err(|e| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("runtime start failed: {e}"))
-        })?;
+        let rt = runtime::start(cfg).map_err(|e| value_error("runtime start failed", e))?;
         Ok(Server { rt })
     }
 
     /// Non-blocking drain of the to_scheduler channel, returned **columnar** as an
     /// [`RequestBatch`] so the large `input_ids` tensor never goes through
-    /// msgpack (see the field docs for the layout). The `ids` cells are copied
-    /// **directly into the result `bytes`** (one copy, no intermediate buffer).
+    /// msgpack (see the field docs for the layout).
     #[pyo3(signature = (max = 256))]
     fn recv_requests(&self, py: Python<'_>, max: usize) -> PyResult<RequestBatch> {
         let cols = self.rt.ingress.drain(max);
@@ -151,20 +147,13 @@ impl Server {
             .iter()
             .map(|h| PyBytes::new(py, h).unbind())
             .collect();
-        // Single pass: copy each raw ids cell straight into the output `bytes`.
         let data = PyBytes::new_with(py, cols.ids_total, |buf| {
-            let mut pos = 0;
-            for cell in &cols.ids {
-                let end = pos + cell.len();
-                buf[pos..end].copy_from_slice(cell);
-                pos = end;
-            }
+            cols.copy_ids_into(buf);
             Ok(())
-        })?
-        .unbind();
+        })?;
         Ok(RequestBatch {
             headers,
-            data,
+            data: data.unbind(),
             lengths: cols.lengths,
         })
     }
@@ -186,7 +175,12 @@ impl Server {
     /// Push a whole decode batch as ONE frame: a columnar msgpack `header` plus
     /// the raw `data_cols` (per-column `bytes`), concatenated here. Blocks for
     /// backpressure; `False` only on shutdown.
-    fn push_batch(&self, py: Python<'_>, header: &[u8], data_cols: Vec<PyBackedBytes>) -> bool {
+    fn push_decode_result_batch(
+        &self,
+        py: Python<'_>,
+        header: &[u8],
+        data_cols: Vec<PyBackedBytes>,
+    ) -> bool {
         let cols: Vec<&[u8]> = data_cols.iter().map(|d| d.as_ref()).collect();
         self.push_frame(
             py,
@@ -196,7 +190,7 @@ impl Server {
 
     /// Push a control-request result. Blocks for backpressure; `False` only on
     /// shutdown.
-    fn push_result(&self, py: Python<'_>, rid: &str, payload: &[u8]) -> bool {
+    fn push_control_result(&self, py: Python<'_>, rid: &str, payload: &[u8]) -> bool {
         self.push_frame(
             py,
             crate::message::response::frame_egress_result(rid, payload),
@@ -223,7 +217,7 @@ impl Server {
             self.rt.tokenizer.clone(),
             self.rt.mm_sidecar.clone(),
         )
-        .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
+        .map_err(|e| value_error("mm spec", e))?;
         self.rt.spawn_mm_pool(workers, std::sync::Arc::new(ctx));
         Ok(())
     }
@@ -285,27 +279,9 @@ impl Server {
     }
 }
 
-/// Keeps the non-blocking log writer's background thread alive for the process
-/// lifetime (dropping the guard would stop log delivery).
-static LOG_GUARD: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
-    std::sync::OnceLock::new();
-
 #[pymodule]
 fn _server(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Initialize tracing once; ignore if already set by the host process.
-    // Non-blocking writer: emitting threads (axum workers, egress, detok) only
-    // enqueue; a dedicated thread does the stdout formatting-flush + syscall.
-    // The queue is bounded and lossy — under extreme pressure log lines are
-    // dropped instead of stalling request threads.
-    let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
-    let _ = LOG_GUARD.set(guard);
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(writer)
-        .try_init();
+    logging::init_tracing();
     m.add_class::<DisaggregationMode>()?;
     m.add_class::<DefaultSamplingParams>()?;
     m.add_class::<ModelConfig>()?;
