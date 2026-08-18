@@ -1177,6 +1177,22 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
+def resolve_inkling_attention_backend(server_args: Any) -> str:
+    """The attention backend Inkling will actually run on.
+
+    Shared with ServerArgs._apply_inkling_prefill_cuda_graph_default, which runs
+    before declarative overrides are materialized and so cannot read the
+    resolved value off server_args.
+    """
+    if not server_args.is_attention_backend_not_set():
+        return (
+            server_args.attention_backend
+            or server_args.prefill_attention_backend
+            or server_args.decode_attention_backend
+        )
+    return "fa4" if is_sm100_supported() else "triton"
+
+
 @_register_for(
     "InklingForConditionalGeneration",
     "InklingForConditionalGenerationMTP",
@@ -1218,7 +1234,7 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     # (mirrors the MiniMax-M3 SM100 fa4-default above); an explicit
     # --attention-backend / --prefill/decode-attention-backend still wins.
     if server_args.is_attention_backend_not_set():
-        inkling_attn_backend = "fa4" if is_sm100_supported() else "triton"
+        inkling_attn_backend = resolve_inkling_attention_backend(server_args)
         overrides["attention_backend"] = inkling_attn_backend
         logger.info(
             f"Use {inkling_attn_backend} as the attention backend for Inkling "

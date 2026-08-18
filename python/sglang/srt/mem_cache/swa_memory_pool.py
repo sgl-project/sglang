@@ -168,6 +168,13 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
+    def get_v_head_dim(self):
+        # Layer 0 is not necessarily full attention here, so ask the full
+        # sub-pool. Mirrors HybridLinearKVPool.
+        return self.full_kv_pool.get_value_buffer(self.full_kv_pool.start_layer).shape[
+            -1
+        ]
+
     def get_kv_scale_buffer(self, layer_id: int):
         self._wait_for_layer(layer_id)
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
