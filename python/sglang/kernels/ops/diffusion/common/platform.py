@@ -31,7 +31,13 @@ _CUDA_LIKE = frozenset({"cuda", "hip"})
 
 
 def platform_key() -> str:
-    """Return the live device family: ``cuda``/``hip``/``npu``/``mps``/``musa``/``cpu``."""
+    """Return the live device family: ``cuda``/``hip``/``npu``/``mps``/``musa``/``cpu``.
+
+    Deliberately *not* memoized: :func:`select_impl` calls it at module import
+    time, and latching that first answer would freeze the choice before the
+    platform plugin has resolved. Use :func:`is_cuda` / :func:`is_hip` on hot
+    paths -- they delegate straight to the platform's own cached predicates.
+    """
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
     for name in ("cuda", "hip", "npu", "mps", "musa"):
@@ -41,11 +47,23 @@ def platform_key() -> str:
 
 
 def is_cuda() -> bool:
-    return platform_key() == "cuda"
+    """Cheap enough for a per-call kernel guard.
+
+    Delegates to ``current_platform.is_cuda``, which is ``lru_cache``d on the
+    platform object -- the same call the pre-refactor guards made. Going
+    through :func:`platform_key` instead would add an import plus a chain of
+    ``getattr`` lookups to every fused-elementwise dispatch.
+    """
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    return current_platform.is_cuda()
 
 
 def is_hip() -> bool:
-    return platform_key() == "hip"
+    """See :func:`is_cuda`; delegates to the platform's cached predicate."""
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    return current_platform.is_hip()
 
 
 def has_triton() -> bool:
