@@ -50,8 +50,9 @@ class B12xMoeQuantInfo(MoeQuantInfo):
     # b12x scratch plan, planned at load time.
     plan: Any
     # Caller-owned scratch, allocated at load time so it never lands in a CUDA
-    # graph's private memory pool.
-    scratch: torch.Tensor
+    # graph's private memory pool. None on the 0.15.3 path, where everything
+    # lives in ``launch``.
+    scratch: torch.Tensor | None = None
     # Set when the quant method already bound everything it needs; the two b12x
     # generations take different arguments, so the version-specific call lives
     # there rather than here.

@@ -46,19 +46,6 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
-# One scratch buffer per (num_experts, k, n, top_k, device), shared by every
-# layer: they run sequentially and it is pure scratch. Allocated at load time so
-# it can never land in a CUDA graph's private memory pool -- a buffer first
-# allocated during capture is only valid inside that graph, and reusing it from
-# an un-captured forward faults.
-_B12X_SCRATCH: dict = {}
-
-# Every expert layer in the model has the same shape, so they share one weight
-# plan. That is not just a memory saving: b12x's compiled-kernel cache is keyed
-# per plan, so sharing means the warm-up below compiles each token count once
-# for the whole model instead of once per layer.
-_B12X_WEIGHT_PLANS: dict = {}
-
 
 def _select_b12x_distribution() -> None:
     """Put the pinned b12x on sys.path ahead of whatever pip installed.
@@ -155,9 +142,6 @@ def _core_token_counts(max_tokens: int, tokens_per_seq: int) -> tuple[int, ...]:
     return tuple(sorted(c for c in counts if 0 < c <= max_tokens))
 
 
-_BLOCKS_PER_SM_RELAXED = False
-
-
 def _relax_blocks_per_sm() -> None:
     """Undo b12x's one-CTA-per-SM pin for moe_block_size==8.
 
@@ -172,12 +156,13 @@ def _relax_blocks_per_sm() -> None:
     launch bounds and therefore of b12x's kernel cache key, and b12x refuses to
     compile during CUDA graph capture.
     """
-    global _BLOCKS_PER_SM_RELAXED
-    if _BLOCKS_PER_SM_RELAXED:
-        return
     from b12x.moe._shared.kernels.w4a16 import kernel as b12x_kernel
 
     original = b12x_kernel._determine_blocks_per_sm
+    # Latched on the patched function itself: the patch is process-global state
+    # inside the b12x module, which reset_context() cannot (and must not) undo.
+    if getattr(original, "_sglang_unpinned", False):
+        return
 
     def _unpinned(*args, **kwargs):
         # Route to the cta_m_blocks==1 branch, which caps at 4 rather than 1.
@@ -186,8 +171,8 @@ def _relax_blocks_per_sm() -> None:
         kwargs["uses_m_block_8"] = False
         return original(*args, **kwargs)
 
+    _unpinned._sglang_unpinned = True
     b12x_kernel._determine_blocks_per_sm = _unpinned
-    _BLOCKS_PER_SM_RELAXED = True
     log_info_on_rank0(
         logger, "b12x: dropped the one-CTA-per-SM pin for moe_block_size==8."
     )
@@ -226,6 +211,9 @@ def _warmup(*, plan, scratch, experts, top_k, num_experts, hidden_size, device, 
     torch.cuda.synchronize()
 
 
+# Module-level on purpose: this latch mirrors b12x's own process-global
+# compiled-kernel cache, which reset_context() cannot reset -- re-warming after
+# a context reset would be wasted work, not a correctness need.
 _B12X_WARMED = False
 
 
@@ -340,11 +328,20 @@ def _legacy_launcher(*, plan, scratch, prepared, w13, s13, w2, s2, ones, swiglu_
 
 
 def _get_weight_plan(*, num_experts: int, hidden_size: int, intermediate: int):
-    """One weight plan per shape, shared by every expert layer."""
+    """One weight plan per shape, shared by every expert layer.
+
+    Not just a memory saving: b12x's compiled-kernel cache is keyed per plan,
+    so sharing means the warm-up compiles each token count once for the whole
+    model instead of once per layer. Stored on ``get_resources().buffers`` so
+    unit-test teardown (``reset_context``) drops it with everything else.
+    """
     from b12x.moe import fused_moe
 
-    key = (num_experts, hidden_size, intermediate)
-    plan = _B12X_WEIGHT_PLANS.get(key)
+    from sglang.srt.runtime_context import get_resources
+
+    buffers = get_resources().buffers
+    key = f"b12x:weight_plan:{num_experts}:{hidden_size}:{intermediate}"
+    plan = buffers.get(key)
     if plan is None:
         plan = fused_moe.plan_weights(
             quant_modes="w4a16",
@@ -356,7 +353,7 @@ def _get_weight_plan(*, num_experts: int, hidden_size: int, intermediate: int):
             intermediate_size=intermediate,
             w13_layout="up_gate",
         )
-        _B12X_WEIGHT_PLANS[key] = plan
+        buffers[key] = plan
     return plan
 
 
@@ -374,9 +371,17 @@ def _get_scratch(
     """Plan and allocate the shared scratch buffer, once per shape."""
     from b12x.moe import fused_moe
 
+    from sglang.srt.runtime_context import get_resources
+
     max_tokens = _b12x_max_tokens()
-    key = (id(weight_plan), top_k, str(device), swiglu_limit)
-    entry = _B12X_SCRATCH.get(key)
+    # One scratch arena per shape, shared by every layer: they run sequentially
+    # and it is pure scratch. Allocated at load time so it can never land in a
+    # CUDA graph's private memory pool -- a buffer first allocated during
+    # capture is only valid inside that graph, and reusing it from an
+    # un-captured forward faults.
+    buffers = get_resources().buffers
+    key = f"b12x:scratch:{id(weight_plan)}:{top_k}:{device}:{swiglu_limit}"
+    entry = buffers.get(key)
     if entry is None:
         if envs.SGLANG_B12X_RELAX_BLOCKS_PER_SM.get():
             _relax_blocks_per_sm()
@@ -411,7 +416,7 @@ def _get_scratch(
             counts=counts,
         )
         entry = (plan, scratch)
-        _B12X_SCRATCH[key] = entry
+        buffers[key] = entry
     return entry
 
 
