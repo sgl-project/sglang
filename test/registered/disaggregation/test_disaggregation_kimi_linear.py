@@ -1,30 +1,3 @@
-"""PD disaggregation logprob parity for kimi-linear (MLA hybrid-Mamba).
-
-The rationale below applies to the --enable-unified-memory classes.
-
-Guards the unified-memory PD transfer scheme end to end: whole page-envelope
-KV registration (`UnifiedMLATokenToKVPool.get_contiguous_buf_infos`), whole
-slot-envelope KDA/mamba state transfer, virtual->physical index translation at
-the prefill send / decode prealloc sites, and the compaction move gate. A
-regression in any of them shifts the decode-side KV/state bytes and breaks
-logprob parity with the non-PD unified-memory reference.
-
-`--attention-backend` is deliberately NOT pinned, matching
-`models_e2e/test_kimi_linear_unified_memory.py`, which documents that pinning
-hides defects reachable only under the resolved default. The transferred bytes
-are backend-independent, so the default (fa3 on this suite's H100 runner) covers
-this file's subject either way. The linear-attn/Mamba backends stay pinned to
-triton -- the page-major layout requires them.
-
-`--enable-deterministic-inference` is deliberately NOT set. It would only guard
-against batch-shape-dependent kernel variation, and the reference and P+D paths
-run the same shapes: measured, two fresh servers on separate GPUs produce
-bit-identical logits without it. Setting it would narrow the test to the
-batch-invariant op set and a non-default sampling backend -- a less
-representative config -- and couple a PD-transfer test to the deterministic code
-path, so a defect there would fail this file for an unrelated reason.
-"""
-
 import time
 import unittest
 
@@ -61,11 +34,14 @@ DETERMINISTIC_ARGS = [
     "disabled",
 ]
 
+# --attention-backend and --enable-deterministic-inference are deliberately
+# absent: bytes are backend-independent and both paths run identical shapes.
 UNIFIED_MEMORY_ARGS = [
     "--skip-tokenizer-init",
     "--random-seed",
     "1",
     "--enable-unified-memory",
+    # Page-major layout requires triton for both.
     "--linear-attn-backend",
     "triton",
     "--mamba-backend",
