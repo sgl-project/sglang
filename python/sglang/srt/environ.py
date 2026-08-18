@@ -1023,6 +1023,11 @@ class Envs:
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
+    # Use FlashInfer's source-built Cake Router GEMM for the fixed DeepSeek,
+    # Mistral Large 3, and GLM small-token shapes on SM100/SM103. Missing APIs,
+    # unsupported shapes, and this kill switch all retain the existing model
+    # fallback without importing FlashInfer at module load time.
+    SGLANG_ENABLE_FLASHINFER_ROUTER_GEMM = EnvBool(True)
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
     # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
     # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,

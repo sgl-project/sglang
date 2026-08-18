@@ -245,6 +245,9 @@ from sglang.kernels.ops.gemm.fused_a_gemm import (
     fused_a_gemm_weight_eligible,
     linear_with_fused_a_gemm,
 )
+from sglang.kernels.ops.gemm.flashinfer_router_gemm import (
+    try_flashinfer_router_gemm,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -525,6 +528,11 @@ class MoEGate(nn.Module):
                 return linear_bf16_fp32(hidden_states, self.weight)
             return F.linear(hidden_states, self.weight, None)
         else:
+            logits = None
+            if not self.is_deepseek_v4:
+                logits = try_flashinfer_router_gemm(hidden_states, self.weight)
+            if logits is not None:
+                return logits
             # NOTE(b8zhong): this threshold has been empirically verified
             max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
             if (
