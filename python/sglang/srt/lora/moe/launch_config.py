@@ -24,6 +24,7 @@ from sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle import (
     FUSED_B_ACT_DEFAULT_CONFIG,
 )
 from sglang.srt.lora.moe.execution_plan import (
+    DeviceArchitecture,
     LoraAFamily,
     MiddleFamily,
     MoeLoraExecutionPlan,
@@ -183,7 +184,7 @@ class _TileRuleModel(pydantic.BaseModel):
 class _TilesFileModel(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="forbid")
 
-    arch: str
+    arch: DeviceArchitecture
     rules: dict[str, list[_TileRuleModel]]
 
 

@@ -500,8 +500,11 @@ class _PlanRowModel(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="forbid")
 
     name: str
-    layout: str | None = None  # per_expert | shared; None matches both
-    phase: str | None = None  # decode | prefill; None matches both
+    # Typed, not str: these three are the row's MATCH keys, and a typo in one
+    # loads clean and then never matches -- the row goes dead and its layers
+    # silently serve the fallback. None still means "matches both".
+    layout: Literal["per_expert", "shared"] | None = None
+    phase: Phase | None = None
     max_rank: int | None = None
     # Row order of the activation buffer reaching the base GEMM -- NOT the
     # adapter ``layout`` above. expert_major = padded [E, m_max, K] slabs,
@@ -518,7 +521,7 @@ class _PlanRowModel(pydantic.BaseModel):
 class _PlansFileModel(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra="forbid")
 
-    arch: str
+    arch: DeviceArchitecture
     domain: dict[str, int] = pydantic.Field(default_factory=dict)
     scenarios: list[_PlanRowModel] = pydantic.Field(default_factory=list)
     fallback: list[_PlanRowModel]
@@ -682,7 +685,7 @@ def resolve_plans(
                 candidate
                 for candidate in (*rows, *table.fallback)
                 if candidate.layout in (None, layout_name)
-                and candidate.phase in (None, phase.value)
+                and candidate.phase in (None, phase)
                 and (candidate.max_rank is None or physical_rank <= candidate.max_rank)
             ),
             None,
