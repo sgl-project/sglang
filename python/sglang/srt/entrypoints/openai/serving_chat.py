@@ -652,14 +652,14 @@ class OpenAIServingChat(OpenAIServingBase):
     def _should_return_input_ids(self, request: ChatCompletionRequest) -> bool:
         """Whether prompt (input) token ids should be returned via sglext."""
         return (
-            request.return_input_ids
+            request.return_input_ids_in_sglext
             or self.tokenizer_manager.server_args.return_input_ids
         )
 
     def _should_return_output_ids(self, request: ChatCompletionRequest) -> bool:
         """Whether sampled output token ids should be returned via sglext."""
         return (
-            request.return_output_ids
+            request.return_output_ids_in_sglext
             or self.tokenizer_manager.server_args.return_output_ids
         )
 
@@ -932,13 +932,13 @@ class OpenAIServingChat(OpenAIServingBase):
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
         # Header-based opt-in (same rationale as request_headers.py).
-        if raw_request is not None and not request.return_input_ids:
+        if raw_request is not None and not request.return_input_ids_in_sglext:
             if raw_request.headers.get("x-sglext-return-input-ids") == "1":
-                request.return_input_ids = True
+                request.return_input_ids_in_sglext = True
 
-        if raw_request is not None and not request.return_output_ids:
+        if raw_request is not None and not request.return_output_ids_in_sglext:
             if raw_request.headers.get("x-sglext-return-output-ids") == "1":
-                request.return_output_ids = True
+                request.return_output_ids_in_sglext = True
 
         reasoning_effort = (
             request.chat_template_kwargs.pop("reasoning_effort", None)

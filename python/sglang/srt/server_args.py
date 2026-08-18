@@ -1371,12 +1371,12 @@ class ServerArgs:
     ] = False
     return_input_ids: A[
         bool,
-        "Return prompt (input) token ids on the response-level sglext extension for every chat completion request, as if return_input_ids were set on the request.",
+        "Return prompt (input) token ids on the response-level sglext extension for every chat completion request, as if return_input_ids_in_sglext were set on the request.",
         NS("serving"),
     ] = False
     return_output_ids: A[
         bool,
-        "Return sampled output token ids on the response-level sglext extension for every chat completion request, as if return_output_ids were set on the request.",
+        "Return sampled output token ids on the response-level sglext extension for every chat completion request, as if return_output_ids_in_sglext were set on the request.",
         NS("serving"),
     ] = False
     reasoning_parser: A[Optional[str], NS("serving")] = None

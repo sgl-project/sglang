@@ -2059,8 +2059,8 @@ class ServingChatTestCase(unittest.TestCase):
             temperature=0.7,
             max_tokens=100,
             stream=True,
-            return_input_ids=True,
-            return_output_ids=True,
+            return_input_ids_in_sglext=True,
+            return_output_ids_in_sglext=True,
         )
 
         with patch(
@@ -2478,8 +2478,8 @@ class ServingChatTestCase(unittest.TestCase):
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
             n=2,
-            return_input_ids=True,
-            return_output_ids=True,
+            return_input_ids_in_sglext=True,
+            return_output_ids_in_sglext=True,
         )
 
         response = self.chat._build_chat_response(
@@ -2547,8 +2547,8 @@ class ServingChatTestCase(unittest.TestCase):
                 req, self.fastapi_request
             )
 
-        self.assertTrue(processed_request.return_input_ids)
-        self.assertTrue(processed_request.return_output_ids)
+        self.assertTrue(processed_request.return_input_ids_in_sglext)
+        self.assertTrue(processed_request.return_output_ids_in_sglext)
 
     def _run_output_ids_stream(
         self,
@@ -2595,8 +2595,8 @@ class ServingChatTestCase(unittest.TestCase):
             messages=[{"role": "user", "content": "Hi?"}],
             max_tokens=100,
             stream=True,
-            return_input_ids=True,
-            return_output_ids=True,
+            return_input_ids_in_sglext=True,
+            return_output_ids_in_sglext=True,
             return_cached_tokens_details=cached_tokens_details is not None,
         )
 
@@ -2731,7 +2731,7 @@ class ServingChatTestCase(unittest.TestCase):
             messages=[{"role": "user", "content": "Hi?"}],
             max_tokens=100,
             stream=True,
-            return_output_ids=True,
+            return_output_ids_in_sglext=True,
         )
 
         with patch(
