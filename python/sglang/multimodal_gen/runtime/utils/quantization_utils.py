@@ -8,14 +8,14 @@ from typing import Any, Dict, List, Optional
 
 from safetensors import safe_open
 
-from sglang.srt.model_loader.checkpoint_quantization import (
-    resolve_checkpoint_quant_spec,
-)
 from sglang.multimodal_gen.runtime.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
+)
 
 logger = init_logger(__name__)
 
