@@ -273,8 +273,6 @@ With LayerSplit, the kv cache on each rank can be sharded over the CP attention 
 
 ### 3.6 Agentic Long-Context with HiCache DRAM Offload (NVFP4, MTP)
 
-For agentic coding workloads on the 1M-token corpus, HBM-only KV capacity saturates past a few concurrent sessions and the radix hit rate collapses, so every turn re-prefills its whole history. Enable HiCache to spill cold KV to a pinned host pool. GLM-5.2 is DSA: every TP rank holds complete per-token KV, so host capacity is sized directly with `--hicache-size` (GB per rank) rather than `--hicache-ratio`.
-
 **B300 (TP8):**
 ```bash Command
 python3 -m sglang.launch_server \
@@ -301,16 +299,4 @@ python3 -m sglang.launch_server \
   --hicache-mem-layout page_first_direct
 ```
 
-**B200 (TP8):** same command, with `--mem-fraction-static 0.83` (180 GB HBM3e vs B300's 288 GB leaves less non-static headroom). Only the two highest-concurrency points need the full 270 GB/rank pool; lower concurrency keeps the smaller ratio-based pool:
-
-```bash
-# c1 / c4 / c8
---hicache-ratio 0.75
-
-# c12 / c16
---hicache-size 270
-```
-
-<Note>
-  This MTP shape (3-1-4) is tuned for the AgentX host-cache regime and differs from the general low-latency NVFP4 recipe above (5-1-6), which targets HBM-only single-turn latency.
-</Note>
+**B200 (TP8):** same command, with `--mem-fraction-static 0.83`. Lower concurrency (c1/c4/c8) uses `--hicache-ratio 0.75` instead of `--hicache-size 270`.
