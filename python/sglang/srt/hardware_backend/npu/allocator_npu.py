@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -34,11 +34,15 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
         num_new_pages: int = None,
+        skip_invariant_check: Optional[torch.Tensor] = None,
     ):
+        # skip_invariant_check masks rows whose last_loc is a synthetic
+        # fresh-page anchor installed by the DSV4 c-pool caller.
         if self.debug_mode:
-            assert torch.all(
-                (last_loc + 1) % self.page_size == prefix_lens % self.page_size
-            )
+            violation = (last_loc + 1) % self.page_size != prefix_lens % self.page_size
+            if skip_invariant_check is not None:
+                violation = violation & ~skip_invariant_check
+            assert torch.all(~violation)
 
         if num_new_pages is None:
             num_new_pages_tensor = (
