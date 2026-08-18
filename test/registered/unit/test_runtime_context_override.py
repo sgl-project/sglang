@@ -102,12 +102,40 @@ class TestContextOverride(CustomTestCase):
         self.assertEqual(sa.kv_cache_dtype, raw)
 
     def test_bare_server_args_write_raises_after_resolution(self):
-        # server_args is read-only after resolution regardless of the
-        # SGLANG_STRICT_CONFIG_MUTATION env; write via override instead.
+        # server_args is read-only after resolution: resolved config changes go
+        # to the bags, a per-runner config to a derived variant.
         sa = ServerArgs(model_path="dummy")
         object.__setattr__(sa, "_declarations_materialized", True)
         with self.assertRaises(AttributeError):
             sa.page_size = 999
+
+    def test_publish_records_role(self):
+        rc.publish(ServerArgs(model_path="dummy"), role="scheduler")
+        self.assertEqual(rc.publish_role(), "scheduler")
+
+    def test_legacy_shims_record_roles(self):
+        # Unit 2a: the legacy setters publish with their process role.
+        from sglang.srt.server_args import (
+            set_global_server_args_for_scheduler,
+            set_global_server_args_for_tokenizer,
+        )
+
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        self.assertEqual(rc.publish_role(), "scheduler")
+        set_global_server_args_for_tokenizer(ServerArgs(model_path="dummy"))
+        self.assertEqual(rc.publish_role(), "tokenizer")
+
+    def test_reset_clears_role(self):
+        rc.publish(ServerArgs(model_path="dummy"), role="test")
+        rc.reset_context()
+        self.assertIsNone(rc.publish_role())
+
+    def test_direct_install_clears_role(self):
+        # A role-less set_server_args (test overrides, draft-worker builds)
+        # must not inherit the previous lifecycle's role.
+        rc.publish(ServerArgs(model_path="dummy"), role="scheduler")
+        rc.get_context().set_server_args(ServerArgs(model_path="dummy"))
+        self.assertIsNone(rc.publish_role())
 
 
 if __name__ == "__main__":

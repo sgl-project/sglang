@@ -32,7 +32,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from cutlass.utils import get_smem_capacity_in_bytes
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils import get_device_sm
 from sglang.srt.utils.common import direct_register_custom_op
 

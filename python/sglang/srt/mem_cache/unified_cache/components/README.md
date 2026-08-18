@@ -111,7 +111,7 @@ Find the longest cached prefix for a token sequence.
    - Promotes matched path to MRU in each component's LRU via `node_has_component_data()` as filter
    - Updates `last_access_time` with decreasing timestamps up the path (parent < child)
    - Concatenates matched device indices via `torch.cat` (concat length ≤ K, subsumed by O(K))
-   - Calls `finalize_match_result_in_tree_core()` per component (tree-side: Full/SWA host-hit sums, Mamba `branching_seqlen`); the cache then routes the static `finalize_match_result_in_cache()` per component post-walk (Mamba performs copy-on-write: allocates new pool slot, copies SSM state)
+   - Calls `finalize_match_result_in_tree_core()` per component (tree-side: Full/SWA host-hit sums, Mamba `branching_seqlen`); the cache then routes `finalize_match_result_in_cache()` per component post-walk (Mamba performs copy-on-write: allocates new pool slot, copies SSM state)
 
 ---
 
@@ -127,7 +127,7 @@ Insert a key-value pair into the tree.
 | **Mutation** | Creates new leaf nodes; updates component data on overlapping nodes; frees duplicate KV indices; may split nodes; updates LRU lists and evictable sizes |
 | **Complexity** | **O(K + D·C)** |
 
-**Algorithm detail** (`_insert_helper`):
+**Algorithm detail** (the resumable insert steps: `_insert_walk_step` / `_insert_commit_step` / `_insert_tail_step`):
 1. At each existing node, calls `_touch_node` → promotes to MRU via `node_has_component_data()`
 2. If key diverges mid-node, calls `_split_node` → `redistribute_on_node_split()` per component
 3. For each overlapping node, calls `update_component_on_insert_overlap()` per component — returns `consumed_from` index; the tree frees `value[dup_start:consumed_from]` as duplicate pool indices
@@ -267,15 +267,15 @@ Each component implements these hooks. See `tree_component.py` for the ABC and d
 |------|---------|-----------|----------|
 | `create_match_validator(match_device_only=False)` | Return a per-match stateful predicate that decides whether a node is a valid match boundary. Full: requires Full device data, or host backup when `match_device_only=False`. SWA: tracks accumulated window length across device/host data. Mamba: requires Mamba device data, or host backup when `match_device_only=False`. | `_match_prefix_helper` | *abstract* |
 | `finalize_match_result_in_tree_core()` | Tree-side post-processing inside the match walk. Full/SWA: host-hit sums. Mamba: records `branching_seqlen` + the host-hit bump. | `_match_post_processor` | pass-through |
-| `finalize_match_result_in_cache()` | Static, cache-level finalize after the walk (receives the cache + NodeId-based result), dispatched class-level by `UnifiedRadixCache.match_prefix`. Mamba: copy-on-write — allocates a new mamba pool slot, copies SSM state into the request pool. | `UnifiedRadixCache.match_prefix` | pass-through |
+| `finalize_match_result_in_cache()` | Cache-level finalize after the walk (receives the params + NodeId-based result), dispatched by `UnifiedRadixCache.match_prefix`. Mamba: copy-on-write — allocates a new mamba pool slot, copies SSM state into the request pool. | `UnifiedRadixCache.match_prefix` | pass-through |
 
 ### Insert Phase
 
 | Hook | Purpose | Called By | Default |
 |------|---------|-----------|----------|
-| `update_component_on_insert_overlap()` | Handle key overlap with an existing node during insert. Returns the index within `value_slice` from which this component consumed (took ownership of) pool slots. Full/Mamba: no consumption (`prefix_len`). SWA: may recover tombstoned nodes within the sliding window boundary. | `_insert_helper` | returns `prefix_len` |
-| `recover_after_unevict()` | Rebuild auxiliary component data after `_unevict_node_on_insert()` restores a Full device value from fresh KV indices. SWA uses this to rebuild in-window SWA data. | `_insert_helper` | no-op |
-| `commit_insert_component_data()` | Finalize component data on the target node after the insert walk completes. Full: no-op (handled by `_add_new_node`). SWA: checks window boundary, may split node — parent becomes tombstone, child gets SWA data. Mamba: sets mamba pool indices and inserts into Mamba LRU. | `_insert_helper` | no-op |
+| `update_component_on_insert_overlap()` | Handle key overlap with an existing node during insert. Returns the index within `value_slice` from which this component consumed (took ownership of) pool slots. Full/Mamba: no consumption (`prefix_len`). SWA: may recover tombstoned nodes within the sliding window boundary. | `_insert_walk_step` | returns `prefix_len` |
+| `recover_after_unevict()` | Rebuild auxiliary component data after `_unevict_node_on_insert()` restores a Full device value from fresh KV indices. SWA uses this to rebuild in-window SWA data. | `_insert_walk_step` | no-op |
+| `commit_insert_component_data()` | Finalize component data on the target node after the insert walk completes. Full: no-op (handled by `_add_new_node`). SWA: checks window boundary, may split node — parent becomes tombstone, child gets SWA data. Mamba: sets mamba pool indices and inserts into Mamba LRU. | `_insert_commit_step` | no-op |
 
 ### Node Split
 

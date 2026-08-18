@@ -25,6 +25,7 @@ from typing import Any, List, Optional, Set, Union
 import torch
 from transformers import PretrainedConfig
 
+from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
@@ -120,6 +121,19 @@ def is_deepseek_dsa(config) -> bool:
     )
 
 
+def is_kimi_k3(config) -> bool:
+    return _hf_arch(config) == "KimiK3ForConditionalGeneration"
+
+
+def is_qwen3_5(config) -> bool:
+    return _hf_arch(config) in (
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5MoeForCausalLM",
+    )
+
+
 def is_deepseek_v4(config) -> bool:
     return _hf_arch(config) in (
         "DeepseekV4ForCausalLM",
@@ -187,6 +201,14 @@ def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     """Return whether a DSA layer reuses the previous layer's top-k indices."""
     assert is_deepseek_dsa(config)
 
+    # LongCat computes fresh top-k indices every cli_factor layers.
+    cli_factor = getattr(config, "cli_factor", 1)
+    if cli_factor is None:
+        cli_factor = 1
+    assert cli_factor > 0, f"cli_factor must be positive, got {cli_factor}"
+    if cli_factor > 1:
+        return layer_id % cli_factor != 0
+
     pattern = getattr(config, "index_topk_pattern", None)
     if pattern is not None:
         return layer_id < len(pattern) and pattern[layer_id] == "S"
@@ -217,11 +239,12 @@ REQUANTIZATION_METHODS = ["quark_mxfp4"]
 def get_num_indexer_layers(config) -> int:
     """Layer count for the global indexer-topk capturer's host buffer.
 
-    DSA models (V3.2) instantiate an Indexer on every transformer layer.
-    With index_topk_freq > 1 some layers reuse prev layer's topk; those still
-    get a slot (mirrored at the MLA call site). DSv4 has C4 indexers only on
-    layers whose compress_ratio == 4. Other architectures: set
-    num_indexer_layers on hf_text_config; 0 disables the capturer.
+    DSA models (V3.2) expose one capturer slot per transformer layer. With
+    index_topk_freq > 1 some layers reuse prev layer's topk; those still get a
+    slot mirrored at the MLA call site even if no Indexer module is built.
+    DSv4 has C4 indexers only on layers whose compress_ratio == 4. Other
+    architectures: set num_indexer_layers on hf_text_config; 0 disables the
+    capturer.
     """
     if is_deepseek_dsa(config):
         return config.num_hidden_layers
@@ -251,15 +274,18 @@ class ModelConfig:
         is_multi_layer_eagle: bool = False,
         encoder_only: bool = False,
         language_only: bool = False,
+        language_model_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
         speculative_algorithm: Optional[str] = None,
+        is_draft_quantization_explicit: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
         self.is_draft_model = is_draft_model
+        self.is_draft_quantization_explicit = is_draft_quantization_explicit
         self.speculative_algorithm = speculative_algorithm
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
@@ -293,12 +319,20 @@ class ModelConfig:
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
         self.is_embedding_gemma = is_embedding_gemma(self.hf_text_config)
+        self.embedding_model_spec = resolve_embedding_model_spec(
+            self.hf_config.architectures,
+            is_embedding_requested=bool(is_embedding),
+            is_embedding_gemma=self.is_embedding_gemma,
+        )
 
         rope_scaling = getattr(self.hf_text_config, "rope_parameters", None) or getattr(
             self.hf_text_config, "rope_scaling", {}
         )
+        self.is_lm_only = getattr(self.hf_config, "language_model_only", False)
         self.model_is_mrope = (
-            rope_scaling is not None and "mrope_section" in rope_scaling
+            not self.is_lm_only
+            and rope_scaling is not None
+            and "mrope_section" in rope_scaling
         )
 
         self.hf_generation_config = get_generation_config(
@@ -415,16 +449,25 @@ class ModelConfig:
                 or hasattr(self.hf_config, "audio_config")
             )
         )
-        self.is_multimodal = enable_multimodal and (
-            is_multimodal_model(self.hf_config.architectures)
-            or has_multimodal_subconfig
+        self.is_multimodal = (
+            enable_multimodal
+            and not self.is_lm_only
+            and (
+                is_multimodal_model(self.hf_config.architectures)
+                or has_multimodal_subconfig
+            )
         )
         self.is_audio_model = enable_multimodal and is_audio_model(
             self.hf_config.architectures
         )
         # TODO: requires further polishing
-        self.is_image_understandable_model = enable_multimodal and hasattr(
-            self.hf_config, "vision_config"
+        # Key on the tower, not the attribute: several config classes default
+        # vision_config to None, which presence alone would read as image-capable
+        # (MuseGlimmerConfig's text-only layouts are one such case).
+        self.is_image_understandable_model = (
+            enable_multimodal
+            and not self.is_lm_only
+            and getattr(self.hf_config, "vision_config", None) is not None
         )
 
         # Models expose audio_config at different nesting levels:
@@ -433,11 +476,17 @@ class ModelConfig:
         #   - sound_config: Nemotron AVLM with Parakeet audio encoder
         #   - is_audio_model(): Whisper, Qwen3-ASR (architecture-based fallback)
         # TODO: Handle this more robustly by standardizing the config structure in the future
-        self.is_audio_understandable_model = enable_multimodal and (
-            hasattr(self.hf_config, "audio_config")
-            or hasattr(getattr(self.hf_config, "thinker_config", None), "audio_config")
-            or getattr(self.hf_config, "sound_config", None) is not None
-            or is_audio_model(self.hf_config.architectures)
+        self.is_audio_understandable_model = (
+            enable_multimodal
+            and not self.is_lm_only
+            and (
+                hasattr(self.hf_config, "audio_config")
+                or hasattr(
+                    getattr(self.hf_config, "thinker_config", None), "audio_config"
+                )
+                or getattr(self.hf_config, "sound_config", None) is not None
+                or is_audio_model(self.hf_config.architectures)
+            )
         )
 
         self.is_multimodal_chunked_prefill_supported = (
@@ -488,7 +537,7 @@ class ModelConfig:
         # Cache attributes
         self.hf_eos_token_id = self._get_hf_eos_token_id()
         # Set by scheduler when reasoning_parser is enabled
-        self.think_end_id: Optional[int] = None
+        self.think_end_ids: Optional[List[int]] = None
 
         # multimodal
         self.image_token_id = getattr(
@@ -497,6 +546,10 @@ class ModelConfig:
 
         self.hf_config.encoder_only = encoder_only
         self.hf_config.language_only = language_only
+        # Checkpoints declare this one themselves (hf_transformers/processor.py),
+        # so the flag may only turn it on: writing the default back would build a
+        # vision tower with no weights to fill.
+        self.hf_config.language_model_only = language_model_only or self.is_lm_only
 
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(
@@ -545,8 +598,13 @@ class ModelConfig:
             override_config_file=override_config_file,
             is_multi_layer_eagle=server_args.enable_multi_layer_eagle,
             language_only=server_args.language_only,
+            language_model_only=server_args.language_model_only,
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
+            is_draft_quantization_explicit=(
+                is_draft_model
+                and server_args._speculative_draft_quantization_explicitly_set
+            ),
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,
             speculative_algorithm=server_args.speculative_algorithm,
@@ -611,6 +669,7 @@ class ModelConfig:
             self.hf_config.architectures[0] = "MiMoMTP"
         if is_draft_model and self.hf_config.architectures[0] in MIMO_V2_MODEL_ARCHS:
             self.hf_config.architectures[0] = "MiMoV2MTP"
+            self.hf_config.num_nextn_predict_layers = 1
         if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
             self.hf_config.architectures[0] = "Step3p5MTP"
         if (
@@ -650,9 +709,23 @@ class ModelConfig:
             "Qwen3_5ForCausalLM",
             "Qwen3_5MoeForCausalLM",
             "InternS2PreviewForConditionalGeneration",
+            "InternS2MobiusForConditionalGeneration",
         ]:
+            if (
+                self.hf_config.architectures[0]
+                == "InternS2MobiusForConditionalGeneration"
+            ):
+                # The target owns 2,560 experts through four shared physical
+                # banks, while its bundled MTP layer is an ordinary Qwen3.5
+                # MoE layer with the checkpoint-declared smaller expert set.
+                self.hf_text_config.model_type = "qwen3_5_moe_text"
+                self.hf_text_config.num_experts = self.hf_text_config.mtp_num_experts
+                self.hf_text_config.num_experts_per_tok = (
+                    self.hf_text_config.mtp_num_experts_per_tok
+                )
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
+            self.hf_text_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
@@ -677,7 +750,7 @@ class ModelConfig:
         )
 
         if self.is_hybrid_swa:
-            logger.info(f"Hybrid swa model: {self.hf_config.architectures=}")
+            logger.debug(f"Hybrid swa model: {self.hf_config.architectures=}")
 
             self.is_deepseek_v4_arch = any(
                 arch
@@ -712,6 +785,17 @@ class ModelConfig:
     @cached_property
     def linear_attn_registry_result(self) -> Any:
         return get_linear_attn_config(self.hf_config)
+
+    @property
+    def has_asymmetric_kv(self) -> bool:
+        """Whether K and V rows differ in width (MiMoV2 is 192 / 128).
+
+        Not an ``__init__`` field because the MLA special-casing below still
+        rewrites ``v_head_dim``.
+        """
+        return (
+            self.head_dim != self.v_head_dim or self.swa_head_dim != self.swa_v_head_dim
+        )
 
     def _detect_attention_sinks(self) -> bool:
         """Check whether the model uses learned attention sinks.
@@ -823,21 +907,8 @@ class ModelConfig:
                 if is_deepseek_dsa(self.hf_text_config)
                 else None
             )
-            # Handle rope scaling
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            # in transformers v5, rope_scaling is just rope_parameters for backward compatibility
-            rope_scaling = self.hf_text_config.rope_scaling
-            if rope_scaling:
-                # v5 uses "rope_type", v4 uses "type"
-                rope_type = (
-                    rope_scaling.get("rope_type")
-                    or rope_scaling.get("type")
-                    or "default"
-                )
-                if rope_type != "default":
-                    self.scaling = compute_mla_mscale_scaling(
-                        rope_scaling, self.scaling
-                    )
+            # In transformers v5, rope_scaling is just rope_parameters.
+            self._init_mla_scaling(self.hf_text_config.rope_scaling)
         elif (
             "DeepseekV4ForCausalLM" in self.hf_config.architectures
             or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
@@ -851,11 +922,7 @@ class ModelConfig:
             self.index_head_dim = self.hf_config.index_head_dim
             self.compress_ratios = self.hf_config.compress_ratios
             self.attention_arch = AttentionArch.MHA
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                self.scaling = compute_mla_mscale_scaling(
-                    self.hf_config.rope_scaling, self.scaling
-                )
+            self._init_mla_scaling(self.hf_config.rope_scaling)
         elif "Glm4MoeForCausalLMNextN" in self.hf_config.architectures:
             if self.head_dim is None:
                 self.head_dim = (
@@ -887,18 +954,18 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
-        elif "KimiLinearForCausalLM" in self.hf_config.architectures:
+        elif (
+            "KimiLinearForCausalLM" in self.hf_config.architectures
+            or "KimiK3ForConditionalGeneration" in self.hf_config.architectures
+        ):
+            tc = self.hf_text_config
             self.head_dim = 72
             self.attention_arch = AttentionArch.MLA
-            self.kv_lora_rank = self.hf_config.kv_lora_rank
-            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
-            self.v_head_dim = self.hf_config.v_head_dim
-            self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                self.scaling = compute_mla_mscale_scaling(
-                    self.hf_config.rope_scaling, self.scaling
-                )
+            self.kv_lora_rank = tc.kv_lora_rank
+            self.qk_rope_head_dim = tc.qk_rope_head_dim
+            self.v_head_dim = tc.v_head_dim
+            self.qk_nope_head_dim = tc.qk_nope_head_dim
+            self._init_mla_scaling(getattr(tc, "rope_scaling", None))
         elif (
             "BailingMoeV2_5ForCausalLM" in self.hf_config.architectures
             or "BailingMoeForCausalLMNextN" in self.hf_config.architectures
@@ -909,12 +976,7 @@ class ModelConfig:
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
-            # Handle rope scaling with yarn
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                self.scaling = compute_mla_mscale_scaling(
-                    self.hf_config.rope_scaling, self.scaling
-                )
+            self._init_mla_scaling(self.hf_config.rope_scaling)
         elif "SarvamMLAForCausalLM" in self.hf_config.architectures:
             self.head_dim = (
                 self.hf_config.qk_nope_head_dim + self.hf_config.qk_rope_head_dim
@@ -924,11 +986,7 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
             self.v_head_dim = self.hf_config.v_head_dim
-            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
-            if self.hf_config.rope_scaling:
-                self.scaling = compute_mla_mscale_scaling(
-                    self.hf_config.rope_scaling, self.scaling
-                )
+            self._init_mla_scaling(self.hf_config.rope_scaling)
         else:
             if (
                 "MistralModel" in self.hf_config.architectures
@@ -1005,6 +1063,12 @@ class ModelConfig:
         if _hf_arch(self.hf_config) == "GlmImageForConditionalGeneration":
             self.vocab_size = self.hf_text_config.vision_vocab_size
 
+    def _init_mla_scaling(self, rope_scaling: Optional[dict]) -> None:
+        """Base MLA attention scale from the head dims, then the rope mscale."""
+        self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+        if rope_scaling:
+            self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
+
     def get_total_num_attention_heads(self) -> int:
         return self.num_attention_heads
 
@@ -1076,14 +1140,26 @@ class ModelConfig:
         # equal to the number of attention heads.
         return self.hf_text_config.num_attention_heads
 
-    def get_num_kv_heads(self, tensor_parallel_size) -> int:
-        """Returns the number of KV heads per GPU."""
+    def get_max_num_attention_heads(self) -> int:
+        """Max per-layer query head count; num_attention_heads unless the
+        model sets num_attention_heads_per_layer."""
+        per_layer = getattr(self.hf_text_config, "num_attention_heads_per_layer", None)
+        if per_layer:
+            return max(per_layer)
+        return self.num_attention_heads
+
+    def get_num_kv_heads(self, tensor_parallel_size: int, dcp_size: int = 1) -> int:
+        """Number of KV heads per GPU.
+
+        DCP ranks replicate KV, so heads shard across ``tp // dcp`` groups.
+        Drafts never join the group and ignore ``dcp_size``. With fewer heads
+        than groups, each GPU keeps one.
+        """
         total_num_kv_heads = self.get_total_num_kv_heads()
-        # If tensor parallelism is used, we divide the number of KV heads by
-        # the tensor parallel size. We will replicate the KV heads in the
-        # case where the number of KV heads is smaller than the tensor
-        # parallel size so each GPU has at least one KV head.
-        return max(1, total_num_kv_heads // tensor_parallel_size)
+        if self.is_draft_model:
+            dcp_size = 1
+        kv_tensor_parallel_size = tensor_parallel_size // dcp_size
+        return max(1, total_num_kv_heads // kv_tensor_parallel_size)
 
     def get_swa_num_kv_heads(self, tensor_parallel_size) -> int:
         """Similar to get_num_kv_heads(), but for SWA."""
@@ -1229,8 +1305,34 @@ class ModelConfig:
             return {"quant_method": "w4afp8", "quant_algo": quant_algo}
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
             return {"quant_method": "modelopt_fp4", "quant_algo": quant_algo}
-        elif quant_algo and "FP8" in quant_algo:
+        elif quant_algo == "FP8":
             return {"quant_method": "modelopt_fp8", "quant_algo": quant_algo}
+        elif quant_algo == "MXFP8":
+            group_size = json_quant_configs.get("group_size", 32)
+            ignored_layers = json_quant_configs.get(
+                "exclude_modules", json_quant_configs.get("ignore")
+            )
+            kv_cache_quant_algo = json_quant_configs.get("kv_cache_quant_algo")
+            if kv_cache_quant_algo is None:
+                kv_cache_scheme = json_quant_configs.get("kv_cache_scheme")
+                if (
+                    isinstance(kv_cache_scheme, dict)
+                    and kv_cache_scheme.get("type") == "float"
+                    and kv_cache_scheme.get("num_bits") == 8
+                ):
+                    kv_cache_quant_algo = "FP8"
+            parsed = {
+                "quant_method": "mxfp8",
+                "quant_algo": quant_algo,
+                "activation_scheme": "dynamic",
+                "weight_block_size": [1, group_size],
+                "scale_fmt": "ue8m0",
+            }
+            if ignored_layers is not None:
+                parsed["modules_to_not_convert"] = ignored_layers
+            if kv_cache_quant_algo is not None:
+                parsed["kv_cache_quant_algo"] = kv_cache_quant_algo
+            return parsed
         else:
             return None
 
@@ -1375,12 +1477,15 @@ class ModelConfig:
             "modelslim",
             "humming",
             "quark_mxfp4",
+            "auto-round",
         ]
         compatible_quantization_methods = {
             "modelopt_fp8": ["modelopt"],
-            "modelopt_fp4": ["modelopt"],
+            # Keep explicit or inherited modelopt_fp4 for literal FP8 checkpoints
+            # so eligible MoE experts are requantized online.
+            "modelopt_fp4": ["modelopt", "fp8"],
             "modelopt_mixed": ["modelopt"],
-            "nvfp4_online": ["fp8"],
+            "nvfp4_online": ["fp8", "modelopt_fp8"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
@@ -1411,22 +1516,37 @@ class ModelConfig:
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()
 
-            # Detect which checkpoint is it
-            for _, method in QUANTIZATION_METHODS.items():
-                quantization_override = method.override_quantization_method(
-                    quant_cfg, self.quantization
-                )
-                if quantization_override:
-                    quant_method = quantization_override
-                    self.quantization = quantization_override
-                    break
+            # ModelOpt FP4 checkpoints quantize only the target model; an
+            # embedded MTP draft may stay unquantized, so an explicit
+            # nvfp4_online opt-in for the draft wins over checkpoint detection.
+            # The online loader rejects already-packed weights at load time.
+            preserve_online_draft_quantization = (
+                self.is_draft_model
+                and self.quantization == "nvfp4_online"
+                and quant_method == "modelopt_fp4"
+            )
+            # An explicit online-requantization request (e.g. quark_mxfp4 on top
+            # of an NVFP4/mixed checkpoint) must not be overridden back to the
+            # source format
+            if self.quantization not in REQUANTIZATION_METHODS:
+
+                # Detect which checkpoint is it
+                if not preserve_online_draft_quantization:
+                    for _, method in QUANTIZATION_METHODS.items():
+                        quantization_override = method.override_quantization_method(
+                            quant_cfg, self.quantization
+                        )
+                        if quantization_override:
+                            quant_method = quantization_override
+                            self.quantization = quantization_override
+                            break
 
             # Verify quantization configurations.
             if self.quantization is None:
                 self.quantization = quant_method
             elif self.quantization != quant_method:
                 # Check if the CLI-specified quantization is compatible with HF config's quant_method
-                is_compatible = (
+                is_compatible = preserve_online_draft_quantization or (
                     self.quantization in compatible_quantization_methods
                     and quant_method
                     in compatible_quantization_methods[self.quantization]
@@ -1458,20 +1578,6 @@ class ModelConfig:
                         f"method specified in the `quantization` argument "
                         f"({self.quantization})."
                     )
-
-            # Warn if DeepGemm is enabled for a non-ue8m0 checkpoint on Blackwell.
-            # MXFP8 stores E8M0 block scales that DeepGemm consumes losslessly, so skip the warning there.
-            self.use_scale_ue8m0 = quant_cfg.get("scale_fmt", None) == "ue8m0"
-            from sglang.srt.layers import deep_gemm_wrapper
-
-            if (
-                not self.use_scale_ue8m0
-                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                and self.quantization != "mxfp8"
-            ):
-                logger.warning(
-                    "DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell."
-                )
 
         if self.quantization is not None:
             if self.quantization not in supported_quantization:
@@ -1748,6 +1854,7 @@ multimodal_model_archs = [
     "MossVLForConditionalGeneration",
     "NemotronH_Nano_VL_V2",
     "NemotronH_Nano_Omni_Reasoning_V3",
+    "MuseGlimmerForConditionalGeneration",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
     "Qwen2VLForConditionalGeneration",
@@ -1757,6 +1864,7 @@ multimodal_model_archs = [
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
+    "InternS2MobiusForConditionalGeneration",
     "Qwen3ASRForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
@@ -1806,9 +1914,17 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
 
 # Multimodal archs whose LM prefill is validated under breakable CUDA graph;
 # embed-carrying batches are rejected at replay (can_run_graph) and run eager.
+# The Kimi archs are structurally multimodal -- their configs always carry a
+# vision_config, so is_multimodal is True even for text-only serving -- and the
+# generic multimodal rule disabled prefill CG for them despite the LM prefill
+# capturing cleanly.
 multimodal_breakable_cuda_graph_supported_model_archs = [
+    "InternS2MobiusForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    "MuseGlimmerForConditionalGeneration",
+    "KimiK3ForConditionalGeneration",
+    "KimiK25ForConditionalGeneration",
 ]
 
 if external_mm_model_arch := envs.SGLANG_EXTERNAL_MM_MODEL_ARCH.get():
@@ -1906,8 +2022,15 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     """Compute MLA attention scaling factor from rope_scaling with mscale.
 
     Used by DeepSeek, BailingMoe, SarvamMLA and similar MLA models.
-    Warns if 'factor' is missing from rope_scaling (common in v5 configs).
+    Transformers v5 also exposes the default RoPE parameters through
+    ``rope_scaling``. Those parameters do not request any scaling.
+    Warns if 'factor' is missing from a scaling request (common in v5 configs).
     """
+    # v5 uses "rope_type", v4 uses "type"
+    rope_type = rope_scaling.get("rope_type") or rope_scaling.get("type")
+    if rope_type == "default":
+        return base_scaling
+
     if not rope_scaling.get("apply_yarn_scaling", True) or not rope_scaling.get(
         "apply_scale", True
     ):
@@ -1945,6 +2068,8 @@ def is_hybrid_swa_model(
         "Gemma4UnifiedForConditionalGeneration",
         "LagunaForCausalLM",
         "MellumForCausalLM",
+        "MuseGlimmerForCausalLM",
+        "MuseGlimmerForConditionalGeneration",
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
         "UnlimitedOCRForCausalLM",
@@ -2020,6 +2145,8 @@ def get_hybrid_layer_ids(
         or "Gemma4UnifiedForConditionalGeneration" in model_architectures
         or "LagunaForCausalLM" in model_architectures
         or "MellumForCausalLM" in model_architectures
+        or "MuseGlimmerForCausalLM" in model_architectures
+        or "MuseGlimmerForConditionalGeneration" in model_architectures
     ):
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
