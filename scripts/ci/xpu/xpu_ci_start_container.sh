@@ -109,54 +109,39 @@ elif [[ -r "${HF_TOKEN_FILE}" ]]; then
   HF_TOKEN_VALUE=$(cat "${HF_TOKEN_FILE}")
 fi
 
-# Persistent JIT kernel cache (Triton/Inductor/NEO/SYCL) keyed by GPU mask
-# AND the resolved image content ID. Nightly image rebuilds swap the runtime
-# libraries the JIT'd .so files link against (e.g. a torch upgrade replacing
-# libsycl.so.8 with libsycl.so.9), and Triton keys its cache on the source
-# hash only, so a bare gpu-mask key would dlopen stale .so files from the
-# previous image and every job would die with
-#   OSError: libsycl.so.N: cannot open shared object file: No such file or directory
-# The image's content-addressable ID from `docker image inspect` changes iff
-# any layer changed, giving exactly the invariant needed: new image -> new
-# cache dir. Cold JIT compile can push test_xpu_basic past its 1200s timeout
-# on B580, so we keep the cache warm within an image version.
+# Persistent JIT kernel cache keyed by GPU mask + image ID (new image -> new
+# cache; avoids dlopen of stale .so's like libsycl.so.8 after a torch bump).
 if [[ -n "${XPU_KERNEL_CACHE_DIR:-}" ]]; then
-  # Explicit override -- honor verbatim, no image keying, no sibling pruning.
   XPU_KERNEL_CACHE_HOST="${XPU_KERNEL_CACHE_DIR}"
 else
+  # `|| IMG_ID_SHORT=""` keeps pipefail from killing the script on inspect failure.
   IMG_ID_SHORT=$(docker image inspect --format '{{.Id}}' "${IMAGE}" 2>/dev/null \
-    | sed 's/^sha256://' | cut -c1-12)
+    | sed 's/^sha256://' | cut -c1-12) || IMG_ID_SHORT=""
   CACHE_ROOT="${HOME}/.cache/sglang-xpu-ci"
   GPU_KEY="gpu${ZE_AFFINITY_MASK:-shared}"
   if [[ -n "${IMG_ID_SHORT}" ]]; then
     XPU_KERNEL_CACHE_HOST="${CACHE_ROOT}/kernel-cache-${GPU_KEY}-${IMG_ID_SHORT}"
-    # Prune sibling caches for the same GPU but a different image ID. The
-    # files inside are root-owned (written from the CI container), so unlink
-    # them via a rootful busybox helper -- same pattern as the workspace
-    # ownership reset step in the workflow.
+    # Prune caches for other image IDs + the legacy unversioned dir (root-owned).
     shopt -s nullglob
-    stale_siblings=("${CACHE_ROOT}"/kernel-cache-"${GPU_KEY}"-*)
+    stale_siblings=("${CACHE_ROOT}"/kernel-cache-"${GPU_KEY}"-* "${CACHE_ROOT}/kernel-cache-${GPU_KEY}")
     shopt -u nullglob
     for sibling in "${stale_siblings[@]}"; do
       [[ -d "${sibling}" ]] || continue
       [[ "${sibling}" == "${XPU_KERNEL_CACHE_HOST}" ]] && continue
-      echo "Pruning stale kernel cache from a previous image build: ${sibling}"
+      echo "Pruning stale kernel cache: ${sibling}"
       docker run --rm -v "${CACHE_ROOT}:/c" busybox:latest \
         rm -rf "/c/$(basename "${sibling}")" || true
     done
   else
-    # `docker image inspect` failed (image not local yet, daemon issue, ...).
-    # Fall back to the legacy unversioned path so we don't churn the cache.
-    echo "Warning: could not resolve image ID for ${IMAGE}; cache is not image-versioned this run." >&2
-    XPU_KERNEL_CACHE_HOST="${CACHE_ROOT}/kernel-cache-${GPU_KEY}"
+    # Throwaway per-run dir; legacy path may be poisoned. Next good run prunes it.
+    echo "Warning: could not resolve image ID for ${IMAGE}; using throwaway cache." >&2
+    XPU_KERNEL_CACHE_HOST="${CACHE_ROOT}/kernel-cache-${GPU_KEY}-unversioned-$$"
   fi
 fi
 mkdir -p "${XPU_KERNEL_CACHE_HOST}"/{triton,inductor,neo,sycl}
 echo "Using persistent XPU kernel cache: ${XPU_KERNEL_CACHE_HOST}"
 
-# Cap the cache (default 5 GiB); over-cap resets it (misses just recompile).
-# Cache contents are root-owned (written from inside the container), so the
-# reset must go through busybox rather than a plain `rm -rf` as the runner.
+# Cap the cache (default 5 GiB); over-cap resets it via busybox (root-owned).
 XPU_KERNEL_CACHE_MAX_MB="${XPU_KERNEL_CACHE_MAX_MB:-5120}"
 cache_mb=$(du -sm "${XPU_KERNEL_CACHE_HOST}" 2>/dev/null | cut -f1)
 if [[ -n "${cache_mb}" && "${cache_mb}" -gt "${XPU_KERNEL_CACHE_MAX_MB}" ]]; then
