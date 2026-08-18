@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency impor
     estimate_default_workload_peak_bytes,
     format_applied_changes,
     plan_auto_residency,
+    rank_candidates_by_h2d_savings,
     rollback_promotions,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -453,6 +454,31 @@ class TestApplyAndRollback:
         # never disabled: re-enabling must not stack a second set of hooks
         module.enable_offload()
         assert manager.register_hooks_calls == 0
+
+
+class TestCandidateRanking:
+    def test_post_request_hint_order_matches_promotion_order(self):
+        # The recommendation log and the promotion plan share one ranking, so
+        # the hint lists components in the order auto mode would promote them.
+        candidates = [
+            _candidate("vae", weight_gib=1),
+            _candidate(
+                "transformer", mode=LAYERWISE_OFFLOAD, weight_gib=10, h2d_gib=500
+            ),
+            _candidate("text_encoder", weight_gib=7),
+        ]
+        ranked = rank_candidates_by_h2d_savings(candidates)
+        assert [candidate.component_name for candidate in ranked] == [
+            "transformer",
+            "text_encoder",
+            "vae",
+        ]
+        plan = plan_auto_residency(
+            reports=[_report(budget_gib=1000, estimated_gib=50, candidates=candidates)]
+        )
+        assert [candidate.component_name for candidate in plan.promotions] == [
+            candidate.component_name for candidate in ranked
+        ]
 
 
 class TestAppliedChangesLog:
