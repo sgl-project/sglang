@@ -1,3 +1,5 @@
+"""CPU unit tests for MXFP8 activation-preparation dispatch."""
+
 import unittest
 from unittest.mock import patch
 
@@ -7,11 +9,12 @@ from sglang.srt.layers.quantization.mxfp4 import (
     _prepare_flashinfer_mxfp8_activations,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-class TestMxfp4FlashinferActivationPrep(unittest.TestCase):
+class TestMxfp4FlashinferActivationPrep(CustomTestCase):
     def test_sm107_handoff_miss_uses_flashinfer_quantizer(self):
         x = torch.randn(3, 64, dtype=torch.bfloat16)
         x_quant = torch.empty(3, 64, dtype=torch.float8_e4m3fn)
