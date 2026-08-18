@@ -206,6 +206,12 @@ class SamplingParams:
     guidance_rescale: float = 0.0
     cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
+    # CFG gating (lossy): after this fraction of the denoising steps, reuse the
+    # cached cond-uncond residual instead of running the unconditional branch.
+    # ``None`` follows the SGLANG_DIFFUSION_CFG_GATE_STEP server default;
+    # 1.0 disables gating for this request. Participates in the dynamic-batch
+    # signature. No-op for requests without classifier-free guidance.
+    cfg_gate_step: float | None = None
 
     progressive_mode: str = "fullres"
     progressive_levels: int = 1
@@ -929,6 +935,10 @@ class SamplingParams:
         add_argument(
             "--cache-dit-params",
             type=json.loads,
+        )
+        add_argument(
+            "--cfg-gate-step",
+            type=float,
         )
         add_argument(
             "--enable-spectrum",

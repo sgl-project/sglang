@@ -1198,12 +1198,20 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def _init_cfg_gate_state(
         self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
-        """Initialize optional CFG residual reuse for the current denoising loop."""
-        fraction = envs.SGLANG_DIFFUSION_CFG_GATE_STEP
+        """Initialize optional CFG residual reuse for the current denoising loop.
+
+        The fraction is per-request (``SamplingParams.cfg_gate_step``); the
+        SGLANG_DIFFUSION_CFG_GATE_STEP env value is the server-wide default for
+        requests that leave it unset. The state is rebuilt per denoising loop,
+        so no cross-request transition is needed.
+        """
+        fraction = batch.sampling_params.cfg_gate_step
+        if fraction is None:
+            fraction = envs.SGLANG_DIFFUSION_CFG_GATE_STEP
         if not 0.0 <= fraction <= 1.0:
             raise ValueError(
-                "SGLANG_DIFFUSION_CFG_GATE_STEP must be between 0.0 and 1.0, "
-                f"got {fraction}."
+                "cfg_gate_step (SGLANG_DIFFUSION_CFG_GATE_STEP) must be between "
+                f"0.0 and 1.0, got {fraction}."
             )
 
         num_steps = len(ctx.timesteps)
