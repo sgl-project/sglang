@@ -5,7 +5,10 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.arg_groups.overrides import (
+    declare_direct_writes,
+    declare_resolution,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -149,7 +152,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 
         # TODO: move the per-algorithm validation below into spec module hooks.
         if isinstance(algo, CustomSpecAlgo) and algo.validate_server_args is not None:
-            algo.validate_server_args(server_args)
+            declare_direct_writes(
+                server_args,
+                "handle_speculative_decoding.custom_validate",
+                algo.validate_server_args,
+            )
 
     if server_args.speculative_skip_dp_mlp_sync:
         assert server_args.speculative_algorithm == "EAGLE", (
@@ -163,7 +170,13 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             _init_adaptive_speculative_params(server_args)
 
     if algo is not None:
-        algo.handle_server_args(server_args)
+        # A registered algorithm's callback lives outside this tree and sets
+        # fields on the record, so the writes are captured around the call.
+        declare_direct_writes(
+            server_args,
+            "handle_speculative_decoding.custom_algo",
+            algo.handle_server_args,
+        )
 
 
 def _handle_dflash(server_args: ServerArgs) -> None:
