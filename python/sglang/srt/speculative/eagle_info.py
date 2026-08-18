@@ -230,7 +230,7 @@ class EagleDraftInput(SpecInput):
         if self.dsa_topk_indices is not None:
             self.dsa_topk_indices = self.dsa_topk_indices[new_indices]
 
-    def merge_batch(self, spec_info: "EagleDraftInput"):
+    def merge_batch(self, spec_info: EagleDraftInput):
         if self.future_indices is not None:
             assert spec_info.future_indices is not None
             self.future_indices = torch.cat(
@@ -339,7 +339,7 @@ class EagleDraftExtendInput(SpecInput):
         hidden_size: Optional[int],
         dtype: Optional[torch.dtype],
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST,
-    ) -> "EagleDraftExtendInput":
+    ) -> EagleDraftExtendInput:
         return cls(
             hidden_states=(
                 torch.empty((0, hidden_size), device=device, dtype=dtype)
@@ -435,7 +435,7 @@ class EaglePPVerifyInputRaw(SpecInput):
     @classmethod
     def build_dummy_for_decode(
         cls, batch: ScheduleBatch, num_draft: int
-    ) -> "EaglePPVerifyInputRaw":
+    ) -> EaglePPVerifyInputRaw:
         """Build a dummy draft spec for the first decode step after prefill.
 
         The last PP rank produces no draft tokens for prefill batches, so a
@@ -483,7 +483,7 @@ class EaglePPVerifyInputRaw(SpecInput):
                 "via pp_outputs, or be given a dummy tree for its first decode."
             ) from e
 
-    def merge_batch(self, other: "EaglePPVerifyInputRaw"):
+    def merge_batch(self, other: EaglePPVerifyInputRaw):
         try:
             if other.bonus_tokens.numel() == 0:
                 return

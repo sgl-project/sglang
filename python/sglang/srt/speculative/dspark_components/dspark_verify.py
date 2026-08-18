@@ -37,7 +37,6 @@ from sglang.srt.speculative.dflash_info_v2 import (
     DFlashDraftInputV2,
 )
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
-from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -47,6 +46,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     apply_logits_adjustments_strided,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_METHOD,
     sample_simulated_acc_len,
@@ -108,9 +108,7 @@ class DSparkPPLocalSamplingCache:
 
     @staticmethod
     def _request_keys(reqs, seq_lens) -> List[Tuple[str, int]]:
-        return [
-            (req.rid, int(seq_len)) for req, seq_len in zip(reqs, seq_lens)
-        ]
+        return [(req.rid, int(seq_len)) for req, seq_len in zip(reqs, seq_lens)]
 
     def match(
         self,
@@ -219,7 +217,9 @@ class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
         top_ks = [int(req.sampling_params.top_k) for req in reqs]
         self.max_top_k = max(max(top_ks, default=1), 1)
         self.uniform_top_k_value = (
-            top_ks[0] if top_ks and all(top_k == top_ks[0] for top_k in top_ks) else None
+            top_ks[0]
+            if top_ks and all(top_k == top_ks[0] for top_k in top_ks)
+            else None
         )
 
     def to_tensor_dict(self) -> dict:
@@ -249,9 +249,7 @@ class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
             accept_index=None,
         )
 
-    def filter_batch(
-        self, new_indices, new_indices_cpu: Optional[List[int]] = None
-    ):
+    def filter_batch(self, new_indices, new_indices_cpu: Optional[List[int]] = None):
         self.bonus_tokens = self.bonus_tokens[new_indices]
         if self.draft_tokens is not None:
             self.draft_tokens = self.draft_tokens[new_indices]

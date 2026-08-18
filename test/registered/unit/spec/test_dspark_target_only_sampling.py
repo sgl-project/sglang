@@ -62,9 +62,7 @@ class TestDSparkTargetOnlySampling(CustomTestCase):
         self.assertIsNotNone(logits)
         torch.testing.assert_close(ready, torch.tensor([True, False, True]))
         torch.testing.assert_close(logits[0], cache.corrected_logits[2])
-        torch.testing.assert_close(
-            logits[1], torch.zeros((2, 4), dtype=torch.int64)
-        )
+        torch.testing.assert_close(logits[1], torch.zeros((2, 4), dtype=torch.int64))
         torch.testing.assert_close(logits[2], cache.corrected_logits[0])
         self.assertEqual(
             manager.consume(2, [], [], device=torch.device("cpu")), (None, None)

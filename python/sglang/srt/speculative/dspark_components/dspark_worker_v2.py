@@ -63,7 +63,6 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     DSparkPPVerifyInputRaw,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
-    TargetVerifyResult,
     verify_logits_adjustments_are_noop,
 )
 from sglang.srt.speculative.spec_utils import (
@@ -481,7 +480,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_prefill_step()
             return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
-        return self._forward_decode(batch, on_publish, grammar_barrier, pp_proxy_tensors)
+        return self._forward_decode(
+            batch, on_publish, grammar_barrier, pp_proxy_tensors
+        )
 
     def _forward_prefill(
         self, batch: ScheduleBatch, on_publish, pp_proxy_tensors=None
@@ -635,13 +636,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             pp_raw.prepare_local_sampling_metadata(batch.reqs)
             pp_mb_id = getattr(batch, "pp_mb_id", None)
             assert pp_mb_id is not None, "DSpark PP sampling requires pp_mb_id"
-            corrected_logits, corrected_logits_ready = (
-                self._pp_sampling_cache.consume(
-                    pp_mb_id,
-                    batch.reqs,
-                    pp_raw.new_seq_lens,
-                    device=device,
-                )
+            corrected_logits, corrected_logits_ready = self._pp_sampling_cache.consume(
+                pp_mb_id,
+                batch.reqs,
+                pp_raw.new_seq_lens,
+                device=device,
             )
         draft_block = DraftBlockResult(
             draft_tokens=drafts,
@@ -674,9 +673,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "DSpark spec-v2 expected DFlashDraftInputV2 / DSparkPPVerifyInputRaw "
                 "state on the running batch."
             )
-        pp_raw = (
-            spec_info if isinstance(spec_info, DSparkPPVerifyInputRaw) else None
-        )
+        pp_raw = spec_info if isinstance(spec_info, DSparkPPVerifyInputRaw) else None
         draft_input = spec_info
 
         if batch.forward_mode.is_idle():
@@ -822,9 +819,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         # scheduler, which forwards it to the next PP stage.
         if self._pp_enabled and not self._pp_is_last_rank:
             pp_proxy_out = target_verify.pp_hidden_states_proxy_tensors
-            assert pp_proxy_out is not None, (
-                "non-last PP rank must relay proxy hidden downstream"
-            )
+            assert (
+                pp_proxy_out is not None
+            ), "non-last PP rank must relay proxy hidden downstream"
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_out,
                 next_token_ids=torch.empty((0,), dtype=torch.int64, device=device),

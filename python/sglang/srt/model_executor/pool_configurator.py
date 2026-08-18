@@ -199,8 +199,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                             get_glm_dsa_layer_split_effective_num_layers,
                         )
 
-                        target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
-                            kvc, num_layers
+                        target_kv_num_layers = (
+                            get_glm_dsa_layer_split_effective_num_layers(
+                                kvc, num_layers
+                            )
                         )
                         draft_kv_size = int(
                             target_kv_size * draft_num_layers / target_kv_num_layers
