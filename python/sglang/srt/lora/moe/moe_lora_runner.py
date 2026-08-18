@@ -245,7 +245,6 @@ class MoeLoraRunner:
         """
         from sglang.srt.layers import deep_gemm_wrapper
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
-        from sglang.srt.layers.moe.utils import get_moe_runner_backend
         from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
         if not isinstance(base_layer.quant_method, UnquantizedFusedMoEMethod):
@@ -262,27 +261,27 @@ class MoeLoraRunner:
                 "resident BF16 provider"
             )
 
-        resident_backend = (
-            base_layer.quant_method.runner.runner_backend
-            if base_layer.quant_method.runner is not None
-            else get_moe_runner_backend()
-        )
-        # Both shipped providers (DeepGEMM and CuTeDSL) consume the DeepGEMM
-        # backend's canonical resident weight layout ([E, 2I, H] gate-first
-        # BF16 with EP-local expert IDs), so admission is gated on that
-        # backend AND on DeepGEMM being usable regardless of which provider
-        # the env selects; a Triton-resident provider is separate later work.
-        if not resident_backend.is_deep_gemm():
-            raise NotImplementedError(
-                "MoE LoRA BF16 currently requires --moe-runner-backend "
-                "deep_gemm (canonical gate-first [E, 2I, H] BF16 weights and "
-                f"EP-local expert IDs); this layer resolved to "
-                f"{resident_backend}"
-            )
+        # The resident weight layout needs no check: reaching here at all means
+        # --moe-runner-backend lora (layers.py gates the engine on is_lora),
+        # and that same flag sets the layer's use_deep_gemm (fused_moe_triton/
+        # layer.py), which makes the quant method build a DEEP_GEMM runner
+        # (unquant.py) -- so the canonical gate-first [E, 2I, H] BF16 residents
+        # are guaranteed by construction. An is_deep_gemm() assert here could
+        # not fail, and its error told users to pass --moe-runner-backend
+        # deep_gemm, which turns this feature off.
+        #
+        # This one is NOT about the weight layout, despite where it sits. Only
+        # the DeepGEMM provider imports deep_gemm; CuteDSL never touches it. It
+        # stays because it is also, accidentally, the SM120 gate: DeepGEMM's
+        # configurer returns False there ("requires TMEM/tcgen05, not available
+        # on SM120"), while architecture_for_capability and _kernel_class_for
+        # both test major >= 10 and would hand SM120 the GB300 tables and the
+        # tcgen05 kernel it cannot run. Make that rejection explicit before
+        # narrowing this to the DeepGEMM vendor.
         if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             raise NotImplementedError(
-                "MoE LoRA BF16 requires a usable JIT DeepGEMM build: every "
-                "base provider consumes the DeepGEMM-resident weight layout"
+                "MoE LoRA BF16 requires a usable JIT DeepGEMM build (this also "
+                "excludes SM120, which has neither DeepGEMM nor tcgen05)"
             )
         if base_layer.dispatcher.skip_local_expert_mapping:
             raise NotImplementedError(

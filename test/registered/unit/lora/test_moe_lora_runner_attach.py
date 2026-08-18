@@ -191,11 +191,7 @@ class TestEngineAdmission(unittest.TestCase):
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
         from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
-        runner_backend = SimpleNamespace(
-            is_deep_gemm=lambda: overrides.get("deep_gemm", True),
-        )
         quant_method = object.__new__(UnquantizedFusedMoEMethod)
-        quant_method.runner = SimpleNamespace(runner_backend=runner_backend)
         dispatcher = object.__new__(StandardDispatcher)
         dispatcher.skip_local_expert_mapping = overrides.get("skip_local", False)
         return SimpleNamespace(
@@ -233,16 +229,15 @@ class TestEngineAdmission(unittest.TestCase):
     def test_admits_a_supported_layer(self):
         self._admit()
 
-    def test_rejects_non_deep_gemm_resident_backend(self):
-        """Triton-resident layers were admitted then bound a DeepGEMM provider.
-
-        Regression: the first forward reached an unbound `deep_gemm` symbol.
-        Triton is the DEFAULT for unquantized MoE, so this was the common case.
-        """
-        with self.assertRaisesRegex(NotImplementedError, "deep_gemm"):
-            self._admit(deep_gemm=False)
-
     def test_rejects_unusable_deep_gemm_build(self):
+        """Also the SM120 gate: no DeepGEMM there, and no tcgen05 either.
+
+        The regression this family guards -- a first forward reaching an
+        unbound deep_gemm symbol, since deep_gemm_wrapper imports those names
+        only when the build is usable -- is caught here. The resident BACKEND
+        needs no case: --moe-runner-backend lora is the only way to reach
+        _admit, and it forces the layer's quant method onto a DEEP_GEMM runner.
+        """
         with self.assertRaisesRegex(NotImplementedError, "JIT DeepGEMM"):
             self._admit(jit_deep_gemm=False)
 

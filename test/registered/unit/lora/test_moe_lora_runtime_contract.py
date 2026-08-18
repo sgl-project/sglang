@@ -294,11 +294,7 @@ class TestRunnerAdmission:
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
         from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
-        runner_backend = SimpleNamespace(
-            is_deep_gemm=lambda: overrides.get("deep_gemm", True),
-        )
         quant_method = object.__new__(UnquantizedFusedMoEMethod)
-        quant_method.runner = SimpleNamespace(runner_backend=runner_backend)
         dispatcher = object.__new__(StandardDispatcher)
         dispatcher.skip_local_expert_mapping = overrides.get("skip_local", False)
         is_gated = overrides.get("is_gated", True)
@@ -350,7 +346,6 @@ class TestRunnerAdmission:
     @pytest.mark.parametrize(
         ("overrides", "message"),
         [
-            ({"deep_gemm": False}, "deep_gemm"),
             ({"jit_deep_gemm": False}, "JIT DeepGEMM"),
             ({"skip_local": True}, "EP-local"),
             ({"fused_scaling": True}, "routed scaling"),
