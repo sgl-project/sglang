@@ -1630,10 +1630,33 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         )
     if kv_cache_dtype == "bf16":
         kv_cache_dtype = "bfloat16"
+    if kv_cache_dtype == "nvfp4":
+        model_arch = hf_config.architectures[0]
+        if major != 10 or is_hip():
+            raise ValueError(
+                f"DSA --kv-cache-dtype={kv_cache_dtype} currently requires an SM100 GPU"
+            )
+        if model_arch != "GlmMoeDsaForCausalLM":
+            raise ValueError(
+                f"DSA --kv-cache-dtype={kv_cache_dtype} is currently specialized for "
+                f"GLM-5.2, got architecture {model_arch}"
+            )
+        if view.enable_prefill_cp or view.dcp_size > 1:
+            raise ValueError(
+                "GLM-5.2 SM100 DSA --kv-cache-dtype=nvfp4 does not yet support "
+                "prefill context parallelism or decode context parallelism; "
+                "disable --enable-prefill-cp and set --dcp-size=1"
+            )
+        if view.enable_hisparse:
+            raise ValueError(
+                "GLM-5.2 SM100 DSA --kv-cache-dtype=nvfp4 does not yet support "
+                "HiSparse; disable --enable-hisparse"
+            )
     assert kv_cache_dtype in [
         "bfloat16",
         "fp8_e4m3",
-    ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+        "nvfp4",
+    ], "DeepSeek DSA only supports bf16/bfloat16, fp8_e4m3, or nvfp4 kv_cache_dtype"
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
     return {}
@@ -1701,6 +1724,35 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         logger.warning(
             "Set DSA backends for GLM FP8 KV Cache on SM120/SM121: "
             f"prefill={backend}, decode={backend}."
+        )
+        return declared
+
+    if kv_cache_dtype == "nvfp4":
+        if major != 10 or model_arch != "GlmMoeDsaForCausalLM" or is_hip():
+            raise ValueError(
+                f"DSA {kv_cache_dtype} FlashMLA is supported only for GLM-5.2 on SM100"
+            )
+        if view.page_size not in (None, 64):
+            raise ValueError(
+                f"GLM-5.2 SM100 {kv_cache_dtype} DSA requires --page-size=64, got {view.page_size}"
+            )
+        if user_set_prefill and view.dsa_prefill_backend != "flashmla_sparse":
+            raise ValueError(
+                "GLM-5.2 SM100 DSA NVFP4 requires "
+                "--dsa-prefill-backend=flashmla_sparse"
+            )
+        if user_set_decode and view.dsa_decode_backend != "flashmla_kv":
+            raise ValueError(
+                "GLM-5.2 SM100 DSA NVFP4 requires "
+                "--dsa-decode-backend=flashmla_kv"
+            )
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "flashmla_sparse"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "flashmla_kv"
+        logger.warning(
+            f"Set GLM-5.2 SM100 {kv_cache_dtype} DSA backends: "
+            "prefill=flashmla_sparse, decode=flashmla_kv"
         )
         return declared
 

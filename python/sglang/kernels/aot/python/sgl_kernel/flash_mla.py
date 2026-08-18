@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 import torch
 
 try:
-    from sgl_kernel import flashmla_ops  # triggers TORCH extension registration
+    from sgl_kernel import flashmla_ops  # noqa: F401  # registers extension
 except Exception as _e:
     _flashmla_import_error = _e
 else:
@@ -197,6 +197,68 @@ def flash_mla_with_kvcache(
             extra_topk_length,
         )
     return out, softmax_lse
+
+
+def flash_mla_with_kvcache_nvfp4(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    kv_global_scale: torch.Tensor,
+    indices: torch.Tensor,
+    head_dim_v: int,
+    tile_scheduler_metadata: Optional[torch.Tensor],
+    num_splits: Optional[torch.Tensor],
+    softmax_scale: float,
+    topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """SM100 GLM-5.2 sparse decode over the 416-byte mixed NVFP4 row.
+
+    Unlike :func:`flash_mla_with_kvcache`, this is a distinct ABI: the cache is
+    byte-addressed, RoPE is BF16, the global FP32 scale is explicit, and Q is
+    BF16.  The producer dequantizes E2M1 latent values into the same BF16
+    shared-memory layout consumed by the open FlashMLA FP8-cache kernel.
+    Keeping the op separate prevents a packed cache from being accidentally
+    interpreted as FlashMLA's 656-byte FP8 layout.
+    """
+
+    if _flashmla_import_error is not None:
+        raise _IMPORT_ERROR from _flashmla_import_error
+    if q.dtype != torch.bfloat16:
+        raise TypeError(f"NVFP4 sparse decode requires BF16 Q, got {q.dtype}")
+    if q.ndim != 4 or q.shape[2:] != (64, 576):
+        raise ValueError(f"expected Q [B, Sq, 64, 576], got {tuple(q.shape)}")
+    if k_cache.dtype != torch.uint8 or k_cache.ndim != 4:
+        raise TypeError("packed NVFP4 cache must be a four-dimensional uint8 tensor")
+    if tuple(k_cache.shape[1:]) != (64, 1, 416):
+        raise ValueError(
+            f"expected packed cache [pages, 64, 1, 416], got {tuple(k_cache.shape)}"
+        )
+    if kv_global_scale.dtype != torch.float32 or kv_global_scale.numel() != 1:
+        raise TypeError("kv_global_scale must be a one-element FP32 tensor")
+    if indices.dtype != torch.int32 or indices.shape != (
+        q.shape[0],
+        q.shape[1],
+        2048,
+    ):
+        raise ValueError(
+            "indices must be int32 [B, Sq, 2048], got "
+            f"dtype={indices.dtype}, shape={tuple(indices.shape)}"
+        )
+    if head_dim_v != 512:
+        raise ValueError(f"GLM-5.2 NVFP4 requires d_v=512, got {head_dim_v}")
+
+    return torch.ops.sgl_kernel.sparse_decode_fwd_nvfp4.default(
+        q,
+        k_cache,
+        kv_global_scale,
+        indices,
+        topk_length,
+        attn_sink,
+        tile_scheduler_metadata,
+        num_splits,
+        head_dim_v,
+        softmax_scale,
+    )
 
 
 def _flash_mla_with_kvcache_sched_meta(

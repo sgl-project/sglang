@@ -316,6 +316,10 @@ class DeepseekSparseAttnBackend(
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
+        self.dsa_kv_cache_store_nvfp4 = getattr(
+            model_runner.token_to_kv_pool, "dsa_kv_cache_store_nvfp4", False
+        )
+        self.dsa_kv_cache_store_packed_fp4 = self.dsa_kv_cache_store_nvfp4
         self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
@@ -340,7 +344,9 @@ class DeepseekSparseAttnBackend(
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
-        if self.num_q_heads <= 64:
+        if self.dsa_kv_cache_store_packed_fp4:
+            self.flashmla_kv_num_q_heads = self.num_q_heads
+        elif self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
             self.flashmla_kv_num_q_heads = 128
@@ -402,6 +408,49 @@ class DeepseekSparseAttnBackend(
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+
+        if self.dsa_kv_cache_store_packed_fp4:
+            expected = {
+                "device_sm_major": (self.device_sm_major, 10),
+                "local_q_heads": (self.num_q_heads, 64),
+                "kv_lora_rank": (self.kv_lora_rank, 512),
+                "qk_rope_head_dim": (self.qk_rope_head_dim, 64),
+                "index_topk": (self.dsa_index_topk, 2048),
+                "page_size": (self.real_page_size, 64),
+            }
+            mismatches = [
+                f"{name}={actual} (expected {wanted})"
+                for name, (actual, wanted) in expected.items()
+                if actual != wanted
+            ]
+            if mismatches:
+                raise ValueError(
+                    "GLM-5.2 SM100 NVFP4 DSA native kernel shape mismatch: "
+                    + ", ".join(mismatches)
+                )
+            if self.dsa_decode_impl != "flashmla_kv":
+                raise ValueError(
+                    "GLM-5.2 SM100 NVFP4 DSA requires "
+                    "--dsa-decode-backend=flashmla_kv"
+                )
+            if self.dsa_prefill_impl != "flashmla_sparse":
+                raise ValueError(
+                    "GLM-5.2 SM100 NVFP4 DSA requires "
+                    "--dsa-prefill-backend=flashmla_sparse"
+                )
+            # Importing the wrapper also loads flashmla_ops.  Fail at backend
+            # construction, rather than during graph capture, when a wheel was
+            # built without the native SM100 specialization.
+            from sgl_kernel.flash_mla import flash_mla_with_kvcache_nvfp4
+
+            del flash_mla_with_kvcache_nvfp4
+            required_op = "sparse_decode_fwd_nvfp4"
+            if not hasattr(torch.ops.sgl_kernel, required_op):
+                raise RuntimeError(
+                    f"sglang-kernel is missing {required_op}; rebuild "
+                    "the SM100 flashmla_ops extension from this source tree"
+                )
+            logger.info("Enabled GLM-5.2 SM100 NVFP4-to-BF16 fused FlashMLA decode")
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
@@ -2109,9 +2158,23 @@ class DeepseekSparseAttnBackend(
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
-                    kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
-                    )
+                    if self.dsa_kv_cache_store_nvfp4:
+                        from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
+                            dequantize_nvfp4_k_cache_paged,
+                        )
+
+                        kv_cache = dequantize_nvfp4_k_cache_paged(
+                            kv_cache,
+                            page_table_1_flattened,
+                            self.token_to_kv_pool.get_mla_kv_global_scale(
+                                layer.layer_id
+                            ),
+                            dtype=torch.bfloat16,
+                        )
+                    else:
+                        kv_cache = dequantize_k_cache_paged(
+                            kv_cache, page_table_1_flattened
+                        )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 
@@ -2399,12 +2462,17 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
-        # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
-        # When using TP, num_heads might be smaller (e.g., 256//8=32)
+        # With attention DP, every GLM-5.2 decode rank owns all 64 Q heads.
+        # Select the matching H64 sparse-prefill specialization rather than
+        # padding to the generic Blackwell H128 path.
         num_tokens, num_heads, head_dim = q_all.shape
 
         # Determine required padding based on GPU architecture (use cached value)
-        required_padding = 128 if self.device_sm_major >= 10 else 64
+        required_padding = (
+            64
+            if self.dsa_kv_cache_store_packed_fp4
+            else (128 if self.device_sm_major >= 10 else 64)
+        )
 
         need_padding = num_heads % required_padding != 0
 
@@ -2808,7 +2876,40 @@ class DeepseekSparseAttnBackend(
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        q_input = q_all
         num_q_heads = q_all.shape[2]
+
+        if self.dsa_kv_cache_store_nvfp4:
+            from sgl_kernel.flash_mla import flash_mla_with_kvcache_nvfp4
+
+            if num_q_heads != 64:
+                raise ValueError(
+                    f"native GLM-5.2 NVFP4 decode requires Hq=64, got {num_q_heads}"
+                )
+            packed_kv = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
+            indices = page_table_1.unsqueeze(1).contiguous()
+            # `_compute_flashmla_metadata` builds the persistent graph schedule
+            # for the full 2048 slots, matching the existing FP8 path.  Passing
+            # a shorter topk_length with that schedule can leave a partition's
+            # scheduled start block beyond its runtime end block.  The kernel
+            # masks padded `-1` indices before any cache load, so retaining the
+            # fixed-width schedule is both safe and graph-stable.
+            topk_length = None
+            global_scale = self.token_to_kv_pool.get_mla_kv_global_scale(layer.layer_id)
+            o, _, _, _ = flash_mla_with_kvcache_nvfp4(
+                q=q_input,
+                k_cache=packed_kv,
+                kv_global_scale=global_scale,
+                indices=indices,
+                topk_length=topk_length,
+                attn_sink=None,
+                head_dim_v=v_head_dim,
+                tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
+                num_splits=metadata.flashmla_metadata.num_splits,
+                softmax_scale=sm_scale,
+            )
+            return o
+
         target_q_heads = self.flashmla_kv_num_q_heads
         if target_q_heads != num_q_heads:
             # Pad q heads to match FlashMLA decode supported head-count variants.
@@ -3369,7 +3470,7 @@ class DeepseekSparseAttnBackend(
         """
         if (
             # disable for MTP
-            self.dsa_kv_cache_store_fp8
+            (self.dsa_kv_cache_store_fp8 or self.dsa_kv_cache_store_packed_fp4)
             # flashmla_sparse_q8 shares flashmla_sparse's RAGGED prefill routing — the q8
             # dispatch lives inside the RAGGED branch of forward_extend; without this the
             # transform is PAGED, the q8 path is skipped, and the bf16 kernel crashes on

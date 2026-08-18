@@ -3,6 +3,7 @@ import unittest
 
 import torch
 
+from sglang.srt.layers.attention.dsa.nvfp4_k_cache import NVFP4_BYTES_PER_TOKEN
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.common import (
@@ -47,21 +48,43 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
         ]
         return torch.cat(parts, dim=0)
 
-    def _run_device_to_host_indexer_copy(self, io_backend: str):
+    def _run_device_to_host_indexer_copy(
+        self,
+        io_backend: str,
+        *,
+        packed_fp4_format: str | None = None,
+    ):
         page_size = 1 if is_hip() else 64
         layer_num = 2
         size = page_size * 4
+        if packed_fp4_format is not None:
+            if is_hip():
+                self.skipTest("DSA packed FP4 host transfer is only supported on CUDA.")
+            fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+            if fp4_dtype is None:
+                self.skipTest("PyTorch does not expose torch.float4_e2m1fn_x2.")
+            kv_lora_rank = 512
+            qk_rope_head_dim = 64
+            if packed_fp4_format != "nvfp4":
+                raise ValueError(f"unsupported packed FP4 format: {packed_fp4_format}")
+            kv_cache_dim = NVFP4_BYTES_PER_TOKEN
+            dtype = fp4_dtype
+        else:
+            kv_lora_rank = 128
+            qk_rope_head_dim = 32
+            kv_cache_dim = 576
+            dtype = torch.bfloat16
 
         device_pool = DSATokenToKVPool(
             size=size,
             page_size=page_size,
-            kv_lora_rank=128,
-            dtype=torch.bfloat16,
-            qk_rope_head_dim=32,
+            kv_lora_rank=kv_lora_rank,
+            dtype=dtype,
+            qk_rope_head_dim=qk_rope_head_dim,
             layer_num=layer_num,
             device="cuda",
             enable_memory_saver=False,
-            kv_cache_dim=576,
+            kv_cache_dim=kv_cache_dim,
             index_head_dim=128,
         )
         pin_memory = io_backend == "kernel"
@@ -91,17 +114,25 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
         finally:
             ALLOC_MEMORY_FUNCS["cuda"] = original_alloc
 
+        if packed_fp4_format is not None:
+            self.assertEqual(mla_host.kv_cache_dim, kv_cache_dim)
+        self.assertEqual(mla_host.dtype, device_pool.store_dtype)
+
         for layer_id in range(layer_num):
             buf = device_pool.index_k_with_scale_buffer[layer_id]
             data = torch.arange(
-                buf.numel(), device=buf.device, dtype=torch.uint8
+                buf.numel(), device=buf.device, dtype=torch.int64
             ).view_as(buf)
-            buf.copy_((data + layer_id) % 256)
+            buf.copy_(((data + layer_id) % 251).to(buf.dtype))
             kv_buf = device_pool.kv_buffer[layer_id]
             kv_data = torch.arange(
-                kv_buf.numel(), device=kv_buf.device, dtype=kv_buf.dtype
+                kv_buf.numel(), device=kv_buf.device, dtype=torch.int64
             ).view_as(kv_buf)
-            kv_buf.copy_(kv_data + layer_id)
+            if kv_buf.dtype == torch.uint8:
+                kv_data = ((kv_data + layer_id) % 251).to(kv_buf.dtype)
+            else:
+                kv_data = kv_data.to(kv_buf.dtype) + layer_id
+            kv_buf.copy_(kv_data)
 
         device_pages = torch.tensor([1, 2, 3], device="cuda", dtype=torch.int64)
         host_pages = torch.tensor(
@@ -144,6 +175,49 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
                 ].cpu()
                 self.assertTrue(torch.equal(got_kv, expected_kv))
 
+        # Exercise the reverse transfer too.  The latent KV and the indexer
+        # sidecar must both survive a HiCache round trip; testing only D2H can
+        # hide a host layout that the H2D path interprets with another stride.
+        for layer_id in range(layer_num):
+            device_pool.kv_buffer[layer_id][device_indices].zero_()
+            page_indices = device_indices.reshape(-1, page_size)[:, 0] // page_size
+            device_pool.index_k_with_scale_buffer[layer_id][page_indices].zero_()
+            mla_host.load_to_device_per_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+            )
+            indexer_host.load_to_device_per_layer(
+                device_pool,
+                host_indices,
+                device_indices,
+                layer_id,
+                io_backend,
+            )
+
+        for layer_id in range(layer_num):
+            for host_page, device_page in zip(
+                host_pages.tolist(), device_pages.tolist()
+            ):
+                host_start = host_page * page_size
+                device_start = device_page * page_size
+                got_kv = device_pool.kv_buffer[layer_id][
+                    device_start : device_start + page_size
+                ].cpu()
+                expected_kv = mla_host.kv_buffer[layer_id][
+                    host_start : host_start + page_size
+                ].cpu()
+                self.assertTrue(torch.equal(got_kv, expected_kv))
+                got_indexer = device_pool.index_k_with_scale_buffer[layer_id][
+                    device_page
+                ].cpu()
+                expected_indexer = indexer_host.index_k_with_scale_buffer[layer_id][
+                    host_page
+                ].cpu()
+                self.assertTrue(torch.equal(got_indexer, expected_indexer))
+
     @unittest.skipIf(
         is_hip(),
         '`io_backend="kernel"` path in MLATokenToKVPoolHost.backup_from_device_all_layer '
@@ -161,6 +235,16 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
     )
     def test_device_to_host_indexer_direct(self):
         self._run_device_to_host_indexer_copy(io_backend="direct")
+
+    def test_nvfp4_device_to_host_indexer_kernel(self):
+        self._run_device_to_host_indexer_copy(
+            io_backend="kernel", packed_fp4_format="nvfp4"
+        )
+
+    def test_nvfp4_device_to_host_indexer_direct(self):
+        self._run_device_to_host_indexer_copy(
+            io_backend="direct", packed_fp4_format="nvfp4"
+        )
 
 
 if __name__ == "__main__":

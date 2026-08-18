@@ -27,6 +27,9 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.nvfp4_k_cache import (
+    NVFP4_BYTES_PER_TOKEN as DSA_NVFP4_BYTES_PER_TOKEN,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
@@ -1356,7 +1359,48 @@ class KVCacheConfigurator:
             index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
             **pool_kwargs,
         )
+        if getattr(token_to_kv_pool, "dsa_kv_cache_store_nvfp4", False):
+            self._load_dsa_nvfp4_global_scales(token_to_kv_pool)
         return token_to_kv_pool
+
+    def _load_dsa_nvfp4_global_scales(self, pool: DSATokenToKVPool) -> None:
+        """Copy calibrated per-layer K scales into the persistent NVFP4 pool."""
+
+        from sglang.srt.model_loader.utils import resolve_language_model
+
+        language_model = resolve_language_model(self.model)
+        layers = getattr(language_model, "layers", None)
+        if layers is None:
+            decoder = getattr(language_model, "decoder", None)
+            layers = [] if decoder is None else [decoder]
+
+        initialized = 0
+        for model_layer in layers:
+            attention = None
+            if hasattr(model_layer, "self_attn"):
+                self_attn = model_layer.self_attn
+                attention = getattr(
+                    self_attn, "attn", getattr(self_attn, "attn_mqa", None)
+                )
+            elif hasattr(model_layer, "attn"):
+                attention = model_layer.attn
+            elif hasattr(model_layer, "attention"):
+                attention = getattr(model_layer.attention, "attn", None)
+            if attention is None or not hasattr(attention, "layer_id"):
+                continue
+            layer_id = attention.layer_id
+            if not pool.start_layer <= layer_id < pool.start_layer + pool.layer_num:
+                continue
+            scale = getattr(attention, "k_scale_float", None)
+            if scale is None:
+                scale = getattr(attention, "k_scale", None)
+            pool.set_mla_kv_global_scale(layer_id, 1.0 if scale is None else scale)
+            initialized += 1
+        logger.info(
+            "Initialized DSA NVFP4 global scales for %d/%d local layers",
+            initialized,
+            pool.layer_num,
+        )
 
     def _build_mla_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         token_to_kv_pool = MLATokenToKVPoolFP4(
@@ -2151,6 +2195,19 @@ def calculate_mla_kv_cache_dim(
     # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
     if not is_dsa_model:
         return kv_cache_dim
+
+    if is_float4_e2m1fn_x2(kv_cache_dtype):
+        if server_args.kv_cache_dtype != "nvfp4":
+            raise ValueError(
+                "DSA FP4 KV cache requires --kv-cache-dtype=nvfp4; "
+                f"got {server_args.kv_cache_dtype}"
+            )
+        if kv_lora_rank != 512 or qk_rope_head_dim != 64:
+            raise ValueError(
+                "DSA packed FP4 is specialized for GLM-5.2 QK=512+64, got "
+                f"{kv_lora_rank=} and {qk_rope_head_dim=}"
+            )
+        return DSA_NVFP4_BYTES_PER_TOKEN
 
     # TRTLLM backend does not override kv_cache_dim for MLA kv cache
     # Assuming dsa prefill and decode backends are the same when using trtllm MLA backend,

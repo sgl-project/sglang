@@ -62,6 +62,48 @@ python3 -m sglang.launch_server \
     --kv-cache-dtype fp4_mx_block16 \
 ```
 
+### GLM-5.2 DSA NVFP4 on SM100
+
+SGLang has a fused NVFP4 KV-cache decode path for the GLM-5.2 DSA layout on
+NVIDIA SM100 GPUs. The implementation stores each main-cache token in 416
+bytes: 256 bytes of packed E2M1 latent values, 32 bytes of block-16 E4M3
+scales, and 128 bytes of BF16 RoPE values. Together with the 132-byte DSA
+indexer row, this uses 548 bytes per token per layer.
+
+The specialization requires the GLM-5.2 DSA shape (512 NoPE dimensions, 64
+RoPE dimensions, and 512 value dimensions), 64 local query heads through
+attention DP, and a page size of 64. A representative TP8 launch is:
+
+```bash Command
+export MODEL_PATH="${MODEL_PATH:?set MODEL_PATH to the GLM-5.2 checkpoint}"
+
+python3 -m sglang.launch_server \
+    --model-path "$MODEL_PATH" \
+    --tp-size 8 \
+    --dp-size 8 \
+    --enable-dp-attention \
+    --attention-backend dsa \
+    --dsa-prefill-backend flashmla_sparse \
+    --dsa-decode-backend flashmla_kv \
+    --kv-cache-dtype nvfp4 \
+    --page-size 64
+```
+
+The weight dtype and weight-quantization method are independent of the KV
+cache format and should be selected for the checkpoint being served. Decode
+reads the packed cache directly and performs E2M1 dequantization inside the
+FlashMLA producer before the existing BF16 attention consumer. It does not
+materialize a full BF16 cache. Prefill gathers and dequantizes the paged prefix
+into a BF16 compatibility workspace for FlashMLA sparse-prefill; only decode is
+fused, and ordinary decode supports CUDA Graph replay.
+
+This path currently rejects non-SM100 devices, other DSA model layouts, local
+query-head counts other than 64, page sizes other than 64, and prefill CP or
+DCP configurations. HiSparse is not supported on this path. The native
+FlashMLA operator must be rebuilt from a source revision that includes the
+SM100 NVFP4 specialization; a missing operator is reported at backend
+initialization instead of silently falling back to an unfused decode path.
+
 ### Scaling Factors
 
 FP8 quantization requires scaling factors to properly quantize and dequantize the KV cache.
@@ -98,7 +140,11 @@ If scaling factors are not provided and not found in the checkpoint, it will def
 </Warning>
 
 <Tip>
-**FP4 (MXFP4)**: Unlike FP8, FP4 quantization handles scaling factors automatically on-the-fly during quantization and dequantization. No pre-quantized models or external scaling factor files are required—the block-based scaling factors are computed dynamically as needed.
+**FP4 block scales** are computed dynamically during cache writes. The
+GLM-5.2 DSA NVFP4 path additionally applies a persistent per-layer global K
+scale. SGLang loads that scale from the model's attention layer when present
+and otherwise uses `1.0`; calibrated checkpoint scales are recommended for
+accuracy.
 </Tip>
 
 ## Performance Considerations

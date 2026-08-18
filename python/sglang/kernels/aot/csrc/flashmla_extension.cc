@@ -21,6 +21,18 @@ limitations under the License.
 #include "api/sparse_fwd.h"
 #include "sgl_kernel_ops.h"
 
+std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sparse_decode_fwd_nvfp4(
+    const at::Tensor& q,
+    const at::Tensor& packed_kv,
+    const at::Tensor& kv_global_scale,
+    const at::Tensor& indices,
+    const std::optional<at::Tensor>& topk_length,
+    const std::optional<at::Tensor>& attn_sink,
+    std::optional<at::Tensor> tile_scheduler_metadata,
+    std::optional<at::Tensor> num_splits,
+    int64_t d_v,
+    double sm_scale);
+
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>> sgl_sparse_decode_fwd(
     const at::Tensor& q,
     const at::Tensor& kv,
@@ -97,6 +109,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "cumulative_seqlen_kv, Tensor o, Tensor lse, int mask_mode_code, float softmax_scale, int max_seqlen_q, int "
       "max_seqlen_kv, bool is_varlen) -> ()");
   m.impl("dense_prefill_fwd", torch::kCUDA, &FMHACutlassSM100FwdRun);
+
+  m.def(
+      "sparse_decode_fwd_nvfp4(Tensor q, Tensor packed_kv, Tensor kv_global_scale, Tensor indices, Tensor? "
+      "topk_length, Tensor? attn_sink, Tensor? tile_scheduler_metadata, Tensor? num_splits, int d_v, float "
+      "sm_scale) -> (Tensor, Tensor, Tensor?, Tensor?)");
+  m.impl("sparse_decode_fwd_nvfp4", torch::kCUDA, &sparse_decode_fwd_nvfp4);
+
 #endif
 
   m.def(

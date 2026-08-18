@@ -6099,6 +6099,7 @@ class ServerArgs:
                     if use_mla_backend:  # !FA4 + MLA
                         KV4_ATTENTION_MLA_BACKEND_CHOICES = [
                             "cutlass_mla",
+                            "dsa",
                             "flashinfer",
                             "trtllm_mla",
                         ]

@@ -1586,6 +1586,28 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
                     self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
 
 
+class TestKv4Compatibility(unittest.TestCase):
+    def test_dsa_nvfp4_is_allowed_by_generic_mla_gate(self):
+        args = ServerArgs(
+            model_path="dummy",
+            attention_backend="dsa",
+            kv_cache_dtype="nvfp4",
+        )
+        with (
+            patch.object(args, "use_mla_backend", return_value=True),
+            patch.object(
+                args,
+                "_resolved_attention_backends",
+                return_value=("dsa", "dsa"),
+            ),
+            patch.object(server_args_module, "is_cuda", return_value=True),
+            patch.object(
+                server_args_module, "is_sm100_supported", return_value=True
+            ),
+        ):
+            args._handle_kv4_compatibility()
+
+
 class TestCudaGraphConfigDataclassAccess(CustomTestCase):
     @patch(
         "sglang.srt.model_executor.runner_backend."
