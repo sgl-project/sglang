@@ -21,7 +21,7 @@
 # Build (from the repo root):
 #   docker build -f docker/sgl-router.Dockerfile -t sgl-router:dev .
 # Run:
-#   docker run --rm -p 8090:8090 \
+#   docker run --rm -p 8090:30000 \
 #       -v $(pwd)/docker/sgl-router.sample.yaml:/etc/sgl-router/sgl-router.yaml \
 #       sgl-router:dev --config /etc/sgl-router/sgl-router.yaml
 #
@@ -84,7 +84,7 @@ COPY --from=builder /work/target/release/sgl-router /usr/local/bin/sgl-router
 
 # Default config path; mount your own via `-v <host-path>:/etc/sgl-router`.
 ENV SGL_ROUTER_CONFIG=/etc/sgl-router/sgl-router.yaml
-EXPOSE 8090
+EXPOSE 30000
 
 # distroless `nonroot` runs as uid 65532. The router doesn't need root.
 USER nonroot:nonroot
