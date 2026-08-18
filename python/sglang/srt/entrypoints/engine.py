@@ -734,7 +734,6 @@ class Engine(EngineScoreMixin, EngineBase):
                     gpu_id_step=server_args.gpu_id_step,
                 )
                 cmd = build_weight_cache_daemon_command(
-                    server_args,
                     gpu_id=gpu_id,
                     tp_rank=tp_rank,
                     pp_rank=pp_rank,
