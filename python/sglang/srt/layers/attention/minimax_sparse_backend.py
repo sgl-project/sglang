@@ -283,11 +283,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         self.dense_backend: Optional[AttentionBackend] = None
 
-        # Each pair of sparse layers shares one top-k result. The sharing changes
-        # which KV blocks the skip layers attend, so it is applied on ROCm only
-        # (and never under two-batch overlap); elsewhere every layer computes its
-        # own top-k.
-        self.index_topk_freq = 2 if is_hip() and not is_tbo_enabled() else 1
+        self.index_topk_freq = (
+            max(int(envs.SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ.get()), 1)
+            if is_hip() and not is_tbo_enabled()
+            else 1
+        )
         self.index_cache_enabled = self.index_topk_freq > 1
         # Persistent per-bs device buffer for decode top-k reuse. Allocated eagerly
         # outside CUDA-graph capture; the captured graph only copies into and reads

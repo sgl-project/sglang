@@ -19,6 +19,7 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx imp
 from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
 )
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 _msa_fallback_warned = False
@@ -41,7 +42,8 @@ def _warn_atom_fallback(msg: str) -> None:
     if _atom_fallback_warned:
         return
     logger.warning(
-        "ATOM Gluon sparse prefill is unavailable (%s); falling back to Triton.",
+        "SGLANG_OPT_USE_ATOM_PREFILL is set, but the ATOM Gluon sparse prefill "
+        "path is unavailable (%s); falling back to Triton.",
         msg,
     )
     _atom_fallback_warned = True
@@ -166,38 +168,39 @@ def minimax_sparse_prefill(
     # MSA paths only replace this step; the indexer above is unchanged. MSA has
     # no attn-sink input, so keep the Triton path when sink is present.
     o = None
-    try:
-        from .atom_prefill import atom_gluon_sparse_prefill, can_use_atom_prefill
+    if envs.SGLANG_OPT_USE_ATOM_PREFILL.get():
+        try:
+            from .atom_prefill import atom_gluon_sparse_prefill, can_use_atom_prefill
 
-        if can_use_atom_prefill(
-            q,
-            k_cache,
-            v_cache,
-            sink,
-            block_size_k,
-            seq_lens_cpu,
-            q_scale,
-            k_scale,
-            v_scale,
-        ):
-            o = atom_gluon_sparse_prefill(
-                q=q,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                topk_idx=topk_idx,
-                req_to_token=req_to_token,
-                req_pool_indices=slot_ids,
-                cu_seqlens=cu_seqlens,
-                seq_lens=seq_lens,
-                prefix_lens=prefix_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                block_size_k=block_size_k,
-                sm_scale=sm_scale,
-            )
-        else:
-            _warn_atom_fallback("unsupported batch/cache layout or dtype")
-    except Exception as exc:
-        _warn_atom_fallback(repr(exc))
+            if can_use_atom_prefill(
+                q,
+                k_cache,
+                v_cache,
+                sink,
+                block_size_k,
+                seq_lens_cpu,
+                q_scale,
+                k_scale,
+                v_scale,
+            ):
+                o = atom_gluon_sparse_prefill(
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    topk_idx=topk_idx,
+                    req_to_token=req_to_token,
+                    req_pool_indices=slot_ids,
+                    cu_seqlens=cu_seqlens,
+                    seq_lens=seq_lens,
+                    prefix_lens=prefix_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    block_size_k=block_size_k,
+                    sm_scale=sm_scale,
+                )
+            else:
+                _warn_atom_fallback("unsupported batch/cache layout or dtype")
+        except Exception as exc:
+            _warn_atom_fallback(repr(exc))
     if o is None and use_msa and sink is None:
         from .msa import MSAUnavailableError, msa_sparse_prefill_main
 

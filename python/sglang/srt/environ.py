@@ -1454,6 +1454,14 @@ class Envs:
     SGLANG_MINIMAX_M3_FUSED_SWIGLU_MXFP8 = EnvBool(False)
     SGLANG_MINIMAX_M3_FUSED_MOE_COMBINE = EnvBool(False)
 
+    # MiniMax-M3 sparse-attention toggles for ROCm.
+    # Share one index top-k across every N sparse layers; 1 disables sharing.
+    # Changes which KV blocks the skip layers attend, so it applies on ROCm only
+    # (never under two-batch overlap); elsewhere the backend pins 1.
+    SGLANG_MINIMAX_M3_INDEX_TOPK_FREQ = EnvInt(2)
+    # Run the sparse prefill main attention through AITER's Gluon paged attention
+    # instead of the Triton kernel. Unsupported cases fall back to Triton.
+    SGLANG_OPT_USE_ATOM_PREFILL = EnvBool(True)
     # MiniMax M3 NPU prefill MAIN-attention: route the sparse main attention through
     # the native Ascend FA op `torch.ops.npu.npu_fused_infer_attention_score` (FIA)
     # with a per-query CUSTOM block_table
