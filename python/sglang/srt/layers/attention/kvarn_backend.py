@@ -1746,7 +1746,12 @@ class KVarNMultiStepDraftBackend:
         self.device = model_runner.device
 
         # Create one shared KVarNAttnBackend for all draft steps.
-        self._backend = KVarNAttnBackend(model_runner)
+        # Use the same config resolution as the attention registry.
+        from sglang.srt.layers.attention.attention_registry import (
+            create_kvarn_backend,
+        )
+
+        self._backend = create_kvarn_backend(model_runner)
 
         # Expose the same attributes as FlashInferMultiStepDraftBackend
         self.max_context_len = getattr(

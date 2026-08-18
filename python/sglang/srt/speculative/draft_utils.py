@@ -545,9 +545,8 @@ class DraftBackendFactory:
         )
 
     def _create_kvarn_prefill_backend(self):
-        from sglang.srt.layers.attention.kvarn_backend import KVarNAttnBackend
-
-        return (
-            "kvarn",
-            KVarNAttnBackend(self.draft_model_runner),
+        from sglang.srt.layers.attention.attention_registry import (
+            create_kvarn_backend,
         )
+
+        return ("kvarn", create_kvarn_backend(self.draft_model_runner))
