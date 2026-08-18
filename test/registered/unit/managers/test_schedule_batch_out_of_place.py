@@ -2,7 +2,7 @@ import dataclasses
 import types
 import unittest
 from array import array
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -13,6 +13,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 from sglang.srt.utils.common import Range  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -113,6 +114,84 @@ class TestMergeBatchOutOfPlace(unittest.TestCase):
 
 
 class TestMixWithRunningOutOfPlace(unittest.TestCase):
+    @patch("sglang.kernels.ops.speculative.cache_locs.assign_extend_cache_locs_func")
+    def test_prepare_dspark_for_mixed_uses_first_reserved_slot(self, assign_locs):
+        assign_locs.return_value = torch.tensor([101, 202], dtype=torch.int64)
+        req_to_token = torch.arange(128, dtype=torch.int32).view(2, 64)
+        batch = ScheduleBatch(
+            reqs=[types.SimpleNamespace(rid="r0"), types.SimpleNamespace(rid="r1")],
+            req_to_token_pool=types.SimpleNamespace(req_to_token=req_to_token),
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            seq_lens=torch.tensor([10, 20], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([10, 20], dtype=torch.int64),
+            spec_algorithm=SpeculativeAlgorithm.DSPARK,
+            device="cpu",
+        )
+
+        prefix_lens = batch.prepare_dspark_for_mixed()
+
+        self.assertEqual(prefix_lens, [10, 20])
+        self.assertTrue(torch.equal(batch.seq_lens, torch.tensor([11, 21])))
+        self.assertTrue(torch.equal(batch.seq_lens_cpu, torch.tensor([11, 21])))
+        self.assertEqual(batch.seq_lens_sum, 32)
+        self.assertTrue(torch.equal(batch.out_cache_loc, torch.tensor([101, 202])))
+        kwargs = assign_locs.call_args.kwargs
+        self.assertTrue(torch.equal(kwargs["start_offset"], torch.tensor([10, 20])))
+        self.assertTrue(torch.equal(kwargs["end_offset"], torch.tensor([11, 21])))
+        self.assertEqual(kwargs["draft_token_num"], 1)
+
+    @patch("sglang.kernels.ops.speculative.cache_locs.assign_extend_cache_locs_func")
+    def test_prepare_dspark_for_mixed_materializes_missing_cpu_lens(self, assign_locs):
+        assign_locs.return_value = torch.tensor([101, 202], dtype=torch.int64)
+        batch = ScheduleBatch(
+            reqs=[types.SimpleNamespace(rid="r0"), types.SimpleNamespace(rid="r1")],
+            req_to_token_pool=types.SimpleNamespace(
+                req_to_token=torch.arange(128, dtype=torch.int32).view(2, 64)
+            ),
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            seq_lens=torch.tensor([10, 20], dtype=torch.int64),
+            seq_lens_cpu=None,
+            spec_algorithm=SpeculativeAlgorithm.DSPARK,
+            device="cpu",
+        )
+
+        prefix_lens = batch.prepare_dspark_for_mixed()
+
+        self.assertEqual(prefix_lens, [10, 20])
+        self.assertTrue(torch.equal(batch.seq_lens_cpu, torch.tensor([11, 21])))
+        self.assertEqual(batch.seq_lens_sum, 32)
+
+    def test_mix_with_running_uses_resolved_dspark_prefix_lens(self):
+        extend_batch = make_schedule_batch(
+            1,
+            reqs=[types.SimpleNamespace(rid="prefill")],
+            model_config=types.SimpleNamespace(is_encoder_decoder=False),
+            sampling_info=MagicMock(),
+            return_logprob=False,
+            forward_mode=ForwardMode.EXTEND,
+            enable_overlap=True,
+            is_prefill_only=True,
+            out_cache_loc=torch.tensor([0, 1], dtype=torch.int64),
+            prefix_lens=[0],
+            extend_lens=[2],
+            extend_num_tokens=2,
+            extend_logprob_start_lens=[0],
+        )
+        running_batch = make_schedule_batch(
+            1,
+            reqs=[_FakeReq("decode", origin_len=4, output_len=1)],
+            model_config=types.SimpleNamespace(is_encoder_decoder=False),
+            sampling_info=MagicMock(),
+            return_logprob=False,
+            forward_mode=ForwardMode.DECODE,
+            out_cache_loc=torch.tensor([9], dtype=torch.int64),
+        )
+
+        extend_batch.mix_with_running(running_batch, running_prefix_lens=[37])
+
+        self.assertEqual(extend_batch.prefix_lens, [0, 37])
+        self.assertEqual(extend_batch.extend_lens, [2, 1])
+
     def test_mix_with_running_rebinds_extend_fields_without_mutating_either_side(self):
         """mix_with_running must append via rebound lists; no field of either side may be mutated in place."""
         extend_batch = make_schedule_batch(

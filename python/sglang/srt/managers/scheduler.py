@@ -3530,7 +3530,18 @@ class Scheduler(
             running_batch.filter_batch()
             if not running_batch.is_empty():
                 running_batch.prepare_for_decode()
-                new_batch.mix_with_running(running_batch)
+                running_prefix_lens = None
+                if running_batch.spec_algorithm.is_dspark():
+                    # Spec-v2 overlap keeps the authoritative accepted length
+                    # in FutureMap. Resolve it before turning this running
+                    # batch into a one-token target extend; req.output_ids and
+                    # req.kv_committed_len may still lag by one scheduler turn.
+                    if self.enable_overlap:
+                        self.future_map.resolve_seq_lens_cpu(running_batch)
+                    running_prefix_lens = running_batch.prepare_dspark_for_mixed()
+                new_batch.mix_with_running(
+                    running_batch, running_prefix_lens=running_prefix_lens
+                )
                 new_batch.decoding_reqs = running_batch.reqs
             running_batch = ScheduleBatch(
                 reqs=[], batch_is_full=running_batch.batch_is_full

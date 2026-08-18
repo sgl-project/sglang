@@ -58,6 +58,16 @@ class TestTargetCheckpointBundlesDsparkDraft(CustomTestCase):
 
 
 class TestDsparkDraftPathDefaulting(CustomTestCase):
+    def test_mixed_chunk_remains_enabled(self):
+        server_args = _make_dspark_server_args(
+            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+        )
+        server_args.enable_mixed_chunk = True
+
+        _handle_dspark(server_args)
+
+        self.assertTrue(server_args.enable_mixed_chunk)
+
     def test_bundled_checkpoint_defaults_draft_path_to_model_path(self):
         server_args = _make_dspark_server_args(
             model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()

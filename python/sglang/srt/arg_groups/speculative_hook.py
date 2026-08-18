@@ -515,13 +515,10 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
 
     if server_args.enable_mixed_chunk:
-        declare_resolution(
-            server_args,
-            "_handle_dspark",
-            enable_mixed_chunk=False,
-        )
-        logger.warning(
-            "Mixed chunked prefill is disabled because of using dspark speculative decoding."
+        logger.info(
+            "Mixed chunked prefill is enabled for DSpark. Running decode "
+            "requests advance by one target token in each mixed batch and "
+            "resume speculative verification on the following decode batch."
         )
 
     from sglang.srt.speculative.ragged_verify import (
