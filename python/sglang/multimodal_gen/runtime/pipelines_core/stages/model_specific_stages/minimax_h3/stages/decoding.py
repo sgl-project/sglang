@@ -26,11 +26,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.precision import (
+    autocast_context,
     autocast_enabled,
     resolve_decode_precision,
     resolve_precision,
+    temporary_module_dtype,
 )
 from sglang.multimodal_gen.runtime.utils.torch_compile import (
     ActiveTargetCompiledCallable,
@@ -187,6 +190,19 @@ _MINIMAX_H3_CANONICAL_REQUEST_EXTRA_KEY = "minimax_h3_canonical_request"
 _MINIMAX_H3_RESOLVED_PLAN_EXTRA_KEY = "minimax_h3_resolved_plan"
 
 
+def _resolve_minimax_h3_video_decode_precision(server_args: ServerArgs) -> torch.dtype:
+    """Prefer bf16 video decode on CPU when the static config still requests fp16.
+
+    MiniMax H3's released GPU recipe keeps VAE decode in fp16, but the Xeon CPU
+    path pays a large decode penalty there. Preserve the configured precision on
+    non-CPU platforms and for explicit non-fp16 overrides.
+    """
+    dtype = resolve_decode_precision(server_args, "video_vae")
+    if current_platform.is_cpu() and dtype == torch.float16:
+        return torch.bfloat16
+    return dtype
+
+
 def _minimax_h3_decoder_task(batch: Req) -> str | None:
     """Return the validated request task used for output-decoder routing.
 
@@ -238,9 +254,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         stage_name = self._component_stage_name(stage_name)
-        video_vae_dtype = resolve_precision(
-            server_args, "video_vae", precision_attr="vae_precision"
-        )
+        video_vae_dtype = _resolve_minimax_h3_video_decode_precision(server_args)
         audio_vae_dtype = resolve_precision(
             server_args, "audio_vae", precision_attr="audio_vae_precision"
         )
@@ -345,20 +359,24 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 std_values=visual_arch_config.latents_std,
                 name="video_vae",
             )
-            video_vae_dtype = resolve_decode_precision(server_args, "video_vae")
+            video_vae_dtype = _resolve_minimax_h3_video_decode_precision(server_args)
             visual_autocast_enabled = (
                 visual_latent.device.type == "cuda"
                 and autocast_enabled(video_vae_dtype, server_args.disable_autocast)
             )
             if visual_autocast_enabled:
                 selected_video_vae.prepare_decoder_autocast_weights(video_vae_dtype)
-            with torch.autocast(
-                device_type=visual_latent.device.type,
-                dtype=video_vae_dtype,
+            with autocast_context(
+                video_vae_dtype,
+                server_args.disable_autocast,
                 enabled=visual_autocast_enabled,
             ):
-                video_decode = self._get_vae_decode_fn(
+                should_cast_video_vae = not visual_autocast_enabled
+                if not visual_autocast_enabled:
+                    visual_decode_latent = visual_decode_latent.to(video_vae_dtype)
+                with temporary_module_dtype(
                     selected_video_vae,
+<<<<<<< ours
                     server_args,
                     decode_fn=selected_video_vae.decode_base,
                 )
@@ -367,6 +385,20 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 visual_frames = selected_video_vae.processor.revert_tensor(
                     visual_frames
                 )
+=======
+                    video_vae_dtype,
+                    enabled=should_cast_video_vae,
+                ) as active_video_vae:
+                    video_decode = self._get_vae_decode_fn(
+                        active_video_vae,
+                        server_args,
+                        decode_fn=active_video_vae.decode_base,
+                    )
+                    visual_frames = video_decode(visual_decode_latent)
+                    visual_frames = active_video_vae.processor.revert_tensor(
+                        visual_frames
+                    )
+>>>>>>> theirs
                 visual_frames = _required_tensor(
                     visual_frames,
                     "video_vae.processor.revert_tensor",
