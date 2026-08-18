@@ -9,9 +9,6 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    # One evaluation round takes ~1h in CI (2026-08-17 nightly-acc-2-npu-a3).
-    # Budget capped at 3.5h (derive_timeout_per_file = 1.5x est = 12600s),
-    # which still covers up to 3 rounds (~3h) for accuracy retries.
     est_time=8400,
     suite="nightly-acc-2-npu-a3",
     nightly=True,

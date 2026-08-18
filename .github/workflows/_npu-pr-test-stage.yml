@@ -40,6 +40,10 @@ on:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         type: string
         default: 'false'
+      is_nightly_pipeline_job:
+        description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
+        type: boolean
+        default: false
       github-token:
         description: 'GitHub token for API calls'
         type: string
@@ -204,12 +208,20 @@ jobs:
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+        shell: bash
         run: |
           # Fail fast on any command error, undefined variable, or pipe failure.
           set -euo pipefail
           cd test
+          # Append `--nightly` and `--continue-on-error` when the job belongs to the nightly pipeline.
+          # --nightly: Collect test cases registered for nightly runs.
+          # --continue-on-error: Keep running remaining cases even if one fails.
+          NIGHTLY_FLAG=""
+          if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
+            NIGHTLY_FLAG="--nightly --continue-on-error"
+          fi
           python3 run_suite.py --hw npu --suite ${{ inputs.self_name }} \
             --auto-partition-id ${{ matrix.partition }} \
             --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
-            $CONTINUE_ON_ERROR_FLAG
+            $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG
