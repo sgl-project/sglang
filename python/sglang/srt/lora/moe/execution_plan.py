@@ -439,8 +439,30 @@ class MoeLoraExecutionPlan:
         per layer, and the plan and every nested stage are frozen dataclasses
         whose __post_init__ already proved the whole dependency graph.
         """
+        return self._requirements_of(
+            self.gate_up_a, self.gate_up_b, self.down_a, self.down_b
+        )
+
+    def downstream_route_requirements(self) -> frozenset[RouteRequirement]:
+        """The same union with gate/up-A left out.
+
+        build_routes asks this to learn whether the canonical per-expert
+        aligned route exists ONLY for gate/up-A, which -- when gate/up-A runs
+        at its own block size -- means the canonical one need not be built.
+
+        It cannot be derived by subtracting gate_up_a's requirements from the
+        full union: that would also drop a requirement a downstream stage
+        shares with it, and skip a route something still reads.
+        """
+        return self._requirements_of(self.gate_up_b, self.down_a, self.down_b)
+
+    def _requirements_of(
+        self, *stages: LoraASpec | LoraBSpec | None
+    ) -> frozenset[RouteRequirement]:
+        # The middle and finalize stages are never optional, so they join
+        # every union; only the standalone A/B stages vary.
         requirements: set[RouteRequirement] = set()
-        for stage in (self.gate_up_a, self.gate_up_b, self.down_a, self.down_b):
+        for stage in stages:
             if stage is not None:
                 requirements.update(stage.route_requirements())
         requirements.update(self.middle.route_requirements())

@@ -264,16 +264,11 @@ def build_routes(
 
     need_per_expert = RouteRequirement.ALIGNED_PER_EXPERT in requirements
     need_shared = RouteRequirement.ALIGNED_SHARED_OUTER in requirements
-    downstream_requirements: set[RouteRequirement] = set()
-    for stage in (plan.gate_up_b, plan.down_a, plan.down_b):
-        if stage is not None:
-            downstream_requirements.update(stage.route_requirements())
-    downstream_requirements.update(plan.middle.route_requirements())
-    downstream_requirements.update(plan.finalize.route_requirements())
     gate_up_only_per_expert = (
         separate_gate_up_a_route
         and plan.route_builder is RouteBuilderFamily.STANDARD
-        and RouteRequirement.ALIGNED_PER_EXPERT not in downstream_requirements
+        and RouteRequirement.ALIGNED_PER_EXPERT
+        not in plan.downstream_route_requirements()
     )
     dual_granularity_fused = False
     if plan.route_builder is RouteBuilderFamily.JOINT_SHARED_OUTER:
