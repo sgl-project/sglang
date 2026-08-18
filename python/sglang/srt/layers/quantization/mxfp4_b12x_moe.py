@@ -19,8 +19,18 @@ FlashInfer. Three things depend on that choice:
   but it refuses to compile at all while a graph is being captured, which is
   what the warm-up exists for.
 
-Install with ``pip install --no-deps b12x==1.2.2``; without ``--no-deps`` pip
-pulls a newer torch and breaks the rest of the image.
+Two b12x API generations are supported, auto-detected by import shape
+(:func:`_b12x_is_legacy`); "legacy" throughout this file names the API
+generation, not a recommendation:
+
+* **1.2.2** (``b12x.moe.fused_moe``) is the current PyPI release and the
+  default. Install with ``pip install --no-deps b12x==1.2.2``; without
+  ``--no-deps`` pip pulls a newer torch and breaks the rest of the image.
+* **0.15.3** (``b12x.integration``, the legacy API) was never published to
+  PyPI and can only come from a checkout (``SGLANG_B12X_PATH``). On this
+  shape it is ~19% *faster* per call -- see
+  :func:`_select_b12x_distribution` for the numbers and the mechanism --
+  which is why a deployment would bother.
 """
 
 from __future__ import annotations
