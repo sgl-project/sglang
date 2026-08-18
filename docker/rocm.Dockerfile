@@ -410,17 +410,23 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     && rm -f pyproject.toml \
     && mv pyproject_rocm.toml pyproject.toml \
     && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install
-RUN pip freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt
+RUN pip list --format=freeze | grep -E '^(torch|triton)' > /tmp/constraints.txt
 RUN cd sglang \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
     && case "${GPU_ARCH}" in \
-         *rocm7_15*) CT_EXTRA="rocm_rock" ;; \
-         *)           CT_EXTRA="rocm_legacy" ;; \
+         *rocm7_15*) CT_EXTRA="rocm_rock"; CONS="-c /tmp/constraints.txt" ;; \
+         *rocm720*)  CT_EXTRA="rocm_legacy"; CONS="-c /tmp/constraints.txt" ;; \
+         *)          CT_EXTRA="rocm_legacy"; CONS="-c /tmp/constraints.txt"; \
+                     echo 'diffusers==0.37.0' >> /tmp/constraints.txt ; \
+                     echo 'transformers==5.12.1' >> /tmp/constraints.txt ; \
+                     echo 'tokenizers==0.22.2' >> /tmp/constraints.txt ; \
+                     echo 'huggingface_hub==1.27.0' >> /tmp/constraints.txt ; \
+                     ;; \
        esac \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" python -m pip --no-cache-dir install --no-build-isolation -c /tmp/constraints.txt -e "python[srt_hip,diffusion_hip,${CT_EXTRA}]"; \
+         SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" python -m pip --no-cache-dir install --no-build-isolation $CONS -e "python[srt_hip,diffusion_hip,${CT_EXTRA}]"; \
        else \
-         SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" python -m pip --no-cache-dir install --no-build-isolation -c /tmp/constraints.txt -e "python[all_hip,${CT_EXTRA}]"; \
+         SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" python -m pip --no-cache-dir install --no-build-isolation $CONS -e "python[all_hip,${CT_EXTRA}]"; \
        fi
 
 RUN python -m pip cache purge
@@ -530,7 +536,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
     git clone --branch "${FHT_BRANCH}" "${FHT_REPO}" fast-hadamard-transform; \
     cd fast-hadamard-transform; \
     git checkout -f "${FHT_COMMIT}"; \
-    python setup.py install'
+    PYTORCH_ROCM_ARCH=${GPU_ARCH_LIST} python setup.py install'
 
 # -----------------------
 # Python tools
