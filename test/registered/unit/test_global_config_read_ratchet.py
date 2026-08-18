@@ -115,6 +115,17 @@ _CONFIGURED_SIZE_CALL_SITES = {
     ("srt/model_executor/cpu_graph_runner.py", "configured_pp_size"): (
         "the same window, on the CPU graph path"
     ),
+    (
+        "srt/managers/scheduler_components/metrics_reporter.py",
+        "configured_pp_size",
+    ): (
+        "the reporter labels its metrics with the stage count it was launched "
+        "with, which is configuration; the live group answers per process"
+    ),
+    ("srt/speculative/eagle_draft_cuda_graph_runner.py", "configured_pp_size"): (
+        "the draft runner's window over the target's stages: its own groups are "
+        "the target's, so the configured count is the one that describes it"
+    ),
     ("srt/disaggregation/common/conn.py", "configured_pp_size"): (
         "the bootstrap connection is built by the KV manager on the transfer "
         "path, which the CPU-only conn tests exercise without ever starting "
