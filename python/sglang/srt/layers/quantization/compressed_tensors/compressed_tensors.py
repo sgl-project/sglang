@@ -937,6 +937,9 @@ class CompressedTensorsConfig(QuantizationConfig):
         # (e.g. target "lm_head" for a "language_model.lm_head" prefix), which
         # find_matched_target's exact/regex name pass would miss — so the match
         # made here is carried through instead of being re-derived downstream.
+        # When several config groups name the head, the first target in config
+        # order wins — the same first-match rule find_matched_target applies
+        # to every other layer.
         matched_target = next(
             (
                 target
