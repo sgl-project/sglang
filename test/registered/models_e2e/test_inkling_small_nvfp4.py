@@ -48,10 +48,17 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1700, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=2400, stage="extra-b", runner_config="4-gpu-b200")
+# Also on GB300: the DSPARK class below reads exactly 0 there and 6.4e-02 on
+# B200, and the two runners are the only way to tell a GPU difference from an
+# environment one.
+register_cuda_ci(est_time=2400, stage="extra-b", runner_config="4-gpu-gb300")
 
 _MODEL_PATH = os.environ.get(
     "INKLING_SMALL_TEST_MODEL_PATH", "thinkingmachines/Inkling-Small-NVFP4"
+)
+_DSPARK_DRAFT_PATH = os.environ.get(
+    "INKLING_SMALL_DSPARK_DRAFT_PATH", "RadixArk/Inkling-Small-DSpark"
 )
 
 # Measured 0.900 (10-shot, 200 questions, tp=4, invalid=0.000) -- completion,
@@ -150,6 +157,9 @@ class TestInklingSmallNvfp4Deterministic(CustomTestCase):
     numerics, so it cannot share this one.
     """
 
+    mem_fraction_static: str = "0.85"
+    extra_server_args: list[str] = []
+
     @classmethod
     def setUpClass(cls):
         cls.model = _MODEL_PATH
@@ -179,11 +189,12 @@ class TestInklingSmallNvfp4Deterministic(CustomTestCase):
                 "--mamba-full-memory-ratio",
                 "0.1",
                 "--mem-fraction-static",
-                "0.85",
+                cls.mem_fraction_static,
                 "--mamba-track-interval",
                 str(KL_TRACK_INTERVAL),
                 "--enable-deterministic-inference",
-            ],
+            ]
+            + cls.extra_server_args,
             env={**os.environ, "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
 
@@ -225,6 +236,35 @@ KL_HICACHE_TRACK_INTERVAL = 128
 def _random_suffixes(n: int, length: int, seed: int) -> list[list[int]]:
     rng = random.Random(seed)
     return [[rng.randint(1, 30000) for _ in range(length)] for _ in range(n)]
+
+
+class TestInklingSmallNvfp4DsparkDeterministic(TestInklingSmallNvfp4Deterministic):
+    """Same exactness bar with DSPARK driving the decode loop.
+
+    The MTP class in test_unified_radix_cache_kl_hybrid_bitexact.py cannot reach
+    the spec-side mamba/sconv save: that gate lives in PrefillCudaGraphRunner and
+    EAGLE targets disable the prefill graph outright (#28386). DSPARK and DFlash
+    keep it, and are the algorithms #34043 fixed. Reverting #34043 reads 1.10e-01
+    on prefill_cache_hit here and drops decode reuse to 31/32, while the parent
+    stays at exactly 0.
+
+    Read any nonzero against the parent first. This is a 256-expert MoE where
+    dropping --enable-deterministic-inference alone reads 5.0e-02, so only a
+    divergence the parent does not share is a speculative state-reuse bug.
+    """
+
+    # The draft weights and the speculative CUDA graphs need the headroom: at
+    # the parent's 0.85 the server OOMs mid-run on a 178 GB B200. The KV pool
+    # still reports ~50x the tokens this file uses at 0.80.
+    mem_fraction_static = "0.80"
+    extra_server_args = [
+        "--speculative-algorithm",
+        "DSPARK",
+        "--speculative-draft-model-path",
+        _DSPARK_DRAFT_PATH,
+        "--speculative-draft-attention-backend",
+        "fa4",
+    ]
 
 
 class TestInklingSmallNvfp4HiCacheDeterministic(CustomTestCase):
