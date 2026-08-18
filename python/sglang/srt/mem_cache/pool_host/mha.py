@@ -127,7 +127,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
-        if self.mtp_draft_device_pools:
+        if self.mtp_draft_device_pools and not _is_npu:
             device_pools = (self.device_pool, *self.mtp_draft_device_pools)
             self.packed_device_k_data_ptrs = torch.cat(
                 [pool.k_data_ptrs for pool in device_pools]
@@ -351,16 +351,19 @@ class MHATokenToKVPoolHost(HostKVCache):
             if self.layout == "page_first_direct":
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
                 if host_layer_id == 0:
-                    transfer_kv_dim_exchange(
-                        device_indices=device_indices,
-                        host_indices=host_indices,
-                        device_k=device_pool.k_buffer,
-                        host_k=self.k_buffer,
-                        device_v=device_pool.v_buffer,
-                        host_v=self.v_buffer,
-                        page_size=self.page_size,
-                        direction=TransferDirection.H2D,
-                    )
+                    for device_k, device_v, host_k, host_v in self._npu_transfer_buffers(
+                        device_pool
+                    ):
+                        transfer_kv_dim_exchange(
+                            device_indices=device_indices,
+                            host_indices=host_indices,
+                            device_k=device_k,
+                            host_k=host_k,
+                            device_v=device_v,
+                            host_v=host_v,
+                            page_size=self.page_size,
+                            direction=TransferDirection.H2D,
+                        )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
@@ -380,6 +383,19 @@ class MHATokenToKVPoolHost(HostKVCache):
             device_pool.k_buffer,
             device_pool.v_buffer,
         )
+
+    def _npu_transfer_buffers(self, target_device_pool):
+        layer_start = 0
+        for pool in (target_device_pool, *self.mtp_draft_device_pools):
+            device_k, device_v = pool.get_hicache_transfer_buffers()
+            layer_end = layer_start + device_k.shape[0]
+            yield (
+                device_k,
+                device_v,
+                self.k_buffer[:, layer_start:layer_end],
+                self.v_buffer[:, layer_start:layer_end],
+            )
+            layer_start = layer_end
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -483,16 +499,19 @@ class MHATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
-                transfer_kv_dim_exchange(
-                    device_indices=device_indices,
-                    host_indices=host_indices,
-                    device_k=device_pool.k_buffer,
-                    host_k=self.k_buffer,
-                    device_v=device_pool.v_buffer,
-                    host_v=self.v_buffer,
-                    page_size=self.page_size,
-                    direction=TransferDirection.D2H,
-                )
+                for device_k, device_v, host_k, host_v in self._npu_transfer_buffers(
+                    device_pool
+                ):
+                    transfer_kv_dim_exchange(
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        device_k=device_k,
+                        host_k=host_k,
+                        device_v=device_v,
+                        host_v=host_v,
+                        page_size=self.page_size,
+                        direction=TransferDirection.D2H,
+                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
