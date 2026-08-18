@@ -50,7 +50,7 @@ class TestQwenNativeMmHashes(CustomTestCase):
         from sglang.srt.managers.multimodal_processor import import_processors
 
         import_processors("sglang.srt.multimodal.processors")
-        self.processor = make_processor(PROCESSOR_CONFIGS["qwen2_5_vl"])
+        self.processor = make_processor(self, PROCESSOR_CONFIGS["qwen2_5_vl"])
 
     def tearDown(self):
         self.processor.io_executor.shutdown()
