@@ -70,7 +70,6 @@ from sglang.kernels.ops.moe.virtual_experts import (
     _align_block_size_jit,
     _align_block_size_torch,
 )
-from sglang.srt.lora.moe.routing_shape import uses_fused_align_shape
 
 # The shared JIT align primitive supports at most 8191 real expert buckets.
 # This backend switches to its own fused builder at V >= 8192, so it does not
@@ -81,6 +80,11 @@ from sglang.srt.lora.moe.routing_shape import uses_fused_align_shape
 # two measured 0-3.7% apart across 8 paired cells -- noise. One path is simpler
 # (execution plan section 36).
 _JIT_ALIGN_MAX_VIRTUAL_EXPERTS = 8191
+
+# The fused builder takes over exactly at that ceiling + 1; the two constants
+# must stay adjacent with no gap, which is why they sit together.
+FUSED_ALIGN_MIN_VIRTUAL_EXPERTS = 8192
+FUSED_ALIGN_MIN_PAIRS = 16384
 
 # ALIGNED-view kernel config, sited by the section 40 redo (15 rung-edge-aware
 # V values x P in {8..16384} x 3 seeds x 2 interleaved repeats x graph AND
@@ -102,12 +106,18 @@ _JIT_ALIGN_MAX_VIRTUAL_EXPERTS = 8191
 #   jit-or-tied at small V except one decided fused win at eager V=1024
 #   (1.07x, the config's one accepted give-away in that direction), so per
 #   section 13 rule 3 the unsampled (8192, 16384) interior stays JIT.
-# The constants and pure predicate live in ``routing_shape.py`` so CPU-only
-# sweep admission cannot drift from this production dispatch.
 ROUTE_RAW = "raw"
 ROUTE_FUSED_IDS = "fused_ids"
 ROUTE_ALIGNED = "aligned"
 ROUTE_VIEWS = (ROUTE_RAW, ROUTE_FUSED_IDS, ROUTE_ALIGNED)
+
+
+def uses_fused_align_shape(*, num_virtual_experts: int, num_pairs: int) -> bool:
+    """Whether an aligned route uses the fused builder for this shape."""
+    return (
+        num_virtual_experts >= FUSED_ALIGN_MIN_VIRTUAL_EXPERTS
+        or num_pairs >= FUSED_ALIGN_MIN_PAIRS
+    )
 
 
 def uses_fused_align(

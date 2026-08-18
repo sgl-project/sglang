@@ -284,15 +284,6 @@ def _load_routing():
     virtual_experts._align_block_size_jit = lambda *_args, **_kwargs: None
     virtual_experts._align_block_size_torch = lambda *_args, **_kwargs: None
 
-    # The policy module is pure shape math; load the real one so the host
-    # under test cannot drift from production dispatch.
-    policy_spec = importlib.util.spec_from_file_location(
-        "_host_routing_shape", LORA_MOE / "routing_shape.py"
-    )
-    assert policy_spec is not None and policy_spec.loader is not None
-    policy = importlib.util.module_from_spec(policy_spec)
-    policy_spec.loader.exec_module(policy)
-
     module_name = "_host_routing"
     spec = importlib.util.spec_from_file_location(module_name, LORA_MOE / "routing.py")
     assert spec is not None and spec.loader is not None
@@ -304,7 +295,6 @@ def _load_routing():
             "triton": fake_triton,
             "triton.language": fake_tl,
             virtual_experts.__name__: virtual_experts,
-            "sglang.srt.lora.moe.routing_shape": policy,
             module_name: module,
         },
     ):

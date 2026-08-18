@@ -241,11 +241,9 @@ class TestMoeLoraRouting(CustomTestCase):
         from sglang.srt.lora.moe import fused_align
         from sglang.srt.lora.moe.routing import (
             _JIT_ALIGN_MAX_VIRTUAL_EXPERTS,
-            build_virtual_expert_routing,
-        )
-        from sglang.srt.lora.moe.routing_shape import (
             FUSED_ALIGN_MIN_PAIRS,
             FUSED_ALIGN_MIN_VIRTUAL_EXPERTS,
+            build_virtual_expert_routing,
         )
 
         self.assertEqual(FUSED_ALIGN_MIN_VIRTUAL_EXPERTS, 8192)
