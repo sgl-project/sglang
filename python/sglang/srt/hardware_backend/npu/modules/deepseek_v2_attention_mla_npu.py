@@ -22,6 +22,11 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_kv_cache_finalize,
+    cp_all_gather_rerange_kv_cache_launch,
+)
+from sglang.srt.utils import get_current_device_stream_fast
 from sglang.srt.utils import is_npu_before_atlas_a5
 
 if TYPE_CHECKING:
@@ -584,6 +589,8 @@ def forward_dsa_prepare_npu(
         is_mla_preprocess_enabled()
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
     )
+    cp_handle = None
+    cp_kv_full = None
     if mla_preprocess_used:
         (
             q_pe,
@@ -687,16 +694,19 @@ def forward_dsa_prepare_npu(
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
         if dsa_use_prefill_cp(forward_batch):
-            # support allgather+rerrange
-            k_nope, k_pe = m.rebuild_cp_kv_cache(
-                latent_cache, forward_batch, k_nope, k_pe
+            k_flat = k_nope.contiguous().reshape(k_nope.shape[0], -1)
+            kr_flat = k_pe.contiguous().reshape(k_pe.shape[0], -1)
+            kv_flat = torch.cat([k_flat, kr_flat], dim=-1)
+            cp_handle, cp_kv_full = cp_all_gather_rerange_kv_cache_launch(
+                kv_flat,
+                m.cp_size,
+                forward_batch,
+                get_current_device_stream_fast(),
             )
 
         q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
-
-
 
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(
@@ -710,7 +720,20 @@ def forward_dsa_prepare_npu(
         )
     else:
         topk_indices = prev_topk_indices
-
+    if cp_handle is not None:
+        cp_handle.wait()
+        kv_full = cp_all_gather_rerange_kv_cache_finalize(
+            cp_kv_full, forward_batch
+        )
+        k_feat_size = m.kv_lora_rank
+        k_nope = kv_full[..., :k_feat_size].unsqueeze(1)
+        k_pe = kv_full[..., k_feat_size:].unsqueeze(1)
+        get_token_to_kv_pool().set_kv_buffer(
+            m.attn_mqa,
+            forward_batch.out_cache_loc,
+            k_nope,
+            k_pe,
+        )
     return (
         q_pe,
         k_pe,
