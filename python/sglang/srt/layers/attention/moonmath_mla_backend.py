@@ -1,14 +1,20 @@
 """Moonmath MLA attention backend for CDNA3 (gfx942).
 
-Subclasses AiterAttnBackend and takes over absorbed MLA decode with the
-moonmath_attention A16W8 kernel (bf16 Q / fp8 KV), which reads sglang's existing
+Subclasses AiterAttnBackend and takes over absorbed MLA with the
+moonmath_attention A16W8 kernels (bf16 Q / fp8 KV), which read sglang's existing
 fused-576 MLATokenToKVPool key buffer directly (page_size=1, device-driven,
-cuda-graph safe). H <= 16:
+cuda-graph safe). Two shapes, both H <= 16:
 
     decode        q_len 1     -> mla_decode_a16w8_paged_dev
+    TARGET_VERIFY q_len 4..8  -> mla_decode_a16w8_multiq_paged_dev
 
-Everything else -- prefill, spec-verify, bf16 KV, unsupported geometry -- falls
-back to AiterAttnBackend.
+Everything else -- prefill, bf16 KV, unsupported geometry -- falls back to
+AiterAttnBackend.
+
+The multi-query arm is what makes speculative decoding work here at all: aiter's
+asm MLA has no kernel past qseqlen 4, so a larger draft window aborts the
+process during cuda-graph capture. Q stays bf16 in both arms, so there is no
+query scale to calibrate and the verify logits are not perturbed.
 
 aiter's MLA kernels also require num_head in {4, 8} or a multiple of 16 in
 [16, 128], which excludes Kimi-K3's 12 heads at TP8. The moonmath kernels take H
@@ -23,6 +29,7 @@ import logging
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -43,12 +50,17 @@ _MAX_HEADS = 16
 # Narrowest head count aiter's asm MLA has a kernel for: its qh16 kernels bake
 # gqa=16 into the ISA, so a 12-head call has nothing to dispatch to.
 _AITER_MLA_MIN_HEADS = 16
+# Draft window the multi-query kernel is compiled for. Position t of the window
+# attends KV [0, S - q_len + t]. q_len 1 is a different CTA shape and is the
+# single-query decode kernel's job.
+_MULTIQ_MIN_QLEN = 4
+_MULTIQ_MAX_QLEN = 8
 
 _MAX_BATCH = 8192  # size of the staged int32 seq_lens buffer
 
 
 class MoonmathMLABackend(AiterAttnBackend):
-    """MLA decode via moonmath_attention; aiter for everything else."""
+    """MLA decode and spec-verify via moonmath_attention; aiter for the rest."""
 
     # This backend has its own MLA kernels, so aiter's head-count assert must not
     # reject it at construction.
@@ -64,6 +76,11 @@ class MoonmathMLABackend(AiterAttnBackend):
         self._enabled = (
             bool(self.use_mla) and self.kv_cache_dtype == torch.float8_e4m3fnuz
         )
+        self._multiq = (
+            self._enabled
+            and envs.SGLANG_MOONMATH_MLA_MULTIQ_VERIFY.get()
+            and hasattr(mla, "mla_decode_a16w8_multiq_paged_dev")
+        )
 
         # `parts` must not vary inside a captured graph, so the kv-split is
         # frozen per (arm, bs, H, q_len) at first call / capture and reused.
@@ -77,9 +94,11 @@ class MoonmathMLABackend(AiterAttnBackend):
             _MAX_BATCH, dtype=torch.int32, device=model_runner.device
         )
         self._logged_decode = False
+        self._logged_verify = False
         logger.info(
-            "moonmath_mla: enabled=%s num_head=%s kv_cache_dtype=%s",
+            "moonmath_mla: enabled=%s multiq_verify=%s num_head=%s kv_cache_dtype=%s",
             self._enabled,
+            self._multiq,
             self.num_head,
             self.kv_cache_dtype,
         )
@@ -90,10 +109,26 @@ class MoonmathMLABackend(AiterAttnBackend):
     # out-of-graph before every replay, which is where a device buffer that a
     # captured kernel reads must be refreshed.
     def _stage_seq_lens_i32(self, forward_batch: ForwardBatch) -> None:
-        if not self._enabled or not forward_batch.forward_mode.is_decode():
+        mode = forward_batch.forward_mode
+        # TARGET_VERIFY is an extend mode, not is_decode(), so it needs staging
+        # of its own or the window kernel reads the previous forward's values.
+        is_verify = self._multiq and mode.is_target_verify()
+        if not self._enabled or not (mode.is_decode() or is_verify):
             return
         bs = forward_batch.batch_size
-        if bs <= _MAX_BATCH:
+        if bs > _MAX_BATCH:
+            return
+        if is_verify:
+            # `fb.seq_lens` at TARGET_VERIFY EXCLUDES the draft tokens, but their
+            # KV is already written and the window kernel wants the TOTAL span:
+            # its position t sees the first `seq_lens[b] - q_len + t + 1` slots.
+            # Take the span from `kv_indptr`, which is what `kv_indices` was
+            # built against, so it is by construction the number of slots this
+            # request owns -- no assumption that every request drafted the same
+            # number of tokens. Device-side, so it stays graph-capture safe.
+            indptr = self.forward_metadata.kv_indptr
+            torch.sub(indptr[1 : bs + 1], indptr[:bs], out=self._seq_lens_i32[:bs])
+        else:
             self._seq_lens_i32[:bs].copy_(forward_batch.seq_lens)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -209,6 +244,80 @@ class MoonmathMLABackend(AiterAttnBackend):
         )
         return out.reshape(B, H * KV_LORA_RANK)
 
+    # ── TARGET_VERIFY: the multi-query draft window ──────────────────────────
+    def _verify_eligible(self, q, layer: RadixAttention, fb: ForwardBatch) -> bool:
+        """Falls back to aiter rather than raising: a mishandled shape here
+        surfaces as mis-accepted tokens, not as an exception."""
+        return (
+            self._multiq
+            and fb.forward_mode.is_target_verify()
+            and fb.spec_info is not None
+            and _MULTIQ_MIN_QLEN <= fb.spec_info.num_tokens_per_req <= _MULTIQ_MAX_QLEN
+            and self._shape_eligible(q, layer, fb)
+        )
+
+    def _forward_verify(self, q, k, v, layer, fb, save_kv_cache):
+        """TARGET_VERIFY through the A16W8 multi-query window, or None to fall back.
+
+        `seq_lens` is the TOTAL span including the draft tokens (staged in
+        `_stage_seq_lens_i32`) and the kernel applies end-aligned causal masking
+        inside the window, which is bitwise equal to per-position q_len=1 calls.
+        """
+        B, H = fb.batch_size, layer.tp_q_head_num
+        q_len = fb.spec_info.num_tokens_per_req
+        if q.shape[0] != B * q_len:
+            return None
+
+        if save_kv_cache and k is not None:
+            self.token_to_kv_pool.set_kv_buffer(layer, fb.out_cache_loc, k, v)
+
+        parts = self._cached_parts(
+            ("verify", B, H, q_len),
+            lambda: self._mla.mla_decode_a16w8_multiq_plan_parts_q(
+                B, self._plan_seq_len(B), q_len, H
+            ),
+        )
+        if not self._logged_verify:
+            self._logged_verify = True
+            logger.info(
+                "moonmath_mla: multi-query verify bs=%d q_len=%d H=%d parts=%d",
+                B,
+                q_len,
+                H,
+                parts,
+            )
+
+        q_lat, q_pe = self._split_q(q, B, q_len, H)
+        out = torch.empty(
+            B, q_len, H, KV_LORA_RANK, dtype=torch.bfloat16, device=q.device
+        )
+        kv_indices, kv_indptr = self._kv_indices_int32()
+        self._mla.mla_decode_a16w8_multiq_paged_dev(
+            q_lat,
+            q_pe,
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            out,
+            self._seq_lens_i32[:B],
+            None,
+            kv_indices,
+            kv_indptr,
+            parts,
+            layer.scaling,
+            1.0 if layer.k_scale is None else float(layer.k_scale),
+        )
+        return out.reshape(B * q_len, H * KV_LORA_RANK)
+
+    def forward_extend(
+        self, q, k, v, layer, forward_batch, save_kv_cache=True, sinks=None
+    ):
+        if sinks is None and self._verify_eligible(q, layer, forward_batch):
+            out = self._forward_verify(q, k, v, layer, forward_batch, save_kv_cache)
+            if out is not None:
+                return out
+        return super().forward_extend(
+            q, k, v, layer, forward_batch, save_kv_cache, sinks
+        )
+
     # ── prefill fallback: aiter asm-MLA head padding ─────────────────────────
     @staticmethod
     def _aiter_mla_needs_head_pad(num_head: int) -> bool:
@@ -226,8 +335,8 @@ class MoonmathMLABackend(AiterAttnBackend):
         """`mla_decode_fwd` with Q zero-padded up to aiter's 16-head minimum.
 
         Every aiter asm-MLA call this backend makes goes through here, so one
-        override covers prefill, TARGET_VERIFY, DRAFT_EXTEND_V2 and the shapes
-        the decode arm declines. Unconditional at the head counts
+        override covers prefill, DRAFT_EXTEND_V2 and the shapes the two moonmath
+        arms decline. Unconditional at the head counts
         `_aiter_mla_needs_head_pad` selects: there aiter aborts the process, so
         there is no prior behaviour to preserve.
 
