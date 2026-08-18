@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -219,6 +220,16 @@ class IntelAMXAttnBackend(AttentionBackend):
         if seq_lens.dtype != torch.int64:
             seq_lens = seq_lens.to(torch.int64)
 
+        # Bidirectional self-attention (BERT-family encoder-only models) needs
+        # every extend token to attend every other extend token, not just past
+        # ones -- is_cross_attention alone doesn't cover this: it also gates KV
+        # cache pool selection above (encoder_out_cache_loc), which is wrong for
+        # plain self-attention. AttentionType.ENCODER_ONLY carries the "no causal
+        # order" signal instead; see the same pattern in triton_backend.py.
+        is_causal = not (
+            layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY
+        )
+
         # Gemma4's KV-shared layers pass k=v=None - the layer they share with
         # already wrote their extend K/V to the cache
         self.extend_attention_fwd(
@@ -241,6 +252,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             forward_batch.encoder_lens,
             sinks,
             tree_mask,
+            is_causal,
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
