@@ -1,11 +1,8 @@
 """FlashInfer autotune must reach the same tactics on every TP rank.
 
-Each rank times the candidate tactics on its own GPU, so without a cross-rank
-reduction the per-rank ``argmin`` follows local timing noise and the ranks run
-different kernels for the same shape (observed: 20/20 tuned MoE shapes diverged
-across 4 ranks on gpt-oss-120b). These tests cover the two pieces that keep the
-ranks in agreement: the group handed to FlashInfer, and the cache digest that
-decides whether ranks may start from their on-disk caches.
+Without a cross-rank reduction each rank's ``argmin`` follows local timing noise
+(observed: 20/20 tuned MoE shapes diverged across 4 ranks on gpt-oss-120b).
+Covers the group handed to FlashInfer and the cache digest gating cache reuse.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -57,8 +54,7 @@ class TestAutotuneCacheDigest(CustomTestCase):
         self.assertEqual(_autotune_cache_digest(corrupt), "")
 
     def test_metadata_is_not_part_of_the_tuning_result(self):
-        # Toolkit versions are a property of the rank's environment, so ranks
-        # that agree on every tactic must still compare equal.
+        # Ranks that agree on every tactic must compare equal.
         rank0 = self._write("rank0.json", {"_metadata": {"cublas": "12.8"}, "op": 7})
         rank1 = self._write("rank1.json", {"_metadata": {"cublas": "12.9"}, "op": 7})
         self.assertEqual(_autotune_cache_digest(rank0), _autotune_cache_digest(rank1))

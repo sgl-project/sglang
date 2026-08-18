@@ -176,37 +176,22 @@ def autotune_tactic_sync_group(
 ) -> Optional[torch.distributed.ProcessGroup]:
     """CPU group over the ranks that must agree on the tuned tactics.
 
-    Each rank times the candidate tactics on its own GPU, so timing noise alone
-    is enough for the per-rank ``argmin`` to disagree: ranks end up running
-    different kernels for the same shape. That costs performance (some ranks
-    take a tactic that only won by noise, and the slowest rank sets the pace of
-    every collective) and it can deadlock allocation paths that assume a
-    symmetric kernel choice, e.g. NCCL symmetric memory. Handing the group to
-    FlashInfer makes it all-reduce the per-tactic timings, so every rank
-    minimizes over the *same* averaged times and picks the same tactic.
-
-    The TP group is the right scope: its ranks run the same dummy forward in
-    lockstep, which is what FlashInfer's caller contract needs (identical tactic
-    counts, in the same order, on every rank). PP stages hold different layers
-    and are already in different TP groups, so they tune independently.
-
-    A single rank has nobody to agree with, and is the only case that tunes
-    without a group.
+    Per-rank timing noise alone makes each rank's ``argmin`` pick a different
+    tactic for the same shape, which costs performance and can deadlock NCCL
+    symmetric-memory allocation. FlashInfer all-reduces the timings over this
+    group so every rank minimizes over the same numbers. TP is the right scope:
+    those ranks run the same dummy forward in lockstep, as FlashInfer's caller
+    contract requires; PP stages are already in separate TP groups.
     """
     if tp_group.world_size <= 1:
         return None
-    # gloo: the timings are host-side scalars, and reducing them on CPU keeps
-    # the reduction off the stream being profiled.
+    # gloo keeps the reduction of these host-side scalars off the profiled stream.
     return tp_group.cpu_group
 
 
 @contextlib.contextmanager
 def _autotune_process_group(group: Optional[torch.distributed.ProcessGroup]):
-    """Set FlashInfer's tactic-timing reduction group for the enclosed block.
-
-    The group is a FlashInfer process global; save and restore it so a nested
-    tuning pass cannot leave a stale (or cleared) group behind.
-    """
+    """Set FlashInfer's timing-reduction group, restoring the previous one after."""
     from flashinfer.autotuner import (
         get_autotune_process_group,
         set_autotune_process_group,
@@ -223,8 +208,7 @@ def _autotune_process_group(group: Optional[torch.distributed.ProcessGroup]):
 def _autotune_cache_digest(cache_path: Path) -> str:
     """Hash of the tuned entries in ``cache_path`` ("" when absent/unreadable).
 
-    ``_metadata`` is excluded: it records the local toolkit versions, a property
-    of the rank's environment rather than of the tuning result.
+    ``_metadata`` is excluded: it records local toolkit versions, not tactics.
     """
     if not cache_path.is_file():
         return ""
@@ -251,11 +235,9 @@ def _drop_diverged_autotune_cache(
 ) -> None:
     """Enter tuning with the same cache on every rank, or with none at all.
 
-    The cross-rank reduction requires every rank to profile the same tactics the
-    same number of times, and a cache hit skips a profile -- so ranks that start
-    from caches which disagree desync the reduction and hang. A synced run
-    leaves identical caches behind, so a mismatch means the files predate the
-    sync (or a rank died mid-tune): drop them and tune from scratch.
+    A cache hit skips a profile, so caches that disagree desync the reduction
+    and hang. Synced runs leave identical caches, so a mismatch means they
+    predate the sync or a rank died mid-tune.
     """
     if len(set(_gather_autotune_cache_digests(cache_path, group))) == 1:
         return
@@ -313,8 +295,6 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
-        # Every rank in `sync_group` averages its per-tactic timings with the
-        # others, so they all pick the same tactic.
         with _autotune_process_group(sync_group), autotune(
             True,
             cache=str(autotune_cache),
