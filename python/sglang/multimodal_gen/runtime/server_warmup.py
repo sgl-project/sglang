@@ -138,6 +138,11 @@ def auto_residency_skip_reason(server_args: ServerArgs) -> str | None:
         return "dynamic batching enabled"
     if (server_args.dp_size or 1) > 1:
         return "dp replicas warm up independently"
+    if (server_args.ulysses_degree or 1) > 1:
+        # Sequence-parallel workers can have a different execution order
+        # after residency changes; keep their configured placement until that
+        # interaction is explicitly calibrated and validated.
+        return "Ulysses sequence parallelism"
     if server_args.use_fsdp_inference:
         return "FSDP inference"
     nunchaku = server_args.nunchaku_config
