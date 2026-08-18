@@ -348,22 +348,22 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         extend_lens=(64, 65, 129),
     )
     CAKE_DECODE_CASE = GDNAttentionCase(
-        name="flashinfer_cake_gdn_decode_b4_t1",
+        name="flashinfer_cake_gdn_tp4_decode_b4_t1",
         backend="flashinfer",
         forward_mode=ForwardMode.DECODE,
-        num_k_heads=16,
-        num_v_heads=32,
+        num_k_heads=4,
+        num_v_heads=8,
         page_size=16,
         prefix_lens=(4, 7, 10, 13),
         linear_attn_decode_backend="flashinfer",
         linear_attn_prefill_backend="flashinfer",
     )
     CAKE_VERIFY_CASE = GDNAttentionCase(
-        name="flashinfer_cake_gdn_verify_b8_t4",
+        name="flashinfer_cake_gdn_tp4_verify_b8_t4",
         backend="flashinfer",
         forward_mode=ForwardMode.TARGET_VERIFY,
-        num_k_heads=16,
-        num_v_heads=32,
+        num_k_heads=4,
+        num_v_heads=8,
         page_size=16,
         prefix_lens=(4, 5, 6, 7, 8, 9, 10, 11),
         extend_lens=(4,) * 8,

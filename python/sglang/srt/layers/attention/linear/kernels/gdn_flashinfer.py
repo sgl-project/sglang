@@ -454,7 +454,15 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             num_v_heads=num_v_heads,
         )
         state_heads = batch_size * num_v_heads
-        tile_v = 128 if state_heads >= 1024 else 64 if state_heads >= 512 else 32
+        tile_v = (
+            16
+            if route.route_id.endswith(".tile16_fullwarp")
+            else 128
+            if state_heads >= 1024
+            else 64
+            if state_heads >= 512
+            else 32
+        )
         entry(
             q,
             k,
