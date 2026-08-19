@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 import time
+from array import array
 from queue import Empty
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -956,11 +957,15 @@ class HiRadixCache(RadixCache):
         top = chain[0]
         if top.key.is_bigram:
             # Bigram segments share boundary tokens; drop overlap after first.
-            token_ids = list(chain[0].key.token_ids)
+            token_ids = array("q", chain[0].key.token_ids)
             for n in chain[1:]:
                 token_ids.extend(n.key.token_ids[1:])
         else:
-            token_ids = []
+            # Rebuild the key from array('q') segments: a plain-list RadixKey
+            # would fall into the ~11x slower slice-compare path in match()
+            # (see benchmark/scheduler/bench_radix_key_match.py). Array concat
+            # is also cheaper than the old list materialization + re-box.
+            token_ids = array("q")
             for n in chain:
                 token_ids.extend(n.key.token_ids)
         key = RadixKey(
