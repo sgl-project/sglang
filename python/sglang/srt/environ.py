@@ -947,6 +947,9 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
 
     # Spec Config
+    # Shard the Qwen3.5 NEXTN draft LM head across the attention-DP ranks and
+    # exchange only each shard's greedy candidate. Target sampling is unchanged.
+    SGLANG_EAGLE_DRAFT_VOCAB_PARALLEL_TOP1 = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

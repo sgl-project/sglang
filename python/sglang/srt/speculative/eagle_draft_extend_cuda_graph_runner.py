@@ -620,7 +620,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             out = self._replay_graph(shape_key, forward_batch)
 
         out = LogitsProcessorOutput(
-            next_token_logits=out.next_token_logits[:raw_bs],
+            next_token_logits=(
+                out.next_token_logits[:raw_bs]
+                if out.next_token_logits is not None
+                else None
+            ),
+            next_token_ids=(
+                out.next_token_ids[:raw_bs]
+                if out.next_token_ids is not None
+                else None
+            ),
             hidden_states=out.hidden_states[:raw_bs],
         )
         return out

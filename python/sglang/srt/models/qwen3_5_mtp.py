@@ -95,6 +95,10 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
     ) -> None:
         nn.Module.__init__(self)
 
+        self.use_vocab_parallel_draft_head = (
+            envs.SGLANG_EAGLE_DRAFT_VOCAB_PARALLEL_TOP1.get()
+        )
+
         self.is_multimodal = hasattr(config, "text_config")
         if self.is_multimodal:
             config = config.text_config
@@ -106,6 +110,15 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         self.config = config
         self.tp_size = get_parallel().tp_size
+        if self.use_vocab_parallel_draft_head and (
+            config.tie_word_embeddings
+            or not get_parallel().enable_dp_lm_head
+            or get_parallel().attn_dp_size <= 1
+        ):
+            raise ValueError(
+                "SGLANG_EAGLE_DRAFT_VOCAB_PARALLEL_TOP1 requires an untied "
+                "LM head with attention DP and --enable-dp-lm-head"
+            )
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
 
@@ -156,12 +169,29 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             del self.lm_head.weight
 
         self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+        if self.use_vocab_parallel_draft_head:
+            shard = self.lm_head.shard_indices
+            start = shard.org_vocab_start_index
+            end = shard.org_vocab_end_index
+            if head.ndim != 2 or head.shape[0] < end:
+                raise ValueError(
+                    "Vocab-parallel draft top-1 requires an unquantized target "
+                    f"LM head with at least {end} rows, got {tuple(head.shape)}"
+                )
+            # The target head is replicated under --enable-dp-lm-head. Keep a
+            # view of this rank's contiguous vocab shard rather than loading or
+            # retaining a second copy of the weights.
+            self.lm_head.register_parameter(
+                "weight",
+                nn.Parameter(head[start:end], requires_grad=False),
+            )
+        else:
+            self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
     def set_lm_head_from_target(self, target_lm_head):
-        if self.config.tie_word_embeddings:
+        if self.config.tie_word_embeddings or self.use_vocab_parallel_draft_head:
             return
 
         self.lm_head = target_lm_head
@@ -225,9 +255,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         finally:
             exit_stack.close()
 
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        if self.use_vocab_parallel_draft_head:
+            return self.logits_processor.forward_vocab_parallel_top1(
+                hidden_states, self.lm_head, forward_batch
+            )
+        return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch)
 
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False

@@ -24,6 +24,7 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
@@ -101,6 +102,9 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Greedy token ids selected from a vocab-parallel draft head. This avoids
+    # materializing full-vocab draft logits; target-model outputs leave it None.
+    next_token_ids: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -423,6 +427,114 @@ class LogitsProcessor(nn.Module):
         )
         logprobs_result.write_input_to(logits_output)
         return logits_output
+
+    def forward_vocab_parallel_top1(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: Union[LogitsMetadata, ForwardBatch],
+    ) -> LogitsProcessorOutput:
+        """Greedy draft sampling from a vocab-sharded head under attention DP.
+
+        Hidden rows are gathered across the attention-DP group, while each rank
+        projects only its vocab shard. One float32 ``(token_id, max_logit)`` pair
+        per row is gathered from each rank, then the selected ids are scattered
+        back to the rows owned by this attention-DP rank. Full logits never move.
+        """
+        if isinstance(logits_metadata, ForwardBatch):
+            logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
+        if logits_metadata.extend_return_logprob:
+            raise ValueError("Vocab-parallel draft top-1 does not support logprobs")
+        if self.logit_scale is not None or self.final_logit_softcapping:
+            raise ValueError(
+                "Vocab-parallel draft top-1 requires unscaled, unsoftcapped logits"
+            )
+
+        (
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            _,
+            _,
+        ) = self._get_pruned_states(
+            hidden_states,
+            None,
+            None,
+            logits_metadata,
+        )
+        hidden_states_to_store = self._get_hidden_states_to_store(
+            hidden_states,
+            None,
+            None,
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            logits_metadata,
+        )
+
+        local_hidden_states = pruned_states
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
+        if tp_size > 1:
+            logits_metadata.compute_dp_attention_metadata()
+            global_hidden_states = logits_metadata.gathered_buffer
+            dp_gather_replicate(
+                global_hidden_states, local_hidden_states, logits_metadata
+            )
+        else:
+            global_hidden_states = local_hidden_states
+
+        shard = lm_head.shard_indices
+        if shard.num_added_elements != 0:
+            raise ValueError("Vocab-parallel draft top-1 does not support added vocab")
+        logits = self._compute_lm_head(global_hidden_states, lm_head)
+        logits = logits[:, : shard.num_org_elements]
+        local_max, local_arg = torch.max(logits, dim=-1)
+        local_arg.add_(shard.org_vocab_start_index)
+
+        if tp_size > 1:
+            # Token ids are below 2**24 for supported vocabularies, so float32
+            # represents them exactly and lets one collective carry ids+values.
+            if lm_head.num_embeddings >= 2**24:
+                raise ValueError(
+                    "Vocab-parallel draft top-1 requires vocab_size < 2**24"
+                )
+            combined = torch.stack(
+                (local_arg.to(torch.float32), local_max.to(torch.float32)), dim=-1
+            )
+            gathered = torch.empty(
+                (tp_size * combined.shape[0], 2),
+                dtype=torch.float32,
+                device=combined.device,
+            )
+            tp_group.all_gather_into_tensor(gathered, combined.contiguous())
+            gathered = gathered.view(tp_size, combined.shape[0], 2)
+            gathered_ids = gathered[:, :, 0]
+            gathered_values = gathered[:, :, 1]
+            best_rank = torch.argmax(gathered_values, dim=0, keepdim=True)
+            global_token_ids = (
+                torch.gather(gathered_ids, 0, best_rank)
+                .squeeze(0)
+                .to(torch.int64)
+            )
+
+            local_token_ids = torch.empty(
+                (local_hidden_states.shape[0],),
+                dtype=torch.int64,
+                device=global_token_ids.device,
+            )
+            dp_scatter(local_token_ids, global_token_ids, logits_metadata)
+        else:
+            local_token_ids = local_arg
+
+        return LogitsProcessorOutput(
+            next_token_logits=None,
+            next_token_ids=local_token_ids,
+            hidden_states=hidden_states_to_store,
+            mm_input_embeds=logits_metadata.mm_input_embeds,
+        )
 
     def _get_pruned_states(
         self,
