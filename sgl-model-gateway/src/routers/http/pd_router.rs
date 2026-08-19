@@ -565,6 +565,7 @@ impl PDRouter {
                 error_stream,
                 status,
                 None,
+                None,
                 context.return_logprob,
                 Some(response_headers),
                 prefill,
@@ -658,7 +659,6 @@ impl PDRouter {
             (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
         let _decode_guard =
             (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
-
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
@@ -824,27 +824,16 @@ impl PDRouter {
                 }
 
                 // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
+                // Streaming P/D may terminate immediately after the token sampled
+                // by prefill. Retain the small prefill response as a fallback in
+                // case decode reaches a clean terminal state without content.
+                let capture_prefill_body = context.is_stream || context.return_logprob;
+                let prefill_body = match self
+                    .process_prefill_response(prefill_result, prefill.url(), capture_prefill_body)
+                    .await
+                {
+                    Ok((_, body)) => body,
+                    Err(error_response) => return error_response,
                 };
 
                 if context.is_stream {
@@ -866,6 +855,7 @@ impl PDRouter {
                         res.bytes_stream(),
                         status,
                         prefill_logprobs,
+                        prefill_body,
                         context.return_logprob,
                         Some(response_headers),
                         prefill,
@@ -945,6 +935,65 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
+    }
+
+    /// Return whether an accumulated SSE prefix contains client-visible model
+    /// output. Usage, role, finish-reason, and other metadata do not count.
+    /// Keeping the bytes accumulated means JSON split across network chunks is
+    /// parsed as soon as its complete `data:` line arrives.
+    fn sse_has_semantic_output(body: &[u8]) -> bool {
+        String::from_utf8_lossy(body).lines().any(|line| {
+            let Some(payload) = line.trim().strip_prefix("data:") else {
+                return false;
+            };
+            let payload = payload.trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                return false;
+            }
+            serde_json::from_str::<Value>(payload)
+                .is_ok_and(|value| Self::json_has_semantic_output(&value))
+        })
+    }
+
+    fn json_has_semantic_output(value: &Value) -> bool {
+        fn meaningful(value: Option<&Value>) -> bool {
+            match value {
+                Some(Value::String(text)) => !text.is_empty(),
+                Some(Value::Array(items)) => !items.is_empty(),
+                Some(Value::Object(fields)) => !fields.is_empty(),
+                Some(Value::Bool(value)) => *value,
+                Some(Value::Number(_)) => true,
+                _ => false,
+            }
+        }
+
+        if meaningful(value.get("text")) {
+            return true;
+        }
+
+        value
+            .get("choices")
+            .and_then(Value::as_array)
+            .is_some_and(|choices| {
+                choices.iter().any(|choice| {
+                    if meaningful(choice.get("text")) {
+                        return true;
+                    }
+                    let Some(delta) = choice.get("delta") else {
+                        return false;
+                    };
+                    [
+                        "content",
+                        "reasoning_content",
+                        "tool_calls",
+                        "function_call",
+                        "refusal",
+                        "audio",
+                    ]
+                    .iter()
+                    .any(|field| meaningful(delta.get(*field)))
+                })
+            })
     }
 
     /// Builds the text used for cache-aware routing of a chat request.
@@ -1106,6 +1155,7 @@ impl PDRouter {
         stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
         status: StatusCode,
         prefill_logprobs: Option<Value>,
+        prefill_fallback: Option<bytes::Bytes>,
         return_logprob: bool,
         headers: Option<HeaderMap>,
         prefill: Arc<dyn Worker>,
@@ -1137,6 +1187,13 @@ impl PDRouter {
         }
         let decode_for_log = decode.clone();
         tokio::spawn(async move {
+            // Decode normally emits the first client-visible token. Keep only
+            // its initial metadata until semantic output appears. If decode
+            // instead finishes cleanly without content (for example, EOS was
+            // sampled by prefill), return prefill's handoff token rather than
+            // an empty metadata/[DONE] stream.
+            let mut pending_decode = Vec::new();
+            let mut semantic_output_seen = false;
             loop {
                 tokio::select! {
                     biased;
@@ -1145,12 +1202,32 @@ impl PDRouter {
                             Some(Ok(chunk)) => {
                                 let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
 
-                                let result = if return_logprob && prefill_logprobs.is_some() {
-                                    Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
-                                        .unwrap_or(chunk)
+                                let mut chunks_to_send = Vec::new();
+                                if semantic_output_seen {
+                                    chunks_to_send.push(chunk);
                                 } else {
-                                    chunk
-                                };
+                                    pending_decode.extend_from_slice(&chunk);
+                                    semantic_output_seen =
+                                        Self::sse_has_semantic_output(&pending_decode);
+
+                                    if semantic_output_seen {
+                                        chunks_to_send.push(bytes::Bytes::from(std::mem::take(
+                                            &mut pending_decode,
+                                        )));
+                                    } else if is_done {
+                                        if let Some(prefill_body) = prefill_fallback.clone() {
+                                            tracing::debug!(
+                                                decode_url = %decode_for_log.url(),
+                                                "Decode completed without semantic output; returning prefill response"
+                                            );
+                                            chunks_to_send.push(prefill_body);
+                                        } else {
+                                            chunks_to_send.push(bytes::Bytes::from(std::mem::take(
+                                                &mut pending_decode,
+                                            )));
+                                        }
+                                    }
+                                }
 
                                 // Mark the wrapper completed before the client
                                 // send: upstream finished cleanly regardless of
@@ -1162,12 +1239,24 @@ impl PDRouter {
                                     tracked.mark_completed();
                                 }
 
-                                if tx.send(Ok(result)).is_err() {
-                                    tracing::debug!(
-                                        "Receiver dropped (likely client disconnect), \
-                                        cancelling upstream PD stream"
-                                    );
-                                    break;
+                                for chunk in chunks_to_send {
+                                    let result = if return_logprob && prefill_logprobs.is_some() {
+                                        Self::merge_streaming_logprobs(
+                                            prefill_logprobs.clone(),
+                                            &chunk,
+                                        )
+                                        .unwrap_or(chunk)
+                                    } else {
+                                        chunk
+                                    };
+
+                                    if tx.send(Ok(result)).is_err() {
+                                        tracing::debug!(
+                                            "Receiver dropped (likely client disconnect), \
+                                            cancelling upstream PD stream"
+                                        );
+                                        return;
+                                    }
                                 }
 
                                 if is_done {
@@ -1181,7 +1270,18 @@ impl PDRouter {
                                 let _ = tx.send(Err(format!("Stream error: {}", e)));
                                 break;
                             }
-                            None => break,
+                            None => {
+                                tracked.mark_completed();
+                                if !semantic_output_seen {
+                                    let result = prefill_fallback.clone().unwrap_or_else(|| {
+                                        bytes::Bytes::from(std::mem::take(&mut pending_decode))
+                                    });
+                                    if !result.is_empty() {
+                                        let _ = tx.send(Ok(result));
+                                    }
+                                }
+                                break;
+                            }
                         }
                     }
                     _ = tx.closed() => {
@@ -1259,12 +1359,13 @@ impl PDRouter {
         }
     }
 
-    // Helper to process prefill response and extract body if needed for logprobs
+    // Helper to process prefill response and optionally retain its body for
+    // logprob merging or terminal-without-content streaming fallback.
     async fn process_prefill_response(
         &self,
         prefill_result: Result<reqwest::Response, reqwest::Error>,
         prefill_url: &str,
-        return_logprob: bool,
+        capture_body: bool,
     ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
         // Check prefill result first - it's critical for disaggregated mode
         let prefill_response = match prefill_result {
@@ -1333,12 +1434,12 @@ impl PDRouter {
             return Err(error_response);
         }
 
-        // Read prefill body if needed for logprob merging
-        let prefill_body = if return_logprob {
+        // Read prefill body if needed by the downstream response path.
+        let prefill_body = if capture_body {
             match prefill_response.bytes().await {
                 Ok(body) => Some(body),
                 Err(e) => {
-                    warn!("Failed to read prefill response body for logprobs: {}", e);
+                    warn!("Failed to read prefill response body: {}", e);
                     None
                 }
             }
@@ -1606,7 +1707,6 @@ impl RouterTrait for PDRouter {
 
         // Calculate batch size
         let batch_size = Self::get_chat_batch_size(body);
-
         let context = PDRequestContext {
             route: "/v1/chat/completions",
             batch_size,
@@ -1993,6 +2093,7 @@ mod tests {
             let response = router.create_streaming_response(
                 stream.map(Ok),
                 StatusCode::OK,
+                None,
                 None,
                 false,
                 None,
