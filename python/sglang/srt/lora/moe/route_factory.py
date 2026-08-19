@@ -96,7 +96,6 @@ def _aligned_pair_route(
     num_local_experts: int,
     max_loras: int,
     block_size: int,
-    use_pdl: bool | None,
     workspace: MoeLoraWorkspace,
     scratch_prefix: str,
 ) -> RouteView:
@@ -140,7 +139,6 @@ def _aligned_pair_route(
         max_loras=max_loras,
         block_size=block_size,
         view=ROUTE_ALIGNED,
-        use_pdl=use_pdl,
         num_pairs_post_padded_out=padded_count,
         fused_align_scratch=scratch,
     )
@@ -164,12 +162,6 @@ def build_routes(
     original pair route remains authoritative for every B consumer.
     """
     requirements = plan.route_requirements()
-    # Route PDL is always on where the architecture supports it: measured
-    # +0.5..+2.0% decode on every model and GPU, prefill within +-1.3%
-    # (2026-08 twins); no per-plan knob.
-    from sglang.kernels.jit.utils import is_arch_support_pdl
-
-    use_pdl = is_arch_support_pdl()
     values: dict[str, object] = {}
     if RouteRequirement.RAW_PER_EXPERT in requirements:
         values["raw_per_expert"] = build_virtual_expert_routing(
@@ -179,7 +171,6 @@ def build_routes(
             max_loras=max_loras,
             block_size=block_size,
             view=ROUTE_RAW,
-            use_pdl=use_pdl,
         )
     if RouteRequirement.RAW_SHARED_OUTER in requirements:
         # One LoRA expert per adapter, with the local expert count restoring
@@ -192,7 +183,6 @@ def build_routes(
             max_loras=max_loras,
             block_size=block_size,
             view=ROUTE_RAW,
-            use_pdl=use_pdl,
         )
 
     need_per_expert = RouteRequirement.ALIGNED_PER_EXPERT in requirements
@@ -205,7 +195,6 @@ def build_routes(
             max_loras=max_loras,
             block_size=block_size,
             workspace=workspace,
-            use_pdl=use_pdl,
         )
         values["aligned_per_expert"] = per_expert
         values["aligned_shared_outer"] = shared
@@ -218,7 +207,6 @@ def build_routes(
                 num_local_experts=num_local_experts,
                 max_loras=max_loras,
                 block_size=block_size,
-                use_pdl=use_pdl,
                 workspace=workspace,
                 scratch_prefix="route:aligned_per_expert",
             )
@@ -230,7 +218,6 @@ def build_routes(
                 num_local_experts=num_local_experts,
                 max_loras=max_loras,
                 block_size=block_size,
-                use_pdl=use_pdl,
                 workspace=workspace,
                 scratch_prefix="route:aligned_shared_outer",
             )
@@ -271,7 +258,6 @@ def build_routes(
             num_local_experts=num_local_experts,
             max_loras=max_loras,
             block_size=block_size,
-            use_pdl=use_pdl,
             workspace=workspace,
             scratch_prefix="route:shared_token",
         )

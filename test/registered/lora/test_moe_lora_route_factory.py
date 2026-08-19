@@ -348,14 +348,11 @@ def _route(
 
 
 class TestRoutePdlWiring(unittest.TestCase):
-    def test_standard_plan_threads_architecture_pdl_to_every_aligned_route(self):
+    def test_plans_build_exactly_their_aligned_routes(self):
         reference = SERIAL_MATERIALIZED_REFERENCE
         shared_down = dataclasses.replace(
             reference,
-            down_b=dataclasses.replace(
-                reference.down_b,
-                is_shared_outer=True,
-            ),
+            down_b=dataclasses.replace(reference.down_b, is_shared_outer=True),
         )
         shared_token = dataclasses.replace(
             reference,
@@ -371,80 +368,66 @@ class TestRoutePdlWiring(unittest.TestCase):
             ),
         )
 
-        for enabled in (False, True):
-            calls = []
+        calls = []
 
-            def fake_aligned(
+        def fake_aligned(
+            topk_ids,
+            token_slots,
+            *,
+            is_shared_outer,
+            num_local_experts,
+            max_loras,
+            block_size,
+            workspace,
+            scratch_prefix,
+        ):
+            calls.append(scratch_prefix)
+            return _route(
                 topk_ids,
                 token_slots,
-                *,
-                is_shared_outer,
-                num_local_experts,
-                max_loras,
-                block_size,
-                use_pdl,
-                workspace,
-                scratch_prefix,
-            ):
-                calls.append((scratch_prefix, use_pdl))
-                return _route(
-                    topk_ids,
-                    token_slots,
-                    block_size=block_size,
-                    padded_count=torch.tensor([block_size], dtype=torch.int32),
+                block_size=block_size,
+                padded_count=torch.tensor([block_size], dtype=torch.int32),
+            )
+
+        with mock.patch.object(
+            ROUTE_FACTORY, "_aligned_pair_route", side_effect=fake_aligned
+        ):
+            for plan in (reference, shared_down, shared_token):
+                ROUTE_FACTORY.build_routes(
+                    plan,
+                    topk_ids=torch.tensor([[0, 1]], dtype=torch.int32),
+                    token_slots=torch.tensor([0], dtype=torch.int32),
+                    num_local_experts=2,
+                    max_loras=2,
+                    block_size=16,
+                    workspace=_Workspace(),
                 )
 
-            with (
-                _arch_pdl(enabled),
-                mock.patch.object(
-                    ROUTE_FACTORY,
-                    "_aligned_pair_route",
-                    side_effect=fake_aligned,
-                ),
-            ):
-                for plan in (reference, shared_down, shared_token):
-                    ROUTE_FACTORY.build_routes(
-                        plan,
-                        topk_ids=torch.tensor([[0, 1]], dtype=torch.int32),
-                        token_slots=torch.tensor([0], dtype=torch.int32),
-                        num_local_experts=2,
-                        max_loras=2,
-                        block_size=16,
-                        workspace=_Workspace(),
-                    )
+        self.assertEqual(
+            set(calls),
+            {
+                "route:aligned_per_expert",
+                "route:aligned_shared_outer",
+                "route:shared_token",
+            },
+        )
 
-            by_prefix = {}
-            for prefix, value in calls:
-                by_prefix.setdefault(prefix, set()).add(value)
-            self.assertEqual(
-                set(by_prefix),
-                {
-                    "route:aligned_per_expert",
-                    "route:aligned_shared_outer",
-                    "route:shared_token",
-                },
-            )
-            self.assertTrue(all(values == {enabled} for values in by_prefix.values()))
-
-    def test_joint_plan_threads_architecture_pdl_control(self):
-        # The follow-on shared-token build under a joint plan takes the same
-        # architecture PDL value as every other build (the old "gated off"
-        # state was a measurement default, retired after an off/on twin
-        # measured arm-always as a wash).
+    def test_joint_plan_builds_joint_routes_plus_the_shared_token_follow_on(self):
         reference = SERIAL_MATERIALIZED_REFERENCE
-        shared_down_b = dataclasses.replace(
-            reference.down_b,
-            is_shared_outer=True,
-        )
-        dedup_gate_up_a = PLAN.LoraASpec(
-            PLAN.Site.GATE_UP,
-            PLAN.LoraAFamily.TOKEN_DEDUP_GROUPED,
-            True,
-            PLAN.BridgeLayout.TOKEN_MAJOR,
-        )
-        token_major_gate_up_b = dataclasses.replace(
-            reference.gate_up_b,
-            input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
+        plan = dataclasses.replace(
+            reference,
+            gate_up_a=PLAN.LoraASpec(
+                PLAN.Site.GATE_UP,
+                PLAN.LoraAFamily.TOKEN_DEDUP_GROUPED,
+                True,
+                PLAN.BridgeLayout.TOKEN_MAJOR,
+            ),
+            gate_up_b=dataclasses.replace(
+                reference.gate_up_b,
+                input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
+            ),
+            down_b=dataclasses.replace(reference.down_b, is_shared_outer=True),
+            route_builder=PLAN.RouteBuilderFamily.JOINT_SHARED_OUTER,
         )
         joint_calls = []
         standard_calls = []
@@ -457,9 +440,8 @@ class TestRoutePdlWiring(unittest.TestCase):
             max_loras,
             block_size,
             workspace,
-            use_pdl,
         ):
-            joint_calls.append(use_pdl)
+            joint_calls.append(block_size)
             route = _route(
                 topk_ids,
                 token_slots,
@@ -476,13 +458,12 @@ class TestRoutePdlWiring(unittest.TestCase):
             max_loras,
             block_size,
             view,
-            use_pdl,
             shared_outer_local_expert_count=None,
             lora_expert_map=None,
             num_pairs_post_padded_out=None,
             fused_align_scratch=None,
         ):
-            standard_calls.append(use_pdl)
+            standard_calls.append(view)
             num_pairs_post_padded_out.fill_(block_size)
             return _route(
                 topk_ids,
@@ -491,43 +472,31 @@ class TestRoutePdlWiring(unittest.TestCase):
                 padded_count=num_pairs_post_padded_out,
             )
 
-        for enabled in (False, True):
-            plan = dataclasses.replace(
-                reference,
-                gate_up_a=dedup_gate_up_a,
-                gate_up_b=token_major_gate_up_b,
-                down_b=shared_down_b,
-                route_builder=PLAN.RouteBuilderFamily.JOINT_SHARED_OUTER,
+        with (
+            mock.patch.object(
+                ROUTE_FACTORY, "build_joint_shared_routes", side_effect=fake_joint
+            ),
+            mock.patch.object(
+                ROUTE_FACTORY, "build_virtual_expert_routing", side_effect=fake_route
+            ),
+        ):
+            ROUTE_FACTORY.build_routes(
+                plan,
+                topk_ids=torch.tensor([[0, 1]], dtype=torch.int32),
+                token_slots=torch.tensor([0], dtype=torch.int32),
+                num_local_experts=2,
+                max_loras=2,
+                block_size=16,
+                workspace=_Workspace(),
             )
-            with (
-                _arch_pdl(enabled),
-                mock.patch.object(
-                    ROUTE_FACTORY,
-                    "build_joint_shared_routes",
-                    side_effect=fake_joint,
-                ),
-                mock.patch.object(
-                    ROUTE_FACTORY,
-                    "build_virtual_expert_routing",
-                    side_effect=fake_route,
-                ),
-            ):
-                ROUTE_FACTORY.build_routes(
-                    plan,
-                    topk_ids=torch.tensor([[0, 1]], dtype=torch.int32),
-                    token_slots=torch.tensor([0], dtype=torch.int32),
-                    num_local_experts=2,
-                    max_loras=2,
-                    block_size=16,
-                    workspace=_Workspace(),
-                )
 
-        self.assertEqual(joint_calls, [False, True])
-        self.assertEqual(standard_calls, [False, True])
+        self.assertEqual(joint_calls, [16])
+        self.assertEqual(standard_calls, ["aligned"])
 
     def _run_joint(self, *, use_pdl):
         recorders = [_KernelRecorder() for _ in range(3)]
         with (
+            _arch_pdl(bool(use_pdl)),
             mock.patch.object(JOINT_ROUTING, "_joint_hist_kernel", recorders[0]),
             mock.patch.object(JOINT_ROUTING, "_dual_scan_kernel", recorders[1]),
             mock.patch.object(
@@ -541,7 +510,6 @@ class TestRoutePdlWiring(unittest.TestCase):
                 max_loras=2,
                 block_size=16,
                 workspace=_Workspace(),
-                use_pdl=use_pdl,
             )
         return routes, recorders
 
@@ -555,14 +523,11 @@ class TestRoutePdlWiring(unittest.TestCase):
             self.assertTrue(consumer.calls[0][2]["USE_PDL"])
             self.assertTrue(consumer.calls[0][2]["launch_pdl"])
 
-    def test_joint_route_delegates_default_to_architecture_support(self):
-        arch = types.ModuleType("sglang.kernels.jit.utils")
-        arch.is_arch_support_pdl = lambda: True
-        with mock.patch.dict(sys.modules, {arch.__name__: arch}):
-            _, recorders = self._run_joint(use_pdl=None)
-
+    def test_joint_route_pdl_off_leaves_launches_unarmed(self):
+        _, recorders = self._run_joint(use_pdl=False)
         for recorder in recorders:
-            self.assertTrue(recorder.calls[0][2]["USE_PDL"])
+            self.assertFalse(recorder.calls[0][2]["USE_PDL"])
+            self.assertNotIn("launch_pdl", recorder.calls[0][2])
 
     def test_joint_kernel_dependency_operations_are_complete(self):
         source = (LORA_MOE / "joint_routing.py").read_text()
@@ -629,13 +594,11 @@ class TestSharedTokenRoute(unittest.TestCase):
             max_loras,
             block_size,
             view,
-            use_pdl,
             shared_outer_local_expert_count=None,
             lora_expert_map=None,
             num_pairs_post_padded_out=None,
             fused_align_scratch=None,
         ):
-            self.assertIs(use_pdl, False)
             calls.append(
                 (
                     shared_outer_local_expert_count is not None,
@@ -715,14 +678,12 @@ class TestSharedTokenRoute(unittest.TestCase):
                     max_loras,
                     block_size,
                     view,
-                    use_pdl,
                     shared_outer_local_expert_count=None,
                     lora_expert_map=None,
                     num_pairs_post_padded_out=None,
                     fused_align_scratch=None,
                 ):
                     self.assertEqual(view, "aligned")
-                    self.assertIs(use_pdl, False)
                     num_virtual = lora_experts_per_adapter * max_loras
                     cached_count = cached_counts.setdefault(
                         num_virtual, torch.zeros(1, dtype=torch.int32)

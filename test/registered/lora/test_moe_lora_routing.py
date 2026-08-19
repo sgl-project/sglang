@@ -74,7 +74,6 @@ class TestMoeLoraRouting(CustomTestCase):
         block_size=16,
         dtype=torch.int32,
         view=ROUTE_ALIGNED,
-        use_pdl=None,
     ):
         return build_virtual_expert_routing(
             torch.tensor(topk_ids, dtype=dtype, device=self.device),
@@ -88,7 +87,6 @@ class TestMoeLoraRouting(CustomTestCase):
                 else torch.tensor(lora_expert_map, dtype=dtype, device=self.device)
             ),
             view=view,
-            use_pdl=use_pdl,
         )
 
     def test_narrower_views_refuse_fields_they_did_not_build(self):
@@ -282,7 +280,7 @@ class TestMoeLoraRouting(CustomTestCase):
                 try:
 
                     def spy(*args, **kwargs):
-                        calls.append(kwargs["use_pdl"])
+                        calls.append(True)
                         return original(*args, **kwargs)
 
                     fused_align.fused_align_block_size = spy
@@ -302,55 +300,10 @@ class TestMoeLoraRouting(CustomTestCase):
                     f"V={num_virtual}, P={num_tokens * 8} took the wrong path",
                 )
                 if expects_fused:
-                    self.assertEqual(
-                        calls,
-                        [False],
-                        "standard fused alignment must default PDL off",
-                    )
+                    self.assertEqual(len(calls), 1)
                 self.assertGreater(int(route.num_pairs_post_padded), 0)
                 self.assertEqual(route.sorted_pair_ids.dtype, torch.int32)
                 self.assertEqual(route.block_virtual_expert_ids.dtype, torch.int32)
-
-    def test_explicit_standard_pdl_reaches_only_the_fused_align_builder(self):
-        from sglang.srt.lora.moe import fused_align
-
-        original = fused_align.fused_align_block_size
-        for num_virtual, expects_fused in ((8160, False), (8192, True)):
-            lora_experts_per_adapter = num_virtual // 32
-            ids = torch.randint(
-                0,
-                lora_experts_per_adapter,
-                (8, 8),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            slots = torch.randint(
-                0,
-                32,
-                (8,),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            calls = []
-            try:
-
-                def spy(*args, **kwargs):
-                    calls.append(kwargs["use_pdl"])
-                    return original(*args, **kwargs)
-
-                fused_align.fused_align_block_size = spy
-                build_virtual_expert_routing(
-                    ids,
-                    slots,
-                    lora_experts_per_adapter=lora_experts_per_adapter,
-                    max_loras=32,
-                    block_size=16,
-                    view=ROUTE_ALIGNED,
-                    use_pdl=True,
-                )
-            finally:
-                fused_align.fused_align_block_size = original
-            self.assertEqual(calls, [True] if expects_fused else [])
 
     def test_sentinel_blocks_isolate_invalid_pairs_on_both_align_paths(self):
         """A5 pin-down (gate-1 packet): the sentinel-bucket contract, black-box.

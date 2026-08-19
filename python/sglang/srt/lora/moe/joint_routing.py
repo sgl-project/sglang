@@ -415,11 +415,10 @@ def build_joint_shared_routes(
     max_loras: int,
     block_size: int,
     workspace: MoeLoraWorkspace,
-    use_pdl: bool | None = None,
 ) -> tuple[RouteView, RouteView]:
     """Return ``(per_expert, shared_outer)`` aligned views from one pair pass.
 
-    ``use_pdl=None`` selects PDL on architectures that support it. The three
+    PDL is on where the architecture supports it (cached check). The three
     kernels form a real histogram -> scan -> scatter dependency chain; the
     consumer launches carry ``launch_pdl=True`` and wait only immediately
     before their first predecessor-produced load.
@@ -428,12 +427,9 @@ def build_joint_shared_routes(
         raise ValueError("joint routing expects topk_ids [T,K] and token_slots [T]")
     if num_local_experts < 1 or max_loras < 1 or block_size < 1:
         raise ValueError("expert, adapter, and route block counts must be positive")
-    if use_pdl is None:
-        from sglang.kernels.jit.utils import is_arch_support_pdl
+    from sglang.kernels.jit.utils import is_arch_support_pdl
 
-        use_pdl = is_arch_support_pdl()
-    else:
-        use_pdl = bool(use_pdl)
+    use_pdl = is_arch_support_pdl()
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
 
     device = topk_ids.device

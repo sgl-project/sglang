@@ -347,7 +347,6 @@ def fused_align_block_size(
     shared_outer_local_expert_count: int | None = None,
     num_pairs_post_padded_out: torch.Tensor | None = None,
     scratch: FusedAlignScratch | None = None,
-    use_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return ``(sorted_pair_ids, block_virtual_expert_ids, num_pairs_post_padded)``.
 
@@ -412,6 +411,13 @@ def fused_align_block_size(
     )
     sorted_pair_ids = torch.empty(capacity, dtype=torch.int32, device=device)
     block_virtual_expert_ids = torch.empty(num_blocks, dtype=torch.int32, device=device)
+    # PDL is always on where the architecture supports it: measured
+    # +0.5..+2.0% decode on every model and GPU, prefill within +-1.3%
+    # (2026-08 twins), and arming every composition measured a wash against
+    # partial arming (2026-08-19 twin). The check is @cache_once.
+    from sglang.kernels.jit.utils import is_arch_support_pdl
+
+    use_pdl = is_arch_support_pdl()
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
 
     _fused_hist_kernel[(triton.cdiv(max(num_pairs, 1), HIST_BLOCK),)](

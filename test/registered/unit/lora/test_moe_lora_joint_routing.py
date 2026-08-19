@@ -70,7 +70,6 @@ def test_joint_route_scan_restores_both_count_buffers_between_calls() -> None:
             max_loras=max_loras,
             block_size=block_size,
             workspace=workspace,
-            use_pdl=False,
         )
 
         per_expert_counts = workspace.tensor(

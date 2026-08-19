@@ -457,7 +457,6 @@ def build_virtual_expert_routing(
     lora_expert_map: torch.Tensor | None = None,
     shared_outer_local_expert_count: int | None = None,
     view: str = ROUTE_ALIGNED,
-    use_pdl: bool | None = None,
     num_pairs_post_padded_out: torch.Tensor | None = None,
     fused_align_scratch: FusedAlignScratch | None = None,
 ) -> RouteView:
@@ -515,10 +514,6 @@ def build_virtual_expert_routing(
         # inside the kernel. Consumers read only the [T, K] shape off
         # `topk_ids`, never these values. Above the JIT kernel's 8191 ceiling
         # this is also the only CUDA-speed option.
-        #
-        # Standard-route PDL is deliberately opt-in. ``None`` and ``False``
-        # remain the default-off control; explicit ``True`` is admitted only
-        # through bounded composed off/on twins until promotion evidence exists.
         from sglang.srt.lora.moe.fused_align import fused_align_block_size
 
         sorted_pair_ids, block_virtual_expert_ids, num_pairs_post_padded = (
@@ -533,7 +528,6 @@ def build_virtual_expert_routing(
                 shared_outer_local_expert_count=shared_outer_local_expert_count,
                 num_pairs_post_padded_out=num_pairs_post_padded_out,
                 scratch=fused_align_scratch,
-                use_pdl=bool(use_pdl),
             )
         )
         return RouteView(
