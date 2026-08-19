@@ -55,6 +55,21 @@ class TestInitThreadsBinding(unittest.TestCase):
         self.assertEqual(init_threads_binding(numa_index=0, world_size=2), "0-1")
         self.assertEqual(init_threads_binding(numa_index=1, world_size=2), "4-5")
 
+    @patch(
+        "sglang.srt.utils.numa_utils.get_cpu_ids_by_node",
+        return_value=["0,1", "2,3", "4,5"],
+    )
+    @patch.dict(os.environ, {"SGLANG_CPU_OMP_THREADS_BIND": "0-1|2-3|4-5"})
+    def test_router_worker_uses_global_numa_index(self, _mock_nodes):
+        # Router mode: each worker is an independent dp_size=1 server, so
+        # world_size is locally 1 even though the bind string has multiple
+        # groups. numa_index is still the global gpu_id and must be able to
+        # select any group, not just index 0.
+        self.assertEqual(
+            init_threads_binding(numa_index=2, world_size=1),
+            "4-5",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
