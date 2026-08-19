@@ -187,6 +187,7 @@ class SchedulerOutputStreamer:
             and self.ps.attn_tp_rank == 0
             and get_observability().enable_request_time_stats_logging
         ):
+            req.time_stats.has_timing_data = True
             req.log_time_stats()
 
     def _stream_output_embedding(self, reqs: List[Req]):

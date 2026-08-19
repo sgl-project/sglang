@@ -505,6 +505,8 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
             meta_info["request_finished_ts"] = convert_time_to_realtime(
                 self.finished_time
             )
+        if scheduler_time_stats is not None and scheduler_time_stats.has_timing_data:
+            meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
 
         decode_latency = self.get_decode_latency()
         if decode_latency > 0.0 and completion_tokens > 1:
@@ -550,16 +552,17 @@ class DPControllerReqTimeStats(ReqTimeStatsBase):
     # new timestamp, get by time.perf_counter()
     dpc_dispatch_time: float = 0.0
     dpc_dispatch_finish_time: float = 0.0
+    has_timing_data: bool = False
 
     def __getstate__(self) -> object:
-        state = {}
-        # send to Scheduler
-        # If necessary, can propagate the timestamp here, for example:
-        # state = {
-        #     "created_time": self.created_time,
-        #     "api_server_dispatch_time": self.api_server_dispatch_time,
-        #     "dpc_dispatch_time": self.dpc_dispatch_time,
-        # }
+        state = (
+            {
+                "dpc_dispatch_time": self.dpc_dispatch_time,
+                "has_timing_data": True,
+            }
+            if self.has_timing_data
+            else {}
+        )
         state.update(super().__getstate__())
         return state
 
@@ -649,6 +652,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
         state = {
             "has_timing_data": True,
+            "dpc_dispatch_time": self.dpc_dispatch_time,
+            "scheduler_recv_time": self.scheduler_recv_time,
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
@@ -1166,6 +1171,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def convert_to_output_meta_info(self):
         meta_data = {}
+        if self.dpc_dispatch_time > 0.0:
+            meta_data["dpc_dispatch_time"] = convert_time_to_realtime(
+                self.dpc_dispatch_time
+            )
+        if self.scheduler_recv_time > 0.0:
+            meta_data["scheduler_recv_time"] = convert_time_to_realtime(
+                self.scheduler_recv_time
+            )
+        if self.wait_queue_entry_time > 0.0:
+            meta_data["wait_queue_entry_time"] = convert_time_to_realtime(
+                self.wait_queue_entry_time
+            )
         if self.forward_entry_time > 0.0:
             meta_data["forward_entry_time"] = convert_time_to_realtime(
                 self.forward_entry_time
