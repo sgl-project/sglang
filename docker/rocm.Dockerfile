@@ -229,15 +229,31 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
     printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
         > /etc/apt/apt.conf.d/80-net-hardening
 
-# Fix hipDeviceGetName returning empty string in ROCm 7.0 docker images.
-# The ROCm 7.0 base image is missing libdrm-amdgpu-common which provides the
-# amdgpu.ids device-ID-to-marketing-name mapping file.
-# ROCm 7.2 base images already ship these packages, so this step is skipped.
+# Fix hipDeviceGetName returning empty / generic names.
+# amdgpu.ids maps PCI IDs to marketing names. The ROCm 7.0 base is missing it.
+# The 7.2.0 base was built with amdgpu-install and already has it. The 7.2.4
+# ubuntu24.04 base installs the `rocm` apt metapackage and does not; noble's
+# distro table has MI300 (74A*) but no MI355X (75A3), so gfx950-rocm724 would
+# otherwise report "AMD Radeon Graphics" and miss every name-keyed config.
 # See https://github.com/ROCm/ROCm/issues/5992
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm720*|*rocm724*) \
-        echo "ROCm 7.2 (GPU_ARCH=${GPU_ARCH}): libdrm-amdgpu packages already present, skipping"; \
+      *rocm724*) \
+        echo "ROCm 7.2.4 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu from graphics/7.2.4 noble"; \
+        curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+          | gpg --dearmor -o /etc/apt/keyrings/amdgpu-graphics.gpg \
+        && echo 'deb [arch=amd64,i386 signed-by=/etc/apt/keyrings/amdgpu-graphics.gpg] https://repo.radeon.com/graphics/7.2.4/ubuntu noble main' \
+          > /etc/apt/sources.list.d/amdgpu-graphics.list \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends \
+             libdrm-amdgpu-common \
+             libdrm-amdgpu-amdgpu1 \
+             libdrm2-amdgpu \
+        && rm -rf /var/lib/apt/lists/* \
+        && cp /opt/amdgpu/share/libdrm/amdgpu.ids /usr/share/libdrm/amdgpu.ids; \
+        ;; \
+      *rocm720*) \
+        echo "ROCm 7.2.0 (GPU_ARCH=${GPU_ARCH}): libdrm-amdgpu packages already present, skipping"; \
         ;; \
       *) \
         echo "ROCm 7.0 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu packages"; \
