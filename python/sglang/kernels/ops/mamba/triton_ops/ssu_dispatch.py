@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import msgspec
 import torch
 
 if TYPE_CHECKING:
@@ -13,8 +13,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class CompactMambaPrefillCheckpoints:
+class CompactMambaPrefillCheckpoints(msgspec.Struct, frozen=True):
     """Selected SSM chunk-boundary states in radix-track destination order."""
 
     states: torch.Tensor
