@@ -415,6 +415,9 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         if enable_override is False:
             # The per-request kill switch wins over quality="high".
             desired_mode = None
+        elif getattr(batch.sampling_params, "enable_spectrum", False):
+            # Spectrum skips the block stack; Cache-DiT wraps those blocks.
+            desired_mode = None
         elif quality == "high":
             desired_mode = "high"
         else:

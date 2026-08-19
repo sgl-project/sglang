@@ -214,6 +214,27 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "MiniMax H3 does not support enable_teacache: its packed "
                 "video/audio denoise loop has no lossless TeaCache contract"
             )
+        if self.enable_spectrum:
+            if self.quality == "high":
+                raise ValueError(
+                    "MiniMax H3 enable_spectrum cannot be combined with "
+                    'quality="high" (Cache-DiT). Use one skip-step accelerator.'
+                )
+            if self.enable_cache_dit:
+                raise ValueError(
+                    "MiniMax H3 enable_spectrum cannot be combined with "
+                    "enable_cache_dit. Use one skip-step accelerator."
+                )
+            from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
+            from sglang.multimodal_gen.runtime.cache.spectrum import (
+                apply_h3_spectrum_param_defaults,
+            )
+
+            if isinstance(self.spectrum_params, dict):
+                self.spectrum_params = SpectrumParams(**self.spectrum_params)
+            elif self.spectrum_params is None:
+                self.spectrum_params = SpectrumParams()
+            apply_h3_spectrum_param_defaults(self.spectrum_params)
         if self.rollout:
             raise ValueError(
                 "MiniMax H3 does not support rollout: its coupled video/audio "

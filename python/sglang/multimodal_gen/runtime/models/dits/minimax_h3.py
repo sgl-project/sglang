@@ -36,6 +36,12 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTConfig,
 )
 from sglang.multimodal_gen.configs.models.fsdp import is_block
+from sglang.multimodal_gen.runtime.cache.spectrum import (
+    SpectrumMixin,
+    blend_h3_spectrum_prediction,
+    local_target_hidden,
+    target_audio_video_span,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     tensor_model_parallel_all_gather,
@@ -58,6 +64,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.usp import _ring_attention_varlen
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     is_layerwise_offloaded_module,
@@ -1546,7 +1553,7 @@ class MiniMaxH3FinalLayer(nn.Module):
         return video, audio
 
 
-class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
+class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     # refine_prompt_embeds drives a forward pass outside __call__.
     _fsdp_forward_methods = ("refine_prompt_embeds",)
@@ -1734,7 +1741,11 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 for index in range(arch.num_layers)
             ]
         )
-        self.layer_names = ["token_refiner.blocks", "blocks"]
+        # Offload the 50-layer DiT stack before token_refiner. Each
+        # LayerwiseOffloadManager ends with model.to(device) for leftovers;
+        # putting the 2-layer refiner first would copy the full INT8 DiT onto
+        # a 24GB card and OOM.
+        self.layer_names = ["blocks", "token_refiner.blocks"]
         self.final_layer = MiniMaxH3FinalLayer(
             arch,
             quant_config,
@@ -1754,6 +1765,9 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         )
         self._resolved_attention_backend: AttentionBackendEnum | None = None
         self._mark_missing_params_required()
+        self._init_spectrum_state()
+        self._h3_spectrum_last_audio: torch.Tensor | None = None
+        self._h3_spectrum_last_video: torch.Tensor | None = None
 
     def set_cache_dit_input_preservation(self, enabled: bool) -> None:
         """Stop the blocks from overwriting the input Cache-DiT holds by reference.
@@ -1770,6 +1784,78 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         """
         for block in self.blocks:
             block.preserve_input_for_cache_dit = enabled
+
+    def _h3_spectrum_requested(self, *, sp_ws: int) -> bool:
+        """True when this forward should use Spectrum. Off path stays bit-exact."""
+        try:
+            forward_batch = get_forward_context().forward_batch
+        except AssertionError:
+            return False
+        if forward_batch is None or not getattr(
+            forward_batch, "enable_spectrum", False
+        ):
+            return False
+        if sp_ws > 1:
+            raise ValueError(
+                "MiniMax-H3 Spectrum requires sequence-parallel size 1 so "
+                "target audio/video rows stay on one rank. Disable "
+                "--enable-spectrum or run without SP / Ulysses / ring."
+            )
+        return True
+
+    def _h3_spectrum_record_targets(
+        self,
+        hidden: torch.Tensor,
+        audio_pos: torch.Tensor,
+        infer_out_pos: torch.Tensor,
+        row_start: int,
+        row_stop: int,
+    ) -> None:
+        audio_start, audio_stop, video_stop = target_audio_video_span(
+            audio_pos, infer_out_pos
+        )
+        sliced = local_target_hidden(
+            hidden, audio_start, video_stop, row_start, row_stop
+        )
+        if sliced is None:
+            return
+        local, _, _ = sliced
+        n_audio = audio_stop - audio_start
+        cpu_local = local.detach().to(device="cpu", dtype=local.dtype)
+        self._h3_spectrum_last_audio = cpu_local[:n_audio].contiguous()
+        self._h3_spectrum_last_video = cpu_local[n_audio:].contiguous()
+        self.spectrum_record_features(cpu_local)
+
+    def _h3_spectrum_predict_targets(
+        self,
+        hidden: torch.Tensor,
+        audio_pos: torch.Tensor,
+        infer_out_pos: torch.Tensor,
+        row_start: int,
+        row_stop: int,
+    ) -> torch.Tensor:
+        audio_start, audio_stop, video_stop = target_audio_video_span(
+            audio_pos, infer_out_pos
+        )
+        sliced = local_target_hidden(
+            hidden, audio_start, video_stop, row_start, row_stop
+        )
+        if sliced is None:
+            return hidden
+        local, local_start, local_stop = sliced
+        predicted = self.spectrum_predict_features(
+            local.detach().to(device="cpu", dtype=local.dtype)
+        )
+        predicted = blend_h3_spectrum_prediction(
+            predicted,
+            n_audio=audio_stop - audio_start,
+            last_audio=self._h3_spectrum_last_audio,
+            last_video=self._h3_spectrum_last_video,
+        )
+        hidden[local_start:local_stop].copy_(
+            predicted.to(device=hidden.device, dtype=hidden.dtype)
+        )
+        return hidden
 
     def _resolve_attention_backend_once(self) -> None:
         if self._resolved_attention_backend is not None:
@@ -2243,48 +2329,81 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
 
         hidden = decoder_input
         cu_seqlens = cu_seqlens.to(device)
+        spectrum_on = self._h3_spectrum_requested(sp_ws=sp_ws)
+        run_transformer_blocks = (
+            self.begin_spectrum_step() if spectrum_on else True
+        )
+        if spectrum_on:
+            try:
+                timestep = get_forward_context().current_timestep
+            except AssertionError:
+                timestep = None
+            if timestep == 0:
+                self._h3_spectrum_last_audio = None
+                self._h3_spectrum_last_video = None
         block_adaln_params = None
         adaln_cache_plan_index = None
-        if self.adaln_cache is not None:
+        # Skip-step forecasts still run embed + final_layer. Do not touch
+        # per-block AdaLN or the 50-layer stack — that is what lets Spectrum
+        # coexist with DiT layerwise offload.
+        if run_transformer_blocks:
+            if self.adaln_cache is not None:
+                adaln_cache_plan_index = self.adaln_cache.lookup(
+                    unique_timesteps.view(-1).to(device)
+                )
+                block_adaln_params = tuple(
+                    self.adaln_cache.block(
+                        index,
+                        adaln_cache_plan_index,
+                        adaln_input.shape[0],
+                    )
+                    for index in range(len(self.blocks))
+                )
+            elif self._can_batch_block_adaln():
+                local_adaln = torch.stack(
+                    [
+                        block.adaln_proj.project_local(adaln_input)
+                        for block in self.blocks
+                    ]
+                )
+                gathered_adaln = tensor_model_parallel_all_gather(local_adaln)
+                block_adaln_params = tuple(
+                    block.adaln_proj.split_output(output)
+                    for block, output in zip(self.blocks, gathered_adaln)
+                )
+            # With sequence parallelism, shard rows across the group for the
+            # block stack. Attention trades sequence for heads internally
+            # (Ulysses) and/or ring-rotates KV across ring ranks; everything
+            # else, including the final layer, is row-local. Only the narrow
+            # video/audio logits are gathered after the final layer.
+            for index, block in enumerate(self.blocks):
+                hidden = block(
+                    hidden,
+                    adaln_input=adaln_input,
+                    combined_indices=block_combined,
+                    rope_cache=rope_cache,
+                    cu_seqlens=cu_seqlens,
+                    cu_seqlens_host=cu_seqlens_host,
+                    max_seqlen=max_seqlen,
+                    ulysses_active=ulysses_ws > 1,
+                    ring_active=ring_ws > 1,
+                    adaln_params=(
+                        None
+                        if block_adaln_params is None
+                        else block_adaln_params[index]
+                    ),
+                )
+            if spectrum_on:
+                self._h3_spectrum_record_targets(
+                    hidden, audio_pos, infer_out_pos, row_start, row_stop
+                )
+        elif spectrum_on:
+            hidden = self._h3_spectrum_predict_targets(
+                hidden, audio_pos, infer_out_pos, row_start, row_stop
+            )
+        if self.adaln_cache is not None and adaln_cache_plan_index is None:
             adaln_cache_plan_index = self.adaln_cache.lookup(
                 unique_timesteps.view(-1).to(device)
-            )
-            block_adaln_params = tuple(
-                self.adaln_cache.block(
-                    index,
-                    adaln_cache_plan_index,
-                    adaln_input.shape[0],
-                )
-                for index in range(len(self.blocks))
-            )
-        elif self._can_batch_block_adaln():
-            local_adaln = torch.stack(
-                [block.adaln_proj.project_local(adaln_input) for block in self.blocks]
-            )
-            gathered_adaln = tensor_model_parallel_all_gather(local_adaln)
-            block_adaln_params = tuple(
-                block.adaln_proj.split_output(output)
-                for block, output in zip(self.blocks, gathered_adaln)
-            )
-        # With sequence parallelism, shard rows across the group for the
-        # block stack. Attention trades sequence for heads internally
-        # (Ulysses) and/or ring-rotates KV across ring ranks; everything
-        # else, including the final layer, is row-local. Only the narrow
-        # video/audio logits are gathered after the final layer.
-        for index, block in enumerate(self.blocks):
-            hidden = block(
-                hidden,
-                adaln_input=adaln_input,
-                combined_indices=block_combined,
-                rope_cache=rope_cache,
-                cu_seqlens=cu_seqlens,
-                cu_seqlens_host=cu_seqlens_host,
-                max_seqlen=max_seqlen,
-                ulysses_active=ulysses_ws > 1,
-                ring_active=ring_ws > 1,
-                adaln_params=(
-                    None if block_adaln_params is None else block_adaln_params[index]
-                ),
             )
         self.materialize_mps_non_layer_weights("final_layer")
         video_logits, audio_logits = self.final_layer(
