@@ -1315,6 +1315,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 lora_ids=([None] * bs if self._capture_lora else None),
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
+            forward_batch = self.model_runner.prepare_dummy_forward_batch(forward_batch)
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
         return forward_batch, self.model_runner.attn_backend
 
@@ -1576,6 +1577,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 or forward_batch.return_pooled_hidden_states
             ),
         )
+        static_forward_batch = self.model_runner.prepare_dummy_forward_batch(
+            static_forward_batch
+        )
         if self._is_full_backend:
             forward_batch.next_token_logits_buffer = (
                 static_forward_batch.next_token_logits_buffer
@@ -1749,6 +1753,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             input_top_logprobs_idx=output.input_top_logprobs_idx,
             input_token_ids_logprobs_val=output.input_token_ids_logprobs_val,
             input_token_ids_logprobs_idx=output.input_token_ids_logprobs_idx,
+            customized_info=output.customized_info,
             mm_input_embeds=mm_input_embeds,
         )
 
