@@ -160,18 +160,9 @@ class GrammarMask(NamedTuple):
 
 
 def _grammar_key_contains_nul(key_type: str, key_string: str) -> bool:
-    """Whether a grammar spec carries a NUL byte that must never reach a backend.
-
-    xgrammar's regex converter appends its own NUL terminator and indexes past it
-    when the pattern itself carries an embedded NUL, so it segfaults instead of
-    raising -- taking down the whole process, since a signal cannot be caught by
-    an `except` clause.
-
-    For `regex` the NUL is a literal byte in the spec, but a JSON schema reaches
-    the same converter through its `pattern` keyword, where the client may spell
-    the NUL as an escaped `\\u0000` -- leaving no NUL byte in `key_string` at all.
-    So json-shaped specs are decoded and walked. A NUL has no meaning in a
-    regex/schema/grammar spec, so rejecting it costs nothing.
+    """A NUL in a spec segfaults xgrammar's regex converter, which a JSON schema
+    also reaches through `pattern` (possibly escaped). Drop once the upstream fix
+    https://github.com/mlc-ai/xgrammar/pull/850 is in our pinned version.
     """
     if "\x00" in key_string:
         return True

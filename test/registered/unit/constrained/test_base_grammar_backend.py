@@ -468,23 +468,6 @@ class TestLlguidanceStructuralTagTriggerPairing(unittest.TestCase):
 
 
 class TestNulByteGrammarRejection(unittest.TestCase):
-    """Bug regression: a client-supplied `regex` starting with a NUL byte crashed
-    the whole server. xgrammar's regex converter appends its own NUL terminator
-    and indexes past it when the input carries an embedded NUL, so
-    `Grammar.from_regex("\\x00...")` raises SIGSEGV rather than an exception --
-    and a segfault is an OS signal below the interpreter, which the
-    `except RuntimeError` in dispatch_regex cannot catch. One unauthenticated
-    request therefore killed the scheduler process for every concurrent user.
-
-    The same converter is reached through a JSON schema's `pattern`, so the guard
-    lives at the shared dispatch point: a NUL-bearing key must be rejected as an
-    InvalidGrammarObject without ever reaching a backend.
-
-    A json spec can also spell the NUL as an escaped `\\u0000`, in which case the
-    key string holds no NUL byte at all and only decoding it reveals the payload --
-    a scanner that checks the raw key string alone still lets the crash through.
-    """
-
     def setUp(self):
         self.backend = BaseGrammarBackend()
 
@@ -495,9 +478,8 @@ class TestNulByteGrammarRejection(unittest.TestCase):
         cases = [
             ("regex", "\x00\x01\x02\x1f"),
             ("regex", "\x00"),
-            # a NUL after valid characters does not crash xgrammar, but C string
-            # handling truncates at it, so the compiled grammar would silently be
-            # the prefix. Pinned so the guard cannot be narrowed to startswith().
+            # a non-leading NUL truncates the pattern instead of crashing; pinned
+            # so the guard cannot be narrowed to startswith()
             ("regex", "a\x00b"),
             ("ebnf", "root ::= \x00"),
             ("structural_tag", '{"triggers": ["\x00"]}'),
@@ -523,8 +505,6 @@ class TestNulByteGrammarRejection(unittest.TestCase):
                 dispatch.assert_not_called()
 
     def test_nul_free_payload_still_dispatches(self):
-        """The guard must not degrade to always-true: ordinary patterns, including
-        other control characters, still compile normally."""
         cases = [
             ("regex", "[0-9]+"),
             ("regex", r"\x00"),  # escaped in the pattern text, not a raw NUL byte
