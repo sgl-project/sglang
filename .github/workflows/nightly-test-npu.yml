@@ -392,7 +392,7 @@ jobs:
       max-parallel: 1
       matrix:
         test_config:
-          # kimi_k2_6 performance tests
+          # kimi_k2_6 performance test
           - name: kimi_k2_6_w4a8_16p_in64k_out1k_100ms
             node_size: 2
             test_case: test/registered/npu/performance/kimi_k2_6/test_npu_kimi_k2_6_w4a8_16p_in64k_out1k_100ms.py
