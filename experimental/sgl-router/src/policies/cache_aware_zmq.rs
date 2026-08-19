@@ -117,6 +117,44 @@ impl CacheAwareZmqPolicy {
             .map(Arc::clone)
     }
 
+    /// Cache-hit load guard. Given the worker chosen by cache overlap
+    /// (`hot`), divert to the globally least-loaded worker when `hot` is
+    /// backed up past both thresholds relative to the coolest worker.
+    /// Returns `hot` unchanged when the guard is OFF (rel = INFINITY), when
+    /// `hot` *is* the coolest worker, or when the gap is below threshold.
+    ///
+    /// Two conditions, both required (AND):
+    ///   ABS: `hot_load - min_load > hit_load_abs_threshold`
+    ///   REL: `hot_load > min_load * hit_load_rel_threshold`
+    /// The `is_finite()` arm-gate also dodges the `min_load == 0` edge: with
+    /// min_load 0 the REL test would degenerate to `hot_load > 0`, so we only
+    /// arm when the operator set a finite ratio.
+    fn apply_hit_load_guard(&self, hot: Arc<Worker>, workers: &[Arc<Worker>]) -> Arc<Worker> {
+        if !self.config.hit_load_rel_threshold.is_finite() {
+            return hot; // guard OFF — behaviour identical to plain cache-aware
+        }
+        let Some(cool) = Self::pick_min_load(workers) else {
+            return hot;
+        };
+        if cool.url == hot.url {
+            return hot;
+        }
+        let c = hot.active_load();
+        let m = cool.active_load();
+        let divert = c.saturating_sub(m) > self.config.hit_load_abs_threshold
+            && (c as f32) > (m as f32) * self.config.hit_load_rel_threshold;
+        if divert {
+            tracing::debug!(
+                hot = %hot.url, hot_load = c,
+                cool = %cool.url, cool_load = m,
+                "cache-aware-zmq: hit-load guard diverted off backed-up cache worker",
+            );
+            cool
+        } else {
+            hot
+        }
+    }
+
     /// Detect load imbalance. Returns `true` when the spread between max
     /// and min load is large enough that cache-aware routing would dump
     /// even more on the hot worker.
@@ -228,6 +266,12 @@ impl Policy for CacheAwareZmqPolicy {
             .filter(|w| matched_urls.contains(w.url.as_str()))
             .min_by_key(|w| w.active_load())
             .map(Arc::clone);
+        // Cache-hit load guard: even when a cache hit wins, the hit worker
+        // may be individually backed up while the system as a whole still
+        // looks balanced (so the imbalance fast-path above didn't fire).
+        // Divert to the globally least-loaded worker when the hit worker
+        // leads it past both thresholds. OFF by default (rel = INFINITY).
+        let best_matched = best_matched.map(|hot| self.apply_hit_load_guard(hot, workers));
         let chosen = best_matched.or_else(|| Self::pick_min_load(workers));
         if let Some(w) = &chosen {
             tracing::debug!(
@@ -263,6 +307,8 @@ mod tests {
             cache_threshold: 0.5,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
+            hit_load_abs_threshold: 0,
+            hit_load_rel_threshold: f32::INFINITY,
         }
     }
 
@@ -377,6 +423,8 @@ mod tests {
                 cache_threshold: 0.0, // any match counts
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY,
             },
             tree,
             registry,
@@ -414,6 +462,8 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY,
             },
             tree,
             registry,
@@ -459,6 +509,8 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY,
             },
             tree,
             toks,
@@ -510,6 +562,8 @@ mod tests {
                 cache_threshold: 1.0, // match_rate <= 1.0 always -> always fall back
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY,
             },
             tree,
             toks,
@@ -593,6 +647,8 @@ mod tests {
                     cache_threshold: 0.0,
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
+                    hit_load_abs_threshold: 0,
+                    hit_load_rel_threshold: f32::INFINITY,
                 },
                 tree,
                 Arc::clone(&registry),
@@ -632,6 +688,8 @@ mod tests {
                     cache_threshold: 0.0,
                     balance_abs_threshold: 32,
                     balance_rel_threshold: 1.1,
+                    hit_load_abs_threshold: 0,
+                    hit_load_rel_threshold: f32::INFINITY,
                 },
                 tree,
                 Arc::clone(&registry),
@@ -690,6 +748,8 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY,
             },
             tree,
             registry,
@@ -762,6 +822,8 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY,
             },
             tree,
             registry,
@@ -800,6 +862,8 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY,
             },
             tree,
             registry,
@@ -903,6 +967,8 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY,
             },
             tree,
             registry,
@@ -938,6 +1004,8 @@ mod tests {
                 cache_threshold: 0.0, // would normally always match
                 balance_abs_threshold: 5,
                 balance_rel_threshold: 2.0,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY,
             },
             tree,
             registry,
@@ -1063,6 +1131,8 @@ mod tests {
                 cache_threshold: 0.99,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY,
             },
             tree,
             tokenizer_registry_with_tiny(),
@@ -1146,6 +1216,8 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY,
             },
             tree.clone(),
             registry,
@@ -1243,6 +1315,8 @@ mod tests {
                 cache_threshold: 0.0,
                 balance_abs_threshold: 32,
                 balance_rel_threshold: 1.1,
+                hit_load_abs_threshold: 0,
+                hit_load_rel_threshold: f32::INFINITY,
             },
             tree,
             registry,
@@ -1264,5 +1338,126 @@ mod tests {
             chosen.url, "http://w0:30000",
             "select must use ctx tokens (w0's prefix), not re-tokenize the body"
         );
+    }
+
+    // ---- cache-hit load guard ----
+
+    /// Build a cache-aware-zmq policy whose tree is primed with `text`'s
+    /// prefix on worker `hit_url`, with the global imbalance fast-path
+    /// effectively disabled (huge balance_abs_threshold) so tests exercise
+    /// the per-hit load guard in isolation. Returns (policy, tokens).
+    fn guard_policy(
+        text: &str,
+        hit_url: &str,
+        hit_load_abs_threshold: usize,
+        hit_load_rel_threshold: f32,
+    ) -> (CacheAwareZmqPolicy, Vec<u32>) {
+        let tree = Arc::new(HashTree::new());
+        let registry = tokenizer_registry_with_tiny();
+        let tok = registry.get("tiny").unwrap();
+        let ids = adapter::encode(&tok, text).unwrap();
+        let hashes = compute_block_hashes(&ids, 4);
+        assert!(!hashes.is_empty(), "need at least one full block");
+        tree.insert(&KvWorkerId::new(hit_url.into(), 0), None, &hashes);
+        let policy = CacheAwareZmqPolicy::new(
+            CacheAwareConfig {
+                cache_threshold: 0.0, // any overlap counts as a hit
+                balance_abs_threshold: usize::MAX, // disable global fast-path
+                balance_rel_threshold: f32::INFINITY,
+                hit_load_abs_threshold,
+                hit_load_rel_threshold,
+            },
+            tree,
+            registry,
+            oracle_for_tests(4),
+        );
+        (policy, ids)
+    }
+
+    /// Guard OFF (rel = INFINITY, the default): a backed-up cache worker is
+    /// still chosen — behaviour identical to plain cache-aware.
+    #[test]
+    fn hit_load_guard_off_keeps_backed_up_cache_worker() {
+        let text = "hello world hello world hello world";
+        let (policy, ids) = guard_policy(text, "http://w0:30000", 0, f32::INFINITY);
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        // Pile load on the cache worker; w1 stays idle.
+        let _guards: Vec<_> = (0..10).map(|_| w0.load_guard()).collect();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(chosen.url, "http://w0:30000", "guard OFF keeps the cache hit");
+    }
+
+    /// Guard ARMED and the hit worker is backed up past both thresholds:
+    /// divert to the globally least-loaded worker.
+    #[test]
+    fn hit_load_guard_diverts_off_backed_up_worker() {
+        let text = "hello world hello world hello world";
+        let (policy, ids) = guard_policy(text, "http://w0:30000", 6, 1.2);
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        // w0 load 10, w1 load 0: gap 10 > abs 6, and 10 > 0*1.2 — divert.
+        let _guards: Vec<_> = (0..10).map(|_| w0.load_guard()).collect();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(chosen.url, "http://w1:30000", "armed guard diverts to coolest");
+    }
+
+    /// Guard ARMED but the gap is below the absolute threshold: keep the
+    /// cache hit even though another worker is slightly cooler.
+    #[test]
+    fn hit_load_guard_below_abs_keeps_cache_worker() {
+        let text = "hello world hello world hello world";
+        let (policy, ids) = guard_policy(text, "http://w0:30000", 6, 1.2);
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        // w0 load 4, w1 load 0: gap 4 <= abs 6 → ABS fails → keep hit.
+        let _guards: Vec<_> = (0..4).map(|_| w0.load_guard()).collect();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(chosen.url, "http://w0:30000", "below abs threshold keeps hit");
+    }
+
+    /// Guard ARMED, abs gap exceeded, but the relative ratio is not: keep
+    /// the cache hit. w0 load 10, w1 load 8 → gap 2 fails abs anyway, so use
+    /// a high abs=1 with a steep rel to isolate the REL condition: gap 2 >
+    /// abs 1, but 10 > 8*1.5 (=12) is false → REL fails → keep hit.
+    #[test]
+    fn hit_load_guard_below_rel_keeps_cache_worker() {
+        let text = "hello world hello world hello world";
+        let (policy, ids) = guard_policy(text, "http://w0:30000", 1, 1.5);
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        let _g0: Vec<_> = (0..10).map(|_| w0.load_guard()).collect();
+        let _g1: Vec<_> = (0..8).map(|_| w1.load_guard()).collect();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(chosen.url, "http://w0:30000", "below rel ratio keeps hit");
+    }
+
+    /// Guard ARMED but the hit worker already IS the globally least-loaded
+    /// one: nothing to divert to, keep it.
+    #[test]
+    fn hit_load_guard_hit_is_coolest_keeps_it() {
+        let text = "hello world hello world hello world";
+        let (policy, ids) = guard_policy(text, "http://w0:30000", 6, 1.2);
+        let w0 = worker("http://w0:30000", "tiny");
+        let w1 = worker("http://w1:30000", "tiny");
+        // w1 is the busy one; the cache hit (w0) is already coolest.
+        let _g1: Vec<_> = (0..10).map(|_| w1.load_guard()).collect();
+        let workers = vec![Arc::clone(&w0), Arc::clone(&w1)];
+        let model = ModelId("tiny".into());
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+        let chosen = policy.select(&workers, &ctx).expect("must pick");
+        assert_eq!(chosen.url, "http://w0:30000", "hit already coolest, keep it");
     }
 }

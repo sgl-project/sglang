@@ -109,6 +109,8 @@ async fn zmq_indexer_routes_to_publishing_worker_e2e() {
             cache_threshold: 0.0,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
+            hit_load_abs_threshold: 0,
+            hit_load_rel_threshold: f32::INFINITY,
         },
         kv_index.tree(),
         Arc::clone(&tokenizers),
