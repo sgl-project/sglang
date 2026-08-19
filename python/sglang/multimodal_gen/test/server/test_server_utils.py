@@ -540,7 +540,8 @@ class PerformanceValidator:
         actual: float,
         expected: float,
         tolerance: float,
-        min_abs_tolerance_ms: float = 20.0,
+        min_abs_tolerance: float = 20.0,
+        unit: str = "ms",
     ):
         """Assert that actual is less than or equal to expected within a tolerance.
 
@@ -556,28 +557,41 @@ class PerformanceValidator:
             # Use 100% higher tolerance for AMD (2x the expected value)
             amd_tolerance = 1.0  # 100%
             upper_bound = calculate_upper_bound(
-                expected, amd_tolerance, min_abs_tolerance_ms
+                expected, amd_tolerance, min_abs_tolerance
             )
             if actual > upper_bound:
                 logger.warning(
                     f"[AMD PERF WARNING] Validation would fail for '{name}'.\n"
-                    f"  Actual:   {actual:.4f}ms\n"
-                    f"  Expected: {expected:.4f}ms\n"
-                    f"  AMD Limit: {upper_bound:.4f}ms "
-                    f"(rel_tol: {amd_tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)\n"
+                    f"  Actual:   {actual:.4f}{unit}\n"
+                    f"  Expected: {expected:.4f}{unit}\n"
+                    f"  AMD Limit: {upper_bound:.4f}{unit} "
+                    f"(rel_tol: {amd_tolerance:.1%}, "
+                    f"abs_pad: {min_abs_tolerance}{unit})\n"
                     f"  Original tolerance was: {tolerance:.1%}"
                 )
         else:
-            upper_bound = calculate_upper_bound(
-                expected, tolerance, min_abs_tolerance_ms
-            )
+            upper_bound = calculate_upper_bound(expected, tolerance, min_abs_tolerance)
             assert actual <= upper_bound, (
                 f"Validation failed for '{name}'.\n"
-                f"  Actual:   {actual:.4f}ms\n"
-                f"  Expected: {expected:.4f}ms\n"
-                f"  Limit:    {upper_bound:.4f}ms "
-                f"(rel_tol: {tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)"
+                f"  Actual:   {actual:.4f}{unit}\n"
+                f"  Expected: {expected:.4f}{unit}\n"
+                f"  Limit:    {upper_bound:.4f}{unit} "
+                f"(rel_tol: {tolerance:.1%}, "
+                f"abs_pad: {min_abs_tolerance}{unit})"
             )
+
+    def validate_peak_vram(
+        self, summary: PerformanceSummary, expected_peak_vram_mb: float
+    ) -> None:
+        assert summary.peak_vram_mb > 0, "Lifetime peak VRAM metric missing"
+        self._assert_le(
+            "Lifetime Peak VRAM",
+            summary.peak_vram_mb,
+            expected_peak_vram_mb,
+            self.tolerances.peak_vram,
+            min_abs_tolerance=256.0,
+            unit=" MiB",
+        )
 
     def validate(
         self, perf_record: RequestPerfRecord, *args, **kwargs
@@ -641,7 +655,7 @@ class PerformanceValidator:
                     actual,
                     expected,
                     FIRST_DENOISE_STEP_TOLERANCE,
-                    min_abs_tolerance_ms=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                    min_abs_tolerance=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
                 )
                 continue
 
@@ -668,15 +682,15 @@ class PerformanceValidator:
             )
             if stage.endswith("DecodingStage"):
                 tolerance = max(tolerance, 0.9)
-                min_abs_tolerance_ms = DECODING_STAGE_MIN_ABS_TOLERANCE_MS
+                min_abs_tolerance = DECODING_STAGE_MIN_ABS_TOLERANCE_MS
             else:
-                min_abs_tolerance_ms = 120.0
+                min_abs_tolerance = 120.0
             self._assert_le(
                 f"Stage '{stage}'",
                 actual,
                 expected,
                 tolerance,
-                min_abs_tolerance_ms=min_abs_tolerance_ms,
+                min_abs_tolerance=min_abs_tolerance,
             )
 
 
@@ -697,7 +711,7 @@ class VideoPerformanceValidator(PerformanceValidator):
                     actual,
                     expected,
                     FIRST_DENOISE_STEP_TOLERANCE,
-                    min_abs_tolerance_ms=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                    min_abs_tolerance=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
                 )
                 continue
 
@@ -708,7 +722,7 @@ class VideoPerformanceValidator(PerformanceValidator):
                 actual,
                 expected,
                 self.tolerances.denoise_step,
-                min_abs_tolerance_ms=VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                min_abs_tolerance=VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
             )
 
     def validate(

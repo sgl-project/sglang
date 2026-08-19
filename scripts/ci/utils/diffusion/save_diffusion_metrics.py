@@ -49,6 +49,7 @@ def transform_diffusion_result(result: dict, gpu_config: str) -> dict:
         "e2e_ms": result.get("e2e_ms"),
         "avg_denoise_ms": result.get("avg_denoise_ms"),
         "median_denoise_ms": result.get("median_denoise_ms"),
+        "peak_vram_mb": result.get("peak_vram_mb"),
         "stage_metrics": result.get("stage_metrics", {}),
         "sampled_steps": result.get("sampled_steps", {}),
         # Video-specific metrics (if present)

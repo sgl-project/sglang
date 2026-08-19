@@ -43,10 +43,30 @@ def _write_github_step_summary(content: str):
 def _write_results_json(results: list, output_path: str = "diffusion-results.json"):
     """Write performance results to JSON file for CI artifact collection."""
     try:
+        existing = []
+        if os.path.exists(output_path):
+            try:
+                with open(output_path, encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    existing = loaded
+            except json.JSONDecodeError:
+                pass
+
+        merged = {
+            (entry.get("class_name"), entry.get("test_name")): entry
+            for entry in existing
+        }
+        merged.update(
+            {
+                (entry.get("class_name"), entry.get("test_name")): entry
+                for entry in results
+            }
+        )
         with open(output_path, "w") as f:
-            json.dump(results, f, indent=2)
+            json.dump(list(merged.values()), f, indent=2)
         print(f"[CONFTEST] Wrote results to {output_path}")
-    except Exception as e:
+    except (json.JSONDecodeError, OSError) as e:
         print(f"[CONFTEST] Failed to write results JSON: {e}")
 
 
@@ -63,15 +83,16 @@ def _generate_diffusion_markdown_report(results: list) -> str:
 
     # Main performance table
     markdown = header
-    markdown += "| Test Suite | Test Name | Modality | E2E (ms) | Avg Denoise (ms) | Median Denoise (ms) |\n"
-    markdown += "| ---------- | --------- | -------- | -------- | ---------------- | ------------------- |\n"
+    markdown += "| Test Suite | Test Name | Modality | E2E (ms) | Avg Denoise (ms) | Median Denoise (ms) | Peak VRAM (MiB) |\n"
+    markdown += "| ---------- | --------- | -------- | -------- | ---------------- | ------------------- | --------------- |\n"
 
     for entry in sorted(results, key=lambda x: (x["class_name"], x["test_name"])):
         modality = entry.get("modality", "image")
         markdown += (
             f"| {entry['class_name']} | {entry['test_name']} | {modality} | "
             f"{entry['e2e_ms']:.2f} | {entry['avg_denoise_ms']:.2f} | "
-            f"{entry['median_denoise_ms']:.2f} |\n"
+            f"{entry['median_denoise_ms']:.2f} | "
+            f"{entry.get('peak_vram_mb', 0):.0f} |\n"
         )
 
     # Video-specific metrics table (if any video tests)
@@ -111,7 +132,7 @@ def pytest_sessionfinish(session):
     # Print to stdout (existing behavior)
     print("\n\n" + "=" * 35 + " Performance Summary " + "=" * 35)
     print(
-        f"{'Test Suite':<30} | {'Test Name':<20} | {'E2E (ms)':>12} | {'Avg Denoise (ms)':>18} | {'Median Denoise (ms)':>20}"
+        f"{'Test Suite':<30} | {'Test Name':<20} | {'E2E (ms)':>12} | {'Avg Denoise (ms)':>18} | {'Median Denoise (ms)':>20} | {'Peak VRAM (MiB)':>15}"
     )
     print(
         "-" * 30
@@ -123,15 +144,18 @@ def pytest_sessionfinish(session):
         + "-" * 18
         + "-+-"
         + "-" * 20
+        + "-+-"
+        + "-" * 15
     )
 
     for entry in sorted_results:
         print(
             f"{entry['class_name']:<30} | {entry['test_name']:<20} | {entry['e2e_ms']:>12.2f} | "
-            f"{entry['avg_denoise_ms']:>18.2f} | {entry['median_denoise_ms']:>20.2f}"
+            f"{entry['avg_denoise_ms']:>18.2f} | {entry['median_denoise_ms']:>20.2f} | "
+            f"{entry.get('peak_vram_mb', 0):>15.0f}"
         )
 
-    print("=" * 91)
+    print("=" * 109)
 
     print("\n\n" + "=" * 36 + " Detailed Reports " + "=" * 37)
     for entry in sorted_results:

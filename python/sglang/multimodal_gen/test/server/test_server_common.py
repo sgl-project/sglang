@@ -446,6 +446,21 @@ class DiffusionServerBase:
         summary = validator.collect_metrics(perf_record)
         self._print_performance_log(case, summary, scenario)
 
+        expected_peak_vram_mb = BASELINE_CONFIG.peak_vram_mb.get(case.id)
+        if not is_baseline_generation_mode and BASELINE_CONFIG.peak_vram_mb:
+            if expected_peak_vram_mb is None:
+                self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                pytest.fail(
+                    f"Testcase '{case.id}' has no peak_vram_mb baseline in "
+                    f"{get_perf_baseline_path()}"
+                )
+            try:
+                validator.validate_peak_vram(summary, expected_peak_vram_mb)
+            except AssertionError as e:
+                logger.error(f"Peak VRAM validation failed for {case.id}:\n{e}")
+                self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                raise
+
         if case.run_perf_check:
             if is_baseline_generation_mode:
                 _PENDING_BASELINE_DUMPS[case.id] = (summary, missing_scenario)
@@ -473,6 +488,7 @@ class DiffusionServerBase:
             "e2e_ms": summary.e2e_ms,
             "avg_denoise_ms": summary.avg_denoise_ms,
             "median_denoise_ms": summary.median_denoise_ms,
+            "peak_vram_mb": summary.peak_vram_mb,
             "stage_metrics": summary.stage_metrics,
             "sampled_steps": summary.sampled_steps,
         }
@@ -504,7 +520,8 @@ class DiffusionServerBase:
             (
                 f"  e2e={summary.e2e_ms:.2f}ms, "
                 f"avg_denoise={summary.avg_denoise_ms:.2f}ms, "
-                f"median_denoise={summary.median_denoise_ms:.2f}ms"
+                f"median_denoise={summary.median_denoise_ms:.2f}ms, "
+                f"peak_vram={summary.peak_vram_mb:.0f}MiB"
             ),
         ]
         if scenario is not None:
@@ -514,6 +531,9 @@ class DiffusionServerBase:
                 f"avg_denoise={scenario.expected_avg_denoise_ms:.2f}ms, "
                 f"median_denoise={scenario.expected_median_denoise_ms:.2f}ms"
             )
+        expected_peak_vram_mb = BASELINE_CONFIG.peak_vram_mb.get(case.id)
+        if expected_peak_vram_mb is not None:
+            lines.append(f"  peak_vram_baseline: {expected_peak_vram_mb:.0f}MiB")
         if summary.stage_metrics:
             stages = ", ".join(
                 f"{name}={duration:.2f}ms"
@@ -569,6 +589,10 @@ class DiffusionServerBase:
 {action} this baseline in the "scenarios" section of {get_perf_baseline_path()}:
 
 "{case.id}": {json.dumps(baseline, indent=4)}
+
+and set this entry in the top-level "peak_vram_mb" object:
+
+"{case.id}": {round(summary.peak_vram_mb, 2)}
 
 """
         logger.error(output)
