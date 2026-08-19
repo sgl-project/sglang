@@ -35,6 +35,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fp8_dot_support import dot_in_kv_dtype
 from sglang.srt.utils import is_hip
 
 _MIN_BLOCK_KV = 32
@@ -155,6 +156,10 @@ def _verify_prefix_stage1(
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MIN_BLOCK_KV: tl.constexpr,
+    # Per-dot: cast the query-side tile down to the KV-pool dtype (fp8 matrix
+    # core), or upcast the KV tile instead. See fp8_dot_support.dot_in_kv_dtype.
+    QK_DOT_IN_KV_DTYPE: tl.constexpr = True,
+    PV_DOT_IN_KV_DTYPE: tl.constexpr = True,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -197,7 +202,12 @@ def _verify_prefix_stage1(
             mask=mask_l[:, None] & (offs_d[None, :] < HEAD_DIM),
             other=0.0,
         )
-        q_k = q.to(K_Buffer.dtype.element_ty)
+        # Casting Q to the pool dtype is hoisted out of the KV loop; the
+        # upcast-K alternative below has to happen per tile instead.
+        if QK_DOT_IN_KV_DTYPE:
+            q_k = q.to(K_Buffer.dtype.element_ty)
+        else:
+            q_k = q
 
         base_offs_k = cur_kv_head * stride_buf_kh + offs_d[:, None]
         base_offs_v = cur_kv_head * stride_buf_vh + offs_dv[None, :]
@@ -217,7 +227,10 @@ def _verify_prefix_stage1(
                 mask=(offs_d[:, None] < HEAD_DIM) & n_mask[None, :],
                 other=0.0,
             )
-            qk = tl.dot(q_k, k)  # [L_EXT, BLOCK_N]
+            if QK_DOT_IN_KV_DTYPE:
+                qk = tl.dot(q_k, k)  # [L_EXT, BLOCK_N]
+            else:
+                qk = tl.dot(q_k, k.to(q_k.dtype))
             qk *= sm_scale * k_scale  # fp8 dequant of prefix K (k_scale==1 if bf16)
             # NO causal mask: full prefix is visible to all draft tokens.
             qk = tl.where(n_mask[None, :], qk, float("-inf"))
@@ -234,7 +247,10 @@ def _verify_prefix_stage1(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
+            if PV_DOT_IN_KV_DTYPE:
+                acc += tl.dot(p.to(v.dtype), v)
+            else:
+                acc += tl.dot(p.to(q.dtype), v.to(q.dtype))
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
 
@@ -521,6 +537,10 @@ class VerifySplitKV:
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
             BLOCK_N=self.block_n,
             MIN_BLOCK_KV=_MIN_BLOCK_KV,
+            QK_DOT_IN_KV_DTYPE=dot_in_kv_dtype(
+                k_buffer.dtype, triton.next_power_of_2(self.head_dim)
+            ),
+            PV_DOT_IN_KV_DTYPE=dot_in_kv_dtype(v_buffer.dtype, self.block_n),
             num_warps=self.num_warps,
             num_stages=1,
             **_AMD_LAUNCH_KWARGS,

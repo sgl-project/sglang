@@ -16,6 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fp8_dot_support import dot_in_kv_dtype
 from sglang.kernels.ops.attention.verify_splitkv import _AMD_LAUNCH_KWARGS
 
 MAX_N_SPLITS = 32  # Grid split dim upper bound
@@ -87,6 +88,11 @@ def _verify_mla_prefix_stage1(
     BLOCK_DPE: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    # Per-dot: cast the query-side tile down to the KV-pool dtype (fp8 matrix
+    # core), or upcast the KV tile instead. See fp8_dot_support.dot_in_kv_dtype.
+    QK_DOT_IN_KV_DTYPE: tl.constexpr = True,
+    QK_PE_DOT_IN_KV_DTYPE: tl.constexpr = True,
+    PV_DOT_IN_KV_DTYPE: tl.constexpr = True,
 ):
     cur_batch = tl.program_id(0)
     head_block = tl.program_id(1)
@@ -126,17 +132,23 @@ def _verify_mla_prefix_stage1(
             (cur_q_start + offs_l)[None, :] * stride_qbs + offs_h[:, None] * stride_qh,
             (R,),
         )
+        # Casting Q to the pool dtype is hoisted out of the KV loop; the
+        # upcast-K alternative below has to happen per tile instead.
         q_nope = tl.load(
             Q + q_row[:, None] + offs_dn[None, :],
             mask=row_mask[:, None] & (offs_dn[None, :] < NOPE_DIM),
             other=0.0,
-        ).to(K_Buffer.dtype.element_ty)
+        )
+        if QK_DOT_IN_KV_DTYPE:
+            q_nope = q_nope.to(K_Buffer.dtype.element_ty)
         if PE_DIM > 0:
             q_pe = tl.load(
                 Q + q_row[:, None] + (NOPE_DIM + offs_dp)[None, :],
                 mask=row_mask[:, None] & (offs_dp[None, :] < PE_DIM),
                 other=0.0,
-            ).to(K_Buffer.dtype.element_ty)
+            )
+            if QK_PE_DOT_IN_KV_DTYPE:
+                q_pe = q_pe.to(K_Buffer.dtype.element_ty)
 
         e_max = tl.zeros([R], dtype=tl.float32) - float("inf")
         e_sum = tl.zeros([R], dtype=tl.float32)
@@ -155,14 +167,20 @@ def _verify_mla_prefix_stage1(
                 mask=(offs_dn[:, None] < NOPE_DIM) & n_mask[None, :],
                 other=0.0,
             )
-            qk = tl.dot(q_nope, k_nope)
+            if QK_DOT_IN_KV_DTYPE:
+                qk = tl.dot(q_nope, k_nope)
+            else:
+                qk = tl.dot(q_nope, k_nope.to(q_nope.dtype))
             if PE_DIM > 0:
                 k_pe = tl.load(
                     K_Buffer + base + (NOPE_DIM + offs_dp)[:, None],
                     mask=(offs_dp[:, None] < PE_DIM) & n_mask[None, :],
                     other=0.0,
                 )
-                qk += tl.dot(q_pe, k_pe)
+                if QK_PE_DOT_IN_KV_DTYPE:
+                    qk += tl.dot(q_pe, k_pe)
+                else:
+                    qk += tl.dot(q_pe, k_pe.to(q_pe.dtype))
             qk *= sm_scale * k_scale
             qk = tl.where(n_mask[None, :], qk, float("-inf"))
 
@@ -177,7 +195,10 @@ def _verify_mla_prefix_stage1(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
+            if PV_DOT_IN_KV_DTYPE:
+                acc += tl.dot(p.to(v.dtype), v)
+            else:
+                acc += tl.dot(p.to(Q.dtype.element_ty), v.to(Q.dtype.element_ty))
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
 
@@ -402,6 +423,7 @@ class VerifyMLA:
         v_scale,
     ):
         grid = (bs, self.n_head_blocks, num_splits)
+        block_dpe = max(1, triton.next_power_of_2(self.pe_dim))
         _verify_mla_prefix_stage1[grid](
             q_extend,
             k_buffer,
@@ -433,9 +455,15 @@ class VerifyMLA:
             PE_DIM=self.pe_dim,
             V_HEAD_DIM=self.v_head_dim,
             BLOCK_DNOPE=triton.next_power_of_2(self.nope_dim),
-            BLOCK_DPE=max(1, triton.next_power_of_2(self.pe_dim)),
+            BLOCK_DPE=block_dpe,
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
             BLOCK_N=self.block_n,
+            QK_DOT_IN_KV_DTYPE=dot_in_kv_dtype(
+                k_buffer.dtype, triton.next_power_of_2(self.nope_dim)
+            ),
+            QK_PE_DOT_IN_KV_DTYPE=self.pe_dim == 0
+            or dot_in_kv_dtype(k_buffer.dtype, block_dpe),
+            PV_DOT_IN_KV_DTYPE=dot_in_kv_dtype(v_buffer.dtype, self.block_n),
             num_warps=self.num_warps,
             num_stages=1,
             **_AMD_LAUNCH_KWARGS,

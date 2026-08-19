@@ -21,6 +21,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
+from sglang.kernels.ops.attention.fp8_dot_support import dot_in_kv_dtype
 from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
@@ -360,6 +361,11 @@ def _fwd_kernel(
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
     USE_COMPACT_TILE_GRID: tl.constexpr,
+    # Per-dot: cast the query-side tile down to the KV-pool dtype (fp8 matrix
+    # core), or upcast the KV tile instead. See fp8_dot_support.dot_in_kv_dtype.
+    QK_DOT_IN_KV_DTYPE: tl.constexpr = True,
+    QK_PE_DOT_IN_KV_DTYPE: tl.constexpr = True,
+    PV_DOT_IN_KV_DTYPE: tl.constexpr = True,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
@@ -520,7 +526,10 @@ def _fwd_kernel(
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
                 other=0.0,
             )
-            qk = tl.dot(q.to(k.dtype), k)
+            if QK_DOT_IN_KV_DTYPE:
+                qk = tl.dot(q.to(k.dtype), k)
+            else:
+                qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
                 if PAGE_SIZE == 1:
                     offs_kpe = (
@@ -540,7 +549,10 @@ def _fwd_kernel(
                     mask=mask_n[None, :],
                     other=0.0,
                 )
-                qk += tl.dot(qpe.to(kpe.dtype), kpe)
+                if QK_PE_DOT_IN_KV_DTYPE:
+                    qk += tl.dot(qpe.to(kpe.dtype), kpe)
+                else:
+                    qk += tl.dot(qpe, kpe.to(qpe.dtype))
             qk *= sm_scale * k_scale
 
             if logit_cap > 0:
@@ -593,8 +605,11 @@ def _fwd_kernel(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
+            if PV_DOT_IN_KV_DTYPE:
+                pv = tl.dot(p.to(v.dtype), v)
+            else:
+                pv = tl.dot(p.to(q.dtype), v.to(q.dtype))
+            acc = acc * re_scale[:, None] + pv * v_scale
 
             e_max = n_e_max
 
@@ -854,6 +869,12 @@ def extend_attention_fwd(
         score_mod, aux_tensors
     )
 
+    # Each prefix-stage dot reduces a different width, so each gets its own
+    # verdict on whether it may run in the (possibly fp8) pool dtype.
+    qk_dot_in_kv_dtype = dot_in_kv_dtype(k_buffer.dtype, BLOCK_DMODEL)
+    qk_pe_dot_in_kv_dtype = BLOCK_DPE == 0 or dot_in_kv_dtype(k_buffer.dtype, BLOCK_DPE)
+    pv_dot_in_kv_dtype = dot_in_kv_dtype(v_buffer.dtype, BLOCK_N)
+
     _fwd_kernel[grid](
         q_extend,
         k_extend,
@@ -911,6 +932,9 @@ def extend_attention_fwd(
         HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
         USE_COMPACT_TILE_GRID=use_compact_tile_grid,
+        QK_DOT_IN_KV_DTYPE=qk_dot_in_kv_dtype,
+        QK_PE_DOT_IN_KV_DTYPE=qk_pe_dot_in_kv_dtype,
+        PV_DOT_IN_KV_DTYPE=pv_dot_in_kv_dtype,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
         Aux0=aux0,
@@ -1003,6 +1027,10 @@ def _fwd_kernel_unified(
     IS_CAUSAL: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    # See the matching arguments on _fwd_kernel.
+    QK_DOT_IN_KV_DTYPE: tl.constexpr = True,
+    QK_PE_DOT_IN_KV_DTYPE: tl.constexpr = True,
+    PV_DOT_IN_KV_DTYPE: tl.constexpr = True,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
@@ -1171,7 +1199,10 @@ def _fwd_kernel_unified(
                 other=0.0,
             )
 
-            qk = tl.dot(q.to(k.dtype), k)
+            if QK_DOT_IN_KV_DTYPE:
+                qk = tl.dot(q.to(k.dtype), k)
+            else:
+                qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
                 if PAGE_SIZE == 1:
                     offs_kpe = (
@@ -1191,7 +1222,10 @@ def _fwd_kernel_unified(
                     mask=mask_n[None, :],
                     other=0.0,
                 )
-                qk += tl.dot(qpe.to(kpe.dtype), kpe)
+                if QK_PE_DOT_IN_KV_DTYPE:
+                    qk += tl.dot(qpe.to(kpe.dtype), kpe)
+                else:
+                    qk += tl.dot(qpe, kpe.to(qpe.dtype))
 
             qk *= sm_scale_withk
 
@@ -1245,8 +1279,10 @@ def _fwd_kernel_unified(
                 mask=mask_n[:, None] & mask_dv[None, :],
                 other=0.0,
             )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v)
+            if PV_DOT_IN_KV_DTYPE:
+                acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v)
+            else:
+                acc = acc * re_scale[:, None] + tl.dot(p.to(q.dtype), v.to(q.dtype))
 
             e_max = n_e_max
 
@@ -1357,6 +1393,10 @@ def extend_attention_fwd_unified(
         score_mod, aux_tensors
     )
 
+    qk_dot_in_kv_dtype = dot_in_kv_dtype(k_buffer.dtype, BLOCK_DMODEL)
+    qk_pe_dot_in_kv_dtype = BLOCK_DPE == 0 or dot_in_kv_dtype(k_buffer.dtype, BLOCK_DPE)
+    pv_dot_in_kv_dtype = dot_in_kv_dtype(v_buffer.dtype, BLOCK_N)
+
     _fwd_kernel_unified[grid](
         q,
         o,
@@ -1398,6 +1438,9 @@ def extend_attention_fwd_unified(
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         HAS_SINK=HAS_SINK,
+        QK_DOT_IN_KV_DTYPE=qk_dot_in_kv_dtype,
+        QK_PE_DOT_IN_KV_DTYPE=qk_pe_dot_in_kv_dtype,
+        PV_DOT_IN_KV_DTYPE=pv_dot_in_kv_dtype,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
         Aux0=aux0,

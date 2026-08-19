@@ -26,6 +26,7 @@ from typing import NamedTuple, Optional, Tuple
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fp8_dot_support import dot_in_kv_dtype
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_core_count, is_gfx95_supported, is_hip
@@ -576,6 +577,10 @@ def _fwd_grouped_kernel_stage1(
     HAS_MLA: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
+    # Per-dot: cast the query-side tile down to the KV-pool dtype (fp8 matrix
+    # core), or upcast the KV tile instead. See fp8_dot_support.dot_in_kv_dtype.
+    QK_DOT_IN_KV_DTYPE: tl.constexpr = True,
+    PV_DOT_IN_KV_DTYPE: tl.constexpr = True,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
     aux0_stride_t=0,
@@ -649,7 +654,12 @@ def _fwd_grouped_kernel_stage1(
 
     if split_kv_end > split_kv_start:
         q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
-        q_k = q.to(K_Buffer.dtype.element_ty)
+        # Casting Q to the pool dtype is hoisted out of the KV loop; the
+        # upcast-K alternative below has to happen per tile instead.
+        if QK_DOT_IN_KV_DTYPE:
+            q_k = q.to(K_Buffer.dtype.element_ty)
+        else:
+            q_k = q
         if BLOCK_DPE > 0:
             qpe = tl.load(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
@@ -677,7 +687,10 @@ def _fwd_grouped_kernel_stage1(
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                 other=0.0,
             )
-            qk = tl.dot(q_k, k)
+            if QK_DOT_IN_KV_DTYPE:
+                qk = tl.dot(q_k, k)
+            else:
+                qk = tl.dot(q_k, k.to(q_k.dtype))
             if BLOCK_DPE > 0:
                 if PAGE_SIZE == 1:
                     offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
@@ -739,7 +752,10 @@ def _fwd_grouped_kernel_stage1(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
+            if PV_DOT_IN_KV_DTYPE:
+                acc += tl.dot(p.to(v.dtype), v)
+            else:
+                acc += tl.dot(p.to(q.dtype), v.to(q.dtype))
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
@@ -896,6 +912,11 @@ def _decode_grouped_att_m_fwd(
         HAS_MLA=has_mla,
         USE_PDL=use_pdl,
         PAGE_SIZE=page_size,
+        # HAS_MLA reuses the K tile as V, so both dots read the K pool there.
+        QK_DOT_IN_KV_DTYPE=dot_in_kv_dtype(k_buffer.dtype, BLOCK_DMODEL),
+        PV_DOT_IN_KV_DTYPE=dot_in_kv_dtype(
+            k_buffer.dtype if has_mla else v_buffer.dtype, BLOCK
+        ),
         SCORE_MOD=score_mod,
         Aux0=aux0,
         aux0_stride_t=aux0_stride_t,
