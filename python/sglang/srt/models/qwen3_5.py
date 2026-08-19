@@ -631,13 +631,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def _forward_xpu(
         self,
-        hidden_states: torch.Tensor,
+        projected_states_qkvz: torch.Tensor,
+        projected_states_ba: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
-        )
-
         core_attn_out = z = None
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
@@ -686,13 +683,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
-        if _is_xpu:
-            if (xpu_out := self._forward_xpu(hidden_states, forward_batch)) is not None:
-                return xpu_out
-
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
+
+        if _is_xpu:
+            xpu_out = self._forward_xpu(
+                projected_states_qkvz, projected_states_ba, forward_batch
+            )
+            if xpu_out is not None:
+                return xpu_out
 
         if (
             self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS
