@@ -538,11 +538,24 @@ class LayerCommunicator:
         """True if ``prepare_mlp``'s post-attention RMSNorm leaves ``residual``
         untouched, so Eagle3 aux capture can keep its reference and skip the clone.
 
-        Only the flashinfer all-reduce-fusion path writes a fresh ``residual_out``
-        (see ``flashinfer_allreduce_residual_rmsnorm``); the aiter fused kernel and
-        every plain norm fold into ``residual`` in place. That path is reachable
-        only from the ``_gather_*`` communicate-fns, and only when they fall past
-        their input-scattered branch.
+        A plain norm (``RMSNorm.forward(x, residual)``) folds the residual add
+        into ``residual`` in place, so its caller must clone before capture. Both
+        all-reduce-fusion kernels instead return a *fresh* residual tensor and
+        leave their residual input unwritten:
+
+        * flashinfer — ``flashinfer_allreduce_residual_rmsnorm`` writes
+          ``residual_out``.
+        * aiter (ROCm) — ``custom_fused_ar_rms`` / ``fused_ar_rms`` write a
+          separate ``res_out`` and never mutate ``res_inp``. Verified under real
+          TP2: ``res_out == AR(inp)`` bit-exact at 16 shapes across both the
+          1-stage and 2-stage variants, with ``res_inp`` unchanged.
+
+        This predicate nevertheless reports only the flashinfer path, so the
+        aiter path still takes the defensive clone in ``_gather_*``. That is
+        conservative-safe (an unnecessary copy, never a wrong capture); widening
+        it to the aiter path is a measurable-perf change and is left alone here.
+        The predicate is reachable only from the ``_gather_*`` communicate-fns,
+        and only when they fall past their input-scattered branch.
         """
         norm_fn = getattr(
             self._communicate_with_all_reduce_and_layer_norm_fn,
