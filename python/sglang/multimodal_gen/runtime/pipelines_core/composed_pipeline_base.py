@@ -1029,10 +1029,7 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
-        self.component_residency_manager = get_global_component_residency_manager(
-            self, server_args
-        )
-        self.executor.component_residency_manager = self.component_residency_manager
+        self._install_component_residency_manager(server_args)
 
         return self.executor.execute_with_profiling(self.stages, batch, server_args)
 
@@ -1062,6 +1059,8 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
+        self._install_component_residency_manager(server_args)
+
         return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
         )
@@ -1080,12 +1079,23 @@ class ComposedPipelineBase(ABC):
             yield self.forward(batches[0], server_args)
             return
 
-        self.component_residency_manager = get_global_component_residency_manager(
-            self, server_args
-        )
-        self.executor.component_residency_manager = self.component_residency_manager
+        self._install_component_residency_manager(server_args)
         yield from self.executor.execute_group_sequentially_with_profiling(
             self.stages,
             batches,
             server_args,
         )
+
+    def _install_component_residency_manager(self, server_args: ServerArgs) -> None:
+        """Publish the residency manager the executor dereferences unguarded.
+
+        ``PipelineExecutor`` initializes ``component_residency_manager`` to
+        ``None``, and every ``_execute_stages`` run enters
+        ``_component_residency_request``. An entry point that reaches the
+        executor without calling this raises ``AttributeError`` on ``None``, so
+        all three forward paths must install it.
+        """
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
