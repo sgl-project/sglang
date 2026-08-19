@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -31,6 +32,27 @@ class TorchNativeAttnBackend(AttentionBackend):
         )
         # full->SWA translated out_cache_loc, computed once per forward
         self.swa_out_cache_loc = None
+
+        # ---- Embedding KV-cache-skip fast path (opt-in) ---------------------
+        # For a pure embedding model (prefill only, no decode) with no cached
+        # prefix, the paged-KV write-then-gather-back round trip is pure
+        # redundancy: the freshly-computed local k/v ARE each sequence's entire
+        # K/V context. When every guard in forward_extend holds we skip both the
+        # set_kv_buffer write and the pool gather and run SDPA directly on the
+        # local k/v (bit-exact). Opt-in via SGLANG_SKIP_EMBED_KV_CACHE=1; OFF by
+        # default -> forward_extend runs the original path byte-for-byte.
+        self._skip_embed_kv_cache = os.environ.get("SGLANG_SKIP_EMBED_KV_CACHE") == "1"
+        # is_generation == False <=> served purely as an embedding model: a
+        # one-shot prefill with no decode step that could read this KV back.
+        self._embed_no_decode = not model_runner.model_config.is_generation
+        # Chunked-prefill guard: the skip is only bit-exact when a request
+        # finishes in ONE forward. If chunking is possible (chunked_prefill_size
+        # in (0, context_len)), chunk-1 would skip a KV write that chunk-2 later
+        # reads back -> wrong embedding. Cache whether chunking is even possible;
+        # if not, extend_prefix_lens==0 alone already makes the fast path safe.
+        _cps = getattr(model_runner.server_args, "chunked_prefill_size", None)
+        _ctx = model_runner.model_config.context_len
+        self._kvskip_chunk_impossible = _cps is None or _cps <= 0 or _cps >= _ctx
 
     @staticmethod
     def _make_sliding_window_mask(
@@ -173,6 +195,77 @@ class TorchNativeAttnBackend(AttentionBackend):
             start_q, start_kv = end_q, end_kv
         return output
 
+    def _run_sdpa_forward_extend_local(
+        self,
+        query: torch.Tensor,
+        output: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        scaling=None,
+        enable_gqa=False,
+        causal=False,
+    ):
+        """Local-k/v variant of ``_run_sdpa_forward_extend`` for the embedding
+        KV-cache-skip fast path.
+
+        Identical per-sequence-loop structure to ``_run_sdpa_forward_extend``,
+        but reads K/V directly from the local (just-computed, not-yet-cached)
+        tensors instead of gathering them back from the paged KV pool via
+        ``req_to_token`` indices. Valid only when every sequence's full KV
+        context IS exactly its own freshly-computed K/V (``extend_prefix_lens ==
+        0`` for the whole batch) -- enforced by the caller. No dummy-query
+        padding is needed (unlike the original) because query length == kv
+        length exactly when prefix_len == 0.
+
+        Args:
+            query:  [num_tokens, num_heads, head_size]
+            output: [num_tokens, num_heads, head_size]
+            key:    [num_tokens, num_kv_heads, head_size]
+            value:  [num_tokens, num_kv_heads, head_size]
+            extend_seq_lens: [num_seqs]
+            scaling: float or None
+            enable_gqa: bool
+            causal: bool
+
+        Returns:
+            output: [num_tokens, num_heads, head_size]
+        """
+        # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
+        query = query.movedim(0, query.dim() - 2)
+        key = key.movedim(0, key.dim() - 2)
+        value = value.movedim(0, value.dim() - 2)
+
+        if not (query.dtype == key.dtype == value.dtype):
+            # scaled_dot_product_attention() expects q, k, v to share a dtype
+            key = key.to(query.dtype)
+            value = value.to(query.dtype)
+
+        start = 0
+        for seq_idx in range(extend_seq_lens.shape[0]):
+            seq_len = int(extend_seq_lens[seq_idx])
+            end = start + seq_len
+
+            per_req_query = query[:, start:end, :]
+            per_req_key = key[:, start:end, :]
+            per_req_value = value[:, start:end, :]
+
+            per_req_out = (
+                scaled_dot_product_attention(
+                    per_req_query.unsqueeze(0),
+                    per_req_key.unsqueeze(0),
+                    per_req_value.unsqueeze(0),
+                    enable_gqa=enable_gqa,
+                    scale=scaling,
+                    is_causal=causal,
+                )
+                .squeeze(0)
+                .movedim(query.dim() - 2, 0)
+            )
+            output[start:end, :, :] = per_req_out
+            start = end
+        return output
+
     def _run_sdpa_forward_decode(
         self,
         query: torch.Tensor,
@@ -276,6 +369,52 @@ class TorchNativeAttnBackend(AttentionBackend):
 
         return output
 
+    def _forward_extend_kv_skip(
+        self,
+        q,
+        k,
+        v,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ):
+        """Embedding KV-cache-skip fast path (all guards checked by
+        ``forward_extend`` before this is called).
+
+        Runs per-sequence SDPA on the freshly-computed local k/v WITHOUT writing
+        them to (``set_kv_buffer``) or gathering them back from the paged KV
+        pool. Valid only when every sequence's full K/V context IS exactly its
+        own just-computed k/v (``extend_prefix_lens == 0`` everywhere) and no
+        sliding window / pool quantization is in play -- all enforced by the
+        caller, so this is bit-exact vs. the original write-then-gather path.
+        """
+        if layer.qk_head_dim != layer.v_head_dim:
+            o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
+        else:
+            o = torch.empty_like(q)
+
+        use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
+
+        q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k_ = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v_ = v.view(-1, layer.tp_v_head_num, layer.v_head_dim)
+        o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+
+        causal = True
+        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+            causal = False
+
+        self._run_sdpa_forward_extend_local(
+            q_,
+            o_,
+            k_,
+            v_,
+            forward_batch.extend_seq_lens,
+            scaling=layer.scaling,
+            enable_gqa=use_gqa,
+            causal=causal,
+        )
+        return o
+
     def forward_extend(
         self,
         q,
@@ -285,6 +424,44 @@ class TorchNativeAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        # ---- Embedding KV-cache-skip fast path (opt-in) --------------------
+        # Bit-exact iff EVERY guard below holds; any failure => the original
+        # path (unchanged, below this block) runs. With SGLANG_SKIP_EMBED_KV_CACHE
+        # unset, self._skip_embed_kv_cache is False, so can_skip is always False
+        # and this whole block is a no-op -> original behavior, byte-for-byte.
+        can_skip = (
+            self._skip_embed_kv_cache  # (1) opt-in env switch
+            and self._embed_no_decode  # (3) embedding model: no decode reads KV back
+            and save_kv_cache  # (2)
+            and k is not None
+            and v is not None
+            and not layer.is_cross_attention  # (4)
+            and (  # (8) sliding window not enabled (local path has no SWA mask)
+                layer.sliding_window_size is None or layer.sliding_window_size <= -1
+            )
+            # (5) no cached prefix: every sequence's full KV == its local k/v
+            and forward_batch.extend_prefix_lens is not None
+            and bool((forward_batch.extend_prefix_lens == 0).all())
+        )
+        if can_skip and not self._kvskip_chunk_impossible:
+            # (6) chunked prefill possible: only skip when THIS forward covers
+            # each sequence in full (no later chunk reads the skipped KV back).
+            orig = forward_batch.orig_seq_lens
+            ext = forward_batch.extend_seq_lens
+            can_skip = (
+                orig is not None and ext is not None and bool((ext == orig).all())
+            )
+        if can_skip:
+            # (7) pool stores K/V verbatim (no fp8/uint8 repacking) so a gather
+            # would return the local k/v byte-for-byte.
+            pool = self.token_to_kv_pool
+            can_skip = getattr(pool, "store_dtype", pool.dtype) == getattr(
+                pool, "dtype", k.dtype
+            ) and k.dtype == getattr(pool, "dtype", k.dtype)
+        if can_skip:
+            return self._forward_extend_kv_skip(q, k, v, layer, forward_batch)
+        # ---- Original path (unchanged) -------------------------------------
+
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
