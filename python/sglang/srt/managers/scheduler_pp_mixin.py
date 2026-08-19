@@ -1323,32 +1323,66 @@ class SchedulerPPMixin:
         )
 
         # ---- Prepare send dict ----
+        # On NPU, always send something (full output or a lightweight skip
+        # marker) so the peer's recv in batch_isend_irecv always has a
+        # matching send.  Without this, SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM
+        # would cause asymmetric skip decisions between adjacent ranks
+        # (send target and recv target are different micro-batches), leading
+        # to deadlock or forcing the user to disable the optimisation
+        # entirely (≈10 % throughput loss).
         send_dict: Optional[Dict[str, torch.Tensor]] = None
         if self.pp_group.is_last_rank:
             target_send = mbs[next_first_rank_mb_id]
             if target_send is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
-                if (
-                    not target_send.forward_mode.is_prebuilt()
-                    and not _pp_can_skip_output_comm(target_send)
-                ):
-                    self.device_module.current_stream().wait_event(q_event)
-                    send_dict = dict(pp_outputs_to_send.tensors)
-                    send_dict["__msg_type__"] = "output"
+                if not target_send.forward_mode.is_prebuilt():
+                    if _pp_can_skip_output_comm(target_send):
+                        send_dict = {"__msg_type__": "output", "__skip__": True}
+                    else:
+                        self.device_module.current_stream().wait_event(q_event)
+                        send_dict = dict(pp_outputs_to_send.tensors)
+                        send_dict["__msg_type__"] = "output"
         elif pp_outputs:
-            send_dict = dict(pp_outputs.tensors)
-            send_dict["__msg_type__"] = "output"
+            if pp_outputs.tensors.get("__skip__"):
+                send_dict = {"__msg_type__": "output", "__skip__": True}
+            else:
+                send_dict = dict(pp_outputs.tensors)
+                send_dict["__msg_type__"] = "output"
 
         # ---- Determine recv conditions ----
+        # NOTE: skip_recv is NOT computed here.  The skip decision is made
+        # by the sender (last rank) and communicated via the __skip__
+        # marker.  The receiver always participates in the
+        # batch_isend_irecv and inspects the marker after recv.
         target_recv = mbs[next_mb_id]
         should_recv = (
             target_recv is not None
             and not target_recv.forward_mode.is_prebuilt()
         )
-        skip_recv = should_recv and _pp_can_skip_output_comm(target_recv)
+
+        def _handle_recv_dict(recv_dict):
+            nonlocal next_pp_outputs, batch_result, d2h_event
+            if recv_dict.get("__skip__"):
+                # _pp_make_skip_output_result returns next_pp_outputs=None
+                # (correct for the non-NPU path where the skip propagates
+                # via pp_outputs=None).  On NPU we must propagate the skip
+                # marker through the ring, so override it here.
+                _, batch_result, d2h_event = self._pp_make_skip_output_result(
+                    target_recv, mb_metadata[next_mb_id]
+                )
+                next_pp_outputs = PPProxyTensors(recv_dict)
+            else:
+                next_pp_outputs = PPProxyTensors(recv_dict)
+                with self.copy_stream_ctx:
+                    self.copy_stream.wait_stream(self.schedule_stream)
+                    batch_result = self._pp_prep_batch_result(
+                        target_recv, mb_metadata[next_mb_id], next_pp_outputs
+                    )
+                    d2h_event = self.device_module.Event()
+                    d2h_event.record(self.device_module.current_stream())
 
         # ---- Execute communication ----
-        if send_dict is not None and should_recv and not skip_recv:
+        if send_dict is not None and should_recv:
             # Paired send + recv via batch_isend_irecv
             with torch.profiler.record_function("send_recv_res_dict"):
                 recv_dict = self.pp_group.send_recv_tensor_dict(
@@ -1356,49 +1390,17 @@ class SchedulerPPMixin:
                     send_all_gather_group=all_gather_group,
                     recv_all_gather_group=all_gather_group,
                 )
-            next_pp_outputs = PPProxyTensors(recv_dict)
-            with self.copy_stream_ctx:
-                self.copy_stream.wait_stream(self.schedule_stream)
-                batch_result = self._pp_prep_batch_result(
-                    target_recv, mb_metadata[next_mb_id], next_pp_outputs
-                )
-                d2h_event = self.device_module.Event()
-                d2h_event.record(self.device_module.current_stream())
+            _handle_recv_dict(recv_dict)
         elif send_dict is not None:
-            # Send only (recv is skipped or not needed)
+            # Send only (recv not needed — target is None or prebuilt)
             send_output_work = self._pp_send_dict_to_next_stage(
                 send_dict, async_send=True, msg_type="output"
             )
-            if skip_recv:
-                next_pp_outputs, batch_result, d2h_event = (
-                    self._pp_make_skip_output_result(
-                        target_recv, mb_metadata[next_mb_id]
-                    )
-                )
         elif should_recv:
             # Recv only (no send needed)
-            if skip_recv:
-                next_pp_outputs, batch_result, d2h_event = (
-                    self._pp_make_skip_output_result(
-                        target_recv, mb_metadata[next_mb_id]
-                    )
-                )
-            else:
-                with torch.profiler.record_function(
-                    "recv_res_dict_from_prev_stage"
-                ):
-                    next_pp_outputs = PPProxyTensors(
-                        self._pp_recv_dict_from_prev_stage()
-                    )
-                with self.copy_stream_ctx:
-                    self.copy_stream.wait_stream(self.schedule_stream)
-                    batch_result = self._pp_prep_batch_result(
-                        target_recv,
-                        mb_metadata[next_mb_id],
-                        next_pp_outputs,
-                    )
-                    d2h_event = self.device_module.Event()
-                    d2h_event.record(self.device_module.current_stream())
+            with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
+                recv_dict = self._pp_recv_dict_from_prev_stage()
+            _handle_recv_dict(recv_dict)
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
