@@ -372,7 +372,7 @@ jobs:
         working-directory: experimental/sgl-router
         run: |
           source "$HOME/.cargo/env"
-          cargo build --release
+          cargo build --release --workspace
 
       # Install SGLang from the local checkout in editable mode (no PyPI
       # version pin) — mirrors `pr-test-rust.yml` so the router e2e runs

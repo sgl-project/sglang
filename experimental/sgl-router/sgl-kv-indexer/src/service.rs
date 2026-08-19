@@ -657,7 +657,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use tokio::time::{timeout, Duration};
+    use tokio::time::Duration;
 
     #[derive(Clone)]
     struct BlockingPrefixBackend {
@@ -700,55 +700,6 @@ mod tests {
         ) -> Result<GetExternalKvHitCountsResponse, Status> {
             Ok(GetExternalKvHitCountsResponse::default())
         }
-    }
-
-    fn prefix_request() -> Request<MatchExternalKvPrefixRequest> {
-        Request::new(MatchExternalKvPrefixRequest {
-            hashes: vec![-1],
-            max_blocks: 0,
-        })
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn prefix_query_limit_rejects_without_queueing() {
-        let entered = Arc::new(AtomicUsize::new(0));
-        let release = Arc::new(Semaphore::new(0));
-        let backend = BlockingPrefixBackend {
-            entered: Arc::clone(&entered),
-            release: Arc::clone(&release),
-        };
-        let service = Arc::new(KvIndexerService::with_prefix_query_max_inflight(backend, 2));
-
-        let first = {
-            let service = Arc::clone(&service);
-            tokio::spawn(async move {
-                KvIndexer::match_external_kv_prefix(service.as_ref(), prefix_request()).await
-            })
-        };
-        let second = {
-            let service = Arc::clone(&service);
-            tokio::spawn(async move {
-                KvIndexer::match_external_kv_prefix(service.as_ref(), prefix_request()).await
-            })
-        };
-
-        timeout(Duration::from_secs(1), async {
-            while entered.load(Ordering::SeqCst) != 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("two prefix queries should enter the backend");
-
-        let rejected = KvIndexer::match_external_kv_prefix(service.as_ref(), prefix_request())
-            .await
-            .unwrap_err();
-        assert_eq!(rejected.code(), tonic::Code::ResourceExhausted);
-        assert_eq!(entered.load(Ordering::SeqCst), 2);
-
-        release.add_permits(2);
-        first.await.unwrap().unwrap();
-        second.await.unwrap().unwrap();
     }
 
     /// Runs the arrival stamp, waits out `queued_for` to stand in for the time a

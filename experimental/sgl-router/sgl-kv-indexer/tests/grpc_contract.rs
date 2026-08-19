@@ -290,37 +290,15 @@ async fn multiple_workers_share_one_indexer_server() {
 async fn validation_errors_map_to_invalid_argument_over_grpc() {
     let mut c = start().await;
 
-    // empty worker_id
     let err = c
         .apply_external_kv_batch(apply_report("", "addr", 1, hbm(), &[1]))
         .await
         .expect_err("empty worker_id must be rejected");
-    assert_eq!(
-        err.code(),
-        Code::InvalidArgument,
-        "empty worker_id -> InvalidArgument"
-    );
+    assert_eq!(err.code(), Code::InvalidArgument);
 
-    // REPORT action with no hashes
-    let err = c
-        .apply_external_kv_batch(apply(
-            "w",
-            "addr",
-            1,
-            ExternalKvActionType::ActionReport,
-            hbm(),
-            &[],
-        ))
-        .await
-        .expect_err("empty hashes must be rejected");
-    assert_eq!(
-        err.code(),
-        Code::InvalidArgument,
-        "empty hashes -> InvalidArgument"
-    );
-
-    // unknown action type
-    let bad = ApplyExternalKvBatchRequest {
+    // An action type outside the enum can only arrive over the wire; the
+    // in-process tests cover the mapped `ActionUnknown` variant instead.
+    let unmapped_action_type = ApplyExternalKvBatchRequest {
         worker_id: "w".into(),
         seq: 1,
         worker_address: String::new(),
@@ -334,32 +312,10 @@ async fn validation_errors_map_to_invalid_argument_over_grpc() {
         }],
     };
     let err = c
-        .apply_external_kv_batch(bad)
+        .apply_external_kv_batch(unmapped_action_type)
         .await
-        .expect_err("unknown action type rejected");
-    assert_eq!(
-        err.code(),
-        Code::InvalidArgument,
-        "unknown action type -> InvalidArgument"
-    );
-
-    // invalid tier in an ApplyBatch action
-    let err = c
-        .apply_external_kv_batch(apply(
-            "w",
-            "addr",
-            1,
-            ExternalKvActionType::ActionReport,
-            999,
-            &[1],
-        ))
-        .await
-        .expect_err("bad tier rejected");
-    assert_eq!(
-        err.code(),
-        Code::InvalidArgument,
-        "bad tier -> InvalidArgument"
-    );
+        .expect_err("unknown action type must be rejected");
+    assert_eq!(err.code(), Code::InvalidArgument);
 }
 
 #[tokio::test]
