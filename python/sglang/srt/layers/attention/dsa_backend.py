@@ -1513,9 +1513,20 @@ class DeepseekSparseAttnBackend(
                     cp_bs == len(next_q_lens) == len(prev_k_lens) == len(next_k_lens)
                 ), "Mismatched zigzag CP metadata lengths"
 
-                local_seq_lens_cpu = [int(x) for x in prev_k_lens] + [
-                    int(x) for x in next_k_lens
-                ]
+                prefix_offsets = []
+                seq_lens_cpu_list = forward_batch.seq_lens_cpu.tolist()
+                for i in range(cp_bs):
+                    prefix_offsets.append(
+                        max(
+                            int(seq_lens_cpu_list[i])
+                            - int(forward_batch.extend_seq_lens_cpu[i]),
+                            0,
+                        )
+                    )
+
+                local_seq_lens_cpu = [
+                    prefix_offsets[i] + int(prev_k_lens[i]) for i in range(cp_bs)
+                ] + [prefix_offsets[i] + int(next_k_lens[i]) for i in range(cp_bs)]
                 local_extend_seq_lens_cpu = [int(x) for x in prev_q_lens] + [
                     int(x) for x in next_q_lens
                 ]
