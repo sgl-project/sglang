@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=700, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=900, stage="base-c", runner_config="4-gpu-h100")
 
 QWEN3_32B_MODEL = "Qwen/Qwen3-32B"
 
@@ -35,7 +35,7 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
     max_running_requests = 2
     kl_threshold = 0.005
     gsm8k_threshold = 0.7
-    num_gsm8k_questions = 25
+    num_gsm8k_questions = 50
     decode_cache_assert = staticmethod(_assert_pp_decode_cached_tokens)
 
     def test_gsm8k(self):
