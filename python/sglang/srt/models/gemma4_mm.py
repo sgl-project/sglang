@@ -66,6 +66,7 @@ from sglang.srt.models.gemma4_causal import (
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
+from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -190,6 +191,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+        self.enable_multimodal = get_server_args().enable_multimodal
 
         text_config = config.text_config
 
@@ -197,7 +199,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         # Vision/audio encoders + their projection embedders are only consumed
         # at the input-embedding stage, so they live on the first PP rank only.
-        if self.pp_group.is_first_rank:
+        if self.pp_group.is_first_rank and self.enable_multimodal:
             self.vision_tower = Gemma4VisionEncoder(
                 config=config.vision_config,
                 quant_config=quant_config,
@@ -224,9 +226,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             else:
                 self.audio_tower = None
                 self.embed_audio = None
-        else:
+        elif self.enable_multimodal:
             self.vision_tower = PPMissingLayer()
             self.embed_vision = PPMissingLayer()
+            self.audio_tower = None
+            self.embed_audio = None
+        else:
+            self.vision_tower = None
+            self.embed_vision = None
             self.audio_tower = None
             self.embed_audio = None
 
@@ -881,6 +888,16 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
+            if not self.enable_multimodal and any(
+                module_name in name
+                for module_name in (
+                    "vision_tower.",
+                    "embed_vision.",
+                    "audio_tower.",
+                    "embed_audio.",
+                )
+            ):
+                continue
             if "embed_vision.embedding." in name or "embed_audio.embedding." in name:
                 continue
             if self.audio_tower is None and (
