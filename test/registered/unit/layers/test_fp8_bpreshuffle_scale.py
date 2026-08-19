@@ -5,8 +5,8 @@ import torch
 
 from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale,
-    materialize_bpreshuffle_fp8_scale_tuple,
     view_aiter_fused_rms_transposed_fp8_scale,
+    view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -89,17 +89,19 @@ class TestBpreshuffleScaleMaterialization(CustomTestCase):
 
     def test_tuple_helper_keeps_extra_tuple_payload(self):
         q_input = torch.ones((3, 8), dtype=torch.float32)
-        scale = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        logical_scale = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        aiter_scale = logical_scale.t().contiguous().view(logical_scale.shape)
         bf16_side = torch.ones((3, 8), dtype=torch.bfloat16)
 
-        q_out, scale_out, bf16_out = materialize_bpreshuffle_fp8_scale_tuple(
-            (q_input, scale, bf16_side)
+        q_out, scale_out, bf16_out = view_aiter_fused_rms_transposed_fp8_scale_tuple(
+            (q_input, aiter_scale, bf16_side)
         )
 
         self.assertIs(q_out, q_input)
         self.assertIs(bf16_out, bf16_side)
-        self.assertTrue(torch.equal(scale_out, scale))
-        self.assertEqual(scale_out.stride(), (1, scale.shape[0]))
+        self.assertTrue(torch.equal(scale_out, logical_scale))
+        self.assertEqual(scale_out.stride(), (1, logical_scale.shape[0]))
+        self.assertEqual(scale_out.data_ptr(), aiter_scale.data_ptr())
 
 
 if __name__ == "__main__":

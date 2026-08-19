@@ -125,13 +125,18 @@ def view_aiter_fused_rms_transposed_fp8_scale(scale: torch.Tensor) -> torch.Tens
     return torch.as_strided(scale, scale.shape, (1, scale.shape[0]))
 
 
-def materialize_bpreshuffle_fp8_scale_tuple(
+def view_aiter_fused_rms_transposed_fp8_scale_tuple(
     value: Tuple[torch.Tensor, ...],
 ) -> Tuple[torch.Tensor, ...]:
-    """Materialize the scale slot in FP8 ``(q_input, x_scale, ...)`` tuples."""
+    """Restride the scale slot in FP8 ``(q_input, x_scale, ...)`` tuples.
+
+    Tuple-level wrapper around
+    :func:`view_aiter_fused_rms_transposed_fp8_scale` for producers already
+    invoked with ``transpose_scale=True``.
+    """
     return (
         value[0],
-        materialize_bpreshuffle_fp8_scale(value[1]),
+        view_aiter_fused_rms_transposed_fp8_scale(value[1]),
         *value[2:],
     )
 
@@ -1159,20 +1164,39 @@ def aiter_w8a8_block_fp8_linear(
         q_input = input_2d
         x_scale = input_scale
         if _use_aiter_bpreshuffle_gfx95 and not use_triton:
-            x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
+            # The CK bpreshuffle GEMM wants the per-token scale in M-major
+            # physical order. Callers on this path hand us the scale either
+            # (a) as raw transpose_scale=True bytes -- physically M-major
+            #     already, exposed as a row-major-looking [M, G] view (strides
+            #     (G, 1)), or (b) pre-materialized to strides (1, M).
+            # as_strided to (1, M) yields the correct logical [M, G] over the
+            # same bytes in both cases -- a no-op on (b), the corrective view
+            # on (a) -- with zero copy. A natural (un-transposed) row-major
+            # scale must never reach this branch; every bpreshuffle producer
+            # emits (a) or (b).
+            x_scale = view_aiter_fused_rms_transposed_fp8_scale(x_scale)
         # On ROCm >= 7.2, scale is in bpreshuffle's transposed layout.
         # Triton needs a row-major view, so adjust strides only. No copy.
         elif use_triton and _use_aiter_bpreshuffle_gfx95:
             x_scale = torch.as_strided(x_scale, x_scale.shape, (1, x_scale.shape[0]))
     else:
         materialize_bpreshuffle_scale = _use_aiter_bpreshuffle_gfx95 and not use_triton
+        # Ask the quant kernel to emit the M-major bytes the bpreshuffle GEMM
+        # wants, instead of writing row-major and transposing afterwards with a
+        # separate fp32 direct_copy kernel.
         q_input, x_scale = aiter_per1x128_quant(
             input_2d,
             quant_dtype=aiter.dtypes.fp8,
-            transpose_scale=False,
+            transpose_scale=materialize_bpreshuffle_scale,
         )
         if materialize_bpreshuffle_scale:
-            x_scale = materialize_bpreshuffle_fp8_scale(x_scale)
+            # The layout here differs from the fused-RMS case, where the
+            # producer has already restrided the scale before we see it. aiter
+            # hands the M-major bytes back through a [M, G] view carrying
+            # row-major (G, 1) strides that do not describe the storage, so
+            # apply the scale view helper to restore (1, M) -- equivalent to
+            # the materialized tensor, minus the copy.
+            x_scale = view_aiter_fused_rms_transposed_fp8_scale(x_scale)
 
     if use_triton:
         gemm_a8w8_blockscale_op = triton_gemm_a8w8_blockscale
