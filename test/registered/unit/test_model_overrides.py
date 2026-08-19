@@ -25,6 +25,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_context,
+    get_exec,
     get_server_args,
     reset_context,
 )
@@ -68,6 +69,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "quantization",
                     "enable_dp_attention",
                     "enable_dp_lm_head",
+                    "enable_tp_lm_head_all_to_all",
                     "moe_a2a_backend",
                     "ep_size",
                     "moe_dense_tp_size",
@@ -88,6 +90,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",
                     "fp8_gemm_runner_backend",
+                    "fp4_gemm_runner_backend",
                     "disable_custom_all_reduce",
                     "enable_aiter_allreduce_fusion",
                     "enable_symm_mem",
@@ -345,6 +348,51 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         flags = self._publish(sa)
         self.assertTrue(flags.enable_tf32_matmul)
         self.assertFalse(flags.enable_multi_layer_eagle)  # pristine materialize
+
+    def test_minimax_m2_sm10x_nvfp4_uses_routed_trtllm(self):
+        """MiniMax-M2 NVFP4 auto must avoid the unsupported plain TRT-LLM path."""
+        with patch.object(overrides_module, "is_sm100_supported", return_value=True):
+            explicit = self._construct(
+                "MiniMaxM2ForCausalLM",
+                "llama",
+                quantization="modelopt_fp4",
+                moe_runner_backend="flashinfer_cutlass",
+            )
+            non_nvfp4 = self._construct(
+                "MiniMaxM2ForCausalLM", "llama", quantization="fp8"
+            )
+            nvfp4 = self._construct(
+                "MiniMaxM2ForCausalLM", "llama", quantization="modelopt_fp4"
+            )
+
+        self.assertEqual(explicit.moe_runner_backend, "flashinfer_cutlass")
+        self.assertEqual(non_nvfp4.moe_runner_backend, "auto")
+        self.assertEqual(nvfp4.moe_runner_backend, "flashinfer_trtllm_routed")
+        self.assertTrue(nvfp4.disable_shared_experts_fusion)
+        self.assertIn(
+            (
+                "_minimax_m2_overrides",
+                {
+                    "enable_tf32_matmul": True,
+                    "moe_runner_backend": "flashinfer_trtllm_routed",
+                },
+            ),
+            nvfp4._resolved_overrides,
+        )
+        self.assertIn(
+            ("_moe_runner_fusion_disable", {"disable_shared_experts_fusion": True}),
+            nvfp4._resolved_overrides,
+        )
+
+        # Thor (SM110) and other architectures keep the existing auto behavior.
+        with patch.object(overrides_module, "is_sm100_supported", return_value=False):
+            non_sm10x = self._construct(
+                "MiniMaxM2ForCausalLM", "llama", quantization="modelopt_fp4"
+            )
+        self.assertEqual(non_sm10x.moe_runner_backend, "auto")
+
+        self._publish(nvfp4)
+        self.assertEqual(get_exec().moe.moe_runner_backend, "flashinfer_trtllm_routed")
 
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),
@@ -1726,29 +1774,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
-    def test_cutlass_moe_env_override_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _cutlass_moe_env_override,
-        )
-
-        with patch("sglang.srt.environ.envs.SGLANG_CUTLASS_MOE") as e:
-            e.get.return_value = True
-            self.assertEqual(
-                _cutlass_moe_env_override(
-                    ResolvedView(SimpleNamespace(quantization="fp8"))
-                ),
-                {"moe_runner_backend": "cutlass"},
-            )
-            with self.assertRaises(AssertionError):
-                _cutlass_moe_env_override(
-                    ResolvedView(SimpleNamespace(quantization=None))
-                )
-            e.get.return_value = False
-            self.assertEqual(
-                _cutlass_moe_env_override(ResolvedView(SimpleNamespace())), {}
-            )
-
     def test_gguf_quantization_pass(self):
         from sglang.srt.arg_groups.overrides import ResolvedView, _gguf_quantization
 
@@ -2099,7 +2124,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_data_parallelism_and_a2a_passes(self):
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
-            _a2a_backend_overrides,
             _a2a_ep_size,
             _data_parallelism_defaults,
         )
@@ -2116,27 +2140,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {},
         )
-
-        with patch("sglang.srt.environ.envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE") as e:
-            e.get.return_value = False
-            self.assertEqual(
-                _a2a_backend_overrides(
-                    ResolvedView(
-                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
-                    )
-                ),
-                {"moe_a2a_backend": "deepep"},
-            )
-            e.get.return_value = True
-            # megamoe env wins over the waterfill override (chained, last write)
-            self.assertEqual(
-                _a2a_backend_overrides(
-                    ResolvedView(
-                        SimpleNamespace(enable_waterfill=True, moe_a2a_backend="none")
-                    )
-                ),
-                {"moe_a2a_backend": "megamoe"},
-            )
 
         self.assertEqual(
             _a2a_ep_size(

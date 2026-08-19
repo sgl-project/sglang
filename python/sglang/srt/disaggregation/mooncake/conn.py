@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -27,7 +27,6 @@ from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
     DecodeStagingContext,
     PrefillStagingContext,
-    StagingRegisterInfo,
     StagingTransferInfo,
 )
 from sglang.srt.disaggregation.common.utils import (
@@ -60,7 +59,7 @@ from sglang.srt.observability.trace import (
     TraceReqContext,
     trace_set_thread_info,
 )
-from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.runtime_context import get_memory, get_parallel, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
@@ -144,8 +143,8 @@ class KVArgsRegisterInfo:
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
-    # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
-    staging: Optional[StagingRegisterInfo] = None
+    staging_base_ptr: int = 0
+    staging_total_size: int = 0
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -176,15 +175,20 @@ class KVArgsRegisterInfo:
                 if len(msg) > 13 and msg[13] != b""
                 else []
             ),
-            # msg[14:16] belong to the staging field below; DCP trails it.
+            staging_base_ptr=(
+                struct.unpack("Q", msg[14])[0]
+                if len(msg) > 14 and len(msg[14]) == 8
+                else 0
+            ),
+            staging_total_size=(
+                int(msg[15].decode("ascii")) if len(msg) > 15 and msg[15] != b"" else 0
+            ),
             dst_dcp_size=(
                 int(msg[16].decode("ascii")) if len(msg) > 16 and msg[16] != b"" else 1
             ),
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
             ),
-            # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 14),
         )
 
 
@@ -210,6 +214,10 @@ class MooncakeKVManager(CommonKVManager):
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
+            # Deferred KV release: aborted room -> (decode_ip, decode_port), ack
+            # held until the transfer drains. Written by the bootstrap thread,
+            # popped by the single transfer worker that owns the room.
+            self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
             self.session_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
@@ -278,35 +286,41 @@ class MooncakeKVManager(CommonKVManager):
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
 
-    def register_buffer_to_engine(self):
-        # Batch register KV data buffers
-        if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
-            self.engine.batch_register(
-                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
-            )
+    def _registerable_regions(self) -> List[Tuple[int, int]]:
+        """(ptr, len) regions to (de)register, exact duplicates removed.
 
-        # Batch register auxiliary data buffers
-        if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
-            self.engine.batch_register(
-                self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
-            )
+        Deduped because the unified memory pool reports one raw buffer as both
+        its KV and its mamba state component, and double registration fails in
+        the engine.
+        """
+        regions: List[Tuple[int, int]] = []
+        seen: Set[Tuple[int, int]] = set()
 
+        def add(ptrs: List[int], lens: List[int]) -> None:
+            for ptr, length in zip(ptrs or [], lens or []):
+                if (ptr, length) not in seen:
+                    seen.add((ptr, length))
+                    regions.append((ptr, length))
+
+        add(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
+        add(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens)
         for ptrs, lens in zip(
             self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
         ):
-            if ptrs and lens:
-                self.engine.batch_register(ptrs, lens)
+            add(ptrs, lens)
+        return regions
+
+    def register_buffer_to_engine(self):
+        regions = self._registerable_regions()
+        if regions:
+            ptrs, lens = zip(*regions)
+            self.engine.batch_register(list(ptrs), list(lens))
 
     def deregister_buffer_to_engine(self):
-        if self.kv_args.kv_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
-
-        if self.kv_args.aux_data_ptrs:
-            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
-
-        for ptrs in self.kv_args.state_data_ptrs or []:
-            if ptrs:
-                self.engine.batch_deregister(ptrs)
+        regions = self._registerable_regions()
+        if regions:
+            ptrs, _ = zip(*regions)
+            self.engine.batch_deregister(list(ptrs))
 
         if hasattr(self, "connection_pool"):
             with self.connection_lock:
@@ -467,8 +481,8 @@ class MooncakeKVManager(CommonKVManager):
         ret = staging_strategy.transfer(
             req.mooncake_session_id,
             kv_chunk.prefill_kv_indices,
-            target_info.staging.base_ptr + c_offset,
-            target_info.staging.total_size - c_offset,
+            target_info.staging_base_ptr + c_offset,
+            target_info.staging_total_size - c_offset,
             target_info,
         )
         if ret == -1:
@@ -510,6 +524,7 @@ class MooncakeKVManager(CommonKVManager):
             get_schedule().chunked_prefill_size,
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
+            requester_pp_rank=self.pp_rank,
         )
 
     def send_kvcache_staged(
@@ -521,6 +536,7 @@ class MooncakeKVManager(CommonKVManager):
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
+        dst_layer_ids: List[int],
         staging_buffer=None,
     ) -> int:
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
@@ -553,7 +569,19 @@ class MooncakeKVManager(CommonKVManager):
 
         num_tokens = len(prefill_kv_indices) * page_size
         per_layer_bytes = num_tokens * num_heads_to_send * head_dim * dtype_size
-        per_rank_bytes = per_layer_bytes * num_layers * 2
+        local_bytes = per_layer_bytes * num_layers * 2
+
+        if self.pp_size > 1:
+            pairs = build_transfer_entry_pairs(
+                self.kv_args.kv_layer_ids,
+                dst_layer_ids,
+                num_layers * 2,
+                len(dst_layer_ids),
+            )
+            dst_num_layers = len(dst_layer_ids) // 2
+        else:
+            pairs = None
+            dst_num_layers = num_layers
 
         num_writers, writer_rank_bytes, total_staging_needed = compute_staging_layout(
             self.attn_tp_size,
@@ -562,21 +590,20 @@ class MooncakeKVManager(CommonKVManager):
             total_kv_heads,
             num_tokens,
             head_dim * dtype_size,
-            num_layers,
+            dst_num_layers,
         )
         writer_idx = local_tp_rank % num_writers if num_writers > 1 else 0
         rank_offset = sum(writer_rank_bytes[:writer_idx])
 
-        if not staging_buffer.fits(per_rank_bytes):
+        if not staging_buffer.fits(local_bytes):
             logger.warning(
-                f"Prefill staging too small for {per_rank_bytes} bytes, falling back"
+                f"Prefill staging too small for {local_bytes} bytes, falling back"
             )
             return -1
         if dst_staging_size < total_staging_needed:
             logger.warning(
                 f"Decode staging too small: need {total_staging_needed} bytes "
-                f"({num_writers if self.attn_tp_size > dst_attn_tp_size else 1} writers "
-                f"x {per_rank_bytes} bytes/rank), have {dst_staging_size}, falling back"
+                f"for {dst_num_layers} layers, have {dst_staging_size}, falling back"
             )
             return -1
 
@@ -595,16 +622,29 @@ class MooncakeKVManager(CommonKVManager):
             self.kv_args.gpu_id,
         )
 
-        dst_write_ptr = dst_staging_ptr + rank_offset
-        ret = self._transfer_data(
-            mooncake_session_id,
-            [(staging_buffer.get_ptr(), dst_write_ptr, per_rank_bytes)],
-        )
+        if pairs is None:
+            transfer_blocks = [
+                (
+                    staging_buffer.get_ptr(),
+                    dst_staging_ptr + rank_offset,
+                    local_bytes,
+                )
+            ]
+        else:
+            transfer_blocks = [
+                (
+                    staging_buffer.get_ptr() + src_idx * per_layer_bytes,
+                    dst_staging_ptr + rank_offset + dst_idx * per_layer_bytes,
+                    per_layer_bytes,
+                )
+                for src_idx, dst_idx in pairs
+            ]
+        ret = self._transfer_data(mooncake_session_id, transfer_blocks)
         if ret != 0:
             raise RuntimeError(
                 f"[Staging] Bulk RDMA transfer failed with ret={ret}. "
                 f"src_ptr=0x{staging_buffer.get_ptr():x}, "
-                f"dst_ptr=0x{dst_write_ptr:x}, size={per_rank_bytes}. "
+                f"dst_ptr=0x{dst_staging_ptr + rank_offset:x}, size={local_bytes}. "
                 f"The decode staging buffer may not be properly registered."
             )
         return ret
@@ -759,17 +799,76 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 for (src_ptr, dst_ptr, item_len) in layers_params
             ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for f in futures:
-                        f.cancel()
-                    return status
-            return 0
+            return self._await_transfer_futures(futures)
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
             return process_layers(layers_params)
+
+    def _validate_envelope_kv_layout(
+        self,
+        dst_kv_ptrs: list[int],
+        dst_kv_item_len: Optional[int],
+        dst_attn_tp_size: Optional[int] = None,
+    ) -> None:
+        """Reject a peer whose KV registration shape differs from ours.
+
+        The unified memory pool registers ONE whole-envelope region and
+        addresses the destination as ``dst_ptr + page_id * item_len`` using OUR
+        ``item_len``, so a peer on a different page size / spec, or without
+        unified memory, would take envelope-sized blocks at the wrong offsets.
+        Must run before the first RDMA write.
+
+        Scoped to unified memory by config, not by region count: a non-unified
+        PP stage owning a single full-attention layer also registers one region,
+        and `_send_kvcache_generic` pairs that with the peer by layer id.
+        """
+        if not get_memory().enable_unified_memory:
+            return
+        if dst_attn_tp_size is not None and self.attn_tp_size != dst_attn_tp_size:
+            # The unified mamba state ships as one whole-slot envelope with no
+            # per-tensor dims, so `_send_mamba_state_slice` cannot reslice it and
+            # silently falls back to an unsliced copy. Reject here, before any KV
+            # is written, rather than in `maybe_send_extra` afterwards.
+            raise RuntimeError(
+                "--enable-unified-memory does not support different prefill / "
+                f"decode attention TP sizes (prefill={self.attn_tp_size}, "
+                f"decode={dst_attn_tp_size}): the whole-envelope state cannot "
+                "be TP-resliced."
+            )
+        src_item_lens = self.kv_args.kv_item_lens
+        if (
+            len(src_item_lens) != 1
+            or len(dst_kv_ptrs) != 1
+            or dst_kv_item_len is None
+            or src_item_lens[0] != dst_kv_item_len
+        ):
+            raise RuntimeError(
+                "PD KV layout mismatch on the whole-envelope path: prefill has "
+                f"{len(src_item_lens)} KV region(s) with item_lens="
+                f"{src_item_lens}, decode has {len(dst_kv_ptrs)} with item_len="
+                f"{dst_kv_item_len}. With --enable-unified-memory both sides "
+                "must enable it and use the same page size and model spec."
+            )
+
+    def _await_transfer_futures(self, futures) -> int:
+        """Await a chunk's per-layer RDMA writes; return the first non-zero status.
+        cancel() is a no-op for a running future, so with deferred release on we
+        still drain the running ones before returning (no write may outlive this
+        call, which the drain-ack relies on). Off: original early-return."""
+        ret = 0
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                status = future.result()
+            except concurrent.futures.CancelledError:
+                continue
+            if status != 0 and ret == 0:
+                ret = status
+                for f in futures:
+                    f.cancel()
+                if not self.enable_deferred_decode_kv_release:
+                    return ret
+        return ret
 
     def send_kvcache(
         self,
@@ -780,7 +879,12 @@ class MooncakeKVManager(CommonKVManager):
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
+        dst_kv_item_len: Optional[int] = None,
+        dst_attn_tp_size: Optional[int] = None,
     ):
+        self._validate_envelope_kv_layout(
+            dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
+        )
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
             compression_ratios = self.kv_args.mla_compression_ratios
@@ -891,13 +995,7 @@ class MooncakeKVManager(CommonKVManager):
                 executor.submit(process_layer, src_ptr, dst_ptr, token_item_len)
                 for src_ptr, dst_ptr, token_item_len in layers_params
             ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for pending in futures:
-                        pending.cancel()
-                    return status
-            return 0
+            return self._await_transfer_futures(futures)
 
         transfer_blocks = []
         for src_ptr, dst_ptr, token_item_len in layers_params:
@@ -1025,14 +1123,7 @@ class MooncakeKVManager(CommonKVManager):
                 executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
             )
 
-        for future in concurrent.futures.as_completed(futures):
-            status = future.result()
-            if status != 0:
-                for f in futures:
-                    f.cancel()
-                return status
-
-        return 0
+        return self._await_transfer_futures(futures)
 
     def send_aux(
         self,
@@ -1239,6 +1330,17 @@ class MooncakeKVManager(CommonKVManager):
             )
 
             if st == StateType.MAMBA:
+                if (not src_dim_per_tensor or not dst_dim_per_tensor) and list(
+                    src_item_lens
+                ) != list(dst_item_lens):
+                    raise RuntimeError(
+                        "Mamba state layouts differ between prefill and decode "
+                        f"(src item_lens={src_item_lens}, dst item_lens="
+                        f"{dst_item_lens}) and no per-tensor dim metadata is "
+                        "available to reslice. With --enable-unified-memory, "
+                        "prefill and decode must both enable it and use equal "
+                        "attention TP sizes."
+                    )
                 if (
                     target_rank_registration_info is not None
                     and self.attn_tp_size
@@ -1514,6 +1616,39 @@ class MooncakeKVManager(CommonKVManager):
             is_ipv6=na.is_ipv6,
         )
 
+    def _prefill_unique_rank(self) -> int:
+        """Stable per-sender id, matching what the transfer worker syncs on Success."""
+        return (
+            self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+            + self.pp_rank * self.attn_cp_size
+            + self.attn_cp_rank
+        )
+
+    def _send_abort_ack(self, decode_ip: str, decode_port: int, room: int) -> None:
+        """Best-effort ack that this rank's transfer for an aborted room drained."""
+        try:
+            na = NetworkAddress(decode_ip, decode_port)
+            self._send_multipart_locked(
+                na.to_tcp(),
+                [
+                    b"ABORT_ACK",
+                    str(room).encode("ascii"),
+                    str(self._prefill_unique_rank()).encode("ascii"),
+                ],
+                is_ipv6=na.is_ipv6,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
+
+    def _maybe_ack_drained_abort(self, room: int) -> None:
+        """Send the deferred ack once an aborted room's chunks have drained
+        (outstanding == 0). pop() makes it fire at most once."""
+        if self._staging_outstanding.get(room, 0) > 0:
+            return
+        target = self._deferred_ack_targets.pop(room, None)
+        if target is not None:
+            self._send_abort_ack(target[0], target[1], room)
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -1553,6 +1688,9 @@ class MooncakeKVManager(CommonKVManager):
                             thread_finish_flag=True,
                         )
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                    if self.enable_deferred_decode_kv_release:
+                        # Skipped => nothing written for this aborted room; ack.
+                        self._maybe_ack_drained_abort(kv_chunk.room)
                     continue
 
                 # Count each chunk once; the flag survives re-enqueue on defer.
@@ -1689,11 +1827,16 @@ class MooncakeKVManager(CommonKVManager):
                                 executor,
                                 dst_layer_ids=target_rank_registration_info.dst_kv_layer_ids,
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
+                                dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
+                                dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
                             )
                         elif (
                             self.enable_staging
                             and staging_strategy is not None
-                            and target_rank_registration_info.staging is not None
+                            and (
+                                target_rank_registration_info.staging_base_ptr != 0
+                                or target_rank_registration_info.staging_total_size != 0
+                            )
                         ):
                             ret, deferred = self._do_staging_transfer(
                                 staging_strategy,
@@ -1822,6 +1965,10 @@ class MooncakeKVManager(CommonKVManager):
                     continue
 
                 self._staging_outstanding[kv_chunk.room] -= 1
+                if self.enable_deferred_decode_kv_release:
+                    # In-flight write finished; if aborted and nothing outstanding,
+                    # the pages are idle -> release the held ack.
+                    self._maybe_ack_drained_abort(kv_chunk.room)
                 # Tear down only when no chunk is still outstanding and the room
                 # has concluded: already cleared, Success, or a Failed *last*
                 # chunk. A non-last Failed chunk keeps the room (more chunks may
@@ -1881,11 +2028,36 @@ class MooncakeKVManager(CommonKVManager):
                     room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
                     decode_ip = waiting_req_bytes[2].decode("ascii")
                     decode_port = int(waiting_req_bytes[3].decode("ascii"))
-                    # No need to abort the room if it has already succeeded
-                    if (
+                    room_active = (
                         room_to_be_aborted in self.request_status
                         and self.check_status(room_to_be_aborted) != KVPoll.Success
-                    ):
+                    )
+                    if self.enable_deferred_decode_kv_release:
+                        # Mark Failed FIRST (stops add_transfer_request enqueuing
+                        # new chunks), THEN register the ack target: registering
+                        # first would let the worker drain+ack while the room is
+                        # not yet Failed, so a newly enqueued chunk could still
+                        # write to the freed pages. The worker (not this thread)
+                        # acks once its in-flight write drains; if nothing is in
+                        # flight, decode falls back to the release timeout.
+                        if room_active:
+                            self.update_status(room_to_be_aborted, KVPoll.Failed)
+                            self._deferred_ack_targets[room_to_be_aborted] = (
+                                decode_ip,
+                                decode_port,
+                            )
+                            logger.debug(
+                                f"Received abort notification for room {room_to_be_aborted}, "
+                                f"marked as Failed; ACK deferred until transfer drains"
+                            )
+                        else:
+                            # Already completed/unknown: no in-flight write, ack now.
+                            self._send_abort_ack(
+                                decode_ip, decode_port, room_to_be_aborted
+                            )
+                        continue
+                    # No need to abort the room if it has already succeeded
+                    if room_active:
                         self.update_status(room_to_be_aborted, KVPoll.Failed)
                         logger.debug(
                             f"Received abort notification for room {room_to_be_aborted}, "
@@ -1999,9 +2171,14 @@ class MooncakeKVManager(CommonKVManager):
 
                 # Prefill acknowledges abort notification
                 if msg[0] == b"ABORT_ACK":
-                    # TODO(shangming): use this info to implement the deferred release mechanism if needed
                     ack_aborted_room = int(msg[1].decode("ascii"))
                     logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
+                    # Deferred release: the 3-frame ack carries the prefill rank
+                    # and means its transfer drained; aggregate for is_abort_release_safe.
+                    if self.enable_deferred_decode_kv_release and len(msg) >= 3:
+                        self.note_abort_ack(
+                            ack_aborted_room, int(msg[2].decode("ascii"))
+                        )
                     continue
 
                 bootstrap_room, status, prefill_rank = msg
