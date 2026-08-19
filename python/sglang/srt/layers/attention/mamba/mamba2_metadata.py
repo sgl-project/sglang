@@ -86,6 +86,9 @@ class Mamba2Metadata(ForwardMetadata):
         chunk_offsets: torch.Tensor
 
         extend_seq_lens_cpu: list[int]
+        checkpoint_seq_indices: tuple[int, ...]
+        checkpoint_seq_starts: tuple[int, ...]
+        checkpoint_lengths: tuple[int, ...]
 
     mixed_metadata: MixedMetadata | None = None
     """`mixed_metadata` is used for extend/mixed requests"""
@@ -237,6 +240,11 @@ class Mamba2Metadata(ForwardMetadata):
             num_prefill_tokens = int(sum(extend_seq_lens_cpu))
         else:
             num_prefill_tokens = int(forward_batch.extend_num_tokens)
+        prefill_lengths_cpu = (
+            list(extend_seq_lens_cpu)
+            if extend_seq_lens_cpu is not None
+            else forward_batch.extend_seq_lens[:num_prefills].cpu().tolist()
+        )
         batch_size = getattr(forward_batch, "_original_batch_size", None)
         if batch_size is None:
             batch_size = len(forward_batch.seq_lens)
@@ -275,6 +283,41 @@ class Mamba2Metadata(ForwardMetadata):
                     query_start_loc, metadata_chunk_size, num_prefill_tokens
                 )
             )
+
+        # SSDCombined backends intentionally avoid Triton's dense intermediate
+        # ``h`` tensor.  Plan the at-most-one compact earlier checkpoint needed
+        # by every tracked prefill whose radix boundary is not the final chunk
+        # boundary.  The selected SSD backend replays only these prefixes.
+        checkpoint_seq_indices: list[int] = []
+        checkpoint_seq_starts: list[int] = []
+        checkpoint_lengths: list[int] = []
+        if forward_metadata.has_mamba_track_mask:
+            track_mask = forward_batch.mamba_track_mask[:num_prefills].cpu()
+            relative_track_lens = (
+                forward_batch.mamba_track_seqlens[:num_prefills]
+                - forward_batch.extend_prefix_lens[:num_prefills]
+            ).cpu()
+            sequence_start = 0
+            for sequence, (extend_length, track, relative_length) in enumerate(
+                zip(
+                    prefill_lengths_cpu,
+                    track_mask.tolist(),
+                    relative_track_lens.tolist(),
+                    strict=True,
+                )
+            ):
+                if track and relative_length % chunk_size:
+                    checkpoint_length = (relative_length // chunk_size) * chunk_size
+                    if checkpoint_length <= 0 or checkpoint_length > extend_length:
+                        raise ValueError(
+                            "invalid compact Mamba checkpoint length: "
+                            f"sequence={sequence}, checkpoint={checkpoint_length}, "
+                            f"extend={extend_length}"
+                        )
+                    checkpoint_seq_indices.append(sequence)
+                    checkpoint_seq_starts.append(sequence_start)
+                    checkpoint_lengths.append(checkpoint_length)
+                sequence_start += extend_length
 
         draft_token_num = (
             getattr(forward_batch.spec_info, "draft_token_num", 1)
@@ -319,5 +362,8 @@ class Mamba2Metadata(ForwardMetadata):
                 chunk_indices=chunk_indices,
                 chunk_offsets=chunk_offsets,
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
+                checkpoint_seq_indices=tuple(checkpoint_seq_indices),
+                checkpoint_seq_starts=tuple(checkpoint_seq_starts),
+                checkpoint_lengths=tuple(checkpoint_lengths),
             ),
         )

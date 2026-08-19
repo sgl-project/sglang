@@ -14,9 +14,11 @@ register_cuda_ci(est_time=1, stage="base-b", runner_config="1-gpu-small")
 class _FakeSSDCombined:
     def __init__(self) -> None:
         self.call = None
+        self.calls = []
 
     def run(self, x, dt, A, B, C, **kwargs):
         self.call = (x, dt, A, B, C, kwargs)
+        self.calls.append(self.call)
         output = (
             torch.arange(x.numel(), dtype=torch.float32).reshape(x.shape).to(x.dtype)
         )
@@ -145,6 +147,55 @@ def test_flashinfer_prefill_reuses_read_only_zero_initial_states():
     assert first is second
     assert first.shape == (2, 2, 4, 3)
     assert torch.count_nonzero(first) == 0
+
+
+def test_ssd_prefill_returns_compact_unaligned_radix_checkpoint(monkeypatch):
+    backend = _flashinfer_backend_without_imports()
+    runner = _FakeSSDCombined()
+    monkeypatch.setattr(backend, "_get_prefill_runner", lambda **_: runner)
+
+    nheads, headdim, ngroups, dstate = 2, 4, 1, 3
+    x = torch.randn(1, 256, nheads, headdim, dtype=torch.bfloat16)
+    dt = torch.randn(1, 256, nheads, dtype=torch.bfloat16)
+    B = torch.randn(1, 256, ngroups, dstate, dtype=torch.bfloat16)
+    C = torch.randn_like(B)
+    out = torch.empty_like(x)
+    intermediate, final = backend.chunk_scan_combined(
+        x,
+        dt,
+        -torch.ones(nheads),
+        B,
+        C,
+        128,
+        seq_idx=torch.cat(
+            (
+                torch.zeros(128, dtype=torch.int32),
+                torch.ones(128, dtype=torch.int32),
+            )
+        ).unsqueeze(0),
+        chunk_indices=torch.arange(2, dtype=torch.int32),
+        chunk_offsets=torch.zeros(2, dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 128, 256], dtype=torch.int32),
+        dt_softplus=True,
+        out=out,
+        return_varlen_states=True,
+        return_intermediate_states=True,
+        state_dtype=torch.bfloat16,
+        checkpoint_seq_indices=(1,),
+        checkpoint_seq_starts=(128,),
+        checkpoint_lengths=(128,),
+    )
+
+    assert isinstance(intermediate, ssu_dispatch.CompactMambaPrefillCheckpoints)
+    assert intermediate.states.shape == (1, nheads, headdim, dstate)
+    assert final.shape == (2, nheads, headdim, dstate)
+    assert len(runner.calls) == 2
+    replay_x, _, _, _, _, replay_kwargs = runner.calls[0]
+    assert replay_x.shape == (1, 128, nheads, headdim)
+    assert replay_kwargs["initial_states"].shape[0] == 1
+    assert torch.equal(
+        replay_kwargs["seq_idx"], torch.zeros((1, 128), dtype=torch.int32)
+    )
 
 
 def test_flashinfer_prefill_refuses_non_sglang_return_contract():
