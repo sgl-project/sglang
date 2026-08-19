@@ -6,13 +6,18 @@ from transformers.models.pixtral.image_processing_pixtral import (
     _num_image_tokens as _get_pixtral_hf_num_image_tokens,
 )
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.pixtral import (
     PixtralForConditionalGeneration,
     PixtralVisionModel,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
+    BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
 
@@ -77,58 +82,63 @@ class PixtralProcessor(BaseMultimodalProcessor):
             image_data=image_data,
             return_text=True,
         )
-        if mm_data.images:
-            effective_patch = self.patch_size * self._spatial_merge_size
-            image_nrows = []
-            for img in mm_data.images:
-                w, h = img.size
-                ratio = max(w / self.image_size, h / self.image_size)
-                if ratio > 1:
-                    w = int(math.floor(w / ratio))
-                    h = int(math.floor(h / ratio))
-                nrows, _ = _get_pixtral_hf_num_image_tokens(
-                    (h, w), (effective_patch, effective_patch)
-                )
-                image_nrows.append(nrows)
-
-            mm_items, input_ids, _ = self.process_and_combine_mm_data(
-                mm_data, self.mm_tokens
-            )
-
-            # For multi-image: split single IMAGE mm_item into per-image items
-            if len(mm_data.images) > 1:
-                from sglang.srt.managers.schedule_batch import MultimodalDataItem
-
-                old_item = next(
-                    item for item in mm_items if item.modality == Modality.IMAGE
-                )
-                all_offsets = old_item.offsets
-                old_feature = old_item.feature
-                old_image_sizes = getattr(old_item, "image_sizes", None)
-
-                mm_items = [
-                    item for item in mm_items if item.modality != Modality.IMAGE
-                ]
-                offset_idx = 0
-                for i, img in enumerate(mm_data.images):
-                    nr = image_nrows[i]
-                    item_offsets = all_offsets[offset_idx : offset_idx + nr]
-                    offset_idx += nr
-                    new_item = MultimodalDataItem(modality=Modality.IMAGE)
-                    new_item.feature = old_feature[i : i + 1]
-                    new_item.offsets = item_offsets
-                    if old_image_sizes is not None:
-                        new_item.model_specific_data["image_sizes"] = old_image_sizes[
-                            i : i + 1
-                        ]
-                    mm_items.append(new_item)
-        else:
-            mm_items, input_ids, _ = self.process_and_combine_mm_data(
-                mm_data, self.mm_tokens
-            )
+        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            mm_data, self.mm_tokens
+        )
 
         return MultimodalProcessorOutput(
             mm_items=mm_items,
             input_ids=input_ids.tolist(),
             im_token_id=self.IM_TOKEN_ID,
         )
+
+    def _postprocess_mm_items_before_transport(
+        self,
+        mm_items: List[MultimodalDataItem],
+        *,
+        base_output: BaseMultiModalProcessorOutput,
+    ) -> List[MultimodalDataItem]:
+        if len(base_output.images) <= 1:
+            return mm_items
+
+        old_item = next(item for item in mm_items if item.modality == Modality.IMAGE)
+        all_offsets = old_item.offsets
+        old_feature = old_item.feature
+        old_image_sizes = old_item.model_specific_data.get("image_sizes")
+        image_nrows = self._get_image_nrows(base_output.images)
+
+        split_items = [item for item in mm_items if item.modality != Modality.IMAGE]
+        offset_idx = 0
+        for image_idx, num_rows in enumerate(image_nrows):
+            item_offsets = all_offsets[offset_idx : offset_idx + num_rows]
+            offset_idx += num_rows
+            model_specific_data = {}
+            if old_image_sizes is not None:
+                model_specific_data["image_sizes"] = old_image_sizes[
+                    image_idx : image_idx + 1
+                ]
+            split_items.append(
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=old_feature[image_idx : image_idx + 1],
+                    offsets=item_offsets,
+                    model_specific_data=model_specific_data,
+                )
+            )
+        return split_items
+
+    def _get_image_nrows(self, images) -> List[int]:
+        effective_patch = self.patch_size * self._spatial_merge_size
+        image_nrows = []
+        for image in images:
+            width, height = image.size
+            ratio = max(width / self.image_size, height / self.image_size)
+            if ratio > 1:
+                width = int(math.floor(width / ratio))
+                height = int(math.floor(height / ratio))
+            num_rows, _ = _get_pixtral_hf_num_image_tokens(
+                (height, width),
+                (effective_patch, effective_patch),
+            )
+            image_nrows.append(num_rows)
+        return image_nrows
