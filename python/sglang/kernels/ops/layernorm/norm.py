@@ -144,6 +144,27 @@ def _schedule_fused_add_rmsnorm(dim: int, dtype_bytes: int) -> Schedule:
     return Schedule(vec_size, num_threads=num_threads)
 
 
+def _warmup_module(module, kind: str, dim: int, dtype: torch.dtype) -> None:
+    """Launch `module` once so CUDA loads its cubin now rather than later.
+
+    Module loading is lazy: the cubin is brought into the context by the *first*
+    launch, and that allocation can fail once a server has sized its KV cache to
+    fill the device. A schedule that only runs at large batch would first launch
+    mid-serving and take the engine down with `CUDA error: out of memory`, so
+    every variant is made resident here, while the caller is still warming up.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        # allocating here would land in the graph's pool and the launch would be
+        # recorded into the graph; leave the load lazy rather than corrupt it
+        return
+    x = torch.zeros(1, dim, dtype=dtype, device="cuda")
+    weight = torch.zeros(dim, dtype=dtype, device="cuda")
+    if kind == "rmsnorm":
+        module.rmsnorm(x, weight, torch.empty_like(x), 1e-6)
+    else:
+        module.fused_add_rmsnorm(x, torch.zeros_like(x), weight, 1e-6)
+
+
 @cache_once
 def _jit_rmsnorm_module(
     hidden_size: int,
@@ -158,12 +179,14 @@ def _jit_rmsnorm_module(
         cast_x_before_out_mul,
         *schedule,
     )
-    return load_jit(
+    module = load_jit(
         "rmsnorm",
         *args,
         cuda_files=["elementwise/rmsnorm.cuh"],
         cuda_wrappers=[("rmsnorm", f"RMSNormKernel<{args}>::run")],
     )
+    _warmup_module(module, "rmsnorm", hidden_size, dtype)
+    return module
 
 
 @cache_once
@@ -196,12 +219,14 @@ def _jit_fused_add_rmsnorm_module(
     args = make_cpp_args(
         dtype, dim, is_arch_support_pdl(), cast_x_before_out_mul, *schedule
     )
-    return load_jit(
+    module = load_jit(
         "fused_add_rmsnorm",
         *args,
         cuda_files=["elementwise/rmsnorm.cuh"],
         cuda_wrappers=[("fused_add_rmsnorm", f"FusedAddRMSNormKernel<{args}>::run")],
     )
+    _warmup_module(module, "fused_add_rmsnorm", dim, dtype)
+    return module
 
 
 @cache_once
