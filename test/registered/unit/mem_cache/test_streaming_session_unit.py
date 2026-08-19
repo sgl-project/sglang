@@ -25,6 +25,7 @@ class _FakeInnerCache:
         self.page_size = page_size
         self.match_results = list(match_results or [])
         self.dec_lock_ref_calls = []
+        self.dec_lock_ref_params = []
 
     def cache_finished_req(self, *args, **kwargs):
         raise AssertionError("Streaming requests should not delegate to inner cache")
@@ -36,6 +37,7 @@ class _FakeInnerCache:
 
     def dec_lock_ref(self, node, *args, **kwargs):
         self.dec_lock_ref_calls.append(node)
+        self.dec_lock_ref_params.append(args[0] if args else kwargs.get("params"))
 
     def supports_mamba(self):
         return False
@@ -57,36 +59,26 @@ class _FakeReq:
         )
         self.req_pool_idx = req_pool_idx
         self.kv_committed_len = committed
-        self.kv_allocated_len = allocated
-        self.kv_committed_freed = False
-        self.kv_overallocated_freed = False
+        self.kv = SimpleNamespace(
+            kv_allocated_len=allocated,
+            swa_evicted_seqlen=0,
+        )
         self.origin_input_ids = list(range(committed))
         self.output_ids = []
         self.extra_key = None
-        self.swa_evicted_seqlen = 0
+        self.cache_salt = None
         self.last_node = None
         self.cache_protected_len = 0
         self.swa_uuid_for_lock = None
+        self.skip_lock_node_ids = {}
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
-        self.pop_overallocated_calls = 0
         self.to_finish = None
         self.finished_reason = None
         self.finished_len = None
-
-    def pop_committed_kv_cache(self):
-        assert not self.kv_committed_freed
-        self.kv_committed_freed = True
-        return self.kv_committed_len
-
-    def pop_overallocated_kv_cache(self):
-        assert not self.kv_overallocated_freed
-        self.pop_overallocated_calls += 1
-        self.kv_overallocated_freed = True
-        return self.kv_committed_len, self.kv_allocated_len
 
 
 def test_preabort_detaches_session_and_preserves_slot():
@@ -112,7 +104,7 @@ def test_preabort_detaches_session_and_preserves_slot():
     tree_cache.slots["session-a"] = SessionSlot(
         req_pool_idx=0,
         kv_committed_len=48,
-        kv_allocated_len=48,
+        kv=SimpleNamespace(kv_allocated_len=48, swa_evicted_seqlen=0),
         cache_protected_len=16,
     )
 
@@ -132,7 +124,7 @@ def test_preabort_detaches_session_and_preserves_slot():
     slot = tree_cache.slots["session-a"]
     assert slot.req_pool_idx == 0
     assert slot.kv_committed_len == 48
-    assert slot.kv_allocated_len == 48
+    assert slot.kv.kv_allocated_len == 48
     assert len(result.device_indices) == 0
 
 
@@ -159,9 +151,6 @@ def test_first_mid_abort_nukes_ephemeral_slot():
     assert req_to_token_pool.free_slots == [0]
     assert len(allocator.freed) == 1
     assert allocator.freed[0].tolist() == list(range(20))
-    # Bookkeeping flags set.
-    assert req.kv_committed_freed is True
-    assert req.kv_overallocated_freed is True
 
 
 def test_nth_mid_abort_nukes_session_slot():
@@ -179,7 +168,7 @@ def test_nth_mid_abort_nukes_session_slot():
     tree_cache.slots["session-a"] = SessionSlot(
         req_pool_idx=0,
         kv_committed_len=50,
-        kv_allocated_len=50,
+        kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
         last_node=None,
         cache_protected_len=0,
     )
@@ -198,9 +187,37 @@ def test_nth_mid_abort_nukes_session_slot():
     # Pool slot returned.
     assert req_to_token_pool.free_slots == [0]
     assert req.req_pool_idx is None
-    # Bookkeeping flags set.
-    assert req.kv_committed_freed is True
-    assert req.kv_overallocated_freed is True
+
+
+def test_release_session_threads_mamba_skip_ids():
+    """release_session must forward the slot's skip_lock_node_ids to
+    dec_lock_ref. The first req's last_node may be full-only-locked (mamba
+    skipped at inc), so without the skip set the release would drop a mamba
+    lock the session never took -- another request's, on a shared node."""
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
+
+    req_to_token = torch.arange(256, dtype=torch.int32).reshape(2, 128)
+    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
+    allocator = _FakeAllocator()
+    inner = _FakeInnerCache(req_to_token_pool, allocator, page_size=1)
+    tree_cache = StreamingSession(inner)
+
+    lock_node = SimpleNamespace(id=42)
+    tree_cache.slots["session-a"] = SessionSlot(
+        req_pool_idx=0,
+        kv_committed_len=50,
+        kv=SimpleNamespace(kv_allocated_len=50, swa_evicted_seqlen=0),
+        last_node=lock_node,
+        cache_protected_len=0,
+        skip_lock_node_ids={ComponentType.MAMBA: {42}},
+    )
+
+    tree_cache.release_session("session-a")
+
+    assert inner.dec_lock_ref_calls == [lock_node]
+    params = inner.dec_lock_ref_params[0]
+    assert params is not None
+    assert params.skip_lock_node_ids.get(ComponentType.MAMBA) == {42}
 
 
 # Shrink tests removed: streaming sessions are append-only after the
@@ -230,14 +247,14 @@ def test_trim_overshoot_postcondition():
     req = _FakeReq("session-a", req_pool_idx=0, committed=40, allocated=44)
     req.origin_input_ids = list(range(26))
     req.output_ids = list(range(14))
-    req.swa_evicted_seqlen = 42
+    req.kv.swa_evicted_seqlen = 42
 
     tree_cache._trim_overshoot(req, finished_len=12)
 
     target = 38
     assert req.kv_committed_len == target
-    assert req.kv_allocated_len == target
-    assert req.swa_evicted_seqlen == target
+    assert req.kv.kv_allocated_len == target
+    assert req.kv.swa_evicted_seqlen == target
     assert len(req.output_ids) == 12
     # Tail [38, 44) freed by _free_kv_aligned.
     assert len(allocator.freed) == 1

@@ -23,6 +23,30 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
 
+_SGL_TRTLLM_MODULE_WARMED = False
+
+
+def _warm_sgl_trtllm_moe_module() -> None:
+    """Build (JIT-compile + load) the sgl_trtllm MoE module at LoRA init time.
+
+    The LoRA MoE ops call ``get_sgl_trtllm_moe_sm100_raw_module()`` lazily on
+    their first forward. On a cold flashinfer JIT cache that fires a ninja
+    build taking tens of minutes (observed >30 min on GB300 aarch64) -- and the
+    first forward happens INSIDE decode cuda-graph capture, so the boot looks
+    hung mid-capture with an idle main thread. Building here (module init,
+    before capture) makes the cost visible at startup and keeps capture fast.
+    """
+    global _SGL_TRTLLM_MODULE_WARMED
+    if _SGL_TRTLLM_MODULE_WARMED:
+        return
+    from sglang.kernels.ops.moe.trtllm_lora_temp.core import (
+        get_sgl_trtllm_moe_sm100_raw_module,
+    )
+
+    get_sgl_trtllm_moe_sm100_raw_module()
+    _SGL_TRTLLM_MODULE_WARMED = True
+
+
 def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
     """Build and store the trtllm FP8 LoRA quant info on the layer.
 
@@ -36,6 +60,8 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
         get_activation_type,
     )
     from sglang.srt.layers.moe.utils import RoutingMethodType
+
+    _warm_sgl_trtllm_moe_module()
 
     # ---- NVFP4 (modelopt) path ----
     # The fp4 weight loader sets ``g1_scale_c`` on the FusedMoE layer (see
@@ -81,6 +107,39 @@ def init_experimental_sgl_trtllm_lora(layer, base_layer) -> None:
     if weight_block_size is None:
         weight_block_size = getattr(quant_method, "weight_block_size", None)
     use_mxfp8 = bool(getattr(quant_config, "use_mxfp8", False))
+
+    # ---- BF16 (unquantized) path ----
+    # No quant_config / block scales => the checkpoint is bf16. The bf16 LoRA dispatch
+    # runs the decomposed trtllm pipeline (sgl_trtllm_bf16_routed_moe_lora): permute ->
+    # raw gate_up GEMM -> LoRA-aware activation -> down GEMM, all bf16 — using the SAME
+    # prepared w13/w2 tensors (shuffled + BlockMajorK) the plain trtllm_bf16 path consumes.
+    # intermediate_size / local_num_experts / routing_method_type come from
+    # base_layer.moe_runner_config at dispatch time (the bf16 quant-info is minimal).
+    if quant_config is None and not getattr(quant_method, "block_quant", False):
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+            FlashInferTrtllmBf16MoeQuantInfo,
+        )
+
+        layer._lora_runner = None
+        layer._quant_info = FlashInferTrtllmBf16MoeQuantInfo(
+            gemm1_weights=base_layer.w13_weight.data,
+            gemm2_weights=base_layer.w2_weight.data,
+            global_num_experts=int(base_layer.num_experts),
+            local_expert_offset=int(base_layer.moe_ep_rank)
+            * int(base_layer.num_local_experts),
+        )
+        # Expose w13_weight/w2_weight on the bf16 quant-info so the backend-agnostic
+        # cuda-graph MoE buffer init (BaseLoRABackend.init_cuda_graph_moe_buffers) reads
+        # expert dims uniformly with the FP8/FP4 quant-infos (which name them w13/w2).
+        # The bf16 BlockMajorK weights are 4-D [E, N, K/128, 128]; collapsing the inner
+        # dims to a 3-D [E, N, K] view (free for contiguous weights) makes the upstream
+        # `E, N, _ = w13_weight.shape` dim-extraction work without touching base_backend.
+        _g1 = layer._quant_info.gemm1_weights
+        _g2 = layer._quant_info.gemm2_weights
+        layer._quant_info.w13_weight = _g1.reshape(_g1.shape[0], _g1.shape[1], -1)
+        layer._quant_info.w2_weight = _g2.reshape(_g2.shape[0], _g2.shape[1], -1)
+        return
+
     assert getattr(
         quant_method, "block_quant", False
     ), "experimental_sgl_trtllm LoRA currently requires FP8 block quant."
@@ -133,14 +192,17 @@ def dispatch_experimental_sgl_trtllm_lora(
     """
     import sglang.srt.lora.trtllm_lora_temp.lora_dispatch as ft
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+        FlashInferTrtllmBf16MoeQuantInfo,
         FlashInferTrtllmFp4MoeQuantInfo,
     )
 
     # Resolve the fused-experts fn on the module at CALL TIME so the install-time
     # two-stream monkey-patch (sglang.srt.lora.trtllm_lora_temp) takes effect. Route by
-    # quant dtype: NVFP4 -> fp4 LoRA op, else the FP8 path.
+    # quant dtype: NVFP4 -> fp4 LoRA op, BF16 (unquantized) -> bf16 LoRA op, else FP8.
     if isinstance(quant_info, FlashInferTrtllmFp4MoeQuantInfo):
         fused_fn = ft.fused_experts_none_to_experimental_sgl_trtllm_fp4_lora
+    elif isinstance(quant_info, FlashInferTrtllmBf16MoeQuantInfo):
+        fused_fn = ft.fused_experts_none_to_experimental_sgl_trtllm_bf16_lora
     else:
         fused_fn = ft.fused_experts_none_to_experimental_sgl_trtllm_fp8_lora
 

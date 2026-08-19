@@ -26,6 +26,7 @@ from typing_extensions import Self
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import (
+    EncoderMetricsCollector,
     SchedulerMetricsCollector,
     TokenizerMetricsCollector,
 )
@@ -35,6 +36,10 @@ from sglang.srt.observability.trace import (
     TraceReqContext,
     TraceSliceContext,
     get_global_tracing_enabled,
+)
+from sglang.srt.observability.trace_async import (
+    TraceReqContextAsync,
+    is_async_tracing_available,
 )
 from sglang.srt.utils import get_bool_env_var
 
@@ -224,7 +229,11 @@ class RequestStage:
 class ReqTimeStatsBase:
     enable_metrics: bool = False
     metrics_collector: Optional[
-        Union[SchedulerMetricsCollector, TokenizerMetricsCollector]
+        Union[
+            SchedulerMetricsCollector,
+            TokenizerMetricsCollector,
+            EncoderMetricsCollector,
+        ]
     ] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
         default_factory=TraceNullContext
@@ -258,7 +267,12 @@ class ReqTimeStatsBase:
             return "unknown"
 
     def set_metrics_collector(
-        self, collector: Union[SchedulerMetricsCollector, TokenizerMetricsCollector]
+        self,
+        collector: Union[
+            SchedulerMetricsCollector,
+            TokenizerMetricsCollector,
+            EncoderMetricsCollector,
+        ],
     ):
         if collector:
             self.enable_metrics = True
@@ -276,13 +290,22 @@ class ReqTimeStatsBase:
         bootstrap_room: Optional[int],
         external_trace_header: Optional[Dict[str, str]] = None,
     ):
-        self.trace_ctx = TraceReqContext(
-            rid=rid,
-            bootstrap_room=bootstrap_room,
-            role=self.disagg_mode_str(),
-            module_name="request",
-            external_trace_header=external_trace_header,
-        )
+        if is_async_tracing_available():
+            self.trace_ctx = TraceReqContextAsync(
+                rid=rid,
+                bootstrap_room=bootstrap_room,
+                role=self.disagg_mode_str(),
+                module_name="request",
+                external_trace_header=external_trace_header,
+            )
+        else:
+            self.trace_ctx = TraceReqContext(
+                rid=rid,
+                bootstrap_room=bootstrap_room,
+                role=self.disagg_mode_str(),
+                module_name="request",
+                external_trace_header=external_trace_header,
+            )
 
         if not self.trace_ctx.tracing_enable:
             self.trace_ctx = TraceNullContext()
@@ -329,14 +352,18 @@ class ReqTimeStatsBase:
         trace_ctx_state = state.get("trace_ctx")
         if isinstance(trace_ctx_state, dict):
             if trace_ctx_state.get("tracing_enable"):
-                trace_ctx = object.__new__(TraceReqContext)
-                trace_ctx.__setstate__(trace_ctx_state)
+                if trace_ctx_state.get("is_async"):
+                    trace_ctx = object.__new__(TraceReqContextAsync)
+                    trace_ctx.__setstate__(trace_ctx_state)
+                else:
+                    trace_ctx = object.__new__(TraceReqContext)
+                    trace_ctx.__setstate__(trace_ctx_state)
                 state["trace_ctx"] = trace_ctx
             else:
                 state["trace_ctx"] = TraceNullContext()
 
         for key in state.keys():
-            if key.endswith("time"):
+            if key.endswith("time") and state[key]:
                 state[key] = convert_time_cross_thread(
                     state[key],
                     state["diff_realtime_monotonic"],
@@ -613,15 +640,15 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
 
-    # Number of prefill retries for this request
-    prefill_retry_count: int = 0
+    has_timing_data: bool = False
 
     def __getstate__(self) -> object:
         # send to detokenizer/tokenizer
-        if not self.enable_metrics:
+        if not (self.enable_metrics or self.has_timing_data):
             return {}
 
         state = {
+            "has_timing_data": True,
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
             "prefill_finished_time": self.prefill_finished_time,
@@ -1079,8 +1106,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 f"forward_duration={self.format_duration(forward_duration)}, "
                 f"entry_time={self.format_wallclock(self.prefill_bootstrap_queue_entry_time)}, "
                 f"transfer_speed={self.transfer_speed_gb_s:.2f} GB/s, "
-                f"transfer_total={self.transfer_total_mb:.2f} MB, "
-                f"#retries={self.prefill_retry_count}"
+                f"transfer_total={self.transfer_total_mb:.2f} MB"
             )
         elif self.disagg_mode == DisaggregationMode.DECODE:
             prealloc_duration = self.duration_between(
@@ -1172,6 +1198,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 class EncoderReqTimeStats(ReqTimeStatsBase):
     mm_encode_start_time: float = 0.0
     mm_encode_end_time: float = 0.0
+    modality: str = "image"
 
     def set_mm_encode_start_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -1193,6 +1220,10 @@ class EncoderReqTimeStats(ReqTimeStatsBase):
                 RequestStage.MM_ENCODE.level,
                 convert_time_to_realtime_ns(ts),
                 thread_finish_flag=True,
+            )
+        if self.enable_metrics:
+            self.metrics_collector.observe_request_e2e_latency(
+                ts - self.mm_encode_start_time, modality=self.modality
             )
 
 
@@ -1233,3 +1264,19 @@ def set_time_batch(
             method(ts)
         else:
             method(ts, attrs)
+
+
+def flush_trace_batch(reqs: List[Any]):
+    """Proactively flush buffered trace ops for a batch of requests.
+
+    Call at natural CPU/GPU overlap points (e.g., right before run_batch)
+    so the ZMQ send overlaps with GPU forward compute.
+    """
+    if reqs is None or not get_global_tracing_enabled():
+        return
+    for req in reqs:
+        time_stats = getattr(req, "time_stats", None)
+        if time_stats is not None:
+            trace_ctx = getattr(time_stats, "trace_ctx", None)
+            if trace_ctx is not None:
+                trace_ctx.flush()

@@ -103,10 +103,6 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform supports FP8 quantization."""
         return False
 
-    def is_pin_memory_available(self) -> bool:
-        """Whether pinned memory is available on this platform."""
-        return True
-
     def support_cuda_graph(self) -> bool:
         """Whether this platform supports device graph capture and replay.
         Controls CUDA graph (CudaGraphRunner) for the decode path.
@@ -131,13 +127,16 @@ class SRTPlatform(DeviceMixin):
         pass
 
     # ------------------------------------------------------------------
-    # MultiPlatformOp integration
+    # BaseFusedOp integration
     # ------------------------------------------------------------------
 
     def get_dispatch_key_name(self) -> str:
-        """Return the dispatch key name for MultiPlatformOp.
+        """Return the dispatch key name for BaseFusedOp
+        (``sglang.kernels.fused_op``).
 
-        Determines which ``forward_<key>()`` method is selected.
-        E.g. "cuda", "npu", "hip", "xpu", "cpu".
+        Determines which ``forward_<key>()`` method is selected on an
+        out-of-tree platform. E.g. "cuda", "npu", "hip", "xpu", "cpu".
+        Forwards registered via ``BaseFusedOp.register_oot_forward`` with
+        this key take precedence over the method lookup.
         """
         return "native"

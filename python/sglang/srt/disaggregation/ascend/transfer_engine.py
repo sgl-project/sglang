@@ -31,7 +31,7 @@ class AscendTransferEngine(MooncakeTransferEngine):
     ):
         if import_error is not None:
             logger.warning(
-                "Please install memfabric_hybrid, for details, see docs/backend/pd_disaggregation.md"
+                "Please install memfabric_hybrid, for details, see docs/docs/advanced_features/pd_disaggregation.mdx"
             )
             raise import_error
 
@@ -48,10 +48,12 @@ class AscendTransferEngine(MooncakeTransferEngine):
         else:
             logger.error(f"Unsupported DisaggregationMode: {disaggregation_mode}")
             raise ValueError(f"Unsupported DisaggregationMode: {disaggregation_mode}")
-        self.session_id = NetworkAddress(
-            self.hostname, self.engine.get_rpc_port()
-        ).to_host_port_str()
+        rpc_port = self.engine.get_rpc_port()
+        self.session_id = NetworkAddress(self.hostname, rpc_port).to_host_port_str()
         self.initialize()
+        if rpc_port == 0:
+            rpc_port = self.engine.get_rpc_port()
+            self.session_id = NetworkAddress(self.hostname, rpc_port).to_host_port_str()
 
     def initialize(self) -> None:
         from sglang.srt.distributed.parallel_state import (

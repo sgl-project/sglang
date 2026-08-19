@@ -1,0 +1,962 @@
+---
+title: GLM-4.7
+metatags:
+    description: "Deploy GLM-4.7 with SGLang on NVIDIA Blackwell (B200, GB200) and AMD GPUs - state-of-the-art reasoning, robust tool calling, and NVFP4 weights for Blackwell."
+---
+
+## 1. Model Introduction
+
+[GLM-4.7](https://huggingface.co/zai-org/GLM-4.7) is a powerful language model developed by Zhipu AI, featuring advanced capabilities in reasoning, function calling, and agent workflows.
+
+GLM-4.7 brings improvements across all major domains:
+
+- **Extended Context Window**: Expanded context window supporting even longer documents and complex multi-turn conversations
+- **Enhanced Reasoning**: Improved reasoning capabilities with better chain-of-thought processing
+- **Superior Coding**: Significantly improved code generation and understanding, with better real-world application performance
+- **Advanced Tool Use**: More robust tool calling and agent capabilities for complex workflows
+- **Optimized Performance**: Better throughput and latency characteristics across all hardware platforms
+
+For more details, please refer to the [official GLM-4.7 documentation](https://docs.z.ai/guides/llm/glm-4.7).
+
+**Key Features:**
+
+- **State-of-the-Art Reasoning**: Enhanced reasoning capabilities for the most complex problem-solving tasks
+- **Multiple Quantizations**: BF16, FP8, and NVFP4 variants for different performance/memory trade-offs
+- **Hardware Optimization**: Tuned for NVIDIA Blackwell (B200, GB200) and AMD MI300X/MI325X/MI355X GPUs
+- **High Performance**: Optimized for both throughput and latency scenarios
+
+**Available Models:**
+
+- **BF16 (Full precision)**: [zai-org/GLM-4.7](https://huggingface.co/zai-org/GLM-4.7)
+- **FP8 (8-bit quantized)**: [zai-org/GLM-4.7-FP8](https://huggingface.co/zai-org/GLM-4.7-FP8)
+- **NVFP4 (4-bit, NVIDIA Blackwell)**: [nvidia/GLM-4.7-NVFP4](https://huggingface.co/nvidia/GLM-4.7-NVFP4)
+
+**License:**
+
+Please refer to the [official GLM-4.7 model card](https://huggingface.co/zai-org/GLM-4.7) for license details.
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
+
+**Docker Images by Hardware Platform:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Hardware Platform</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Docker Image</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA H100 / H200 / B200</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.12`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA GB200 / B300 / GB300 (aarch64)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.12-cu130`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>AMD MI300X / MI325X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.12-rocm720-mi30x`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>AMD MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:v0.5.12-rocm720-mi35x`</td>
+    </tr>
+  </tbody>
+</table>
+
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, deployment strategy, and thinking capabilities.
+
+import { GLM47Deployment } from "/src/snippets/autoregressive/glm-47-deployment.jsx";
+
+<GLM47Deployment />
+
+### 3.2 Configuration Tips
+
+Pick a weight format by hardware: **NVFP4** on NVIDIA Blackwell (B200, GB200), **FP8** on H100/H200/AMD, **BF16** as the full-precision fallback. The recommended tensor-parallel size per platform:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Hardware</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>NVFP4</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>FP8</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B200 (8×, single node)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=2 / 4 / 8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=4 / 8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>GB200 (NVL72, 4× per tray)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=2 / 4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>H200 (8×)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=8</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>AMD MI300X / MI325X / MI355X</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>tp=2 / 4 / 8</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>tp=4 / 8</td>
+    </tr>
+  </tbody>
+</table>
+
+- **EAGLE Speculative Decoding:** Supported for GLM-4.7. Add `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. The spec-v2 overlap scheduler is enabled by default; pass `--disable-overlap-schedule` to disable. Enable via the interactive command generator above.
+- **Thinking Budget:** Use `--enable-custom-logit-processor` flag and pass `Glm4MoeThinkingBudgetLogitProcessor` in requests to cap the model's thinking token count (see section 4.2.3).
+
+For general GLM-4.x family launch guidance (AMD ROCm notes and more), see [Launch GLM-4.5 / GLM-4.6 / GLM-4.7 with SGLang](/cookbook/autoregressive/GLM/GLM-4.5). Per-hardware bench commands and flags are inline in §5.1 below.
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Reasoning Parser
+
+GLM-4.7 supports Thinking mode by default. Enable the reasoning parser during deployment to separate the thinking and the content sections:
+
+```shell Command
+python -m sglang.launch_server \
+  --model zai-org/GLM-4.7 \
+  --reasoning-parser glm45 \
+  --tp 8 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+**Streaming with Thinking Process:**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY"
+)
+
+# Enable streaming to see the thinking process in real-time
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.7",
+    messages=[
+        {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
+    ],
+    temperature=0.7,
+    max_tokens=2048,
+    stream=True
+)
+
+# Process the stream
+has_thinking = False
+has_answer = False
+thinking_started = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print answer content
+        if delta.content:
+            # Close thinking section and add content header
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+To solve this problem, I need to calculate 15% of 240.
+Step 1: Convert 15% to decimal: 15% = 0.15
+Step 2: Multiply 240 by 0.15
+Step 3: 240 × 0.15 = 36
+=============== Content =================
+
+The answer is 36. To find 15% of 240, we multiply 240 by 0.15, which equals 36.
+```
+
+**Note:** The reasoning parser captures the model's step-by-step thinking process, allowing you to see how the model arrives at its conclusions.
+
+#### 4.2.2 Tool Calling
+
+<Note>
+**Parser names by model:** GLM-4.5 and GLM-4.6 use `--tool-call-parser glm45`. GLM-4.7 and GLM-4.7-Flash use `--tool-call-parser glm47`. All GLM models use `--reasoning-parser glm45` regardless of generation.
+</Note>
+
+GLM-4.7 supports tool calling capabilities. Enable the tool call parser:
+
+```shell Command
+python -m sglang.launch_server \
+  --model zai-org/GLM-4.7 \
+  --reasoning-parser glm45 \
+  --tool-call-parser glm47 \
+  --tp 8 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+**Python Example (with Thinking Process):**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY"
+)
+
+# Define available tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature unit"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+
+# Make request with streaming to see thinking process
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.7",
+    messages=[
+        {"role": "user", "content": "What's the weather in Beijing?"}
+    ],
+    tools=tools,
+    temperature=0.7,
+    stream=True
+)
+
+# Process streaming response
+thinking_started = False
+has_thinking = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print tool calls
+        if hasattr(delta, 'tool_calls') and delta.tool_calls:
+            # Close thinking section if needed
+            if has_thinking and thinking_started:
+                print("\n=============== Content =================", flush=True)
+                thinking_started = False
+
+            for tool_call in delta.tool_calls:
+                if tool_call.function:
+                    print(f"Tool Call: {tool_call.function.name}")
+                    print(f"   Arguments: {tool_call.function.arguments}")
+
+        # Print content
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+The user is asking about the weather in Beijing. I need to use the get_weather function to retrieve this information.
+I should call the function with location="Beijing".
+=============== Content =================
+
+Tool Call: get_weather
+   Arguments: {"location": "Beijing", "unit": "celsius"}
+```
+
+**Note:**
+
+- The reasoning parser shows how the model decides to use a tool
+- Tool calls are clearly marked with the function name and arguments
+- You can then execute the function and send the result back to continue the conversation
+
+**Handling Tool Call Results:**
+
+```python Example
+# After getting the tool call, execute the function
+def get_weather(location, unit="celsius"):
+    # Your actual weather API call here
+    return f"The weather in {location} is 22°{unit[0].upper()} and sunny."
+
+# Send tool result back to the model
+messages = [
+    {"role": "user", "content": "What's the weather in Beijing?"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_123",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": '{"location": "Beijing", "unit": "celsius"}'
+            }
+        }]
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_123",
+        "content": get_weather("Beijing", "celsius")
+    }
+]
+
+final_response = client.chat.completions.create(
+    model="zai-org/GLM-4.7",
+    messages=messages,
+    temperature=0.7
+)
+
+print(final_response.choices[0].message.content)
+# Output: "The weather in Beijing is currently 22°C and sunny."
+```
+
+#### 4.2.3 Thinking Budget
+
+Limit the number of thinking tokens using `CustomLogitProcessor`. Launch with `--enable-custom-logit-processor`:
+
+```python Example
+import openai
+from sglang.srt.sampling.custom_logit_processor import Glm4MoeThinkingBudgetLogitProcessor
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="*")
+response = client.chat.completions.create(
+    model="zai-org/GLM-4.7",
+    messages=[{"role": "user", "content": "Is Paris the Capital of France?"}],
+    max_tokens=1024,
+    extra_body={
+        "custom_logit_processor": Glm4MoeThinkingBudgetLogitProcessor().to_str(),
+        "custom_params": {"thinking_budget": 512},
+    },
+)
+print(response)
+```
+
+## 5. Benchmark
+
+This section uses **industry-standard configurations** for comparable benchmark results.
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: NVIDIA B200, NVIDIA GB200, AMD MI300X/MI325X/MI355X (8x)
+- Model: GLM-4.7-NVFP4 on NVIDIA Blackwell; GLM-4.7-FP8 or GLM-4.7 (BF16) on AMD
+- SGLang Version: 0.5.12 (NVIDIA Blackwell), 0.5.6.post1 (AMD)
+- Best per-GPU throughput config on B200: **TP=2 NVFP4 bf16-KV** (NVFP4 weights, no EP). Numbers below come from this config.
+
+**Benchmark Methodology:**
+
+We use industry-standard benchmark configurations to ensure results are comparable across frameworks and hardware platforms.
+
+#### 5.1.1 Standard Test Scenarios
+
+Four core scenarios reflect real-world usage patterns:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Scenario</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Input Length</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Output Length</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Use Case</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Chat**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Most common conversational AI workload</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Reasoning**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Long-form generation, complex reasoning tasks</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Summarization**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Document summarization, RAG retrieval</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Throughput**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1K</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Mixed RAG / agent / multi-turn conversation (used for the inline B200 / GB200 results below)</td>
+    </tr>
+  </tbody>
+</table>
+
+#### 5.1.2 Concurrency Levels
+
+Test each scenario at three concurrency levels to capture the throughput vs. latency tradeoff (Pareto frontier):
+
+- **Low Concurrency**: `--max-concurrency 1` (Latency-optimized)
+- **Medium Concurrency**: `--max-concurrency 16` (Balanced)
+- **High Concurrency**: `--max-concurrency 100` (Throughput-optimized) — the Throughput (4K/1K) scenario uses `--max-concurrency 128` to match the inline B200/GB200 results below.
+
+#### 5.1.3 Number of Prompts
+
+For each concurrency level, configure `num_prompts` to simulate realistic user loads:
+
+- **Quick Test**: `num_prompts = concurrency × 1` (minimal test)
+- **Recommended**: `num_prompts = concurrency × 5` (standard benchmark)
+- **Stable Measurements**: `num_prompts = concurrency × 10` (production-grade)
+
+---
+
+#### 5.1.4 Benchmark Commands
+
+**Scenario 1: Chat (1K/1K) - Most Important**
+
+- **Model Deployment**
+```bash Command
+python -m sglang.launch_server \
+  --model zai-org/GLM-4.7 \
+  --tp 8
+```
+
+
+- Low Concurrency (Latency-Optimized)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.7 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+- Medium Concurrency (Balanced)
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.7 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+
+- High Concurrency (Throughput-Optimized)
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.7 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 500 \
+  --max-concurrency 100 \
+  --request-rate inf
+```
+
+**Scenario 2: Reasoning (1K/8K)**
+
+- Low Concurrency
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.7 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 8000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+- Medium Concurrency
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.7 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 8000 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+
+- High Concurrency
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.7 \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 8000 \
+  --num-prompts 320 \
+  --max-concurrency 64 \
+  --request-rate inf
+```
+
+**Scenario 3: Summarization (8K/1K)**
+
+- Low Concurrency
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.7 \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+- Medium Concurrency
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.7 \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+
+- High Concurrency
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model zai-org/GLM-4.7 \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 320 \
+  --max-concurrency 64 \
+  --request-rate inf
+```
+
+**Scenario 4: Throughput (4K/1K) — NVIDIA Blackwell with NVFP4**
+
+The remaining sub-sections (§5.1.4.1 NVIDIA B200, §5.1.4.2 NVIDIA GB200) measure this scenario with `nvidia/GLM-4.7-NVFP4` weights and report the full `bench_serving` output verbatim. The same commands apply to other NVIDIA hardware after substituting the deployment line from §3.1.
+
+> **Note**: These runs use EOS-enabled generation (no `--disable-ignore-eos`), so generated-token counts reflect natural model behavior rather than a strict fixed-OSL pin. Compare against other EOS-enabled runs at the same workload, not against fixed-output-length benchmarks.
+
+#### 5.1.4.1 NVIDIA B200
+
+**Model Deployment (NVIDIA B200, TP=2 NVFP4 — max tok/s/gpu config):**
+
+```bash Command
+python -m sglang.launch_server \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --tp-size 2 \
+  --mem-fraction-static 0.85 \
+  --reasoning-parser glm45 \
+  --tool-call-parser glm47
+```
+
+- Low Concurrency (Latency-Optimized)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --dataset-name random \
+  --random-input-len 4096 \
+  --random-output-len 1024 \
+  --num-prompts 5 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 1
+Successful requests:                     5
+Benchmark duration (s):                  25.07
+Total input tokens:                      8105
+Total generated tokens:                  2674
+Request throughput (req/s):              0.20
+Input token throughput (tok/s):          323.25
+Output token throughput (tok/s):         106.65
+Total token throughput (tok/s):          429.90
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   5011.93
+Median E2E Latency (ms):                 6441.44
+---------------Time to First Token----------------
+Mean TTFT (ms):                          179.61
+Median TTFT (ms):                        169.05
+P99 TTFT (ms):                           238.01
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          9.05
+Median TPOT (ms):                        9.03
+P99 TPOT (ms):                           9.16
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           9.05
+Median ITL (ms):                         9.05
+==================================================
+```
+
+- Medium Concurrency (Balanced)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --dataset-name random \
+  --random-input-len 4096 \
+  --random-output-len 1024 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  60.60
+Total input tokens:                      179772
+Total generated tokens:                  39657
+Request throughput (req/s):              1.32
+Input token throughput (tok/s):          2966.39
+Output token throughput (tok/s):         654.37
+Total token throughput (tok/s):          3620.76
+Concurrency:                             14.01
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   10615.87
+Median E2E Latency (ms):                 9985.45
+---------------Time to First Token----------------
+Mean TTFT (ms):                          267.39
+Median TTFT (ms):                        177.26
+P99 TTFT (ms):                           584.29
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          20.98
+Median TPOT (ms):                        21.06
+P99 TPOT (ms):                           24.88
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           20.92
+Median ITL (ms):                         17.93
+==================================================
+```
+
+- High Concurrency (Throughput-Optimized)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --dataset-name random \
+  --random-input-len 4096 \
+  --random-output-len 1024 \
+  --num-prompts 640 \
+  --max-concurrency 128 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 128
+Successful requests:                     640
+Benchmark duration (s):                  172.95
+Total input tokens:                      1453591
+Total generated tokens:                  308740
+Request throughput (req/s):              3.70
+Input token throughput (tok/s):          8404.67
+Output token throughput (tok/s):         1785.14
+Total token throughput (tok/s):          10189.80
+Concurrency:                             117.85
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   31848.20
+Median E2E Latency (ms):                 28554.42
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1598.40
+Median TTFT (ms):                        298.88
+P99 TTFT (ms):                           11015.96
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          65.94
+Median TPOT (ms):                        65.81
+P99 TPOT (ms):                           137.73
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           62.99
+Median ITL (ms):                         35.44
+==================================================
+```
+
+#### 5.1.4.2 NVIDIA GB200
+
+**Model Deployment (NVIDIA GB200, TP=2 NVFP4 — max tok/s/gpu config):**
+
+```bash Command
+python -m sglang.launch_server \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --tp-size 2 \
+  --mem-fraction-static 0.85 \
+  --reasoning-parser glm45 \
+  --tool-call-parser glm47
+```
+
+- Low Concurrency (Latency-Optimized)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --dataset-name random \
+  --random-input-len 4096 \
+  --random-output-len 1024 \
+  --num-prompts 5 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 1
+Successful requests:                     5
+Benchmark duration (s):                  24.74
+Total input tokens:                      8105
+Total generated tokens:                  2674
+Request throughput (req/s):              0.20
+Input token throughput (tok/s):          327.65
+Output token throughput (tok/s):         108.10
+Total token throughput (tok/s):          435.75
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   4944.47
+Median E2E Latency (ms):                 6347.31
+---------------Time to First Token----------------
+Mean TTFT (ms):                          211.41
+Median TTFT (ms):                        207.25
+P99 TTFT (ms):                           226.46
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          8.86
+Median TPOT (ms):                        8.84
+P99 TPOT (ms):                           8.96
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           8.87
+Median ITL (ms):                         8.85
+==================================================
+```
+
+- Medium Concurrency (Balanced)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --dataset-name random \
+  --random-input-len 4096 \
+  --random-output-len 1024 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  60.40
+Total input tokens:                      179772
+Total generated tokens:                  39657
+Request throughput (req/s):              1.32
+Input token throughput (tok/s):          2976.52
+Output token throughput (tok/s):         656.61
+Total token throughput (tok/s):          3633.13
+Concurrency:                             13.97
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   10611.51
+Median E2E Latency (ms):                 9956.84
+---------------Time to First Token----------------
+Mean TTFT (ms):                          338.14
+Median TTFT (ms):                        215.25
+P99 TTFT (ms):                           915.40
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          20.87
+Median TPOT (ms):                        21.36
+P99 TPOT (ms):                           27.05
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           20.77
+Median ITL (ms):                         16.53
+==================================================
+```
+
+- High Concurrency (Throughput-Optimized)
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model nvidia/GLM-4.7-NVFP4 \
+  --dataset-name random \
+  --random-input-len 4096 \
+  --random-output-len 1024 \
+  --num-prompts 640 \
+  --max-concurrency 128 \
+  --request-rate inf
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 128
+Successful requests:                     640
+Benchmark duration (s):                  181.89
+Total input tokens:                      1453591
+Total generated tokens:                  309221
+Request throughput (req/s):              3.52
+Input token throughput (tok/s):          7991.59
+Output token throughput (tok/s):         1700.04
+Total token throughput (tok/s):          9691.63
+Concurrency:                             118.86
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   33690.47
+Median E2E Latency (ms):                 30421.55
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1353.16
+Median TTFT (ms):                        383.52
+P99 TTFT (ms):                           8940.53
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          69.88
+Median TPOT (ms):                        71.77
+P99 TPOT (ms):                           131.75
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           67.23
+Median ITL (ms):                         33.46
+==================================================
+```
+
+#### 5.1.5 Understanding the Results
+
+**Key Metrics:**
+
+- **Request Throughput (req/s)**: Number of requests processed per second
+- **Output Token Throughput (tok/s)**: Total tokens generated per second
+- **Mean TTFT (ms)**: Time to First Token - measures responsiveness
+- **Mean TPOT (ms)**: Time Per Output Token - measures generation speed
+- **Mean ITL (ms)**: Inter-Token Latency - measures streaming consistency
+
+**Why These Configurations Matter:**
+
+- **1K/1K (Chat)**: Represents the most common conversational AI workload. This is the highest priority scenario for most deployments.
+- **1K/8K (Reasoning)**: Tests long-form generation capabilities crucial for complex reasoning, code generation, and detailed explanations.
+- **8K/1K (Summarization)**: Evaluates performance with large context inputs, essential for RAG systems, document Q&A, and summarization tasks.
+- **4K/1K (Throughput)**: Realistic mixed workload typical of production deployments (RAG context + medium response). Long enough input that prefill matters, long enough output that decode steady-state dominates. Used for the inline B200 / GB200 results above.
+- **Variable Concurrency**: Captures the Pareto frontier - the optimal tradeoff between throughput and latency at different load levels. Low concurrency shows best-case latency, high concurrency shows maximum throughput.
+
+**Interpreting Results:**
+
+- Compare your results against baseline numbers for your hardware
+- Higher throughput at same latency = better performance
+- Lower TTFT = more responsive user experience
+- Lower TPOT = faster generation speed
+
+### 5.2 Accuracy Benchmark
+
+Document model accuracy on standard benchmarks:
+
+#### 5.2.1 GSM8K Benchmark
+
+- Benchmark Command
+```bash Command
+python -m sglang.test.few_shot_gsm8k \
+  --num-shots 5 \
+  --num-questions 1319 \
+  --port 30000
+```
+
+- Test Result (NVIDIA B200, TP=2 NVFP4)
+```text Output
+Accuracy: 0.946
+Latency: 178.284 s
+Output throughput: 769.204 token/s
+```
+
+- Test Result (NVIDIA GB200, TP=2 NVFP4)
+```text Output
+Accuracy: 0.951
+Latency: 175.190 s
+Invalid: 0.000
+```
