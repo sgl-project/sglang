@@ -168,7 +168,9 @@ void fast_topk_transform_interface(
     at::Tensor& dst_page_table,
     const at::Tensor& src_page_table,
     const at::Tensor& cu_seqlens_q,
-    std::optional<at::Tensor> row_starts_opt = std::nullopt);
+    std::optional<at::Tensor> row_starts_opt = std::nullopt,
+    std::optional<at::Tensor> compact_page_table_opt = std::nullopt,
+    std::optional<at::Tensor> compact_indptr_opt = std::nullopt);
 void fast_topk_transform_ragged_interface(
     const at::Tensor& score,
     const at::Tensor& lengths,

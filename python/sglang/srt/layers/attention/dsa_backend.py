@@ -228,6 +228,28 @@ class DSAFlashMLAMetadata:
         self.num_splits.copy_(other.num_splits)
 
 
+@dataclass
+class AiterTopkCompaction:
+    """Buffers for the decode top-k transform to also emit its result with the
+    -1 padding removed, which is the layout aiter's sparse MLA reads.
+
+    Filling them inside the transform is what lets the aiter decode path skip a
+    compaction launch per top-k table. ``written`` is how it knows the transform
+    really did it: only the sgl_kernel decode transform writes this second
+    output, and which transform runs turns on dispatch conditions not visible
+    from here. Having the transform report back, rather than predicting it,
+    means a dispatch change degrades to the explicit gather instead of leaving
+    the consumer on a stale buffer.
+
+    A plain Python flag suffices even for captured decode graphs: whichever
+    branch ran at capture is the branch whose launches replay.
+    """
+
+    indices: torch.Tensor
+    indptr: torch.Tensor
+    written: bool = False
+
+
 @dataclass(frozen=True)
 class DSAMetadata:
     page_size: int
@@ -298,6 +320,12 @@ class DSAMetadata:
     # ~5 extra kernel launches per layer, which is why the aiter decode path
     # measured slower than tilelang before this was hoisted.
     aiter_sparse_mla: Optional[AiterSparseMLADecodeMetadata] = None
+
+    # Offer to the decode top-k transform to emit the padding-free top-k list
+    # itself, saving the aiter decode path a compaction launch per top-k table.
+    # Present for plain aiter decode; None everywhere else, and the aiter path
+    # then compacts explicitly. See DSABackend._aiter_compaction_request.
+    aiter_compaction: Optional[AiterTopkCompaction] = None
 
 
 @torch.compile
@@ -834,6 +862,28 @@ class DeepseekSparseAttnBackend(
             buffer = self.aiter_sparse_mla_extend_kv_indices
         return buffer[:needed]
 
+    def _aiter_compaction_request(
+        self,
+        forward_mode: ForwardMode,
+        dsa_cu_seqlens_k: torch.Tensor,
+        aiter_sparse_mla: Optional[AiterSparseMLADecodeMetadata],
+    ) -> Optional[AiterTopkCompaction]:
+        """Offer the top-k transform the buffers to emit the gap-free slot list.
+
+        Accepting the offer is what lets :py:meth:`_forward_aiter` drop its own
+        compaction launch. GLM-5.2 otherwise pays one per top-k table, 21 times
+        per decode step, for ~4us of actual work -- almost pure launch overhead,
+        so the only way to remove it is to stop launching.
+
+        Offered only for plain aiter decode: the prefill and verify transforms
+        map several query rows onto one source row, which a per-row indptr
+        cannot describe, and the kernel rejects them outright. Whether the offer
+        is taken is up to the transform, which reports back on the object.
+        """
+        if aiter_sparse_mla is None or not forward_mode.is_decode_or_idle():
+            return None
+        return AiterTopkCompaction(indices=self.kv_indices, indptr=dsa_cu_seqlens_k)
+
     def _aiter_topk_compaction_is_current(
         self, slot: str, page_table_1: torch.Tensor, num_tokens: int
     ) -> bool:
@@ -1311,6 +1361,12 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        aiter_sparse_mla = (
+            self._build_aiter_sparse_mla_metadata(dsa_cu_seqlens_q, dsa_cu_seqlens_k)
+            if _is_hip and forward_batch.forward_mode.is_decode_or_idle()
+            else None
+        )
+
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1344,12 +1400,9 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
-            aiter_sparse_mla=(
-                self._build_aiter_sparse_mla_metadata(
-                    dsa_cu_seqlens_q, dsa_cu_seqlens_k
-                )
-                if _is_hip and forward_batch.forward_mode.is_decode_or_idle()
-                else None
+            aiter_sparse_mla=aiter_sparse_mla,
+            aiter_compaction=self._aiter_compaction_request(
+                forward_batch.forward_mode, dsa_cu_seqlens_k, aiter_sparse_mla
             ),
         )
         self.forward_metadata = metadata
@@ -1661,6 +1714,12 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
             )
 
+        aiter_sparse_mla = (
+            self._build_aiter_sparse_mla_metadata(dsa_cu_seqlens_q, dsa_cu_seqlens_k)
+            if _is_hip
+            else None
+        )
+
         metadata = DSAMetadata(
             page_size=self.real_page_size,
             cache_seqlens_int32=cache_seqlens_int32,
@@ -1679,12 +1738,9 @@ class DeepseekSparseAttnBackend(
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
-            aiter_sparse_mla=(
-                self._build_aiter_sparse_mla_metadata(
-                    dsa_cu_seqlens_q, dsa_cu_seqlens_k
-                )
-                if _is_hip
-                else None
+            aiter_sparse_mla=aiter_sparse_mla,
+            aiter_compaction=self._aiter_compaction_request(
+                forward_mode, dsa_cu_seqlens_k, aiter_sparse_mla
             ),
         )
         self.decode_cuda_graph_metadata[bs] = metadata
@@ -3292,9 +3348,12 @@ class DeepseekSparseAttnBackend(
         Everything batch-shaped was already planned by
         :py:meth:`_build_aiter_sparse_mla_metadata`. What remains is gathering
         the top-k KV slots, whose *values* differ per layer even though their
-        per-request *lengths* do not -- but only for layers that actually
-        recompute top-k, since the gather follows the table rather than the
-        layer (see :py:meth:`_aiter_topk_compaction_is_current`).
+        per-request *lengths* do not -- and even that is normally already done,
+        folded into the top-k transform itself
+        (see :py:meth:`_aiter_compaction_request`). Transforms that cannot emit
+        it leave the gather here, and then only for layers that actually
+        recompute top-k, since it follows the table rather than the layer
+        (see :py:meth:`_aiter_topk_compaction_is_current`).
         """
         assert (
             metadata.aiter_sparse_mla is not None
@@ -3333,8 +3392,12 @@ class DeepseekSparseAttnBackend(
         # -- exactly the sparse indptr, and already up to date for this batch.
         sparse_kv_indptr = metadata.dsa_cu_seqlens_k[: num_tokens + 1]
         sparse_kv_indices = self.kv_indices
-        if not self._aiter_topk_compaction_is_current(
-            "decode", page_table_1, num_tokens
+        # A transform that took the offer already filled these, for every layer
+        # that recomputed top-k and hence for every table a layer can be looking
+        # at -- nothing left to gather here.
+        compaction = metadata.aiter_compaction
+        if not (compaction is not None and compaction.written) and not (
+            self._aiter_topk_compaction_is_current("decode", page_table_1, num_tokens)
         ):
             get_valid_kv_indices(
                 page_table_1, sparse_kv_indptr, sparse_kv_indices, num_tokens
