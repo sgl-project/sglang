@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from unittest.mock import patch
 
 import torch
 
@@ -7,6 +8,7 @@ from sglang.srt.utils.common import (
     flatten_arrays_to_int64_tensor,
     get_device_sm_nvidia_smi,
     get_nvidia_driver_version_str,
+    is_sm89_supported,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -142,6 +144,48 @@ class TestGetDeviceSmNvidiaSmi(CustomTestCase):
             self.assertEqual(get_device_sm_nvidia_smi(), (0, 0))
         finally:
             subprocess.run = original
+
+
+class TestIsSm89Supported(CustomTestCase):
+    """`is_sm89_supported` returns True only when CUDA is available, the
+    device capability is exactly (8, 9), and the CUDA runtime is >= 11.0.
+    The lru_cache means results stick across calls within a process, so each
+    test patches the underlying probes and clears the cache in setUp/tearDown.
+    Runs on CPU CI by mocking `is_cuda` and `torch.cuda.get_device_capability`.
+    """
+
+    def setUp(self):
+        is_sm89_supported.cache_clear()
+
+    def tearDown(self):
+        is_sm89_supported.cache_clear()
+
+    @patch("sglang.srt.utils.common.torch.version.cuda", "12.3")
+    @patch("sglang.srt.utils.common.torch.cuda.get_device_capability", return_value=(8, 9))
+    @patch("sglang.srt.utils.common.is_cuda", return_value=True)
+    def test_returns_true_on_sm89(self, _mock_is_cuda, _mock_cap):
+        self.assertTrue(is_sm89_supported())
+
+    @patch("sglang.srt.utils.common.torch.version.cuda", "12.3")
+    @patch("sglang.srt.utils.common.torch.cuda.get_device_capability", return_value=(9, 0))
+    @patch("sglang.srt.utils.common.is_cuda", return_value=True)
+    def test_returns_false_on_sm90(self, _mock_is_cuda, _mock_cap):
+        # SM90 must not be misreported as SM89 — a bare `major==8` check would
+        # wrongly accept SM80 (Ampere) too, which is exactly why this helper
+        # exists instead of reusing `_check_cuda_device_version`.
+        self.assertFalse(is_sm89_supported())
+
+    @patch("sglang.srt.utils.common.torch.version.cuda", "12.3")
+    @patch("sglang.srt.utils.common.torch.cuda.get_device_capability", return_value=(8, 0))
+    @patch("sglang.srt.utils.common.is_cuda", return_value=True)
+    def test_returns_false_on_sm80(self, _mock_is_cuda, _mock_cap):
+        # SM80 (Ampere) shares major=8 with SM89 but is not Ada Lovelace and
+        # lacks the FP8 throughput this gate ultimately guards.
+        self.assertFalse(is_sm89_supported())
+
+    @patch("sglang.srt.utils.common.is_cuda", return_value=False)
+    def test_returns_false_without_cuda(self, _mock_is_cuda):
+        self.assertFalse(is_sm89_supported())
 
 
 if __name__ == "__main__":
