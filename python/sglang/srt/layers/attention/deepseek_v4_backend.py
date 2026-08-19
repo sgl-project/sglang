@@ -25,9 +25,6 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
-from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
-)
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -41,7 +38,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_attn_metadata import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
-    SharedReadBoundary,
+    SharedReadEnds,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsv4.compressor_v2 import (
@@ -68,7 +65,6 @@ from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
-    compute_ragged_extend_lengths,
     compute_target_verify_graph_key,
     compute_uniform_extend_lengths,
     read_ragged_verify_mode,
@@ -504,11 +500,15 @@ class DeepseekV4AttnBackend(
     supports_ragged_verify_graph: bool = True
     needs_cpu_seq_lens: bool = False
 
-    def shared_read_boundary(self, forward_mode: ForwardMode) -> SharedReadBoundary:
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         # Breakable-graph verify rereads shared state across segments.
-        if forward_mode.is_target_verify():
-            return SharedReadBoundary.POST_REPLAY
-        return super().shared_read_boundary(forward_mode)
+        # DSPARK verify replays one full (non-breakable) graph that honors the
+        # out-graph/in-graph init contract, so the base IN_REPLAY bound holds.
+        if fm.is_target_verify():
+            if self.model_runner.spec_algorithm.is_dspark():
+                return SharedReadEnds.IN_REPLAY
+            return SharedReadEnds.POST_REPLAY
+        return super().shared_read_ends(fm)
 
     def __init__(
         self,
@@ -582,14 +582,13 @@ class DeepseekV4AttnBackend(
         self.sparse_prefill_workspace = SparsePrefillWorkspace(self.device)
         spec_alg = model_runner.spec_algorithm
         self.needs_cpu_seq_lens = not spec_alg.is_dspark() and (
-            not _is_cuda
-            or not envs.SGLANG_PREP_IN_CUDA_GRAPH.get()
-            or self.online_c128_mtp.enabled()
+            not _is_cuda or self.online_c128_mtp.enabled()
         )
 
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
+        self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -691,38 +690,10 @@ class DeepseekV4AttnBackend(
             req_pool_indices.shape[0] == seq_lens.shape[0] == out_cache_loc.shape[0]
         ), f"{req_pool_indices.shape=} {seq_lens.shape=} {out_cache_loc.shape=}"
 
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
-            return DSV4RawDecodeMetadata(
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc,
-            )
-
-        core_attn_metadata = self.make_core_attn_metadata(
-            req_to_token=self.req_to_token,
-            req_pool_indices_repeated=req_pool_indices,
-            seq_lens_casual=seq_lens,
-            max_seq_len=max_seq_len,
-            out_loc=out_cache_loc,
-            need_compress=True,
-        )
-
-        indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
-
-        create = functools.partial(
-            create_paged_compressor_data,
-            is_prefill=False,
-            token_to_kv_pool=self.token_to_kv_pool,
-            req_to_token=self.req_to_token,
+        return DSV4RawDecodeMetadata(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-        )
-
-        return DSV4Metadata(
-            core_attn_metadata,
-            indexer_metadata,
-            c4_compress_metadata=create(compress_ratio=4),
-            c128_compress_metadata=create(compress_ratio=128),
+            out_cache_loc=out_cache_loc,
         )
 
     def init_forward_metadata_prefill(
@@ -841,108 +812,44 @@ class DeepseekV4AttnBackend(
         online_c128_state_slot_offset: int = 0,
         ragged_layout: Optional[RaggedVerifyLayout] = None,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
-        if envs.SGLANG_PREP_IN_CUDA_GRAPH.get():
-            assert out_cache_loc is not None
-            bs = len(seq_lens)
-            if self.needs_cpu_seq_lens:
-                assert seq_lens_cpu is not None
-                seq_lens_cpu_list = seq_lens_cpu.tolist()
-            else:
-                seq_lens_cpu_list = None
-            if ragged_layout is None:
-                self.extend_seq_lens_buffer[:bs].fill_(
-                    self.speculative_num_draft_tokens
-                )
-                extend_seq_lens = self.extend_seq_lens_buffer[:bs]
-                extend_start_loc = None
-                verify_lens = None
-                total_verify_tokens = self.speculative_num_draft_tokens * bs
-            else:
-                self.extend_seq_lens_buffer[:bs].copy_(ragged_layout.verify_lens)
-                self.extend_start_loc_buffer[:bs].copy_(ragged_layout.extend_start_loc)
-                extend_seq_lens = self.extend_seq_lens_buffer[:bs]
-                extend_start_loc = self.extend_start_loc_buffer[:bs]
-                verify_lens = self.extend_seq_lens_buffer[:bs]
-                total_verify_tokens = ragged_layout.graph_num_tokens
-
-            return DSV4RawVerifyMetadata(
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=out_cache_loc,
-                extend_seq_lens=extend_seq_lens,
-                seq_lens_cpu=seq_lens_cpu_list,
-                c128_compress_metadata=self._make_target_verify_c128_metadata(
-                    req_pool_indices,
-                    seq_lens,
-                    seq_lens_cpu_list,
-                    extend_seq_lens,
-                    use_prefill_cuda_graph,
-                    online_c128_state_slot_offset,
-                ),
-                extend_start_loc=extend_start_loc,
-                verify_lens=verify_lens,
-                total_verify_tokens=total_verify_tokens,
-            )
+        assert out_cache_loc is not None
+        bs = len(seq_lens)
+        if self.needs_cpu_seq_lens:
+            assert seq_lens_cpu is not None
+            seq_lens_cpu_list = seq_lens_cpu.tolist()
         else:
-            seq_lens_cpu_list = (
-                seq_lens_cpu.tolist() if seq_lens_cpu is not None else seq_lens.tolist()
-            )
-            return self.init_forward_metadata_target_verify_old(
-                max_seq_len=max_seq_len,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu_list,
-                out_cache_loc=out_cache_loc,
-                use_prefill_cuda_graph=use_prefill_cuda_graph,
-                online_c128_state_slot_offset=online_c128_state_slot_offset,
-                ragged_layout=ragged_layout,
-            )
-
-    def init_forward_metadata_target_verify_old(
-        self,
-        max_seq_len: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: Optional[List[int]] = None,
-        out_cache_loc: Optional[torch.Tensor] = None,
-        use_prefill_cuda_graph: bool = False,
-        online_c128_state_slot_offset: int = 0,
-        ragged_layout: Optional[RaggedVerifyLayout] = None,
-    ) -> DSV4Metadata:
+            seq_lens_cpu_list = None
         if ragged_layout is None:
-            lengths = compute_uniform_extend_lengths(
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                extend_len=self.speculative_num_draft_tokens,
-            )
-            extend_seq_lens = self._move_to_device(lengths.extend_seq_lens_cpu)
+            self.extend_seq_lens_buffer[:bs].fill_(self.speculative_num_draft_tokens)
+            extend_seq_lens = self.extend_seq_lens_buffer[:bs]
+            extend_start_loc = None
+            verify_lens = None
+            total_verify_tokens = self.speculative_num_draft_tokens * bs
         else:
-            lengths = compute_ragged_extend_lengths(
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                ragged_layout=ragged_layout,
-            )
-            extend_seq_lens = ragged_layout.verify_lens
-        seq_lens = lengths.seq_lens_extended
-        seq_lens_cpu = lengths.seq_lens_cpu_extended
-        extend_seq_lens_cpu = lengths.extend_seq_lens_cpu
-        num_tokens = lengths.num_tokens
-        extend_start_loc = lengths.extend_start_loc
-        if out_cache_loc is None:
-            out_cache_loc = seq_lens.new_zeros(num_tokens)
-        return self.init_forward_metadata_prefill(
-            max_seq_len=max_seq_len,
+            self.extend_seq_lens_buffer[:bs].copy_(ragged_layout.verify_lens)
+            self.extend_start_loc_buffer[:bs].copy_(ragged_layout.extend_start_loc)
+            extend_seq_lens = self.extend_seq_lens_buffer[:bs]
+            extend_start_loc = self.extend_start_loc_buffer[:bs]
+            verify_lens = self.extend_seq_lens_buffer[:bs]
+            total_verify_tokens = ragged_layout.graph_num_tokens
+
+        return DSV4RawVerifyMetadata(
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
-            num_tokens=num_tokens,
             extend_seq_lens=extend_seq_lens,
-            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu_list,
+            c128_compress_metadata=self._make_target_verify_c128_metadata(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_cpu_list,
+                extend_seq_lens,
+                use_prefill_cuda_graph,
+                online_c128_state_slot_offset,
+            ),
             extend_start_loc=extend_start_loc,
-            need_compress=True,
-            use_prefill_cuda_graph=use_prefill_cuda_graph,
-            online_c128_state_slot_offset=online_c128_state_slot_offset,
+            verify_lens=verify_lens,
+            total_verify_tokens=total_verify_tokens,
         )
 
     def init_forward_metadata_dspark_draft_block(
@@ -1094,6 +1001,13 @@ class DeepseekV4AttnBackend(
     ) -> DSV4Metadata:
         batch_size = len(seq_lens)
         num_tokens = num_tokens_per_req * batch_size
+        swa_out_cache_loc = self._fill_cuda_graph_swa_out_cache_loc(out_cache_loc)
+        if swa_out_cache_loc is None and out_cache_loc is not None:
+            # Eager-only miss (no graph state / oversized batch): translate once
+            # per step instead of per layer at store time.
+            swa_out_cache_loc = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                out_cache_loc
+            ).to(torch.int32)
         if out_cache_loc is None:
             out_cache_loc = seq_lens.new_zeros(num_tokens)
 
@@ -1116,10 +1030,35 @@ class DeepseekV4AttnBackend(
             need_compress=False,
             is_prefill=True,
         )
+        if swa_out_cache_loc is not None:
+            # Captures store_cache's cached path instead of a per-layer
+            # in-graph mapping translate.
+            core_attn_metadata.swa_out_cache_loc = swa_out_cache_loc
         return DSV4Metadata(
             core_attn_metadata=core_attn_metadata,
             indexer_metadata=None,
         )
+
+    def _fill_cuda_graph_swa_out_cache_loc(
+        self, out_cache_loc: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        # None (buffer absent / too small) is an eager-only miss: capture and
+        # replay always fit the pre-sized buffer.
+        buf = self.cuda_graph_swa_out_cache_loc
+        if (
+            buf is None
+            or out_cache_loc is None
+            or out_cache_loc.shape[0] > buf.shape[0]
+        ):
+            return None
+        n = out_cache_loc.shape[0]
+        buf[n:].zero_()
+        buf[:n].copy_(
+            self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
+                torch.int32
+            )
+        )
+        return buf[:n]
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
         # Upgrade Raw->Full so the c4/c128 compress + core_attn + indexer
@@ -1540,6 +1479,12 @@ class DeepseekV4AttnBackend(
         self.draft_extend_num_tokens_per_req = (
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
+        if self.is_draft_runner:
+            # Draft-extend SWA write-target buffer; bound as a [:num_tokens]
+            # view and refilled outside the graph each step.
+            self.cuda_graph_swa_out_cache_loc = torch.zeros(
+                max_num_tokens, dtype=torch.int32, device=self.device
+            )
         # Verify metadata never extracts the mask. No skip_prefill notion here.
         self._verify_mask = maybe_create_verify_mask(
             is_draft_runner=self.is_draft_runner,
@@ -1596,15 +1541,12 @@ class DeepseekV4AttnBackend(
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Resolve the SWA KV-store write target for the current forward.
 
-        Fast path: the per-forward value cached by init_forward_metadata_in_graph
-        (recorded inside cuda graphs, so replay re-reads live buffers). Fallback:
-        translate at store time, matching the pre-cache behavior, for paths that
-        never run the in-graph init — eager idle (forward_idle skips attn init),
-        runners that only run the out-graph prep (e.g.
-        EAGLEDraftExtendCudaGraphRunner) — or whose batch was re-padded after
-        init (shape mismatch). Idle always falls back: its metadata is absent or
-        left over from a previous forward, and translating the zero-padded
-        out_cache_loc writes to the dummy slot.
+        Prefer the value cached by the metadata init: in-graph for
+        decode/verify, the hoisted cuda_graph_swa_out_cache_loc buffer for
+        draft-extend. Translate at store time when nothing matching is cached
+        (paths that skip the init, or a batch re-padded after init). Idle
+        always falls back: its metadata may be stale, and
+        translating the zero-padded out_cache_loc writes to the dummy slot.
         """
         out_cache_loc = forward_batch.out_cache_loc
         core = getattr(self.forward_metadata, "core_attn_metadata", None)
@@ -1623,19 +1565,11 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
-                layer_id=layer_id,
-                swa_loc=swa_loc,
-                cache_k=swa_k,
-            )
-        else:
-            swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
-            self.token_to_kv_pool.set_swa_key_buffer_radix(
-                layer_id=layer_id,
-                swa_loc=swa_loc,
-                cache_nope_fp8_rope_bf16_pack=swa_k_pack,
-            )
+        self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
+            layer_id=layer_id,
+            swa_loc=swa_loc,
+            cache_k=swa_k,
+        )
 
     def forward(
         self,
