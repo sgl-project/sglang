@@ -76,6 +76,10 @@ def _from_nvidia_kda_state_layout(
 
 
 class NvidiaKDAKernel(LinearAttnKernelBase):
+    # Tracked batches route to the embedded Triton fallback, which forwards
+    # the fp32 snapshot arguments (see _triton_extend).
+    supports_track_state_snapshot: bool = True
+
     def __init__(self):
         # This kernel uses tcgen05 + TMEM, which are available on datacenter
         # Blackwell (SM100/SM103, reported as capability major 10), but not on

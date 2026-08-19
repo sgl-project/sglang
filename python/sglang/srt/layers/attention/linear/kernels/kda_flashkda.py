@@ -40,6 +40,8 @@ def _triton_fallback(
     dt_bias=None,
     lower_bound=None,
     return_intermediate_states=False,
+    track_state=None,
+    track_chunk_idx=None,
 ):
     """Fall back to the Triton chunk_kda kernel (handles all preprocessing).
 
@@ -65,6 +67,8 @@ def _triton_fallback(
         dt_bias=dt_bias,
         lower_bound=lower_bound,
         output_intermediate_states=return_intermediate_states,
+        track_state=track_state,
+        track_chunk_idx=track_chunk_idx,
     )
 
 
@@ -80,6 +84,10 @@ class FlashKDAKernel(LinearAttnKernelBase):
     outside [chunk_size, max_seq_len] fall back to Triton ``chunk_kda``.
     Requires an SM90+ GPU with the ``flash_kda`` package.
     """
+
+    # Tracked batches always take the Triton fallback, which forwards the
+    # fp32 snapshot arguments (see _triton_fallback).
+    supports_track_state_snapshot: bool = True
 
     def decode(
         self,
@@ -137,6 +145,8 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 dt_bias=dt_bias,
                 lower_bound=lower_bound,
                 return_intermediate_states=return_intermediate_states,
+                track_state=kwargs.get("track_state"),
+                track_chunk_idx=kwargs.get("track_chunk_idx"),
             )
 
         return self._flashkda_extend(

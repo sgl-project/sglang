@@ -24,6 +24,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
     """Triton-based kernel for KDA (Kimi Delta Attention) linear attention."""
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
+    supports_track_state_snapshot: bool = True
 
     def packed_decode(
         self,
@@ -241,4 +242,6 @@ class TritonKDAKernel(LinearAttnKernelBase):
             dt_bias=dt_bias,
             lower_bound=lower_bound,
             output_intermediate_states=return_intermediate_states,
+            track_state=kwargs.get("track_state"),
+            track_chunk_idx=kwargs.get("track_chunk_idx"),
         )

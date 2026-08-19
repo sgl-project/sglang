@@ -1023,6 +1023,40 @@ _STATE_VARLEN_SMALL_HEAD_CONFIG = helion.Config(
     range_unroll_factors=[0, 0],
 )
 
+# Track variants of the two varlen configs. The fp32 track snapshot adds one
+# load + one store mid-body, which would shift the positional indexing /
+# eviction lists above; separate kernels keep the non-track configs untouched.
+# Tracked batches are rare (prefix-cache checkpointing only), so these trade
+# the hand-tuned positional lists for plainly correct settings.
+_STATE_VARLEN_TRACK_CONFIG = helion.Config(
+    atomic_indexing=[],
+    block_sizes=[64],
+    indexing="pointer",
+    l2_groupings=[4],
+    loop_orders=[[0, 2, 1]],
+    num_stages=2,
+    num_warps=4,
+    pid_type="flat",
+    range_flattens=[None, None],
+    range_multi_buffers=[None, False],
+    range_num_stages=[],
+    range_unroll_factors=[0, 2],
+)
+_STATE_VARLEN_SMALL_HEAD_TRACK_CONFIG = helion.Config(
+    atomic_indexing=[],
+    block_sizes=[32],
+    indexing="pointer",
+    l2_groupings=[1],
+    loop_orders=[[1, 2, 0]],
+    num_stages=3,
+    num_warps=8,
+    pid_type="flat",
+    range_flattens=[None, None],
+    range_multi_buffers=[None, True],
+    range_num_stages=[],
+    range_unroll_factors=[0, 0],
+)
+
 
 @helion.kernel(
     static_shapes=False,
@@ -1039,6 +1073,9 @@ def _chunk_state(
     cu_seqlens: torch.Tensor,
     chunk_indices: torch.Tensor,
     chunk_offsets: torch.Tensor,
+    track_state: torch.Tensor,
+    track_chunk_idx: torch.Tensor,
+    has_track: hl.constexpr,  # pyrefly: ignore[bad-function-definition]
     is_varlen: hl.constexpr,  # pyrefly: ignore[bad-function-definition]
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Propagate KDA state between chunks and update the state pool in place."""
@@ -1069,6 +1106,11 @@ def _chunk_state(
             initial_state.stride(2),
             initial_state.stride(3),
             initial_state_indices.stride(0),
+            track_state.stride(0),
+            track_state.stride(1),
+            track_state.stride(2),
+            track_state.stride(3),
+            track_chunk_idx.stride(0),
         )
     )
 
@@ -1107,6 +1149,9 @@ def _chunk_state(
             :,
         ].float()
 
+        if has_track:
+            i_track = track_chunk_idx[tile_sequence.id]
+
         for token_tile in hl.tile(sequence_length, block_size=64):
             global_chunk = output_offset + token_tile.id
             h_rows[
@@ -1114,6 +1159,17 @@ def _chunk_state(
                 tile_v,
                 :,
             ] = state.to(h.dtype)
+            if has_track:
+                # Snapshot the fp32 accumulator at the tracked chunk boundary
+                # (the h store above rounds to the activation dtype; -1 marks
+                # untracked sequences and never matches a chunk id).
+                if token_tile.id == i_track:
+                    track_state[
+                        tile_sequence.id,
+                        tile_h.id,
+                        tile_v.index,
+                        :,
+                    ] = state
             token = begin + token_tile.index
             valid = token < end
             row = token * H + tile_h.id
@@ -1162,13 +1218,29 @@ _chunk_state_varlen_small_head = helion.kernel(
     config=_STATE_VARLEN_SMALL_HEAD_CONFIG,
     ignore_warnings=_IGNORED_WARNINGS,
 )(_chunk_state.fn)
+_chunk_state_varlen_track = helion.kernel(
+    static_shapes=False,
+    config=_STATE_VARLEN_TRACK_CONFIG,
+    ignore_warnings=_IGNORED_WARNINGS,
+)(_chunk_state.fn)
+_chunk_state_varlen_small_head_track = helion.kernel(
+    static_shapes=False,
+    config=_STATE_VARLEN_SMALL_HEAD_TRACK_CONFIG,
+    ignore_warnings=_IGNORED_WARNINGS,
+)(_chunk_state.fn)
 
 
-def _select_state_kernel(*, is_varlen: bool, num_heads: int) -> helion.Kernel:
+def _select_state_kernel(
+    *, is_varlen: bool, num_heads: int, has_track: bool
+) -> helion.Kernel:
     if not is_varlen:
         return _chunk_state
     if num_heads <= _PREFILL_SMALL_HEAD_THRESHOLD:
+        if has_track:
+            return _chunk_state_varlen_small_head_track
         return _chunk_state_varlen_small_head
+    if has_track:
+        return _chunk_state_varlen_track
     return _chunk_state_varlen
 
 
@@ -1313,6 +1385,8 @@ def chunk_kda(
     dt_bias: torch.Tensor | None = None,
     lower_bound: float | None = None,
     output_intermediate_states: bool = False,
+    track_state: torch.Tensor | None = None,
+    track_chunk_idx: torch.Tensor | None = None,
     **kwargs: object,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Match the public forward contract of SGLang's Triton ``chunk_kda``."""
@@ -1365,7 +1439,10 @@ def chunk_kda(
     else:
         metadata = torch.empty(0, device=q.device, dtype=torch.int32)
         chunk_offsets = torch.empty(0, device=q.device, dtype=torch.long)
-    state_kernel = _select_state_kernel(is_varlen=is_varlen, num_heads=q.size(2))
+    has_track = track_state is not None
+    state_kernel = _select_state_kernel(
+        is_varlen=is_varlen, num_heads=q.size(2), has_track=has_track
+    )
     h, v_new = state_kernel(
         kg,
         w,
@@ -1380,6 +1457,11 @@ def chunk_kda(
             else torch.empty(0, 2, device=q.device, dtype=torch.long)
         ),
         chunk_offsets,
+        # Unused when has_track is False; bind in-place tensors as stand-ins so
+        # the kernel signature always sees real tensors.
+        track_state if has_track else initial_state,
+        track_chunk_idx if has_track else initial_state_indices,
+        has_track,
         is_varlen,
     )
     if chunk_indices is None:
