@@ -14,12 +14,12 @@
 # image_cache_init to enable, or the empty string to disable.
 #
 # Environment:
-#   AMD_CI_IMAGE_CACHE_MIN_FREE_GB   don't seed below this much free space (default 120)
+#   AMD_CI_IMAGE_CACHE_RESERVE_GB    free space to leave untouched (default 100)
 #   AMD_CI_IMAGE_CACHE_MAX_AGE_DAYS  prune tarballs older than this (default 1)
 
 IMAGE_CACHE_DIR=""
 IMAGE_CACHE_EXT=""
-IMAGE_CACHE_MIN_FREE_GB="${AMD_CI_IMAGE_CACHE_MIN_FREE_GB:-120}"
+IMAGE_CACHE_RESERVE_GB="${AMD_CI_IMAGE_CACHE_RESERVE_GB:-100}"
 IMAGE_CACHE_MAX_AGE_DAYS="${AMD_CI_IMAGE_CACHE_MAX_AGE_DAYS:-1}"
 
 # image_cache_init <cache_host_dir>
@@ -33,13 +33,17 @@ image_cache_init() {
     echo "Image tarball cache unavailable: no persistent volume at '${cache_host}'" >&2
     return 0
   fi
-  # zstd keeps a tarball near the image's compressed size instead of its
-  # on-disk size, which is what makes this affordable next to the weight cache.
+  # A compressor keeps a tarball near the image's compressed size rather than its
+  # 60G on-disk size, which is what makes this affordable next to the weight
+  # cache. Neither tool is currently installed on the runners, so the
+  # uncompressed path is the one that actually runs today.
   if command -v zstd >/dev/null 2>&1; then
     IMAGE_CACHE_EXT=".zst"
+  elif command -v pigz >/dev/null 2>&1; then
+    IMAGE_CACHE_EXT=".gz"
   else
     IMAGE_CACHE_EXT=""
-    echo "Note: zstd not found; image tarballs will be stored uncompressed." >&2
+    echo "Note: no zstd or pigz on this runner; tarballs will be stored uncompressed (~60G each)." >&2
   fi
   if ! mkdir -p "${cache_host}/docker-images" 2>/dev/null; then
     echo "Image tarball cache unavailable: cannot create ${cache_host}/docker-images" >&2
@@ -64,11 +68,11 @@ image_cache_load() {
   # all means it is complete.
   [[ -f "${path}" ]] || return 1
   echo "Loading image from tarball cache: ${path}"
-  if [[ -n "${IMAGE_CACHE_EXT}" ]]; then
-    zstd -dc "${path}" 2>/dev/null | docker load >/dev/null 2>&1 || true
-  else
-    docker load -i "${path}" >/dev/null 2>&1 || true
-  fi
+  case "${IMAGE_CACHE_EXT}" in
+    .zst) zstd -dc "${path}" 2>/dev/null | docker load >/dev/null 2>&1 || true ;;
+    .gz)  pigz -dc "${path}" 2>/dev/null | docker load >/dev/null 2>&1 || true ;;
+    *)    docker load -i "${path}" >/dev/null 2>&1 || true ;;
+  esac
   if [[ -n "$(docker images -q "${image}" 2>/dev/null)" ]]; then
     return 0
   fi
@@ -100,8 +104,24 @@ image_cache_save() {
     echo "Warning: cannot determine free space on ${IMAGE_CACHE_DIR}; not seeding" >&2
     return 0
   fi
-  if (( avail < IMAGE_CACHE_MIN_FREE_GB )); then
-    echo "Not seeding image tarball: ${avail}G free, need ${IMAGE_CACHE_MIN_FREE_GB}G" >&2
+  # `docker save` writes the image's uncompressed layers, so the on-disk size is
+  # the tarball size -- 60G for a rocm/sgl-dev image, which is why this is sized
+  # from the image rather than a flat threshold. This volume also holds the model
+  # weight cache, so leave a reserve on top.
+  local size_gb need
+  size_gb=$(docker image inspect -f '{{.Size}}' "${image}" 2>/dev/null | tr -dc '0-9')
+  if [[ -n "${size_gb}" ]]; then
+    size_gb=$(( size_gb / 1000000000 ))
+  else
+    size_gb=60
+  fi
+  if [[ -n "${IMAGE_CACHE_EXT}" ]]; then
+    need=$(( (size_gb * 6 + 9) / 10 ))   # compressed: ~0.6x, rounded up
+  else
+    need=$(( size_gb + 5 ))
+  fi
+  if (( avail < need + IMAGE_CACHE_RESERVE_GB )); then
+    echo "Not seeding image tarball: ${avail}G free, need ~${need}G plus a ${IMAGE_CACHE_RESERVE_GB}G reserve" >&2
     return 0
   fi
 
@@ -118,11 +138,11 @@ image_cache_save() {
   tmp="${path}.tmp.$$"
   echo "Seeding image tarball cache: ${path}"
   local ok=1
-  if [[ -n "${IMAGE_CACHE_EXT}" ]]; then
-    docker save "${image}" 2>/dev/null | zstd -T0 -3 -q > "${tmp}" 2>/dev/null || ok=0
-  else
-    docker save "${image}" > "${tmp}" 2>/dev/null || ok=0
-  fi
+  case "${IMAGE_CACHE_EXT}" in
+    .zst) docker save "${image}" 2>/dev/null | zstd -T0 -3 -q > "${tmp}" 2>/dev/null || ok=0 ;;
+    .gz)  docker save "${image}" 2>/dev/null | pigz -1 > "${tmp}" 2>/dev/null || ok=0 ;;
+    *)    docker save "${image}" > "${tmp}" 2>/dev/null || ok=0 ;;
+  esac
   if (( ok )) && [[ -s "${tmp}" ]] && mv -f "${tmp}" "${path}" 2>/dev/null; then
     echo "Seeded $(du -h "${path}" 2>/dev/null | cut -f1) tarball for ${image}"
   else
