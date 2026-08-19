@@ -1,6 +1,4 @@
-import sys
 import unittest
-from pathlib import Path
 
 import torch
 
@@ -8,10 +6,6 @@ from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import get_device_sm
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
     DENSE_ATOL,
@@ -25,6 +19,7 @@ from sglang.test.kits.attention_unittest.attention_methods.dense_attention impor
 from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
     _prepare_spec_verify_batch,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
@@ -102,7 +97,7 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
         only by the in_capture=True branch (via ``_bind_metadata_buffers``).
         If TBO short-circuits its capture to its own replay path, those dicts
         are empty and replay raises ``KeyError: bs``. Reproduces the
-        deepep-4-gpu-h100 failure where
+        4-gpu-h100 failure where
         ``flashattention_backend.target_verify_metadata[bs]`` lookup blew up
         during ``init_device_graphs``.
 
@@ -170,8 +165,8 @@ class TestTboAttnDenseAttentionBackendCorrectness(CustomTestCase):
         )
 
         capture_bs = case.batch_size
-        num_tokens_per_bs = sum(case.extend_lens) // capture_bs
-        num_tokens = capture_bs * num_tokens_per_bs
+        num_tokens_per_req = sum(case.extend_lens) // capture_bs
+        num_tokens = capture_bs * num_tokens_per_req
         split_seq_index, split_token_index = (
             compute_split_indices_for_cuda_graph_replay(
                 forward_mode=batch.forward_mode,

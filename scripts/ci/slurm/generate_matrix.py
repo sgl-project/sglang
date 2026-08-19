@@ -70,6 +70,7 @@ def main():
                         "exp_name": exp_name,
                         "model": exp["model"],
                         "model_prefix": exp["model-prefix"],
+                        "model_path": exp.get("model_path", ""),
                         "precision": exp["precision"],
                         "isl": str(isl),
                         "osl": str(osl),

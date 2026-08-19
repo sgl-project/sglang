@@ -164,6 +164,6 @@ class FastHunyuanConfig(HunyuanConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_disable_component_offload_min_available_memory_gb=150,
-            auto_disable_component_offload_components=("vae",),
+            keep_resident_min_available_gb=60,
+            keep_resident_components=("dit", "vae"),
         )

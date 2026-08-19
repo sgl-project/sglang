@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import msgspec.msgpack
 import numpy as np
+import pytest
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
@@ -36,7 +37,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.registry import (
     get_realtime_model_adapter,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.lingbot_world_causal_denoising import (
     LingBotWorldCausalDMDDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.base import (
@@ -294,6 +295,104 @@ def test_lingbot_realtime_adapter_ingests_generic_events():
     assert state.sample_camera_actions(3) == [["w"], ["d"], []]
     assert state.sample_prompt() == "turn left"
     assert state.latest_sampled_event_id == 8
+
+
+def test_lingbot_realtime_adapter_ingests_composite_input_event():
+    adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
+    session = GenerateSession()
+    session.set_adapter(adapter)
+    session.set_request(
+        RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="walk forward",
+        )
+    )
+
+    composite_event = RealtimeEvent(
+        type="event",
+        kind="composite_input",
+        payload={
+            "input_types": ["prompt", "camera_actions"],
+            "prompt": "turn left",
+            "camera_actions": [["w"], ["d"]],
+        },
+        event_id=9,
+    )
+
+    event_log = adapter.ingest_event(session, composite_event)
+
+    assert "kind=composite_input" in event_log
+    chunk_inputs = adapter.sample_chunk_inputs(
+        session,
+        server_args=SimpleNamespace(),
+        chunk=SimpleNamespace(index=1),
+        chunk_size=3,
+    )
+    assert chunk_inputs.prompt == "turn left"
+    assert chunk_inputs.condition_inputs[
+        lingbot_realtime.LINGBOT_PROMPT_UPDATED_CONDITION
+    ]
+    assert chunk_inputs.condition_inputs[
+        lingbot_realtime.LINGBOT_CAMERA_ACTIONS_CONDITION
+    ] == [["w"], ["d"], []]
+    assert adapter.get_realtime_event_id(session) == 9
+
+
+def test_lingbot_realtime_adapter_rejects_composite_input_atomically():
+    adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
+    session = GenerateSession()
+    session.set_adapter(adapter)
+    session.set_request(
+        RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="walk forward",
+        )
+    )
+
+    composite_event = RealtimeEvent(
+        type="event",
+        kind="composite_input",
+        payload={
+            "input_types": ["prompt", "camera_actions"],
+            "prompt": "turn left",
+            "camera_actions": ["w"],
+        },
+        event_id=10,
+    )
+
+    with pytest.raises(ValueError, match="camera_actions"):
+        adapter.ingest_event(session, composite_event)
+
+    state = adapter._state(session)
+    assert not state.has_prompt()
+    assert state.sample_camera_actions(3) is None
+
+
+def test_lingbot_realtime_prompt_event_marks_crossattn_reset():
+    adapter = lingbot_realtime.LingBotWorldRealtimeAdapter()
+    session = GenerateSession()
+    session.set_adapter(adapter)
+    session.set_request(
+        RealtimeVideoGenerationsRequest(
+            type="init",
+            prompt="walk forward",
+        )
+    )
+    state = adapter._state(session)
+    state.receive_prompt("turn left", event_id=8)
+
+    chunk_inputs = adapter.sample_chunk_inputs(
+        session,
+        server_args=SimpleNamespace(),
+        chunk=SimpleNamespace(index=1),
+        chunk_size=3,
+    )
+
+    assert chunk_inputs.prompt == "turn left"
+    assert session.request.prompt == "turn left"
+    assert chunk_inputs.condition_inputs[
+        lingbot_realtime.LINGBOT_PROMPT_UPDATED_CONDITION
+    ]
 
 
 def test_lingbot_realtime_adapter_ingests_state_camera_events():
@@ -672,6 +771,7 @@ def test_lingbot_realtime_condition_horizon_repeats_blank_tail_chunk():
     latent_condition = torch.ones(1, latent_channels, latent_frames, 2, 2)
     batch = SimpleNamespace(
         height=2 * spatial_ratio,
+        num_frames=num_frames,
         width=2 * spatial_ratio,
     )
     condition_full = config.postprocess_image_latent(latent_condition, batch)

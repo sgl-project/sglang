@@ -1,6 +1,6 @@
 ---
 name: cookbook-migrate-model
-description: Migrate a legacy-template SGLang cookbook page (monolithic per-model generator under docs_new/src/snippets/autoregressive/) onto the config-driven template (shared _deployment.jsx / _playground.jsx engines + per-model config). Use when asked to migrate, convert, or port an existing cookbook page — NOT for brand-new models (use cookbook-add-model for those). Run with /cookbook-migrate-model <Model page name, e.g. GLM-5.1>.
+description: Migrate a legacy-template SGLang cookbook page (monolithic per-model generator under docs/src/snippets/autoregressive/) onto the config-driven template (shared _deployment.jsx / _playground.jsx engines + per-model config). Use when asked to migrate, convert, or port an existing cookbook page — NOT for brand-new models (use cookbook-add-model for those). Run with /cookbook-migrate-model <Model page name, e.g. GLM-5.1>.
 ---
 
 # Cookbook Migrate Model
@@ -26,7 +26,7 @@ your dispatch prompt, or ask for it.
 
 1. **Never modernize.** Env vars, flags, TP values, docker tags, version strings
    are copied verbatim from the legacy page — even when today's defaults differ
-   (e.g. `SGLANG_ENABLE_SPEC_V2=1` is now default; keep it anyway). The recipe
+   (e.g. a flag whose behavior has since become the default; keep it anyway). The recipe
    that was verified is the recipe as written. Allowed normalizations are ONLY
    the five alias rewrites in dimension-mapping.md §2 (`launch_server`→`sglang
    serve`, `--model`→`--model-path`, `--tp-size`→`--tp`, abbreviated
@@ -93,7 +93,7 @@ your dispatch prompt, or ask for it.
 ## Workflow (one model = one PR)
 
 ### 1. Inventory the legacy assets
-- Read the legacy generator (`docs_new/src/snippets/autoregressive/<slug>-deployment.jsx`)
+- Read the legacy generator (`docs/src/snippets/autoregressive/<slug>-deployment.jsx`)
   end-to-end: every option dimension (radio vs checkbox vs dynamic), every
   gate/SUPPORT matrix, the full emitted command per reachable combo (env
   prefixes, `# Error` pseudo-commands included).
@@ -101,8 +101,8 @@ your dispatch prompt, or ask for it.
   upgraded); §3.2 tips → new §2; §4 invocation examples → new §3 (keep real
   Output Examples verbatim); §5 benchmark blocks → transcribe each measured
   block: deploy command used, bench command (dataset/isl/osl/num-prompts/
-  concurrency), Mean TTFT/TPOT, output tok/s, hardware, version string.
-- Inbound-anchor sweep: `grep -rn "<PageName>" docs_new/ --include='*.mdx'` —
+  concurrency), P50 (median) TTFT/TPOT, output tok/s, hardware, version string.
+- Inbound-anchor sweep: `grep -rn "<PageName>" docs/ --include='*.mdx'` —
   find links/`#fragments` into this page (`mint broken-links` does NOT check
   fragments). Fix referrers or add `<a id="old-anchor" />` shims in the same PR.
 - Check the maintainer-provided inventory notes for this model's known quirks —
@@ -174,7 +174,12 @@ hardware owners sign off on at review.
 ### 4. Benchmarks file
 One entry per measured block only (cells without entries already render
 "pending" — bare `{match}` stubs are unnecessary). `tokens_per_sec_per_gpu` =
-output tok/s ÷ (tp × nnodes); TTFT/TPOT take the Mean rows; put the workload's
+total (in+out) tok/s/GPU = `output tok/s ÷ (tp × nnodes) ×
+(isl+osl)/osl` — stored directly (the card shows it as-is). TTFT/TPOT
+take the P50 (median) rows; set `config.latencyPercentile` (default `"P50"`; use
+`"Mean"` only for legacy Mean-recorded data — temporary, being migrated to P50; an
+entry-level `latencyPercentile` overrides the page value per cell).
+Put the workload's
 `num_prompts` into `workload`. **`config.accuracyLabels` is required whenever
 the benchmarks carry accuracy data** — the engine ships no default eval set
 (#27842), so missing labels means the accuracy rows silently don't render;
@@ -200,14 +205,14 @@ collapsible (required, DeepSeek-V4 pattern): code in an
 `<Accordion title="Example Output">`; legacy pages kept them inline.
 
 ### 6. Delete the legacy generator
-Remove `docs_new/src/snippets/autoregressive/<slug>-deployment.jsx` and its
-import. `grep -rn "<slug>-deployment" docs_new/` must return nothing (config
+Remove `docs/src/snippets/autoregressive/<slug>-deployment.jsx` and its
+import. `grep -rn "<slug>-deployment" docs/` must return nothing (config
 provenance comments must not name the deleted path). Site wiring needs **no
 changes**: docs.json path/title unchanged, vendor card + logo already exist.
 
 ### 7. Validate
 - `grep -rn '__[A-Z_]*__'` on the new files (no template tokens).
-- `cd docs_new && mint validate && mint broken-links` (pre-existing breaks on
+- `cd docs && mint validate && mint broken-links` (pre-existing breaks on
   main are not yours — say so in the PR).
 - `mint dev` browser smoke: initial selection = the verified cell (first in
   `cells[]`) with green badge; multi-node cells show the injected trio +

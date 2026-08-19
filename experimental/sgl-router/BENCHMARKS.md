@@ -32,12 +32,12 @@ cargo bench --bench radix_tree_benchmark -- --sample-size 30 --measurement-time 
 cargo bench --bench manual_policy_benchmark
 ```
 
-For the quick smoke runs whose numbers are reproduced below: drop
+For the quick runs whose numbers are reproduced below: drop
 `--sample-size` to 10 and `--measurement-time` to 2 (Criterion will
 warn about reduced statistical confidence but the order-of-magnitude
 comparison stands).
 
-## Smoke-run data points (M1 MacBook, release profile)
+## Quick-run Data Points (M1 MacBook, release profile)
 
 These are NOT the real acceptance numbers — they're a sanity check
 that the sgl-router routing primitives are in the same ballpark as the

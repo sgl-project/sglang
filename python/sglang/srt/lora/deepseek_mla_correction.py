@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
-from sglang.srt.lora.triton_ops import (
+from sglang.kernels.ops.gemm.kv_b_lora_absorbed import (
     step_a_q_fwd,
     step_a_v_fwd,
     step_b_q_fwd,
@@ -46,8 +46,6 @@ def _get_state(
     if not hasattr(attn_module.kv_b_proj, "A_buffer"):
         return None
     lora_backend = attn_module.kv_b_proj.lora_backend
-    if not hasattr(lora_backend, "batch_info"):
-        return None
     batch_info = lora_backend.batch_info
     if batch_info is None:
         return None

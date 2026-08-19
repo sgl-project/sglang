@@ -52,6 +52,8 @@ class RolloutDitTrajectory:
     # final denoised latent x_{t_T} (last scheduler.step output).
     latents: torch.Tensor | None = None
     timesteps: torch.Tensor | None = None  # [T]
+    # [T+1] scheduler.sigmas snapshot (post-shift, includes terminal 0).
+    sigmas: torch.Tensor | None = None
 
 
 @dataclass

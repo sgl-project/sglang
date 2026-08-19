@@ -7,11 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.server_args import (
-    ServerArgs,
-    get_global_server_args,
-    set_global_server_args_for_scheduler,
-)
+from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -43,9 +39,11 @@ class TestLMHeadFP32(unittest.TestCase):
             raise unittest.SkipTest("needs CUDA GPU or XPU")
 
     def _make_logprocessor(self, vocab_size, enable_fp32):
-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-        get_global_server_args().enable_dp_lm_head = False
-        get_global_server_args().enable_fp32_lm_head = enable_fp32
+        # LogitsProcessor reads get_exec().features.enable_fp32_lm_head
+        # from the published config.
+        override = get_context().override_server_args(enable_fp32_lm_head=enable_fp32)
+        override.install()
+        self.addCleanup(override.restore)
         cfg = SimpleNamespace(vocab_size=vocab_size, final_logit_softcapping=None)
         return LogitsProcessor(cfg, skip_all_gather=True, logit_scale=None)
 
@@ -56,6 +54,7 @@ class TestLMHeadFP32(unittest.TestCase):
         weights_dtype,
         expected_a_dtype,
         expected_b_dtype,
+        expected_operation,
     ):
         device = get_device()
         BATCH_SIZE, HIDDEN_SIZE, VOCAB_SIZE = 2, 64, 128
@@ -67,6 +66,7 @@ class TestLMHeadFP32(unittest.TestCase):
         logprocessor = self._make_logprocessor(VOCAB_SIZE, enable_fp32)
 
         original_matmul = torch.matmul
+        original_mm = torch.mm
         original_linear = F.linear
 
         state = {
@@ -74,12 +74,30 @@ class TestLMHeadFP32(unittest.TestCase):
             "operation": None,  # Which operation was captured ("matmul" or "linear")
             "a": None,  # The dtype of the first input tensor to the operation
             "b": None,  # The dtype of the second input tensor to the operation
+            "out_dtype": None,
         }
 
         def probe_matmul(a, b, *args, **kw):
             if not state["called"]:
-                state.update(called=True, operation="matmul", a=a.dtype, b=b.dtype)
+                state.update(
+                    called=True,
+                    operation="matmul",
+                    a=a.dtype,
+                    b=b.dtype,
+                    out_dtype=kw.get("out_dtype"),
+                )
             return original_matmul(a, b, *args, **kw)
+
+        def probe_mm(a, b, *args, **kw):
+            if not state["called"]:
+                state.update(
+                    called=True,
+                    operation="mm",
+                    a=a.dtype,
+                    b=b.dtype,
+                    out_dtype=kw.get("out_dtype"),
+                )
+            return original_mm(a, b, *args, **kw)
 
         def probe_linear(x, w, bias=None):
             if not state["called"]:
@@ -88,30 +106,71 @@ class TestLMHeadFP32(unittest.TestCase):
 
         with (
             patch("torch.matmul", new=probe_matmul),
+            patch("torch.mm", new=probe_mm),
             patch("torch.nn.functional.linear", new=probe_linear),
         ):
             logits = logprocessor._get_logits(hidden_state, head, meta)
         self.assertEqual(hidden_state.dtype, hidden_state_dtype)
         self.assertTrue(state["called"], "no call lm head matlmul/linear")
+        self.assertEqual(state["operation"], expected_operation)
         self.assertEqual(state["a"], expected_a_dtype)
         self.assertEqual(state["b"], expected_b_dtype)
+        self.assertEqual(
+            state["out_dtype"],
+            torch.float32 if expected_operation == "mm" else None,
+        )
 
     def test_flag_true_fp16_activations(self):
-        self._run_case(torch.float16, True, torch.float16, torch.float32, torch.float32)
+        expected_operation = "mm" if torch.cuda.is_available() else "matmul"
+        expected_dtype = (
+            torch.float32 if expected_operation == "matmul" else torch.float16
+        )
+        self._run_case(
+            torch.float16,
+            True,
+            torch.float16,
+            expected_dtype,
+            expected_dtype,
+            expected_operation,
+        )
 
     def test_flag_true_bf16_activations(self):
+        expected_operation = "mm" if torch.cuda.is_available() else "matmul"
+        expected_dtype = (
+            torch.float32 if expected_operation == "matmul" else torch.bfloat16
+        )
         self._run_case(
-            torch.bfloat16, True, torch.bfloat16, torch.float32, torch.float32
+            torch.bfloat16,
+            True,
+            torch.bfloat16,
+            expected_dtype,
+            expected_dtype,
+            expected_operation,
+        )
+
+    def test_flag_true_fp32_falls_back_to_explicit_fp32_matmul(self):
+        self._run_case(
+            torch.float32,
+            True,
+            torch.float32,
+            torch.float32,
+            torch.float32,
+            "matmul",
         )
 
     def test_flag_false_fp16_path(self):
         self._run_case(
-            torch.float16, False, torch.float16, torch.float16, torch.float16
+            torch.float16, False, torch.float16, torch.float16, torch.float16, "matmul"
         )
 
     def test_flag_false_bf16_path(self):
         self._run_case(
-            torch.bfloat16, False, torch.bfloat16, torch.bfloat16, torch.bfloat16
+            torch.bfloat16,
+            False,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.bfloat16,
+            "matmul",
         )
 
 
