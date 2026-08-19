@@ -345,13 +345,18 @@ def pre_capture_activation_reserve_mb_of(cfg: Any, gpu_mem: Optional[float]) -> 
     return reserved_mem
 
 
+def allocation_page_size_of(cfg: Any) -> int:
+    """Logical page width used by the DCP-aware token allocator."""
+    return cfg.page_size * cfg.dcp_size
+
+
 def kv_event_block_size_of(cfg: Any) -> int:
     """Width KV events are emitted at.
 
     Under DCP the radix tree pages at ``page_size * dcp_size``
     (`mem_cache/kv_cache_builder.py`), and subscribers key on this.
     """
-    return cfg.page_size * cfg.dcp_size
+    return allocation_page_size_of(cfg)
 
 
 def modelexpress_config_of(cfg: Any) -> dict:

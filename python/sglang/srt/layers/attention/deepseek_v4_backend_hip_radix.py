@@ -41,13 +41,10 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     copy_metadata,
     maybe_copy_inplace,
 )
-from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, dcp_a2a_lse_reduce
+from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mla, dcp_a2a_lse_reduce
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import (
-    get_parallel,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
 from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import ceil_align
@@ -517,6 +514,7 @@ class DeepseekV4HipRadixBackend(
                 attn_tp_size=parallel.attn_tp_size,
                 attn_tp_rank=parallel.attn_tp_rank,
                 attn_dp_size=parallel.attn_dp_size,
+                disaggregation_mode=get_disagg().disaggregation_mode,
             )
             if is_dsa_enable_prefill_cp():
                 raise NotImplementedError(
@@ -740,6 +738,7 @@ class DeepseekV4HipRadixBackend(
                 seq_lens_cpu = [
                     x + self.target_verify_num_draft_tokens for x in seq_lens_cpu
                 ]
+            max_seq_len = max(max_seq_len, max(seq_lens_cpu))
             extend_seq_lens_cpu = [self.target_verify_num_draft_tokens] * batch_size
             num_tokens = self.target_verify_num_draft_tokens * batch_size
             extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
@@ -1396,7 +1395,16 @@ class DeepseekV4HipRadixBackend(
                     is_lse_base_on_e=True,
                     comm_backend=comm_backend,
                 )
-            return cp_lse_ag_out_rs_mha(partial_out, partial_lse, group)
+            return (
+                cp_lse_ag_out_rs_mla(
+                    partial_out,
+                    partial_lse,
+                    group,
+                    is_lse_base_on_e=True,
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
 
         # prefill / extend
         state_slot = core_attn_metadata.unified.pf_state_slot
@@ -1512,7 +1520,16 @@ class DeepseekV4HipRadixBackend(
                     comm_backend=comm_backend,
                 )
             else:
-                o = cp_lse_ag_out_rs_mha(partial_out, partial_lse, group)
+                o = (
+                    cp_lse_ag_out_rs_mla(
+                        partial_out,
+                        partial_lse,
+                        group,
+                        is_lse_base_on_e=True,
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
+                )
 
         # write this chunk's SWA K into the ring for future chunks / decode
         # only the final-window tokens per request

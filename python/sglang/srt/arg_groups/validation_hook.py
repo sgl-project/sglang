@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
+    allocation_page_size_of,
     resolved_view,
     resolving_view,
     run_post_process_pass,
@@ -92,9 +93,10 @@ def check_server_args(server_args: Any):
     # Skip validation if chunked prefill is disabled (i.e., size <= 0).
     # Skip validation if disaggregation mode is decode.
     if cfg.chunked_prefill_size > 0 and cfg.disaggregation_mode != "decode":
-        assert (
-            cfg.chunked_prefill_size % cfg.page_size == 0
-        ), "chunked_prefill_size must be divisible by page_size"
+        assert cfg.chunked_prefill_size % allocation_page_size_of(cfg) == 0, (
+            "chunked_prefill_size must be divisible by the allocator page size "
+            "(page_size * dcp_size)"
+        )
 
     # Check pdmux
     if cfg.enable_pdmux:

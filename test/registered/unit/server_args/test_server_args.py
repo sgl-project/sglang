@@ -40,9 +40,11 @@ from sglang.srt.arg_groups.moe_hook import (
     validate_deepep_v2_speculative_draft,
 )
 from sglang.srt.arg_groups.overrides import (
+    allocation_page_size_of,
     cutedsl_moe_max_num_tokens,
     max_speculative_num_draft_tokens,
     resolution_result,
+    resolving_view,
 )
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
@@ -2890,6 +2892,7 @@ class TestDcpKvEventContract(CustomTestCase):
             page_size=64,
             kv_events_config=self.KV_EVENTS,
         )
+        self.assertEqual(allocation_page_size_of(resolving_view(args)), 256)
         self.assertEqual(describe_kv_events_publisher(args)["block_size"], 256)
         args = ServerArgs(
             model_path="dummy", page_size=64, kv_events_config=self.KV_EVENTS
@@ -2906,6 +2909,31 @@ class TestDcpKvEventContract(CustomTestCase):
 
         args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
         self.assertEqual(kv_event_block_size_of(resolving_view(args)), 8)
+
+
+class TestDcpChunkedPrefillContract(CustomTestCase):
+    def test_rejects_chunk_smaller_than_logical_page(self):
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            dcp_size=8,
+            page_size=256,
+            chunked_prefill_size=1024,
+            served_model_name="dummy",
+        )
+        with self.assertRaisesRegex(AssertionError, "page_size \\* dcp_size"):
+            args.check_server_args()
+
+    def test_accepts_chunk_aligned_to_logical_page(self):
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            dcp_size=8,
+            page_size=256,
+            chunked_prefill_size=2048,
+            served_model_name="dummy",
+        )
+        args.check_server_args()
 
 
 if __name__ == "__main__":

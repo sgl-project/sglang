@@ -284,9 +284,17 @@ class SchedulerPoolStatsObserver:
         )
 
     def _get_swa_token_info(self) -> PoolStats:
-        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        full_available_size = getattr(
+            self.token_to_kv_pool_allocator,
+            "_conserve_full_available_size",
+            self.token_to_kv_pool_allocator.full_available_size,
+        )()
         full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_available_size = self.token_to_kv_pool_allocator.swa_available_size()
+        swa_available_size = getattr(
+            self.token_to_kv_pool_allocator,
+            "_conserve_swa_available_size",
+            self.token_to_kv_pool_allocator.swa_available_size,
+        )()
         swa_evictable_size = self.tree_cache.swa_evictable_size()
         full_num_used = self.full_tokens_per_layer - (
             full_available_size + full_evictable_size
