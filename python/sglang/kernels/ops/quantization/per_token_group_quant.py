@@ -31,6 +31,7 @@ def _jit_module(
     aligned: bool,
     fuse_silu_and_mul: bool,
     masked_layout: bool,
+    unpacked_ue8m0_scales: bool,
     use_pdl: bool,
 ) -> Module:
     assert in_dtype in _SUPPORTED_INPUT_DTYPES
@@ -44,6 +45,7 @@ def _jit_module(
         row_major,
         aligned,
         fuse_silu_and_mul,
+        unpacked_ue8m0_scales,
         use_pdl,
     )
     launcher = (
@@ -63,7 +65,7 @@ def _jit_module(
 
 def _infer_scale_layout(
     output_s: torch.Tensor, scale_ue8m0: bool, num_groups: int
-) -> Tuple[bool, bool]:
+) -> Tuple[bool, bool, bool]:
     """Return ``(row_major, aligned)`` for ``output_s``.
 
     Column-major (transposed) scale buffers have token stride 1 and a larger
@@ -74,11 +76,11 @@ def _infer_scale_layout(
         if not scale_ue8m0:
             raise ValueError("int32-packed scale buffers require scale_ue8m0=True")
         aligned = num_groups % 4 == 0
-        return row_major, aligned
+        return row_major, aligned, False
     if output_s.dtype == torch.float32:
-        if scale_ue8m0:
-            raise ValueError("scale_ue8m0=True requires an int32-packed output_s")
-        return row_major, True
+        if scale_ue8m0 and not row_major:
+            raise ValueError("unpacked UE8M0 scale buffers must be row-major")
+        return row_major, True, scale_ue8m0
     raise ValueError(f"Unsupported output_s dtype {output_s.dtype}")
 
 
@@ -97,7 +99,9 @@ def _per_token_group_quant_custom_op(
     expected_m: Optional[int] = None,
 ) -> None:
     num_groups = output_q.shape[-1] // group_size
-    row_major, aligned = _infer_scale_layout(output_s, scale_ue8m0, num_groups)
+    row_major, aligned, unpacked_ue8m0_scales = _infer_scale_layout(
+        output_s, scale_ue8m0, num_groups
+    )
     module = _jit_module(
         input.dtype,
         output_q.dtype,
@@ -107,6 +111,7 @@ def _per_token_group_quant_custom_op(
         aligned,
         bool(fuse_silu_and_mul),
         masked_m is not None,
+        unpacked_ue8m0_scales,
         is_arch_support_pdl(),
     )
     if masked_m is not None:
@@ -124,6 +129,7 @@ def _allocate_outputs(
     scale_ue8m0: bool,
     column_major_scales: bool,
     fuse_silu_and_mul: bool,
+    unpacked_ue8m0_scales: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Allocate ``(output_q, output_s)`` in the requested major mode / scale
     format, selected by ``(column_major_scales, scale_ue8m0)``."""
@@ -132,7 +138,18 @@ def _allocate_outputs(
     output_q = torch.empty(out_shape, device=input.device, dtype=out_dtype)
 
     num_groups = hidden // group_size
-    if scale_ue8m0 and not column_major_scales:
+    if unpacked_ue8m0_scales:
+        if not scale_ue8m0 or column_major_scales:
+            raise ValueError(
+                "unpacked_ue8m0_scales requires scale_ue8m0=True and "
+                "row-major scales"
+            )
+        output_s = torch.empty(
+            (*out_shape[:-1], num_groups),
+            device=input.device,
+            dtype=torch.float32,
+        )
+    elif scale_ue8m0 and not column_major_scales:
         # Row-major packed UE8M0: int32 [..., ceil(ng/4)] contiguous (an
         # unaligned ng leaves a partially-used last int32 that the kernel zero-
         # pads). The shared create_*_output_scale helper does not produce this
@@ -171,6 +188,7 @@ def per_token_group_quant(
     *,
     out_dtype: Optional[torch.dtype] = None,
     column_major_scales: bool = False,
+    unpacked_ue8m0_scales: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-token-group quantization. Returns ``(output_q, output_s)``.
 
@@ -190,6 +208,8 @@ def per_token_group_quant(
       float32 transposed  -> col-major fp32 scales (TMA-aligned view)
       int32 transposed    -> col-major UE8M0 bytes packed 4-per-int32
       int32 contiguous    -> row-major UE8M0 bytes packed 4-per-int32
+      float32 contiguous with ``unpacked_ue8m0_scales=True`` -> row-major
+                              powers-of-two with UE8M0 quantization semantics
     The packed layouts require ``scale_ue8m0=True``.
 
     ``expected_m`` (masked only) is an optional expected-tokens-per-expert hint.
@@ -206,10 +226,15 @@ def per_token_group_quant(
             scale_ue8m0,
             column_major_scales,
             fuse_silu_and_mul,
+            unpacked_ue8m0_scales,
         )
     else:
         assert output_s is not None
         assert out_dtype is None or out_dtype == output_q.dtype
+        if unpacked_ue8m0_scales and output_s.dtype != torch.float32:
+            raise ValueError(
+                "unpacked_ue8m0_scales requires a float32 output_s buffer"
+            )
     _per_token_group_quant_custom_op(
         input=input,
         output_q=output_q,

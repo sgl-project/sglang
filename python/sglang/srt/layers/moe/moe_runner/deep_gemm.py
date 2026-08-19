@@ -1369,18 +1369,15 @@ def _varlen_deep_gemm_silu_mul_quant(
         deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         and not deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_PACKED_SCALES
     ):
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
-
-        return sglang_per_token_group_quant_fp8(
+        return per_token_group_quant(
             gateup_output,
-            group_size,
-            column_major_scales=False,
-            scale_tma_aligned=False,
+            group_size=group_size,
             scale_ue8m0=True,
             fuse_silu_and_mul=True,
             masked_m=masked_m,
+            expected_m=ceil_div(num_real_tokens * topk, E) if num_real_tokens else None,
+            column_major_scales=False,
+            unpacked_ue8m0_scales=True,
         )
 
     # Native DeepGEMM keeps the packed UE8M0 layout used by its TMA path.

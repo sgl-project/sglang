@@ -162,9 +162,9 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
                 "DEEPGEMM_MASKED_FP8_PACKED_SCALES",
                 False,
             ),
-            patch(
-                "sglang.kernels.ops.quantization.fp8_kernel."
-                "sglang_per_token_group_quant_fp8",
+            patch.object(
+                deep_gemm_runner,
+                "per_token_group_quant",
                 return_value=expected,
             ) as quant,
         ):
@@ -180,7 +180,7 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
         self.assertTrue(quant.call_args.kwargs["scale_ue8m0"])
         self.assertTrue(quant.call_args.kwargs["fuse_silu_and_mul"])
         self.assertFalse(quant.call_args.kwargs["column_major_scales"])
-        self.assertFalse(quant.call_args.kwargs["scale_tma_aligned"])
+        self.assertTrue(quant.call_args.kwargs["unpacked_ue8m0_scales"])
         self.assertIs(quant.call_args.kwargs["masked_m"], masked_m)
 
     def test_unpack_packed_ue8m0_activation_scale_is_lossless(self):
