@@ -223,6 +223,23 @@ class TestDFlashDraftModel(CustomTestCase):
 
     @patch.object(dflash, "RMSNorm", _FakeNorm)
     @patch.object(dflash, "ReplicatedLinear", _FakeReplicatedLinear)
+    def test_grouped_convolution_and_prefix_are_forwarded_together(self):
+        _FakeDraftLayer.calls.clear()
+        config = _draft_config(has_embed_tokens=False)
+        config.dflash_config.update(conv_kernel_size=2, conv_group_size=2)
+
+        _MinimalDraftModel(config, prefix="draft")
+
+        self.assertEqual(
+            [call["prefix"] for call in _FakeDraftLayer.calls],
+            [f"draft.layers.{i}" for i in range(6)],
+        )
+        for call in _FakeDraftLayer.calls:
+            self.assertIsInstance(call["attention_conv"], dflash.DFlashGroupedConv)
+            self.assertIsInstance(call["mlp_conv"], dflash.DFlashGroupedConv)
+
+    @patch.object(dflash, "RMSNorm", _FakeNorm)
+    @patch.object(dflash, "ReplicatedLinear", _FakeReplicatedLinear)
     def test_checkpoint_without_embedding_uses_fallback_contract(self):
         model = _MinimalDraftModel(_draft_config(has_embed_tokens=False))
 
