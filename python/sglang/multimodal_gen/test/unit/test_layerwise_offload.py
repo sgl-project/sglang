@@ -749,6 +749,25 @@ class _AuxiliaryResidentComponent(_ResidentComponent):
     layerwise_offload_dit_group_enabled = False
 
 
+class _MultiGroupComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+    layer_names = ["small_blocks", "large_blocks"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.small_blocks = torch.nn.ModuleList([_DummyBlock()])
+        self.large_blocks = torch.nn.ModuleList(
+            [_DummyBlock(), _DummyBlock(), _DummyBlock()]
+        )
+        self.non_layer = torch.nn.Parameter(torch.ones(2))
+        self.to_parameter_shapes = []
+
+    def to(self, *args, **kwargs):
+        self.to_parameter_shapes.append(
+            {name: tuple(param.shape) for name, param in self.named_parameters()}
+        )
+        return super().to(*args, **kwargs)
+
+
 def _patch_fake_device(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
@@ -914,6 +933,20 @@ def test_configure_resolves_residency_policy(monkeypatch):
     assert comp.layerwise_offload_managers[0].residency_policy == (
         RESIDENCY_POLICY_STRIDED
     )
+
+
+def test_configure_offloads_all_layer_groups_before_moving_non_layers(monkeypatch):
+    _patch_fake_device(monkeypatch)
+    model = _MultiGroupComponent()
+
+    model.configure_layerwise_offload(_server_args())
+
+    assert len(model.to_parameter_shapes) == 1
+    shapes_at_move = model.to_parameter_shapes[0]
+    assert shapes_at_move["non_layer"] == (2,)
+    for name, shape in shapes_at_move.items():
+        if name != "non_layer":
+            assert shape == (1,), name
 
 
 def test_holds_residents_reflects_configuration(monkeypatch):
