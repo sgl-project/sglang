@@ -69,7 +69,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1150, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=1150, stage="base-b", runner_config="2-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
@@ -227,6 +227,9 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
     cannot produce a non-aligned hit length, which this regression needs.
     """
 
+    pp_size = 1
+    tp_size = 1
+
     @classmethod
     def setUpClass(cls):
         cls.model = _MODEL_PATH
@@ -253,6 +256,10 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
             "500",
             "--max-running-requests",
             "4",
+            "--tp-size",
+            str(cls.tp_size),
+            "--pp-size",
+            str(cls.pp_size),
         ]
         if _MODEL_REVISION:
             other_args += ["--revision", _MODEL_REVISION]
@@ -297,6 +304,16 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
             max_new_tokens=512,
             sampling_temperature=0,
         )
+
+
+class TestUnifiedHybridHiCacheBitExactPP2(TestUnifiedHybridHiCacheBitExact):
+    pp_size = 2
+    tp_size = 1
+
+
+class TestUnifiedHybridHiCacheBitExactTP2(TestUnifiedHybridHiCacheBitExact):
+    pp_size = 1
+    tp_size = 2
 
 
 class TestUnifiedHybridMTPBitExact(CustomTestCase):
