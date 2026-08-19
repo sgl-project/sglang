@@ -1,10 +1,22 @@
 from __future__ import annotations
 
 from sglang.srt.runtime_context import (
+    get_parallel,
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
 )
+
+
+def get_alloc_page_size() -> int:
+    """The page the allocator hands out, which is what a KV length rounds up to.
+
+    DCP builds the allocator with page_size * attn_dcp_size (see
+    kv_cache_configurator._build_token_to_kv_pool_allocator); the platform
+    allocators that skip that branch page by the scheduled size, so under DCP
+    this is an upper bound for them rather than the exact value.
+    """
+    return get_schedule().page_size * get_parallel().attn_dcp_size
 
 
 def get_alloc_len_per_decode() -> int:
@@ -21,7 +33,7 @@ def get_alloc_len_per_decode() -> int:
     spec_steps = spec.speculative_num_steps or 1
     spec_topk = spec.speculative_eagle_topk or 1
     spec_tokens = max_speculative_num_draft_tokens()
-    page_size = get_schedule().page_size
+    page_size = get_alloc_page_size()
 
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -80,7 +92,7 @@ def get_req_to_token_extra_context_len() -> int:
     """
     # FIXME(lsyin): temporary fix for the context length issue under spec decoding
     extra = 4 + (max_speculative_num_draft_tokens() or 0)
-    page_size = get_schedule().page_size
+    page_size = get_alloc_page_size()
     if get_spec().speculative_algorithm is not None and page_size > 1:
         # kv_allocated_len is page-aligned (eagle_prepare_for_decode), so near
         # the context limit the aligned reserve can overshoot by page_size - 1;
