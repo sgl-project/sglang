@@ -1918,6 +1918,7 @@ class HiRadixCache(RadixCache):
         value = params.value
         chunked = params.chunked
         priority = params.priority
+        is_finished = params.is_finished
 
         if priority is None:
             priority = 0
@@ -1951,7 +1952,8 @@ class HiRadixCache(RadixCache):
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(node.parent)
                 else:
-                    self._inc_hit_count(node, chunked)
+                    if not is_finished:
+                        self._inc_hit_count(node, chunked)
                     total_prefix_length += prefix_len
             else:
                 # partial match, split the node
@@ -1966,7 +1968,8 @@ class HiRadixCache(RadixCache):
                     # update parent status as a new leaf is added into device
                     self._update_leaf_status(new_node.parent)
                 else:
-                    self._inc_hit_count(new_node, chunked)
+                    if not is_finished:
+                        self._inc_hit_count(new_node, chunked)
                     total_prefix_length += prefix_len
                 node = new_node
 

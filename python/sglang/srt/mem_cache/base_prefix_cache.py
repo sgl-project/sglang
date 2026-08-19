@@ -78,6 +78,7 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    is_finished: bool = False
 
 
 @dataclasses.dataclass
