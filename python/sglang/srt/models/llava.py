@@ -875,6 +875,8 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
             for part in ("language_model", "vision_tower"):
                 if name.startswith(part):
                     name = name[len(part + ".") :]
+                    if part == "vision_tower" and name.startswith("vision_model."):
+                        name = name[len("vision_model.") :]
                     getattr(self, part).load_weights([(name, loaded_weight)])
                     break
             else:
