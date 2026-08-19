@@ -821,5 +821,31 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
             req.normalize_batch_and_arguments()
 
 
+class TestEmbeddingReqInputSubrequest(CustomTestCase):
+    """Splitting a batched EmbeddingReqInput must preserve per-request fields."""
+
+    def test_priority_preserved_in_batch(self):
+        req = EmbeddingReqInput(text=["hello", "world"], priority=7)
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].priority, 7)
+        self.assertEqual(req[1].priority, 7)
+
+    def test_priority_preserved_in_cross_encoder_batch(self):
+        req = EmbeddingReqInput(
+            text=[["query 1", "doc 1"], ["query 2", "doc 2"]],
+            is_cross_encoder_request=True,
+            priority=3,
+        )
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].priority, 3)
+        self.assertEqual(req[1].priority, 3)
+
+    def test_priority_defaults_to_none_when_unset(self):
+        req = EmbeddingReqInput(text=["a", "b"])
+        req.normalize_batch_and_arguments()
+        self.assertIsNone(req[0].priority)
+        self.assertIsNone(req[1].priority)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1251,6 +1251,7 @@ class EmbeddingReqInput:
         if self.is_cross_encoder_request:
             sub = EmbeddingReqInput(
                 rid=self.rid[i],
+                priority=self.priority,
                 text=[self.text[i]] if self.text is not None else None,
                 sampling_params=self.sampling_params[i],
                 is_cross_encoder_request=True,
@@ -1270,6 +1271,7 @@ class EmbeddingReqInput:
         else:
             sub = EmbeddingReqInput(
                 rid=self.rid[i],
+                priority=self.priority,
                 text=self.text[i] if self.text is not None else None,
                 input_ids=self.input_ids[i] if self.input_ids is not None else None,
                 image_data=self.image_data[i] if self.image_data is not None else None,
