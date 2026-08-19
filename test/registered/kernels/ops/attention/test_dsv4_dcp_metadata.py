@@ -1,8 +1,13 @@
-import pytest
-import torch
 import math
 from types import SimpleNamespace
 
+import pytest
+import torch
+
+from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+from sglang.kernels.ops.attention.deepseek_v4_rope import (
+    precompute_freqs_cis,
+)
 from sglang.kernels.ops.attention.dsv4.compress import (
     CompressorDecodePlan,
     compress_norm_rope_store,
@@ -21,19 +26,15 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.runtime import (
     build_prefill_indices,
     update_dcp_csa_stream,
 )
-from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
+from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+    DeepseekV4HipRadixBackend,
+)
 from sglang.srt.layers.attention.dsv4.dcp import (
     local_compressed_lens,
     local_swa_lens,
     localize_compressed_indices,
+    select_dcp_attn_sink,
 )
-from sglang.kernels.ops.attention.deepseek_v4_rope import (
-    precompute_freqs_cis,
-)
-from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
-    DeepseekV4HipRadixBackend,
-)
-from sglang.srt.layers.attention.dsv4.dcp import select_dcp_attn_sink
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -213,9 +214,7 @@ def test_compressed_metadata_matches_dcp_domain(dcp_size: int) -> None:
         c4_out, _, c4_lens, _, c128_out, _, c128_lens, _, c128_pages = result
 
         expected_c4 = localize_compressed_indices(raw_out_loc, 4, dcp_size, rank)
-        expected_c128 = localize_compressed_indices(
-            raw_out_loc, 128, dcp_size, rank
-        )
+        expected_c128 = localize_compressed_indices(raw_out_loc, 128, dcp_size, rank)
         c4_boundaries = seq_lens % 4 == 0
         c128_boundaries = seq_lens % 128 == 0
         expected_c4_out = torch.where(
@@ -271,9 +270,7 @@ def test_unified_bf16_store_skips_negative_locations() -> None:
         compress_ratio, req_pool_indices, seq_lens
     )
     out_loc = torch.tensor([-1, 2, -1], dtype=torch.int64, device=DEVICE)
-    cache = torch.full(
-        (4, head_dim), 7.0, dtype=torch.bfloat16, device=DEVICE
-    )
+    cache = torch.full((4, head_dim), 7.0, dtype=torch.bfloat16, device=DEVICE)
     before = cache.clone()
     freqs_cis = precompute_freqs_cis(
         64, int(seq_lens.max().item()) + 1, 0, 10000, 1, 32, 1
@@ -380,12 +377,8 @@ def test_partitioned_prefill_lse_merge_counts_replicated_terms_once() -> None:
     q = torch.randn(
         num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=DEVICE
     )
-    prefix_kv = torch.randn(
-        total_prefix, head_dim, dtype=torch.bfloat16, device=DEVICE
-    )
-    extend_kv = torch.randn(
-        total_extend, head_dim, dtype=torch.bfloat16, device=DEVICE
-    )
+    prefix_kv = torch.randn(total_prefix, head_dim, dtype=torch.bfloat16, device=DEVICE)
+    extend_kv = torch.randn(total_extend, head_dim, dtype=torch.bfloat16, device=DEVICE)
     prefix_indices = torch.arange(total_prefix, dtype=torch.int32, device=DEVICE)
     prefix_indptr = torch.tensor(
         [0, prefix_lens[0], total_prefix], dtype=torch.int32, device=DEVICE
@@ -508,7 +501,9 @@ def test_dcp_decode_streams_partition_swa_and_c128() -> None:
             for key_position in all_positions
         }
         assert seen_swa[row] == expected_swa
-        expected_hca = {value + swa_pages for value in hca_pages[row].tolist() if value >= 0}
+        expected_hca = {
+            value + swa_pages for value in hca_pages[row].tolist() if value >= 0
+        }
         assert seen_hca[row] == expected_hca
 
 
@@ -628,9 +623,7 @@ def test_dcp_decode_and_csa_streams_replay_live_cuda_graph_inputs() -> None:
     c4_len = torch.tensor([2, 1], dtype=torch.int32, device=DEVICE)
 
     def eager_streams():
-        swa_len = local_swa_lens(
-            positions + 1, win, dcp_size, dcp_rank
-        ).to(torch.int32)
+        swa_len = local_swa_lens(positions + 1, win, dcp_size, dcp_rank).to(torch.int32)
         streams = build_decode_streams(
             state_slot=state_slot,
             positions=positions,
@@ -689,10 +682,6 @@ def test_dcp_decode_and_csa_streams_replay_live_cuda_graph_inputs() -> None:
     ):
         torch.testing.assert_close(actual_indptr, expected_indptr)
         for row in range(positions.numel()):
-            actual = actual_indices[
-                actual_indptr[row] : actual_indptr[row + 1]
-            ]
-            wanted = expected_indices[
-                expected_indptr[row] : expected_indptr[row + 1]
-            ]
+            actual = actual_indices[actual_indptr[row] : actual_indptr[row + 1]]
+            wanted = expected_indices[expected_indptr[row] : expected_indptr[row + 1]]
             torch.testing.assert_close(actual, wanted)

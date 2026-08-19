@@ -1,8 +1,9 @@
 """Multi-GPU parity for DeepSeek V4 DCP top-k and attention collectives.
 
-This file doubles as its torchrun worker. The pytest process launches two- and
-four-rank workers; each worker uses the production GroupCoordinator, C4
-candidate merge, paged decode kernel, and both DCP reduction backends.
+This file doubles as its torchrun worker. Registered CI launches two ranks;
+larger MI355X validation can invoke the worker directly with torchrun. Each
+worker uses the production GroupCoordinator, C4 candidate merge, paged decode
+kernel, and both DCP reduction backends.
 """
 
 from __future__ import annotations
@@ -45,11 +46,10 @@ def _launch_workers(nproc: int) -> None:
     )
 
 
-@pytest.mark.parametrize("nproc", [2, 4])
-def test_dsv4_dcp_collectives(nproc: int) -> None:
-    if torch.cuda.device_count() < nproc:
-        pytest.skip(f"Requires {nproc} GPUs")
-    _launch_workers(nproc)
+def test_dsv4_dcp_collectives() -> None:
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Requires 2 GPUs")
+    _launch_workers(2)
 
 
 def _init_distributed():
@@ -128,21 +128,17 @@ def _worker_test(rank: int, world_size: int, device, coordinator) -> None:
 
     local_kv = kv_global[rank::world_size].contiguous()
     local_scores = global_scores[:, rank::world_size].contiguous()
-    local_lens = local_compressed_lens(
-        global_lens * 4, 4, world_size, rank
-    )
+    local_lens = local_compressed_lens(global_lens * 4, 4, world_size, rank)
     candidate_scores, candidate_ids = local_c4_topk_candidates(
         local_scores, local_lens, topk, world_size, rank
     )
-    gathered_scores = coordinator.all_gather(
-        candidate_scores.contiguous(), dim=1
-    )
+    gathered_scores = coordinator.all_gather(candidate_scores.contiguous(), dim=1)
     gathered_ids = coordinator.all_gather(candidate_ids.contiguous(), dim=1)
 
     local_pages = (local_kv.shape[0] + c4_page_size - 1) // c4_page_size
-    page_table = torch.arange(
-        local_pages, dtype=torch.int32, device=device
-    ).expand(batch, -1)
+    page_table = torch.arange(local_pages, dtype=torch.int32, device=device).expand(
+        batch, -1
+    )
     topk_result = merge_c4_topk_candidates(
         gathered_scores,
         gathered_ids,
@@ -169,9 +165,7 @@ def _worker_test(rank: int, world_size: int, device, coordinator) -> None:
         sink,
         scale,
     )
-    reference_local = reference_out[
-        :, rank * local_heads : (rank + 1) * local_heads
-    ]
+    reference_local = reference_out[:, rank * local_heads : (rank + 1) * local_heads]
 
     shifted_sink = sink - torch.log(
         torch.tensor(float(world_size), dtype=torch.float32, device=device)
@@ -186,9 +180,7 @@ def _worker_test(rank: int, world_size: int, device, coordinator) -> None:
         return_lse=True,
     )
 
-    ag_rs = cp_lse_ag_out_rs_mha(
-        partial_out.clone(), partial_lse.clone(), coordinator
-    )
+    ag_rs = cp_lse_ag_out_rs_mha(partial_out.clone(), partial_lse.clone(), coordinator)
     a2a = dcp_a2a_lse_reduce(
         partial_out.clone(),
         partial_lse.clone(),

@@ -63,8 +63,7 @@ class TestDSV4DCPLayout(CustomTestCase):
                 )
                 group_start = tp_rank - dcp_rank
                 expected = sink[
-                    group_start * local_heads : (group_start + dcp_size)
-                    * local_heads
+                    group_start * local_heads : (group_start + dcp_size) * local_heads
                 ]
                 torch.testing.assert_close(got, expected)
 
@@ -157,9 +156,7 @@ class TestDSV4DCPLayout(CustomTestCase):
         for ratio in (4, 128):
             for dcp_size in (1, 2, 4, 8):
                 for rank in range(dcp_size):
-                    got = local_compressed_lens(
-                        seq_lens, ratio, dcp_size, rank
-                    )
+                    got = local_compressed_lens(seq_lens, ratio, dcp_size, rank)
                     expected = torch.tensor(
                         [
                             sum(
@@ -204,9 +201,8 @@ class TestDSV4DCPLayout(CustomTestCase):
                 for page in range(max_seq_len // logical_page_size):
                     start = page * logical_page_size
                     req_to_token[request, start : start + logical_page_size] = (
-                        (request * 64 + page + 1) * logical_page_size
-                        + torch.arange(logical_page_size)
-                    )
+                        request * 64 + page + 1
+                    ) * logical_page_size + torch.arange(logical_page_size)
             got = build_local_page_table(
                 req_to_token,
                 torch.tensor([0, 2]),
@@ -236,9 +232,7 @@ class TestDSV4DCPLayout(CustomTestCase):
         c4_page_size = 64
         for rank in range(dcp_size):
             local_scores = global_scores[:, rank::dcp_size]
-            local_lens = local_compressed_lens(
-                global_lens * 4, 4, dcp_size, rank
-            )
+            local_lens = local_compressed_lens(global_lens * 4, 4, dcp_size, rank)
             scores, ids = local_c4_topk_candidates(
                 local_scores, local_lens, topk, dcp_size, rank
             )
@@ -282,8 +276,7 @@ class TestDSV4DCPLayout(CustomTestCase):
                 reconstructed.extend((local_ids * dcp_size + rank).tolist())
                 page_indices = result.page_indices[row, :count]
                 expected_pages = (
-                    page_tables[rank][row, local_ids // c4_page_size]
-                    * c4_page_size
+                    page_tables[rank][row, local_ids // c4_page_size] * c4_page_size
                     + local_ids % c4_page_size
                 ).to(torch.int32)
                 torch.testing.assert_close(page_indices, expected_pages)

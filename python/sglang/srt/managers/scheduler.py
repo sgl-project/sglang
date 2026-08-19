@@ -2238,9 +2238,7 @@ class Scheduler(
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         allocation_page_size = self.token_to_kv_pool_allocator.page_size
-        paged_input_len = (
-            -(-input_len // allocation_page_size) * allocation_page_size
-        )
+        paged_input_len = -(-input_len // allocation_page_size) * allocation_page_size
         req.sampling_params.max_new_tokens = max(
             0,
             min(
