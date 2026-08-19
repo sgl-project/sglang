@@ -328,7 +328,15 @@ def _unified_attention_with_output_impl(
 
     if real_query_num_tokens == 0:
         _zero_skipped_attn_outputs(output)
-        return
+        if return_lse:
+            # unified_attention_with_output_and_lse asserts a tensor comes back.
+            # Match _unified_attention_with_output_and_lse_fake's meta shape and
+            # the padded LSE the normal path returns below (padded row count,
+            # i.e. query before narrowing).
+            return query.new_zeros(
+                (query.shape[0], query.shape[1]), dtype=torch.float32
+            )
+        return None
 
     query = query[:real_query_num_tokens]
     if key is not None:
@@ -591,6 +599,10 @@ def attention_with_output_extra_kwargs(
     forward_batch = context.forward_batch
     attention_layer = context.attention_layers[layer_id]
     real_num_tokens = forward_batch.num_token_non_padded_cpu
+
+    if real_num_tokens == 0:
+        _zero_skipped_attn_outputs(output)
+        return
 
     query = query[:real_num_tokens]
     if key is not None:

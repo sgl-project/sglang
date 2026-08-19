@@ -778,6 +778,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # DSV4 DP attention / DeepEP collectives need every DP rank to enter
         # the same replay path. Sparse-DP batches (one or more ranks with
         # zero local tokens) fall back to eager to avoid hanging ranks.
+        # MegaMoE is exempt (prefill_graph_tolerates_sum_len): its idle ranks
+        # still execute MegaMoE with 0 tokens, so per-rank SUM_LEN buckets stay
+        # collective-safe and need no eager fallback.
         global_num_tokens = forward_batch.global_num_tokens_cpu
         if global_num_tokens is None:
             return False
