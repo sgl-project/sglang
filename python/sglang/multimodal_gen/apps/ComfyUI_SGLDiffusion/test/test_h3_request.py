@@ -260,3 +260,31 @@ def test_extra_fields_win_over_generic_defaults():
 
     assert captured["size"] == "1344x768"
     assert captured["task"] == "t2va"
+
+
+@pytest.mark.parametrize("task", ["t2va", "fl2va", "ref2va"])
+def test_payload_validates_against_the_server_request_model(task):
+    """The node's payload must satisfy the schema the server actually parses.
+
+    The other tests mock HTTP, so they would still pass if a field were
+    misnamed or mistyped. This one feeds the captured payload to
+    VideoGenerationsRequest, closing that gap without a running server.
+    """
+    from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+        VideoGenerationsRequest,
+    )
+
+    conditioning = {
+        "t2va": {},
+        "fl2va": {"first_frame": _image()},
+        "ref2va": {"reference_image": _image()},
+    }[task]
+    payload, _ = _run_node(positive_prompt="a cat", task=task, **conditioning)
+
+    request = VideoGenerationsRequest(**payload)
+
+    # the H3 fields ride through as extras; losing them silently would leave a
+    # valid request that generates the wrong thing
+    assert request.task == task
+    assert request.target["short_edge"] == payload["target"]["short_edge"]
+    assert len(request.conditions) == len(payload["conditions"])
