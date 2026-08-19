@@ -14,11 +14,11 @@ import torch
 from sglang.srt.lora.moe.base_gemm_provider.base import MoeBaseProviderContract
 from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
     ContiguousRowDomainProvider,
-    ContiguousRowWorkspace,
+    ContiguousRowState,
 )
 from sglang.srt.lora.moe.base_gemm_provider.masked_row_domain import (
     MaskedRowDomainProvider,
-    MaskedRowWorkspace,
+    MaskedRowState,
 )
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 
@@ -93,20 +93,20 @@ class DeepGemmBf16Provider(MaskedRowDomainProvider):
 
     def gateup(
         self,
-        ws: MaskedRowWorkspace,
+        row_state: MaskedRowState,
         out: torch.Tensor,
     ) -> None:
         self._grouped_gemm_bf16_masked(
-            ws.hidden_permuted,
+            row_state.hidden_permuted,
             self.quant_info.w13_weight,
             out,
-            ws.masked_m,
-            self._expected_m_hint(ws.expected_m),
+            row_state.masked_m,
+            self._expected_m_hint(row_state.expected_m),
         )
 
     def down(
         self,
-        ws: MaskedRowWorkspace,
+        row_state: MaskedRowState,
         act_out: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
@@ -114,8 +114,8 @@ class DeepGemmBf16Provider(MaskedRowDomainProvider):
             act_out,
             self.quant_info.w2_weight,
             out,
-            ws.masked_m,
-            self._expected_m_hint(ws.expected_m),
+            row_state.masked_m,
+            self._expected_m_hint(row_state.expected_m),
         )
 
 
@@ -161,19 +161,22 @@ class DeepGemmBf16ContiguousProvider(ContiguousRowDomainProvider):
 
     def gateup(
         self,
-        ws: ContiguousRowWorkspace,
+        row_state: ContiguousRowState,
         out: torch.Tensor,
     ) -> None:
         self._grouped_gemm_bf16_contig(
-            ws.hidden_compact, self.quant_info.w13_weight, out, ws.grouped_layout
+            row_state.hidden_compact,
+            self.quant_info.w13_weight,
+            out,
+            row_state.grouped_layout,
         )
 
     def down(
         self,
-        ws: ContiguousRowWorkspace,
+        row_state: ContiguousRowState,
         act_out: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
         self._grouped_gemm_bf16_contig(
-            act_out, self.quant_info.w2_weight, out, ws.grouped_layout
+            act_out, self.quant_info.w2_weight, out, row_state.grouped_layout
         )

@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
 
-class MaskedRowWorkspace(msgspec.Struct, kw_only=True):
+class MaskedRowState(msgspec.Struct, kw_only=True):
     """Per-forward state of the masked row domain.
 
     Rows are ``[E_local, m_max, ·]`` with
@@ -154,7 +154,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         topk_ids: torch.Tensor,
         top_k: int,
         workspace: MoeLoraWorkspace | None = None,
-    ) -> MaskedRowWorkspace:
+    ) -> MaskedRowState:
         m_max = (hidden_states.size(0) // 256 + 1) * 256
         masked_m_out = None
         src2dst_out = None
@@ -193,7 +193,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             src2dst_out=src2dst_out,
             gateup_input_out=hidden_permuted_out,
         )
-        return MaskedRowWorkspace(
+        return MaskedRowState(
             hidden_permuted=hidden_permuted,
             masked_m=masked_m,
             expected_m=expected_m,
@@ -202,20 +202,20 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             retained_inputs=workspace is not None,
         )
 
-    def release_prepared_inputs(self, ws: MaskedRowWorkspace) -> None:
+    def release_prepared_inputs(self, row_state: MaskedRowState) -> None:
         # The permuted hidden rows are dead after the gate/up GEMM; free them
         # before the S3/S4 buffers are allocated when this provider owns the
         # allocation. Runner-workspace inputs remain address-stable for graph
         # replay and are reclaimed with the runner workspace.
-        if ws.retained_inputs:
+        if row_state.retained_inputs:
             return
         from sglang.srt.utils import dispose_tensor
 
-        dispose_tensor(ws.hidden_permuted)
+        dispose_tensor(row_state.hidden_permuted)
 
     def act_with_delta(
         self,
-        ws: MaskedRowWorkspace,
+        row_state: MaskedRowState,
         gateup_out: torch.Tensor,
         gate_up_delta: torch.Tensor | None,
         topk_ids: torch.Tensor,
@@ -232,7 +232,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             gate_up_delta,
             act_out,
             activation_lora_input,
-            ws.src2dst,
+            row_state.src2dst,
             topk_ids,
             gate_first=self.contract.gate_first,
             interleaved=self.contract.interleaved,
@@ -242,18 +242,18 @@ class MaskedRowDomainProvider(MoeBaseProvider):
 
     def mapped_down_lora_a_input(
         self,
-        ws: MaskedRowWorkspace,
+        row_state: MaskedRowState,
         activation: torch.Tensor,
     ) -> MappedLoraAInput:
-        """Expose masked activation rows without leaking workspace internals.
+        """Expose masked activation rows without leaking row-state internals.
 
         The mapping is the provider's semantic pair-to-physical-row ABI.  The
         runner consumes only this descriptor and never reaches into ``ws``.
         """
 
-        if not isinstance(ws, MaskedRowWorkspace):
-            raise TypeError("masked down-A input requires MaskedRowWorkspace")
-        expected = self.act_out_shape(ws)
+        if not isinstance(row_state, MaskedRowState):
+            raise TypeError("masked down-A input requires MaskedRowState")
+        expected = self.act_out_shape(row_state)
         if tuple(activation.shape) != expected:
             raise ValueError(
                 f"mapped down-A activation must be {expected}, got "
@@ -267,10 +267,10 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         if not activation.is_contiguous():
             raise ValueError("mapped down-A activation rows must be contiguous")
         if (
-            ws.src2dst.ndim != 1
-            or ws.src2dst.dtype != torch.int32
-            or ws.src2dst.device != activation.device
-            or not ws.src2dst.is_contiguous()
+            row_state.src2dst.ndim != 1
+            or row_state.src2dst.dtype != torch.int32
+            or row_state.src2dst.device != activation.device
+            or not row_state.src2dst.is_contiguous()
         ):
             raise ValueError(
                 "mapped down-A pair-to-row metadata must be contiguous 1-D "
@@ -278,7 +278,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             )
         return MappedLoraAInput(
             rows=activation.view(-1, activation.shape[-1]),
-            pair_to_row=ws.src2dst,
+            pair_to_row=row_state.src2dst,
         )
 
     def install_fused_middle_implementation(
@@ -360,7 +360,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
 
     def run_fused_middle(
         self,
-        ws: MaskedRowWorkspace,
+        row_state: MaskedRowState,
         family: str,
         *,
         implementation: str,
@@ -386,7 +386,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             base_gateup=base_gateup,
             act_masked=act_masked,
             act_pairs=act_pairs,
-            src2dst=ws.src2dst,
+            src2dst=row_state.src2dst,
             routing=routing,
             num_local_experts=self.num_local_experts,
             gate_first=self.contract.gate_first,
@@ -414,7 +414,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
 
     def run_down_b_scatter(
         self,
-        ws: MaskedRowWorkspace,
+        row_state: MaskedRowState,
         *,
         down_out: torch.Tensor,
         bridge: torch.Tensor,
@@ -428,7 +428,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         # in-place-src2dst-store hazard does not apply.
         self._down_b_scatter(
             down_rows=down_out.view(-1, self.hidden_size),
-            src2dst=ws.src2dst,
+            src2dst=row_state.src2dst,
             bridge=bridge,
             b_down=b_down,
             routing=routing,
@@ -437,7 +437,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
 
     def run_shared_rank_finalize(
         self,
-        ws: MaskedRowWorkspace,
+        row_state: MaskedRowState,
         *,
         implementation: str,
         down_masked: torch.Tensor,
@@ -451,7 +451,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         config: Mapping[str, Mapping[str, int]],
     ) -> None:
         self.run_shared_rank_reduce(
-            ws,
+            row_state,
             implementation=implementation,
             bridge=bridge,
             routing=routing,
@@ -461,7 +461,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             config=config["reduce"],
         )
         self.finish_shared_rank_finalize(
-            ws,
+            row_state,
             implementation=implementation,
             down_masked=down_masked,
             b_down=b_down,
@@ -475,7 +475,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
 
     def run_shared_rank_reduce(
         self,
-        ws: MaskedRowWorkspace,
+        row_state: MaskedRowState,
         *,
         implementation: str,
         bridge: torch.Tensor,
@@ -491,10 +491,10 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             raise NotImplementedError(
                 f"{self.contract.key} has no {implementation!r} shared-rank reduction"
             ) from exc
-        # `ws` is deliberately opaque and unused by this pair-domain launch;
+        # `row_state` is deliberately opaque and unused by this pair-domain launch;
         # retaining it in the provider ABI lets every scheduled stage be
         # invoked uniformly.
-        del ws
+        del row_state
         invoke(
             bridge=bridge,
             routing=routing,
@@ -506,7 +506,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
 
     def finish_shared_rank_finalize(
         self,
-        ws: MaskedRowWorkspace,
+        row_state: MaskedRowState,
         *,
         implementation: str,
         down_masked: torch.Tensor,
@@ -526,7 +526,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             ) from exc
         invoke(
             down_masked=down_masked,
-            src2dst=ws.src2dst,
+            src2dst=row_state.src2dst,
             token_rank=token_rank,
             b_down=b_down,
             routing=routing,
@@ -539,7 +539,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
 
     def finalize(
         self,
-        ws: MaskedRowWorkspace,
+        row_state: MaskedRowState,
         down_out: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -552,7 +552,7 @@ class MaskedRowDomainProvider(MoeBaseProvider):
         self._post_reorder(
             down_out.view(-1, hidden),
             output,
-            ws.src2dst,
+            row_state.src2dst,
             topk_ids,
             topk_weights,
             topk_ids.shape[1],
@@ -562,23 +562,23 @@ class MaskedRowDomainProvider(MoeBaseProvider):
             lora_delta=lora_delta,
         )
 
-    def gateup_out_shape(self, ws: MaskedRowWorkspace) -> tuple[int, ...]:
+    def gateup_out_shape(self, row_state: MaskedRowState) -> tuple[int, ...]:
         return (
             self.quant_info.num_local_experts,
-            ws.m_max,
+            row_state.m_max,
             self.gate_up_slices * self.quant_info.intermediate_size,
         )
 
-    def act_out_shape(self, ws: MaskedRowWorkspace) -> tuple[int, ...]:
+    def act_out_shape(self, row_state: MaskedRowState) -> tuple[int, ...]:
         return (
             self.quant_info.num_local_experts,
-            ws.m_max,
+            row_state.m_max,
             self.quant_info.intermediate_size,
         )
 
-    def down_out_shape(self, ws: MaskedRowWorkspace) -> tuple[int, ...]:
+    def down_out_shape(self, row_state: MaskedRowState) -> tuple[int, ...]:
         return (
             self.quant_info.num_local_experts,
-            ws.m_max,
+            row_state.m_max,
             self.quant_info.hidden_size,
         )

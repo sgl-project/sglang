@@ -38,12 +38,12 @@ import torch
 from sglang.srt.lora.moe.base_gemm_provider.base import MoeBaseProviderContract
 from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
     ContiguousRowDomainProvider,
-    ContiguousRowWorkspace,
+    ContiguousRowState,
     contiguous_m_pad_ceiling,
 )
 from sglang.srt.lora.moe.base_gemm_provider.masked_row_domain import (
     MaskedRowDomainProvider,
-    MaskedRowWorkspace,
+    MaskedRowState,
 )
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 
@@ -72,7 +72,7 @@ class CuteDslStageCall(msgspec.Struct, frozen=True):
     b_arg: object
 
 
-class CuteDslMaskedWorkspace(MaskedRowWorkspace, kw_only=True):
+class CuteDslMaskedRowState(MaskedRowState, kw_only=True):
     """Masked row domain plus this forward's packed tile schedules."""
 
     token_width: int
@@ -331,7 +331,7 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
         topk_ids: torch.Tensor,
         top_k: int,
         workspace: MoeLoraWorkspace | None = None,
-    ) -> CuteDslMaskedWorkspace:
+    ) -> CuteDslMaskedRowState:
         base = super().prepare(hidden_states, topk_ids, top_k, workspace)
         token_width = self._token_width_for(base.m_max, base.expected_m)
         schedule_outputs = {}
@@ -384,7 +384,7 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
             use_2cta_instrs=self.USE_2CTA_INSTRS,
             **schedule_outputs,
         )
-        return CuteDslMaskedWorkspace(
+        return CuteDslMaskedRowState(
             hidden_permuted=base.hidden_permuted,
             masked_m=base.masked_m,
             expected_m=base.expected_m,
@@ -403,14 +403,14 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
         stage: str,
         a: torch.Tensor,
         c: torch.Tensor,
-        ws: CuteDslMaskedWorkspace,
+        row_state: CuteDslMaskedRowState,
         schedule: torch.Tensor,
         tiles: torch.Tensor,
     ) -> None:
         import cuda.bindings.driver as cuda_driver
         from cutlass.cute.runtime import from_dlpack
 
-        call = self._compiled[ws.token_width][stage]
+        call = self._compiled[row_state.token_width][stage]
 
         def dyn(tensor: torch.Tensor, leading_dim: int):
             return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(
@@ -422,25 +422,25 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
             dyn(a, 2),
             call.b_arg,
             dyn(c, 2),
-            dyn(ws.masked_m, 0),
+            dyn(row_state.masked_m, 0),
             dyn(schedule, 0),
             dyn(tiles, 0),
             stream,
         )
 
-    def gateup(self, ws: CuteDslMaskedWorkspace, out: torch.Tensor) -> None:
+    def gateup(self, row_state: CuteDslMaskedRowState, out: torch.Tensor) -> None:
         self._launch(
             "gemm1",
-            ws.hidden_permuted,
+            row_state.hidden_permuted,
             out,
-            ws,
-            ws.gemm1_schedule,
-            ws.gemm1_tiles,
+            row_state,
+            row_state.gemm1_schedule,
+            row_state.gemm1_tiles,
         )
 
     def down(
         self,
-        ws: CuteDslMaskedWorkspace,
+        row_state: CuteDslMaskedRowState,
         act_out: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
@@ -448,13 +448,13 @@ class CuteDslBf16Provider(MaskedRowDomainProvider):
             "gemm2",
             act_out,
             out,
-            ws,
-            ws.gemm2_schedule,
-            ws.gemm2_tiles,
+            row_state,
+            row_state.gemm2_schedule,
+            row_state.gemm2_tiles,
         )
 
 
-class CuteDslContiguousWorkspace(ContiguousRowWorkspace, kw_only=True):
+class CuteDslContiguousRowState(ContiguousRowState, kw_only=True):
     """Contiguous row domain plus this forward's packed tile schedules.
 
     Dual-ownership carries over from the masked twin: both schedules derive
@@ -705,7 +705,7 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
         topk_ids: torch.Tensor,
         top_k: int,
         workspace: MoeLoraWorkspace | None = None,
-    ) -> CuteDslContiguousWorkspace:
+    ) -> CuteDslContiguousRowState:
         num_pairs = topk_ids.numel()
         num_experts = self.quant_info.num_local_experts
         # The pack geometry precedes the dispatch because the S1 seg-layout
@@ -786,7 +786,7 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
         base = super().prepare(
             hidden_states, topk_ids, top_k, workspace, schedule_pack=pack
         )
-        return CuteDslContiguousWorkspace(
+        return CuteDslContiguousRowState(
             hidden_compact=base.hidden_compact,
             seg_counts=base.seg_counts,
             seg_offsets=base.seg_offsets,
@@ -836,26 +836,38 @@ class CuteDslBf16ContiguousProvider(ContiguousRowDomainProvider):
         stage: str,
         a: torch.Tensor,
         c: torch.Tensor,
-        ws: CuteDslContiguousWorkspace,
+        row_state: CuteDslContiguousRowState,
         schedule: torch.Tensor,
         tiles: torch.Tensor,
     ) -> None:
-        call = self._compiled[ws.token_width][stage]
-        self._invoke(call, a, c, ws.seg_offsets, schedule, tiles)
+        call = self._compiled[row_state.token_width][stage]
+        self._invoke(call, a, c, row_state.seg_offsets, schedule, tiles)
 
     def gateup(
         self,
-        ws: CuteDslContiguousWorkspace,
+        row_state: CuteDslContiguousRowState,
         out: torch.Tensor,
     ) -> None:
         self._launch(
-            "gemm1", ws.hidden_compact, out, ws, ws.gemm1_schedule, ws.gemm1_tiles
+            "gemm1",
+            row_state.hidden_compact,
+            out,
+            row_state,
+            row_state.gemm1_schedule,
+            row_state.gemm1_tiles,
         )
 
     def down(
         self,
-        ws: CuteDslContiguousWorkspace,
+        row_state: CuteDslContiguousRowState,
         act_out: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
-        self._launch("gemm2", act_out, out, ws, ws.gemm2_schedule, ws.gemm2_tiles)
+        self._launch(
+            "gemm2",
+            act_out,
+            out,
+            row_state,
+            row_state.gemm2_schedule,
+            row_state.gemm2_tiles,
+        )

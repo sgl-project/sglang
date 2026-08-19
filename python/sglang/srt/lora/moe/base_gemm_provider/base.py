@@ -105,10 +105,10 @@ class MoeBaseProvider:
         """
         raise NotImplementedError
 
-    def gateup(self, ws, out: torch.Tensor) -> None:
+    def gateup(self, row_state, out: torch.Tensor) -> None:
         raise NotImplementedError
 
-    def release_prepared_inputs(self, ws) -> None:
+    def release_prepared_inputs(self, row_state) -> None:
         """Free whatever ``prepare`` allocated once the gate/up GEMM is done.
 
         The provider owns its workspace members, so it performs the release;
@@ -118,7 +118,7 @@ class MoeBaseProvider:
 
     def act_with_delta(
         self,
-        ws,
+        row_state,
         gateup_out: torch.Tensor,
         gate_up_delta: torch.Tensor | None,
         topk_ids: torch.Tensor,
@@ -132,7 +132,7 @@ class MoeBaseProvider:
 
     def down(
         self,
-        ws,
+        row_state,
         act_out: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
@@ -140,7 +140,7 @@ class MoeBaseProvider:
 
     def finalize(
         self,
-        ws,
+        row_state,
         down_out: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -174,7 +174,7 @@ class MoeBaseProvider:
 
     def run_fused_middle(
         self,
-        ws,
+        row_state,
         family: str,
         *,
         implementation: str,
@@ -196,7 +196,7 @@ class MoeBaseProvider:
 
     def mapped_down_lora_a_input(
         self,
-        ws,
+        row_state,
         activation: torch.Tensor,
     ) -> MappedLoraAInput | None:
         """Expose provider activation rows for standalone grouped down-A.
@@ -233,7 +233,7 @@ class MoeBaseProvider:
 
     def run_down_b_scatter(
         self,
-        ws,
+        row_state,
         *,
         down_out: torch.Tensor,
         bridge: torch.Tensor,
@@ -256,7 +256,7 @@ class MoeBaseProvider:
 
     def run_shared_rank_finalize(
         self,
-        ws,
+        row_state,
         *,
         implementation: str,
         down_masked: torch.Tensor,
@@ -275,7 +275,7 @@ class MoeBaseProvider:
 
     def run_shared_rank_reduce(
         self,
-        ws,
+        row_state,
         *,
         implementation: str,
         bridge: torch.Tensor,
@@ -292,7 +292,7 @@ class MoeBaseProvider:
 
     def finish_shared_rank_finalize(
         self,
-        ws,
+        row_state,
         *,
         implementation: str,
         down_masked: torch.Tensor,
@@ -310,11 +310,11 @@ class MoeBaseProvider:
         )
 
     # Buffer shape helpers so the runner owns every allocation.
-    def gateup_out_shape(self, ws) -> tuple[int, ...]:
+    def gateup_out_shape(self, row_state) -> tuple[int, ...]:
         raise NotImplementedError
 
-    def act_out_shape(self, ws) -> tuple[int, ...]:
+    def act_out_shape(self, row_state) -> tuple[int, ...]:
         raise NotImplementedError
 
-    def down_out_shape(self, ws) -> tuple[int, ...]:
+    def down_out_shape(self, row_state) -> tuple[int, ...]:
         raise NotImplementedError

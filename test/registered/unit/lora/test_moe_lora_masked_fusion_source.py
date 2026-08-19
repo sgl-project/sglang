@@ -152,7 +152,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             "sglang.srt.lora.moe.base_gemm_provider.masked_row_domain"
         )
         row_module.MaskedRowDomainProvider = StubProvider
-        row_module.MaskedRowWorkspace = object
+        row_module.MaskedRowState = object
         quant_module = types.ModuleType("sglang.srt.lora.moe.quant_info")
         quant_module.MoeLoraBf16QuantInfo = object
         packages = {}
@@ -241,22 +241,22 @@ class TestMaskedFusionSource(unittest.TestCase):
             self.assertIn(f"def {method}(", row)
 
         body = _function(row, "run_fused_middle")
-        self.assertIn("ws.src2dst", body)
-        self.assertNotIn("ws.hidden_permuted", body)
-        self.assertNotIn("ws.masked_m", body)
+        self.assertIn("row_state.src2dst", body)
+        self.assertNotIn("row_state.hidden_permuted", body)
+        self.assertNotIn("row_state.masked_m", body)
         shared = _function(row, "run_shared_rank_finalize")
         self.assertIn("self.run_shared_rank_reduce(", shared)
         self.assertIn("self.finish_shared_rank_finalize(", shared)
-        self.assertNotIn("ws.hidden_permuted", shared)
-        self.assertNotIn("ws.masked_m", shared)
+        self.assertNotIn("row_state.hidden_permuted", shared)
+        self.assertNotIn("row_state.masked_m", shared)
         finish = _function(row, "finish_shared_rank_finalize")
         self.assertNotIn("self.finalize(", finish)
         self.assertIn("invoke(", finish)
         self.assertIn("down_masked=down_masked", finish)
-        self.assertIn("src2dst=ws.src2dst", finish)
+        self.assertIn("src2dst=row_state.src2dst", finish)
         mapped = _function(row, "mapped_down_lora_a_input")
-        self.assertIn("pair_to_row=ws.src2dst", mapped)
-        self.assertNotIn("ws.src2dst", runner)
+        self.assertIn("pair_to_row=row_state.src2dst", mapped)
+        self.assertNotIn("base_gemm_state.src2dst", runner)
 
         # The contiguous domain exposes the same shared-rank finalize ABI
         # through the same opaque-workspace routing: the reduce is pure
@@ -273,9 +273,9 @@ class TestMaskedFusionSource(unittest.TestCase):
         contiguous_finish = _function(contiguous, "finish_shared_rank_finalize")
         self.assertIn("invoke(", contiguous_finish)
         self.assertIn("down_masked=down_masked", contiguous_finish)
-        self.assertIn("src2dst=ws.src2dst", contiguous_finish)
+        self.assertIn("src2dst=row_state.src2dst", contiguous_finish)
         contiguous_reduce = _function(contiguous, "run_shared_rank_reduce")
-        self.assertIn("del ws", contiguous_reduce)
+        self.assertIn("del row_state", contiguous_reduce)
 
     def test_middle_pair_store_is_optional_and_masked_store_is_unconditional(self):
         source = _source("masked_fused_middle.py")
@@ -499,7 +499,7 @@ class TestMaskedFusionSource(unittest.TestCase):
 
         provider.contract = SimpleNamespace(lora_activation_dtype=torch.bfloat16)
         src2dst = torch.tensor([2, 0, -1, 3], dtype=torch.int32)
-        workspace = module.MaskedRowWorkspace(
+        workspace = module.MaskedRowState(
             hidden_permuted=torch.empty((2, 4, 4), dtype=torch.bfloat16),
             masked_m=torch.tensor([2, 2], dtype=torch.int32),
             expected_m=2,
@@ -547,7 +547,7 @@ class TestMaskedFusionSource(unittest.TestCase):
             "sglang.srt.lora.moe.base_gemm_provider.masked_row_domain"
         )
         row_module.MaskedRowDomainProvider = StubProvider
-        row_module.MaskedRowWorkspace = StubWorkspace
+        row_module.MaskedRowState = StubWorkspace
         quant_module = types.ModuleType("sglang.srt.lora.moe.quant_info")
         quant_module.MoeLoraBf16QuantInfo = object
         packages = {}

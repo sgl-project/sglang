@@ -851,7 +851,7 @@ def fused_b_act_contiguous(
     )
 
 
-class ContiguousRowWorkspace(msgspec.Struct, kw_only=True):
+class ContiguousRowState(msgspec.Struct, kw_only=True):
     """Per-forward state of the contiguous row domain.
 
     Rows live in one compact buffer with
@@ -972,7 +972,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         workspace: MoeLoraWorkspace | None = None,
         *,
         schedule_pack: ContiguousSchedulePack | None = None,
-    ) -> ContiguousRowWorkspace:
+    ) -> ContiguousRowState:
         num_pairs = topk_ids.numel()
         num_experts = self.quant_info.num_local_experts
         m_pad_ceiling = contiguous_m_pad_ceiling(
@@ -1044,7 +1044,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             hidden_compact_out=hidden_compact,
             schedule_pack=schedule_pack,
         )
-        return ContiguousRowWorkspace(
+        return ContiguousRowState(
             hidden_compact=hidden_compact,
             seg_counts=seg_counts,
             seg_offsets=seg_offsets,
@@ -1054,20 +1054,20 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             retained_inputs=workspace is not None,
         )
 
-    def release_prepared_inputs(self, ws: ContiguousRowWorkspace) -> None:
+    def release_prepared_inputs(self, row_state: ContiguousRowState) -> None:
         # Same lifetime contract as the masked twin: the compact hidden rows
         # are dead after the gate/up GEMM; runner-workspace tensors remain
         # address-stable for graph replay and are reclaimed with the runner
         # workspace.
-        if ws.retained_inputs:
+        if row_state.retained_inputs:
             return
         from sglang.srt.utils import dispose_tensor
 
-        dispose_tensor(ws.hidden_compact)
+        dispose_tensor(row_state.hidden_compact)
 
     def act_with_delta(
         self,
-        ws: ContiguousRowWorkspace,
+        row_state: ContiguousRowState,
         gateup_out: torch.Tensor,
         gate_up_delta: torch.Tensor | None,
         topk_ids: torch.Tensor,
@@ -1083,7 +1083,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             gate_up_delta,
             act_out,
             activation_lora_input,
-            ws.src2dst,
+            row_state.src2dst,
             topk_ids,
             self.num_local_experts,
             gate_first=self.contract.gate_first,
@@ -1094,7 +1094,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
 
     def mapped_down_lora_a_input(
         self,
-        ws: ContiguousRowWorkspace,
+        row_state: ContiguousRowState,
         activation: torch.Tensor,
     ) -> MappedLoraAInput | None:
         """Expose compact activation rows for standalone grouped down-A.
@@ -1106,9 +1106,9 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         blocks the mapped grouped-A kernel skips, identical to the masked
         domain, whose dispatch also leaves them unwritten.
         """
-        if not isinstance(ws, ContiguousRowWorkspace):
-            raise TypeError("contiguous down-A input requires ContiguousRowWorkspace")
-        expected = self.act_out_shape(ws)
+        if not isinstance(row_state, ContiguousRowState):
+            raise TypeError("contiguous down-A input requires ContiguousRowState")
+        expected = self.act_out_shape(row_state)
         if tuple(activation.shape) != expected:
             raise ValueError(
                 f"mapped down-A activation must be {expected}, got "
@@ -1122,10 +1122,10 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         if not activation.is_contiguous():
             raise ValueError("mapped down-A activation rows must be contiguous")
         if (
-            ws.src2dst.ndim != 1
-            or ws.src2dst.dtype != torch.int32
-            or ws.src2dst.device != activation.device
-            or not ws.src2dst.is_contiguous()
+            row_state.src2dst.ndim != 1
+            or row_state.src2dst.dtype != torch.int32
+            or row_state.src2dst.device != activation.device
+            or not row_state.src2dst.is_contiguous()
         ):
             raise ValueError(
                 "mapped down-A pair-to-row metadata must be contiguous 1-D "
@@ -1133,7 +1133,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             )
         return MappedLoraAInput(
             rows=activation.view(-1, activation.shape[-1]),
-            pair_to_row=ws.src2dst,
+            pair_to_row=row_state.src2dst,
         )
 
     def fused_middle_implementations(self, family: str) -> tuple[str, ...]:
@@ -1156,7 +1156,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
 
     def run_fused_middle(
         self,
-        ws: ContiguousRowWorkspace,
+        row_state: ContiguousRowState,
         family: str,
         *,
         implementation: str,
@@ -1186,7 +1186,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             base_gateup=base_gateup,
             act_compact=act_masked,
             act_pairs=act_pairs,
-            src2dst=ws.src2dst,
+            src2dst=row_state.src2dst,
             routing=routing,
             num_local_experts=self.num_local_experts,
             gate_first=self.contract.gate_first,
@@ -1243,7 +1243,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
 
     def run_down_b_scatter(
         self,
-        ws: ContiguousRowWorkspace,
+        row_state: ContiguousRowState,
         *,
         down_out: torch.Tensor,
         bridge: torch.Tensor,
@@ -1257,7 +1257,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         # in-place-src2dst-store hazard does not apply.
         self._down_b_scatter(
             down_rows=down_out.view(-1, self.hidden_size),
-            src2dst=ws.src2dst,
+            src2dst=row_state.src2dst,
             bridge=bridge,
             b_down=b_down,
             routing=routing,
@@ -1266,7 +1266,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
 
     def run_shared_rank_finalize(
         self,
-        ws: ContiguousRowWorkspace,
+        row_state: ContiguousRowState,
         *,
         implementation: str,
         down_masked: torch.Tensor,
@@ -1280,7 +1280,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         config: Mapping[str, Mapping[str, int]],
     ) -> None:
         self.run_shared_rank_reduce(
-            ws,
+            row_state,
             implementation=implementation,
             bridge=bridge,
             routing=routing,
@@ -1290,7 +1290,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             config=config["reduce"],
         )
         self.finish_shared_rank_finalize(
-            ws,
+            row_state,
             implementation=implementation,
             down_masked=down_masked,
             b_down=b_down,
@@ -1304,7 +1304,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
 
     def run_shared_rank_reduce(
         self,
-        ws: ContiguousRowWorkspace,
+        row_state: ContiguousRowState,
         *,
         implementation: str,
         bridge: torch.Tensor,
@@ -1315,10 +1315,10 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         config: Mapping[str, int],
     ) -> None:
         invoke = self._shared_reduce_impls[implementation]
-        # `ws` is deliberately opaque and unused by this pair-domain launch;
+        # `row_state` is deliberately opaque and unused by this pair-domain launch;
         # retaining it in the provider ABI lets every scheduled stage be
         # invoked uniformly.
-        del ws
+        del row_state
         invoke(
             bridge=bridge,
             routing=routing,
@@ -1330,7 +1330,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
 
     def finish_shared_rank_finalize(
         self,
-        ws: ContiguousRowWorkspace,
+        row_state: ContiguousRowState,
         *,
         implementation: str,
         down_masked: torch.Tensor,
@@ -1349,7 +1349,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         invoke = self._shared_tail_impls[implementation]
         invoke(
             down_masked=down_masked,
-            src2dst=ws.src2dst,
+            src2dst=row_state.src2dst,
             token_rank=token_rank,
             b_down=b_down,
             routing=routing,
@@ -1362,7 +1362,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
 
     def finalize(
         self,
-        ws: ContiguousRowWorkspace,
+        row_state: ContiguousRowState,
         down_out: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -1380,7 +1380,7 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
         self._post_reorder(
             down_out.view(-1, hidden),
             output,
-            ws.src2dst,
+            row_state.src2dst,
             topk_ids,
             topk_weights,
             topk_ids.shape[1],
@@ -1390,14 +1390,14 @@ class ContiguousRowDomainProvider(MoeBaseProvider):
             lora_delta=lora_delta,
         )
 
-    def gateup_out_shape(self, ws: ContiguousRowWorkspace) -> tuple[int, ...]:
+    def gateup_out_shape(self, row_state: ContiguousRowState) -> tuple[int, ...]:
         return (
-            ws.m_pad_ceiling,
+            row_state.m_pad_ceiling,
             self.gate_up_slices * self.quant_info.intermediate_size,
         )
 
-    def act_out_shape(self, ws: ContiguousRowWorkspace) -> tuple[int, ...]:
-        return (ws.m_pad_ceiling, self.quant_info.intermediate_size)
+    def act_out_shape(self, row_state: ContiguousRowState) -> tuple[int, ...]:
+        return (row_state.m_pad_ceiling, self.quant_info.intermediate_size)
 
-    def down_out_shape(self, ws: ContiguousRowWorkspace) -> tuple[int, ...]:
-        return (ws.m_pad_ceiling, self.quant_info.hidden_size)
+    def down_out_shape(self, row_state: ContiguousRowState) -> tuple[int, ...]:
+        return (row_state.m_pad_ceiling, self.quant_info.hidden_size)

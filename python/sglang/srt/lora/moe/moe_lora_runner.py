@@ -473,7 +473,7 @@ class MoeLoraRunner:
             workspace=self.workspace,
         )
 
-        gate_up, ws, gateup_out = self._run_early(
+        gate_up, base_gemm_state, gateup_out = self._run_early(
             plan,
             launch_config,
             provider,
@@ -488,7 +488,7 @@ class MoeLoraRunner:
             launch_config,
             provider,
             routes,
-            ws,
+            base_gemm_state,
             gateup_out,
             gate_up,
             topk_ids,
@@ -507,7 +507,7 @@ class MoeLoraRunner:
             launch_config,
             provider,
             routes,
-            ws,
+            base_gemm_state,
             act_out,
             down_a_input,
             batch,
@@ -517,7 +517,7 @@ class MoeLoraRunner:
             launch_config,
             provider,
             routes,
-            ws,
+            base_gemm_state,
             output,
             down_out,
             down_rank,
@@ -683,7 +683,7 @@ class MoeLoraRunner:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> tuple[object, torch.Tensor]:
-        ws = provider.prepare(
+        base_gemm_state = provider.prepare(
             hidden_states,
             topk_ids,
             self.top_k,
@@ -691,13 +691,13 @@ class MoeLoraRunner:
         )
         gateup_out = self.workspace.tensor(
             "base:gateup",
-            provider.gateup_out_shape(ws),
+            provider.gateup_out_shape(base_gemm_state),
             dtype=provider.contract.gate_up_output_dtype,
             device=hidden_states.device,
         )
-        provider.gateup(ws, gateup_out)
-        provider.release_prepared_inputs(ws)
-        return ws, gateup_out
+        provider.gateup(base_gemm_state, gateup_out)
+        provider.release_prepared_inputs(base_gemm_state)
+        return base_gemm_state, gateup_out
 
     def _run_early(
         self,
@@ -742,9 +742,9 @@ class MoeLoraRunner:
             gate_up_a()
             if plan.gate_up_b is not None:
                 gate_up_b()
-            ws, gateup = base()
+            base_gemm_state, gateup = base()
         elif plan.early_overlap is EarlyOverlap.GATE_UP_A:
-            ws, gateup = run_parallel(
+            base_gemm_state, gateup = run_parallel(
                 self.workspace,
                 name=plan.early_overlap.value,
                 device=hidden_states.device,
@@ -759,14 +759,14 @@ class MoeLoraRunner:
                 gate_up_a()
                 gate_up_b()
 
-            ws, gateup = run_parallel(
+            base_gemm_state, gateup = run_parallel(
                 self.workspace,
                 name=plan.early_overlap.value,
                 device=hidden_states.device,
                 compute=base,
                 side=gate_up_a_b,
             )
-        return state, ws, gateup
+        return state, base_gemm_state, gateup
 
     def _run_middle(
         self,
@@ -774,7 +774,7 @@ class MoeLoraRunner:
         launch_config: MoeLoraLaunchConfig,
         provider: MoeBaseProvider,
         routes: MoeLoraRoutes,
-        ws,
+        base_gemm_state,
         gateup_out: torch.Tensor,
         gate_up: _LoraStageState,
         topk_ids: torch.Tensor,
@@ -783,7 +783,7 @@ class MoeLoraRunner:
     ) -> tuple[torch.Tensor, _DownAInput | None]:
         act_out = self.workspace.tensor(
             "middle:act_masked",
-            provider.act_out_shape(ws),
+            provider.act_out_shape(base_gemm_state),
             dtype=provider.contract.lora_activation_dtype,
             device=gateup_out.device,
         )
@@ -793,7 +793,7 @@ class MoeLoraRunner:
             plan.middle.family is MiddleFamily.B_ACTIVATION
             and plan.down_a.family is LoraAFamily.GROUPED
         ):
-            mapped_down_a = provider.mapped_down_lora_a_input(ws, act_out)
+            mapped_down_a = provider.mapped_down_lora_a_input(base_gemm_state, act_out)
             if mapped_down_a is not None:
                 exposes_pair_activation = False
         act_pairs = (
@@ -808,7 +808,7 @@ class MoeLoraRunner:
         )
         if plan.middle.family is MiddleFamily.MATERIALIZED:
             provider.act_with_delta(
-                ws,
+                base_gemm_state,
                 gateup_out,
                 gate_up.delta.view(
                     num_tokens,
@@ -826,7 +826,7 @@ class MoeLoraRunner:
         route = routes.aligned(consumed_route.is_shared_outer)
         family, implementation = self._middle_implementation(plan)
         provider.run_fused_middle(
-            ws,
+            base_gemm_state,
             family,
             implementation=implementation,
             activation=self.activation.value,
@@ -902,7 +902,7 @@ class MoeLoraRunner:
         launch_config: MoeLoraLaunchConfig,
         provider: MoeBaseProvider,
         routes: MoeLoraRoutes,
-        ws,
+        base_gemm_state,
         down_out: torch.Tensor,
         rank: torch.Tensor,
         batch: MoeLoraBatch,
@@ -917,7 +917,7 @@ class MoeLoraRunner:
         """
         spec = plan.down_b
         provider.run_down_b_scatter(
-            ws,
+            base_gemm_state,
             down_out=down_out,
             bridge=rank,
             b_down=batch.down_lora_b.flatten(0, 1),
@@ -926,15 +926,15 @@ class MoeLoraRunner:
         )
 
     def _run_base_down(
-        self, provider: MoeBaseProvider, ws, act_out: torch.Tensor
+        self, provider: MoeBaseProvider, base_gemm_state, act_out: torch.Tensor
     ) -> torch.Tensor:
         down_out = self.workspace.tensor(
             "base:down",
-            provider.down_out_shape(ws),
+            provider.down_out_shape(base_gemm_state),
             dtype=torch.bfloat16,
             device=act_out.device,
         )
-        provider.down(ws, act_out, down_out)
+        provider.down(base_gemm_state, act_out, down_out)
         return down_out
 
     def _run_late(
@@ -943,7 +943,7 @@ class MoeLoraRunner:
         launch_config: MoeLoraLaunchConfig,
         provider: MoeBaseProvider,
         routes: MoeLoraRoutes,
-        ws,
+        base_gemm_state,
         act_out: torch.Tensor,
         down_a_input: _DownAInput | None,
         batch: MoeLoraBatch,
@@ -975,7 +975,7 @@ class MoeLoraRunner:
             )
 
         def base() -> torch.Tensor:
-            return self._run_base_down(provider, ws, act_out)
+            return self._run_base_down(provider, base_gemm_state, act_out)
 
         if plan.late_overlap is LateOverlap.NONE:
             if state.rank is None:
@@ -994,7 +994,7 @@ class MoeLoraRunner:
                     launch_config,
                     provider,
                     routes,
-                    ws,
+                    base_gemm_state,
                     down_out,
                     state.rank,
                     batch,
@@ -1067,7 +1067,7 @@ class MoeLoraRunner:
         launch_config: MoeLoraLaunchConfig,
         provider: MoeBaseProvider,
         routes: MoeLoraRoutes,
-        ws,
+        base_gemm_state,
         output: torch.Tensor,
         down_out: torch.Tensor,
         down_rank: torch.Tensor,
@@ -1087,7 +1087,7 @@ class MoeLoraRunner:
                 # equality versus the shipped tail is therefore judged by
                 # the established allclose discipline, not bitwise.
                 provider.finalize(
-                    ws,
+                    base_gemm_state,
                     down_out,
                     topk_output.topk_ids,
                     topk_output.topk_weights,
@@ -1097,7 +1097,7 @@ class MoeLoraRunner:
                 )
                 return output
             provider.finalize(
-                ws,
+                base_gemm_state,
                 down_out,
                 topk_output.topk_ids,
                 topk_output.topk_weights,
@@ -1112,7 +1112,7 @@ class MoeLoraRunner:
         b_down = batch.down_lora_b.flatten(0, 1)
         _, implementation = self._finalize_implementation(plan)
         provider.run_shared_rank_finalize(
-            ws,
+            base_gemm_state,
             implementation=implementation,
             down_masked=down_out,
             bridge=down_rank,
