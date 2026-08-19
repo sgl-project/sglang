@@ -3685,6 +3685,12 @@ class ServerArgs:
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
 
+        # The C128 SSDCombined prefill routes do not yet preserve non-zero
+        # initial SSM states restored by the Mamba radix cache.  Apply the
+        # safety setting before model-specific cache resolution derives
+        # uses_mamba_radix_cache and allocates the corresponding pools.
+        self._handle_mamba_ssd_radix_cache_safety()
+
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
 
@@ -6267,6 +6273,20 @@ class ServerArgs:
                 raise ValueError(
                     "--mamba-backend cake requires datacenter Blackwell " "SM100/SM103."
                 )
+
+    def _handle_mamba_ssd_radix_cache_safety(self):
+        if self.mamba_backend not in ("flashinfer_ssd", "cake"):
+            return
+        if self.disable_radix_cache:
+            return
+        logger.warning(
+            "Radix cache is disabled for --mamba-backend %s because the "
+            "SSDCombined C128 prefill route has not established non-zero "
+            "initial-state parity. This prevents incorrect cached-prefix "
+            "generation until that contract is supported.",
+            self.mamba_backend,
+        )
+        self.disable_radix_cache = True
 
     def _handle_int8_mamba_checkpoint(self):
         # The int8 mamba checkpoint pool is only wired into the built-in
