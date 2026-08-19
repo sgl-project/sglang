@@ -542,6 +542,12 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         open_idx = text.find(self.think_start_token)
         start = open_idx + len(self.think_start_token) if open_idx != -1 else 0
         close_idx = text.find(self.think_end_token, start)
+        tools_idx = text.find(self.tool_start_token, start)
+        if close_idx != -1 and tools_idx != -1 and tools_idx < close_idx:
+            return StreamingParseResult(
+                reasoning_text=strip_partial_marker_suffix(text[start:tools_idx]),
+                normal_text=self._clean_content(text[tools_idx:]),
+            )
         if close_idx == -1:
             channel_idx = self._next_channel_idx(text, start)
             if channel_idx != -1:
@@ -583,7 +589,8 @@ class KimiK3Detector(BaseReasoningFormatDetector):
                     self.stripped_think_start = True
 
             close_idx = buf.find(self.think_end_token)
-            if close_idx != -1:
+            tools_idx = buf.find(self.tool_start_token)
+            if close_idx != -1 and not (tools_idx != -1 and tools_idx < close_idx):
                 reasoning_text = buf[:close_idx]
                 self._buffer = buf[close_idx + len(self.think_end_token) :]
                 self._in_reasoning = False
