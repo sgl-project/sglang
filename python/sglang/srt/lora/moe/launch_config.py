@@ -25,7 +25,6 @@ from sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle import (
 )
 from sglang.srt.lora.moe.execution_plan import (
     DeviceArchitecture,
-    LoraAFamily,
     MiddleFamily,
     MoeLoraExecutionPlan,
     RouteRequirement,
@@ -81,13 +80,11 @@ def _validate_flat_config(name: str, config: Mapping[str, int]) -> None:
 class MoeLoraLaunchConfig:
     """Site-specific launch settings; no token/rank/device config."""
 
-    # One aligned route is SHARED by gate/up-B, down-A, and down-B.
-    # Gate/up-A may request a second aligned plan with a different M tile.  Its
-    # output is written by original pair ID, so the shared B route can
-    # consume that bridge without a layout conversion.  Keeping the two
-    # values explicit also charges the extra route build in composed timing.
+    # One aligned route is SHARED by every grouped LoRA stage; its block is
+    # each stage's row tile. A second gate/up-A-only granularity existed and
+    # was retired 2026-08-19: one block of 32 measured within noise of the
+    # 16+64 split on all three models (see the configs README).
     routing_block_size: int = 16
-    gate_up_a_routing_block_size: int = 16
     gate_up_a: dict[str, int] = field(default_factory=_a_default)
     gate_up_b: dict[str, int] = field(default_factory=_b_default)
     down_a: dict[str, int] = field(default_factory=_a_default)
@@ -102,10 +99,6 @@ class MoeLoraLaunchConfig:
     def __post_init__(self) -> None:
         if not _is_power_of_two(self.routing_block_size):
             raise ValueError("routing_block_size must be a positive power of two")
-        if not _is_power_of_two(self.gate_up_a_routing_block_size):
-            raise ValueError(
-                "gate_up_a_routing_block_size must be a positive power of two"
-            )
         for name in (
             "gate_up_a",
             "gate_up_b",
@@ -143,24 +136,6 @@ class MoeLoraLaunchConfig:
                 "routing_block_size must be at least 16 for aligned "
                 "tensor-core LoRA consumers"
             )
-        separate_gate_up_route = (
-            self.gate_up_a_routing_block_size != self.routing_block_size
-        )
-        if separate_gate_up_route:
-            gate_up_uses_separate_aligned = (
-                plan.gate_up_a.family is LoraAFamily.GROUPED
-                and not plan.gate_up_a.is_shared_outer
-            )
-            if not gate_up_uses_separate_aligned:
-                raise ValueError(
-                    "a distinct gate_up_a_routing_block_size is valid only for "
-                    "grouped per-expert gate/up-A"
-                )
-            if self.gate_up_a_routing_block_size < 16:
-                raise ValueError(
-                    "gate_up_a_routing_block_size must be at least 16 for grouped "
-                    "gate/up-A"
-                )
 
 
 # ---------------------------------------------------------------------------

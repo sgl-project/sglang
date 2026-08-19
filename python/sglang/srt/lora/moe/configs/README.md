@@ -83,110 +83,65 @@ whose `max_tokens` admits the batch (a rule without `max_tokens` terminates
 the ladder). `sites` holds `MoeLoraLaunchConfig` fields (per-site Triton
 tile dicts). A plan row with no rules serves the built-in heuristics.
 
-Route block size (`routing_block_size`, `gate_up_a_routing_block_size`):
+Route block size (`routing_block_size`):
 
-The route's block size IS `BLOCK_SIZE_M` for every LoRA stage that reads it,
-and the shared route serves down-A, gate/up-B and down-B. Gate/up-A may take
-a SECOND route at its own block, and on the shipped rows it does. Both values
-are measured, and they are NOT the same knob:
+One aligned route serves every grouped LoRA kernel on a plan row, and its
+block is each kernel's row tile — of nothing else. The base GEMMs never read
+it (their flat buffer uses their own `m_alignment`, 128 on CuteDSL, and their
+own token-width tiles from `base_gemm/`); the fused middle and finalize are
+pair-domain through `src2dst`. A padded slot costs masked `tl.dot` lanes
+inside whichever LoRA kernel tiles over it, and nothing anywhere else.
 
-- the route block is the ROW TILE of the LoRA kernels that ride the route,
-  and of nothing else. The base GEMMs never read it: they lay out their flat
-  buffer at their own segment alignment (`m_alignment`, 128 on CuteDSL —
-  DeepGEMM's contiguous m-alignment) and tile it with their own token widths
-  (8/64/128) from the `base_gemm/` tables. The fused middle and the finalize
-  address rows through `src2dst`, pair-domain. No activation buffer's size
-  depends on the route block; only the route's own int32 slot list grows
-  (316 KB at 16 vs 508 KB at 64 for an 8k-token chunk).
-- a padded slot is paid INSIDE whichever LoRA kernel tiles over it: a masked
-  `tl.dot` lane still burns its full K-deep tile FLOPs. So each block trades
-  weight refetches (fewer when bigger) against masked lanes (more), privately
-  per kernel.
-- the shared route's riders (down-A, down-B, standalone gate/up-B) carry
-  weight panels of 2-32 KB, so a bigger block saves them little, while their
-  masked lanes scale with each kernel's K x N. Measured end-to-end, 16 -> 64
-  is ~0 on Qwen and negative on Inkling, whose wider rows make every masked
-  lane dearer. The floor — 16, the tensor-core minimum — wins.
-- gate/up-A's panel is 128 KB (K = hidden), so at prefill occupancy the
-  refetch savings dominate its masked lanes: 64 wins. It writes by ORIGINAL
-  PAIR ID, so the shared route consumes its bridge with no conversion, and
-  past 16k pairs (any real prefill chunk) the fused dual builder emits both
-  granularities in one hist/scan/expand pass — the second route is nearly
-  free.
+Shipped values: decode rows 16 (their measured optimum at 1-16 pairs per
+group; also the tensor-core floor), per-expert prefill 32.
 
-That asymmetry is why the shipped `prefill.serial` rows run 16 on the shared
-route and 64 for gate/up-A, and why collapsing them onto one block is a
-regression in both directions. Measured end-to-end 2026-08-18 on H200 with
-Qwen3.5-35B (4k in / 1k out, bs 1-32, two rounds per arm, noise floor ±0.3%),
-against that shipped split:
+There USED to be a second granularity — `gate_up_a_routing_block_size`, a
+private gate/up-A list at 64 over a shared 16 — retired 2026-08-19 along
+with its dual-granularity fused builder (~500 lines). The full retirement
+matrix, three models with per-expert adapters, chunks 8k-32k, two rounds per
+arm, prefill throughput vs that split:
 
-| one block for everything | bs1 | bs8 | bs16 | bs32 |
-|---|---|---|---|---|
-| 16  | −0.1% | −2.3% | −2.6% | −2.5% |
-| 32  | +0.1% | −0.1% | +0.2% | +0.0% |
-| 64  | +0.2% | +0.3% | +0.2% | +0.4% |
-| 256 | −21.3% | −28.0% | −28.6% | −28.6% |
+| chunk sweep | one block of 16 | one block of 32 |
+|---|---|---|
+| Qwen3.5-35B 8k/16k/32k (H200, noise <=1.4%) | -2.4..-3.2% | +0.0..+2.0% |
+| Inkling-Small 8k/16k (GB300) | -3.1..-5.4% | -0.9..+2.1% |
+| Qwen3.5-397B 8k/16k (GB300, noise 0.4%) | -4.5..-5.7% | -1.0..+0.3% |
 
-Uniform 64 looks free there, but it is not: on Inkling-Small, whose wider
-rows (hidden 4096 vs Qwen's 2048) make every masked lane in its LoRA kernels
-cost more, uniform 64 loses 1.0-4.4% on B200 and 4.8-8.5% on GB300 (bs 1-16, one round
-per arm, decode controls flat; bs32 flat). The shipped split is the best
-configuration measured on both models.
+One block of 32 is within noise of the split everywhere but two cells that
+cancel (-1.0% on 397B at 16k, +2.0% on Qwen at 32k), so the split's whole
+value was recoverable by picking the right single number. 16 — the old
+shared value — is NOT that number: gate/up-A's weight slab (2R x hidden, the
+largest K-deep panel of the four kernels) loses 4x its fetch amortization
+there. Do not "simplify" this value downward without rerunning the matrix;
+the harness is `run_chunk_*.sh` in the campaign records.
 
-Occupancy is what sets the shared block -- routed pairs per virtual expert,
-`tokens × top_k ÷ (local_experts × live adapter slots)`. Do not estimate it
-from the token count alone: a 4096-token prefill of a 256-expert model with 4
-adapters resident is 1024 virtual experts and only ~32 pairs each, not the
-thousands a token count suggests. At that occupancy padding dominates and the
-shared block wants to stay small; the 256 row above is that same effect taken
-to its conclusion.
+Occupancy is what moves the optimum — routed pairs per virtual expert,
+`tokens x top_k / (local_experts x live adapter slots)`. A 4096-token
+prefill of a 256-expert model with 4 adapters resident is 1024 groups of
+~32 pairs, not the thousands the token count suggests. The tuner sweeps
+this knob per phase end-to-end (decode scored on output throughput, prefill
+on input throughput).
 
-The SHARED-OUTER prefill rows are the opposite regime and are NOT tuned for
-it. Shared-outer collapses every routed id onto one LoRA expert per adapter,
-so the same forward has 4 virtual experts instead of 1024 and ~16k pairs in
-each -- padding costs 0.4% of rows there, against ~98% for the per-expert
-rows at a block of 64. A kernel-level sweep on GB300 (down-A, gate/up-B,
-down-B at the token_dedup tiles) puts a block of 128 at **+19.6% at 2048
-tokens and +26.0% at 8192** over the 16 those rows ship, with no padding
-penalty to give it back. That is unverified end-to-end and the rows still
-ship 16; it is the open lead here, and Inkling or 397B with a shared-outer
-adapter is the vehicle for it. A block of 256 does not compile for these
-tiles -- it exceeds shared memory.
+The SHARED-OUTER prefill rows remain the open lead: they run the opposite
+regime (4 virtual experts, ~16k pairs each, padding 0.4% of slots) and a
+kernel-level sweep on GB300 puts a block of 128 at +19.6% (2k tokens) to
++26.0% (8k) over the 16 they ship, with no padding tax to give it back.
+Unverified end-to-end; a shared-outer adapter on 397B or Inkling is the
+vehicle. A block of 256 exceeds shared memory for these tiles.
 
-A second lead, for geometries we do not ship. Which kernel the split favors
-is set by the model's shape: gate/up-A's weight slab is 2R x hidden and
-down-A's is R x intermediate, so the two equalize at intermediate = 2 x
-hidden and down-A dominates past it. Our models all sit at intermediate <=
-hidden, where down-A at 16 wastes a few percent of a sub-100 us kernel --
-noise, and the reason the shipped split pairs the 64 with gate/up-A alone.
-Measured at a Mixtral-shaped 4096/14336 under production geometry (256
-experts x 4 adapters, 8k chunk), it flips: down-A at 16 wastes 54-65% of
-what is now the layer's largest standalone LoRA kernel (0.7-1.0 ms), and
-every rider prefers 32-64 at the kernel level. Onboarding such a model, the
-tuner's per-phase shared-block axis is the first instrument; the finer move
--- pointing down-A at gate/up-A's list, legal because its input is
-pair-addressed -- needs a plan-level change and is unverified end-to-end.
+A second retired-but-documented lead: which kernel most wants a big block is
+set by the model's shape (gate/up-A slab 2R x hidden vs down-A slab R x
+intermediate, equal at I = 2H). Our fleet is all I <= H. At a Mixtral-shaped
+4096/14336 under production geometry, down-A at 16 wastes 54-65% of what
+becomes the layer's largest LoRA kernel (0.7-1.0 ms per 8k chunk) — for such
+a model, sweep this knob first and expect a bigger winner.
 
-One caution for anyone re-deriving this. A kernel-level sweep that times only
-the four LoRA stages gets the route STRUCTURE wrong in both directions, while
-looking rigorous:
-
-- its geometry lied. An E=32 harness (128 virtual experts) put the measured
-  cells at 128-512 pairs per group; production is ~32-128 over 1024 groups,
-  where a big block's masked lanes eat most of what its fewer weight fetches
-  save. Its +15-21% for one block of 64 was real at its own occupancy and
-  converts to ~0 on Qwen / negative on Inkling at production's — and a
-  LoRA-only percentage must be scaled by LoRA's share of the layer before it
-  means anything end-to-end;
-- it cannot price the split's second route. Charged as a standalone build it
-  scored one block of 16 as ~10% better than the shipped split at 1k tokens,
-  when end-to-end that collapse LOSES 2.5% -- in production the fused dual
-  builder makes both routes in one pass, so the sweep was billing the split
-  for a cost it does not pay. An E=32 harness geometry (128 virtual experts
-  against production's 1024) does not represent gate/up-A's economics either.
-
-Use kernel sweeps to rank tiles within one stage at a fixed route. Decide
-route structure -- how many routes, which stage reads which -- end-to-end.
+One caution for anyone re-deriving any of this with a kernel-level sweep:
+it measures LoRA-only percentages at whatever occupancy the harness picked,
+and both of this file's past mistakes came from that — quoting kernel wins
+without LoRA's share of the layer, and measuring at occupancies production
+never runs. Rank tiles within one stage with kernel sweeps; decide route
+values end-to-end.
 
 Some rules carry byte-identical `sites` ON PURPOSE, and nothing enforces the
 pairing — the format is deliberately raw values with no reference/alias

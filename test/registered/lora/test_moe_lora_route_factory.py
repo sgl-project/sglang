@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import contextlib
 import dataclasses
 import importlib.util
 import sys
@@ -163,14 +162,6 @@ def _load_route_factory():
     routing.FusedAlignScratch = types.SimpleNamespace
     routing.build_virtual_expert_routing = lambda *args, **kwargs: None
     routing.uses_fused_align = lambda *_args, **_kwargs: True
-
-    def unexpected_dual_granularity_route(*_args, **_kwargs):
-        raise AssertionError(
-            "the dual-granularity fused builder must be reached only through "
-            "an explicit test mock"
-        )
-
-    routing.build_dual_granularity_aligned_routes = unexpected_dual_granularity_route
 
     joint_routing = types.ModuleType("sglang.srt.lora.moe.joint_routing")
 
@@ -356,253 +347,6 @@ def _route(
     )
 
 
-class TestDualGateUpARoute(unittest.TestCase):
-    def setUp(self):
-        self.topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
-        self.token_slots = torch.tensor([0], dtype=torch.int32)
-        self.workspace = _Workspace()
-
-    def _build(self, *, gate_up_a_block_size: int, fused_shapes: bool = True):
-        """Build the reference plan with the standalone (non-dual) route path.
-
-        ``fused_shapes`` keeps the stub's always-fused dispatch; ``False``
-        pins the JIT small-shape regime, where the standalone builds carry no
-        caller-owned fused metadata.  Dual-granularity dispatch is asserted
-        separately: this helper's ``build_virtual_expert_routing`` mock would hide it.
-        """
-        cached_padded_count = torch.zeros(1, dtype=torch.int32)
-        calls: list[int] = []
-
-        def fake_route(
-            topk_ids,
-            token_slots,
-            *,
-            lora_experts_per_adapter,
-            max_loras,
-            block_size,
-            view,
-            use_pdl,
-            shared_outer_local_expert_count=None,
-            lora_expert_map=None,
-            num_pairs_post_padded_out=None,
-            fused_align_scratch=None,
-        ):
-            self.assertEqual(lora_experts_per_adapter, 2)
-            self.assertIsNone(shared_outer_local_expert_count)
-            self.assertEqual(max_loras, 2)
-            self.assertEqual(view, "aligned")
-            self.assertIs(use_pdl, False)
-            calls.append(block_size)
-            if fused_shapes:
-                self.assertIsNotNone(num_pairs_post_padded_out)
-                self.assertIsNotNone(fused_align_scratch)
-                # Model both the fused builder's shared cache and its direct
-                # write into the route factory's caller-owned output.
-                cached_padded_count.fill_(block_size)
-                num_pairs_post_padded_out.fill_(block_size)
-                padded_count = num_pairs_post_padded_out
-            else:
-                self.assertIsNone(num_pairs_post_padded_out)
-                self.assertIsNone(fused_align_scratch)
-                padded_count = torch.tensor([block_size], dtype=torch.int32)
-            return _route(
-                topk_ids,
-                token_slots,
-                block_size=block_size,
-                padded_count=padded_count,
-            )
-
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(_arch_pdl(False))
-            stack.enter_context(
-                mock.patch.object(
-                    ROUTE_FACTORY,
-                    "build_virtual_expert_routing",
-                    side_effect=fake_route,
-                )
-            )
-            if not fused_shapes:
-                stack.enter_context(
-                    mock.patch.object(
-                        ROUTE_FACTORY, "uses_fused_align", return_value=False
-                    )
-                )
-            routes = ROUTE_FACTORY.build_routes(
-                SERIAL_MATERIALIZED_REFERENCE,
-                topk_ids=self.topk_ids,
-                token_slots=self.token_slots,
-                num_local_experts=2,
-                max_loras=2,
-                block_size=16,
-                gate_up_a_block_size=gate_up_a_block_size,
-                workspace=self.workspace,
-            )
-        return routes, calls, cached_padded_count
-
-    def test_m16_m64_builds_both_views_in_one_dual_granularity_pass(self):
-        """At fused shapes the two per-expert granularities share ONE pass.
-
-        The dual builder must receive the SAME workspace-owned metadata the
-        standalone builds would have used (so alternating paths across
-        forwards reuses storage), and no standalone per-expert build may run.
-        """
-        dual_calls = []
-
-        def fake_dual(
-            topk_ids,
-            token_slots,
-            *,
-            lora_experts_per_adapter,
-            max_loras,
-            block_sizes,
-            num_pairs_post_padded_outs,
-            scratches,
-            use_pdl,
-        ):
-            self.assertIs(topk_ids, self.topk_ids)
-            self.assertIs(token_slots, self.token_slots)
-            self.assertEqual(lora_experts_per_adapter, 2)
-            self.assertEqual(max_loras, 2)
-            self.assertIs(use_pdl, False)
-            dual_calls.append({"block_sizes": block_sizes, "scratches": scratches})
-            views = []
-            for block_size, padded_count in zip(
-                block_sizes, num_pairs_post_padded_outs
-            ):
-                padded_count.fill_(block_size)
-                views.append(
-                    _route(
-                        topk_ids,
-                        token_slots,
-                        block_size=block_size,
-                        padded_count=padded_count,
-                    )
-                )
-            return views[0], views[1]
-
-        def unexpected_route(*_args, **_kwargs):
-            raise AssertionError(
-                "the dual pass must replace every standalone per-expert build"
-            )
-
-        with (
-            _arch_pdl(False),
-            mock.patch.object(
-                ROUTE_FACTORY,
-                "build_dual_granularity_aligned_routes",
-                side_effect=fake_dual,
-            ),
-            mock.patch.object(
-                ROUTE_FACTORY,
-                "build_virtual_expert_routing",
-                side_effect=unexpected_route,
-            ),
-        ):
-            routes = ROUTE_FACTORY.build_routes(
-                SERIAL_MATERIALIZED_REFERENCE,
-                topk_ids=self.topk_ids,
-                token_slots=self.token_slots,
-                num_local_experts=2,
-                max_loras=2,
-                block_size=16,
-                gate_up_a_block_size=64,
-                workspace=self.workspace,
-            )
-
-        self.assertEqual(len(dual_calls), 1)
-        self.assertEqual(dual_calls[0]["block_sizes"], (16, 64))
-        self.assertEqual(routes.aligned_per_expert.block_size, 16)
-        self.assertEqual(routes.gate_up_a_aligned_per_expert.block_size, 64)
-        self.assertEqual(
-            routes.aligned_per_expert.maybe_num_pairs_post_padded.item(), 16
-        )
-        self.assertEqual(
-            routes.gate_up_a_aligned_per_expert.maybe_num_pairs_post_padded.item(), 64
-        )
-
-        prefixes = ("route:aligned_per_expert", "route:gate_up_a_aligned_per_expert")
-        fields = ("counts", "block_cumulative", "cursor", "bucket_end")
-        for prefix in prefixes:
-            for field in fields + ("padded_pairs",):
-                self.assertIn(f"{prefix}:{field}", self.workspace.tensors)
-        for field in fields + ("padded_pairs",):
-            self.assertNotEqual(
-                self.workspace.tensors[f"{prefixes[0]}:{field}"].data_ptr(),
-                self.workspace.tensors[f"{prefixes[1]}:{field}"].data_ptr(),
-            )
-        for route, prefix in (
-            (routes.aligned_per_expert, prefixes[0]),
-            (routes.gate_up_a_aligned_per_expert, prefixes[1]),
-        ):
-            self.assertEqual(
-                route.maybe_num_pairs_post_padded.data_ptr(),
-                self.workspace.tensors[f"{prefix}:padded_pairs"].data_ptr(),
-            )
-        for scratch, prefix in zip(dual_calls[0]["scratches"], prefixes):
-            for field in fields:
-                self.assertEqual(
-                    getattr(scratch, field).data_ptr(),
-                    self.workspace.tensors[f"{prefix}:{field}"].data_ptr(),
-                )
-
-    def test_m16_m64_small_shapes_keep_two_standalone_builds(self):
-        """Below the fused dispatch edge the measured JIT paths run unchanged."""
-        routes, calls, _ = self._build(gate_up_a_block_size=64, fused_shapes=False)
-
-        self.assertEqual(calls, [16, 64])
-        self.assertEqual(routes.aligned_per_expert.block_size, 16)
-        self.assertEqual(routes.gate_up_a_aligned_per_expert.block_size, 64)
-        # The JIT regime owns its metadata; no fused scratch is allocated.
-        self.assertEqual(self.workspace.tensors, {})
-
-    def test_equal_m_tile_reuses_the_shared_route(self):
-        routes, calls, _ = self._build(gate_up_a_block_size=16)
-        self.assertEqual(calls, [16])
-        self.assertIsNone(routes.gate_up_a_aligned_per_expert)
-        self.assertEqual(routes.aligned_per_expert.block_size, 16)
-        self.assertEqual(
-            set(self.workspace.tensors),
-            {
-                f"route:aligned_per_expert:{field}"
-                for field in (
-                    "counts",
-                    "block_cumulative",
-                    "cursor",
-                    "bucket_end",
-                    "padded_pairs",
-                )
-            },
-        )
-
-    def test_second_route_is_rejected_for_non_grouped_gate_up_a(self):
-        """The (plan, tiles) pairing is owned by the bind-time config check.
-
-        build_routes no longer re-checks it on every forward, so this pins the
-        one place that does: a distinct gate/up-A tile is admissible only for
-        a grouped per-expert gate/up-A.
-        """
-        reference = SERIAL_MATERIALIZED_REFERENCE
-        token_dedup_plan = dataclasses.replace(
-            reference,
-            gate_up_a=PLAN.LoraASpec(
-                PLAN.Site.GATE_UP,
-                PLAN.LoraAFamily.TOKEN_DEDUP_GROUPED,
-                True,
-                PLAN.BridgeLayout.TOKEN_MAJOR,
-            ),
-            gate_up_b=dataclasses.replace(
-                reference.gate_up_b,
-                input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
-            ),
-        )
-        with self.assertRaisesRegex(
-            ValueError, "valid only for grouped per-expert gate/up-A"
-        ):
-            LAUNCH.MoeLoraLaunchConfig(
-                gate_up_a_routing_block_size=64
-            ).validate_for_plan(token_dedup_plan)
-
-
 class TestRoutePdlWiring(unittest.TestCase):
     def test_standard_plan_threads_architecture_pdl_to_every_aligned_route(self):
         reference = SERIAL_MATERIALIZED_REFERENCE
@@ -629,7 +373,6 @@ class TestRoutePdlWiring(unittest.TestCase):
 
         for enabled in (False, True):
             calls = []
-            dual_calls = []
 
             def fake_aligned(
                 topk_ids,
@@ -651,42 +394,12 @@ class TestRoutePdlWiring(unittest.TestCase):
                     padded_count=torch.tensor([block_size], dtype=torch.int32),
                 )
 
-            def fake_dual(
-                topk_ids,
-                token_slots,
-                *,
-                block_sizes,
-                num_pairs_post_padded_outs,
-                use_pdl,
-                **_kwargs,
-            ):
-                dual_calls.append(use_pdl)
-                views = []
-                for block_size, padded_count in zip(
-                    block_sizes, num_pairs_post_padded_outs
-                ):
-                    padded_count.fill_(block_size)
-                    views.append(
-                        _route(
-                            topk_ids,
-                            token_slots,
-                            block_size=block_size,
-                            padded_count=padded_count,
-                        )
-                    )
-                return views[0], views[1]
-
             with (
                 _arch_pdl(enabled),
                 mock.patch.object(
                     ROUTE_FACTORY,
                     "_aligned_pair_route",
                     side_effect=fake_aligned,
-                ),
-                mock.patch.object(
-                    ROUTE_FACTORY,
-                    "build_dual_granularity_aligned_routes",
-                    side_effect=fake_dual,
                 ),
             ):
                 for plan in (reference, shared_down, shared_token):
@@ -697,16 +410,12 @@ class TestRoutePdlWiring(unittest.TestCase):
                         num_local_experts=2,
                         max_loras=2,
                         block_size=16,
-                        gate_up_a_block_size=(16 if plan is shared_token else 64),
                         workspace=_Workspace(),
                     )
 
             by_prefix = {}
             for prefix, value in calls:
                 by_prefix.setdefault(prefix, set()).add(value)
-            # reference and shared_down retain both per-expert granularities,
-            # so their per-expert + gate/up-A routes ride the dual pass; the
-            # token-dedup plan (equal tiles) keeps every standalone build.
             self.assertEqual(
                 set(by_prefix),
                 {
@@ -716,13 +425,26 @@ class TestRoutePdlWiring(unittest.TestCase):
                 },
             )
             self.assertTrue(all(values == {enabled} for values in by_prefix.values()))
-            self.assertEqual(dual_calls, [enabled, enabled])
 
     def test_joint_plan_threads_architecture_pdl_control(self):
+        # The follow-on shared-token build under a joint plan takes the same
+        # architecture PDL value as every other build (the old "gated off"
+        # state was a measurement default, retired after an off/on twin
+        # measured arm-always as a wash).
         reference = SERIAL_MATERIALIZED_REFERENCE
         shared_down_b = dataclasses.replace(
             reference.down_b,
             is_shared_outer=True,
+        )
+        dedup_gate_up_a = PLAN.LoraASpec(
+            PLAN.Site.GATE_UP,
+            PLAN.LoraAFamily.TOKEN_DEDUP_GROUPED,
+            True,
+            PLAN.BridgeLayout.TOKEN_MAJOR,
+        )
+        token_major_gate_up_b = dataclasses.replace(
+            reference.gate_up_b,
+            input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
         )
         joint_calls = []
         standard_calls = []
@@ -772,6 +494,8 @@ class TestRoutePdlWiring(unittest.TestCase):
         for enabled in (False, True):
             plan = dataclasses.replace(
                 reference,
+                gate_up_a=dedup_gate_up_a,
+                gate_up_b=token_major_gate_up_b,
                 down_b=shared_down_b,
                 route_builder=PLAN.RouteBuilderFamily.JOINT_SHARED_OUTER,
             )
@@ -795,12 +519,11 @@ class TestRoutePdlWiring(unittest.TestCase):
                     num_local_experts=2,
                     max_loras=2,
                     block_size=16,
-                    gate_up_a_block_size=64,
                     workspace=_Workspace(),
                 )
 
         self.assertEqual(joint_calls, [False, True])
-        self.assertEqual(standard_calls, [False, False])
+        self.assertEqual(standard_calls, [False, True])
 
     def _run_joint(self, *, use_pdl):
         recorders = [_KernelRecorder() for _ in range(3)]
@@ -875,218 +598,6 @@ class TestRoutePdlWiring(unittest.TestCase):
         )
         self.assertIn("tl.program_id", ast.unparse(scan_ifs[1].test))
         self.assertTrue(scan_ifs[1].orelse)
-
-
-class TestDualGranularityRoutingHost(unittest.TestCase):
-    """Host-side guards for the dual-granularity fused route builder."""
-
-    def _scratch(self, num_buckets: int) -> object:
-        return ROUTING.FusedAlignScratch(
-            counts=torch.zeros(num_buckets, dtype=torch.int32),
-            block_cumulative=torch.empty(num_buckets + 1, dtype=torch.int32),
-            cursor=torch.empty(num_buckets, dtype=torch.int32),
-            bucket_end=torch.empty(num_buckets, dtype=torch.int32),
-        )
-
-    def _run(
-        self,
-        *,
-        use_pdl=None,
-        block_sizes=(16, 64),
-        num_tokens=4,
-        top_k=2,
-        scratches=None,
-        num_pairs_post_padded_outs=None,
-    ):
-        recorders = [_KernelRecorder() for _ in range(3)]
-        num_buckets = 2 * 2 + 1
-        if scratches is None:
-            scratches = (self._scratch(num_buckets), self._scratch(num_buckets))
-        if num_pairs_post_padded_outs is None:
-            num_pairs_post_padded_outs = (
-                torch.empty(1, dtype=torch.int32),
-                torch.empty(1, dtype=torch.int32),
-            )
-        with (
-            mock.patch.object(ROUTING, "_dual_granularity_hist_kernel", recorders[0]),
-            mock.patch.object(ROUTING, "_dual_granularity_scan_kernel", recorders[1]),
-            mock.patch.object(
-                ROUTING, "_dual_granularity_expand_scatter_kernel", recorders[2]
-            ),
-        ):
-            views = ROUTING.build_dual_granularity_aligned_routes(
-                torch.zeros((num_tokens, top_k), dtype=torch.int32),
-                torch.zeros(num_tokens, dtype=torch.int32),
-                lora_experts_per_adapter=2,
-                max_loras=2,
-                block_sizes=block_sizes,
-                num_pairs_post_padded_outs=num_pairs_post_padded_outs,
-                scratches=scratches,
-                use_pdl=use_pdl,
-            )
-        return views, recorders, scratches, num_pairs_post_padded_outs
-
-    def test_one_kernel_triple_covers_both_granularities(self):
-        views, (hist, scan, expand), scratches, padded = self._run()
-
-        # One histogram over pairs feeding BOTH counter arrays.
-        self.assertEqual(len(hist.calls), 1)
-        grid, args, kwargs = hist.calls[0]
-        self.assertEqual(grid, (1,))
-        self.assertEqual(args[2].data_ptr(), scratches[0].counts.data_ptr())
-        self.assertEqual(args[3].data_ptr(), scratches[1].counts.data_ptr())
-        self.assertEqual(kwargs["NUM_BUCKETS"], 5)
-
-        # One two-CTA scan carrying one M tile per program.
-        self.assertEqual(len(scan.calls), 1)
-        grid, args, kwargs = scan.calls[0]
-        self.assertEqual(grid, (2,))
-        self.assertEqual(kwargs["BLOCK_SIZE_M_FIRST"], 16)
-        self.assertEqual(kwargs["BLOCK_SIZE_M_SECOND"], 64)
-        self.assertEqual(args[4].data_ptr(), padded[0].data_ptr())
-        self.assertEqual(args[9].data_ptr(), padded[1].data_ptr())
-
-        # One expand/scatter over two label halves plus the pair half.
-        self.assertEqual(len(expand.calls), 1)
-        grid, args, kwargs = expand.calls[0]
-        self.assertEqual(grid, (3,))
-        # capacity(P=8, bs, V=4): 96 -> 6 blocks at M=16, 384 -> 6 at M=64.
-        self.assertEqual(args[7], 6)
-        self.assertEqual(args[8], 1)
-        self.assertEqual(args[14], 6)
-        self.assertEqual(args[15], 1)
-        self.assertEqual(args[16], 8)
-        # [0, NUM_BUCKETS] holds NUM_BUCKETS + 1 states -> bit_length, not
-        # bit_length of (NUM_BUCKETS - 1).
-        self.assertEqual(kwargs["SEARCH_STEPS"], 3)
-        self.assertEqual(kwargs["BLOCK_SIZE_M_FIRST"], 16)
-        self.assertEqual(kwargs["BLOCK_SIZE_M_SECOND"], 64)
-
-        self.assertEqual(views[0].block_size, 16)
-        self.assertEqual(views[1].block_size, 64)
-        self.assertEqual(views[0].view, "aligned")
-        self.assertEqual(views[0].num_virtual_experts, 4)
-        self.assertEqual(views[0].maybe_sorted_pair_ids.numel(), 96)
-        self.assertEqual(views[1].maybe_sorted_pair_ids.numel(), 384)
-        self.assertEqual(views[0].maybe_block_virtual_expert_ids.numel(), 6)
-        self.assertEqual(views[1].maybe_block_virtual_expert_ids.numel(), 6)
-        for view, count in zip(views, padded):
-            self.assertEqual(
-                view.maybe_num_pairs_post_padded.data_ptr(), count.data_ptr()
-            )
-
-    def test_pdl_launch_wiring_matches_the_incumbent_chain(self):
-        for enabled in (False, True):
-            with self.subTest(use_pdl=enabled):
-                _, recorders, _, _ = self._run(use_pdl=enabled)
-                hist, scan, expand = recorders
-                for recorder in recorders:
-                    self.assertEqual(recorder.calls[0][2]["USE_PDL"], enabled)
-                # Edges are consecutive-launch only: the producer never
-                # carries launch_pdl, both consumers do (when enabled).
-                self.assertNotIn("launch_pdl", hist.calls[0][2])
-                for consumer in (scan, expand):
-                    self.assertEqual(
-                        consumer.calls[0][2].get("launch_pdl", False), enabled
-                    )
-
-    def test_none_pdl_stays_off_for_the_standard_route(self):
-        _, recorders, _, _ = self._run(use_pdl=None)
-        for recorder in recorders:
-            self.assertFalse(recorder.calls[0][2]["USE_PDL"])
-            self.assertNotIn("launch_pdl", recorder.calls[0][2])
-
-    def test_empty_pair_domain_keeps_host_static_launches(self):
-        views, (hist, scan, expand), _, _ = self._run(num_tokens=0)
-        self.assertEqual(hist.calls[0][0], (1,))
-        self.assertEqual(scan.calls[0][0], (2,))
-        self.assertEqual(expand.calls[0][0], (3,))
-        self.assertEqual(views[0].maybe_sorted_pair_ids.numel(), 0)
-        self.assertEqual(views[1].maybe_block_virtual_expert_ids.numel(), 0)
-
-    def test_kernel_dependency_operations_are_complete(self):
-        source = (LORA_MOE / "routing.py").read_text()
-        tree = ast.parse(source)
-        function_nodes = {
-            node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
-        }
-        functions = {name: ast.unparse(node) for name, node in function_nodes.items()}
-
-        hist = functions["_dual_granularity_hist_kernel"]
-        scan = functions["_dual_granularity_scan_kernel"]
-        expand = functions["_dual_granularity_expand_scatter_kernel"]
-        self.assertIn("gdc_launch_dependents", hist)
-        self.assertNotIn("gdc_wait", hist)
-        self.assertIn("gdc_wait", scan)
-        self.assertIn("gdc_launch_dependents", scan)
-        self.assertIn("gdc_wait", expand)
-        self.assertNotIn("gdc_launch_dependents", expand)
-
-        # K3 must be released before either scan body, so its pair path can
-        # overlap scan work while still waiting before cursor consumption.
-        scan_ifs = [
-            node
-            for node in function_nodes["_dual_granularity_scan_kernel"].body
-            if isinstance(node, ast.If)
-        ]
-        self.assertEqual(len(scan_ifs), 2)
-        self.assertEqual(ast.unparse(scan_ifs[0].test), "USE_PDL")
-        pdl_body = ast.unparse(scan_ifs[0])
-        self.assertLess(
-            pdl_body.index("gdc_wait"),
-            pdl_body.index("gdc_launch_dependents"),
-        )
-        self.assertIn("tl.program_id", ast.unparse(scan_ifs[1].test))
-        self.assertTrue(scan_ifs[1].orelse)
-
-    def test_aliased_scratch_is_rejected(self):
-        shared = self._scratch(5)
-        with self.assertRaisesRegex(ValueError, "disjoint scratch"):
-            self._run(scratches=(shared, shared))
-
-    def test_scratch_contract_is_checked_per_granularity(self):
-        bad = ROUTING.FusedAlignScratch(
-            counts=torch.zeros(4, dtype=torch.int32),
-            block_cumulative=torch.empty(6, dtype=torch.int32),
-            cursor=torch.empty(5, dtype=torch.int32),
-            bucket_end=torch.empty(5, dtype=torch.int32),
-        )
-        with self.assertRaisesRegex(ValueError, "route 1 counts"):
-            self._run(scratches=(self._scratch(5), bad))
-
-    def test_geometry_contract_violations_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "must all be positive"):
-            self._run(block_sizes=(16, 0))
-        with self.assertRaisesRegex(ValueError, "exactly two"):
-            self._run(block_sizes=(16,))
-        with self.assertRaisesRegex(ValueError, "topk_ids \\[T,K\\]"):
-            ROUTING.build_dual_granularity_aligned_routes(
-                torch.zeros(4, dtype=torch.int32),
-                torch.zeros(4, dtype=torch.int32),
-                lora_experts_per_adapter=2,
-                max_loras=2,
-                block_sizes=(16, 64),
-                num_pairs_post_padded_outs=(
-                    torch.empty(1, dtype=torch.int32),
-                    torch.empty(1, dtype=torch.int32),
-                ),
-                scratches=(self._scratch(5), self._scratch(5)),
-                use_pdl=None,
-            )
-        with self.assertRaisesRegex(ValueError, "int32 plan math"):
-            ROUTING.build_dual_granularity_aligned_routes(
-                torch.zeros((4, 2), dtype=torch.int32),
-                torch.zeros(4, dtype=torch.int32),
-                lora_experts_per_adapter=2**30,
-                max_loras=4,
-                block_sizes=(16, 64),
-                num_pairs_post_padded_outs=(
-                    torch.empty(1, dtype=torch.int32),
-                    torch.empty(1, dtype=torch.int32),
-                ),
-                scratches=(self._scratch(5), self._scratch(5)),
-                use_pdl=None,
-            )
 
 
 class TestSharedTokenRoute(unittest.TestCase):
@@ -1326,43 +837,12 @@ class TestRunnerRouteSelectionSource(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == name
         )
 
-    def test_only_gate_up_a_can_select_the_dedicated_aligned_route(self):
-        route_for_a = ast.unparse(self._method("_route_for_a"))
-        route_for_b = ast.unparse(self._method("_route_for_b"))
-        self.assertIn("routes.gate_up_a_aligned_per_expert", route_for_a)
-        self.assertIn("spec.site is Site.GATE_UP", route_for_a)
-        self.assertIn("routes.aligned(spec.is_shared_outer)", route_for_a)
-        self.assertNotIn("gate_up_a_aligned_per_expert", route_for_b)
-        self.assertIn("routes.aligned(spec.is_shared_outer)", route_for_b)
-
 
 class TestLaunchConfigRoutePreflight(unittest.TestCase):
     def test_aligned_tensor_core_plan_rejects_subwarp_route_tile(self):
-        config = LAUNCH.MoeLoraLaunchConfig(
-            routing_block_size=8,
-            gate_up_a_routing_block_size=8,
-        )
+        config = LAUNCH.MoeLoraLaunchConfig(routing_block_size=8)
         with self.assertRaisesRegex(ValueError, "at least 16"):
             config.validate_for_plan(SERIAL_MATERIALIZED_REFERENCE)
-
-    def test_distinct_gate_up_tile_rejects_non_grouped_gate_up_family(self):
-        reference = SERIAL_MATERIALIZED_REFERENCE
-        token_dedup = dataclasses.replace(
-            reference,
-            gate_up_a=PLAN.LoraASpec(
-                PLAN.Site.GATE_UP,
-                PLAN.LoraAFamily.TOKEN_DEDUP_GROUPED,
-                True,
-                PLAN.BridgeLayout.TOKEN_MAJOR,
-            ),
-            gate_up_b=dataclasses.replace(
-                reference.gate_up_b,
-                input_layout=PLAN.BridgeLayout.TOKEN_MAJOR,
-            ),
-        )
-        config = LAUNCH.MoeLoraLaunchConfig(gate_up_a_routing_block_size=64)
-        with self.assertRaisesRegex(ValueError, "grouped per-expert"):
-            config.validate_for_plan(token_dedup)
 
 
 if __name__ == "__main__":

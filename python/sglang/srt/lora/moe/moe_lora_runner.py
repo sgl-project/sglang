@@ -470,7 +470,6 @@ class MoeLoraRunner:
             num_local_experts=self.num_local_experts,
             max_loras=batch.slot_capacity,
             block_size=launch_config.routing_block_size,
-            gate_up_a_block_size=launch_config.gate_up_a_routing_block_size,
             workspace=self.workspace,
         )
 
@@ -536,12 +535,6 @@ class MoeLoraRunner:
             return routes.shared_token
         if spec.family is LoraAFamily.INDEXED:
             return routes.raw(spec.is_shared_outer)
-        if (
-            spec.site is Site.GATE_UP
-            and not spec.is_shared_outer
-            and routes.gate_up_a_aligned_per_expert is not None
-        ):
-            return routes.gate_up_a_aligned_per_expert
         return routes.aligned(spec.is_shared_outer)
 
     @staticmethod

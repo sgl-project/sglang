@@ -234,47 +234,23 @@ def bench_once(
     return {bs: statistics.median(v[1:] or v) for bs, v in sorted(by_bs.items())}
 
 
-ROUTE_BLOCK_KEYS = ("routing_block_size", "gate_up_a_routing_block_size")
-
-
-def _set_route_block(sites: dict, block: int, key: str, *, lockstep: bool) -> None:
-    """Move one route granularity to ``block`` without fabricating a split.
-
-    The two keys are independent knobs and have to be swept that way: the
-    shared block is the row tile of every LoRA kernel riding the shared
-    route, so raising it adds masked lanes to three kernels at once, while
-    gate/up-A's block pads only its own kernel (its writes land by original
-    pair id). Collapsing them measured -2.5% end-to-end at 4k tokens on the
-    shipped H200 row.
-
-    ``lockstep`` moves both keys together. It is REQUIRED for rows whose plan
-    cannot run a split (shared layout, non-grouped gate/up-A -- the bind
-    validation rejects a split there and the arm dies), and rules that never
-    declared their own gate/up-A block move as one route too: raising only
-    the shared key would leave gate/up-A at the loader default and invent a
-    split the row never asked for.
-    """
-    sites[key] = block
-    if key == "routing_block_size":
-        if lockstep or "gate_up_a_routing_block_size" not in sites:
-            sites["gate_up_a_routing_block_size"] = block
-        # tripwires on the B sites are checked against the shared route
-        for name in ("gate_up_b", "down_b"):
-            site = sites.get(name)
-            if site is not None and "BLOCK_SIZE_M" in site:
-                site["BLOCK_SIZE_M"] = block
+def _set_route_block(sites: dict, block: int) -> None:
+    """Move one rule's route block; B-site tripwires follow the route."""
+    sites["routing_block_size"] = block
+    for name in ("gate_up_b", "down_b"):
+        site = sites.get(name)
+        if site is not None and "BLOCK_SIZE_M" in site:
+            site["BLOCK_SIZE_M"] = block
 
 
 def sweep_route_block(args, seed_path: str, arch: str, variant_dir: str) -> dict:
-    """Pick each route block per phase and write the winners into the tiles.
+    """Pick one route block per phase and write the winners into the tiles.
 
-    Occupancy decides these -- routed pairs per virtual expert, i.e.
+    Occupancy decides it -- routed pairs per virtual expert, i.e.
     tokens x top_k / virtual experts -- so decode and prefill get their own
-    sweep and their own metric, and the shared route and gate/up-A's get
-    theirs (see ``_set_route_block`` for why they cannot be swept together).
-    Four arms per candidate, so this is the expensive axis; it earns that on a
-    geometry whose occupancy is far from the campaign's, where the packing
-    trade lands somewhere else entirely.
+    sweep and their own metric. The shipped tables want 16 at decode and 32
+    at prefill; a geometry far from the campaign's can land elsewhere, which
+    is why it is an axis here at all.
     """
     tiles_path = os.path.join(args.out, f"{arch}.tiles.json")
     if not os.path.isfile(tiles_path):
@@ -282,29 +258,13 @@ def sweep_route_block(args, seed_path: str, arch: str, variant_dir: str) -> dict
     plans = json.load(open(seed_path))
     rows = plans["scenarios"] + plans.get("fallback", [])
     phase_of = {row["name"]: row.get("phase") for row in rows}
-    # Rows that may legally run gate/up-A on its own route: per-expert layout
-    # with grouped gate/up-A (the loader default). Everything else -- shared
-    # layout, wildcard layout, dedup families -- moves as one route.
-    splittable = {
-        row["name"]
-        for row in rows
-        if row.get("layout") == "per_expert"
-        and row.get("plan", {}).get("gate_up_a_family", "grouped") == "grouped"
-    }
     tiles = json.load(open(tiles_path))
     all_results = {}
-    axes = [
-        (phase, metric, key)
-        for phase, metric in (
-            ("decode", "output_throughput"),
-            ("prefill", "input_throughput"),
-        )
-        for key in ROUTE_BLOCK_KEYS
-    ]
-    for phase, metric, key in axes:
+    for phase, metric in (
+        ("decode", "output_throughput"),
+        ("prefill", "input_throughput"),
+    ):
         names = [n for n in tiles["rules"] if phase_of.get(n) == phase]
-        if key == "gate_up_a_routing_block_size":
-            names = [n for n in names if n in splittable]
         if not names:
             continue
         results = {}
@@ -312,28 +272,23 @@ def sweep_route_block(args, seed_path: str, arch: str, variant_dir: str) -> dict
             candidate = copy.deepcopy(tiles)
             for name in names:
                 for rule in candidate["rules"][name]:
-                    _set_route_block(
-                        rule["sites"], block, key, lockstep=name not in splittable
-                    )
+                    _set_route_block(rule["sites"], block)
             os.makedirs(variant_dir, exist_ok=True)
             json.dump(
                 candidate, open(os.path.join(variant_dir, f"{arch}.tiles.json"), "w")
             )
             json.dump(plans, open(os.path.join(variant_dir, f"{arch}.plans.json"), "w"))
-            short = "shared" if key == "routing_block_size" else "gate_up_a"
-            tag = f"route_{phase}_{short}_{block}"
+            tag = f"route_{phase}_{block}"
             results[block] = bench_once(
                 args, {"SGLANG_LORA_MOE_CONFIG_DIR": variant_dir}, tag, metric
             )
             print(tag, results[block])
         winner = max(results, key=lambda b: sum(results[b].values()))
-        print(f"{key} winner ({phase}, scored on {metric}): {winner}")
+        print(f"route block winner ({phase}, scored on {metric}): {winner}")
         for name in names:
             for rule in tiles["rules"][name]:
-                _set_route_block(
-                    rule["sites"], winner, key, lockstep=name not in splittable
-                )
-        all_results.update({f"{phase}-{key}-{b}": v for b, v in results.items()})
+                _set_route_block(rule["sites"], winner)
+        all_results.update({f"{phase}-{b}": v for b, v in results.items()})
     json.dump(tiles, open(tiles_path, "w"), indent=1)
     return all_results
 
