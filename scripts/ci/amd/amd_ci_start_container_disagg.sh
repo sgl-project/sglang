@@ -4,25 +4,26 @@ set -euo pipefail
 # Get version from git tags
 SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
 
-# Read the tag name off the remote rather than fetching tag objects into the
-# shallow CI checkout; see amd_ci_latest_release_tag.py for why.
-VERSION_FROM_TAG=$(python3 scripts/ci/amd/amd_ci_latest_release_tag.py || true)
-if [ -n "$VERSION_FROM_TAG" ]; then
-  SGLANG_VERSION="$VERSION_FROM_TAG"
-  echo "Using SGLang version from git tags: $SGLANG_VERSION"
+# Fetch tags from origin to ensure we have the latest
+if git fetch --tags origin; then
+  # Use the shared helper so stable/post releases sort above rc tags.
+  VERSION_FROM_TAG=$(python3 scripts/release/get_version_tag.py --tag-only || true)
+  if [ -n "$VERSION_FROM_TAG" ]; then
+    SGLANG_VERSION="$VERSION_FROM_TAG"
+    echo "Using SGLang version from git tags: $SGLANG_VERSION"
+  else
+    echo "Warning: No version tags found; using default $SGLANG_VERSION" >&2
+  fi
 else
-  echo "Warning: No version tags resolved; using default $SGLANG_VERSION" >&2
+  echo "Warning: Failed to fetch tags from origin; using default $SGLANG_VERSION" >&2
 fi
-VERSION_RESOLVE_SECONDS=$SECONDS
 
 
 # Default base tags (can be overridden by command line arguments)
 ROCM_VERSION="rocm700"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
-# Enabled per architecture once the GPU arch is known below; see
-# amd_ci_start_container.sh for AMD_CI_DOCKER_REGISTRY_MIRROR.
-DEFAULT_DOCKER_REGISTRY_MIRROR="10.44.14.109:5000"
+LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
@@ -74,20 +75,6 @@ case "${GPU_ARCH}" in
     GPU_ARCH="mi30x"
     ;;
 esac
-
-# Only MI300 can route to the mirror; see amd_ci_start_container.sh.
-if [[ -n "${AMD_CI_DOCKER_REGISTRY_MIRROR+x}" ]]; then
-  LOCAL_DOCKER_REGISTRY="${AMD_CI_DOCKER_REGISTRY_MIRROR}"
-elif [[ "${GPU_ARCH}" == "mi30x" ]]; then
-  LOCAL_DOCKER_REGISTRY="${DEFAULT_DOCKER_REGISTRY_MIRROR}"
-else
-  LOCAL_DOCKER_REGISTRY=""
-fi
-if [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
-  echo "Registry mirror for ${GPU_ARCH}: ${LOCAL_DOCKER_REGISTRY}"
-else
-  echo "No registry mirror for ${GPU_ARCH}; pulling from Docker Hub."
-fi
 
 
 # Set up DEVICE_FLAG based on Kubernetes pod info
@@ -143,8 +130,7 @@ find_latest_image() {
       *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
   esac
 
-  # First, check local cache on the runner. Always cold in CI: the runners are
-  # docker-in-docker with ephemeral storage. See amd_ci_start_container.sh.
+  # First, check local cache on the runner.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
@@ -226,6 +212,22 @@ find_latest_image() {
   esac
 }
 
+# Pull and run the latest image
+IMAGE=$(find_latest_image "${GPU_ARCH}")
+# Try the local docker registry first (avoids Docker Hub rate limits and is
+# faster on the LAN); if that fails for any reason, fall back to the
+# public registry with exponential-backoff retries. Capture stderr so the
+# real failure reason (TLS handshake, 404, connection refused, etc.) is
+# visible in the job log instead of being silently swallowed.
+if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+  echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
+  docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
+else
+  echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
+  printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
+  retry_with_backoff 6 docker pull "${IMAGE}"
+fi
+
 CACHE_HOST=/home/runner/sglang-data
 if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
   RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
@@ -256,50 +258,6 @@ case "${ENABLE_CACHE_HOST,,}" in
     exit 1
     ;;
 esac
-
-# shellcheck source=scripts/ci/amd/amd_ci_image_cache.sh
-source "$(dirname "${BASH_SOURCE[0]}")/amd_ci_image_cache.sh"
-if [[ -n "${CACHE_VOLUME}" ]]; then
-  image_cache_init "${CACHE_HOST}"
-else
-  image_cache_init ""
-fi
-
-# Pull and run the latest image
-IMAGE=$(find_latest_image "${GPU_ARCH}")
-pulled_from_mirror=0
-loaded_from_cache=0
-if image_cache_load "${IMAGE}"; then
-  loaded_from_cache=1
-  IMAGE_SOURCE="local-tarball"
-elif [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
-  # Try the in-network mirror first: it avoids Docker Hub rate limits and is
-  # faster on the LAN. Capture stderr so the real failure reason (TLS handshake,
-  # 404, connection refused, etc.) is visible in the job log instead of being
-  # silently swallowed.
-  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
-    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
-    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
-    pulled_from_mirror=1
-  else
-    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
-    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
-  fi
-fi
-if (( loaded_from_cache == 0 )); then
-  if (( pulled_from_mirror == 0 )); then
-    IMAGE_SOURCE="docker-hub"
-    retry_with_backoff 6 docker pull "${IMAGE}"
-  else
-    IMAGE_SOURCE="registry-mirror"
-  fi
-  image_cache_save "${IMAGE}"
-fi
-
-# One greppable line per job; see amd_ci_start_container.sh.
-echo "[amd-ci-setup] image=${IMAGE} source=${IMAGE_SOURCE}" \
-     "version_resolve=${VERSION_RESOLVE_SECONDS}s" \
-     "image_acquire=$(( SECONDS - VERSION_RESOLVE_SECONDS ))s"
 
 # Detect libionic library for RDMA support
 LIBIONIC_MOUNT=""
