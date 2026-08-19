@@ -184,7 +184,7 @@ class LoRAPipeline(ComposedPipelineBase):
             )  # type: ignore
 
     def is_target_layer(self, module_name: str) -> bool:
-        if self.lora_target_modules is None:
+        if getattr(self, "lora_target_modules", None) is None:
             return True
         return any(
             target_name in module_name for target_name in self.lora_target_modules
