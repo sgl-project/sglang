@@ -108,6 +108,26 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
             expected,
         )
 
+    def test_vision_qkv_checkpoint_name_maps_to_native_projection(self):
+        encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
+        torch.nn.Module.__init__(encoder)
+        encoder.model = torch.nn.Module()
+        encoder.model.visual = torch.nn.Module()
+        block = torch.nn.Module()
+        block.attn = torch.nn.Module()
+        block.attn.qkv_proj = torch.nn.Linear(2, 2)
+        encoder.model.visual.blocks = torch.nn.ModuleList([block])
+
+        loaded = encoder.load_weights(
+            [("model.visual.blocks.0.attn.qkv.bias", torch.tensor([1.0, 2.0]))]
+        )
+
+        self.assertEqual(loaded, {"model.visual.blocks.0.attn.qkv_proj.bias"})
+        torch.testing.assert_close(
+            encoder.model.visual.blocks[0].attn.qkv_proj.bias,
+            torch.tensor([1.0, 2.0]),
+        )
+
 
 class TestTextEncoderQuantization(unittest.TestCase):
     def setUp(self):
