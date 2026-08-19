@@ -439,7 +439,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return seq_len
 
         page_size = self.token_to_kv_pool_allocator.page_size
-        if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+        if getattr(
+            self.scheduler.server_args,
+            "disaggregation_decode_enable_radix_cache",
+            False,
+        ):
             # Keep enough SWA before the page-aligned radix-cache insert
             # boundary for the cached key to contain a complete window.
             # `seq_len - 1` is the last committed position.
