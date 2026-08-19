@@ -33,18 +33,23 @@ from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
-# Detect the target hardware defensively: a non-ROCm / non-gfx95 (or otherwise
-# broken) environment simply skips this test.
+# Detect the target hardware. The probe is aiter-independent (SGLANG_USE_AITER
+# env var + gfx95 arch string) and deepseek_common.utils imports no aiter, so a
+# broken AITER cannot flip _ON_GFX95 to False. Catch ONLY ImportError: a
+# genuinely absent module (non-ROCm / non-gfx95) is the expected skip; any other
+# (unexpected) error propagates so a broken gfx95 runtime fails loudly instead of
+# silently skipping.
 try:
     from sglang.srt.models.deepseek_common.utils import _use_aiter_gfx95
 
     _ON_GFX95 = _use_aiter_gfx95 and torch.cuda.is_available()
-except Exception:
+except ImportError:
     _ON_GFX95 = False
 
 # On the gfx95 runner (where this coverage is required) the aiter kernel import is
-# NOT guarded: an API move or an incompatible pinned AITER build must fail loudly
-# here rather than silently degrade into a green skip and lose MI35x coverage.
+# NOT guarded: an API move, an initialization failure, or an incompatible pinned
+# AITER build must fail loudly here rather than silently degrade into a green skip
+# and lose MI35x coverage.
 if _ON_GFX95:
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _bmm_a8w8,
