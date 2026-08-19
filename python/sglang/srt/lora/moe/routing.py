@@ -59,7 +59,6 @@ import triton.language as tl
 
 from sglang.kernels.ops.moe.virtual_experts import (
     _align_block_size_jit,
-    _align_block_size_torch,
 )
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
@@ -125,13 +124,9 @@ def uses_fused_align(
     view: RouteViewKind = RouteViewKind.ALIGNED,
 ) -> bool:
     """Return the aligned-route dispatch without building either arm."""
-    return (
-        view == RouteViewKind.ALIGNED
-        and topk_ids.is_cuda
-        and (
-            num_virtual_experts >= FUSED_ALIGN_MIN_VIRTUAL_EXPERTS
-            or topk_ids.numel() >= FUSED_ALIGN_MIN_PAIRS
-        )
+    return view == RouteViewKind.ALIGNED and (
+        num_virtual_experts >= FUSED_ALIGN_MIN_VIRTUAL_EXPERTS
+        or topk_ids.numel() >= FUSED_ALIGN_MIN_PAIRS
     )
 
 
@@ -302,22 +297,12 @@ def _build_virtual_topk_ids(
     # The sole caller validated these same objects before branching.
     virtual_topk_ids = torch.empty_like(topk_ids)
     if topk_ids.numel() == 0:
+        # A DP-attention rank with no sequences runs ForwardMode.IDLE to stay
+        # in step on the collectives, and reaches here with zero tokens. The
+        # grid below would be cdiv(0, 1024) == 0, which is not a launchable
+        # configuration (the fused builder's own max(num_pairs, 1) is the same
+        # accommodation).
         return virtual_topk_ids
-
-    if not topk_ids.is_cuda:
-        adapter_valid = (token_lora_mapping >= 0) & (token_lora_mapping < max_loras)
-        if shared_outer_local_expert_count is not None:
-            in_range = (topk_ids >= 0) & (topk_ids < shared_outer_local_expert_count)
-            lora_expert_ids = torch.where(in_range, 0, -1)
-        else:
-            lora_expert_ids = topk_ids
-        factor_valid = (lora_expert_ids >= 0) & (
-            lora_expert_ids < lora_experts_per_adapter
-        )
-        virtual_ids = (
-            token_lora_mapping[:, None] * lora_experts_per_adapter + lora_expert_ids
-        )
-        return torch.where(adapter_valid[:, None] & factor_valid, virtual_ids, -1)
 
     block_size = 1024
     _build_virtual_topk_ids_kernel[(triton.cdiv(topk_ids.numel(), block_size),)](
@@ -352,10 +337,6 @@ def _align_virtual_topk_ids(
     block_size: int,
     num_virtual_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if not virtual_topk_ids.is_cuda:
-        return _align_block_size_torch(
-            virtual_topk_ids, block_size, num_virtual_experts
-        )
     # Reaching here means the aligned view did NOT dispatch to the fused
     # builder, i.e. V < FUSED_ALIGN_MIN_VIRTUAL_EXPERTS, which is identically
     # V <= _JIT_ALIGN_MAX_VIRTUAL_EXPERTS since the two are adjacent. Past that
