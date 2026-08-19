@@ -104,6 +104,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
   } else {
     static_assert(host::dependent_false_v<DType>, "Unsupported Mode");
   }
+  if (out_loc < 0) return;
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
@@ -270,6 +271,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
   } else {
     static_assert(host::dependent_false_v<DType>, "Unsupported Mode");
   }
+  if (out_loc < 0) return;
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();
@@ -424,6 +426,7 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   } else {
     static_assert(host::dependent_false_v<DType>, "Unsupported Mode");
   }
+  if (out_loc < 0) return;
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();

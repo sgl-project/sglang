@@ -25,6 +25,8 @@ def _init_compressed_attn_metadata_kernel(
     max_pages,
     c128_cur_max_seq_len,
     c128_page_size: tl.constexpr,
+    dcp_size: tl.constexpr,
+    dcp_rank: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     COMPUTE_PAGE_INDICES: tl.constexpr,
 ):
@@ -37,10 +39,19 @@ def _init_compressed_attn_metadata_kernel(
     is_write_token = batch_id < num_write_tokens
     raw_out_loc = tl.load(raw_out_loc_ptr + batch_id, mask=is_write_token, other=0)
 
+    c4_global_out_loc = raw_out_loc // 4
     c4_should_compress = (seq_len % 4) == 0
-    c4_out_loc = tl.where(c4_should_compress, raw_out_loc // 4, 0)
+    c4_owned = (c4_global_out_loc % dcp_size) == dcp_rank
+    c4_out_loc = tl.where(
+        c4_should_compress,
+        tl.where(c4_owned, c4_global_out_loc // dcp_size, -1),
+        0,
+    )
     c4_positions = position & (~3)
-    c4_seq_lens_raw = seq_len // 4
+    c4_global_seq_lens = seq_len // 4
+    c4_seq_lens_raw = c4_global_seq_lens // dcp_size + (
+        dcp_rank < c4_global_seq_lens % dcp_size
+    )
     c4_seq_lens_clamp1 = tl.maximum(c4_seq_lens_raw, 1)
 
     tl.store(c4_out_loc_ptr + batch_id, c4_out_loc, mask=is_write_token)
@@ -48,10 +59,19 @@ def _init_compressed_attn_metadata_kernel(
     tl.store(c4_seq_lens_raw_ptr + batch_id, c4_seq_lens_raw)
     tl.store(c4_seq_lens_clamp1_ptr + batch_id, c4_seq_lens_clamp1)
 
+    c128_global_out_loc = raw_out_loc // 128
     c128_should_compress = (seq_len % 128) == 0
-    c128_out_loc = tl.where(c128_should_compress, raw_out_loc // 128, 0)
+    c128_owned = (c128_global_out_loc % dcp_size) == dcp_rank
+    c128_out_loc = tl.where(
+        c128_should_compress,
+        tl.where(c128_owned, c128_global_out_loc // dcp_size, -1),
+        0,
+    )
     c128_positions = position & (~127)
-    c128_seq_lens_raw = seq_len // 128
+    c128_global_seq_lens = seq_len // 128
+    c128_seq_lens_raw = c128_global_seq_lens // dcp_size + (
+        dcp_rank < c128_global_seq_lens % dcp_size
+    )
     c128_seq_lens_clamp1 = tl.maximum(c128_seq_lens_raw, 1)
 
     tl.store(c128_out_loc_ptr + batch_id, c128_out_loc, mask=is_write_token)
@@ -94,6 +114,8 @@ def _init_compressed_attn_metadata_triton(
     page_table: Optional[torch.Tensor] = None,
     page_size: int = 0,
     compute_page_indices: bool = True,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -106,6 +128,7 @@ def _init_compressed_attn_metadata_triton(
     Optional[torch.Tensor],
 ]:
     bs = seq_lens.shape[0]
+    assert dcp_size >= 1 and 0 <= dcp_rank < dcp_size
     # CP-v2 may add padding rows to the attention metadata, but those rows have
     # no cache-write locations. Keep the write buffers unpadded and mask those
     # rows in the kernel.
@@ -172,6 +195,8 @@ def _init_compressed_attn_metadata_triton(
         max_pages,
         c128_cur_max_seq_len,
         c128_page_size,
+        dcp_size,
+        dcp_rank,
         BLOCK_SIZE,
         compute_page_indices,
     )
@@ -196,6 +221,8 @@ def init_compression_metadata(
     page_table: Optional[torch.Tensor] = None,
     page_size: int = 0,
     compute_page_indices: bool = True,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -214,4 +241,6 @@ def init_compression_metadata(
         page_table,
         page_size,
         compute_page_indices,
+        dcp_size,
+        dcp_rank,
     )

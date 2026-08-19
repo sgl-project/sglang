@@ -73,6 +73,7 @@ def _sparse_attn_v4_paged_prefill_kernel(
     kv_indptr_extend_ptr,  # [N+1] int32
     attn_sink_ptr,  # [H]
     out_ptr,  # [N, H, D]
+    lse_out_ptr,  # [N, H] fp32
     q_stride_t: tl.constexpr,
     q_stride_h: tl.constexpr,
     q_stride_d: tl.constexpr,
@@ -86,9 +87,11 @@ def _sparse_attn_v4_paged_prefill_kernel(
     H: tl.constexpr,
     D: tl.constexpr,
     softmax_scale: tl.constexpr,
+    replicated_logit_shift: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    STORE_LSE: tl.constexpr,
 ):
     t = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -176,7 +179,9 @@ def _sparse_attn_v4_paged_prefill_kernel(
             other=0.0,
         )
 
-        scores = tl.dot(q, tl.trans(kv)) * softmax_scale
+        scores = (
+            tl.dot(q, tl.trans(kv)) * softmax_scale + replicated_logit_shift
+        )
         scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
 
         m_block = tl.max(scores, axis=1)
@@ -197,7 +202,9 @@ def _sparse_attn_v4_paged_prefill_kernel(
     # rescale BOTH l_i (for denom) AND acc (for numerator) by alpha to switch
     # to m_final frame. The sink itself adds exp(sink - m_final) to l_final
     # but contributes 0 to acc since V_sink = 0.
-    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
+    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(
+        tl.float32
+    ) + replicated_logit_shift
     m_final = tl.maximum(m_i, sink)
     alpha = tl.exp(m_i - m_final)
     l_final = l_i * alpha + tl.exp(sink - m_final)
@@ -212,6 +219,13 @@ def _sparse_attn_v4_paged_prefill_kernel(
         out,
         mask=h_mask[:, None] & d_mask[None, :],
     )
+    if STORE_LSE:
+        lse = tl.where(
+            l_final > 0.0,
+            m_final + tl.log(l_final),
+            -float("inf"),
+        )
+        tl.store(lse_out_ptr + t * H + h_offs, lse, mask=h_mask)
 
 
 def _sparse_attn_v4_paged_prefill_triton(
@@ -224,7 +238,9 @@ def _sparse_attn_v4_paged_prefill_triton(
     kv_indptr_extend: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-) -> torch.Tensor:
+    return_lse: bool = False,
+    replicated_logit_shift: float = 0.0,
+):
     if not q.is_cuda:
         raise RuntimeError(
             "Triton sparse_attn_v4_paged_prefill requires CUDA/HIP tensors"
@@ -246,6 +262,7 @@ def _sparse_attn_v4_paged_prefill_triton(
 
     T, H, D = q.shape
     out = torch.empty_like(q)
+    lse_out = torch.empty((T, H), dtype=torch.float32, device=q.device)
     kv_indices_prefix = kv_indices_prefix.to(torch.int32).contiguous()
     kv_indptr_prefix = kv_indptr_prefix.to(torch.int32).contiguous()
     kv_indices_extend = kv_indices_extend.to(torch.int32).contiguous()
@@ -264,6 +281,7 @@ def _sparse_attn_v4_paged_prefill_triton(
         kv_indptr_extend,
         attn_sink,
         out,
+        lse_out,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -277,12 +295,14 @@ def _sparse_attn_v4_paged_prefill_triton(
         H,
         D,
         float(softmax_scale),
+        float(replicated_logit_shift),
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
+        STORE_LSE=return_lse,
         num_warps=8,
     )
-    return out
+    return (out, lse_out) if return_lse else out
 
 
 def sparse_attn_v4_paged_prefill(
@@ -295,7 +315,9 @@ def sparse_attn_v4_paged_prefill(
     kv_indptr_extend: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-) -> torch.Tensor:
+    return_lse: bool = False,
+    replicated_logit_shift: float = 0.0,
+):
     """V4 prefill sparse attention over two KV sources (paged unified_kv +
     flat per-fwd kv).
 
@@ -316,7 +338,7 @@ def sparse_attn_v4_paged_prefill(
     Returns:
       out: [T, H, D] same dtype as q.
     """
-    if _HAS_OPUS:
+    if _HAS_OPUS and not return_lse and replicated_logit_shift == 0.0:
         # OPUS contract differs from the Triton kernel in two ways the Triton
         # path tolerates implicitly:
         #  - it requires a FULLY-contiguous q (it only asserts stride(2)==1 but
@@ -356,4 +378,6 @@ def sparse_attn_v4_paged_prefill(
         kv_indptr_extend,
         attn_sink,
         softmax_scale,
+        return_lse=return_lse,
+        replicated_logit_shift=replicated_logit_shift,
     )

@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.allocator.swa import (
+    DeepSeekV4DCPTokenToKVPoolAllocator,
     PureSWATokenToKVPoolAllocator,
     SWATokenToKVPoolAllocator,
 )
@@ -1674,15 +1675,35 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
                 elif self.is_hybrid_swa:
-                    token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
-                        sizes.full_max_total_num_tokens,
-                        sizes.swa_max_total_num_tokens,
-                        page_size=get_schedule().page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
+                    if is_dsv4_model and get_parallel().dcp_enabled:
+                        token_to_kv_pool_allocator = (
+                            DeepSeekV4DCPTokenToKVPoolAllocator(
+                                physical_size_full=sizes.full_max_total_num_tokens,
+                                physical_size_swa=sizes.swa_max_total_num_tokens,
+                                physical_page_size=get_schedule().page_size,
+                                dcp_size=get_parallel().attn_dcp_size,
+                                dcp_rank=get_parallel().attn_dcp_rank,
+                                dtype=self.kv_cache_dtype,
+                                device=self.device,
+                                kvcache=token_to_kv_pool,
+                                need_sort=need_sort,
+                            )
+                        )
+                        token_to_kv_pool.register_dcp_geometry(
+                            dcp_size=get_parallel().attn_dcp_size,
+                            dcp_rank=get_parallel().attn_dcp_rank,
+                            logical_page_size=token_to_kv_pool_allocator.page_size,
+                        )
+                    else:
+                        token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
+                            sizes.full_max_total_num_tokens,
+                            sizes.swa_max_total_num_tokens,
+                            page_size=get_schedule().page_size,
+                            dtype=self.kv_cache_dtype,
+                            device=self.device,
+                            kvcache=token_to_kv_pool,
+                            need_sort=need_sort,
+                        )
                 else:
                     if get_memory().enable_hisparse:
                         from sglang.srt.mem_cache.sparsity import (

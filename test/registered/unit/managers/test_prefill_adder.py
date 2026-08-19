@@ -119,6 +119,24 @@ class TestPrefillAdder(CustomTestCase):
         defaults.update(kwargs)
         return PrefillAdder(**defaults)
 
+    def test_dcp_allocation_page_widens_only_full_budget(self):
+        adder = self.create_adder(
+            running_batch=None,
+            page_size=256,
+            allocation_page_size=2048,
+        )
+
+        adder._update_prefill_budget(
+            prefix_len=0,
+            extend_input_len=1,
+            max_new_tokens=0,
+            retracted_stain=False,
+        )
+
+        self.assertEqual(adder.rem_total_token_offset, 4096)
+        self.assertEqual(adder.cur_rem_token_offset, 4096)
+        self.assertEqual(adder.page_size, 256)
+
     def test_preempt_success_high_priority_values_first(self):
         params = [
             ("run1", 0, 50),

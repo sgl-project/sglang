@@ -406,7 +406,9 @@ def create_paged_compressor_data(
             online_state_slot_offset=online_state_slot_offset,
         )
 
-    swa_page_size = token_to_kv_pool.swa_page_size
+    swa_page_size = getattr(
+        token_to_kv_pool, "logical_page_size", token_to_kv_pool.swa_page_size
+    )
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
     # NOTE: This is actually a proxy, which encounter some bug with tvm-ffi.
     # As a workaround, we use `.detach()` to get the real tensor.

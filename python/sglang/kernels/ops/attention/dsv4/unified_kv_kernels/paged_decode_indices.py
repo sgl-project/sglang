@@ -67,6 +67,8 @@ def _v4_paged_decode_indices_kernel(
     hca_indices_ptr,  # [hca_total] int32, output (writes SWA-prefix segment only)
     ring_stride,  # win_with_spec — stride into unified_kv SWA region (paper §3.6.1)
     win: tl.constexpr,  # window_size — max SWA prefix slots
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
     BLOCK_N: tl.constexpr,  # next_pow2(win)
 ):
     """One program per token. Writes `n = min(positions[t]+1, win)` paged
@@ -96,14 +98,18 @@ def _v4_paged_decode_indices_kernel(
     pos = tl.load(positions_ptr + t)
     # `n` = actual valid SWA prefix count. Cast to match `win` (compile-time
     # int) — pos is i32/i64 from positions buffer.
-    n = tl.minimum(pos + 1, win)
+    start = tl.maximum(pos - win + 1, 0)
+    first_owned = start + (
+        DCP_RANK + DCP_SIZE - (start % DCP_SIZE)
+    ) % DCP_SIZE
+    n = tl.maximum(tl.cdiv(pos + 1 - first_owned, DCP_SIZE), 0)
     swa_base = tl.load(swa_indptr_ptr + t)
     csa_base = tl.load(csa_indptr_ptr + t)
     hca_base = tl.load(hca_indptr_ptr + t)
 
     i = tl.arange(0, BLOCK_N)
     mask = i < n
-    abs_pos = pos - n + 1 + i  # ∈ [0, pos] for valid i
+    abs_pos = first_owned + i * DCP_SIZE
     ring_idx = abs_pos % ring_stride
     paged = slot * ring_stride + ring_idx
 
@@ -126,6 +132,8 @@ def write_v4_paged_decode_indices(
     T: int,
     win: int,
     ring_stride: int,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ) -> None:
     """In-place fill SWA / CSA / HCA window-prefix offsets via a single
     Triton kernel. Replaces the prior `_build_window_topk_np` (CPU O(T·win))
@@ -172,6 +180,7 @@ def write_v4_paged_decode_indices(
     assert swa_indices.dim() == 1
     assert csa_indices.dim() == 1
     assert hca_indices.dim() == 1
+    assert dcp_size >= 1 and 0 <= dcp_rank < dcp_size
 
     BLOCK_N = triton.next_power_of_2(win)
     _v4_paged_decode_indices_kernel[(T,)](
@@ -186,5 +195,69 @@ def write_v4_paged_decode_indices(
         hca_indices,
         ring_stride,
         win=win,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
         BLOCK_N=BLOCK_N,
+    )
+
+
+@triton.jit
+def _v4_paged_single_stream_indices_kernel(
+    state_slot_ptr,
+    positions_ptr,
+    indptr_ptr,
+    indices_ptr,
+    ring_stride,
+    win: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    slot = tl.load(state_slot_ptr + row)
+    pos = tl.load(positions_ptr + row)
+    start = tl.maximum(pos - win + 1, 0)
+    first_owned = start + (
+        DCP_RANK + DCP_SIZE - (start % DCP_SIZE)
+    ) % DCP_SIZE
+    count = tl.maximum(tl.cdiv(pos + 1 - first_owned, DCP_SIZE), 0)
+    base = tl.load(indptr_ptr + row)
+    offsets = tl.arange(0, BLOCK_N)
+    mask = offsets < count
+    absolute_positions = first_owned + offsets * DCP_SIZE
+    ring_indices = absolute_positions % ring_stride
+    tl.store(
+        indices_ptr + base + offsets,
+        slot * ring_stride + ring_indices,
+        mask=mask,
+    )
+
+
+def write_v4_paged_single_stream_indices(
+    *,
+    state_slot: torch.Tensor,
+    positions: torch.Tensor,
+    indptr: torch.Tensor,
+    indices: torch.Tensor,
+    win: int,
+    ring_stride: int,
+    dcp_size: int,
+    dcp_rank: int,
+) -> None:
+    num_rows = state_slot.shape[0]
+    if num_rows == 0:
+        return
+    assert positions.shape[0] == num_rows
+    assert indptr.shape[0] == num_rows + 1
+    assert dcp_size >= 1 and 0 <= dcp_rank < dcp_size
+    _v4_paged_single_stream_indices_kernel[(num_rows,)](
+        state_slot,
+        positions,
+        indptr,
+        indices,
+        ring_stride,
+        win=win,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
+        BLOCK_N=triton.next_power_of_2(win),
     )

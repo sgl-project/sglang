@@ -2237,7 +2237,10 @@ class Scheduler(
         # smaller than max_total_num_tokens. Otherwise a request can be accepted
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
-        paged_input_len = -(-input_len // self.page_size) * self.page_size
+        allocation_page_size = self.token_to_kv_pool_allocator.page_size
+        paged_input_len = (
+            -(-input_len // allocation_page_size) * allocation_page_size
+        )
         req.sampling_params.max_new_tokens = max(
             0,
             min(
@@ -2245,7 +2248,7 @@ class Scheduler(
                 self.max_req_len - input_len - 1,
                 self.max_total_num_tokens * get_parallel().attn_dcp_size
                 - paged_input_len
-                - self.page_size
+                - allocation_page_size
                 - 1,
             ),
         )
@@ -3336,6 +3339,7 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            allocation_page_size=self.token_to_kv_pool_allocator.page_size,
         )
 
         if self.chunked_req is not None:

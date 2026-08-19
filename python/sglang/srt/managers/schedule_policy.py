@@ -527,8 +527,10 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        allocation_page_size: Optional[int] = None,
     ):
         self.page_size = page_size
+        self.allocation_page_size = allocation_page_size or page_size
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -766,7 +768,7 @@ class PrefillAdder:
         headroom = min(extend_input_len + max_new_tokens, window)
         reserved = headroom + self.page_size
         if swa_host_hit_length > 0:
-            reserved += self.ceil_paged_tokens(swa_host_hit_length)
+            reserved += self._ceil_swa_paged_tokens(swa_host_hit_length)
         return reserved
 
     def _swa_new_tokens(self, req: Req) -> int:
@@ -836,6 +838,9 @@ class PrefillAdder:
         return 0
 
     def ceil_paged_tokens(self, tokens: int) -> int:
+        return -(-tokens // self.allocation_page_size) * self.allocation_page_size
+
+    def _ceil_swa_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
     def budget_state(self):
@@ -875,7 +880,7 @@ class PrefillAdder:
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
 
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
-        page_overhead = self.page_size
+        page_overhead = self.allocation_page_size
         # `mamba_gap_reserve` (shared Mamba pool only; 0 otherwise) charges the new
         # mamba state's shared-gap cost to BOTH full budgets: the slot is allocated
         # immediately (counts against `cur_rem`) and held for the request lifetime
@@ -1230,7 +1235,7 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
-        total_tokens = cand_extend_input_len + max_new + self.page_size
+        total_tokens = cand_extend_input_len + max_new + self.allocation_page_size
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
@@ -1385,7 +1390,11 @@ class PrefillAdder:
                 )
             else:
                 # Make sure at least one page is available
-                trunc_len = chunk_tokens_limit // self.page_size * self.page_size
+                trunc_len = (
+                    chunk_tokens_limit
+                    // self.allocation_page_size
+                    * self.allocation_page_size
+                )
 
                 if trunc_len <= 0:
                     return AddReqResult.OTHER
@@ -1402,7 +1411,11 @@ class PrefillAdder:
                         )
 
                 now_input_len = trunc_len + len(req.prefix_indices)
-                now_input_len = now_input_len // self.page_size * self.page_size
+                now_input_len = (
+                    now_input_len
+                    // self.allocation_page_size
+                    * self.allocation_page_size
+                )
                 trunc_len = now_input_len - len(req.prefix_indices)
 
                 if trunc_len <= 0:
