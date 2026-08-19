@@ -600,6 +600,44 @@ def test_flashmla_dsv4_mxfp4_rejects_invalid_contracts() -> None:
 
 @pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
 @torch.inference_mode()
+def test_flashmla_dsv4_mxfp4_dispatch_raises_instead_of_exiting() -> None:
+    """The C++ entry point runs inside a serving process.
+
+    Its contract violations used to fprintf + exit(1), killing the whole
+    server on a bad input; they must raise a Python exception instead. The
+    public wrapper rejects bad inputs first, so this drives the raw FFI
+    dispatch with an invalid head_dim_v — the entry's first check.
+    """
+    from sglang.kernels.ops.attention.mxfp4_dsv4_decode_sm90 import _get_dispatch
+
+    device = torch.device("cuda")
+    empty_i32 = torch.empty(0, dtype=torch.int32, device=device)
+    empty_f32 = torch.empty(0, dtype=torch.float32, device=device)
+    q = torch.empty((1, 1, 64, 512), dtype=torch.bfloat16, device=device)
+    with pytest.raises((ValueError, RuntimeError), match="512"):
+        _get_dispatch()(
+            q,
+            q,  # k_cache placeholder; the head_dim_v check fires first
+            empty_i32,  # indices
+            empty_i32,  # topk_length
+            empty_f32,  # attn_sink
+            empty_i32,  # tile_scheduler_metadata
+            empty_i32,  # num_splits
+            empty_i32,  # extra_k_cache
+            empty_i32,  # extra_indices
+            empty_i32,  # extra_topk_length
+            empty_f32,  # lse_accum
+            empty_f32,  # o_accum
+            empty_f32,  # out
+            empty_f32,  # lse
+            256,  # head_dim_v
+            1.0,  # sm_scale
+            0,  # generate_sched_meta
+        )
+
+
+@pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
+@torch.inference_mode()
 def test_flashmla_dsv4_mxfp4_rejects_unsafe_kernel_contracts() -> None:
     """Guard the wrapper contract for values the SM90 kernel hardcodes.
 

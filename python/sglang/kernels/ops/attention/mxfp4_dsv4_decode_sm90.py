@@ -46,7 +46,7 @@ def _mxfp4_cuda_flags() -> list[str]:
 def _jit_mxfp4_dsv4_decode_module() -> Module:
     """Compile and cache the MXFP4 DSV4 decode module (one translation unit)."""
     if torch.cuda.get_device_capability()[0] != 9:
-        raise RuntimeError("MXFP4 DSV4 decode requires SM90 (Hopper) or later")
+        raise RuntimeError("MXFP4 DSV4 decode requires SM90 (Hopper)")
     return load_jit(
         "mxfp4_dsv4_decode_sm90",
         cuda_files=["mxfp4_dsv4_decode_sm90/entry.cuh"],

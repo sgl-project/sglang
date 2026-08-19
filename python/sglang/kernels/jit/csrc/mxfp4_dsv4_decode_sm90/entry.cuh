@@ -19,6 +19,7 @@
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
+#include <tvm/ffi/error.h>
 #include <tvm/ffi/extra/c_env_api.h>
 
 #include "combine.cuh"
@@ -171,9 +172,11 @@ static inline bool is_empty(tvm::ffi::TensorView t) {
   return t.numel() == 0;
 }
 
-static inline void fail(const char* msg) {
-  fprintf(stderr, "mxfp4_dsv4_decode: %s\n", msg);
-  exit(1);
+// Raise a Python-visible ValueError instead of exiting: this entry runs
+// inside a serving process, and a contract violation must surface as an
+// exception the caller can handle, not kill the process.
+[[noreturn]] static inline void fail(const char* msg) {
+  TVM_FFI_THROW(ValueError) << "mxfp4_dsv4_decode: " << msg;
 }
 
 }  // namespace
@@ -214,16 +217,17 @@ void mxfp4_dsv4_decode_dispatch(
   // ~100us per call.
   cudaStream_t stream = static_cast<cudaStream_t>(::TVMFFIEnvGetStream(kDLCUDA, dev.device_id));
 
-  // One-time SM90 gate: cudaDeviceGetAttribute is a driver round-trip and
-  // would cost microseconds on every decode step. The device cannot change
-  // within a process for a given device id.
-  static bool sm90_checked = false;
+  // One-time SM90 gate per device: cudaDeviceGetAttribute is a driver
+  // round-trip and would cost microseconds on every decode step. A process
+  // may span heterogeneous GPUs, so the cached verdict is keyed by the
+  // device it was computed for rather than decided once for the process.
+  static int sm90_checked_device = -1;
   static bool is_sm90 = false;
-  if (!sm90_checked) {
+  if (sm90_checked_device != static_cast<int>(dev.device_id)) {
     int major = 0;
     cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev.device_id);
     is_sm90 = (major == 9);
-    sm90_checked = true;
+    sm90_checked_device = static_cast<int>(dev.device_id);
   }
   if (!is_sm90) {
     fail("mxfp4_dsv4_decode only supports SM90 (Hopper)");
