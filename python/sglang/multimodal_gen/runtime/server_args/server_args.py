@@ -1310,31 +1310,17 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _adjust_platform_specific(self):
         if current_platform.is_mps():
+            if self.num_gpus != 1:
+                raise ValueError("MPS currently supports only --num-gpus 1")
             if self.component_residency is not None and any(
-                mode != RESIDENT for mode in self.component_residency.values()
+                mode not in (RESIDENT, LAYERWISE_OFFLOAD)
+                for mode in self.component_residency.values()
             ):
                 raise ValueError(
-                    "--component-residency offload modes require CUDA; "
-                    "MPS supports only resident components"
+                    "MPS supports only resident or layerwise-offload component "
+                    "residency"
                 )
             self.use_fsdp_inference = False
-            self.dit_layerwise_offload = False
-            self.layerwise_offload_components = None
-            if (
-                self.dit_cpu_offload
-                or self.text_encoder_cpu_offload
-                or self.image_encoder_cpu_offload
-                or self.vae_cpu_offload
-            ):
-                logger.warning(
-                    "Disabling component CPU offload on MPS because the component "
-                    "residency offload strategy is only validated on CUDA."
-                )
-            self.dit_cpu_offload = False
-            self.text_encoder_cpu_offload = False
-            self.image_encoder_cpu_offload = False
-            self.vae_cpu_offload = False
-            self.cpu_offload_components = None
 
     def is_arg_explicitly_set(self, arg_name: str) -> bool:
         return arg_name in self._explicit_arg_names
