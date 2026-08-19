@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -214,6 +214,10 @@ class MooncakeKVManager(CommonKVManager):
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
+            # Deferred KV release: aborted room -> (decode_ip, decode_port), ack
+            # held until the transfer drains. Written by the bootstrap thread,
+            # popped by the single transfer worker that owns the room.
+            self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
             self.session_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
@@ -795,13 +799,7 @@ class MooncakeKVManager(CommonKVManager):
                 )
                 for (src_ptr, dst_ptr, item_len) in layers_params
             ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for f in futures:
-                        f.cancel()
-                    return status
-            return 0
+            return self._await_transfer_futures(futures)
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
@@ -852,6 +850,25 @@ class MooncakeKVManager(CommonKVManager):
                 f"{dst_kv_item_len}. With --enable-unified-memory both sides "
                 "must enable it and use the same page size and model spec."
             )
+
+    def _await_transfer_futures(self, futures) -> int:
+        """Await a chunk's per-layer RDMA writes; return the first non-zero status.
+        cancel() is a no-op for a running future, so with deferred release on we
+        still drain the running ones before returning (no write may outlive this
+        call, which the drain-ack relies on). Off: original early-return."""
+        ret = 0
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                status = future.result()
+            except concurrent.futures.CancelledError:
+                continue
+            if status != 0 and ret == 0:
+                ret = status
+                for f in futures:
+                    f.cancel()
+                if not self.enable_deferred_decode_kv_release:
+                    return ret
+        return ret
 
     def send_kvcache(
         self,
@@ -978,13 +995,7 @@ class MooncakeKVManager(CommonKVManager):
                 executor.submit(process_layer, src_ptr, dst_ptr, token_item_len)
                 for src_ptr, dst_ptr, token_item_len in layers_params
             ]
-            for future in concurrent.futures.as_completed(futures):
-                status = future.result()
-                if status != 0:
-                    for pending in futures:
-                        pending.cancel()
-                    return status
-            return 0
+            return self._await_transfer_futures(futures)
 
         transfer_blocks = []
         for src_ptr, dst_ptr, token_item_len in layers_params:
@@ -1112,14 +1123,7 @@ class MooncakeKVManager(CommonKVManager):
                 executor.submit(process_layer_tp_aware, src_v_ptrs[i], dst_v_ptrs[i])
             )
 
-        for future in concurrent.futures.as_completed(futures):
-            status = future.result()
-            if status != 0:
-                for f in futures:
-                    f.cancel()
-                return status
-
-        return 0
+        return self._await_transfer_futures(futures)
 
     def send_aux(
         self,
@@ -1612,6 +1616,39 @@ class MooncakeKVManager(CommonKVManager):
             is_ipv6=na.is_ipv6,
         )
 
+    def _prefill_unique_rank(self) -> int:
+        """Stable per-sender id, matching what the transfer worker syncs on Success."""
+        return (
+            self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+            + self.pp_rank * self.attn_cp_size
+            + self.attn_cp_rank
+        )
+
+    def _send_abort_ack(self, decode_ip: str, decode_port: int, room: int) -> None:
+        """Best-effort ack that this rank's transfer for an aborted room drained."""
+        try:
+            na = NetworkAddress(decode_ip, decode_port)
+            self._send_multipart_locked(
+                na.to_tcp(),
+                [
+                    b"ABORT_ACK",
+                    str(room).encode("ascii"),
+                    str(self._prefill_unique_rank()).encode("ascii"),
+                ],
+                is_ipv6=na.is_ipv6,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
+
+    def _maybe_ack_drained_abort(self, room: int) -> None:
+        """Send the deferred ack once an aborted room's chunks have drained
+        (outstanding == 0). pop() makes it fire at most once."""
+        if self._staging_outstanding.get(room, 0) > 0:
+            return
+        target = self._deferred_ack_targets.pop(room, None)
+        if target is not None:
+            self._send_abort_ack(target[0], target[1], room)
+
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -1651,6 +1688,9 @@ class MooncakeKVManager(CommonKVManager):
                             thread_finish_flag=True,
                         )
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                    if self.enable_deferred_decode_kv_release:
+                        # Skipped => nothing written for this aborted room; ack.
+                        self._maybe_ack_drained_abort(kv_chunk.room)
                     continue
 
                 # Count each chunk once; the flag survives re-enqueue on defer.
@@ -1925,6 +1965,10 @@ class MooncakeKVManager(CommonKVManager):
                     continue
 
                 self._staging_outstanding[kv_chunk.room] -= 1
+                if self.enable_deferred_decode_kv_release:
+                    # In-flight write finished; if aborted and nothing outstanding,
+                    # the pages are idle -> release the held ack.
+                    self._maybe_ack_drained_abort(kv_chunk.room)
                 # Tear down only when no chunk is still outstanding and the room
                 # has concluded: already cleared, Success, or a Failed *last*
                 # chunk. A non-last Failed chunk keeps the room (more chunks may
@@ -1984,11 +2028,36 @@ class MooncakeKVManager(CommonKVManager):
                     room_to_be_aborted = int(waiting_req_bytes[1].decode("ascii"))
                     decode_ip = waiting_req_bytes[2].decode("ascii")
                     decode_port = int(waiting_req_bytes[3].decode("ascii"))
-                    # No need to abort the room if it has already succeeded
-                    if (
+                    room_active = (
                         room_to_be_aborted in self.request_status
                         and self.check_status(room_to_be_aborted) != KVPoll.Success
-                    ):
+                    )
+                    if self.enable_deferred_decode_kv_release:
+                        # Mark Failed FIRST (stops add_transfer_request enqueuing
+                        # new chunks), THEN register the ack target: registering
+                        # first would let the worker drain+ack while the room is
+                        # not yet Failed, so a newly enqueued chunk could still
+                        # write to the freed pages. The worker (not this thread)
+                        # acks once its in-flight write drains; if nothing is in
+                        # flight, decode falls back to the release timeout.
+                        if room_active:
+                            self.update_status(room_to_be_aborted, KVPoll.Failed)
+                            self._deferred_ack_targets[room_to_be_aborted] = (
+                                decode_ip,
+                                decode_port,
+                            )
+                            logger.debug(
+                                f"Received abort notification for room {room_to_be_aborted}, "
+                                f"marked as Failed; ACK deferred until transfer drains"
+                            )
+                        else:
+                            # Already completed/unknown: no in-flight write, ack now.
+                            self._send_abort_ack(
+                                decode_ip, decode_port, room_to_be_aborted
+                            )
+                        continue
+                    # No need to abort the room if it has already succeeded
+                    if room_active:
                         self.update_status(room_to_be_aborted, KVPoll.Failed)
                         logger.debug(
                             f"Received abort notification for room {room_to_be_aborted}, "
@@ -2102,9 +2171,14 @@ class MooncakeKVManager(CommonKVManager):
 
                 # Prefill acknowledges abort notification
                 if msg[0] == b"ABORT_ACK":
-                    # TODO(shangming): use this info to implement the deferred release mechanism if needed
                     ack_aborted_room = int(msg[1].decode("ascii"))
                     logger.debug(f"Received ABORT_ACK for room {ack_aborted_room}")
+                    # Deferred release: the 3-frame ack carries the prefill rank
+                    # and means its transfer drained; aggregate for is_abort_release_safe.
+                    if self.enable_deferred_decode_kv_release and len(msg) >= 3:
+                        self.note_abort_ack(
+                            ack_aborted_room, int(msg[2].decode("ascii"))
+                        )
                     continue
 
                 bootstrap_room, status, prefill_rank = msg
