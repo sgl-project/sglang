@@ -148,6 +148,7 @@ def test_cake_stage2_uses_direct_topk_metadata(monkeypatch):
     assert q2k_indices.dtype == torch.int32
     assert q2k_indices.is_contiguous()
     assert q2k_indices.shape == (1, num_blocks, expected_topk)
+    assert torch.all(q2k_indices[..., 1:] >= q2k_indices[..., :-1])
     assert torch.equal(
         q2k_num,
         torch.full((1, num_blocks), expected_topk, dtype=torch.int32),

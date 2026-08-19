@@ -352,7 +352,12 @@ class VideoSparseAttentionImpl(AttentionImpl):
             cur_topk,
         )
 
-        q2k_indices = topk_indices[0].to(torch.int32).contiguous()
+        # Native VSA converts its boolean block map back to q2k metadata by
+        # scanning KV block ids in ascending order. Preserve that visitation
+        # order so Cake and native VSA accumulate the same selected blocks in
+        # the same order; score-ordered ``torch.topk`` metadata can otherwise
+        # amplify BF16 reduction-order drift over diffusion steps.
+        q2k_indices = topk_indices[0].sort(dim=-1).values.to(torch.int32).contiguous()
         q2k_shape = tuple(q2k_indices.shape)
         q2k_num = self._cake_q2k_num.get(q2k_shape)
         if q2k_num is None or q2k_num.device != query.device:
