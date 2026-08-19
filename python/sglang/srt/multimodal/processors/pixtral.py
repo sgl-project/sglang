@@ -1,5 +1,6 @@
+import copy
 import math
-from typing import List, Union
+from typing import Any, List, Optional, Union
 
 from transformers import PreTrainedTokenizerBase
 from transformers.models.pixtral.image_processing_pixtral import (
@@ -17,7 +18,6 @@ from sglang.srt.models.pixtral import (
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
-    BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
 
@@ -46,6 +46,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
             "spatial_merge_size",
             getattr(hf_config, "spatial_merge_size", 1),
         )
+        self._effective_patch_size = self.patch_size * self._spatial_merge_size
 
         self._processor.patch_size = self.patch_size
         if self._spatial_merge_size > 1:
@@ -96,39 +97,62 @@ class PixtralProcessor(BaseMultimodalProcessor):
         self,
         mm_items: List[MultimodalDataItem],
         *,
-        base_output: BaseMultiModalProcessorOutput,
+        images: Optional[List[Any]],
     ) -> List[MultimodalDataItem]:
-        if len(base_output.images) <= 1:
+        if not images or len(images) <= 1:
             return mm_items
 
-        old_item = next(item for item in mm_items if item.modality == Modality.IMAGE)
+        image_items = [item for item in mm_items if item.modality == Modality.IMAGE]
+        if len(image_items) == len(images):
+            return mm_items
+        if len(image_items) != 1:
+            raise ValueError(
+                "Pixtral multi-image processing expected one bundled IMAGE item or "
+                f"{len(images)} split items, but found {len(image_items)}"
+            )
+
+        old_item = image_items[0]
         all_offsets = old_item.offsets
         old_feature = old_item.feature
         old_image_sizes = old_item.model_specific_data.get("image_sizes")
-        image_nrows = self._get_image_nrows(base_output.images)
+        image_nrows = self._get_image_nrows(images)
+        if old_feature is None or len(old_feature) != len(image_nrows):
+            raise ValueError(
+                "Pixtral multi-image feature count does not match the number of "
+                f"images: features={0 if old_feature is None else len(old_feature)}, "
+                f"images={len(image_nrows)}"
+            )
+        if all_offsets is None or sum(image_nrows) != len(all_offsets):
+            raise ValueError(
+                "Pixtral image patch rows do not match the computed offsets: "
+                f"rows={sum(image_nrows)}, "
+                f"offsets={0 if all_offsets is None else len(all_offsets)}"
+            )
 
         split_items = [item for item in mm_items if item.modality != Modality.IMAGE]
         offset_idx = 0
         for image_idx, num_rows in enumerate(image_nrows):
             item_offsets = all_offsets[offset_idx : offset_idx + num_rows]
             offset_idx += num_rows
-            model_specific_data = {}
+            new_item = copy.copy(old_item)
+            new_item.feature = old_feature[image_idx : image_idx + 1]
+            new_item.offsets = item_offsets
+            new_item.model_specific_data = copy.copy(old_item.model_specific_data)
             if old_image_sizes is not None:
-                model_specific_data["image_sizes"] = old_image_sizes[
+                new_item.model_specific_data["image_sizes"] = old_image_sizes[
                     image_idx : image_idx + 1
                 ]
-            split_items.append(
-                MultimodalDataItem(
-                    modality=Modality.IMAGE,
-                    feature=old_feature[image_idx : image_idx + 1],
-                    offsets=item_offsets,
-                    model_specific_data=model_specific_data,
-                )
+            new_item.hash = None
+            new_item.pad_value = None
+            split_items.append(new_item)
+        if offset_idx != len(all_offsets):
+            raise ValueError(
+                "Pixtral multi-image split did not consume every offset: "
+                f"consumed={offset_idx}, offsets={len(all_offsets)}"
             )
         return split_items
 
-    def _get_image_nrows(self, images) -> List[int]:
-        effective_patch = self.patch_size * self._spatial_merge_size
+    def _get_image_nrows(self, images: List[Any]) -> List[int]:
         image_nrows = []
         for image in images:
             width, height = image.size
@@ -138,7 +162,7 @@ class PixtralProcessor(BaseMultimodalProcessor):
                 height = int(math.floor(height / ratio))
             num_rows, _ = _get_pixtral_hf_num_image_tokens(
                 (height, width),
-                (effective_patch, effective_patch),
+                (self._effective_patch_size, self._effective_patch_size),
             )
             image_nrows.append(num_rows)
         return image_nrows

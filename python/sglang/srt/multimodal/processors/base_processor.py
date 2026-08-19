@@ -1727,7 +1727,7 @@ class BaseMultimodalProcessor(ABC):
         all_collected_items = get_new_expanded_mm_items(all_collected_items)
         all_collected_items = self._finalize_mm_items(
             all_collected_items,
-            base_output=base_output,
+            images=base_output.images,
         )
 
         return all_collected_items, input_ids, ret
@@ -1736,11 +1736,11 @@ class BaseMultimodalProcessor(ABC):
         self,
         mm_items: List[MultimodalDataItem],
         *,
-        base_output: BaseMultiModalProcessorOutput,
+        images: Optional[List[Any]],
     ) -> List[MultimodalDataItem]:
         mm_items = self._postprocess_mm_items_before_transport(
             mm_items,
-            base_output=base_output,
+            images=images,
         )
 
         for item in mm_items:
@@ -1751,24 +1751,23 @@ class BaseMultimodalProcessor(ABC):
                 item.set_pad_value()
 
         self._precompute_hashes_before_cpu_transfer(mm_items)
-        self._prepare_mm_items_for_transport(mm_items)
-        return mm_items
+        return self._prepare_mm_items_for_transport(mm_items)
 
     def _postprocess_mm_items_before_transport(
         self,
         mm_items: List[MultimodalDataItem],
         *,
-        base_output: BaseMultiModalProcessorOutput,
+        images: Optional[List[Any]],
     ) -> List[MultimodalDataItem]:
         """Apply model-specific item reshaping while features are still tensors."""
         return mm_items
 
     def _prepare_mm_items_for_transport(
         self, mm_items: List[MultimodalDataItem]
-    ) -> None:
+    ) -> List[MultimodalDataItem]:
         """Wrap final GPU features for dispatch to the scheduler."""
         if not self.use_cuda_ipc:
-            return
+            return mm_items
 
         # Pool misses fall back to plain CPU tensors. The scheduler copies out
         # and releases each successful pool slice.
@@ -1779,6 +1778,7 @@ class BaseMultimodalProcessor(ABC):
                 item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
                     item.precomputed_embeddings
                 )
+        return mm_items
 
     async def process_and_combine_mm_data_async(
         self,
