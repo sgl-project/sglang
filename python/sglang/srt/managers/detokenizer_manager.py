@@ -187,8 +187,16 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # TODO(lmzheng): handle the case where multiple stop strs are hit
 
         # Trim stop str.
+        # Use rfind (not find) so we locate the *last* occurrence of the stop
+        # string — the actual stop hit point at the tail of the output. When
+        # reasoning is enabled the decoded text concatenates thinking content
+        # and the final answer, and the stop string can legitimately appear
+        # inside the thinking section (e.g. the model quotes the stop string
+        # while planning). `find` would match that earlier occurrence and
+        # truncate the whole answer away. `rfind` correctly anchors on the
+        # real hit at the end of the normal text.
         if isinstance(matched, str) and isinstance(output, str):
-            pos = output.find(matched)
+            pos = output.rfind(matched)
             if pos == -1:
                 return output
             end = pos + len(matched)
