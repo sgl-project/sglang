@@ -824,9 +824,7 @@ class XPUAttentionBackend(AttentionBackend):
             else (-1, -1)
         )
         causal = not (
-            layer.is_cross_attention
-            or layer.attn_type
-            in (AttentionType.ENCODER_ONLY, AttentionType.DECODER_BIDIRECTIONAL)
+            layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY
         )
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
