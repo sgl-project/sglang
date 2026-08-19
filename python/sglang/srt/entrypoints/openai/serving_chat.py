@@ -21,6 +21,18 @@ class ThinkingMode(str, Enum):
 import jinja2
 import orjson
 from fastapi import Request
+
+try:
+    from mistral_common.exceptions import MistralCommonException
+
+    _MISTRAL_COMMON_ERRORS: tuple[type[BaseException], ...] = (MistralCommonException,)
+except ImportError:
+    _MISTRAL_COMMON_ERRORS = ()
+
+_CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
+    jinja2.TemplateError,
+    TypeError,
+) + _MISTRAL_COMMON_ERRORS
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
@@ -58,7 +70,9 @@ from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_for_response,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
+    process_spec_tokens_details_from_ret,
     should_include_usage,
+    spec_tokens_details_from_meta_info,
     to_openai_style_logprobs,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
@@ -1365,7 +1379,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids = self.tokenizer_manager.tokenizer.encode(
                         rendered_prompt, **encode_kwargs
                     )
-                except (jinja2.TemplateError, TypeError) as template_error:
+                except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)
                     # should be treated as client errors (400 BadRequest)
@@ -1515,6 +1529,7 @@ class OpenAIServingChat(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
+        spec_tokens_details = {}
         image_tokens = {}
         audio_tokens = {}
         video_tokens = {}
@@ -1546,6 +1561,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
+                if request.return_spec_tokens_details:
+                    spec_tokens_details[index] = spec_tokens_details_from_meta_info(
+                        content["meta_info"]
+                    )
                 image_tokens[index] = content["meta_info"].get("image_tokens", 0)
                 audio_tokens[index] = content["meta_info"].get("audio_tokens", 0)
                 video_tokens[index] = content["meta_info"].get("video_tokens", 0)
@@ -1666,15 +1685,36 @@ class OpenAIServingChat(OpenAIServingBase):
                     (v for v in routed_experts.values() if v is not None), None
                 )
 
-            sglext_details = None
+            sglext_cached_tokens_details = None
             if request.return_cached_tokens_details and cached_tokens_details:
                 first_details = next(
                     (v for v in cached_tokens_details.values() if v is not None), None
                 )
                 if first_details is not None:
-                    sglext_details = cached_tokens_details_from_dict(first_details)
+                    sglext_cached_tokens_details = cached_tokens_details_from_dict(
+                        first_details
+                    )
 
-            if sglext_routed is not None or sglext_details is not None:
+            sglext_spec_tokens_details = None
+            if request.return_spec_tokens_details and spec_tokens_details:
+                spec_details = [
+                    spec_tokens_details[index]
+                    for index in sorted(spec_tokens_details)
+                    if spec_tokens_details[index] is not None
+                ]
+                if spec_details:
+                    sglext_spec_tokens_details = (
+                        spec_details if request.n > 1 else spec_details[0]
+                    )
+
+            if any(
+                obj is not None
+                for obj in [
+                    sglext_routed,
+                    sglext_cached_tokens_details,
+                    sglext_spec_tokens_details,
+                ]
+            ):
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
@@ -1682,7 +1722,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     sglext=SglExt(
                         routed_experts=sglext_routed,
-                        cached_tokens_details=sglext_details,
+                        cached_tokens_details=sglext_cached_tokens_details,
+                        spec_tokens_details=sglext_spec_tokens_details,
                     ),
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
@@ -1782,11 +1823,24 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        spec_details = [
+            detail
+            for detail in (
+                process_spec_tokens_details_from_ret(item, request) for item in ret
+            )
+            if detail is not None
+        ]
+        spec_tokens_details = (
+            spec_details
+            if request.n > 1
+            else (spec_details[0] if spec_details else None)
+        )
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or spec_tokens_details:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                spec_tokens_details=spec_tokens_details,
             )
 
         for idx, ret_item in enumerate(ret):

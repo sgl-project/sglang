@@ -345,6 +345,14 @@ class HiCacheController:
         # Dedicated stop event for storage background threads (prefetch/backup).
         self.storage_stop_event = threading.Event()
 
+        # Storage control queues, (re)created whenever the storage threads start.
+        self.prefetch_buffer: Optional[Queue[PrefetchOperation]] = None
+        self.prefetch_sync_queue: Optional[Queue[PrefetchAck]] = None
+        self.prefetch_hit_queue: Optional[Queue[StorageOperation]] = None
+        self.ack_prefetch_queue = Queue[PrefetchAck]()
+        self.ack_backup_queue: Optional[Queue[StorageOperation]] = None
+        self.host_mem_release_queue: Optional[Queue[torch.Tensor]] = None
+
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
@@ -455,12 +463,12 @@ class HiCacheController:
         )
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
-        self.prefetch_buffer = Queue[PrefetchOperation]()
-        self.prefetch_sync_queue = Queue[PrefetchAck]()
-        self.prefetch_hit_queue: Queue[StorageOperation] = Queue()
-        self.ack_prefetch_queue = Queue[PrefetchAck]()
-        self.ack_backup_queue: Queue[StorageOperation] = Queue()
-        self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
+        self.prefetch_buffer = Queue()
+        self.prefetch_sync_queue = Queue()
+        self.prefetch_hit_queue = Queue()
+        self.ack_prefetch_queue = Queue()
+        self.ack_backup_queue = Queue()
+        self.host_mem_release_queue = Queue()
 
         self.prefetch_thread.start()
         self.prefetch_io_aux_thread.start()
