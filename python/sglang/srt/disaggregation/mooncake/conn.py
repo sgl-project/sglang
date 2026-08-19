@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -214,10 +214,6 @@ class MooncakeKVManager(CommonKVManager):
             # Per-room count of chunks not yet transferred; teardown waits for
             # zero so a deferred chunk is not dropped by an early conclude.
             self._staging_outstanding = defaultdict(int)
-            # Deferred KV release: aborted room -> (decode_ip, decode_port), ack
-            # held until the transfer drains. Written by the bootstrap thread,
-            # popped by the single transfer worker that owns the room.
-            self._deferred_ack_targets: Dict[int, Tuple[str, int]] = {}
             self.session_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
@@ -1616,39 +1612,6 @@ class MooncakeKVManager(CommonKVManager):
             is_ipv6=na.is_ipv6,
         )
 
-    def _prefill_unique_rank(self) -> int:
-        """Stable per-sender id, matching what the transfer worker syncs on Success."""
-        return (
-            self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
-            + self.pp_rank * self.attn_cp_size
-            + self.attn_cp_rank
-        )
-
-    def _send_abort_ack(self, decode_ip: str, decode_port: int, room: int) -> None:
-        """Best-effort ack that this rank's transfer for an aborted room drained."""
-        try:
-            na = NetworkAddress(decode_ip, decode_port)
-            self._send_multipart_locked(
-                na.to_tcp(),
-                [
-                    b"ABORT_ACK",
-                    str(room).encode("ascii"),
-                    str(self._prefill_unique_rank()).encode("ascii"),
-                ],
-                is_ipv6=na.is_ipv6,
-            )
-        except Exception as e:
-            logger.debug(f"Failed to send drained ABORT_ACK for room {room}: {e}")
-
-    def _maybe_ack_drained_abort(self, room: int) -> None:
-        """Send the deferred ack once an aborted room's chunks have drained
-        (outstanding == 0). pop() makes it fire at most once."""
-        if self._staging_outstanding.get(room, 0) > 0:
-            return
-        target = self._deferred_ack_targets.pop(room, None)
-        if target is not None:
-            self._send_abort_ack(target[0], target[1], room)
-
     def transfer_worker(
         self,
         queue: FastQueue,
@@ -1674,6 +1637,14 @@ class MooncakeKVManager(CommonKVManager):
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                     )
 
+                # Counted at dequeue, before the status check, so
+                # `outstanding == 0` means nothing is dequeued or in flight --
+                # the predicate the abort ack relies on. The flag survives
+                # re-enqueue on defer.
+                if not kv_chunk.staging_counted:
+                    self._staging_outstanding[kv_chunk.room] += 1
+                    kv_chunk.staging_counted = True
+
                 if (
                     kv_chunk.room not in self.request_status
                     or self.check_status(kv_chunk.room) == KVPoll.Failed
@@ -1692,11 +1663,6 @@ class MooncakeKVManager(CommonKVManager):
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
                     continue
-
-                # Count each chunk once; the flag survives re-enqueue on defer.
-                if not kv_chunk.staging_counted:
-                    self._staging_outstanding[kv_chunk.room] += 1
-                    kv_chunk.staging_counted = True
 
                 if (
                     self.enable_staging
@@ -2042,16 +2008,20 @@ class MooncakeKVManager(CommonKVManager):
                         # flight, decode falls back to the release timeout.
                         if room_active:
                             self.update_status(room_to_be_aborted, KVPoll.Failed)
-                            self._deferred_ack_targets[room_to_be_aborted] = (
-                                decode_ip,
-                                decode_port,
+                            self.register_deferred_ack_target(
+                                room_to_be_aborted, decode_ip, decode_port
                             )
+                            # Try once: the room may already be quiescent and
+                            # never revisited by the worker.
+                            self._maybe_ack_drained_abort(room_to_be_aborted)
                             logger.debug(
                                 f"Received abort notification for room {room_to_be_aborted}, "
                                 f"marked as Failed; ACK deferred until transfer drains"
                             )
-                        else:
-                            # Already completed/unknown: no in-flight write, ack now.
+                        elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
+                            # Concluded/unknown AND quiescent: ack now. A cleared
+                            # room is not automatically quiescent -- clear() can
+                            # drop a room whose chunk is still transferring.
                             self._send_abort_ack(
                                 decode_ip, decode_port, room_to_be_aborted
                             )
