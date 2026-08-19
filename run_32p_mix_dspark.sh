@@ -67,11 +67,11 @@ do
         # overlap as the default until that graph/stream combination is fixed.
         export SGLANG_NPU_FUSED_COLLECTIVE_MATMUL=0
         export SGLANG_NPU_FUSED_RMS_QUANT=1
-        export SGLANG_NPU_FUSED_KDA_VERIFY_GATES=1
-        export SGLANG_NPU_FUSED_KDA_RAGGED_IO=1
-        export SGLANG_NPU_FUSED_KDA_ONORM=1
-        export SGLANG_NPU_REUSE_KDA_VERIFY_METADATA=1
-        export SGLANG_NPU_QUANT_SHARED_AG=1
+        export SGLANG_NPU_FUSED_KDA_VERIFY_GATES=${SGLANG_NPU_FUSED_KDA_VERIFY_GATES:-1}
+        export SGLANG_NPU_FUSED_KDA_RAGGED_IO=${SGLANG_NPU_FUSED_KDA_RAGGED_IO:-1}
+        export SGLANG_NPU_FUSED_KDA_ONORM=${SGLANG_NPU_FUSED_KDA_ONORM:-1}
+        export SGLANG_NPU_REUSE_KDA_VERIFY_METADATA=${SGLANG_NPU_REUSE_KDA_VERIFY_METADATA:-1}
+        export SGLANG_NPU_QUANT_SHARED_AG=${SGLANG_NPU_QUANT_SHARED_AG:-1}
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_RAGGED_VERIFY_MODE=static
@@ -79,7 +79,7 @@ do
         # by the model code, while the proposal-side fast paths stay explicit
         # here so an inherited environment cannot silently disable them.
         export SGLANG_DSPARK_FAST_KERNEL=1
-        export SGLANG_DSPARK_FUSED_LOCAL_TOP1=1
+        export SGLANG_DSPARK_FUSED_LOCAL_TOP1=${SGLANG_DSPARK_FUSED_LOCAL_TOP1:-1}
         export SGLANG_DSPARK_FAST_SAMPLING=1
         export SGLANG_DSPARK_FOLDED_PROPOSAL=1
         export SGLANG_DSPARK_FOLDED_SAMPLING=1
