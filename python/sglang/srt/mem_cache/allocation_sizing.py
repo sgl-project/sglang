@@ -9,13 +9,8 @@ from sglang.srt.runtime_context import (
 
 
 def get_alloc_page_size() -> int:
-    """The page the allocator hands out, which is what a KV length rounds up to.
-
-    DCP builds the allocator with page_size * attn_dcp_size (see
-    kv_cache_configurator._build_token_to_kv_pool_allocator); the platform
-    allocators that skip that branch page by the scheduled size, so under DCP
-    this is an upper bound for them rather than the exact value.
-    """
+    # Mirrors _build_token_to_kv_pool_allocator's DCP branch; the platform
+    # allocators that skip it page smaller, so this is an upper bound for them.
     return get_schedule().page_size * get_parallel().attn_dcp_size
 
 
