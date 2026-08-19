@@ -820,9 +820,7 @@ class IndexerKPool(MultiPlatformOp):
                 else attn_metadata.page_table_1
             )
             assert page_table_1 is not None
-            row_index = (
-                paged_page_table_row_index if paged_page_table is not None else None
-            )
+            row_index = paged_page_table_row_index
             return page_table_1, None, row_index
         if topk_method == TopkTransformMethod.RAGGED:
             return None, attn_metadata.topk_indices_offset, None
