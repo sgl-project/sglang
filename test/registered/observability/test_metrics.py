@@ -15,7 +15,6 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
     compute_routing_key_stats,
 )
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -23,6 +22,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=74, stage="base-b", runner_config="1-gpu-small")
@@ -163,7 +163,7 @@ class TestEnableMetrics(CustomTestCase):
             if verify_metrics_extra is not None:
                 verify_metrics_extra(metrics)
         finally:
-            kill_process_tree(process.pid)
+            terminate_and_kill_process_tree(process, wait_timeout=60)
 
     def _verify_metrics_common(self, metrics_text, metrics, expect_mfu_metrics: bool):
         essential_metrics = [
