@@ -99,7 +99,7 @@ jobs:
         id: cache
         uses: actions/cache/restore@v4
         with:
-          path: python/sglang/srt/*/_core*.so
+          path: python/sglang/srt/rust_extensions/_*.so
           key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
 
       # On a miss: different hash = rust/setup.py moved; no entries = evicted.
@@ -112,7 +112,7 @@ jobs:
         run: |
           if [ -n "${MATCHED_KEY}" ]; then
               echo "hit: ${MATCHED_KEY}"
-              ls -l python/sglang/srt/*/_core*.so
+              ls -l python/sglang/srt/rust_extensions/_*.so
           else
               echo "miss: ${PRIMARY_KEY}"
               echo "entries under ${KEY_PREFIX}- (created / ref / size / key):"
@@ -134,7 +134,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact_name }}
-          # Archive holds <pkg>/_core*.so, so it unpacks into python/sglang/srt/.
+          # Archive holds rust_extensions/_*.so, so it unpacks into python/sglang/srt/.
           path: rust-ext-staging/
           if-no-files-found: error
           retention-days: 1
@@ -226,7 +226,7 @@ jobs:
       - name: Save built modules
         uses: actions/cache/save@v4
         with:
-          path: python/sglang/srt/*/_core*.so
+          path: python/sglang/srt/rust_extensions/_*.so
           key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'python/setup.py') }}
 
       - name: Upload extension modules

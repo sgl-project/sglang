@@ -27,11 +27,8 @@ class LongCatImagePipeline(LoRAPipeline, ComposedPipelineBase):
 
     pipeline_name = "LongCatImagePipeline"
 
-    # The Qwen2.5-VL text encoder is loaded in-stage by LongCatPromptRewriteStage
-    # (not via TextEncoderLoader), so "text_encoder" is intentionally absent;
-    # the stage registers the loaded module via add_module("text_encoder", ...)
-    # so the standard TextEncodingStage can fetch the same instance.
     _required_config_modules = [
+        "text_encoder",
         "tokenizer",
         "text_processor",
         "vae",
@@ -41,23 +38,17 @@ class LongCatImagePipeline(LoRAPipeline, ComposedPipelineBase):
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         # 1. Prompt rewriting (optional) + request-level setup (generator, cfg renorm).
-        #    Loads the HF Qwen2.5-VL encoder and shares it with TextEncodingStage.
         rewrite_stage = LongCatPromptRewriteStage(
-            tokenizer=self.get_module("tokenizer"),
+            text_encoder=self.get_module("text_encoder"),
             text_processor=self.get_module("text_processor"),
-            model_path=self.model_path,
             text_encoder_dtype=PRECISION_TO_TYPE[
                 server_args.pipeline_config.text_encoder_precisions[0]
             ],
         )
         self.add_stage(rewrite_stage)
-        self.add_module("text_encoder", rewrite_stage.text_encoder)
 
         # 2. Text encoding via the standard stage (tokenize_prompt +
-        #    postprocess_text_funcs hooks on the pipeline config). Shares the
-        #    encoder instance registered above; both stages declare a
-        #    "text_encoder" ComponentUse so the residency manager keeps it
-        #    resident across rewrite->encode and offloads after the last use.
+        #    postprocess_text_funcs hooks on the pipeline config).
         self.add_standard_text_encoding_stage()
 
         # 3. Latent preparation (batch-size-aware via pipeline config hooks)

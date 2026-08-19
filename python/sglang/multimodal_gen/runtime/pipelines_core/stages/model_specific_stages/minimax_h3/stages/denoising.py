@@ -16,8 +16,7 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     is_fsdp_managed_module,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -36,6 +35,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
@@ -405,14 +405,27 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     ) -> None:
         quality = getattr(batch.sampling_params, "quality", "lossless")
         explicit_fields = getattr(batch.sampling_params, "_explicit_fields", ())
-        generic_requested = (
-            super()._cache_dit_requested() and "quality" not in explicit_fields
+        enable_override = batch.sampling_params.enable_cache_dit
+        generic_enabled = (
+            super()._cache_dit_requested()
+            if enable_override is None
+            else enable_override
         )
-        desired_mode = (
-            "high" if quality == "high" else ("generic" if generic_requested else None)
-        )
+        generic_requested = generic_enabled and "quality" not in explicit_fields
+        if enable_override is False:
+            # The per-request kill switch wins over quality="high".
+            desired_mode = None
+        elif quality == "high":
+            desired_mode = "high"
+        else:
+            desired_mode = "generic" if generic_requested else None
         current_mode = getattr(self, "_minimax_h3_cache_mode", None)
         self._minimax_h3_quality = quality
+
+        if self.server_args.enable_breakable_cuda_graph:
+            if desired_mode is not None:
+                super()._maybe_enable_cache_dit(num_inference_steps, batch)
+            return
 
         # H3 is monolithic-only, and the scheduler executes one worker batch at
         # a time. Combined with `quality` in the dynamic-batch signature, this
@@ -422,9 +435,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             # Cache-DiT still holds references to their inputs. Settle the state
             # fields before restoring the in-place path, so a failure there
             # costs throughput rather than leaving the stage inconsistent.
-            self.transformer = disable_cache_on_transformer(self.transformer)
-            self._cache_dit_enabled = False
-            self._cached_num_steps = None
+            self._unmount_cache_dit()
             self._minimax_h3_cache_mode = None
             self._set_cache_dit_input_preservation(False)
 
@@ -480,6 +491,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         # mounted.
         self._cache_dit_enabled = False
         self._cached_num_steps = None
+        self._cache_dit_active_key = None
         self._minimax_h3_cache_mode = None
         self._set_cache_dit_input_preservation(False)
 
@@ -593,9 +605,16 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         )
 
         ctx = _resolve_full_loop_context(batch)
-        device = get_local_torch_device()
-        if device.type not in ("cuda", "xpu"):
-            raise RuntimeError("MiniMax H3 full-loop denoise requires CUDA or XPU")
+
+        if not (
+            current_platform.is_cuda()
+            or current_platform.is_mps()
+            or current_platform.is_xpu()
+        ):
+            raise RuntimeError(
+                "MiniMax H3 full-loop denoise requires CUDA, MPS, or XPU"
+            )
+        device = current_platform.get_local_torch_device()
         sigmas_video = [float(v) for v in ctx.sigmas["video"]]
         self._maybe_enable_cache_dit_and_torch_compile(
             len(sigmas_video) - 1,
