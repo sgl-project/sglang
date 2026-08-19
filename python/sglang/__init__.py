@@ -20,8 +20,7 @@ import os as _os
 from pathlib import Path as _Path
 
 if (
-    _os.environ.get("SGLANG_K3_AITER_M16384_PROFILE", "0").lower()
-    in ("1", "true")
+    _os.environ.get("SGLANG_K3_AITER_M16384_PROFILE", "0").lower() in ("1", "true")
     and "AITER_CONFIG_GEMM_BF16" not in _os.environ
 ):
     _aiter_spec = _importlib_util.find_spec("aiter")
@@ -29,9 +28,7 @@ if (
         _aiter_root = _Path(_aiter_spec.origin).resolve().parent
         _base = _aiter_root / "configs" / "bf16_tuned_gemm.csv"
         _model_configs = sorted(
-            (_aiter_root / "configs" / "model_configs").glob(
-                "*bf16_tuned_gemm*.csv"
-            )
+            (_aiter_root / "configs" / "model_configs").glob("*bf16_tuned_gemm*.csv")
         )
         _profile = (
             _Path(__file__).resolve().parent
@@ -43,9 +40,7 @@ if (
         )
         _paths = [_base, *_model_configs, _profile]
         if all(_path.is_file() for _path in _paths):
-            _os.environ["AITER_CONFIG_GEMM_BF16"] = _os.pathsep.join(
-                map(str, _paths)
-            )
+            _os.environ["AITER_CONFIG_GEMM_BF16"] = _os.pathsep.join(map(str, _paths))
 del _importlib_util
 del _os
 del _Path

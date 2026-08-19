@@ -9,7 +9,6 @@ import functools
 import math
 
 import torch
-
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.utils import is_flydsl_available
 

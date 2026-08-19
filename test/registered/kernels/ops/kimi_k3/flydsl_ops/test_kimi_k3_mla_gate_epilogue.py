@@ -3,13 +3,16 @@
 
 import pytest
 import torch
-
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.utils import is_flydsl_available
+
 from sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_mla_gate import (
     kimi_k3_mla_gate,
     supports_kimi_k3_mla_gate,
 )
-from aiter.ops.flydsl.utils import is_flydsl_available
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=60, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _gfx950_flydsl_available() -> bool:
@@ -149,3 +152,9 @@ def test_kimi_k3_mla_gate_rejects_invalid_output(shape, dtype):
 
     with pytest.raises(ValueError, match="out must be contiguous BF16"):
         kimi_k3_mla_gate(hidden, weight, attention, out=output)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

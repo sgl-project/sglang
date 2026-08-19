@@ -11,6 +11,12 @@ scaled in FP32 and accumulated in FP32.  The final store is BF16.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    ptr_rsrc,
+)
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as arith_dialect
 from flydsl._mlir.dialects import llvm, scf
@@ -19,13 +25,6 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import T
-
-from aiter.ops.flydsl.kernels import buffer_ops, vector
-from aiter.ops.flydsl.kernels.tensor_shim import (
-    AITER_FLYDSL_KERNARG_PRELOAD,
-    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    ptr_rsrc,
-)
 
 _INPUT_FEATURES = 7168
 _PADDED_OUTPUT_FEATURES = 6288
@@ -103,9 +102,7 @@ def build_kimi_k3_kda_input_group64_module(
         output_rsrc = ptr_rsrc(output)
         token = ArithValue(gpu.block_idx.y)
         hidden_token_base = token * arith.constant(_INPUT_FEATURES, type=i32)
-        output_token_base = token * arith.constant(
-            _PADDED_OUTPUT_FEATURES, type=i32
-        )
+        output_token_base = token * arith.constant(_PADDED_OUTPUT_FEATURES, type=i32)
         hidden_lds = fx.SharedAllocator().allocate(SharedStorage).peek().hidden.ptr
         vec2_f32 = T.vec(2, f32)
         vec2_bf16 = T.vec(2, T.bf16)
@@ -198,9 +195,7 @@ def build_kimi_k3_kda_input_group64_module(
                 load_if = scf.IfOp(can_load)
                 with ir.InsertionPoint(load_if.then_block):
                     fx.ptr_store(
-                        load_bf16x16(
-                            hidden_rsrc, hidden_token_base + element_index
-                        ),
+                        load_bf16x16(hidden_rsrc, hidden_token_base + element_index),
                         hidden_lds + element_index,
                     )
                     scf.YieldOp([])

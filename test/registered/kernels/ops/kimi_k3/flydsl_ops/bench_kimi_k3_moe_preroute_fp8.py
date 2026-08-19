@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Graph microbenchmark for Kimi-K3 preroute projections."""
 
 import argparse
@@ -10,16 +9,17 @@ from sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_moe_preroute_fp8 import (
     kimi_k3_moe_tri_projection_cooperative_preactivated_fp8,
     kimi_k3_moe_tri_projection_fp8,
 )
+from sglang.test.ci.ci_register import register_amd_ci
+from sglang.utils import is_in_ci
+
+register_amd_ci(est_time=120, stage="jit-kernel-benchmark", runner_config="amd")
 
 
 def quantize_rows(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     value = weight.float()
     scale = value.abs().amax(dim=1).clamp_min(1e-12) / 448.0
     return (
-        (value / scale[:, None])
-        .clamp(-448, 448)
-        .to(torch.float8_e4m3fn)
-        .contiguous(),
+        (value / scale[:, None]).clamp(-448, 448).to(torch.float8_e4m3fn).contiguous(),
         scale.contiguous(),
     )
 
@@ -61,9 +61,7 @@ def main() -> None:
     args = parser.parse_args()
     torch.manual_seed(20260817)
     device = torch.device("cuda")
-    hidden = torch.randn(
-        (args.tokens, 7168), dtype=torch.bfloat16, device=device
-    )
+    hidden = torch.randn((args.tokens, 7168), dtype=torch.bfloat16, device=device)
     routed_bf16 = torch.randn((3584, 7168), dtype=torch.bfloat16, device=device)
     shared_bf16 = torch.randn((1536, 7168), dtype=torch.bfloat16, device=device)
     router = torch.randn((896, 7168), dtype=torch.bfloat16, device=device)
@@ -72,14 +70,9 @@ def main() -> None:
     merged = torch.cat((shared_bf16, router, routed_bf16), dim=0).contiguous()
     if args.tokens in (2, 4):
         shared = (
-            shared.view(2, 768, 7168)
-            .permute(1, 0, 2)
-            .contiguous()
-            .view(1536, 7168)
+            shared.view(2, 768, 7168).permute(1, 0, 2).contiguous().view(1536, 7168)
         )
-        shared_scale = (
-            shared_scale.view(2, 768).t().contiguous().view(1536)
-        )
+        shared_scale = shared_scale.view(2, 768).t().contiguous().view(1536)
 
         def rowdot_fn():
             return kimi_k3_moe_tri_projection_cooperative_preactivated_fp8(
@@ -122,4 +115,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if is_in_ci():
+        print("Skipping bench_kimi_k3_moe_preroute_fp8.py in CI")
+        raise SystemExit(0)
     main()

@@ -10,23 +10,21 @@ activation quantization out of the decode graph while halving weight traffic.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith as arith_dialect
-from flydsl._mlir.dialects import scf
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, const_expr, gpu, range_constexpr
-
 from aiter.ops.flydsl.kernels import buffer_ops, vector
-from flydsl.expr.arith import ArithValue, CmpIPredicate
-from flydsl.expr.rocdl import cvt_pk_f32_fp8
-from flydsl.expr.typing import T
-from aiter.ops.flydsl.kernels.vector import ReductionOp
-
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     ptr_rsrc,
 )
+from aiter.ops.flydsl.kernels.vector import ReductionOp
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import arith as arith_dialect
+from flydsl._mlir.dialects import scf
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, const_expr, gpu, range_constexpr
+from flydsl.expr.arith import ArithValue, CmpIPredicate
+from flydsl.expr.rocdl import cvt_pk_f32_fp8
+from flydsl.expr.typing import T
 
 _HIDDEN_SIZE = 7168
 _ROUTED_SIZE = 3584

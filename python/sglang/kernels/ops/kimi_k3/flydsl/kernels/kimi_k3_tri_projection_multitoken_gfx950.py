@@ -9,6 +9,12 @@ from pathlib import Path
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels.tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    ptr_rsrc,
+)
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import arith as arith_dialect
 from flydsl._mlir.dialects import llvm, scf
@@ -18,13 +24,6 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import T
-
-from aiter.ops.flydsl.kernels import buffer_ops, vector
-from aiter.ops.flydsl.kernels.tensor_shim import (
-    AITER_FLYDSL_KERNARG_PRELOAD,
-    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    ptr_rsrc,
-)
 
 _HIDDEN = 7168
 _ROUTED = 3584
@@ -91,9 +90,9 @@ def build_kimi_k3_multitoken_tri_projection_module(
     persistent_iterations = (_TOTAL + groups_per_grid - 1) // groups_per_grid
     hidden_elements = token_tile * _HIDDEN
     handoff_elements = (waves_per_block // 2) * token_tile * 2
-    hidden_load_iterations = (
-        hidden_elements + block_threads * _VEC - 1
-    ) // (block_threads * _VEC)
+    hidden_load_iterations = (hidden_elements + block_threads * _VEC - 1) // (
+        block_threads * _VEC
+    )
 
     @fx.struct
     class SharedStorage:
@@ -163,15 +162,11 @@ def build_kimi_k3_multitoken_tri_projection_module(
         beta_f32 = arith.constant(float(situ_beta), type=f32)
         inv_beta_f32 = arith.constant(1.0 / float(situ_beta), type=f32)
         linear_beta_f32 = arith.constant(float(situ_linear_beta), type=f32)
-        inv_linear_beta_f32 = arith.constant(
-            1.0 / float(situ_linear_beta), type=f32
-        )
+        inv_linear_beta_f32 = arith.constant(1.0 / float(situ_linear_beta), type=f32)
 
         def sigmoid(value):
             if const_expr(fast_situ):
-                exponent = fx.math.exp2(
-                    -value * fx.Float32(_LOG2E)
-                )
+                exponent = fx.math.exp2(-value * fx.Float32(_LOG2E))
             else:
                 exponent = ocml_exp_f32(-value)
             return one_f32 / (one_f32 + exponent)
@@ -225,21 +220,34 @@ def build_kimi_k3_multitoken_tri_projection_module(
                 lp = vector.from_elements(
                     vec2_bf16,
                     [
-                        vector.extract(left, static_position=[pair * 2], dynamic_position=[]),
-                        vector.extract(left, static_position=[pair * 2 + 1], dynamic_position=[]),
+                        vector.extract(
+                            left, static_position=[pair * 2], dynamic_position=[]
+                        ),
+                        vector.extract(
+                            left, static_position=[pair * 2 + 1], dynamic_position=[]
+                        ),
                     ],
                 )
                 rp = vector.from_elements(
                     vec2_bf16,
                     [
-                        vector.extract(right, static_position=[pair * 2], dynamic_position=[]),
-                        vector.extract(right, static_position=[pair * 2 + 1], dynamic_position=[]),
+                        vector.extract(
+                            right, static_position=[pair * 2], dynamic_position=[]
+                        ),
+                        vector.extract(
+                            right, static_position=[pair * 2 + 1], dynamic_position=[]
+                        ),
                     ],
                 )
                 dot = llvm.call_intrinsic(
                     f32,
                     "llvm.amdgcn.fdot2.f32.bf16",
-                    [lp, rp, dot, arith.constant(False, type=ir.IntegerType.get_signless(1))],
+                    [
+                        lp,
+                        rp,
+                        dot,
+                        arith.constant(False, type=ir.IntegerType.get_signless(1)),
+                    ],
                     [],
                     [],
                 )
@@ -254,14 +262,11 @@ def build_kimi_k3_multitoken_tri_projection_module(
                         arith.constant(_WAVE, type=i32),
                     )
                 )
-                result = arith_dialect.AddFOp(
-                    result, peer, fastmath=fm_fast
-                ).result
+                result = arith_dialect.AddFOp(result, peer, fastmath=fm_fast).result
             return ArithValue(result)
 
         first_group = (
-            ArithValue(gpu.block_idx.x)
-            * arith.constant(waves_per_block, type=i32)
+            ArithValue(gpu.block_idx.x) * arith.constant(waves_per_block, type=i32)
             + wave
         )
         for tile_start in range_constexpr(0, num_tokens, token_tile):
@@ -320,14 +325,9 @@ def build_kimi_k3_multitoken_tri_projection_module(
                         else:
                             shared_weight_row = (
                                 shared_pair
-                                + shared_role
-                                * arith.constant(
-                                    _SHARED // 2, type=i32
-                                )
+                                + shared_role * arith.constant(_SHARED // 2, type=i32)
                             )
-                        scale_if = scf.IfOp(
-                            is_routed, results_=[f32], has_else=True
-                        )
+                        scale_if = scf.IfOp(is_routed, results_=[f32], has_else=True)
                         with ir.InsertionPoint(scale_if.then_block):
                             scale = buffer_ops.buffer_load(
                                 routed_scale_rsrc, row, vec_width=1, dtype=f32
@@ -344,8 +344,7 @@ def build_kimi_k3_multitoken_tri_projection_module(
                         accumulators = [ArithValue(zero_f32) for _ in range(token_tile)]
                         for k_iter in range_constexpr(_HIDDEN // (_WAVE * _VEC)):
                             k_element = (
-                                lane
-                                + arith.constant(k_iter * _WAVE, type=i32)
+                                lane + arith.constant(k_iter * _WAVE, type=i32)
                             ) * arith.constant(_VEC, type=i32)
                             weight_if = scf.IfOp(
                                 is_routed, results_=[vec8_f32], has_else=True
@@ -353,8 +352,7 @@ def build_kimi_k3_multitoken_tri_projection_module(
                             with ir.InsertionPoint(weight_if.then_block):
                                 weight = load_fp8x8(
                                     routed_weight_rsrc,
-                                    row * arith.constant(_HIDDEN, type=i32)
-                                    + k_element,
+                                    row * arith.constant(_HIDDEN, type=i32) + k_element,
                                 )
                                 scf.YieldOp([_raw(weight)])
                             with ir.InsertionPoint(weight_if.else_block):
@@ -365,15 +363,11 @@ def build_kimi_k3_multitoken_tri_projection_module(
                                     + k_element,
                                 )
                                 scf.YieldOp([_raw(weight)])
-                            weight_bf16 = arith.trunc_f(
-                                vec8_bf16, weight_if.results[0]
-                            )
+                            weight_bf16 = arith.trunc_f(vec8_bf16, weight_if.results[0])
                             for token_local in range_constexpr(token_tile):
                                 h = fx.ptr_load(
                                     hidden_lds
-                                    + arith.constant(
-                                        token_local * _HIDDEN, type=i32
-                                    )
+                                    + arith.constant(token_local * _HIDDEN, type=i32)
                                     + k_element,
                                     result_type=vec8_bf16,
                                 )
@@ -397,24 +391,15 @@ def build_kimi_k3_multitoken_tri_projection_module(
                                     buffer_ops.buffer_store(
                                         result,
                                         routed_output_rsrc,
-                                        arith.constant(
-                                            token * _ROUTED, type=i32
-                                        )
-                                        + row,
+                                        arith.constant(token * _ROUTED, type=i32) + row,
                                     )
                                     scf.YieldOp([])
                                 with ir.InsertionPoint(output_if.else_block):
-                                    pair_local = wave // arith.constant(
-                                        2, type=i32
-                                    )
+                                    pair_local = wave // arith.constant(2, type=i32)
                                     scratch_index = (
                                         pair_local
-                                        * arith.constant(
-                                            token_tile * 2, type=i32
-                                        )
-                                        + arith.constant(
-                                            token_local * 2, type=i32
-                                        )
+                                        * arith.constant(token_tile * 2, type=i32)
+                                        + arith.constant(token_local * 2, type=i32)
                                         + shared_role
                                     )
                                     fx.ptr_store(
@@ -428,25 +413,18 @@ def build_kimi_k3_multitoken_tri_projection_module(
                     with ir.InsertionPoint(precision_if.else_block):
                         router_row = row - arith.constant(_FP8_OUT, type=i32)
                         accumulators = [ArithValue(zero_f32) for _ in range(token_tile)]
-                        for k_iter in range_constexpr(
-                            _HIDDEN // (_WAVE * _VEC)
-                        ):
+                        for k_iter in range_constexpr(_HIDDEN // (_WAVE * _VEC)):
                             k = (
-                                lane
-                                + arith.constant(k_iter * _WAVE, type=i32)
+                                lane + arith.constant(k_iter * _WAVE, type=i32)
                             ) * arith.constant(_VEC, type=i32)
                             weight_bf16 = load_bf16x8(
                                 router_weight_rsrc,
-                                router_row
-                                * arith.constant(_HIDDEN, type=i32)
-                                + k,
+                                router_row * arith.constant(_HIDDEN, type=i32) + k,
                             )
                             for token_local in range_constexpr(token_tile):
                                 hidden_bf16 = fx.ptr_load(
                                     hidden_lds
-                                    + arith.constant(
-                                        token_local * _HIDDEN, type=i32
-                                    )
+                                    + arith.constant(token_local * _HIDDEN, type=i32)
                                     + k,
                                     result_type=vec8_bf16,
                                 )
@@ -477,9 +455,7 @@ def build_kimi_k3_multitoken_tri_projection_module(
                                 )
                             store_if = scf.IfOp(last_lane)
                             with ir.InsertionPoint(store_if.then_block):
-                                rounded = arith.trunc_f(
-                                    T.bf16, _raw(accumulator)
-                                )
+                                rounded = arith.trunc_f(T.bf16, _raw(accumulator))
                                 buffer_ops.buffer_store(
                                     arith.extf(f32, rounded),
                                     router_output_rsrc,
@@ -493,13 +469,9 @@ def build_kimi_k3_multitoken_tri_projection_module(
                         scf.YieldOp([])
                     scf.YieldOp([])
                 if const_expr(cooperative_preactivate_shared):
-                    block_first_group = (
-                        ArithValue(gpu.block_idx.x)
-                        * arith.constant(waves_per_block, type=i32)
-                        + arith.constant(
-                            persistent_index * groups_per_grid, type=i32
-                        )
-                    )
+                    block_first_group = ArithValue(gpu.block_idx.x) * arith.constant(
+                        waves_per_block, type=i32
+                    ) + arith.constant(persistent_index * groups_per_grid, type=i32)
                     shared_lower = arith.cmpi(
                         CmpIPredicate.uge,
                         block_first_group,
@@ -510,13 +482,9 @@ def build_kimi_k3_multitoken_tri_projection_module(
                         block_first_group,
                         arith.constant(_FP8_OUT, type=i32),
                     )
-                    shared_iteration = arith.andi(
-                        shared_lower, shared_upper
-                    )
+                    shared_iteration = arith.andi(shared_lower, shared_upper)
                     shared_iteration_if = scf.IfOp(shared_iteration)
-                    with ir.InsertionPoint(
-                        shared_iteration_if.then_block
-                    ):
+                    with ir.InsertionPoint(shared_iteration_if.then_block):
                         gpu.barrier()
                         is_gate_wave = arith.cmpi(
                             CmpIPredicate.eq,
@@ -530,15 +498,9 @@ def build_kimi_k3_multitoken_tri_projection_module(
                                 row - arith.constant(_ROUTED, type=i32)
                             ) // arith.constant(2, type=i32)
                             for token_local in range_constexpr(token_tile):
-                                scratch_base = (
-                                    pair_local
-                                    * arith.constant(
-                                        token_tile * 2, type=i32
-                                    )
-                                    + arith.constant(
-                                        token_local * 2, type=i32
-                                    )
-                                )
+                                scratch_base = pair_local * arith.constant(
+                                    token_tile * 2, type=i32
+                                ) + arith.constant(token_local * 2, type=i32)
                                 gate = ArithValue(
                                     arith.extf(
                                         f32,
@@ -563,15 +525,12 @@ def build_kimi_k3_multitoken_tri_projection_module(
                                         ),
                                     )
                                 )
-                                activated = arith.trunc_f(
-                                    T.bf16, _raw(situ(gate, up))
-                                )
+                                activated = arith.trunc_f(T.bf16, _raw(situ(gate, up)))
                                 buffer_ops.buffer_store(
                                     activated,
                                     shared_output_rsrc,
                                     arith.constant(
-                                        (tile_start + token_local)
-                                        * (_SHARED // 2),
+                                        (tile_start + token_local) * (_SHARED // 2),
                                         type=i32,
                                     )
                                     + shared_pair,

@@ -742,10 +742,7 @@ class KimiK3MoE(nn.Module):
                 .view(1536, 7168)
             )
             self._preroute_shared_interleaved_scale = (
-                self._preroute_shared_scale.view(2, 768)
-                .t()
-                .contiguous()
-                .view(1536)
+                self._preroute_shared_scale.view(2, 768).t().contiguous().view(1536)
             )
         (
             self._preroute_shared_down_weight,

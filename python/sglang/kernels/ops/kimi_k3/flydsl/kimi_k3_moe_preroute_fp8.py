@@ -10,7 +10,6 @@ import math
 import os
 
 import torch
-
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.utils import is_flydsl_available
 
@@ -272,15 +271,9 @@ def _tri_cooperative_preactivated_launcher(
         num_tokens=num_tokens,
         token_tile=num_tokens,
         cu_count=int(os.environ.get("SGLANG_K3_PREROUTE_COOP_CU", "256")),
-        waves_per_block=int(
-            os.environ.get("SGLANG_K3_PREROUTE_COOP_WPB", "8")
-        ),
-        waves_per_eu=int(
-            os.environ.get("SGLANG_K3_PREROUTE_COOP_WPE", "3")
-        ),
-        weight_cache_modifier=int(
-            os.environ.get("SGLANG_K3_PREROUTE_COOP_WCM", "3")
-        ),
+        waves_per_block=int(os.environ.get("SGLANG_K3_PREROUTE_COOP_WPB", "8")),
+        waves_per_eu=int(os.environ.get("SGLANG_K3_PREROUTE_COOP_WPE", "3")),
+        weight_cache_modifier=int(os.environ.get("SGLANG_K3_PREROUTE_COOP_WCM", "3")),
         interleaved_shared_pairs=True,
         fast_situ=fast_situ,
         situ_beta=situ_beta,
@@ -323,12 +316,8 @@ def kimi_k3_moe_tri_projection_cooperative_preactivated_fp8(
 
     num_tokens = int(hidden.shape[0])
     routed_output = hidden.new_empty((num_tokens, _ROUTED_SIZE))
-    shared_output = hidden.new_empty(
-        (num_tokens, _SHARED_INTERMEDIATE_SIZE)
-    )
-    router_output = hidden.new_empty(
-        (num_tokens, _ROUTER_SIZE), dtype=torch.float32
-    )
+    shared_output = hidden.new_empty((num_tokens, _SHARED_INTERMEDIATE_SIZE))
+    router_output = hidden.new_empty((num_tokens, _ROUTER_SIZE), dtype=torch.float32)
     _tri_cooperative_preactivated_launcher(
         num_tokens,
         float(situ_beta),
@@ -451,9 +440,7 @@ def kimi_k3_shared_down_fp8(
         or tuple(out.shape) != (gate_up.shape[0], _HIDDEN_SIZE)
         or not out.is_contiguous()
     ):
-        raise ValueError(
-            "out must be contiguous BF16 [M,7168] on the same device"
-        )
+        raise ValueError("out must be contiguous BF16 [M,7168] on the same device")
     else:
         output = out
     _shared_down_launcher(

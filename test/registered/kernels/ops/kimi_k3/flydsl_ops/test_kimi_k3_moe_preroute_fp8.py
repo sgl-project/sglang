@@ -4,12 +4,13 @@
 import pytest
 import torch
 import torch.nn.functional as F
-
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.utils import is_flydsl_available
+
 from sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_moe_preroute_fp8 import (
     is_kimi_k3_moe_preroute_fp8_available,
-    kimi_k3_moe_tri_projection_cooperative_preactivated_fp8,
     kimi_k3_moe_dual_projection_fp8,
+    kimi_k3_moe_tri_projection_cooperative_preactivated_fp8,
     kimi_k3_moe_tri_projection_fp8,
     kimi_k3_shared_down_fp8,
     supports_kimi_k3_moe_dual_projection_fp8,
@@ -18,7 +19,9 @@ from sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_moe_preroute_fp8 import (
     supports_kimi_k3_shared_down_fp8,
     supports_kimi_k3_shared_down_fp8_weight,
 )
-from aiter.ops.flydsl.utils import is_flydsl_available
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=120, stage="jit-kernel-unit", runner_config="amd")
 
 _FP8_MAX = 448.0
 
@@ -236,40 +239,29 @@ def test_kimi_k3_preroute_fp8_matches_dequantized_reference():
 )
 def test_kimi_k3_cooperative_preactivated_projection(num_tokens: int):
     torch.manual_seed(20260818 + num_tokens)
-    hidden = torch.randn(
-        (num_tokens, 7168), device="cuda", dtype=torch.bfloat16
-    )
+    hidden = torch.randn((num_tokens, 7168), device="cuda", dtype=torch.bfloat16)
     routed_bf16 = torch.randn((3584, 7168), device="cuda", dtype=torch.bfloat16)
     shared_bf16 = torch.randn((1536, 7168), device="cuda", dtype=torch.bfloat16)
     router_bf16 = torch.randn((896, 7168), device="cuda", dtype=torch.bfloat16)
     routed_weight, routed_scale = _quantize_rows(routed_bf16)
     shared_weight, shared_scale = _quantize_rows(shared_bf16)
     shared_interleaved = (
-        shared_weight.view(2, 768, 7168)
-        .permute(1, 0, 2)
-        .contiguous()
-        .view(1536, 7168)
+        shared_weight.view(2, 768, 7168).permute(1, 0, 2).contiguous().view(1536, 7168)
     )
-    shared_scale_interleaved = (
-        shared_scale.view(2, 768).t().contiguous().view(1536)
-    )
+    shared_scale_interleaved = shared_scale.view(2, 768).t().contiguous().view(1536)
 
-    routed, activated, router = (
-        kimi_k3_moe_tri_projection_cooperative_preactivated_fp8(
-            hidden,
-            routed_weight,
-            routed_scale,
-            shared_interleaved,
-            shared_scale_interleaved,
-            router_bf16,
-            situ_beta=4.0,
-            situ_linear_beta=25.0,
-            fast_situ=True,
-        )
+    routed, activated, router = kimi_k3_moe_tri_projection_cooperative_preactivated_fp8(
+        hidden,
+        routed_weight,
+        routed_scale,
+        shared_interleaved,
+        shared_scale_interleaved,
+        router_bf16,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+        fast_situ=True,
     )
-    routed_ref = hidden.float() @ (
-        routed_weight.float() * routed_scale[:, None]
-    ).t()
+    routed_ref = hidden.float() @ (routed_weight.float() * routed_scale[:, None]).t()
     gate_up_ref = (
         hidden.float() @ (shared_weight.float() * shared_scale[:, None]).t()
     ).to(torch.bfloat16)
@@ -311,3 +303,9 @@ def test_kimi_k3_cooperative_preactivated_projection(num_tokens: int):
     graph.replay()
     for actual, reference in zip(captured, expected):
         torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

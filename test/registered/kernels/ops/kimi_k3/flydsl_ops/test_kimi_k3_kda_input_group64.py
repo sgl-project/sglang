@@ -5,8 +5,8 @@ import importlib
 
 import pytest
 import torch
-
 from aiter.jit.utils.chip_info import get_gfx
+
 from sglang.kernels.ops.kimi_k3.flydsl.kernels.kimi_k3_kda_input_group64_gfx950 import (
     build_kimi_k3_kda_input_group64_module,
 )
@@ -15,8 +15,13 @@ from sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_kda_input_group64 import (
     quantize_kimi_k3_kda_input_group64,
     supports_kimi_k3_kda_input_group64,
 )
+from sglang.test.ci.ci_register import register_amd_ci
 
-group64_module = importlib.import_module("sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_kda_input_group64")
+register_amd_ci(est_time=60, stage="jit-kernel-unit", runner_config="amd")
+
+group64_module = importlib.import_module(
+    "sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_kda_input_group64"
+)
 
 
 def test_support_predicate_fails_closed_off_gpu() -> None:
@@ -161,3 +166,9 @@ def test_group64_projection_matches_dequantized_reference_on_gfx950(
     assert relative_rmse <= 5e-4
     assert torch.all(cosine >= 0.99999)
     assert torch.count_nonzero(actual[:, stored_rows:]).item() == 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

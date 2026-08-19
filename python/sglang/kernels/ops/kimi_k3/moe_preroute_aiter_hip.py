@@ -18,11 +18,8 @@ def enabled() -> bool:
 def cooperative_preactivated_enabled() -> bool:
     return (
         enabled()
-        and os.environ.get("SGLANG_K3_FLYDSL_SOURCE", "auto").lower()
-        != "aiter"
-        and os.environ.get(
-            "SGLANG_K3_PREROUTE_PREACTIVATED_SHARED", "0"
-        ).lower()
+        and os.environ.get("SGLANG_K3_FLYDSL_SOURCE", "auto").lower() != "aiter"
+        and os.environ.get("SGLANG_K3_PREROUTE_PREACTIVATED_SHARED", "0").lower()
         in ("1", "true")
     )
 
@@ -106,9 +103,7 @@ def run_tri_cooperative_preactivated(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     op, _ = _preactivated_ops()
     if op is None:
-        raise RuntimeError(
-            "Kimi-K3 cooperative preactivated projection is unavailable"
-        )
+        raise RuntimeError("Kimi-K3 cooperative preactivated projection is unavailable")
     return op(
         hidden,
         routed_weight,

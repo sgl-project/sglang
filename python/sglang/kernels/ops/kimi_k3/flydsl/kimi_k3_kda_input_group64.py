@@ -8,11 +8,11 @@ from __future__ import annotations
 import functools
 
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 from .kernels.kimi_k3_kda_input_group64_gfx950 import (
     build_kimi_k3_kda_input_group64_module,
 )
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
 
 _HIDDEN = 7168
 _PADDED_OUTPUT = 6288

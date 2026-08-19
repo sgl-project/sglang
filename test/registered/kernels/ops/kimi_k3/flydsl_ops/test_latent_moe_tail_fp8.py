@@ -3,8 +3,8 @@
 
 import pytest
 import torch
-
 from aiter.jit.utils.chip_info import get_gfx_runtime
+
 from sglang.kernels.ops.kimi_k3.flydsl.kernels.latent_moe_tail_fp8_gfx950 import (
     build_b1_latent_moe_tail_fp8_persistent_module,
 )
@@ -13,6 +13,9 @@ from sglang.kernels.ops.kimi_k3.flydsl.latent_moe_tail_fp8 import (
     quantize_latent_moe_tail_weight,
     supports_latent_moe_tail_fp8,
 )
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=60, stage="jit-kernel-unit", runner_config="amd")
 
 LATENT_DIM = 3584
 HIDDEN_DIM = 7168
@@ -136,3 +139,9 @@ def test_latent_moe_tail_fp8_matches_dequantized_oracle_and_replays():
     graph.replay()
     torch.cuda.synchronize()
     assert not torch.equal(previous, actual)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

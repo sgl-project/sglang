@@ -7,19 +7,18 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, scf
-from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, const_expr, gpu, range_constexpr
-from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
-from flydsl.expr.typing import T
-
 from aiter.ops.flydsl.kernels import buffer_ops, vector
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     ptr_rsrc,
 )
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm, scf
+from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.expr import arith, const_expr, gpu, range_constexpr
+from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
+from flydsl.expr.typing import T
 
 _HIDDEN = 7168
 _OUTPUT = 1536
@@ -156,7 +155,11 @@ def build_kimi_k3_mla_gate_module(
             # bf16 attention multiply in fp32-equivalent arithmetic, result->bf16.
             projected_bf16 = arith.trunc_f(T.bf16, _raw(dot))
             projected = ArithValue(arith.extf(f32, projected_bf16))
-            is_negative = arith.cmpf(CmpFPredicate.OLT, projected, fx.Float32(0.0))
+            is_negative = arith.cmpf(
+                CmpFPredicate.OLT,  # codespell:ignore
+                projected,
+                fx.Float32(0.0),
+            )
             magnitude = ArithValue(
                 arith.select(is_negative, _raw(-projected), _raw(projected))
             )
