@@ -516,9 +516,9 @@ impl From<MmResample> for sglang_mm::qwen_vl::Resampler {
 
 fn join_host_port(host: &str, port: u16) -> String {
     if host.contains(':') && !host.starts_with('[') {
-        return format!("[{host}]:{port}"); // bare IPv6 (`::`) needs brackets to bind
+        format!("[{host}]:{port}") // bare IPv6 (`::`) needs brackets to bind
     } else {
-        return format!("{host}:{port}");
+        format!("{host}:{port}")
     }
 }
 
@@ -567,10 +567,10 @@ impl ServerArgs {
             .as_deref()
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.log_level);
-        return matches!(
+        matches!(
             level.to_ascii_lowercase().as_str(),
             "trace" | "debug" | "info"
-        );
+        )
     }
 
     /// Pinned API threads for the embedded HTTP api-server. Python `server_args`

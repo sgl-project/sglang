@@ -32,7 +32,7 @@ use super::guard::AbortGuard;
 use super::submit::submit;
 use crate::message::ids::Rid;
 use crate::message::request::{GenerateBody, GenerateRequest, RequestKind};
-use crate::message::response::{ResponseItem, ChunkEvent};
+use crate::message::response::{ChunkEvent, ResponseItem};
 use crate::message::sampling::SamplingParams;
 use crate::utils::{
     environ,
