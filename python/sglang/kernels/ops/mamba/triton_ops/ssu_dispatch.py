@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -10,6 +11,13 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class CompactMambaPrefillCheckpoints:
+    """Selected SSM chunk-boundary states in radix-track destination order."""
+
+    states: torch.Tensor
 
 
 class MambaSSUBackend(ABC):
@@ -297,6 +305,125 @@ class FlashInferSSUBackend(MambaSSUBackend):
             self._zero_initial_states[key] = states
         return states
 
+    def _run_compact_checkpoints(
+        self,
+        *,
+        x: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        D: torch.Tensor | None,
+        z: torch.Tensor | None,
+        dt_bias: torch.Tensor | None,
+        dt_softplus: bool,
+        dt_limit,
+        initial_states: torch.Tensor,
+        checkpoint_seq_indices: tuple[int, ...],
+        checkpoint_seq_starts: tuple[int, ...],
+        checkpoint_lengths: tuple[int, ...],
+        chunk_size: int,
+    ) -> CompactMambaPrefillCheckpoints | None:
+        """Re-run only prefixes needed for non-final radix checkpoints.
+
+        SSDCombined does not expose Triton's potentially multi-GB dense ``h``
+        tensor.  Radix tracking needs at most one earlier chunk boundary per
+        selected request, so pack just those prefixes and return their final
+        states in destination order.  This stays on the selected SSD backend;
+        it is not a Triton fallback.
+        """
+
+        if not checkpoint_seq_indices:
+            return None
+        if not (
+            len(checkpoint_seq_indices)
+            == len(checkpoint_seq_starts)
+            == len(checkpoint_lengths)
+        ):
+            raise ValueError("compact checkpoint metadata lengths must match")
+        if any(length <= 0 or length % chunk_size for length in checkpoint_lengths):
+            raise ValueError(
+                "compact checkpoint lengths must be positive chunk multiples"
+            )
+
+        def select_prefixes(value: torch.Tensor | None):
+            if value is None:
+                return None
+            return torch.cat(
+                tuple(
+                    value[:, start : start + length]
+                    for start, length in zip(
+                        checkpoint_seq_starts, checkpoint_lengths, strict=True
+                    )
+                ),
+                dim=1,
+            )
+
+        checkpoint_x = select_prefixes(x)
+        checkpoint_dt = select_prefixes(dt)
+        checkpoint_B = select_prefixes(B)
+        checkpoint_C = select_prefixes(C)
+        checkpoint_z = select_prefixes(z)
+        assert checkpoint_x is not None and checkpoint_dt is not None
+        assert checkpoint_B is not None and checkpoint_C is not None
+        checkpoint_initial = initial_states[
+            torch.tensor(
+                checkpoint_seq_indices,
+                dtype=torch.long,
+                device=initial_states.device,
+            )
+        ]
+        num_checkpoints = len(checkpoint_seq_indices)
+        total_tokens = sum(checkpoint_lengths)
+        checkpoint_seq_idx = torch.repeat_interleave(
+            torch.arange(
+                num_checkpoints,
+                dtype=torch.int32,
+                device=x.device,
+            ),
+            torch.tensor(
+                checkpoint_lengths,
+                dtype=torch.long,
+                device=x.device,
+            ),
+            output_size=total_tokens,
+        ).unsqueeze(0)
+        num_chunks = total_tokens // chunk_size
+        checkpoint_chunk_indices = torch.arange(
+            num_chunks, dtype=torch.int32, device=x.device
+        )
+        checkpoint_chunk_offsets = torch.zeros_like(checkpoint_chunk_indices)
+        runner = self._get_prefill_runner(
+            x=checkpoint_x,
+            B=checkpoint_B,
+            D=D,
+            z=checkpoint_z,
+            initial_states=checkpoint_initial,
+            seq_idx=checkpoint_seq_idx,
+            chunk_size=chunk_size,
+        )
+        _, checkpoint_states = runner.run(
+            checkpoint_x,
+            checkpoint_dt,
+            A,
+            checkpoint_B,
+            checkpoint_C,
+            D=D,
+            z=checkpoint_z,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+            initial_states=checkpoint_initial,
+            seq_idx=checkpoint_seq_idx,
+            chunk_indices=checkpoint_chunk_indices,
+            chunk_offsets=checkpoint_chunk_offsets,
+            out=None,
+            return_final_states=True,
+        )
+        # SSDCombined runners reuse final-state workspace.  Clone the selected
+        # states before the main full-input invocation overwrites that storage.
+        return CompactMambaPrefillCheckpoints(checkpoint_states.clone())
+
     def chunk_scan_combined(
         self,
         x: torch.Tensor,
@@ -320,6 +447,9 @@ class FlashInferSSUBackend(MambaSSUBackend):
         return_varlen_states: bool = False,
         return_intermediate_states: bool = False,
         state_dtype=None,
+        checkpoint_seq_indices: tuple[int, ...] = (),
+        checkpoint_seq_starts: tuple[int, ...] = (),
+        checkpoint_lengths: tuple[int, ...] = (),
     ):
         if self._prefill_backend is None:
             return self._prefill_kernel(
@@ -414,6 +544,23 @@ class FlashInferSSUBackend(MambaSSUBackend):
             seq_idx=seq_idx,
             chunk_size=chunk_size,
         )
+        compact_checkpoints = self._run_compact_checkpoints(
+            x=x,
+            dt=dt,
+            A=A,
+            B=B,
+            C=C,
+            D=D,
+            z=z,
+            dt_bias=dt_bias,
+            dt_softplus=dt_softplus,
+            dt_limit=dt_limit,
+            initial_states=initial_states,
+            checkpoint_seq_indices=checkpoint_seq_indices,
+            checkpoint_seq_starts=checkpoint_seq_starts,
+            checkpoint_lengths=checkpoint_lengths,
+            chunk_size=chunk_size,
+        )
         output, varlen_states = runner.run(
             x_padded,
             dt_padded,
@@ -435,10 +582,7 @@ class FlashInferSSUBackend(MambaSSUBackend):
         output = output[:, :seqlen]
         if out is not None:
             out.copy_(output)
-        # The first value is the chunk-boundary scratch tensor in the Triton
-        # API. MambaMixer2 never consumes it; returning None avoids fabricating
-        # a semantically different value.
-        return None, varlen_states
+        return compact_checkpoints, varlen_states
 
 
 class FlashInferSSDCombinedSSUBackend(FlashInferSSUBackend):

@@ -4,6 +4,9 @@ from unittest.mock import MagicMock, patch, sentinel
 
 import torch
 
+from sglang.kernels.ops.mamba.triton_ops.ssu_dispatch import (
+    CompactMambaPrefillCheckpoints,
+)
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
@@ -200,6 +203,29 @@ class TestFlashInferGDNPrefillBackendPolicy(unittest.TestCase):
             backend.init_forward_metadata(forward_batch)
 
         torch.testing.assert_close(metadata.conv_states_mask_indices, torch.tensor([7]))
+
+    def test_mamba_extend_tracks_compact_and_aligned_states(self):
+        backend = object.__new__(MambaAttnBackendBase)
+        ssm_states = torch.zeros(6, 2, 3)
+        ssm_states[1].fill_(11)
+        metadata = SimpleNamespace(
+            has_mamba_track_mask=True,
+            track_ssm_h_src=torch.tensor([17, 31]),
+            track_ssm_h_dst=torch.tensor([3, 4]),
+            track_ssm_final_src=torch.tensor([1]),
+            track_ssm_final_dst=torch.tensor([5]),
+        )
+        compact = CompactMambaPrefillCheckpoints(
+            torch.stack((torch.full((2, 3), 7.0), torch.full((2, 3), 9.0)))
+        )
+
+        backend._track_mamba_state_extend(
+            SimpleNamespace(), compact, ssm_states, metadata
+        )
+
+        torch.testing.assert_close(ssm_states[3], torch.full((2, 3), 7.0))
+        torch.testing.assert_close(ssm_states[4], torch.full((2, 3), 9.0))
+        torch.testing.assert_close(ssm_states[5], torch.full((2, 3), 11.0))
 
     def test_tree_verify_uses_triton_kernel(self):
         flashinfer_kernel = MagicMock(supports_target_verify=True)

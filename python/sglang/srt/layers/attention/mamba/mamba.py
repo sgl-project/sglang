@@ -624,6 +624,9 @@ class MambaMixer2(torch.nn.Module):
                     1, num_prefill_tokens, -1, self.head_dim
                 ),
                 state_dtype=ssm_state.dtype,
+                checkpoint_seq_indices=mixed_metadata.checkpoint_seq_indices,
+                checkpoint_seq_starts=mixed_metadata.checkpoint_seq_starts,
+                checkpoint_lengths=mixed_metadata.checkpoint_lengths,
             )
 
             # update ssm states

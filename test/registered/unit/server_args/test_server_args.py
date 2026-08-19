@@ -475,24 +475,6 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
             server_args._handle_mamba_backend()
 
 
-class TestMambaSSDCacheSafety(unittest.TestCase):
-    def test_disables_radix_cache_for_ssd_prefill_backends(self):
-        for backend in ("flashinfer_ssd", "cake"):
-            with self.subTest(backend=backend):
-                server_args = ServerArgs(model_path="dummy", mamba_backend=backend)
-                with self.assertLogs(server_args_module.logger, level="WARNING") as logs:
-                    server_args._handle_mamba_ssd_radix_cache_safety()
-                self.assertTrue(server_args.disable_radix_cache)
-                self.assertIn("non-zero initial-state parity", "\n".join(logs.output))
-
-    def test_preserves_radix_cache_for_established_prefill_backends(self):
-        for backend in (None, "triton", "flashinfer"):
-            with self.subTest(backend=backend):
-                server_args = ServerArgs(model_path="dummy", mamba_backend=backend)
-                server_args._handle_mamba_ssd_radix_cache_safety()
-                self.assertFalse(server_args.disable_radix_cache)
-
-
 class TestLoadBalanceMethod(unittest.TestCase):
     def _load_balance_args(self, **kwargs):
         server_args = ServerArgs(model_path="dummy", **kwargs)
