@@ -1197,7 +1197,9 @@ def causal_conv1d_update(
         NP2_STATELEN=np2_statelen,
         NP2_SEQLEN=np2_seqlen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
+        # Speculative verification also materializes every intermediate window;
+        # smaller feature tiles expose enough parallelism for that write-heavy path.
+        BLOCK_N=128 if intermediate_conv_window is not None else 256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
         **pdl_kwargs,
