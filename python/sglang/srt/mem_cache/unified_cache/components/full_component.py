@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    ExternalLinkerLoadPhase,
     LinkerTransferPhase,
     TreeComponent,
 )
@@ -472,16 +473,25 @@ class FullComponent(TreeComponent):
                 keys=list(keys),
             )
 
-    def finish_external_linker_load(
+    def update_external_linker_load(
         self,
+        phase: ExternalLinkerLoadPhase,
         req: Req,
         full_transfer: PoolTransfer,
         transfer: PoolTransfer,
         prefix_len: int,
-        success: bool,
-    ) -> None:
-        if not success:
+        *,
+        insert_result: Optional[InsertResult] = None,
+        canonical_full: Optional[torch.Tensor] = None,
+    ) -> Optional[PoolTransfer]:
+        if phase == ExternalLinkerLoadPhase.ABORT:
             self._full_allocator().free(transfer.device_indices)
+            return None
+        if phase == ExternalLinkerLoadPhase.PREPARE:
+            return transfer
+
+        assert phase == ExternalLinkerLoadPhase.COMMIT
+        return transfer
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
         if self._full_kv_pool_host is None:

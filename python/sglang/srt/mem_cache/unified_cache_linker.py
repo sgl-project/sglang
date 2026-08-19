@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import (
+    ExternalLinkerLoadPhase,
     LinkerTransferPhase,
     TreeComponent,
 )
@@ -463,15 +464,23 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.LOAD, None, tail_hashes
             )
             if transfer is None:
-                self._finish_load(req, component_transfers, prefix_len, False)
+                self._update_load(
+                    ExternalLinkerLoadPhase.ABORT,
+                    req,
+                    component_transfers,
+                    prefix_len,
+                )
                 return empty_indices, req.last_node
             component_transfers.append((component, transfer))
 
         full_transfer = component_transfers[0][1]
         assert full_transfer.name == PoolName.KV
-        # The reservation is committed here; the data itself arrives later, when
-        # the scheduler starts the layer-wise load for this batch.
-        self._finish_load(req, component_transfers, prefix_len, True)
+        self._update_load(
+            ExternalLinkerLoadPhase.PREPARE,
+            req,
+            component_transfers,
+            prefix_len,
+        )
 
         # Insert the newly loaded tail into the tree.
         prefix_indices = torch.cat(
@@ -500,6 +509,7 @@ class UnifiedCacheLinkerWrapper:
                 ),
                 chunked=True,
                 priority=getattr(req, "priority", 0) or 0,
+                track_adopted_ranges=True,
             )
         )
         if mamba_transfer is not None and insert_result.mamba_exist:
@@ -507,15 +517,17 @@ class UnifiedCacheLinkerWrapper:
                 mamba_transfer.device_indices[:1]
             )
 
-        # Insert already resolved every overlap. Read the committed Full path
-        # directly (without matching the key again), then keep only provisional
-        # component pages whose slots survived insert.
         canonical_tail = cache.tree_core.collect_full_device_indices(
             insert_result.last_device_node, req.last_node
         )
         assert canonical_tail.numel() == len(tail_hashes) * cache.page_size
-        load_transfers = self._filter_load_pages_after_insert(
-            component_transfers, canonical_tail
+        load_transfers = self._update_load(
+            ExternalLinkerLoadPhase.COMMIT,
+            req,
+            component_transfers,
+            prefix_len,
+            insert_result=insert_result,
+            canonical_full=canonical_tail,
         )
 
         if load_transfers and not self.cache_linker.load(req.rid, load_transfers):
@@ -527,71 +539,95 @@ class UnifiedCacheLinkerWrapper:
             node = node.parent
         return canonical_tail, insert_result.last_device_node
 
-    def _finish_load(
+    def _update_load(
         self,
+        phase: ExternalLinkerLoadPhase,
         req: Req,
         component_transfers: list[tuple[TreeComponent, PoolTransfer]],
         prefix_len: int,
-        success: bool,
-    ) -> None:
-        """Let every component that reserved room commit it, or release it."""
-        if not component_transfers:
-            return
-        full = component_transfers[0][1]
-        for component, transfer in component_transfers:
-            component.finish_external_linker_load(
-                req, full, transfer, prefix_len, success
-            )
-
-    def _filter_load_pages_after_insert(
-        self,
-        component_transfers: list[tuple[TreeComponent, PoolTransfer]],
-        canonical_full_tail: torch.Tensor,
+        *,
+        insert_result=None,
+        canonical_full: torch.Tensor | None = None,
     ) -> list[PoolTransfer]:
-        """Drop provisional pages that insert replaced with resident L1 slots."""
+        if not component_transfers:
+            return []
+        full = component_transfers[0][1]
         result = []
-        page = self.cache.page_size
-        for _, transfer in component_transfers:
-            if transfer.name == PoolName.KV:
-                canonical = canonical_full_tail
-            else:
-                # Mamba's direct-linker hooks currently reject this mode, so the
-                # only supported auxiliary component here is SWA.
-                assert transfer.name == PoolName.SWA
-                swa_len = transfer.device_indices.numel()
-                canonical = self.cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-                    canonical_full_tail[-swa_len:]
-                ).to(
-                    transfer.device_indices
+        transfers = (
+            reversed(component_transfers)
+            if phase == ExternalLinkerLoadPhase.ABORT
+            else component_transfers
+        )
+        for component, transfer in transfers:
+            component_canonical = canonical_full
+            if phase == ExternalLinkerLoadPhase.COMMIT:
+                assert insert_result.adopted_ranges is not None
+                coverage_start = prefix_len - len(transfer.device_indices)
+                ranges = [
+                    (max(start, coverage_start), min(end, prefix_len))
+                    for start, end in insert_result.adopted_ranges.get(
+                        component.component_type, ()
+                    )
+                    if max(start, coverage_start) < min(end, prefix_len)
+                ]
+                indices, keys = self._select_adopted_pages(
+                    transfer.device_indices,
+                    ranges,
+                    prefix_len,
+                    transfer.keys,
                 )
-
-            incoming_pages = transfer.device_indices.reshape(-1, page)
-            canonical_pages = canonical.to(transfer.device_indices).reshape(-1, page)
-            assert incoming_pages.shape == canonical_pages.shape
-            assert incoming_pages.shape[0] == len(transfer.keys)
-
-            # ``insert`` resolves each provisional page against the canonical
-            # page currently stored in the tree:
-            #
-            # 1. canonical == provisional: ``insert`` kept the newly allocated,
-            #    still-empty page. Keep it in this transfer so remote storage
-            #    can populate it.
-            # 2. canonical != provisional: ``insert`` deduplicated against an
-            #    existing L1 page and already released the provisional slots.
-            #    Exclude it from this transfer; the canonical page has the data.
-            slot_matches = incoming_pages == canonical_pages
-            pages_to_load = slot_matches.all(dim=1)
-            pages_deduplicated = (~slot_matches).all(dim=1)
-            assert bool(
-                (pages_to_load | pages_deduplicated).all().item()
-            ), "insert must keep or replace a whole page"
-
-            page_ids_to_load = pages_to_load.nonzero(as_tuple=True)[0].tolist()
-            if page_ids_to_load:
-                transfer.keys = [transfer.keys[i] for i in page_ids_to_load]
-                transfer.device_indices = incoming_pages[pages_to_load].reshape(-1)
+                if not keys:
+                    continue
+                transfer.device_indices = indices
+                transfer.keys = keys
+                component_canonical, _ = self._select_adopted_pages(
+                    canonical_full, ranges, prefix_len
+                )
+            transfer = component.update_external_linker_load(
+                phase,
+                req,
+                full,
+                transfer,
+                prefix_len,
+                insert_result=insert_result,
+                canonical_full=component_canonical,
+            )
+            if transfer is not None:
                 result.append(transfer)
         return result
+
+    def _select_adopted_pages(
+        self,
+        indices: torch.Tensor,
+        ranges: Sequence[tuple[int, int]],
+        prefix_len: int,
+        keys: Sequence[str] | None = None,
+    ) -> tuple[torch.Tensor, list[str]]:
+        page = self.cache.page_size
+        coverage_start = prefix_len - len(indices)
+        pages = indices.reshape(-1, page)
+        if keys is not None:
+            assert len(keys) == len(pages)
+
+        chunks = []
+        selected_keys = []
+        for start, end in ranges:
+            start = max(start, coverage_start)
+            end = min(end, prefix_len)
+            if start >= end:
+                continue
+            assert (start - coverage_start) % page == 0
+            assert (end - coverage_start) % page == 0
+            first = (start - coverage_start) // page
+            last = (end - coverage_start) // page
+            chunks.append(pages[first:last].reshape(-1))
+            if keys is not None:
+                selected_keys.extend(keys[first:last])
+
+        if not chunks:
+            return indices[:0], selected_keys
+        selected = chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+        return selected, selected_keys
 
     # ---- offload: device -> remote, driven by the write-through chain ----
 

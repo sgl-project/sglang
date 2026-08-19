@@ -643,18 +643,6 @@ class MambaComponent(TreeComponent):
             f"MambaComponent does not support external linker mode, will support soon"
         )
 
-    def finish_external_linker_load(
-        self,
-        req: Req,
-        full_transfer: PoolTransfer,
-        transfer: PoolTransfer,
-        prefix_len: int,
-        success: bool,
-    ) -> None:
-        raise AssertionError(
-            f"MambaComponent does not support external linker mode, will support soon"
-        )
-
     # ---- HiCache Hooks ----
 
     def prepare_load_back(

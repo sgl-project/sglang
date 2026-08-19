@@ -368,10 +368,10 @@ class _InsertWalkState(msgspec.Struct):
     value: torch.Tensor
     params: InsertParams
     priority: int
+    result: InsertResult
     total_prefix_length: int = 0
     is_new_leaf: bool = False
     target_node: Optional[UnifiedTreeNode] = None
-    result: Optional[InsertResult] = None
     # Emitted actions awaiting the next barrier flush (or the final step).
     pending_actions: list[CacheAction | ComponentAction] = []
 
@@ -877,6 +877,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             value=value,
             params=params,
             priority=priority,
+            result=InsertResult(
+                prefix_len=0,
+                adopted_ranges={} if params.track_adopted_ranges else None,
+            ),
         )
         return self._advance_insert()
 
@@ -943,6 +947,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         if node.evicted:
             self._unevict_node_on_insert(node, state.value[:prefix_len])
+            state.result.record_adopted_range(
+                BASE_COMPONENT_TYPE,
+                state.total_prefix_length,
+                state.total_prefix_length + prefix_len,
+            )
             # FULL was restored from the request's fresh KV. Aux
             # components (e.g. SWA) may still hold tombstones and need
             # to rebuild their value from the same slice.
@@ -954,6 +963,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     prefix_len=prefix_len,
                     total_prefix_len=state.total_prefix_length,
                     params=state.params,
+                    result=state.result,
                     cache_actions=step_actions,
                 )
         else:
@@ -967,6 +977,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     total_prefix_len=state.total_prefix_length,
                     value_slice=value_slice,
                     params=state.params,
+                    result=state.result,
                     cache_actions=step_actions,
                 )
                 consumed_from = min(consumed_from, comp_consumed_from)
@@ -991,6 +1002,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # only a tombstone for this span (e.g. the whole leaf is outside the SWA
         # window). Materialize it anyway so the Full KV stays cacheable.
         if len(state.key):
+            state.result.record_adopted_range(
+                BASE_COMPONENT_TYPE,
+                state.total_prefix_length,
+                state.total_prefix_length + len(state.key),
+            )
             state.target_node = self._add_new_node(
                 state.node, state.key, state.value, priority=state.priority
             )
@@ -1002,10 +1018,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # e.g. Mamba attaches mamba_value to the leaf node
         # All hooks run before their emitted actions execute; an action failure
         # fail-stops the process, so partial-commit state is never observed.
-        state.result = InsertResult(
-            prefix_len=state.total_prefix_length,
-            last_device_node=state.target_node.id,
-        )
+        state.result.prefix_len = state.total_prefix_length
+        state.result.last_device_node = state.target_node.id
         for component in self.components:
             component.commit_insert_component_data(
                 node=state.target_node,

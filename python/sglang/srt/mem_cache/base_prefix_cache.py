@@ -18,6 +18,7 @@ import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
     RadixCacheMetricsCollector,
@@ -31,9 +32,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
-    )
-    from sglang.srt.mem_cache.unified_cache.components.tree_component import (
-        ComponentType,
     )
 
 
@@ -73,6 +71,7 @@ class InsertParams:
     # General
     chunked: bool = False
     priority: int = 0
+    track_adopted_ranges: bool = False
 
 
 @dataclasses.dataclass
@@ -85,10 +84,23 @@ class InsertResult:
     mamba_exist: bool = False
     inserted_host_node: Any = None
     host_insert_dropped: bool = False
+    adopted_ranges: Optional[dict[ComponentType, list[tuple[int, int]]]] = None
     # Controller-applied actions from the non-stepped channels (e.g. insert_host); the stepped insert emits via InsertStepResult.actions.
     cache_actions: list[CacheAction | ComponentAction] = dataclasses.field(
         default_factory=list
     )
+
+    def record_adopted_range(
+        self, component_type: ComponentType, start: int, end: int
+    ) -> None:
+        if self.adopted_ranges is None or start >= end:
+            return
+        ranges = self.adopted_ranges.setdefault(component_type, [])
+        if ranges and start <= ranges[-1][1]:
+            prev_start, prev_end = ranges[-1]
+            ranges[-1] = (min(prev_start, start), max(prev_end, end))
+        else:
+            ranges.append((start, end))
 
 
 @dataclasses.dataclass

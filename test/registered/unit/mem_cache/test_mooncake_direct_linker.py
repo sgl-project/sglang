@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.mem_cache.base_prefix_cache import InsertResult
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -21,11 +22,13 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
 )
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.mamba_component import (
     MambaComponent,
 )
 from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
 from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+    ExternalLinkerLoadPhase,
     LinkerTransferPhase,
 )
 from sglang.srt.mem_cache.unified_cache_linker import (
@@ -472,7 +475,7 @@ def test_device_pool_group_allows_partial_side_pool_load():
     assert resolved.host_indices.tolist() == [120, 121, 124, 125]
 
 
-def test_swa_linker_finish_maps_or_releases_slots():
+def test_swa_linker_load_prepare_commit_and_abort():
     swa_allocator = _Allocator()
     allocator = SimpleNamespace(
         swa_attn_allocator=swa_allocator,
@@ -480,22 +483,48 @@ def test_swa_linker_finish_maps_or_releases_slots():
     )
     component = SWAComponent.__new__(SWAComponent)
     component.cache = SimpleNamespace(
-        page_size=64,
+        page_size=1,
         token_to_kv_pool_allocator=allocator,
     )
-    component.sliding_window_size = 128
+    component.sliding_window_size = 2
     req = SimpleNamespace(kv=SimpleNamespace(swa_evicted_seqlen=0))
     full = PoolTransfer(name=PoolName.KV, device_indices=torch.tensor([1, 2, 3, 4]))
     swa = PoolTransfer(name=PoolName.SWA, device_indices=torch.tensor([20, 21]))
 
-    component.finish_external_linker_load(req, full, swa, prefix_len=256, success=True)
+    component.update_external_linker_load(
+        ExternalLinkerLoadPhase.PREPARE, req, full, swa, prefix_len=4
+    )
     mapped_full, mapped_swa = swa_allocator.mapping[0]
     assert mapped_full.tolist() == [3, 4]
     assert mapped_swa.tolist() == [20, 21]
-    assert req.kv.swa_evicted_seqlen == 128
+    assert req.kv.swa_evicted_seqlen == 2
 
-    component.finish_external_linker_load(req, full, swa, prefix_len=256, success=False)
-    assert swa_allocator.freed[0].tolist() == [20, 21]
+    insert_result = InsertResult(
+        prefix_len=2,
+        adopted_ranges={ComponentType.SWA: [(2, 4)]},
+    )
+    canonical = torch.tensor([10, 11, 12, 13])
+    committed = component.update_external_linker_load(
+        ExternalLinkerLoadPhase.COMMIT,
+        req,
+        full,
+        swa,
+        prefix_len=4,
+        insert_result=insert_result,
+        canonical_full=canonical[2:],
+    )
+    assert committed is swa
+    mapped_full, mapped_swa = swa_allocator.mapping[1]
+    assert mapped_full.tolist() == [12, 13]
+    assert mapped_swa.tolist() == [20, 21]
+
+    aborted = PoolTransfer(
+        name=PoolName.SWA, device_indices=torch.tensor([30, 31])
+    )
+    component.update_external_linker_load(
+        ExternalLinkerLoadPhase.ABORT, req, full, aborted, prefix_len=4
+    )
+    assert swa_allocator.freed[0].tolist() == [30, 31]
 
 
 def test_mamba_component_rejects_external_linker():
@@ -506,15 +535,21 @@ def test_mamba_component_rejects_external_linker():
         )
 
 
-def test_insert_filters_overlapping_full_and_swa_load_pages():
-    canonical_swa = torch.tensor([300, 301, 202, 203, 304, 305, 206, 207])
+def test_component_commit_filters_overlapping_full_and_swa_load_pages():
+    mapping = _Allocator()
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     wrapper.cache = SimpleNamespace(
         page_size=2,
         token_to_kv_pool_allocator=SimpleNamespace(
-            translate_loc_from_full_to_swa=lambda indices: canonical_swa
+            set_full_to_swa_mapping=mapping.set_full_to_swa_mapping
         ),
     )
+    full_component = FullComponent.__new__(FullComponent)
+    full_component.cache = wrapper.cache
+    full_component.component_type = ComponentType.FULL
+    swa_component = SWAComponent.__new__(SWAComponent)
+    swa_component.cache = wrapper.cache
+    swa_component.component_type = ComponentType.SWA
     full = PoolTransfer(
         name=PoolName.KV,
         keys=["a", "b", "c", "d"],
@@ -526,12 +561,26 @@ def test_insert_filters_overlapping_full_and_swa_load_pages():
         keys=["a", "b", "c", "d"],
         device_indices=torch.tensor([200, 201, 202, 203, 204, 205, 206, 207]),
     )
-    filtered = wrapper._filter_load_pages_after_insert(
-        [(None, full), (None, swa)],
-        canonical_tail,
+    insert_result = InsertResult(
+        prefix_len=0,
+        adopted_ranges={
+            ComponentType.FULL: [(2, 4), (6, 8)],
+            ComponentType.SWA: [(2, 4), (6, 8)],
+        },
+    )
+    filtered = wrapper._update_load(
+        ExternalLinkerLoadPhase.COMMIT,
+        SimpleNamespace(),
+        [(full_component, full), (swa_component, swa)],
+        prefix_len=8,
+        insert_result=insert_result,
+        canonical_full=canonical_tail,
     )
     assert filtered == [full, swa]
     assert full.keys == ["b", "d"]
     assert full.device_indices.tolist() == [102, 103, 106, 107]
     assert swa.keys == ["b", "d"]
     assert swa.device_indices.tolist() == [202, 203, 206, 207]
+    mapped_full, mapped_swa = mapping.mapping[0]
+    assert mapped_full.tolist() == [102, 103, 106, 107]
+    assert mapped_swa.tolist() == [202, 203, 206, 207]
