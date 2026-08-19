@@ -186,11 +186,17 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
 
     @staticmethod
     def maybe_process_fuseep_weights(layer: torch.nn.Module) -> bool:
-        """Apply the FuseEP ABI once for either supported quantization method."""
+        """Apply the FuseEP weight layout if --moe-a2a-backend is ascend_fuseep.
+
+        Returns True when the FuseEP layout was (or has already been) applied,
+        so that the caller can skip its own ``process_weights_after_loading`` body.
+        """
         from sglang.srt.layers.moe import get_moe_a2a_backend
 
         if not get_moe_a2a_backend().is_ascend_fuseep():
             return False
+        
+        # Guard against double processing when called for multiple prefixes.
         if getattr(layer, "_fuseep_weights_processed", False):
             return True
 
@@ -519,7 +525,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
         # If the FuseEP weight layout is used, process weights via
-        # maybe_process_fuseep_weights and skip the rest of this method.
+        # maybe_apply_fuseep_weights and skip the rest of this method.
         if self.maybe_process_fuseep_weights(layer):
             return
 
