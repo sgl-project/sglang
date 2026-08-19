@@ -1237,6 +1237,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
+        if self.use_mega_moe and moe_runner_backend.is_flashinfer_mxfp4():
+            # MegaMoE uses this method for weight preparation only and calls
+            # DeepGEMM directly instead of dispatching through a MoeRunner.
+            return
+
         if moe_runner_backend.is_auto():
             # Must match apply() priority: _use_aiter before use_triton_kernels.
             if _use_aiter and get_moe_a2a_backend().supports_aiter():

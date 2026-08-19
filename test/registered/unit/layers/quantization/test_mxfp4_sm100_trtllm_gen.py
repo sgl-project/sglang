@@ -141,6 +141,41 @@ def _build_flashinfer_mxfp4_runner(num_experts, hidden, inter):
     return MoeRunner(MoeRunnerBackend.FLASHINFER_MXFP4, cfg)
 
 
+@pytest.mark.parametrize("use_mega_moe", [False, True])
+def test_create_moe_runner_handles_flashinfer_for_megamoe(monkeypatch, use_mega_moe):
+    import sglang.srt.layers.quantization.mxfp4 as mxfp4_mod
+    from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+    from sglang.srt.layers.moe.utils import MoeRunnerBackend
+
+    runner = object()
+
+    def build_runner(backend, config):
+        assert not use_mega_moe
+        assert backend == MoeRunnerBackend.FLASHINFER_MXFP4
+        assert config is runner_config
+        return runner
+
+    monkeypatch.setattr(
+        mxfp4_mod,
+        "get_moe_runner_backend",
+        lambda: MoeRunnerBackend.FLASHINFER_MXFP4,
+    )
+    monkeypatch.setattr(mxfp4_mod, "MoeRunner", build_runner)
+
+    method = mxfp4_mod.Mxfp4MoEMethod.__new__(mxfp4_mod.Mxfp4MoEMethod)
+    method._fi_kernel = "trtllm_sm100"
+    method.use_mega_moe = use_mega_moe
+    runner_config = MoeRunnerConfig()
+
+    method.create_moe_runner(object(), runner_config)
+
+    assert method.moe_runner_config is runner_config
+    if use_mega_moe:
+        assert not hasattr(method, "runner")
+    else:
+        assert method.runner is runner
+
+
 class _MockDispatchOutput:
     # SM100 keeps BYPASSED topk (kernel routes from router_logits), so the
     # dispatch output must carry a real BypassedTopKOutput.
