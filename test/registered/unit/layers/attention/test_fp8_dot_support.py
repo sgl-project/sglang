@@ -90,7 +90,7 @@ class TestFp8DotSupport(CustomTestCase):
         )
         qk_pv = ("QK_DOT_IN_KV_DTYPE", "PV_DOT_IN_KV_DTYPE")
         for name, kernel, flags in (
-            ("_fwd_kernel", ea._fwd_kernel, qk_pe_pv),
+            ("_fwd_kernel", ea._fwd_kernel, qk_pe_pv + ("PV_EXTEND_DOT_IN_V_DTYPE",)),
             ("_fwd_kernel_unified", ea._fwd_kernel_unified, qk_pe_pv),
             ("_verify_mla_prefix_stage1", _verify_mla_prefix_stage1, qk_pe_pv),
             ("_verify_prefix_stage1", _verify_prefix_stage1, qk_pv),

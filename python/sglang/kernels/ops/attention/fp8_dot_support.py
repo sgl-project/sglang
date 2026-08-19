@@ -27,6 +27,19 @@ narrow dots in the query dtype avoids the promotion on every Triton version and
 gives up no throughput: the non-scaled ``V_MFMA_F32_16X16X32_FP8_FP8`` a fixed
 Triton falls back to reduces the same 32 elements per instruction as
 ``V_MFMA_F32_16X16X32_BF16`` does on CDNA4.
+
+Only dots that cast one operand down reach the promotion, so this covers every
+one of those: extend (both kernels), decode's grouped stage 1, and the two
+verify stage-1 kernels. Two other ROCm Triton kernels dot against a tile that
+could in principle be fp8 but need no verdict:
+
+* ``prefill_attention.py`` never reads a KV pool, its ``Q @ K`` is uncast (so
+  operands already share a dtype), and its gfx950 ``BLOCK_N`` is 128, which
+  tiles the scaled instruction even when ``P @ V`` runs in fp8.
+* ``rocm_mla_decode_rope.py`` does read the pool, but its ``Q @ K`` is uncast
+  too, and a bf16 query against an fp8 pool fails Triton's frontend
+  (``Unsupported rhs dtype fp8e4nv``) long before the AMD backend -- a separate
+  pre-existing gap in that kernel, not this crash.
 """
 
 import torch

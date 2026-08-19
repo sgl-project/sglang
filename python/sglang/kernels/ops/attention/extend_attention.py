@@ -361,11 +361,14 @@ def _fwd_kernel(
     STORE_TRANSPOSE: tl.constexpr,
     HAS_SINK: tl.constexpr,
     USE_COMPACT_TILE_GRID: tl.constexpr,
-    # Per-dot: cast the query-side tile down to the KV-pool dtype (fp8 matrix
-    # core), or upcast the KV tile instead. See fp8_dot_support.dot_in_kv_dtype.
+    # Per-dot: cast the query-side tile down to the KV dtype (fp8 matrix core),
+    # or upcast the KV tile instead. See fp8_dot_support.dot_in_kv_dtype. The
+    # first three cover the prefix stage, which reads the KV pool; the last
+    # covers the extend stage, whose V is the caller's current-chunk tensor.
     QK_DOT_IN_KV_DTYPE: tl.constexpr = True,
     QK_PE_DOT_IN_KV_DTYPE: tl.constexpr = True,
     PV_DOT_IN_KV_DTYPE: tl.constexpr = True,
+    PV_EXTEND_DOT_IN_V_DTYPE: tl.constexpr = True,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
     Aux0=None,
@@ -729,8 +732,10 @@ def _fwd_kernel(
             v = tl.load(
                 V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
             )
-            p = p.to(v.dtype)
-            acc = acc * re_scale[:, None] + tl.dot(p, v)
+            if PV_EXTEND_DOT_IN_V_DTYPE:
+                acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v)
+            else:
+                acc = acc * re_scale[:, None] + tl.dot(p.to(q.dtype), v.to(q.dtype))
 
             e_max = n_e_max
 
@@ -869,11 +874,14 @@ def extend_attention_fwd(
         score_mod, aux_tensors
     )
 
-    # Each prefix-stage dot reduces a different width, so each gets its own
-    # verdict on whether it may run in the (possibly fp8) pool dtype.
+    # Each dot reduces a different width, so each gets its own verdict on
+    # whether it may run in the (possibly fp8) dtype of the tile it reads.
+    # Callers pass the current chunk in the query dtype today, but the extend
+    # stage is guarded on v_extend all the same.
     qk_dot_in_kv_dtype = dot_in_kv_dtype(k_buffer.dtype, BLOCK_DMODEL)
     qk_pe_dot_in_kv_dtype = BLOCK_DPE == 0 or dot_in_kv_dtype(k_buffer.dtype, BLOCK_DPE)
     pv_dot_in_kv_dtype = dot_in_kv_dtype(v_buffer.dtype, BLOCK_N)
+    pv_extend_dot_in_v_dtype = dot_in_kv_dtype(v_extend.dtype, BLOCK_N)
 
     _fwd_kernel[grid](
         q_extend,
@@ -935,6 +943,7 @@ def extend_attention_fwd(
         QK_DOT_IN_KV_DTYPE=qk_dot_in_kv_dtype,
         QK_PE_DOT_IN_KV_DTYPE=qk_pe_dot_in_kv_dtype,
         PV_DOT_IN_KV_DTYPE=pv_dot_in_kv_dtype,
+        PV_EXTEND_DOT_IN_V_DTYPE=pv_extend_dot_in_v_dtype,
         PAGE_SIZE=page_size,
         SCORE_MOD=score_mod,
         Aux0=aux0,
