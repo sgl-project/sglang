@@ -85,7 +85,7 @@ def _indexed_lora_a_kernel(
     input_ptr,
     weight_ptr,
     topk_ids_ptr,
-    token_slots_ptr,
+    token_lora_mapping_ptr,
     lora_expert_map_ptr,
     output_ptr,
     num_pairs,
@@ -113,7 +113,7 @@ def _indexed_lora_a_kernel(
     pid_n = tl.program_id(1)
     key = virtual_expert_ids_inline(
         topk_ids_ptr,
-        token_slots_ptr,
+        token_lora_mapping_ptr,
         lora_expert_map_ptr,
         pair_id,
         pair_id < num_pairs,
@@ -193,7 +193,7 @@ def indexed_lora_a(
         input,
         weight,
         routing.topk_ids,
-        routing.token_slots,
+        routing.token_lora_mapping,
         map_arg,
         output,
         num_pairs,

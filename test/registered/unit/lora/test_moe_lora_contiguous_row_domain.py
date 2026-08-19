@@ -738,7 +738,7 @@ def _make_gpu_tensors(
     return {name: tensor.to(device) for name, tensor in tensors.items()}
 
 
-def _token_slots(traffic: str, num_tokens: int) -> torch.Tensor:
+def _token_lora_mapping(traffic: str, num_tokens: int) -> torch.Tensor:
     if traffic == "active":
         return torch.zeros(num_tokens, dtype=torch.int32)
     if traffic == "mixed":
@@ -785,7 +785,7 @@ def _build_runner(architecture, choice, vendor: str, gpu, num_experts, layout):
 
 
 def _run_once(
-    runner, gpu, token_slots, layout, *, use_cuda_graph=False, is_prefill=True
+    runner, gpu, token_lora_mapping, layout, *, use_cuda_graph=False, is_prefill=True
 ):
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
     from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -805,7 +805,7 @@ def _run_once(
         gate_up_lora_b=gpu["gate_up_lora_b"],
         down_lora_a=gpu["down_lora_a"],
         down_lora_b=gpu["down_lora_b"],
-        token_slots=token_slots,
+        token_lora_mapping=token_lora_mapping,
         adapter_enabled=gpu["adapter_enabled"],
         use_cuda_graph=use_cuda_graph,
         is_prefill=is_prefill,
@@ -880,9 +880,9 @@ def test_contiguous_prefill_matches_masked(
     )
 
     for traffic in ("active", "mixed", "base_only"):
-        token_slots = _token_slots(traffic, num_tokens).to(device)
-        reference = _run_once(masked, gpu, token_slots, layout).hidden_states
-        actual = _run_once(contiguous, gpu, token_slots, layout).hidden_states
+        token_lora_mapping = _token_lora_mapping(traffic, num_tokens).to(device)
+        reference = _run_once(masked, gpu, token_lora_mapping, layout).hidden_states
+        actual = _run_once(contiguous, gpu, token_lora_mapping, layout).hidden_states
         torch.testing.assert_close(
             actual,
             reference,
@@ -894,10 +894,10 @@ def test_contiguous_prefill_matches_masked(
         assert reference[0].abs().max().item() == 0.0
     # Guard against both domains silently bypassing the LoRA math.
     active = _run_once(
-        contiguous, gpu, _token_slots("active", num_tokens).to(device), layout
+        contiguous, gpu, _token_lora_mapping("active", num_tokens).to(device), layout
     ).hidden_states
     base_only = _run_once(
-        contiguous, gpu, _token_slots("base_only", num_tokens).to(device), layout
+        contiguous, gpu, _token_lora_mapping("base_only", num_tokens).to(device), layout
     ).hidden_states
     assert (active - base_only).abs().max().item() > 0.02
 
@@ -934,15 +934,15 @@ def test_contiguous_prefill_replays_in_a_real_cuda_graph(
     contiguous = _build_runner(
         architecture, choice, contiguous_provider, gpu, num_experts, layout
     )
-    token_slots = _token_slots("active", num_tokens).to(device)
+    token_lora_mapping = _token_lora_mapping("active", num_tokens).to(device)
 
     for _ in range(2):  # JIT + workspace graph-buffer retention before capture
-        _run_once(contiguous, gpu, token_slots, layout, use_cuda_graph=True)
+        _run_once(contiguous, gpu, token_lora_mapping, layout, use_cuda_graph=True)
     torch.cuda.synchronize(device)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = _run_once(contiguous, gpu, token_slots, layout, use_cuda_graph=True)
+        captured = _run_once(contiguous, gpu, token_lora_mapping, layout, use_cuda_graph=True)
     output = captured.hidden_states
     output_ptr = output.data_ptr()
 
@@ -950,7 +950,7 @@ def test_contiguous_prefill_replays_in_a_real_cuda_graph(
     torch.cuda.synchronize(device)
     torch.testing.assert_close(
         output,
-        _run_once(masked, gpu, token_slots, layout).hidden_states,
+        _run_once(masked, gpu, token_lora_mapping, layout).hidden_states,
         **_ORACLE_TOLERANCE,
         msg="initial routing replay",
     )
@@ -967,19 +967,19 @@ def test_contiguous_prefill_replays_in_a_real_cuda_graph(
     assert output.data_ptr() == output_ptr
     torch.testing.assert_close(
         output,
-        _run_once(masked, gpu, token_slots, layout).hidden_states,
+        _run_once(masked, gpu, token_lora_mapping, layout).hidden_states,
         **_ORACLE_TOLERANCE,
         msg="mutated routing replay",
     )
 
     # Flip the batch to base-only through the token-slot sentinel.
-    token_slots.fill_(-1)
+    token_lora_mapping.fill_(-1)
     graph.replay()
     torch.cuda.synchronize(device)
     torch.testing.assert_close(
         output,
         _run_once(
-            masked, gpu, _token_slots("base_only", num_tokens).to(device), layout
+            masked, gpu, _token_lora_mapping("base_only", num_tokens).to(device), layout
         ).hidden_states,
         **_ORACLE_TOLERANCE,
         msg="base-only replay",

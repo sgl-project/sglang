@@ -34,7 +34,7 @@ _SCAN_CHUNK = 2048
 @triton.jit
 def _joint_hist_kernel(
     topk_ids_ptr,
-    token_slots_ptr,
+    token_lora_mapping_ptr,
     per_expert_counts_ptr,
     shared_counts_ptr,
     num_pairs,
@@ -51,7 +51,7 @@ def _joint_hist_kernel(
     pair_mask = pair_ids < num_pairs
     per_expert_ids = virtual_expert_ids_inline(
         topk_ids_ptr,
-        token_slots_ptr,
+        token_lora_mapping_ptr,
         topk_ids_ptr,
         pair_ids,
         pair_mask,
@@ -64,7 +64,7 @@ def _joint_hist_kernel(
     )
     shared_ids = virtual_expert_ids_inline(
         topk_ids_ptr,
-        token_slots_ptr,
+        token_lora_mapping_ptr,
         topk_ids_ptr,
         pair_ids,
         pair_mask,
@@ -222,7 +222,7 @@ def _label_blocks(
 @triton.jit
 def _joint_expand_scatter_kernel(
     topk_ids_ptr,
-    token_slots_ptr,
+    token_lora_mapping_ptr,
     per_expert_cursor_ptr,
     per_expert_bucket_end_ptr,
     per_expert_block_cumulative_ptr,
@@ -298,7 +298,7 @@ def _joint_expand_scatter_kernel(
     pair_mask = pair_ids < num_pairs
     per_expert_ids = virtual_expert_ids_inline(
         topk_ids_ptr,
-        token_slots_ptr,
+        token_lora_mapping_ptr,
         topk_ids_ptr,
         pair_ids,
         pair_mask,
@@ -311,7 +311,7 @@ def _joint_expand_scatter_kernel(
     )
     shared_ids = virtual_expert_ids_inline(
         topk_ids_ptr,
-        token_slots_ptr,
+        token_lora_mapping_ptr,
         topk_ids_ptr,
         pair_ids,
         pair_mask,
@@ -409,7 +409,7 @@ def _plan_scratch(
 
 def build_joint_shared_routes(
     topk_ids: torch.Tensor,
-    token_slots: torch.Tensor,
+    token_lora_mapping: torch.Tensor,
     *,
     num_local_experts: int,
     max_loras: int,
@@ -423,8 +423,10 @@ def build_joint_shared_routes(
     consumer launches carry ``launch_pdl=True`` and wait only immediately
     before their first predecessor-produced load.
     """
-    if topk_ids.ndim != 2 or token_slots.shape != (topk_ids.shape[0],):
-        raise ValueError("joint routing expects topk_ids [T,K] and token_slots [T]")
+    if topk_ids.ndim != 2 or token_lora_mapping.shape != (topk_ids.shape[0],):
+        raise ValueError(
+            "joint routing expects topk_ids [T,K] and token_lora_mapping [T]"
+        )
     if num_local_experts < 1 or max_loras < 1 or block_size < 1:
         raise ValueError("expert, adapter, and route block counts must be positive")
     from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -462,7 +464,7 @@ def build_joint_shared_routes(
 
     _joint_hist_kernel[(triton.cdiv(max(num_pairs, 1), _HIST_BLOCK),)](
         topk_ids,
-        token_slots,
+        token_lora_mapping,
         per_expert["counts"],
         shared["counts"],
         num_pairs,
@@ -506,7 +508,7 @@ def build_joint_shared_routes(
         (per_expert_label_programs + shared_label_programs + pair_programs,)
     ](
         topk_ids,
-        token_slots,
+        token_lora_mapping,
         per_expert["cursor"],
         per_expert["bucket_end"],
         per_expert["block_cumulative"],
@@ -555,7 +557,7 @@ def build_joint_shared_routes(
             num_virtual_experts=num_virtual_experts,
             block_size=block_size,
             topk_ids=topk_ids,
-            token_slots=token_slots,
+            token_lora_mapping=token_lora_mapping,
             lora_experts_per_adapter=lora_experts_per_adapter,
             max_loras=max_loras,
             shared_outer_local_expert_count=shared_outer_local_expert_count,

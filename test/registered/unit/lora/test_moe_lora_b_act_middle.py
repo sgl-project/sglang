@@ -269,7 +269,7 @@ def _make_gpu_tensors(num_tokens: int, num_experts: int, device: torch.device):
     return {name: tensor.to(device) for name, tensor in tensors.items()}
 
 
-def _token_slots(traffic: str, num_tokens: int) -> torch.Tensor:
+def _token_lora_mapping(traffic: str, num_tokens: int) -> torch.Tensor:
     if traffic == "active":
         pattern = torch.tensor([0, 1], dtype=torch.int32)
     elif traffic == "mixed":
@@ -325,7 +325,7 @@ def _build_runner(plan, launch_config, base_gemm_rows: str, gpu, num_experts: in
     return runner
 
 
-def _run_once(runner, gpu, token_slots):
+def _run_once(runner, gpu, token_lora_mapping):
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
     from sglang.srt.layers.moe.topk import StandardTopKOutput
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraBatch
@@ -344,7 +344,7 @@ def _run_once(runner, gpu, token_slots):
         gate_up_lora_b=gpu["gate_up_lora_b"],
         down_lora_a=gpu["down_lora_a"],
         down_lora_b=gpu["down_lora_b"],
-        token_slots=token_slots,
+        token_lora_mapping=token_lora_mapping,
         adapter_enabled=gpu["adapter_enabled"],
         use_cuda_graph=False,
         is_prefill=True,
@@ -395,9 +395,9 @@ def test_runner_b_act_matches_the_materialized_reference(
     )
 
     for traffic in ("active", "mixed", "base_only"):
-        token_slots = _token_slots(traffic, num_tokens).to(device)
-        reference = _run_once(reference_runner, gpu, token_slots).hidden_states
-        b_act = _run_once(b_act_runner, gpu, token_slots).hidden_states
+        token_lora_mapping = _token_lora_mapping(traffic, num_tokens).to(device)
+        reference = _run_once(reference_runner, gpu, token_lora_mapping).hidden_states
+        b_act = _run_once(b_act_runner, gpu, token_lora_mapping).hidden_states
         torch.testing.assert_close(
             b_act,
             reference,

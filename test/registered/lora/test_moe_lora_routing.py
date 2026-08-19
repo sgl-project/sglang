@@ -123,7 +123,7 @@ class TestMoeLoraRouting(CustomTestCase):
         # A raw consumer fuses the key computation into its own kernel, so the
         # sources must survive on the view.
         self.assertEqual(raw.lora_experts_per_adapter, 2)
-        self.assertEqual(raw.token_slots.numel(), 1)
+        self.assertEqual(raw.token_lora_mapping.numel(), 1)
 
     def test_unknown_view_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "unknown route view"):
@@ -320,8 +320,8 @@ class TestMoeLoraRouting(CustomTestCase):
         policy paths — V=256 (ID pass + JIT) and V=12288 (fused) — since the
         two implement the contract independently.
         """
-        for lora_experts_per_adapter, slot_capacity in ((8, 32), (384, 32)):
-            num_virtual = lora_experts_per_adapter * slot_capacity
+        for lora_experts_per_adapter, max_loras in ((8, 32), (384, 32)):
+            num_virtual = lora_experts_per_adapter * max_loras
             with self.subTest(V=num_virtual):
                 generator = torch.Generator(device="cpu").manual_seed(23)
                 num_tokens, top_k = 96, 8
@@ -332,26 +332,26 @@ class TestMoeLoraRouting(CustomTestCase):
                     generator=generator,
                     dtype=torch.int32,
                 ).to(self.device)
-                token_slots = torch.randint(
+                token_lora_mapping = torch.randint(
                     -1,
-                    slot_capacity,
+                    max_loras,
                     (num_tokens,),
                     generator=generator,
                     dtype=torch.int32,
                 ).to(self.device)
                 route = build_virtual_expert_routing(
                     topk_ids,
-                    token_slots,
+                    token_lora_mapping,
                     lora_experts_per_adapter=lora_experts_per_adapter,
-                    max_loras=slot_capacity,
+                    max_loras=max_loras,
                     block_size=16,
                     view=RouteViewKind.ALIGNED,
                 )
                 num_pairs = num_tokens * top_k
                 keys = (
                     torch.where(
-                        (token_slots[:, None] >= 0) & (topk_ids >= 0),
-                        token_slots[:, None].to(torch.int64) * lora_experts_per_adapter
+                        (token_lora_mapping[:, None] >= 0) & (topk_ids >= 0),
+                        token_lora_mapping[:, None].to(torch.int64) * lora_experts_per_adapter
                         + topk_ids.to(torch.int64),
                         torch.tensor(-1, dtype=torch.int64, device=self.device),
                     )

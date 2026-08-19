@@ -62,10 +62,10 @@ def test_joint_route_scan_restores_both_count_buffers_between_calls() -> None:
         torch.tensor([0, 1, -1, 0, 1, -1], dtype=torch.int32, device=device),
         torch.tensor([1, -1, 0, 1, -1, 0], dtype=torch.int32, device=device),
     )
-    for token_slots in traffic:
+    for token_lora_mapping in traffic:
         build_joint_shared_routes(
             topk_ids,
-            token_slots,
+            token_lora_mapping,
             num_local_experts=num_local_experts,
             max_loras=max_loras,
             block_size=block_size,

@@ -125,7 +125,7 @@ class MoeLoraBatch(msgspec.Struct, kw_only=True):
 
     Narrow by design: the legacy ``LoRAInfo`` carries ~18 fields for the old
     kernels, and passing it wholesale would make it impossible to see what this
-    runner depends on. ``token_slots`` holds active physical slot
+    runner depends on. ``token_lora_mapping`` holds active physical slot
     IDs, with every inactive assignment represented by the ``-1`` sentinel.
     """
 
@@ -133,14 +133,14 @@ class MoeLoraBatch(msgspec.Struct, kw_only=True):
     gate_up_lora_b: torch.Tensor  # [L_cap, E_local, slices*I, R_phys]
     down_lora_a: torch.Tensor  # [L_cap, E_local, R_phys, I]
     down_lora_b: torch.Tensor  # [L_cap, E_f_down, H, R_phys]
-    token_slots: torch.Tensor  # [T] int, physical slot per token (-1 = base)
+    token_lora_mapping: torch.Tensor  # [T] int, adapter slot per token (-1 = base)
     adapter_enabled: torch.Tensor | None  # [L_cap], 0 marks an inactive slot
     use_cuda_graph: bool = False
     is_prefill: bool = False
     has_active_lora: bool = True
 
     @property
-    def slot_capacity(self) -> int:
+    def max_loras(self) -> int:
         return self.gate_up_lora_a.shape[0]
 
 
@@ -454,10 +454,13 @@ class MoeLoraRunner:
         topk_ids = topk_output.topk_ids
 
         num_tokens = hidden_states.shape[0]
-        if batch.token_slots.ndim != 1 or batch.token_slots.shape[0] != num_tokens:
+        if (
+            batch.token_lora_mapping.ndim != 1
+            or batch.token_lora_mapping.shape[0] != num_tokens
+        ):
             raise RuntimeError(
                 "MoE LoRA token/adapter assignment does not match the MoE "
-                f"token domain: mapping has {batch.token_slots.shape[0]} rows "
+                f"token domain: mapping has {batch.token_lora_mapping.shape[0]} rows "
                 f"but the runner received {num_tokens}. Gather/remap "
                 "assignments before MoE-DP execution."
             )
@@ -466,9 +469,9 @@ class MoeLoraRunner:
         routes = build_routes(
             plan,
             topk_ids=topk_ids,
-            token_slots=batch.token_slots,
+            token_lora_mapping=batch.token_lora_mapping,
             num_local_experts=self.num_local_experts,
-            max_loras=batch.slot_capacity,
+            max_loras=batch.max_loras,
             block_size=launch_config.routing_block_size,
             workspace=self.workspace,
         )

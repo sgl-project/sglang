@@ -298,7 +298,7 @@ def _indexed_pairs_lora_b_kernel(
     weight_ptr,
     destination_ptr,
     topk_ids_ptr,
-    token_slots_ptr,
+    token_lora_mapping_ptr,
     lora_expert_map_ptr,
     num_pairs,
     routed_expert_id_bound,
@@ -347,7 +347,7 @@ def _indexed_pairs_lora_b_kernel(
 
     key = virtual_expert_ids_inline(
         topk_ids_ptr,
-        token_slots_ptr,
+        token_lora_mapping_ptr,
         lora_expert_map_ptr,
         pair_id,
         pair_id < num_pairs,
@@ -427,7 +427,7 @@ def indexed_pairs_lora_b(
     """Execute raw-route pair-indexed sliced B.
 
     Consumes only the raw source tensors carried on every ``RouteView``
-    (``topk_ids``/``token_slots``); an execution plan choosing this family
+    (``topk_ids``/``token_lora_mapping``); an execution plan choosing this family
     requests ``RouteViewKind.RAW`` so no aligned pair plan is built merely for this
     stage.  The ``(num_pairs, n_tiles)`` grid is static per CUDA-graph
     capture bucket (``num_pairs == T * top_k``), matching the graph-captured
@@ -461,7 +461,7 @@ def indexed_pairs_lora_b(
         weight,
         destination,
         routing.topk_ids,
-        routing.token_slots,
+        routing.token_lora_mapping,
         map_arg,
         num_pairs,
         routed_bound,

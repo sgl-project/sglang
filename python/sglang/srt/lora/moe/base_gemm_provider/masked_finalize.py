@@ -107,7 +107,7 @@ def _validate_output_boundary(
         down_masked,
         src2dst,
         routing.topk_ids,
-        routing.token_slots,
+        routing.token_lora_mapping,
         topk_weights,
         output,
     )
@@ -157,7 +157,7 @@ def _shared_rank_reduce_kernel(
     token_rank_ptr,
     weights_ptr,
     topk_ids_ptr,
-    token_slots_ptr,
+    token_lora_mapping_ptr,
     num_tokens,
     stride_xm,
     stride_xk,
@@ -181,7 +181,7 @@ def _shared_rank_reduce_kernel(
     tokens64 = tokens.to(tl.int64)
     rank_offsets = tl.arange(0, block_r).to(tl.int64)
     rank_mask = rank_offsets < rank
-    adapter = tl.load(token_slots_ptr + tokens, mask=token_mask, other=-1)
+    adapter = tl.load(token_lora_mapping_ptr + tokens, mask=token_mask, other=-1)
     adapter_valid = (adapter >= 0) & (adapter < max_loras)
     acc = tl.zeros((block_t, block_r), tl.float32)
     for k in range(top_k):
@@ -221,7 +221,7 @@ def _shared_from_scratch_finalize_kernel(
     output_ptr,
     weights_ptr,
     topk_ids_ptr,
-    token_slots_ptr,
+    token_lora_mapping_ptr,
     stride_dm,
     stride_dh,
     stride_tm,
@@ -272,7 +272,7 @@ def _shared_from_scratch_finalize_kernel(
         ).to(tl.float32)
         base_acc += weight * base
 
-    adapter = tl.load(token_slots_ptr + token, mask=token < num_tokens, other=-1)
+    adapter = tl.load(token_lora_mapping_ptr + token, mask=token < num_tokens, other=-1)
     adapter_valid = (adapter >= 0) & (adapter < max_loras)
     safe_adapter = tl.maximum(adapter, 0).to(tl.int64)
     delta = tl.zeros((block_h,), tl.float32)
@@ -362,7 +362,7 @@ def invoke_shared_rank_reduce(
         token_rank,
         topk_weights,
         routing.topk_ids,
-        routing.token_slots,
+        routing.token_lora_mapping,
         num_tokens,
         bridge.stride(0),
         bridge.stride(1),
@@ -427,7 +427,7 @@ def invoke_shared_from_scratch_finalize(
         output,
         topk_weights,
         routing.topk_ids,
-        routing.token_slots,
+        routing.token_lora_mapping,
         down_masked.stride(-2),
         down_masked.stride(-1),
         token_rank.stride(0),

@@ -52,7 +52,7 @@ class MoeLoraRoutes:
 
 def _aligned_pair_route(
     topk_ids: torch.Tensor,
-    token_slots: torch.Tensor,
+    token_lora_mapping: torch.Tensor,
     *,
     is_shared_outer: bool,
     num_local_experts: int,
@@ -100,7 +100,7 @@ def _aligned_pair_route(
     # would be accepted as a valid pair.
     return build_virtual_expert_routing(
         topk_ids,
-        token_slots,
+        token_lora_mapping,
         lora_experts_per_adapter=lora_experts_per_adapter,
         shared_outer_local_expert_count=num_local_experts if is_shared_outer else None,
         max_loras=max_loras,
@@ -115,7 +115,7 @@ def build_routes(
     plan: MoeLoraExecutionPlan,
     *,
     topk_ids: torch.Tensor,
-    token_slots: torch.Tensor,
+    token_lora_mapping: torch.Tensor,
     num_local_experts: int,
     max_loras: int,
     block_size: int,
@@ -133,7 +133,7 @@ def build_routes(
     if RouteRequirement.RAW_PER_EXPERT in requirements:
         values["raw_per_expert"] = build_virtual_expert_routing(
             topk_ids,
-            token_slots,
+            token_lora_mapping,
             lora_experts_per_adapter=num_local_experts,
             max_loras=max_loras,
             block_size=block_size,
@@ -144,7 +144,7 @@ def build_routes(
         # the ownership bound (see _aligned_pair_route).
         values["raw_shared_outer"] = build_virtual_expert_routing(
             topk_ids,
-            token_slots,
+            token_lora_mapping,
             lora_experts_per_adapter=1,
             shared_outer_local_expert_count=num_local_experts,
             max_loras=max_loras,
@@ -155,7 +155,7 @@ def build_routes(
     if plan.route_builder is RouteBuilderFamily.JOINT_SHARED_OUTER:
         per_expert, shared = build_joint_shared_routes(
             topk_ids,
-            token_slots,
+            token_lora_mapping,
             num_local_experts=num_local_experts,
             max_loras=max_loras,
             block_size=block_size,
@@ -167,7 +167,7 @@ def build_routes(
         if RouteRequirement.ALIGNED_PER_EXPERT in requirements:
             values["aligned_per_expert"] = _aligned_pair_route(
                 topk_ids,
-                token_slots,
+                token_lora_mapping,
                 is_shared_outer=False,
                 num_local_experts=num_local_experts,
                 max_loras=max_loras,
@@ -178,7 +178,7 @@ def build_routes(
         if RouteRequirement.ALIGNED_SHARED_OUTER in requirements:
             values["aligned_shared_outer"] = _aligned_pair_route(
                 topk_ids,
-                token_slots,
+                token_lora_mapping,
                 is_shared_outer=True,
                 num_local_experts=num_local_experts,
                 max_loras=max_loras,
@@ -195,17 +195,17 @@ def build_routes(
         # and no downstream B reads its bridge.  This is the same sparse-EP
         # contract qualified by Step 3's token-dedup candidate.
         has_local_pair = ((topk_ids >= 0) & (topk_ids < num_local_experts)).any(dim=1)
-        shared_token_slots = workspace.tensor(
-            "route:shared_token_slots",
-            token_slots.shape,
-            dtype=token_slots.dtype,
-            device=token_slots.device,
+        shared_token_lora_mapping = workspace.tensor(
+            "route:shared_token_lora_mapping",
+            token_lora_mapping.shape,
+            dtype=token_lora_mapping.dtype,
+            device=token_lora_mapping.device,
         )
         torch.where(
             has_local_pair,
-            token_slots,
-            torch.full_like(token_slots, -1),
-            out=shared_token_slots,
+            token_lora_mapping,
+            torch.full_like(token_lora_mapping, -1),
+            out=shared_token_lora_mapping,
         )
         # The shared A factor is adapter-owned, so the expert column itself is
         # synthetic once local participation has been encoded in the slots.
@@ -218,7 +218,7 @@ def build_routes(
         )
         values["shared_token"] = _aligned_pair_route(
             token_experts,
-            shared_token_slots,
+            shared_token_lora_mapping,
             is_shared_outer=True,
             num_local_experts=num_local_experts,
             max_loras=max_loras,

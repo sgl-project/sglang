@@ -84,11 +84,11 @@ def _routing_case(num_tokens: int, top_k: int, num_experts: int, seed: int):
     topk_ids[torch.rand((num_tokens, top_k), generator=generator) < 0.15] = -1
     topk_ids[0] = -1  # a token with zero routed pairs
     pattern = torch.tensor([0, 1, -1, 0, -1, 1], dtype=torch.int32)
-    token_slots = pattern.repeat(-(-num_tokens // pattern.numel()))[:num_tokens]
-    return topk_ids, token_slots
+    token_lora_mapping = pattern.repeat(-(-num_tokens // pattern.numel()))[:num_tokens]
+    return topk_ids, token_lora_mapping
 
 
-def _views(topk_ids, token_slots, num_experts, device):
+def _views(topk_ids, token_lora_mapping, num_experts, device):
     kwargs = dict(
         lora_experts_per_adapter=num_experts,
         max_loras=_SLOTS,
@@ -96,12 +96,12 @@ def _views(topk_ids, token_slots, num_experts, device):
     )
     aligned = build_virtual_expert_routing(
         topk_ids.to(device),
-        token_slots.to(device),
+        token_lora_mapping.to(device),
         view=RouteViewKind.ALIGNED,
         **kwargs,
     )
     raw = build_virtual_expert_routing(
-        topk_ids.to(device), token_slots.to(device), view=RouteViewKind.RAW, **kwargs
+        topk_ids.to(device), token_lora_mapping.to(device), view=RouteViewKind.RAW, **kwargs
     )
     return aligned, raw
 
@@ -142,8 +142,8 @@ def test_indexed_pairs_matches_one_launch_on_identical_inputs(
 ) -> None:
     device = torch.device("cuda")
     seed = 0x1DB0 + num_tokens + num_experts
-    topk_ids, token_slots = _routing_case(num_tokens, top_k, num_experts, seed)
-    aligned, raw = _views(topk_ids, token_slots, num_experts, device)
+    topk_ids, token_lora_mapping = _routing_case(num_tokens, top_k, num_experts, seed)
+    aligned, raw = _views(topk_ids, token_lora_mapping, num_experts, device)
     num_pairs = num_tokens * top_k
     bridge, weight, offsets, num_slices, width = _site_tensors(
         site, num_pairs, num_experts, seed, device
@@ -174,7 +174,7 @@ def test_indexed_pairs_matches_one_launch_on_identical_inputs(
 
     # Invalid pairs (base tokens, unrouted -1 experts) must be ZERO-stored,
     # not left at the poison: B owns every consumed destination cell.
-    pair_valid = (topk_ids.view(-1) >= 0) & (token_slots.repeat_interleave(top_k) >= 0)
+    pair_valid = (topk_ids.view(-1) >= 0) & (token_lora_mapping.repeat_interleave(top_k) >= 0)
     invalid_rows = indexed[~pair_valid.to(device)]
     assert invalid_rows.numel() > 0
     assert torch.count_nonzero(invalid_rows) == 0
@@ -184,13 +184,13 @@ def test_indexed_pairs_matches_one_launch_on_identical_inputs(
 
 def test_zero_pair_batches_return_without_launching() -> None:
     device = torch.device("cuda")
-    topk_ids, token_slots = _routing_case(4, 2, 8, 0x1DB2)
+    topk_ids, token_lora_mapping = _routing_case(4, 2, 8, 0x1DB2)
     empty = RouteView(
         view=RouteViewKind.RAW,
         num_virtual_experts=_SLOTS * 8,
         block_size=16,
         topk_ids=topk_ids[:0].to(device),
-        token_slots=token_slots[:0].to(device),
+        token_lora_mapping=token_lora_mapping[:0].to(device),
         lora_experts_per_adapter=8,
         max_loras=_SLOTS,
     )
@@ -210,8 +210,8 @@ def test_zero_pair_batches_return_without_launching() -> None:
 
 def test_run_lora_b_dispatches_the_family_and_rejects_pdl() -> None:
     device = torch.device("cuda")
-    topk_ids, token_slots = _routing_case(8, 2, 8, 0x1DB3)
-    _, raw = _views(topk_ids, token_slots, 8, device)
+    topk_ids, token_lora_mapping = _routing_case(8, 2, 8, 0x1DB3)
+    _, raw = _views(topk_ids, token_lora_mapping, 8, device)
     bridge, weight, offsets, num_slices, width = _site_tensors(
         "down", 16, 8, 0x1DB3, device
     )
@@ -255,8 +255,8 @@ def test_graph_replay_recomputes_from_mutated_routing_content() -> None:
     indexed down-A precedent."""
     device = torch.device("cuda")
     num_tokens, top_k, num_experts = 16, 2, 8
-    topk_ids, token_slots = _routing_case(num_tokens, top_k, num_experts, 0x1DB4)
-    _, raw = _views(topk_ids, token_slots, num_experts, device)
+    topk_ids, token_lora_mapping = _routing_case(num_tokens, top_k, num_experts, 0x1DB4)
+    _, raw = _views(topk_ids, token_lora_mapping, num_experts, device)
     num_pairs = num_tokens * top_k
     bridge, weight, offsets, num_slices, width = _site_tensors(
         "gate_up", num_pairs, num_experts, 0x1DB4, device
@@ -283,11 +283,11 @@ def test_graph_replay_recomputes_from_mutated_routing_content() -> None:
 
     # Mutate every routing input in place: new expert ids, more base tokens,
     # and a new bridge.
-    new_topk_ids, new_token_slots = _routing_case(
+    new_topk_ids, new_token_lora_mapping = _routing_case(
         num_tokens, top_k, num_experts, 0x1DB5
     )
     raw.topk_ids.copy_(new_topk_ids.to(device))
-    raw.token_slots.copy_(new_token_slots.to(device))
+    raw.token_lora_mapping.copy_(new_token_lora_mapping.to(device))
     new_bridge = (
         torch.randn(
             (num_pairs, num_slices * _RANK),

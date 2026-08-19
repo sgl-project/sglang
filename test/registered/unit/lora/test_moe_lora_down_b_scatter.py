@@ -329,7 +329,7 @@ def _kernel_case(num_tokens: int, top_k: int, num_experts: int, seed: int):
     topk_ids[torch.rand((num_tokens, top_k), generator=generator) < 0.15] = -1
     topk_ids[0] = -1  # a token with zero routed pairs
     pattern = torch.tensor([0, 1, -1, 0, -1, 1], dtype=torch.int32)
-    token_slots = pattern.repeat(-(-num_tokens // pattern.numel()))[:num_tokens]
+    token_lora_mapping = pattern.repeat(-(-num_tokens // pattern.numel()))[:num_tokens]
     weights = torch.rand((num_tokens, top_k), generator=generator) + 0.1
     topk_weights = (weights / weights.sum(dim=1, keepdim=True)).float()
 
@@ -344,8 +344,8 @@ def _kernel_case(num_tokens: int, top_k: int, num_experts: int, seed: int):
     # past half the physical rank, exactly how mixed ranks reach the kernels.
     b_down.view(_SLOTS, num_experts, _HIDDEN, _RANK)[1, :, :, _RANK // 2 :] = 0
     bridge_view = bridge.view(num_tokens, top_k, _RANK)
-    bridge_view[token_slots == 1, :, _RANK // 2 :] = 0
-    return topk_ids, token_slots, topk_weights, bridge, b_down
+    bridge_view[token_lora_mapping == 1, :, _RANK // 2 :] = 0
+    return topk_ids, token_lora_mapping, topk_weights, bridge, b_down
 
 
 def _src2dst_rows(topk_ids: torch.Tensor, num_experts: int, style: str, seed: int):
@@ -377,12 +377,12 @@ def _src2dst_rows(topk_ids: torch.Tensor, num_experts: int, style: str, seed: in
 
 
 def _fp32_finalize_oracle(
-    down_rows, src2dst, bridge, b_down, topk_ids, token_slots, topk_weights, num_experts
+    down_rows, src2dst, bridge, b_down, topk_ids, token_lora_mapping, topk_weights, num_experts
 ):
     num_tokens, top_k = topk_ids.shape
     out = torch.zeros((num_tokens, _HIDDEN), dtype=torch.float32)
     for token in range(num_tokens):
-        slot = int(token_slots[token])
+        slot = int(token_lora_mapping[token])
         for k in range(top_k):
             expert = int(topk_ids[token, k])
             if expert < 0:
@@ -456,7 +456,7 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
 
     device = torch.device("cuda")
     seed = 0x5CA7 + num_tokens + num_experts
-    topk_ids, token_slots, topk_weights, bridge, b_down = _kernel_case(
+    topk_ids, token_lora_mapping, topk_weights, bridge, b_down = _kernel_case(
         num_tokens, top_k, num_experts, seed
     )
     src2dst, down_rows = _src2dst_rows(topk_ids, num_experts, row_domain, seed)
@@ -464,7 +464,7 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
         name: tensor.to(device)
         for name, tensor in {
             "topk_ids": topk_ids,
-            "token_slots": token_slots,
+            "token_lora_mapping": token_lora_mapping,
             "topk_weights": topk_weights,
             "bridge": bridge,
             "b_down": b_down,
@@ -474,7 +474,7 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
     }
     aligned = build_virtual_expert_routing(
         gpu["topk_ids"],
-        gpu["token_slots"],
+        gpu["token_lora_mapping"],
         lora_experts_per_adapter=num_experts,
         max_loras=_SLOTS,
         block_size=16,
@@ -524,7 +524,7 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
     # Rows no LoRA-active pair targets are BITWISE untouched: base-only and
     # sentinel pairs contribute no add and their (poisoned or unwritten)
     # src2dst entries are never dereferenced.
-    lora_active = (topk_ids.view(-1) >= 0) & (token_slots.repeat_interleave(top_k) >= 0)
+    lora_active = (topk_ids.view(-1) >= 0) & (token_lora_mapping.repeat_interleave(top_k) >= 0)
     touched = src2dst[lora_active].long()
     untouched = torch.ones(down_rows.shape[0], dtype=torch.bool)
     untouched[touched] = False
@@ -539,7 +539,7 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
         bridge,
         b_down,
         topk_ids,
-        token_slots,
+        token_lora_mapping,
         topk_weights,
         num_experts,
     )
@@ -547,7 +547,7 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
 
     # Base-only traffic: the launch is a bitwise no-op on the base rows and
     # the outputs collapse to the plain base combine.
-    base_slots = torch.full_like(gpu["token_slots"], -1)
+    base_slots = torch.full_like(gpu["token_lora_mapping"], -1)
     aligned_base = build_virtual_expert_routing(
         gpu["topk_ids"],
         base_slots,
@@ -581,11 +581,11 @@ def test_scatter_rejects_a_mismatched_route_block() -> None:
     )
 
     device = torch.device("cuda")
-    topk_ids, token_slots, _weights, bridge, b_down = _kernel_case(4, 2, 4, 7)
+    topk_ids, token_lora_mapping, _weights, bridge, b_down = _kernel_case(4, 2, 4, 7)
     src2dst, down_rows = _src2dst_rows(topk_ids, 4, "masked", 7)
     aligned = build_virtual_expert_routing(
         topk_ids.to(device),
-        token_slots.to(device),
+        token_lora_mapping.to(device),
         lora_experts_per_adapter=4,
         max_loras=_SLOTS,
         block_size=32,
@@ -647,7 +647,7 @@ def _make_gpu_tensors(num_tokens: int, num_experts: int, device: torch.device):
     return {name: tensor.to(device) for name, tensor in tensors.items()}
 
 
-def _token_slots(traffic: str, num_tokens: int) -> torch.Tensor:
+def _token_lora_mapping(traffic: str, num_tokens: int) -> torch.Tensor:
     if traffic == "active":
         pattern = torch.tensor([0, 1], dtype=torch.int32)
     elif traffic == "mixed":
@@ -708,7 +708,7 @@ def _build_runner(plan, launch_config, base_gemm_rows: str, gpu, num_experts: in
     return runner
 
 
-def _run_once(runner, gpu, token_slots, *, use_cuda_graph=False):
+def _run_once(runner, gpu, token_lora_mapping, *, use_cuda_graph=False):
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
     from sglang.srt.layers.moe.topk import StandardTopKOutput
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraBatch
@@ -727,7 +727,7 @@ def _run_once(runner, gpu, token_slots, *, use_cuda_graph=False):
         gate_up_lora_b=gpu["gate_up_lora_b"],
         down_lora_a=gpu["down_lora_a"],
         down_lora_b=gpu["down_lora_b"],
-        token_slots=token_slots,
+        token_lora_mapping=token_lora_mapping,
         adapter_enabled=gpu["adapter_enabled"],
         use_cuda_graph=use_cuda_graph,
         is_prefill=True,
@@ -768,9 +768,9 @@ def test_runner_scatter_matches_the_materialized_reference(
     )
 
     for traffic in ("active", "mixed", "base_only"):
-        token_slots = _token_slots(traffic, num_tokens).to(device)
-        reference = _run_once(reference_runner, gpu, token_slots).hidden_states
-        scatter = _run_once(scatter_runner, gpu, token_slots).hidden_states
+        token_lora_mapping = _token_lora_mapping(traffic, num_tokens).to(device)
+        reference = _run_once(reference_runner, gpu, token_lora_mapping).hidden_states
+        scatter = _run_once(scatter_runner, gpu, token_lora_mapping).hidden_states
         torch.testing.assert_close(
             scatter, reference, **_SCATTER_TOLERANCE, msg=f"{base_gemm_rows}: {traffic}"
         )
@@ -802,39 +802,39 @@ def test_scatter_pipeline_replays_correctly_in_a_real_cuda_graph(
     scatter_runner = _build_runner(
         reordered_plan, launch_config, "expert_major", gpu, num_experts
     )
-    token_slots = _token_slots("active", num_tokens).to(device)
+    token_lora_mapping = _token_lora_mapping("active", num_tokens).to(device)
 
     for _ in range(2):  # JIT + workspace graph-buffer retention before capture
-        _run_once(scatter_runner, gpu, token_slots, use_cuda_graph=True)
+        _run_once(scatter_runner, gpu, token_lora_mapping, use_cuda_graph=True)
     torch.cuda.synchronize(device)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = _run_once(scatter_runner, gpu, token_slots, use_cuda_graph=True)
+        captured = _run_once(scatter_runner, gpu, token_lora_mapping, use_cuda_graph=True)
     output = captured.hidden_states
     output_ptr = output.data_ptr()
 
     graph.replay()
     torch.cuda.synchronize(device)
-    reference = _run_once(reference_runner, gpu, token_slots).hidden_states
+    reference = _run_once(reference_runner, gpu, token_lora_mapping).hidden_states
     torch.testing.assert_close(output, reference, **_SCATTER_TOLERANCE)
 
     # Replay 2: the whole batch flips to base-only through the sentinel.
-    token_slots.fill_(-1)
+    token_lora_mapping.fill_(-1)
     graph.replay()
     torch.cuda.synchronize(device)
     assert output.data_ptr() == output_ptr
-    reference = _run_once(reference_runner, gpu, token_slots).hidden_states
+    reference = _run_once(reference_runner, gpu, token_lora_mapping).hidden_states
     torch.testing.assert_close(output, reference, **_SCATTER_TOLERANCE)
 
     # Replay 3: new routing and activations arrive in place, adapters return.
     gpu["topk_ids"].copy_(gpu["topk_ids"].flip(dims=(1,)))
     gpu["hidden_states"].copy_((gpu["hidden_states"].float() * 1.5).to(torch.bfloat16))
-    token_slots.copy_(_token_slots("mixed", num_tokens).to(device))
+    token_lora_mapping.copy_(_token_lora_mapping("mixed", num_tokens).to(device))
     graph.replay()
     torch.cuda.synchronize(device)
     assert output.data_ptr() == output_ptr
-    reference = _run_once(reference_runner, gpu, token_slots).hidden_states
+    reference = _run_once(reference_runner, gpu, token_lora_mapping).hidden_states
     torch.testing.assert_close(output, reference, **_SCATTER_TOLERANCE)
 
     assert "down_b:delta" not in _workspace_buffer_names(scatter_runner)

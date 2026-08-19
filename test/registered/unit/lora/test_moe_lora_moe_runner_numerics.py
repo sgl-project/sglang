@@ -124,7 +124,7 @@ def _make_cpu_tensors(num_tokens: int) -> dict[str, torch.Tensor]:
     return tensors
 
 
-def _token_slots(traffic: str, num_tokens: int) -> torch.Tensor:
+def _token_lora_mapping(traffic: str, num_tokens: int) -> torch.Tensor:
     if traffic == "active":
         return torch.zeros(num_tokens, dtype=torch.int32)
     if traffic == "mixed":
@@ -142,7 +142,7 @@ def _token_slots(traffic: str, num_tokens: int) -> torch.Tensor:
 
 
 def _fp32_reference(
-    tensors: dict[str, torch.Tensor], token_slots: torch.Tensor
+    tensors: dict[str, torch.Tensor], token_lora_mapping: torch.Tensor
 ) -> torch.Tensor:
     """Independent token/expert reference with no production route helpers."""
 
@@ -159,7 +159,7 @@ def _fp32_reference(
 
     output = torch.zeros((hidden_states.shape[0], _HIDDEN), dtype=torch.float32)
     for token_idx, hidden in enumerate(hidden_states):
-        slot = int(token_slots[token_idx])
+        slot = int(token_lora_mapping[token_idx])
         slot_is_active = slot >= 0 and bool(adapter_enabled[slot])
         for topk_idx in range(_TOP_K):
             expert = int(topk_ids[token_idx, topk_idx])
@@ -267,14 +267,14 @@ def test_config_chosen_per_expert_swiglu_matches_fp32_reference(
     )
     references: dict[str, torch.Tensor] = {}
     for traffic in ("active", "mixed", "base_only"):
-        cpu_slots = _token_slots(traffic, num_tokens)
+        cpu_slots = _token_lora_mapping(traffic, num_tokens)
         references[traffic] = _fp32_reference(cpu, cpu_slots)
         batch = MoeLoraBatch(
             gate_up_lora_a=gpu["gate_up_lora_a"],
             gate_up_lora_b=gpu["gate_up_lora_b"],
             down_lora_a=gpu["down_lora_a"],
             down_lora_b=gpu["down_lora_b"],
-            token_slots=cpu_slots.to(device),
+            token_lora_mapping=cpu_slots.to(device),
             adapter_enabled=gpu["adapter_enabled"],
             use_cuda_graph=False,
             is_prefill=mode is Phase.PREFILL,
@@ -324,7 +324,7 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
 
     cpu = _make_cpu_tensors(num_tokens)
     gpu = {name: tensor.to(device) for name, tensor in cpu.items()}
-    token_slots = _token_slots("active", num_tokens).to(device)
+    token_lora_mapping = _token_lora_mapping("active", num_tokens).to(device)
 
     choice, launch_config = _resolve_execution(
         architecture_for_capability(*capability), mode, num_tokens
@@ -362,7 +362,7 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
         gate_up_lora_b=gpu["gate_up_lora_b"],
         down_lora_a=gpu["down_lora_a"],
         down_lora_b=gpu["down_lora_b"],
-        token_slots=token_slots,
+        token_lora_mapping=token_lora_mapping,
         adapter_enabled=gpu["adapter_enabled"],
         use_cuda_graph=True,
         is_prefill=mode is Phase.PREFILL,
@@ -383,20 +383,20 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
     torch.cuda.synchronize(device)
     torch.testing.assert_close(
         output.detach().float().cpu(),
-        _fp32_reference(cpu, _token_slots("active", num_tokens)),
+        _fp32_reference(cpu, _token_lora_mapping("active", num_tokens)),
         atol=0.018,
         rtol=0.06,
         msg=f"{choice.key}: active replay",
     )
 
     # Replay 2: the whole batch flips to base-only through the sentinel.
-    token_slots.fill_(-1)
+    token_lora_mapping.fill_(-1)
     graph.replay()
     torch.cuda.synchronize(device)
     assert output.data_ptr() == output_ptr
     torch.testing.assert_close(
         output.detach().float().cpu(),
-        _fp32_reference(cpu, _token_slots("base_only", num_tokens)),
+        _fp32_reference(cpu, _token_lora_mapping("base_only", num_tokens)),
         atol=0.018,
         rtol=0.06,
         msg=f"{choice.key}: base-only replay",
@@ -407,13 +407,13 @@ def test_selected_pipeline_replays_correctly_in_a_real_cuda_graph(
     cpu["hidden_states"] = (cpu["hidden_states"].float() * 1.5).to(torch.bfloat16)
     gpu["topk_ids"].copy_(cpu["topk_ids"])
     gpu["hidden_states"].copy_(cpu["hidden_states"])
-    token_slots.copy_(_token_slots("mixed", num_tokens).to(device))
+    token_lora_mapping.copy_(_token_lora_mapping("mixed", num_tokens).to(device))
     graph.replay()
     torch.cuda.synchronize(device)
     assert output.data_ptr() == output_ptr
     torch.testing.assert_close(
         output.detach().float().cpu(),
-        _fp32_reference(cpu, _token_slots("mixed", num_tokens)),
+        _fp32_reference(cpu, _token_lora_mapping("mixed", num_tokens)),
         atol=0.018,
         rtol=0.06,
         msg=f"{choice.key}: mutated-routing replay",

@@ -40,7 +40,7 @@ sections 7.1 and 29 R1).  Three views exist:
 
 ``raw``
     Nothing is materialized.  An indexed schedule derives ``(adapter, factor)``
-    per pair inline from ``topk_ids`` and ``token_slots``; building a plan it
+    per pair inline from ``topk_ids`` and ``token_lora_mapping``; building a plan it
     never reads is pure cost.
 ``fused_ids``
     ``virtual_topk_ids`` only.  For a consumer that wants the fused key without
@@ -171,7 +171,7 @@ class RouteView(msgspec.Struct, frozen=True, kw_only=True):
     num_virtual_experts: int
     block_size: int
     topk_ids: torch.Tensor
-    token_slots: torch.Tensor
+    token_lora_mapping: torch.Tensor
     lora_experts_per_adapter: int
     max_loras: int
     lora_expert_map: torch.Tensor | None = None
@@ -257,7 +257,7 @@ def validate_shared_outer(
 @triton.jit
 def virtual_expert_ids_inline(
     topk_ids_ptr,
-    token_slots_ptr,
+    token_lora_mapping_ptr,
     lora_expert_map_ptr,
     pair_ids,
     pair_mask,
@@ -296,7 +296,7 @@ def virtual_expert_ids_inline(
     # the fused-align host; the JIT path's own ceiling is far lower), and int64
     # multiplies/divides in this per-pair hot loop cost real issue slots.
     adapter_ids = tl.load(
-        token_slots_ptr + token_ids,
+        token_lora_mapping_ptr + token_ids,
         mask=pair_mask,
         other=-1,
     ).to(tl.int32)
@@ -507,7 +507,7 @@ def build_virtual_expert_routing(
         "num_virtual_experts": lora_experts_per_adapter * max_loras,
         "block_size": block_size,
         "topk_ids": topk_ids,
-        "token_slots": token_lora_mapping,
+        "token_lora_mapping": token_lora_mapping,
         "lora_experts_per_adapter": lora_experts_per_adapter,
         "max_loras": max_loras,
         "lora_expert_map": lora_expert_map,

@@ -84,7 +84,7 @@ SCAN_WARPS = 4
 @triton.jit
 def _fused_hist_kernel(
     topk_ids_ptr,
-    token_slots_ptr,
+    token_lora_mapping_ptr,
     lora_expert_map_ptr,
     counts_ptr,
     num_pairs,
@@ -107,7 +107,7 @@ def _fused_hist_kernel(
     pair_mask = pair_ids < num_pairs
     virtual_ids = virtual_expert_ids_inline(
         topk_ids_ptr,
-        token_slots_ptr,
+        token_lora_mapping_ptr,
         lora_expert_map_ptr,
         pair_ids,
         pair_mask,
@@ -170,7 +170,7 @@ def _padded_scan_kernel(
 @triton.jit
 def _expand_and_scatter_kernel(
     topk_ids_ptr,
-    token_slots_ptr,
+    token_lora_mapping_ptr,
     lora_expert_map_ptr,
     cursor_ptr,
     bucket_end_ptr,
@@ -249,7 +249,7 @@ def _expand_and_scatter_kernel(
     pair_mask = pair_ids < num_pairs
     virtual_ids = virtual_expert_ids_inline(
         topk_ids_ptr,
-        token_slots_ptr,
+        token_lora_mapping_ptr,
         lora_expert_map_ptr,
         pair_ids,
         pair_mask,
@@ -337,7 +337,7 @@ def _validate_scratch(
 
 def fused_align_block_size(
     topk_ids: torch.Tensor,
-    token_slots: torch.Tensor,
+    token_lora_mapping: torch.Tensor,
     *,
     lora_experts_per_adapter: int,
     max_loras: int,
@@ -422,7 +422,7 @@ def fused_align_block_size(
 
     _fused_hist_kernel[(triton.cdiv(max(num_pairs, 1), HIST_BLOCK),)](
         topk_ids,
-        token_slots,
+        token_lora_mapping,
         map_arg,
         active_scratch.counts,
         num_pairs,
@@ -454,7 +454,7 @@ def fused_align_block_size(
     num_pair_programs = triton.cdiv(max(num_pairs, 1), EXPAND_BLOCK)
     _expand_and_scatter_kernel[(num_block_programs + num_pair_programs,)](
         topk_ids,
-        token_slots,
+        token_lora_mapping,
         map_arg,
         active_scratch.cursor,
         active_scratch.bucket_end,

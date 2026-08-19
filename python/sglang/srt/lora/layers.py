@@ -1126,7 +1126,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             gate_up_lora_b=self.gate_up_lora_b_weights,
             down_lora_a=self.down_lora_a_weights,
             down_lora_b=self.down_lora_b_weights,
-            token_slots=moe_lora_info.token_lora_mapping,
+            token_lora_mapping=moe_lora_info.token_lora_mapping,
             adapter_enabled=moe_lora_info.adapter_enabled,
             use_cuda_graph=batch_info.use_cuda_graph,
             is_prefill=batch_info.is_prefill,

@@ -141,7 +141,7 @@ class _HostRouteView(msgspec.Struct, frozen=True, kw_only=True):
     num_virtual_experts: int
     block_size: int
     topk_ids: torch.Tensor
-    token_slots: torch.Tensor
+    token_lora_mapping: torch.Tensor
     lora_experts_per_adapter: int
     max_loras: int
     shared_outer_local_expert_count: int | None = None
@@ -330,7 +330,7 @@ class _KernelRecorder:
 
 def _route(
     topk_ids: torch.Tensor,
-    token_slots: torch.Tensor,
+    token_lora_mapping: torch.Tensor,
     *,
     block_size: int,
     padded_count: torch.Tensor,
@@ -344,7 +344,7 @@ def _route(
         num_virtual_experts=lora_experts_per_adapter * max_loras,
         block_size=block_size,
         topk_ids=topk_ids,
-        token_slots=token_slots,
+        token_lora_mapping=token_lora_mapping,
         lora_experts_per_adapter=lora_experts_per_adapter,
         max_loras=max_loras,
         shared_outer_local_expert_count=shared_outer_local_expert_count,
@@ -380,7 +380,7 @@ class TestRoutePdlWiring(unittest.TestCase):
 
         def fake_aligned(
             topk_ids,
-            token_slots,
+            token_lora_mapping,
             *,
             is_shared_outer,
             num_local_experts,
@@ -392,7 +392,7 @@ class TestRoutePdlWiring(unittest.TestCase):
             calls.append(scratch_prefix)
             return _route(
                 topk_ids,
-                token_slots,
+                token_lora_mapping,
                 block_size=block_size,
                 padded_count=torch.tensor([block_size], dtype=torch.int32),
             )
@@ -404,7 +404,7 @@ class TestRoutePdlWiring(unittest.TestCase):
                 ROUTE_FACTORY.build_routes(
                     plan,
                     topk_ids=torch.tensor([[0, 1]], dtype=torch.int32),
-                    token_slots=torch.tensor([0], dtype=torch.int32),
+                    token_lora_mapping=torch.tensor([0], dtype=torch.int32),
                     num_local_experts=2,
                     max_loras=2,
                     block_size=16,
@@ -442,7 +442,7 @@ class TestRoutePdlWiring(unittest.TestCase):
 
         def fake_joint(
             topk_ids,
-            token_slots,
+            token_lora_mapping,
             *,
             num_local_experts,
             max_loras,
@@ -452,7 +452,7 @@ class TestRoutePdlWiring(unittest.TestCase):
             joint_calls.append(block_size)
             route = _route(
                 topk_ids,
-                token_slots,
+                token_lora_mapping,
                 block_size=block_size,
                 padded_count=torch.tensor([block_size], dtype=torch.int32),
             )
@@ -460,7 +460,7 @@ class TestRoutePdlWiring(unittest.TestCase):
 
         def fake_route(
             topk_ids,
-            token_slots,
+            token_lora_mapping,
             *,
             lora_experts_per_adapter,
             max_loras,
@@ -475,7 +475,7 @@ class TestRoutePdlWiring(unittest.TestCase):
             num_pairs_post_padded_out.fill_(block_size)
             return _route(
                 topk_ids,
-                token_slots,
+                token_lora_mapping,
                 block_size=block_size,
                 padded_count=num_pairs_post_padded_out,
             )
@@ -491,7 +491,7 @@ class TestRoutePdlWiring(unittest.TestCase):
             ROUTE_FACTORY.build_routes(
                 plan,
                 topk_ids=torch.tensor([[0, 1]], dtype=torch.int32),
-                token_slots=torch.tensor([0], dtype=torch.int32),
+                token_lora_mapping=torch.tensor([0], dtype=torch.int32),
                 num_local_experts=2,
                 max_loras=2,
                 block_size=16,
@@ -590,13 +590,13 @@ class TestSharedTokenRoute(unittest.TestCase):
             ),
         )
         topk_ids = torch.tensor([[-1, -1], [-1, 1], [0, -1]], dtype=torch.int32)
-        token_slots = torch.tensor([0, 1, 0], dtype=torch.int32)
+        token_lora_mapping = torch.tensor([0, 1, 0], dtype=torch.int32)
         workspace = _Workspace()
         calls = []
 
         def fake_route(
             route_topk_ids,
-            route_token_slots,
+            route_token_lora_mapping,
             *,
             lora_experts_per_adapter,
             max_loras,
@@ -611,13 +611,13 @@ class TestSharedTokenRoute(unittest.TestCase):
                 (
                     shared_outer_local_expert_count is not None,
                     route_topk_ids.clone(),
-                    route_token_slots.clone(),
+                    route_token_lora_mapping.clone(),
                 )
             )
             num_pairs_post_padded_out.fill_(block_size)
             return _route(
                 route_topk_ids,
-                route_token_slots,
+                route_token_lora_mapping,
                 block_size=block_size,
                 padded_count=num_pairs_post_padded_out,
             )
@@ -631,7 +631,7 @@ class TestSharedTokenRoute(unittest.TestCase):
             routes = ROUTE_FACTORY.build_routes(
                 shared_plan,
                 topk_ids=topk_ids,
-                token_slots=token_slots,
+                token_lora_mapping=token_lora_mapping,
                 num_local_experts=2,
                 max_loras=2,
                 block_size=16,
@@ -646,7 +646,7 @@ class TestSharedTokenRoute(unittest.TestCase):
             shared_call[2], torch.tensor([-1, 1, 0], dtype=torch.int32)
         )
         self.assertIsNotNone(routes.shared_token)
-        self.assertIn("route:shared_token_slots", workspace.tensors)
+        self.assertIn("route:shared_token_lora_mapping", workspace.tensors)
 
     def test_large_shared_token_route_cannot_overwrite_retained_pair_counts(self):
         """Every retained fused route owns its scalar, even at shared bucket V."""
@@ -671,7 +671,7 @@ class TestSharedTokenRoute(unittest.TestCase):
         num_tokens = 16384
         top_k = 8
         topk_ids = torch.zeros((num_tokens, top_k), dtype=torch.int32)
-        token_slots = torch.zeros(num_tokens, dtype=torch.int32)
+        token_lora_mapping = torch.zeros(num_tokens, dtype=torch.int32)
 
         for num_local_experts in (1, 2):
             with self.subTest(num_local_experts=num_local_experts):
@@ -680,7 +680,7 @@ class TestSharedTokenRoute(unittest.TestCase):
 
                 def fake_route(
                     route_topk_ids,
-                    route_token_slots,
+                    route_token_lora_mapping,
                     *,
                     lora_experts_per_adapter,
                     max_loras,
@@ -706,7 +706,7 @@ class TestSharedTokenRoute(unittest.TestCase):
                     num_pairs_post_padded_out.fill_(route_topk_ids.numel())
                     return _route(
                         route_topk_ids,
-                        route_token_slots,
+                        route_token_lora_mapping,
                         block_size=block_size,
                         padded_count=num_pairs_post_padded_out,
                         lora_experts_per_adapter=lora_experts_per_adapter,
@@ -725,7 +725,7 @@ class TestSharedTokenRoute(unittest.TestCase):
                     routes = ROUTE_FACTORY.build_routes(
                         shared_plan,
                         topk_ids=topk_ids,
-                        token_slots=token_slots,
+                        token_lora_mapping=token_lora_mapping,
                         num_local_experts=num_local_experts,
                         max_loras=2,
                         block_size=16,
