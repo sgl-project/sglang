@@ -142,6 +142,43 @@ def _is_noop_kv_scale(scale) -> bool:
     return scale is None or (isinstance(scale, (int, float)) and float(scale) == 1.0)
 
 
+def _has_dense_kv_rows(t: torch.Tensor, head_num: int, head_dim: int) -> bool:
+    """Whether ``t`` is addressable as ``token * t.stride(0) + head * head_dim + dim``.
+
+    That is all ``reshape_and_cache_flash`` needs, because it takes each source's token
+    stride as a kernel argument: only the (head, dim) block of one token has to be dense
+    and head-major. Whole-tensor contiguity is stricter than the kernel, and rejects the
+    ``dim=-1`` slice of a fused QKV projection that the decode path actually passes.
+    """
+    row = head_num * head_dim
+    if t.is_contiguous():
+        return t.numel() % row == 0
+    if t.dim() == 2:
+        return t.shape[1] == row and t.stride(1) == 1
+    if t.dim() == 3:
+        return (
+            t.shape[1] == head_num
+            and t.shape[2] == head_dim
+            and t.stride(1) == head_dim
+            and t.stride(2) == 1
+        )
+    return False
+
+
+def _as_token_head_dim(t: torch.Tensor, head_num: int, head_dim: int) -> torch.Tensor:
+    """View ``t`` as ``[tokens, head_num, head_dim]`` without moving data.
+
+    Splits only the trailing block, so a strided token dimension keeps its own stride
+    rather than being flattened, which would need a copy. Pair with
+    :func:`_has_dense_kv_rows`, which establishes that these views are legal.
+    """
+    if t.dim() == 3 and t.shape[1] == head_num and t.shape[2] == head_dim:
+        return t
+    if t.dim() == 2 and t.shape[1] == head_num * head_dim:
+        return t.unflatten(1, (head_num, head_dim))
+    return t.view(-1, head_num, head_dim)
+
+
 def _set_kv_buffer_impl(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -2264,9 +2301,10 @@ class MHATokenToKVPool(KVCache):
         ``reshape_and_cache_flash`` converts on store, so the separate
         ``.to(self.dtype)`` pass -- one full-tensor elementwise kernel per tensor
         per layer -- is only needed when this returns False. The kernel reuses K's
-        head geometry for V and assumes each token's (head, dim) block is dense,
-        and it can only take a device-tensor scale, so a non-unit host scalar
-        falls back.
+        head geometry for V and needs each token's (head, dim) block dense, but it
+        takes the token stride per source, so K and V may be strided views with
+        different strides. It can only take a device-tensor scale, so a non-unit
+        host scalar falls back.
         """
         if self.kv_cache_layout != "nhd" or self.use_hnd:
             return False
@@ -2278,12 +2316,10 @@ class MHATokenToKVPool(KVCache):
             return False
         if not (_is_noop_kv_scale(k_scale) and _is_noop_kv_scale(v_scale)):
             return False
-        row = self.head_num * self.head_dim
         return (
-            cache_k.is_contiguous()
-            and cache_v.is_contiguous()
+            _has_dense_kv_rows(cache_k, self.head_num, self.head_dim)
+            and _has_dense_kv_rows(cache_v, self.head_num, self.head_dim)
             and cache_k.shape == cache_v.shape
-            and cache_k.numel() % row == 0
         )
 
     def store_kv_fused_cast(
@@ -2297,12 +2333,11 @@ class MHATokenToKVPool(KVCache):
         one launch. Guard with :meth:`can_store_kv_fused_cast`."""
         from sglang.kernels.ops.attention.utils import launch_reshape_and_cache_flash
 
-        shape = (-1, self.head_num, self.head_dim)
         # unsqueeze(1) presents the flat slot-indexed buffer as a page-size-1
         # paged cache, which is the layout the kernel indexes with `loc`.
         launch_reshape_and_cache_flash(
-            cache_k.view(shape),
-            cache_v.view(shape),
+            _as_token_head_dim(cache_k, self.head_num, self.head_dim),
+            _as_token_head_dim(cache_v, self.head_num, self.head_dim),
             self._get_key_buffer(layer_id).unsqueeze(1),
             self._get_value_buffer(layer_id).unsqueeze(1),
             loc,
