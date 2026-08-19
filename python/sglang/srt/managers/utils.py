@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import msgspec
 import torch
@@ -397,3 +397,46 @@ def compute_num_reserved_tokens() -> int:
         spec.speculative_eagle_topk * spec.speculative_num_steps,
         max_speculative_num_draft_tokens(),
     )
+
+
+def scheduler_died_error(rank: int, proc) -> RuntimeError:
+    """Build a descriptive error for a scheduler process that died during init."""
+    proc.join(timeout=10)
+    return RuntimeError(
+        f"Rank {rank} scheduler died during initialization "
+        f"(exit code: {proc.exitcode}). "
+        f"If exit code is -9 (SIGKILL), a common cause is the OS OOM killer. "
+        f"Run `dmesg -T | grep -i oom` to check."
+    )
+
+
+def wait_for_scheduler_ready(
+    scheduler_pipe_readers: List,
+    scheduler_procs: List,
+) -> List[Dict]:
+    """Wait for the model to finish loading and return scheduler infos.
+
+    Uses poll() with timeout instead of blocking recv(), so that child process
+    death (e.g. OOM SIGKILL) is detected promptly instead of hanging forever.
+    """
+    scheduler_infos = []
+    for i in range(len(scheduler_pipe_readers)):
+        while True:
+            if scheduler_pipe_readers[i].poll(timeout=5.0):
+                try:
+                    data = scheduler_pipe_readers[i].recv()
+                except EOFError:
+                    raise scheduler_died_error(i, scheduler_procs[i])
+                if data["status"] != "ready":
+                    raise RuntimeError(
+                        "Initialization failed. Please see the error messages above."
+                    )
+                scheduler_infos.append(data)
+                break
+
+            # Poll timed out — check all processes for early death
+            for j in range(len(scheduler_procs)):
+                if not scheduler_procs[j].is_alive():
+                    raise scheduler_died_error(j, scheduler_procs[j])
+
+    return scheduler_infos

@@ -45,6 +45,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.utils import wait_for_scheduler_ready
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
 from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
@@ -606,6 +607,10 @@ class DataParallelController:
         )
 
         scheduler_pipe_readers = []
+        # Local to this call. self.scheduler_procs is shared with the threads
+        # that launch the other DP groups, so it cannot be indexed alongside
+        # the readers collected here.
+        launched_procs = []
 
         pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
         nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
@@ -722,12 +727,13 @@ class DataParallelController:
                     ):
                         proc.start()
                 self.scheduler_procs.append(proc)
+                launched_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
 
         # Wait for model to finish loading
-        scheduler_info = []
-        for i in range(len(scheduler_pipe_readers)):
-            scheduler_info.append(scheduler_pipe_readers[i].recv())
+        scheduler_info = wait_for_scheduler_ready(
+            scheduler_pipe_readers, launched_procs
+        )
 
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]

@@ -94,6 +94,7 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.utils import wait_for_scheduler_ready
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
@@ -945,7 +946,7 @@ class Engine(EngineScoreMixin, EngineBase):
         scheduler_infos = []
 
         def wait_for_ready():
-            infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
+            infos = wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
             scheduler_infos.extend(infos)
             if use_dp_controller:
                 for info in infos:
@@ -1777,49 +1778,6 @@ def _log_legacy_kernel_cache_dirs():
         envs.SGLANG_CACHE_DIR.get(),
         ", ".join(legacy_dirs),
     )
-
-
-def _scheduler_died_error(rank: int, proc) -> RuntimeError:
-    """Build a descriptive error for a scheduler process that died during init."""
-    proc.join(timeout=10)
-    return RuntimeError(
-        f"Rank {rank} scheduler died during initialization "
-        f"(exit code: {proc.exitcode}). "
-        f"If exit code is -9 (SIGKILL), a common cause is the OS OOM killer. "
-        f"Run `dmesg -T | grep -i oom` to check."
-    )
-
-
-def _wait_for_scheduler_ready(
-    scheduler_pipe_readers: List,
-    scheduler_procs: List,
-) -> List[Dict]:
-    """Wait for the model to finish loading and return scheduler infos.
-
-    Uses poll() with timeout instead of blocking recv(), so that child process
-    death (e.g. OOM SIGKILL) is detected promptly instead of hanging forever.
-    """
-    scheduler_infos = []
-    for i in range(len(scheduler_pipe_readers)):
-        while True:
-            if scheduler_pipe_readers[i].poll(timeout=5.0):
-                try:
-                    data = scheduler_pipe_readers[i].recv()
-                except EOFError:
-                    raise _scheduler_died_error(i, scheduler_procs[i])
-                if data["status"] != "ready":
-                    raise RuntimeError(
-                        "Initialization failed. Please see the error messages above."
-                    )
-                scheduler_infos.append(data)
-                break
-
-            # Poll timed out — check all processes for early death
-            for j in range(len(scheduler_procs)):
-                if not scheduler_procs[j].is_alive():
-                    raise _scheduler_died_error(j, scheduler_procs[j])
-
-    return scheduler_infos
 
 
 def _calculate_rank_ranges(
