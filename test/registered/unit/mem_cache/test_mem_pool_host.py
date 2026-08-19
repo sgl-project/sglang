@@ -2,8 +2,8 @@
 
 import threading
 import unittest
+import unittest.mock
 
-import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -201,12 +201,20 @@ class TestLazyHostPoolRelease(CustomTestCase):
 
 
 class TestHostMemoryBudget(CustomTestCase):
+    # Pinned so the two budget reads below see identical free memory; the real
+    # psutil value drifts between calls and would flake the equality checks.
+    _AVAILABLE = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 64 * (1024**3)
+
     def tearDown(self):
         base._ranks_per_host = None
 
     def _budget_with_ranks(self, ranks):
         base._ranks_per_host = ranks
-        return base.host_memory_budget_bytes()
+        fake_mem = unittest.mock.Mock(available=self._AVAILABLE)
+        with unittest.mock.patch.object(
+            base.psutil, "virtual_memory", return_value=fake_mem
+        ):
+            return base.host_memory_budget_bytes()
 
     def test_budget_is_split_across_co_located_ranks(self):
         solo = self._budget_with_ranks(1)
@@ -214,9 +222,10 @@ class TestHostMemoryBudget(CustomTestCase):
 
     def test_reserve_is_taken_before_the_split(self):
         # Each rank must not get its own copy of the reserve.
-        free = psutil.virtual_memory().available
         budget = self._budget_with_ranks(8)
-        self.assertLessEqual(budget * 8, free - base.HICACHE_HOST_MEMORY_RESERVE_BYTES)
+        self.assertLessEqual(
+            budget * 8, self._AVAILABLE - base.HICACHE_HOST_MEMORY_RESERVE_BYTES
+        )
 
 
 if __name__ == "__main__":
