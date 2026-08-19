@@ -1284,9 +1284,7 @@ class KimiK3MoE(nn.Module):
                 self._front_head,
                 out_dtype=torch.float32 if self._front_fp32 else None,
             )
-            gate_up, router_logits = torch.split(
-                head, self._front_sizes[:2], dim=-1
-            )
+            gate_up, router_logits = torch.split(head, self._front_sizes[:2], dim=-1)
             routed_input = latent_mxfp4_aiter_hip.run(
                 hidden_states, self._front_down_w4, self._front_down_scale4
             )
