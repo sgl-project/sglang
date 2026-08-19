@@ -31,15 +31,14 @@ def _rgba_png_bytes() -> bytes:
 
 
 def test_load_image_preserves_rgba_fidelity():
-    # The global loader must not composite: an RGBA PNG round-trips untouched.
-    img, _ = load_image(BytesIO(_rgba_png_bytes()))
+    img, _ = load_image(_rgba_png_bytes())
     assert img.mode == "RGBA"
     assert img.getpixel((0, 0)) == _RGBA_PIXEL
 
 
 def test_kimi_k3_no_discard_keeps_rgba():
     out = KimiK3ImageProcessor._load_single_item(
-        BytesIO(_rgba_png_bytes()),
+        _rgba_png_bytes(),
         modality=Modality.IMAGE,
         discard_alpha_channel=False,
     )
@@ -49,7 +48,7 @@ def test_kimi_k3_no_discard_keeps_rgba():
 
 def test_default_processor_plain_convert_drops_alpha_only():
     out = BaseMultimodalProcessor._load_single_item(
-        BytesIO(_rgba_png_bytes()),
+        _rgba_png_bytes(),
         modality=Modality.IMAGE,
         discard_alpha_channel=True,
     )
@@ -61,7 +60,7 @@ def test_glm4v_optin_smart_composite_matches_reference():
     rgba = Image.open(BytesIO(_rgba_png_bytes()))
     reference = smart_to_rgb(rgba.copy())
     out = Glm4vImageProcessor._load_single_item(
-        BytesIO(_rgba_png_bytes()),
+        _rgba_png_bytes(),
         modality=Modality.IMAGE,
         discard_alpha_channel=True,
     )
