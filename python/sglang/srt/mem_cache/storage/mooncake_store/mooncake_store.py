@@ -40,6 +40,14 @@ class MooncakeHostTensorAllocator(HostTensorAllocator):
         self.allocator = MooncakeHostMemAllocator()
         self.ptr = None
 
+    def free_hugetlb_bytes(self) -> int:
+        # Mooncake manages its own host allocation and applies its own hugepage
+        # policy, configured through its own environment variables
+        # (MC_STORE_USE_HUGEPAGE / MC_STORE_HUGEPAGE_SIZE) inside its own arena.
+        # This preflight neither sees nor governs that, so it claims no credit:
+        # 0 means "not this check's budget to spend", not "no hugepages".
+        return 0
+
     def allocate(
         self, dims: tuple, dtype: torch.dtype, device: str = "cpu"
     ) -> torch.Tensor:

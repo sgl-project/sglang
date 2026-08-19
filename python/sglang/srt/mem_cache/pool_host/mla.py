@@ -135,6 +135,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
+    def _uses_single_host_mapping(self) -> bool:
+        # page_first_kv_split issues 2-3 separate mappings (K, V, and optionally
+        # the index buffer), each independently rounded up to a whole hugepage.
+        return self.layout != "page_first_kv_split"
+
     def init_kv_buffer(self):
         if self.layout == "layer_first":
             dims = (
