@@ -181,7 +181,6 @@ class TestMoeLoraRouting(CustomTestCase):
         """
         from sglang.srt.lora.moe import fused_align
         from sglang.srt.lora.moe.routing import (
-            _JIT_ALIGN_MAX_VIRTUAL_EXPERTS,
             FUSED_ALIGN_MIN_PAIRS,
             FUSED_ALIGN_MIN_VIRTUAL_EXPERTS,
             RouteViewKind,
@@ -190,13 +189,11 @@ class TestMoeLoraRouting(CustomTestCase):
 
         self.assertEqual(FUSED_ALIGN_MIN_VIRTUAL_EXPERTS, 8192)
         self.assertEqual(FUSED_ALIGN_MIN_PAIRS, 16384)
-        # The shared JIT align primitive covers 8191 real buckets; the fused
-        # builder takes over exactly at the 8192 dispatch edge, so the two
-        # constants must stay adjacent with no gap.
-        self.assertEqual(_JIT_ALIGN_MAX_VIRTUAL_EXPERTS, 8191)
-        self.assertEqual(
-            FUSED_ALIGN_MIN_VIRTUAL_EXPERTS, _JIT_ALIGN_MAX_VIRTUAL_EXPERTS + 1
-        )
+        # The JIT primitive's own ceiling (8191) is asserted where it lives, in
+        # kernels/ops/moe/virtual_experts.py; restating it here could only ever
+        # agree with itself. What guards the dispatch is the edge cases below:
+        # 8192 has to REACH the fused builder, because the JIT path cannot
+        # align it.
 
         # (V, T, expects_fused): straddles both edges; K = 8 so P = 8 * T.
         cases = (

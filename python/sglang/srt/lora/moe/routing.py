@@ -59,18 +59,16 @@ from sglang.kernels.ops.moe.virtual_experts import (
 )
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
-# The shared JIT align primitive supports at most 8191 real expert buckets.
-# This backend switches to its own fused builder at V >= 8192, so it does not
-# need to widen that legacy primitive merely to serve larger LoRA domains.
+# The shared JIT align primitive asserts num_experts <= 8191 (its own limit,
+# in kernels/ops/moe/virtual_experts.py), and the fused builder takes over at
+# 8192 so this backend never needs that legacy primitive widened. Keep these
+# adjacent to it: a gap would send buckets the JIT path cannot align down the
+# JIT path, and the primitive's assert is what would catch it.
 #
 # There is no separate AOT branch: below 1024 buckets the JIT path selects a
 # one-thread-per-expert kernel structurally identical to the AOT one, and the
 # two measured 0-3.7% apart across 8 paired cells -- noise. One path is simpler
 # (execution plan section 36).
-_JIT_ALIGN_MAX_VIRTUAL_EXPERTS = 8191
-
-# The fused builder takes over exactly at that ceiling + 1; the two constants
-# must stay adjacent with no gap, which is why they sit together.
 FUSED_ALIGN_MIN_VIRTUAL_EXPERTS = 8192
 FUSED_ALIGN_MIN_PAIRS = 16384
 
@@ -110,19 +108,6 @@ class RouteViewKind(str, Enum):
 
     RAW = "raw"
     ALIGNED = "aligned"
-
-
-def uses_fused_align(
-    topk_ids: torch.Tensor,
-    *,
-    num_virtual_experts: int,
-    view: RouteViewKind = RouteViewKind.ALIGNED,
-) -> bool:
-    """Return the aligned-route dispatch without building either arm."""
-    return view == RouteViewKind.ALIGNED and (
-        num_virtual_experts >= FUSED_ALIGN_MIN_VIRTUAL_EXPERTS
-        or topk_ids.numel() >= FUSED_ALIGN_MIN_PAIRS
-    )
 
 
 class RouteView(msgspec.Struct, frozen=True, kw_only=True):
@@ -380,12 +365,12 @@ def build_virtual_expert_routing(
         return RouteView(**common)
 
     num_virtual = lora_experts_per_adapter * max_loras
-    use_fused = uses_fused_align(
-        topk_ids,
-        num_virtual_experts=num_virtual,
-        view=view,
-    )
-    if use_fused:
+    # Either edge sends this to the fused builder (see the constants above).
+    # No view test: RAW returned already, and RAW/ALIGNED are the only members.
+    if (
+        num_virtual >= FUSED_ALIGN_MIN_VIRTUAL_EXPERTS
+        or topk_ids.numel() >= FUSED_ALIGN_MIN_PAIRS
+    ):
         # The fused kernel DERIVES the key itself, so the `virtual_topk_ids`
         # pass is skipped entirely rather than computed and then recomputed
         # inside the kernel. Consumers read only the [T, K] shape off
@@ -432,8 +417,8 @@ def build_virtual_expert_routing(
         is_shared_outer=is_shared_outer,
     )
     # Reaching here means the aligned view did NOT dispatch to the fused
-    # builder, i.e. V < FUSED_ALIGN_MIN_VIRTUAL_EXPERTS, which is identically
-    # V <= _JIT_ALIGN_MAX_VIRTUAL_EXPERTS since the two are adjacent.
+    # builder, so V < FUSED_ALIGN_MIN_VIRTUAL_EXPERTS -- within what the JIT
+    # primitive can align.
     sorted_pair_ids, block_virtual_expert_ids, num_pairs_post_padded = (
         _align_block_size_jit(virtual_topk_ids, block_size, num_virtual)
     )
