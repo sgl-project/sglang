@@ -121,6 +121,27 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         self.assertFalse(weight_scale.format_ue8m0)
         requant.assert_not_called()
 
+    def test_helper_preserves_standard_scales_for_batch_fp8_api(self):
+        weight, weight_scale = _make_params()
+
+        with patch.multiple(
+            deep_gemm_wrapper,
+            ENABLE_JIT_DEEPGEMM=True,
+            DEEPGEMM_SCALE_UE8M0=False,
+        ), patch.object(fp8_utils, "requant_weight_ue8m0_inplace") as requant:
+            fired = fp8_utils.requant_block_scale_ue8m0_for_deepgemm(
+                weight,
+                weight_scale,
+                BLOCK_SIZE,
+                use_deepgemm_runner=True,
+                output_dtype=torch.bfloat16,
+                weight_shape=weight.shape,
+            )
+
+        self.assertFalse(fired)
+        self.assertFalse(weight_scale.format_ue8m0)
+        requant.assert_not_called()
+
     def test_helper_skips_unsupported_block_size(self):
         weight, weight_scale = _make_params()
         unsupported_block_size = [128, 256]
@@ -163,7 +184,7 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         self.assertTrue(layer.weight_scale.format_ue8m0)
         requant.assert_called_once()
 
-    def test_fp8_moe_requants_standard_layer_for_deepgemm(self):
+    def test_fp8_moe_requants_weights_for_batch_api(self):
         method = fp8_quant.Fp8MoEMethod.__new__(fp8_quant.Fp8MoEMethod)
         method.convert_mxfp8_to_block = False
         method.use_mxfp8 = False
@@ -176,8 +197,10 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         layer.w2_weight, layer.w2_weight_scale_inv = _make_params()
 
         def _mark_ue8m0(weight, weight_scale, *args, **kwargs):
-            weight_scale.format_ue8m0 = True
-            return True
+            if kwargs["use_deepgemm_runner"]:
+                weight_scale.format_ue8m0 = True
+                return True
+            return False
 
         with patch.multiple(
             fp8_quant,

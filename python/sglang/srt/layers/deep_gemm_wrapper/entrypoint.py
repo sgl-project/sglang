@@ -8,6 +8,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_BLACKWELL,
+    DEEPGEMM_MASKED_FP8_BACKEND,
+    DEEPGEMM_MASKED_FP8_PACKED_SCALES,
+    DEEPGEMM_MASKED_NEED_TMA_ALIGNED_SCALES,
     DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
@@ -67,6 +70,77 @@ def grouped_gemm_nt_f8f8bf16_masked(
     lhs = _ensure_cuda(lhs)
     rhs = _ensure_cuda(rhs)
 
+    if DEEPGEMM_MASKED_FP8_BACKEND != "native":
+        if recipe_a is not None or recipe_b is not None:
+            raise ValueError(
+                f"{DEEPGEMM_MASKED_FP8_BACKEND} masked FP8 backend does not "
+                "support FP4/MXFP8 recipes"
+            )
+        if overlap_args is not None:
+            raise ValueError(
+                f"{DEEPGEMM_MASKED_FP8_BACKEND} masked FP8 backend does not "
+                "support GEMM overlap"
+            )
+
+        from flashinfer.gemm import batch_deepgemm_fp8_nt_groupwise
+
+        flashinfer_backend = (
+            "deepgemm" if DEEPGEMM_MASKED_FP8_BACKEND == "flashinfer" else "cake"
+        )
+        if DEEPGEMM_MASKED_FP8_BACKEND == "cake":
+            if lhs[1].dtype != torch.int32 or rhs[1].dtype != torch.int32:
+                raise ValueError(
+                    "Cake masked FP8 requires native packed int32 UE8M0 scales, "
+                    f"got lhs={lhs[1].dtype}, rhs={rhs[1].dtype}"
+                )
+            lhs_scale = lhs[1]
+            rhs_scale = rhs[1]
+        else:
+            lhs_scale = (
+                _unpack_packed_ue8m0_scale(lhs[1], collapse_mn=False)
+                if lhs[1].dtype == torch.int32
+                else lhs[1].contiguous()
+            )
+            if lhs_scale.dtype != torch.float32:
+                raise ValueError(
+                    "batch DeepGEMM FP8 activation scales must be packed int32 "
+                    f"UE8M0 or row-major float32, got dtype={lhs[1].dtype}"
+                )
+            rhs_scale = getattr(rhs[1], "_batch_deepgemm_fp8_scale", None)
+            if rhs_scale is None:
+                rhs_scale = _unpack_packed_ue8m0_scale(rhs[1], collapse_mn=True)
+                # Expert weights are immutable after model loading. Cache their
+                # expanded scale once instead of allocating/converting it for
+                # every MoE invocation.
+                rhs[1]._batch_deepgemm_fp8_scale = rhs_scale
+        logger.info_once(
+            "Using FlashInfer batch DeepGEMM API backend=%s for masked FP8 MoE "
+            "(B=%d, M=%d, N=%d, K=%d, expected_m=%d, "
+            "contiguous=[a:%s,b:%s,a_scale:%s,b_scale:%s,masked_m:%s,out:%s])",
+            flashinfer_backend,
+            num_groups,
+            lhs[0].shape[1],
+            n,
+            k,
+            expected_m,
+            lhs[0].is_contiguous(),
+            rhs[0].is_contiguous(),
+            lhs_scale.is_contiguous(),
+            rhs_scale.is_contiguous(),
+            masked_m.is_contiguous(),
+            out.is_contiguous(),
+        )
+        return batch_deepgemm_fp8_nt_groupwise(
+            lhs[0],
+            rhs[0],
+            lhs_scale,
+            rhs_scale,
+            masked_m,
+            expected_m,
+            out=out,
+            backend=flashinfer_backend,
+        )
+
     with compile_utils.deep_gemm_execution_hook(
         expected_m, n, k, num_groups, kernel_type
     ):
@@ -106,6 +180,37 @@ def _ensure_cuda(
         pair[0].cuda() if not pair[0].is_cuda else pair[0],
         pair[1].cuda() if not pair[1].is_cuda else pair[1],
     )
+
+
+def _unpack_packed_ue8m0_scale(
+    scale: torch.Tensor, *, collapse_mn: bool
+) -> torch.Tensor:
+    """Expand native packed UE8M0 bytes to exact float32 powers of two.
+
+    Activation scales are packed as ``[B, M, K/512]`` and expand directly to
+    ``[B, M, K/128]``. Weight scales repeat each 128-row block across its rows;
+    collapsing that dimension produces the public API shape
+    ``[B, N/128, K/128]``. The FP8 payload is left untouched.
+    """
+    if scale.dtype != torch.int32 or scale.dim() != 3:
+        raise ValueError(
+            "batch DeepGEMM FP8 expects packed UE8M0 scales with dtype "
+            f"int32 and rank 3, got dtype={scale.dtype}, shape={scale.shape}"
+        )
+    exponents = (
+        scale.contiguous()
+        .view(torch.uint8)
+        .reshape(*scale.shape[:-1], scale.shape[-1] * 4)
+    )
+    unpacked = (exponents.to(torch.int32) << 23).view(torch.float32)
+    if collapse_mn:
+        if scale.shape[-2] % 128 != 0:
+            raise ValueError(
+                "packed weight scale row count must be divisible by 128, "
+                f"got shape={scale.shape}"
+            )
+        unpacked = unpacked[:, ::128, :]
+    return unpacked.contiguous()
 
 
 def grouped_gemm_nt_bf16_masked(

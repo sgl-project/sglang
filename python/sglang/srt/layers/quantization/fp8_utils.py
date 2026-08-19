@@ -1468,15 +1468,18 @@ def requant_block_scale_ue8m0_for_deepgemm(
 ) -> bool:
     """Requantize block-FP8 weight scales to UE8M0 in place for DeepGEMM.
 
-    No-op (returns False) unless the caller selected the DeepGEMM runner, the
-    block size is 128x128 (the only layout the requant kernel supports), the
-    scales are not already UE8M0, and DeepGEMM can run the layer (bf16 output,
-    aligned shape). Returns True when it requantizes.
+    No-op (returns False) unless the caller selected the DeepGEMM runner and
+    its native UE8M0 quantization, the block size is 128x128 (the only layout
+    the requant kernel supports), the scales are not already UE8M0, and
+    DeepGEMM can run the layer (bf16 output, aligned shape). Public batch FP8
+    backends use the same quantization and expand scales only at their API
+    boundary. Returns True when it requantizes.
     """
     from sglang.srt.model_loader.utils import should_deepgemm_weight_requant_ue8m0
 
     if (
         not use_deepgemm_runner
+        or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         or weight_block_size != [128, 128]
         or getattr(weight_scale, "format_ue8m0", False)
         or not should_deepgemm_weight_requant_ue8m0(
