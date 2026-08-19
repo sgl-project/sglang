@@ -15,6 +15,8 @@
 
 from typing import Callable, Optional
 
+from ray.util.placement_group import PlacementGroup
+
 from sglang.srt.entrypoints.engine import (
     init_tokenizer_manager,
     run_detokenizer_process,
@@ -28,16 +30,19 @@ def launch_engine(
     init_tokenizer_manager_func: Callable = init_tokenizer_manager,
     run_scheduler_process_func: Callable = run_scheduler_process,
     run_detokenizer_process_func: Callable = run_detokenizer_process,
+    *,
+    placement_group: Optional[PlacementGroup] = None,
 ):
     """Create RayEngine subprocesses / SchedulerActors."""
-    from sglang.srt.ray.engine import RayEngine
+    from sglang.srt.ray.engine import RayEngine, _placement_group_context
 
-    return RayEngine._launch_subprocesses(
-        server_args,
-        init_tokenizer_manager_func=init_tokenizer_manager_func,
-        run_scheduler_process_func=run_scheduler_process_func,
-        run_detokenizer_process_func=run_detokenizer_process_func,
-    )
+    with _placement_group_context(placement_group):
+        return RayEngine._launch_subprocesses(
+            server_args,
+            init_tokenizer_manager_func=init_tokenizer_manager_func,
+            run_scheduler_process_func=run_scheduler_process_func,
+            run_detokenizer_process_func=run_detokenizer_process_func,
+        )
 
 
 def serve_http(

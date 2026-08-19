@@ -15,9 +15,11 @@
 
 from __future__ import annotations
 
+import contextvars
 import dataclasses
 import logging
 import threading
+from contextlib import contextmanager
 from typing import Callable, List, Optional
 
 import ray
@@ -35,6 +37,20 @@ from sglang.srt.ray.scheduler_actor import SchedulerActor
 from sglang.srt.server_args import PortArgs, ServerArgs
 
 logger = logging.getLogger(__name__)
+
+_caller_placement_group: contextvars.ContextVar[Optional[PlacementGroup]] = (
+    contextvars.ContextVar("sglang_ray_caller_placement_group", default=None)
+)
+
+
+@contextmanager
+def _placement_group_context(placement_group: Optional[PlacementGroup]):
+    """Expose launch-only state while Engine synchronously starts schedulers."""
+    token = _caller_placement_group.set(placement_group)
+    try:
+        yield
+    finally:
+        _caller_placement_group.reset(token)
 
 
 @dataclasses.dataclass
@@ -254,15 +270,17 @@ def _create_scheduler_actor(
 
 
 class RayEngine(Engine):
-    """Engine using Ray actors for scheduler processes."""
+    """Engine using Ray actors for scheduler processes.
 
-    def __init__(self, **kwargs):
-        placement_group = kwargs.pop("placement_group", None)
-        if "log_level" not in kwargs:
-            kwargs["log_level"] = "error"
-        server_args = ServerArgs(**kwargs)
-        server_args.override("ray.placement_group", placement_group=placement_group)
-        super().__init__(server_args=server_args)
+    Same constructor kwargs as :class:`Engine`, plus ``placement_group`` (a Ray
+    PlacementGroup handle, not a ServerArgs field).
+    """
+
+    def __init__(
+        self, *, placement_group: Optional[PlacementGroup] = None, **kwargs
+    ):
+        with _placement_group_context(placement_group):
+            super().__init__(**kwargs)
 
     def shutdown(self):
         """Shutdown the engine — kill Ray scheduler actors then local processes."""
@@ -286,7 +304,8 @@ class RayEngine(Engine):
             Tuple of (RaySchedulerInitResult, None).
             scheduler_procs is None since Ray uses actors instead of mp.Process.
         """
-        pg = server_args.placement_group or ray.util.get_current_placement_group()
+        placement_group = _caller_placement_group.get()
+        pg = placement_group or ray.util.get_current_placement_group()
         if pg is None:
             from ray.util.placement_group import (
                 placement_group as create_placement_group,
@@ -315,7 +334,7 @@ class RayEngine(Engine):
             )
             ray.get(pg.ready())
 
-        is_custom_pg = server_args.placement_group is not None
+        is_custom_pg = placement_group is not None
         nnodes = server_args.nnodes
         world_size = _compute_world_size(server_args)
 
@@ -451,6 +470,7 @@ class RayEngine(Engine):
                     pg,
                     bundle_for_node,
                     rank0_node_ip,
+                    is_custom_pg,
                 ),
                 None,
             )
@@ -463,6 +483,7 @@ class RayEngine(Engine):
         pg,
         bundle_for_node: Optional[List[int]],
         rank0_node_ip: str,
+        is_custom_pg: bool = False,
     ) -> RaySchedulerInitResult:
         """Launch DP schedulers via RayDataParallelController."""
         from sglang.srt.ray.data_parallel_controller import (
@@ -488,16 +509,16 @@ class RayEngine(Engine):
             server_args,
             dist_init_addr=f"{rank0_node_ip}:{port_args.nccl_port}",
         )
-        # dataclasses.replace only copies declared fields; placement_group is
-        # a dynamic attribute that must be manually appended after the rebuild.
-        dp_server_args.override(
-            "ray.placement_group", placement_group=server_args.placement_group
-        )
 
         # Create the DP controller in-process. This blocks until all actors
         # are initialized and their event loops have started.
         controller = RayDataParallelController(
-            dp_server_args, port_args, pg, bundle_for_node, rank0_node_ip
+            dp_server_args,
+            port_args,
+            pg,
+            bundle_for_node,
+            rank0_node_ip,
+            is_custom_pg,
         )
 
         # Start the DP controller's event loop in a daemon thread.
