@@ -32,7 +32,7 @@ pre-commit run --all-files
 
 - **`pre-commit run --all-files`** manually runs all configured checks, applying fixes if possible. If it fails the first time, re-run it to ensure lint errors are fully resolved. Make sure your code passes all checks **before** creating a Pull Request.
 - **Do not commit** directly to the `main` branch. Always create a new branch (e.g., `feature/my-new-feature`), push your changes, and open a PR from that branch.
-- Documentation links and anchors are checked with Mintlify in CI. To run the same check locally, install the [Mintlify CLI](https://www.npmjs.com/package/mint) and run `cd docs && mint broken-links --check-anchors --check-redirects`.
+- Documentation links and anchors are checked with Mintlify in CI. To run the same version locally, install it with `npm install -g mint@4.2.559`, then run `cd docs && mint broken-links --check-anchors --check-redirects`.
 - The manual `lychee` pre-commit hook checks links in the repository-level `README.md`: `pre-commit run --hook-stage manual lychee --all-files`.
 
 ## Run and add unit tests
@@ -115,7 +115,7 @@ Then your PR can be merged.
 We have a lot of open PRs but limited CI machines, so only top and trusted contributors have permission to trigger CI tests.
 Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json)
 
-**PR authors** can use `/rerun-failed-ci` on their own PRs even if they are not listed in `CI_PERMISSIONS.json`. Selective reruns on fork PRs must be requested by a maintainer with write permission because they execute PR code on self-hosted runners.
+**PR authors** can use `/rerun-failed-ci` on their own PRs even if they are not listed in `CI_PERMISSIONS.json`. Selective reruns have additional rules because they execute PR code on self-hosted runners; see the permission table below.
 
 For CI to run on a pull request, it must have the "run-ci" label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
@@ -124,6 +124,17 @@ For CI to run on a pull request, it must have the "run-ci" label. Authorized use
 - `/tag-and-rerun-ci`: Runs both. Use this on a fresh PR to kick off CI on the current commit — `/tag-run-ci-label` alone won't. Accepts the same `extra` argument (`/tag-and-rerun-ci extra`).
 - `/rerun-test <test-spec> [<test-spec> ...]`: Reruns one or more specific tests directly. A spec may select a file, class, or method using `<file>::<TestClass>[.<test_method>]`. Multiple specs and file globs are supported. Examples: `/rerun-test test_srt_endpoint.py`, `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`, `/rerun-test test_a.py test_b.py`, or `/rerun-test test_*backend*.py`.
 - `/rerun-group <group> [<group> ...]`: Expands one or more registered test groups (for example, `/rerun-group hicache`) and dispatches their tests through the same selective-rerun workflow.
+
+The rerun commands have the following permission rules:
+
+| Command | PR author | Other users | Additional rule for fork PRs |
+| --- | --- | --- | --- |
+| `/rerun-failed-ci` | Always allowed on their own PR | Must have `can_rerun_failed_ci` in `CI_PERMISSIONS.json` | None |
+| `/rerun-test`, `/rerun-group` | Automatically receives `can_rerun_test` on a non-fork PR | Must have `can_rerun_test` or the legacy `can_rerun_stage` permission in `CI_PERMISSIONS.json` | The commenter must also have `write` or `admin` repository permission. This applies even to the fork PR author; a write/admin collaborator must still have one of the selective-rerun CI permissions. |
+
+<Warning>
+Selective reruns do not build or install a PR-local `sglang-kernel` wheel. If a PR changes `python/sglang/kernels/aot/` or code that depends on that AOT change, use the normal/full PR CI workflow. A `/rerun-test` or `/rerun-group` result may use the pinned released kernel and does not validate the combined change.
+</Warning>
 
 If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash-command-handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/14253#issuecomment-3599509302).
 
@@ -171,7 +182,7 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
 
 ## How to update sglang-kernel
 
-The `sglang-kernel` distribution (formerly `sgl-kernel`) is a separate Python package, but its source now lives in this repository under `python/sglang/kernels/aot/`. CI builds wheels from kernel changes and installs those PR-local wheels in the relevant test jobs, so a kernel implementation and its SGLang caller can be updated in the same PR.
+The `sglang-kernel` distribution (formerly `sgl-kernel`) is a separate Python package, but its source now lives in this repository under `python/sglang/kernels/aot/`. Normal/full PR CI builds wheels from kernel changes and installs those PR-local wheels in the relevant test jobs, so a kernel implementation and its SGLang caller can be updated in the same PR. Selective `/rerun-test` and `/rerun-group` workflows do not use these PR-local wheels and cannot validate such a combined change.
 
 For a lightweight kernel that does not depend on CUTLASS or another large C++ project, prefer the JIT kernel path. Use the AOT `sglang-kernel` path for heavyweight kernels, large C++ dependencies, or operations that need wheel packaging and Torch operator registration. FlashInfer-based kernels are an exception and may still use the JIT path.
 
