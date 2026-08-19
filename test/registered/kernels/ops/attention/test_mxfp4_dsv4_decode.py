@@ -566,19 +566,25 @@ def test_flashmla_dsv4_mxfp4_rejects_invalid_contracts() -> None:
 
     cache_numel = case.kv.numel()
     misaligned_storage = torch.empty(
-        cache_numel + 1, dtype=torch.uint8, device=case.q.device
+        cache_numel + 16, dtype=torch.uint8, device=case.q.device
     )
-    misaligned_cache = misaligned_storage[1:].view_as(case.kv)
-    assert misaligned_cache.data_ptr() % 4 != 0
-    with pytest.raises(RuntimeError, match="4-byte aligned"):
-        native(
-            case.q,
-            misaligned_cache,
-            case.indices,
-            case.topk_length,
-            case.attn_sink,
-            FlashMLASchedMeta(),
-        )
+    # Offsets 1 and 4 cover both a fully misaligned base and one that only
+    # satisfies the old 4-byte contract (4 % 4 == 0 but 4 % 16 != 0 — the
+    # kernel's 128-bit vector loads would fault).
+    for misaligned_by in (1, 4):
+        misaligned_cache = misaligned_storage[
+            misaligned_by : misaligned_by + cache_numel
+        ].view_as(case.kv)
+        assert misaligned_cache.data_ptr() % 16 == misaligned_by
+        with pytest.raises(RuntimeError, match="16-byte aligned"):
+            native(
+                case.q,
+                misaligned_cache,
+                case.indices,
+                case.topk_length,
+                case.attn_sink,
+                FlashMLASchedMeta(),
+            )
 
     with pytest.raises((AssertionError, RuntimeError, ValueError)):
         native(
@@ -589,6 +595,154 @@ def test_flashmla_dsv4_mxfp4_rejects_invalid_contracts() -> None:
             case.attn_sink,
             FlashMLASchedMeta(),
             extra_k_cache=case.kv,
+        )
+
+
+@pytest.mark.skipif(not _is_sm90_supported(), reason="SM90 and CUDA >= 12.5 required")
+@torch.inference_mode()
+def test_flashmla_dsv4_mxfp4_rejects_unsafe_kernel_contracts() -> None:
+    """Guard the wrapper contract for values the SM90 kernel hardcodes.
+
+    The kernel fixes head dim 512, 64/128 query heads, int32 index and length
+    tensors, [B, S_Q] index geometry matching q, same-device placement, and
+    contiguous layouts. Before these checks, a 256-wide bf16 q or an int64
+    indices tensor passed validation and the kernel read memory with
+    hardcoded 512-element int32 strides — an out-of-bounds or reinterpreted
+    read instead of an exception.
+    """
+    native = _require_native()
+    assert FlashMLASchedMeta is not None
+    case = _build_case(h_q=64, batch_size=1)
+
+    # Head dims: a 256-wide q and a non-512 head_dim_v both sailed through
+    # every earlier check while the kernel addresses q with 512 strides.
+    narrow_q = case.q[..., :256].contiguous()
+    with pytest.raises(ValueError, match="512"):
+        native(
+            narrow_q,
+            case.kv,
+            case.indices,
+            case.topk_length,
+            case.attn_sink,
+            FlashMLASchedMeta(),
+        )
+    with pytest.raises(ValueError, match="512"):
+        native(
+            case.q,
+            case.kv,
+            case.indices,
+            case.topk_length,
+            case.attn_sink,
+            FlashMLASchedMeta(),
+            head_dim_v=256,
+        )
+
+    wide_q = case.q.repeat(1, 1, 3, 1)  # 192 heads
+    with pytest.raises(ValueError, match="64 or 128"):
+        native(
+            wide_q,
+            case.kv,
+            case.indices,
+            case.topk_length,
+            case.attn_sink,
+            FlashMLASchedMeta(),
+        )
+
+    # Index tensors: int64 reinterpreted as int32 by the kernel.
+    with pytest.raises(ValueError, match="int32"):
+        native(
+            case.q,
+            case.kv,
+            case.indices.long(),
+            case.topk_length,
+            case.attn_sink,
+            FlashMLASchedMeta(),
+        )
+    with pytest.raises(ValueError, match="int32"):
+        native(
+            case.q,
+            case.kv,
+            case.indices,
+            case.topk_length.long(),
+            case.attn_sink,
+            FlashMLASchedMeta(),
+        )
+
+    # Length-vector geometry: the scheduler kernel reads lengths[request] for
+    # every request in the batch.
+    with pytest.raises(ValueError, match="topk_length"):
+        native(
+            case.q,
+            case.kv,
+            case.indices,
+            case.topk_length.repeat(2),
+            case.attn_sink,
+            FlashMLASchedMeta(),
+        )
+
+    # Batch/sequence geometry mismatch between q and indices.
+    with pytest.raises(ValueError, match="indices"):
+        native(
+            case.q,
+            case.kv,
+            case.indices.repeat(2, 1, 1),
+            case.topk_length,
+            case.attn_sink,
+            FlashMLASchedMeta(),
+        )
+
+    # A strided q view: shape and dtype pass, but the kernel addresses q with
+    # hardcoded contiguous strides.
+    strided_q = torch.empty(
+        (1, 1, 64, 1024), dtype=torch.bfloat16, device=case.q.device
+    )[..., ::2]
+    assert not strided_q.is_contiguous()
+    with pytest.raises(ValueError, match="contiguous"):
+        native(
+            strided_q,
+            case.kv,
+            case.indices,
+            case.topk_length,
+            case.attn_sink,
+            FlashMLASchedMeta(),
+        )
+
+    # Cross-device tensors: only q's device was ever checked before.
+    cpu_cache = torch.empty_like(case.kv, device="cpu")
+    with pytest.raises(ValueError, match="query device"):
+        native(
+            case.q,
+            cpu_cache,
+            case.indices,
+            case.topk_length,
+            case.attn_sink,
+            FlashMLASchedMeta(),
+        )
+
+    # Extra source: an unaligned extra width and int64 extra indices.
+    with pytest.raises(RuntimeError, match="multiple of 64"):
+        native(
+            case.q,
+            case.kv,
+            case.indices,
+            case.topk_length,
+            case.attn_sink,
+            FlashMLASchedMeta(),
+            extra_k_cache=case.kv,
+            extra_indices_in_kvcache=case.indices[..., :32].contiguous(),
+            extra_topk_length=case.topk_length,
+        )
+    with pytest.raises(ValueError, match="int32"):
+        native(
+            case.q,
+            case.kv,
+            case.indices,
+            case.topk_length,
+            case.attn_sink,
+            FlashMLASchedMeta(),
+            extra_k_cache=case.kv,
+            extra_indices_in_kvcache=case.indices.long(),
+            extra_topk_length=case.topk_length,
         )
 
 

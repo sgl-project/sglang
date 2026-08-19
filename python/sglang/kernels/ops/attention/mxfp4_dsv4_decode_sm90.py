@@ -197,6 +197,88 @@ def _num_sm_parts(b: int, s_q: int, h_q: int, device: torch.device) -> int:
     return max(mpc // s_q // (h_q // 64), 1)
 
 
+def _validate_core_inputs(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    head_dim_v: int,
+) -> None:
+    """Reject inputs the SM90 kernel cannot consume safely.
+
+    The kernel hardcodes head dim 512 (QK and V), int32 indices, contiguous
+    row-major layouts, and 128-bit vector loads of the 368-byte cache rows;
+    every deviation must fail here as a Python exception rather than read
+    out of bounds on the device.
+    """
+    if q.dtype != torch.bfloat16:
+        raise RuntimeError("q must have dtype bfloat16")
+    if q.ndim != 4 or k_cache.ndim != 4 or indices.ndim != 3:
+        raise ValueError(
+            "Expected q [B, S_Q, H_Q, D], cache [pages, page_size, H_K, 368], "
+            f"and indices [B, S_Q, topk], got {q.shape=}, {k_cache.shape=}, "
+            f"{indices.shape=}"
+        )
+    b, s_q, h_q, d_qk = q.shape
+    if b <= 0 or s_q <= 0:
+        raise ValueError(
+            f"q batch and sequence dimensions must be positive, got {b=} {s_q=}"
+        )
+    if h_q not in (64, 128):
+        raise ValueError(f"q must contain 64 or 128 heads, got {h_q}")
+    if d_qk != 512 or head_dim_v != 512:
+        raise ValueError(
+            "Query head dim and head_dim_v must both be 512, got "
+            f"d_qk={d_qk}, head_dim_v={head_dim_v}"
+        )
+    if indices.shape[:2] != (b, s_q):
+        raise ValueError(
+            f"indices must have shape [{b}, {s_q}, topk], got {tuple(indices.shape)}"
+        )
+    if indices.shape[-1] % 64 != 0:
+        raise RuntimeError(
+            f"indices top-k width must be a multiple of 64, got {indices.shape[-1]}"
+        )
+    if indices.dtype != torch.int32:
+        raise ValueError(f"indices must be int32, got {indices.dtype}")
+    if k_cache.shape[2] != 1 or k_cache.shape[3] != 368:
+        raise ValueError(
+            "DeepSeek V4 MXFP4 cache must have shape "
+            f"[pages, page_size, 1, 368], got {tuple(k_cache.shape)}"
+        )
+    # 368 = 23 * 16, so per-row strides preserve 128-bit vector-load
+    # alignment only when the base pointer itself is 16-byte aligned.
+    if k_cache.data_ptr() % 16 != 0:
+        raise RuntimeError("k_cache must be 16-byte aligned for 128-bit vector loads")
+    if k_cache.device != q.device or indices.device != q.device:
+        raise ValueError(
+            f"All tensors must live on the query device {q.device}, got "
+            f"k_cache {k_cache.device} and indices {indices.device}"
+        )
+    if (
+        not q.is_contiguous()
+        or not k_cache.is_contiguous()
+        or not indices.is_contiguous()
+    ):
+        raise ValueError("q, k_cache, and indices must be contiguous")
+
+
+def _validate_lengths_vector(
+    t: torch.Tensor, name: str, b: int, device: torch.device
+) -> None:
+    """Validate a per-request top-k length vector (int32 [B] on-device)."""
+    if t.dtype != torch.int32:
+        raise ValueError(f"{name} must be int32, got {t.dtype}")
+    if t.shape != (b,):
+        raise ValueError(
+            f"{name} must have shape [{b}] (one entry per request), got "
+            f"{tuple(t.shape)}"
+        )
+    if t.device != device:
+        raise ValueError(f"{name} must live on the query device, got {t.device}")
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -243,25 +325,18 @@ def flash_mla_with_kvcache_dsv4_mxfp4(
             "DeepSeek V4 MXFP4 decode requires FlashMLASchedMeta, got "
             f"{type(tile_scheduler_metadata).__name__}"
         )
-    if q.dtype != torch.bfloat16:
-        raise RuntimeError("q must have dtype bfloat16")
-    if q.ndim != 4 or k_cache.ndim != 4 or indices.ndim != 3:
-        raise ValueError(
-            "Expected q [B, S_Q, H_Q, D], cache [pages, page_size, H_K, 368], "
-            f"and indices [B, S_Q, topk], got {q.shape=}, {k_cache.shape=}, "
-            f"{indices.shape=}"
-        )
-    if indices.shape[-1] % 64 != 0:
-        raise RuntimeError(
-            f"indices top-k width must be a multiple of 64, got {indices.shape[-1]}"
-        )
-    if k_cache.data_ptr() % 4 != 0:
-        raise RuntimeError("k_cache must be 4-byte aligned")
-    if k_cache.shape[2] != 1 or k_cache.shape[3] != 368:
-        raise ValueError(
-            "DeepSeek V4 MXFP4 cache must have shape "
-            f"[pages, page_size, 1, 368], got {tuple(k_cache.shape)}"
-        )
+    _validate_core_inputs(q, k_cache, indices, head_dim_v)
+    if topk_length is not None:
+        _validate_lengths_vector(topk_length, "topk_length", q.shape[0], q.device)
+    if attn_sink is not None:
+        if attn_sink.dtype != torch.float32:
+            raise ValueError(f"attn_sink must be float32, got {attn_sink.dtype}")
+        if attn_sink.device != q.device:
+            raise ValueError(
+                f"attn_sink must live on the query device, got {attn_sink.device}"
+            )
+        if not attn_sink.is_contiguous():
+            raise ValueError("attn_sink must be contiguous")
 
     have_extra_cache = extra_k_cache is not None
     have_extra_indices = extra_indices_in_kvcache is not None
@@ -285,6 +360,43 @@ def flash_mla_with_kvcache_dsv4_mxfp4(
                 "[pages, page_size, 1, 368], got "
                 f"{tuple(extra_k_cache.shape)}"
             )
+        if extra_k_cache.data_ptr() % 16 != 0:
+            raise RuntimeError(
+                "extra_k_cache must be 16-byte aligned for 128-bit vector loads"
+            )
+        if extra_indices_in_kvcache.shape[:2] != (q.shape[0], q.shape[1]):
+            raise ValueError(
+                "extra_indices_in_kvcache must have shape "
+                f"[{q.shape[0]}, {q.shape[1]}, topk], got "
+                f"{tuple(extra_indices_in_kvcache.shape)}"
+            )
+        if extra_indices_in_kvcache.shape[-1] % 64 != 0:
+            raise RuntimeError(
+                "extra indices top-k width must be a multiple of 64, got "
+                f"{extra_indices_in_kvcache.shape[-1]}"
+            )
+        if extra_indices_in_kvcache.dtype != torch.int32:
+            raise ValueError(
+                f"extra_indices_in_kvcache must be int32, got "
+                f"{extra_indices_in_kvcache.dtype}"
+            )
+        if (
+            extra_k_cache.device != q.device
+            or extra_indices_in_kvcache.device != q.device
+        ):
+            raise ValueError(
+                f"Extra-source tensors must live on the query device {q.device}, "
+                f"got cache {extra_k_cache.device} and indices "
+                f"{extra_indices_in_kvcache.device}"
+            )
+        if (
+            not extra_k_cache.is_contiguous()
+            or not extra_indices_in_kvcache.is_contiguous()
+        ):
+            raise ValueError("extra_k_cache and extra_indices must be contiguous")
+        _validate_lengths_vector(
+            extra_topk_length, "extra_topk_length", q.shape[0], q.device
+        )
 
     sched_meta = tile_scheduler_metadata
     topk = indices.shape[-1]
