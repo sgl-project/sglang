@@ -1,0 +1,68 @@
+---
+title: "Streaming Weights over HTTP Range (per-NIC)"
+metatags:
+    description: "Stream SGLang model weights straight out of an object store over HTTP GET Range requests, with one endpoint and one NIC per tensor-parallel rank."
+---
+
+The `http-range` connector streams safetensors weights straight out of an object store over HTTP GET Range requests, without a full local download. It is aimed at multi-NIC hosts: unlike a POSIX/FUSE mount, where the kernel routing table funnels every rank onto one egress link, this connector lets each tensor-parallel rank open its own sockets and pin them to a dedicated NIC.
+
+## When to use it
+
+Use it when **all** of the following hold:
+
+- Weights live behind an HTTP/1.1 server that supports byte ranges and keep-alive (an S3-compatible store, or a small range server in front of the checkpoints).
+- The host has several NICs and you want each rank to drive its own, so aggregate read bandwidth scales with NIC count.
+- The checkpoint is in `.safetensors` format.
+
+If you only need to load from S3/GCS/Azure without per-NIC control, prefer the [`runai_streamer` path](object_storage).
+
+## URL format
+
+```
+http-range://<host>:<port>/<prefix>[?<option>=<value>&...]
+```
+
+The authority is the default endpoint, used for metadata objects and for any rank without a dedicated endpoint. Options:
+
+| Option | Meaning | Default |
+|---|---|---|
+| `endpoints` | Comma-separated `host[:port]` list; rank `i` uses entry `i % len`. Bracket IPv6 literals (`[::1]:9000`). | authority only |
+| `nics` | Comma-separated interfaces bound with `SO_BINDTODEVICE` (Linux only), indexed by rank the same way. Empty entry = routing table. | none |
+| `connections` | Parallel connections per object. | 16 |
+| `chunk_size` | Range size in bytes; keep it large (request rate throttles before bandwidth). | 33554432 |
+| `timeout` | Socket timeout, seconds. | 30 |
+| `retries` | Retries per range. | 2 |
+| `metadata` | Extra metadata object names to fetch (custom code / tokenizer files). | none |
+
+## Quick start
+
+```bash
+python3 -m sglang.launch_server \
+  --tp 4 --load-format remote \
+  --served-model-name Qwen3-30B-A3B \
+  --model-path 'http-range://[fd00::1]:9000/models/Qwen3-30B-A3B?endpoints=[fd00::1]:9000,[fd00::2]:9001,[fd00::3]:9002,[fd00::4]:9003&nics=eth0,eth1,eth2,eth3'
+```
+
+`--served-model-name` is required because the URL contains colons, which SGLang otherwise treats as the `model:adapter` LoRA separator.
+
+The model directory needs no local weight bytes: the connector fetches `config.json`, the tokenizer files and `model.safetensors.index.json` from the server, then streams the shards named in the index.
+
+## Server requirements
+
+- **HTTP/1.1 with `Range` and keep-alive.** A server that closes after every response (HTTP/1.0) or ignores `Range` and returns the whole object is rejected with an explicit error.
+- **Per-NIC return path.** To make the *return* traffic use the intended NIC, the server must be split per NIC as well, with `SO_BINDTODEVICE` on its listening socket. Otherwise only the client side is spread out and the routing table still funnels every rank onto one link.
+- `nics` needs `CAP_NET_RAW` (present by default in containers).
+
+## Cost and limitations
+
+- Every rank pulls **all** shards, because `load_weights` narrows per rank on the consumer side. Total network volume is `tp_size × checkpoint_size` — which is exactly why per-rank NIC pinning is worthwhile: the same volume on one shared NIC takes roughly twice as long.
+- Shards are fetched serially; network time is not overlapped with the host-to-device copy.
+- Only `.safetensors` checkpoints are supported.
+
+## Measured numbers
+
+On a 4-NIC host, Qwen3-30B-A3B (57 GiB, 16 shards), TP=4, one range-server endpoint per NIC, objects served from the storage node's RAM:
+
+- ~3.4 s of network time per rank (~17 GB/s per NIC, ~71 GB/s aggregate), **7.6 s** total `Load weight` including header parse, narrow and H2D.
+- Compared with 25 s for the same model read cold from a local NVMe and 42 s over a FUSE-mounted distributed filesystem.
+- Outputs matched the file-based baseline token for token (greedy, 5 prompts, N=3).
