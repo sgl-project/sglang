@@ -684,6 +684,7 @@ class DeepseekV4HipRadixBackend(
         use_prefill_cuda_graph: bool = False,
         seq_lens_cpu: Optional[List[int]] = None,
         ragged_layout=None,
+        seq_lens_cpu_is_final: bool = False,
     ) -> Union[DSV4Metadata, DSV4RawVerifyMetadata]:
         # HIP path: build target-verify metadata eagerly. The raw/lazy-upgrade route can
         # hit planner invariants during graph capture for DSV4+EAGLE.
@@ -697,6 +698,7 @@ class DeepseekV4HipRadixBackend(
             out_cache_loc=out_cache_loc,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             ragged_layout=ragged_layout,
+            seq_lens_cpu_is_final=seq_lens_cpu_is_final,
         )
 
     def init_forward_metadata_target_verify_old(
@@ -708,6 +710,7 @@ class DeepseekV4HipRadixBackend(
         out_cache_loc: Optional[torch.Tensor] = None,
         use_prefill_cuda_graph: bool = False,
         ragged_layout=None,
+        seq_lens_cpu_is_final: bool = False,
     ) -> DSV4Metadata:
         batch_size = len(seq_lens)
         extend_start_loc = None
@@ -733,9 +736,10 @@ class DeepseekV4HipRadixBackend(
             seq_lens_cpu = None
         else:
             seq_lens = seq_lens + self.target_verify_num_draft_tokens
-            seq_lens_cpu = [
-                x + self.target_verify_num_draft_tokens for x in seq_lens_cpu
-            ]
+            if not seq_lens_cpu_is_final:
+                seq_lens_cpu = [
+                    x + self.target_verify_num_draft_tokens for x in seq_lens_cpu
+                ]
             extend_seq_lens_cpu = [self.target_verify_num_draft_tokens] * batch_size
             num_tokens = self.target_verify_num_draft_tokens * batch_size
             extend_seq_lens = self._move_to_device(extend_seq_lens_cpu)
@@ -990,6 +994,14 @@ class DeepseekV4HipRadixBackend(
         elif bucket == _GraphBucket.TARGET_VERIFY:
             assert out_cache_loc is not None
             ragged_layout = resolve_ragged_verify_layout(forward_batch)
+            seq_lens_cpu_is_final = self.is_dspark_draft and not in_capture
+            if seq_lens_cpu_is_final and ragged_layout is None:
+                num_padding = getattr(forward_batch, "num_padding", 0)
+                if num_padding:
+                    seq_lens_cpu = seq_lens_cpu.clone()
+                    seq_lens_cpu[-num_padding:] += (
+                        self.target_verify_num_draft_tokens
+                    )
             if ragged_layout is not None:
                 ragged_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
                 num_tokens_v = ragged_layout.graph_num_tokens
@@ -1012,6 +1024,7 @@ class DeepseekV4HipRadixBackend(
                 # pass it so target_verify skips the per-iter seq_lens.tolist() sync.
                 seq_lens_cpu=seq_lens_cpu.tolist(),
                 ragged_layout=ragged_layout,
+                seq_lens_cpu_is_final=seq_lens_cpu_is_final,
             )
         elif bucket == _GraphBucket.DRAFT_EXTEND:
             num_tokens_per_req = self.draft_extend_num_tokens_per_req
@@ -1093,6 +1106,7 @@ class DeepseekV4HipRadixBackend(
                     seq_lens_cpu.tolist() if seq_lens_cpu is not None else None
                 ),
                 ragged_layout=ragged_layout,
+                seq_lens_cpu_is_final=self.is_dspark_draft,
             )
         elif forward_batch.forward_mode.is_prefill(include_draft_extend_v2=True):
             extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
