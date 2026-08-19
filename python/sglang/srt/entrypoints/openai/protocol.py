@@ -1081,6 +1081,14 @@ class ChatCompletionRequest(BaseModel):
         )
 
         if tool_call_constraint and has_existing_constraints:
+            if self.tool_choice == "required" or isinstance(
+                self.tool_choice, ToolChoice
+            ):
+                raise ValueError(
+                    "tool_choice 'required' or a named tool cannot be combined with "
+                    "response_format, regex, or ebnf: the tool-call constraint and the "
+                    "output constraint cannot both be honored."
+                )
             logger.warning("Constrained decoding is not compatible with tool calls.")
         elif tool_call_constraint:
             constraint_type, constraint_value = tool_call_constraint
@@ -1117,7 +1125,7 @@ class ChatCompletionResponseChoice(BaseModel):
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
     prompt_token_ids: Optional[List[int]] = None
-    token_ids: Optional[List[int]] = None
+    response_token_ids: Optional[List[int]] = None
     meta_info: Optional[Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
@@ -1127,8 +1135,8 @@ class ChatCompletionResponseChoice(BaseModel):
             data.pop("hidden_states", None)
         if self.prompt_token_ids is None:
             data.pop("prompt_token_ids", None)
-        if self.token_ids is None:
-            data.pop("token_ids", None)
+        if self.response_token_ids is None:
+            data.pop("response_token_ids", None)
         if self.meta_info is None:
             data.pop("meta_info", None)
         return data
