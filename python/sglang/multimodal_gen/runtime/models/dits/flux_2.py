@@ -521,8 +521,8 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         # Handle the attention logic
         query, key, value = qkv.chunk(3, dim=-1)
 
-        query = query.unflatten(-1, (self.local_heads, -1))
-        key = key.unflatten(-1, (self.local_heads, -1))
+        query = query.unflatten(-1, (self.local_heads, -1)).contiguous()
+        key = key.unflatten(-1, (self.local_heads, -1)).contiguous()
         value = value.unflatten(-1, (self.local_heads, -1))
 
         cos_sin_cache = None
