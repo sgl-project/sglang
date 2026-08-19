@@ -664,8 +664,10 @@ class SpatialParallelCausalConv3d(nn.Conv3d):
             )
 
         # Bind ``super().forward`` lazily: doing it unconditionally costs two
-        # extra Dynamo frames per conv when the ROCm hook is what runs.
-        if current_platform.is_rocm() and self._halo_conv_forward is not None:
+        # extra Dynamo frames per conv when the ROCm hook is what runs.  The
+        # hook is only ever installed on ROCm, so it doubles as the platform
+        # check.
+        if self._halo_conv_forward is not None:
             conv_forward = self._halo_conv_forward
         else:
             conv_forward = super().forward
@@ -739,8 +741,10 @@ class SpatialParallelConv3d(nn.Conv3d):
             x = _pad_with_mode(x, self._padding, self.padding_mode)
 
         # Bind ``super().forward`` lazily: doing it unconditionally costs two
-        # extra Dynamo frames per conv when the ROCm hook is what runs.
-        if current_platform.is_rocm() and self._halo_conv_forward is not None:
+        # extra Dynamo frames per conv when the ROCm hook is what runs.  The
+        # hook is only ever installed on ROCm, so it doubles as the platform
+        # check.
+        if self._halo_conv_forward is not None:
             conv_forward = self._halo_conv_forward
         else:
             conv_forward = super().forward
