@@ -128,13 +128,28 @@ class AITerImpl(AttentionImpl):
         dropout_p: float = 0.0,
         **extra_impl_args,
     ) -> None:
-        if num_kv_heads is not None and num_kv_heads != num_heads:
-            raise NotImplementedError(
-                "AITer backend does not support Grouped Query Attention yet."
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+        if num_kv_heads <= 0 or num_heads % num_kv_heads != 0:
+            raise ValueError(
+                f"num_heads ({num_heads}) must be a positive multiple of "
+                f"num_kv_heads ({num_kv_heads})."
             )
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        # aiter.flash_attn_func broadcasts KV heads internally (MHA/GQA/MQA);
+        # only the FP8 FMHA ASM kernel is MHA-only, gated below.
+        self.is_gqa = num_kv_heads != num_heads
         self.causal = causal
         self.dropout_p = dropout_p
         self.softmax_scale = softmax_scale
+        if _use_fp8_attn and self.is_gqa:
+            logger.warning_once(
+                "FP8 FMHA prefill requires full MHA; got num_heads=%d, num_kv_heads=%d. "
+                "Using BF16 attention for this layer.",
+                num_heads,
+                num_kv_heads,
+            )
 
     @torch.compiler.disable
     def forward(
@@ -149,16 +164,19 @@ class AITerImpl(AttentionImpl):
           - _fmha_fp8_prefill_attention (FP8, SGLANG_DIFFUSION_AITER_FP8_ATTN=1 when eligible)
           - flash_attn_func (BF16, default or FP8 fallback for unsupported shapes)
 
+        ``num_kv_heads`` may be smaller than ``num_heads`` (GQA/MQA); the KV
+        heads are broadcast inside the aiter kernel.
+
         Args:
             query: Query tensor of shape [batch_size, seq_len, num_heads, head_dim]
-            key: Key tensor of shape [batch_size, seq_len, num_heads, head_dim]
-            value: Value tensor of shape [batch_size, seq_len, num_heads, head_dim]
+            key: Key tensor of shape [batch_size, seq_len, num_kv_heads, head_dim]
+            value: Value tensor of shape [batch_size, seq_len, num_kv_heads, head_dim]
             attn_metadata: Metadata for the attention operation (unused).
 
         Returns:
             Output tensor of shape [batch_size, seq_len, num_heads, head_dim]
         """
-        if _use_fp8_attn:
+        if _use_fp8_attn and not self.is_gqa:
             if query.dtype != _fp8_dtype:
                 q_fp8, q_scale = aiter.per_tensor_quant(query, quant_dtype=_fp8_dtype)
                 k_fp8, k_scale = aiter.per_tensor_quant(key, quant_dtype=_fp8_dtype)
@@ -204,6 +222,7 @@ class AITerImpl(AttentionImpl):
             key,
             value,
             dropout_p=self.dropout_p,
+            softmax_scale=self.softmax_scale,
             causal=self.causal,
             return_attn_probs=False,
             return_lse=True,
