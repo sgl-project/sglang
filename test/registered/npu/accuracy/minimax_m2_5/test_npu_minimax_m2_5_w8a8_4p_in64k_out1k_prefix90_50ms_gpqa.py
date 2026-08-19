@@ -11,10 +11,9 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
-    est_time=3600,
-    suite="",
+    est_time=7200,
+    suite="nightly-acc-16-npu-a3",
     nightly=True,
-    disabled="accuracy testcase",
 )
 
 MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS = {
@@ -26,7 +25,6 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_ENVS = {
     "ASCEND_USE_FIA": "1",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_NPU_FUSED_MOE_MODE": "2",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "140000",
     "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HCCL_BUFFSIZE": "1024",
@@ -65,6 +63,8 @@ MINIMAX_M2_5_W8A8_4P_IN64K_OUT1K_PREFIX90_OTHER_ARGS = [
     26,
     "--moe-a2a-backend",
     "ascend_fuseep",
+    "--fuseep-mode",
+    2,
     "--deepep-mode",
     "auto",
     "--quantization",
