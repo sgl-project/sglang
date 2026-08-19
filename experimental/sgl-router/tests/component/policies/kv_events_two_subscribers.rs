@@ -38,6 +38,9 @@ async fn two_independent_subscribers_converge_to_same_tree_state() {
     let cfg = EventConfig {
         host: "127.0.0.1".into(),
         port_base: port,
+        // These exercise KV events only; None means "worker publishes no
+        // load", so the load subscriber is skipped.
+        load_port_base: None,
         topic: String::new(),
         block_size,
         dp_size: 1,
@@ -171,6 +174,9 @@ async fn two_subscribers_merge_events_from_two_publishers() {
     let cfg_x = EventConfig {
         host: "127.0.0.1".into(),
         port_base: port_x,
+        // These exercise KV events only; None means "worker publishes no
+        // load", so the load subscriber is skipped.
+        load_port_base: None,
         topic: String::new(),
         block_size,
         dp_size: 1,
@@ -179,6 +185,9 @@ async fn two_subscribers_merge_events_from_two_publishers() {
     let cfg_y = EventConfig {
         host: "127.0.0.1".into(),
         port_base: port_y,
+        // These exercise KV events only; None means "worker publishes no
+        // load", so the load subscriber is skipped.
+        load_port_base: None,
         topic: String::new(),
         block_size,
         dp_size: 1,
