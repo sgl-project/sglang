@@ -1,8 +1,6 @@
 # Reference: https://github.com/feifeibear/long-context-attention/blob/main/yunchang/globals.py
 
 
-import torch
-
 from .group_coordinator import new_device_group
 
 
@@ -58,7 +56,7 @@ def set_seq_parallel_pg_by_sp_groups(
     def _map_indices_to_ranks(ranks: list[int], indices: list[int]) -> list[int]:
         return [ranks[i] for i in indices]
 
-    # Important: call torch.distributed.new_group in the same order on all ranks.
+    # Important: create the groups in the same order on all ranks.
     for sp_ranks in sp_groups:
         if use_ulysses_low:
             for i in range(num_ulysses_pgs):

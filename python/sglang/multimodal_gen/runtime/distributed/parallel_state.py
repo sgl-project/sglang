@@ -53,10 +53,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from ..utils.distributed import RankGenerator
 from .group_coordinator import (
     GroupCoordinator,
-    new_device_group,
     PipelineGroupCoordinator,
     SequenceParallelGroupCoordinator,
     get_local_torch_device,
+    new_device_group,
 )
 
 logger = init_logger(__name__)
