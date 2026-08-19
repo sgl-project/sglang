@@ -59,6 +59,19 @@
     "change": "Keep all draft-extend model rows, but compute CUDA-graph lm_head/logits only for the one sampled row per request. The eager fallback is unchanged.",
     "targeted_validation": "py_compile, manifest parse, and diff-check pass; exact runtime graph, output, and matched-B28 serving gates pending"
   },
+  "eagle_draft_vocab_parallel_top1": {
+    "parent_commit": "c237f88a98c906075588a0e5e0c0d4e66d114410",
+    "change_commit": "31180a74cdf6fba6311d1273c27889bdf153759d",
+    "files": [
+      "python/sglang/srt/environ.py",
+      "python/sglang/srt/layers/logits_processor.py",
+      "python/sglang/srt/models/qwen3_5_mtp.py",
+      "python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py",
+      "python/sglang/srt/speculative/eagle_worker_v2.py"
+    ],
+    "change": "For greedy Qwen3.5 NEXTN under attention DP, all-gather draft hidden rows, project a rank-local target-head vocab view, gather one (token_id, max_logit) pair per row, and scatter selected ids back to the owning rank. Target sampling and the default-off path are unchanged.",
+    "targeted_validation": "py_compile and diff-check pass; four-rank graph/eager identity and matched-B28 serving gates pending"
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
