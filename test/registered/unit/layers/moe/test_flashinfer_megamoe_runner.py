@@ -84,17 +84,18 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
         moe_ep = types.ModuleType("flashinfer.moe_ep")
         for name in (
             "BootstrapConfig",
-            "DeepGemmMegaMoeConfig",
             "FleetParams",
             "MegaConfig",
             "MoEEpMegaLayer",
             "MoEWeightPack",
+            "Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig",
         ):
             setattr(moe_ep, name, FakeConfig)
         moe_ep.preprocess_mega_weights = fake_preprocess
         flashinfer.moe_ep = moe_ep
 
         layer = SimpleNamespace(
+            layer_id=0,
             moe_ep_size=1,
             moe_ep_rank=0,
             num_experts=8,
@@ -170,17 +171,18 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
         flashinfer.__spec__ = importlib.machinery.ModuleSpec("flashinfer", loader=None)
         moe_ep = types.ModuleType("flashinfer.moe_ep")
         for name in (
-            "Bf16CutedslMegaMoeConfig",
             "BootstrapConfig",
             "FleetParams",
             "MegaConfig",
             "MoEEpMegaLayer",
             "MoEWeightPack",
+            "Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig",
         ):
             setattr(moe_ep, name, FakeConfig)
         moe_ep.preprocess_bf16_cutedsl_mega_weights = fake_preprocess
         flashinfer.moe_ep = moe_ep
         layer = SimpleNamespace(
+            layer_id=0,
             moe_ep_size=1,
             moe_ep_rank=0,
             num_experts=8,
@@ -250,18 +252,22 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
         flashinfer = types.ModuleType("flashinfer")
         flashinfer.__spec__ = importlib.machinery.ModuleSpec("flashinfer", loader=None)
         moe_ep = types.ModuleType("flashinfer.moe_ep")
+        mixed_backend = types.ModuleType(
+            "flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl"
+        )
+        mixed_backend.preprocess_mega_weights = fake_preprocess
         for name in (
             "BootstrapConfig",
             "FleetParams",
             "MegaConfig",
             "MoEEpMegaLayer",
             "MoEWeightPack",
-            "Mxfp8Bf16CutedslMegaMoeConfig",
+            "Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
         ):
             setattr(moe_ep, name, FakeConfig)
-        moe_ep.preprocess_mxfp8_bf16_cutedsl_mega_weights = fake_preprocess
         flashinfer.moe_ep = moe_ep
         layer = SimpleNamespace(
+            layer_id=0,
             moe_ep_size=1,
             moe_ep_rank=0,
             num_experts=8,
@@ -288,7 +294,11 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
         with (
             patch.dict(
                 sys.modules,
-                {"flashinfer": flashinfer, "flashinfer.moe_ep": moe_ep},
+                {
+                    "flashinfer": flashinfer,
+                    "flashinfer.moe_ep": moe_ep,
+                    "flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl": mixed_backend,
+                },
             ),
             patch(
                 "sglang.srt.layers.moe.flashinfer_megamoe._resolve_max_tokens_per_rank",
@@ -307,14 +317,14 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
 
         self.assertEqual(preprocess_args["intermediate_size"], 128)
         self.assertEqual(preprocess_args["hidden_size"], 128)
-        self.assertEqual(preprocess_args["kind"], "mxfp8_bf16_e4m3")
+        self.assertEqual(preprocess_args["kind"], "bf16_mxfp8_e4m3")
         weights = preprocess_args["weights"].kwargs
         self.assertEqual(weights["w13_scale"].dtype, torch.uint8)
         self.assertEqual(weights["w2_scale"].dtype, torch.uint8)
         backend = mega.kwargs["backend"]
         self.assertFalse(backend.kwargs["preprocess_weights"])
         config = backend.kwargs["megakernel"]
-        self.assertEqual(config.kwargs["kind"], "mxfp8_bf16_e4m3")
+        self.assertEqual(config.kwargs["kind"], "bf16_mxfp8_e4m3")
         transformed = backend.kwargs["transformed_weights"]
         self.assertEqual(transformed[0][0].data_ptr(), layer.w13_weight.data.data_ptr())
         self.assertEqual(transformed[1][0].data_ptr(), layer.w2_weight.data.data_ptr())
@@ -347,8 +357,6 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
                 tensor_args.update(kwargs)
 
         class FakeMega:
-            _workspace = object()
-
             def forward(self, _):
                 return torch.ones((2, 4), dtype=torch.bfloat16)
 
@@ -390,14 +398,14 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
             )
 
         self.assertEqual(tensor_args["hidden_states"].dtype, torch.bfloat16)
-        self.assertEqual(tensor_args["topk_ids"].dtype, torch.int64)
+        self.assertEqual(tensor_args["topk_ids"].dtype, torch.int32)
         self.assertEqual(tensor_args["topk_weights"].dtype, torch.float32)
         torch.testing.assert_close(
             result.hidden_states,
             torch.full((2, 4), 0.5, dtype=torch.bfloat16),
         )
 
-    def test_fused_forward_pads_zero_token_rank(self):
+    def test_fused_forward_passes_zero_token_rank(self):
         tensor_args = {}
 
         class FakeTensors:
@@ -406,8 +414,6 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
                 tensor_args.update(kwargs)
 
         class FakeMega:
-            _workspace = object()
-
             def forward(self, tensors):
                 return torch.ones(
                     (tensors.kwargs["hidden_states"].shape[0], 4),
@@ -447,8 +453,9 @@ class TestFlashInferMegaMoeRunner(CustomTestCase):
                 MoeRunnerConfig(),
             )
 
-        self.assertEqual(tensor_args["hidden_states"].shape, (1, 4))
-        self.assertTrue(torch.all(tensor_args["topk_weights"] == 0))
+        self.assertEqual(tensor_args["hidden_states"].shape, (0, 4))
+        self.assertEqual(tensor_args["topk_ids"].shape, (0, 2))
+        self.assertEqual(tensor_args["topk_weights"].shape, (0, 2))
         self.assertEqual(result.hidden_states.shape, (0, 4))
 
 

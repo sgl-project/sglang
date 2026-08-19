@@ -323,11 +323,11 @@ def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     if mega is not None:
         return mega
 
-    from flashinfer.moe_ep import DeepGemmMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig
 
     return _ensure_flashinfer_megamoe_layer(
         layer,
-        megakernel_config=DeepGemmMegaMoeConfig(
+        megakernel_config=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             activation_clamp=layer.moe_runner_config.swiglu_limit,
@@ -342,11 +342,11 @@ def ensure_nvfp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     if mega is not None:
         return mega
 
-    from flashinfer.moe_ep import Nvfp4CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
 
     return _ensure_flashinfer_megamoe_layer(
         layer,
-        megakernel_config=Nvfp4CutedslMegaMoeConfig(
+        megakernel_config=Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
@@ -368,11 +368,11 @@ def ensure_mxfp8_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     if mega is not None:
         return mega
 
-    from flashinfer.moe_ep import Mxfp8CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
 
     return _ensure_flashinfer_megamoe_layer(
         layer,
-        megakernel_config=Mxfp8CutedslMegaMoeConfig(
+        megakernel_config=Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             kind="mxfp8_e4m3",
@@ -389,14 +389,14 @@ def ensure_mxfp8_bf16_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     if mega is not None:
         return mega
 
-    from flashinfer.moe_ep import Mxfp8Bf16CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
 
     return _ensure_flashinfer_megamoe_layer(
         layer,
-        megakernel_config=Mxfp8Bf16CutedslMegaMoeConfig(
+        megakernel_config=Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
-            kind="mxfp8_bf16_e4m3",
+            kind="bf16_mxfp8_e4m3",
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
         ),
         w13_scale_name="w13_weight_scale_inv",
@@ -409,11 +409,11 @@ def ensure_bf16_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     if mega is not None:
         return mega
 
-    from flashinfer.moe_ep import Bf16CutedslMegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
 
     return _ensure_flashinfer_megamoe_layer(
         layer,
-        megakernel_config=Bf16CutedslMegaMoeConfig(
+        megakernel_config=Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=layer.intermediate_size_per_partition,
             top_k=layer.top_k,
             gate_up_clamp=layer.moe_runner_config.swiglu_limit,
@@ -568,9 +568,9 @@ def prepare_mxfp8_moe_weights_for_flashinfer_megamoe(
 def prepare_mxfp8_bf16_moe_weights_for_flashinfer_megamoe(
     layer: FusedMoE,
 ) -> None:
-    from flashinfer.moe_ep import (
-        MoEWeightPack,
-        preprocess_mxfp8_bf16_cutedsl_mega_weights,
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl import (
+        preprocess_mega_weights,
     )
 
     if not layer.moe_runner_config.is_gated:
@@ -607,11 +607,11 @@ def prepare_mxfp8_bf16_moe_weights_for_flashinfer_megamoe(
         w13_scale=layer.w13_weight_scale_inv.data,
         w2_scale=layer.w2_weight_scale_inv.data,
     )
-    transformed_weights = preprocess_mxfp8_bf16_cutedsl_mega_weights(
+    transformed_weights = preprocess_mega_weights(
         weights,
         intermediate_size=layer.intermediate_size_per_partition,
         hidden_size=layer.hidden_size,
-        kind="mxfp8_bf16_e4m3",
+        kind="bf16_mxfp8_e4m3",
     )
     _bind_transformed_weights(
         layer,
@@ -674,50 +674,6 @@ def prepare_bf16_moe_weights_for_flashinfer_megamoe(layer: FusedMoE) -> None:
     )
 
 
-# One symmetric-memory workspace shared across all mega layers. FlashInfer's
-# MoEEpMegaLayer allocates a workspace per instance; MoE layers run
-# sequentially and the workspace is weight-independent, so a per-layer buffer
-# would multiply device memory by the layer count (and OOM). Keyed by the
-# durable sizing so distinct shapes still get distinct buffers. Mirrors the
-# shared symm-buffer cache in the deepgemm mega_moe path.
-_SHARED_MEGA_WORKSPACE: dict = {}
-
-
-def _ensure_shared_workspace(mega) -> None:
-    """Point this layer's workspace at the process-wide shared symm buffer.
-
-    The first mega layer's first forward creates it (collective; safe because
-    warmup runs the same layer on all ranks in lockstep); later layers reuse it.
-    """
-    if getattr(mega, "_workspace", None) is not None:
-        return
-    fp = mega._fleet_params
-    kc = mega._megakernel_config
-    mc = mega._mega_config
-    key = (
-        getattr(kc, "kernel_name", kc.__class__.__name__),
-        mega._bootstrap.world_size,
-        fp.num_experts,
-        fp.max_tokens_per_rank,
-        fp.token_hidden_size,
-        kc.top_k,
-        kc.intermediate_size,
-        getattr(kc, "gate_up_clamp", None),
-        getattr(kc, "activation_clamp", None),
-        getattr(kc, "apply_topk_in_fc1", None),
-        getattr(kc, "kind", None),
-        getattr(kc, "in_kernel_fc2_reduce", None),
-        getattr(kc, "token_back_by_dispatch", None),
-        getattr(kc, "fast_math", None),
-        mc.quantize_input,
-    )
-    shared = _SHARED_MEGA_WORKSPACE.get(key)
-    if shared is None:
-        _SHARED_MEGA_WORKSPACE[key] = mega._ensure_workspace()
-    else:
-        mega._workspace = shared
-
-
 @register_fused_func("flashinfer_megamoe", "flashinfer_megamoe")
 def run_flashinfer_megamoe(
     dispatch_output: DispatchOutput,
@@ -739,22 +695,7 @@ def run_flashinfer_megamoe(
     topk_ids = topk_output.topk_ids
     num_tokens = x.shape[0]
 
-    # MegaMOE is collective across EP ranks but its current BF16 frontend
-    # requires at least one local token. Keep zero-token ranks in the
-    # collective with a zero-weight dummy route, then discard its output.
-    if num_tokens == 0:
-        x = x.new_zeros((1, x.shape[1]))
-        topk_ids = torch.zeros(
-            (1, topk_ids.shape[1]), device=topk_ids.device, dtype=topk_ids.dtype
-        )
-        topk_weights = torch.zeros(
-            (1, topk_weights.shape[1]),
-            device=topk_weights.device,
-            dtype=topk_weights.dtype,
-        )
-
     mega = quant_info.mega
-    _ensure_shared_workspace(mega)
 
     if not _keep_topk_ids_int32():
         topk_ids = topk_ids.to(torch.int64)
@@ -781,4 +722,4 @@ def run_flashinfer_megamoe(
         if rsf is not None and rsf != 1.0:
             y.mul_(rsf)
 
-    return StandardCombineInput(hidden_states=y[:num_tokens])
+    return StandardCombineInput(hidden_states=y)
