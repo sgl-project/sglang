@@ -212,6 +212,37 @@ async fn streaming_chunks_pass_through() {
 }
 
 #[tokio::test]
+async fn streaming_string_true_passes_through() {
+    let chunks: Vec<&'static str> = vec![
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    ];
+    let worker = crate::common::mock_worker::MockWorker::start(chunks).await;
+    let ctx = build_ctx_with_worker(&worker.url);
+    let app = build_router(ctx);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": "True"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get("content-type").unwrap().to_str().unwrap(),
+        "text/event-stream"
+    );
+}
+
+#[tokio::test]
 async fn streaming_first_chunk_before_completion() {
     let chunks: Vec<&'static str> = vec![
         "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n",
