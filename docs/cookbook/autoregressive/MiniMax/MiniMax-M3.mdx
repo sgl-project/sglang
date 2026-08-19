@@ -122,11 +122,11 @@ For multimodal (image) serving, keep the same text recipe above — `--attention
 
 ### 2.2 Memory and workload tuning
 
-The NVIDIA Blackwell recipes are validated single-node: **B200 at `--tp 8`** and **B300 / GB300 at `--tp 4`** (4-GPU is also the GB200 / GB300 single-node ceiling). GB200 (sm_100, aarch64) is inferred-supported — both of its axes are validated above (B200 is sm_100; GB300 is sm_103 aarch64) — but not directly benchmarked. The AMD recipes use **8-GPU (`--tp 8`)**.
+The NVIDIA Blackwell recipes run single-node at **`--tp 4`** (4-GPU is also the GB200 / GB300 single-node ceiling). **B300 / GB300 `--tp 4`** are directly validated; **B200** uses the same `--tp 4` recipe but is pending a formal benchmark — its `--tp 8` path hits a DeepGEMM MXFP8 warmup crash (`layout.hpp:98`). GB200 (sm_100, aarch64) is inferred-supported — its axes are validated above (B300 is sm_103 aarch64; B200 is sm_100) — but not directly benchmarked. The AMD recipes use **8-GPU (`--tp 8`)**.
 
 - **Memory**: `--mem-fraction-static` reserves GPU memory for weights + KV pool; the rest is prefill **activation headroom**. The value scales with *free* memory per GPU (card capacity minus per-GPU weight), so it tracks the card more than the TP degree: **`0.65` on B200** (180 GB — less headroom once weights are resident) and **`0.75` on the larger-memory B300 / GB300** (`0.80` on AMD). Lower TP packs more weight per GPU, so a tighter config needs a *lower* value — B200 needs `0.65` even at `--tp 4`. Raising it past the validated value is fine only for low-concurrency single-stream serving; it OOMs under high concurrency or long context.
 - **Long context (32K+)**: keep `--mem-fraction-static` at the platform default and raise `--chunked-prefill-size` to `16384`. Decode TPOT stays roughly flat in context length thanks to sparse attention; 1K–128K prompts are validated.
-- **Scaling TP**: B200 is documented at `--tp 8`; B300 / GB200 / GB300 at `--tp 4` (the single-node cross-family common denominator). On an 8-GPU B300 host you can also raise to `--tp 8` for more throughput / KV headroom.
+- **Scaling TP**: B200 / B300 / GB200 / GB300 at `--tp 4` (the single-node cross-family common denominator). On an 8-GPU B300 host you can also raise to `--tp 8` for more throughput / KV headroom.
 - **Expert parallelism**: to trade latency for throughput add `--ep` (see [Expert Parallelism Deployment](../../../docs/advanced_features/expert_parallelism)). On AMD, set `--ep` equal to `--tp`. Shared-experts fusion is automatically disabled when EP > 1; on AMD standard EP the server also disables `--enable-aiter-allreduce-fusion` automatically to preserve accuracy.
 - `--trust-remote-code` is required to load the MiniMax config / processor classes.
 

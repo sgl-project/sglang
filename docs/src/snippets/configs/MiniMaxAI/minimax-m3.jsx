@@ -210,7 +210,10 @@ sgl-eval run mmmu_pro \\
   cells: [
     {
       match: { hw: "b200", variant: "default", quant: "mxfp8", strategy: "balanced", nodes: "single" },
-      // Pending — not yet measured. env PYTORCH_CUDA_ALLOC_CONF required on 0.5.16.
+      // Pending — not yet measured. The --tp 8 path crashes at DeepGEMM MXFP8 grouped-GEMM
+      // warmup (scale-factor assertion, layout.hpp:98), so B200 uses the same --tp 4 recipe
+      // that is validated on B300/GB300; B200 --tp 4 is inferred, pending a formal bench.
+      // env PYTORCH_CUDA_ALLOC_CONF required on 0.5.16.
       verified: false,
       env: ["PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"],
       flags: [
@@ -218,7 +221,7 @@ sgl-eval run mmmu_pro \\
         "--model-path {{MODEL_NAME}}",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
-        "--tp 8",
+        "--tp 4",
         "--attention-backend fa4",
         "--moe-runner-backend deep_gemm",
         "--chunked-prefill-size 8192",
