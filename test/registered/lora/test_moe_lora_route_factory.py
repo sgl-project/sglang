@@ -148,107 +148,6 @@ class _HostRouteView(msgspec.Struct, frozen=True, kw_only=True):
     maybe_num_pairs_post_padded: torch.Tensor | None = None
 
 
-def _load_route_factory():
-    package_names = (
-        "sglang",
-        "sglang.srt",
-        "sglang.srt.lora",
-        "sglang.srt.lora.moe",
-    )
-    packages = {}
-    for name in package_names:
-        package = types.ModuleType(name)
-        package.__path__ = []
-        packages[name] = package
-
-    routing = types.ModuleType("sglang.srt.lora.moe.routing")
-    routing.RouteViewKind = _RouteViewKind
-    routing.RouteView = _HostRouteView
-    routing.build_virtual_expert_routing = lambda *args, **kwargs: None
-
-    aligned_route = types.ModuleType("sglang.srt.lora.moe.aligned_route")
-
-    def unexpected_joint_route(*_args, **_kwargs):
-        raise AssertionError("the standard route plan must not use R10")
-
-    aligned_route.build = unexpected_joint_route
-
-    workspace = types.ModuleType("sglang.srt.lora.moe.workspace")
-    workspace.MoeLoraWorkspace = object
-
-    module_name = "_host_route_factory"
-    spec = importlib.util.spec_from_file_location(
-        module_name, LORA_MOE / "route_factory.py"
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    stubs = {
-        **packages,
-        "sglang.srt.lora.moe.execution_plan": PLAN,
-        routing.__name__: routing,
-        aligned_route.__name__: aligned_route,
-        workspace.__name__: workspace,
-        module_name: module,
-    }
-    with mock.patch.dict(sys.modules, stubs):
-        spec.loader.exec_module(module)
-    return module
-
-
-ROUTE_FACTORY = _load_route_factory()
-
-
-def _load_aligned_route():
-    package_names = (
-        "sglang",
-        "sglang.srt",
-        "sglang.srt.lora",
-        "sglang.srt.lora.moe",
-    )
-    packages = {}
-    for name in package_names:
-        package = types.ModuleType(name)
-        package.__path__ = []
-        packages[name] = package
-
-    fake_triton = types.ModuleType("triton")
-    fake_triton.jit = lambda function: function
-    fake_triton.cdiv = lambda value, divisor: (value + divisor - 1) // divisor
-    fake_tl = types.ModuleType("triton.language")
-    fake_triton.language = fake_tl
-
-    routing = types.ModuleType("sglang.srt.lora.moe.routing")
-    routing.RouteViewKind = _RouteViewKind
-    routing.RouteView = _HostRouteView
-    routing.virtual_expert_ids_inline = lambda *_args, **_kwargs: None
-
-    workspace = types.ModuleType("sglang.srt.lora.moe.workspace")
-    workspace.MoeLoraWorkspace = object
-
-    module_name = "_host_aligned_route"
-    spec = importlib.util.spec_from_file_location(
-        module_name, LORA_MOE / "aligned_route.py"
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    with mock.patch.dict(
-        sys.modules,
-        {
-            **packages,
-            "triton": fake_triton,
-            "triton.language": fake_tl,
-            routing.__name__: routing,
-            workspace.__name__: workspace,
-            module_name: module,
-        },
-    ):
-        spec.loader.exec_module(module)
-    return module
-
-
-ALIGNED_ROUTE = _load_aligned_route()
-
-
 def _load_routing():
     package_names = (
         "sglang",
@@ -274,6 +173,28 @@ def _load_routing():
     virtual_experts = types.ModuleType("sglang.kernels.ops.moe.virtual_experts")
     virtual_experts._align_block_size_jit = lambda *_args, **_kwargs: None
 
+    route_view = types.ModuleType("sglang.srt.lora.moe.route_view")
+    route_view.RouteViewKind = _RouteViewKind
+    route_view.RouteView = _HostRouteView
+
+    class _Unlaunched:
+        """Every kernel a host-level test reaches has to be patched first."""
+
+        def __getitem__(self, _grid):
+            def launch(*_args, **_kwargs):
+                raise AssertionError("a kernel launched in the host sandbox")
+
+            return launch
+
+    route_kernels = types.ModuleType("sglang.srt.lora.moe.route_kernels")
+    for kernel in (
+        "_build_virtual_topk_ids_kernel",
+        "_hist_kernel",
+        "_place_kernel",
+        "_scan_kernel",
+    ):
+        setattr(route_kernels, kernel, _Unlaunched())
+
     # routing.py imports this for the fused builder's metadata; stub it so the
     # loader does not depend on another test module having imported the real
     # one first.
@@ -290,7 +211,10 @@ def _load_routing():
             **packages,
             "triton": fake_triton,
             "triton.language": fake_tl,
+            "sglang.srt.lora.moe.execution_plan": PLAN,
             virtual_experts.__name__: virtual_experts,
+            route_view.__name__: route_view,
+            route_kernels.__name__: route_kernels,
             workspace.__name__: workspace,
             module_name: module,
         },
@@ -382,25 +306,28 @@ class TestRoutePdlWiring(unittest.TestCase):
             block_size,
             view,
             is_shared_outer=False,
+            is_joint_routing=False,
             workspace=None,
             tensor_prefix=None,
         ):
             # Every route gets the SAME local expert count; only the flag
             # differs, and it has to match the route being built.
             self.assertEqual(num_local_experts, 2)
+            self.assertFalse(is_joint_routing, "a standard plan must not go joint")
             calls.append((tensor_prefix, is_shared_outer))
-            return _route(
+            built = _route(
                 topk_ids,
                 token_lora_mapping,
                 block_size=block_size,
                 padded_count=torch.tensor([block_size], dtype=torch.int32),
             )
+            return (None, built) if is_shared_outer else (built, None)
 
         with mock.patch.object(
-            ROUTE_FACTORY, "build_virtual_expert_routing", side_effect=fake_aligned
+            ROUTING, "build_virtual_expert_routing", side_effect=fake_aligned
         ):
             for plan in (reference, shared_down, shared_token):
-                ROUTE_FACTORY.build_routes(
+                ROUTING.build_routes(
                     plan,
                     topk_ids=torch.tensor([[0, 1]], dtype=torch.int32),
                     token_lora_mapping=torch.tensor([0], dtype=torch.int32),
@@ -439,27 +366,6 @@ class TestRoutePdlWiring(unittest.TestCase):
         joint_calls = []
         standard_calls = []
 
-        def fake_joint(
-            topk_ids,
-            token_lora_mapping,
-            *,
-            num_local_experts,
-            max_loras,
-            block_size,
-            workspace,
-            tensor_prefix,
-            need_per_expert,
-            need_shared,
-        ):
-            joint_calls.append(block_size)
-            route = _route(
-                topk_ids,
-                token_lora_mapping,
-                block_size=block_size,
-                padded_count=torch.tensor([block_size], dtype=torch.int32),
-            )
-            return route, route
-
         def fake_route(
             topk_ids,
             token_lora_mapping,
@@ -467,30 +373,31 @@ class TestRoutePdlWiring(unittest.TestCase):
             num_local_experts,
             max_loras,
             block_size,
-            view,
+            view=None,
             is_shared_outer=False,
+            is_joint_routing=False,
             workspace=None,
             tensor_prefix=None,
         ):
-            standard_calls.append(view)
             padded = torch.zeros(1, dtype=torch.int32)
             padded.fill_(block_size)
-            return _route(
+            built = _route(
                 topk_ids,
                 token_lora_mapping,
                 block_size=block_size,
                 padded_count=padded,
             )
+            # One front door serves both, so the flag is what separates them.
+            if is_joint_routing:
+                joint_calls.append(block_size)
+                return built, built
+            standard_calls.append(view)
+            return (None, built) if is_shared_outer else (built, None)
 
-        with (
-            mock.patch.object(
-                ROUTE_FACTORY.aligned_route, "build", side_effect=fake_joint
-            ),
-            mock.patch.object(
-                ROUTE_FACTORY, "build_virtual_expert_routing", side_effect=fake_route
-            ),
+        with mock.patch.object(
+            ROUTING, "build_virtual_expert_routing", side_effect=fake_route
         ):
-            ROUTE_FACTORY.build_routes(
+            ROUTING.build_routes(
                 plan,
                 topk_ids=torch.tensor([[0, 1]], dtype=torch.int32),
                 token_lora_mapping=torch.tensor([0], dtype=torch.int32),
@@ -507,11 +414,11 @@ class TestRoutePdlWiring(unittest.TestCase):
         recorders = [_KernelRecorder() for _ in range(3)]
         with (
             _arch_pdl(bool(use_pdl)),
-            mock.patch.object(ALIGNED_ROUTE, "_hist_kernel", recorders[0]),
-            mock.patch.object(ALIGNED_ROUTE, "_scan_kernel", recorders[1]),
-            mock.patch.object(ALIGNED_ROUTE, "_place_kernel", recorders[2]),
+            mock.patch.object(ROUTING, "_hist_kernel", recorders[0]),
+            mock.patch.object(ROUTING, "_scan_kernel", recorders[1]),
+            mock.patch.object(ROUTING, "_place_kernel", recorders[2]),
         ):
-            routes = ALIGNED_ROUTE.build(
+            routes = ROUTING._build_aligned(
                 torch.tensor([[0, 1]], dtype=torch.int32),
                 torch.tensor([0], dtype=torch.int32),
                 num_local_experts=2,
@@ -618,20 +525,21 @@ class TestSharedTokenRoute(unittest.TestCase):
             )
             padded = torch.zeros(1, dtype=torch.int32)
             padded.fill_(block_size)
-            return _route(
+            built = _route(
                 route_topk_ids,
                 route_token_lora_mapping,
                 block_size=block_size,
                 padded_count=padded,
             )
+            return (None, built) if is_shared_outer else (built, None)
 
         with (
             _arch_pdl(False),
             mock.patch.object(
-                ROUTE_FACTORY, "build_virtual_expert_routing", side_effect=fake_route
+                ROUTING, "build_virtual_expert_routing", side_effect=fake_route
             ),
         ):
-            routes = ROUTE_FACTORY.build_routes(
+            routes = ROUTING.build_routes(
                 shared_plan,
                 topk_ids=topk_ids,
                 token_lora_mapping=token_lora_mapping,
@@ -714,7 +622,7 @@ class TestSharedTokenRoute(unittest.TestCase):
                         device=route_topk_ids.device,
                     )
                     padded.fill_(route_topk_ids.numel())
-                    return _route(
+                    built = _route(
                         route_topk_ids,
                         route_token_lora_mapping,
                         block_size=block_size,
@@ -723,13 +631,14 @@ class TestSharedTokenRoute(unittest.TestCase):
                         max_loras=max_loras,
                         is_shared_outer=is_shared_outer,
                     )
+                    return (None, built) if is_shared_outer else (built, None)
 
                 with mock.patch.object(
-                    ROUTE_FACTORY,
+                    ROUTING,
                     "build_virtual_expert_routing",
                     side_effect=fake_route,
                 ):
-                    routes = ROUTE_FACTORY.build_routes(
+                    routes = ROUTING.build_routes(
                         shared_plan,
                         topk_ids=topk_ids,
                         token_lora_mapping=token_lora_mapping,

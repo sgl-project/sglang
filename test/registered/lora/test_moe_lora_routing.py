@@ -5,7 +5,10 @@ import unittest
 import torch
 
 from sglang.srt.lora.moe.route_view import RouteViewKind
-from sglang.srt.lora.moe.routing import build_virtual_expert_routing
+from sglang.srt.lora.moe.routing import (
+    _only,
+    build_virtual_expert_routing,
+)
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -72,15 +75,17 @@ class TestMoeLoraRouting(CustomTestCase):
         view=RouteViewKind.ALIGNED,
     ):
         # A real workspace, since the fused builder requires one.
-        return build_virtual_expert_routing(
-            torch.tensor(topk_ids, dtype=dtype, device=self.device),
-            torch.tensor(adapters, dtype=dtype, device=self.device),
-            num_local_experts=num_local_experts,
-            max_loras=max_loras,
-            block_size=block_size,
-            view=view,
-            workspace=MoeLoraWorkspace(),
-            tensor_prefix="test:route",
+        return _only(
+            build_virtual_expert_routing(
+                torch.tensor(topk_ids, dtype=dtype, device=self.device),
+                torch.tensor(adapters, dtype=dtype, device=self.device),
+                num_local_experts=num_local_experts,
+                max_loras=max_loras,
+                block_size=block_size,
+                view=view,
+                workspace=MoeLoraWorkspace(),
+                tensor_prefix="test:route",
+            )
         )
 
     def test_narrower_views_refuse_fields_they_did_not_build(self):
@@ -177,11 +182,12 @@ class TestMoeLoraRouting(CustomTestCase):
         happened once, when a raised kernel ceiling never reached the
         dispatch — so the values AND the edge behavior are pinned together.
         """
-        from sglang.srt.lora.moe import aligned_route as fused_align
+        from sglang.srt.lora.moe import routing as routing_module
         from sglang.srt.lora.moe.route_view import RouteViewKind
         from sglang.srt.lora.moe.routing import (
             FUSED_ALIGN_MIN_PAIRS,
             FUSED_ALIGN_MIN_VIRTUAL_EXPERTS,
+            _only,
             build_virtual_expert_routing,
         )
 
@@ -202,7 +208,7 @@ class TestMoeLoraRouting(CustomTestCase):
             (1024, 1024, False),  # small V, P = 8192: below the P edge
             (40960, 8, True),  # above the JIT ceiling: fused is the only path
         )
-        original = fused_align.build
+        original = routing_module._build_aligned
         for num_virtual, num_tokens, expects_fused in cases:
             num_local_experts = num_virtual // 32
             with self.subTest(V=num_virtual, P=num_tokens * 8):
@@ -223,19 +229,21 @@ class TestMoeLoraRouting(CustomTestCase):
                         calls.append(True)
                         return original(*args, **kwargs)
 
-                    fused_align.build = spy
-                    route = build_virtual_expert_routing(
-                        ids,
-                        slots,
-                        num_local_experts=num_local_experts,
-                        max_loras=32,
-                        block_size=16,
-                        view=RouteViewKind.ALIGNED,
-                        workspace=MoeLoraWorkspace(),
-                        tensor_prefix="test:route",
+                    routing_module._build_aligned = spy
+                    route = _only(
+                        build_virtual_expert_routing(
+                            ids,
+                            slots,
+                            num_local_experts=num_local_experts,
+                            max_loras=32,
+                            block_size=16,
+                            view=RouteViewKind.ALIGNED,
+                            workspace=MoeLoraWorkspace(),
+                            tensor_prefix="test:route",
+                        )
                     )
                 finally:
-                    fused_align.build = original
+                    routing_module._build_aligned = original
                 self.assertEqual(
                     bool(calls),
                     expects_fused,
@@ -280,15 +288,17 @@ class TestMoeLoraRouting(CustomTestCase):
                     generator=generator,
                     dtype=torch.int32,
                 ).to(self.device)
-                route = build_virtual_expert_routing(
-                    topk_ids,
-                    token_lora_mapping,
-                    num_local_experts=num_local_experts,
-                    max_loras=max_loras,
-                    block_size=16,
-                    view=RouteViewKind.ALIGNED,
-                    workspace=MoeLoraWorkspace(),
-                    tensor_prefix="test:route",
+                route = _only(
+                    build_virtual_expert_routing(
+                        topk_ids,
+                        token_lora_mapping,
+                        num_local_experts=num_local_experts,
+                        max_loras=max_loras,
+                        block_size=16,
+                        view=RouteViewKind.ALIGNED,
+                        workspace=MoeLoraWorkspace(),
+                        tensor_prefix="test:route",
+                    )
                 )
                 num_pairs = num_tokens * top_k
                 keys = (

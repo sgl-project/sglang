@@ -83,11 +83,8 @@ from sglang.srt.lora.moe.launch_config import (
 from sglang.srt.lora.moe.lora_a import run_lora_a
 from sglang.srt.lora.moe.lora_b import run_lora_b
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
-from sglang.srt.lora.moe.route_factory import (
-    MoeLoraRoutes,
-    build_routes,
-)
 from sglang.srt.lora.moe.route_view import RouteView
+from sglang.srt.lora.moe.routing import MoeLoraRoutes, build_routes
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace, run_parallel
 from sglang.srt.runtime_context import get_lora
 

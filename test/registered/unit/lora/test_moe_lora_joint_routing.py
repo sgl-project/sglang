@@ -7,9 +7,9 @@ import torch
 
 pytest.importorskip("triton")
 
-from sglang.srt.lora.moe.aligned_route import (  # noqa: E402
+from sglang.srt.lora.moe.routing import (  # noqa: E402
+    _build_aligned,
     _plan_scratch,
-    build,
 )
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace  # noqa: E402
 from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
@@ -63,7 +63,7 @@ def test_joint_route_scan_restores_both_count_buffers_between_calls() -> None:
         torch.tensor([1, -1, 0, 1, -1, 0], dtype=torch.int32, device=device),
     )
     for token_lora_mapping in traffic:
-        build(
+        _build_aligned(
             topk_ids,
             token_lora_mapping,
             num_local_experts=num_local_experts,
