@@ -1245,6 +1245,11 @@ class ModelConfig:
             getattr(self.hf_config, "quantization_config", None)
         )
         if quant_cfg is not None:
+            from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
+
+            if AutoRoundConfig.is_mxfp_config(quant_cfg):
+                quant_cfg.update(AutoRoundConfig.to_native_mxfp_config(quant_cfg))
+
             # Identify modelopt quantization
             if (
                 "quant_method" not in quant_cfg
