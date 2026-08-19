@@ -11,7 +11,7 @@ use std::num::NonZeroU32;
 
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
-    resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
+    resolve_mode, ActiveLoadConfig, AdminConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
     DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
     ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
 };
@@ -35,6 +35,12 @@ pub struct Cli {
     /// Port to bind the HTTP server to.
     #[arg(long, default_value_t = 30000)]
     pub port: u16,
+
+    // ---- admin ----
+    /// Admin API key for router admin endpoints such as `/flush_cache`.
+    /// When unset, admin endpoints remain unauthenticated.
+    #[arg(long)]
+    pub admin_api_key: Option<String>,
 
     // ---- model (exactly one) ----
     /// Model id this router serves (the OpenAI `model` field).
@@ -258,6 +264,9 @@ impl Cli {
                 log_level: self.log_level,
                 log_format: self.log_format,
             },
+            admin: AdminConfig {
+                api_key: self.admin_api_key,
+            },
             model: ModelConfig {
                 // Default the tokenizer source to the model id (treated as a
                 // HuggingFace repo id) when --tokenizer-path is omitted.
@@ -391,6 +400,51 @@ mod tests {
         assert_eq!(c.model.id, "qwen3-0.6b");
         assert_eq!(c.proxy.request_timeout_secs, 300);
         assert_eq!(c.active_load.stale_request_timeout_secs, 600);
+        assert!(c.admin.api_key.is_none());
+    }
+
+    #[test]
+    fn admin_api_key_flag_sets_admin_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--admin-api-key",
+            "router-secret",
+        ]))
+        .unwrap();
+        assert_eq!(c.admin.api_key.as_deref(), Some("router-secret"));
+    }
+
+    #[test]
+    fn rejects_empty_admin_api_key() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--admin-api-key",
+            "",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("admin.api_key must be non-empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_admin_api_key_with_surrounding_whitespace() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--admin-api-key",
+            " router-secret ",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("admin.api_key must not contain leading or trailing whitespace"),
+            "got: {err}"
+        );
     }
 
     /// With `--tokenizer-path` omitted, the tokenizer source defaults to the

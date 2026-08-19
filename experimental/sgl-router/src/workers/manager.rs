@@ -487,6 +487,7 @@ mod tests {
             }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
+            admin: crate::config::AdminConfig::default(),
         }
     }
 

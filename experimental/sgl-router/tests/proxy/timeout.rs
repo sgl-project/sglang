@@ -47,6 +47,7 @@ fn config(_worker_url: &str) -> Config {
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        admin: sgl_router::config::AdminConfig::default(),
     }
 }
 
