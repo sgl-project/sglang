@@ -78,6 +78,21 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         first_stride = _SSCP_CONV_STRIDE_SIZES[0][0]
         return hop * first_stride
 
+    @staticmethod
+    def _validate_precomputed_image_token_counts(mm_items) -> None:
+        for item in mm_items:
+            if not item.is_image() or not item.is_precomputed_embedding():
+                continue
+
+            embedding = torch.as_tensor(item.feature)
+            num_embeddings = embedding.reshape(-1, embedding.shape[-1]).shape[0]
+            num_placeholders = sum(end - start + 1 for start, end in item.offsets)
+            if num_placeholders != num_embeddings:
+                raise ValueError(
+                    "Gemma4 precomputed image token count mismatch: "
+                    f"placeholders={num_placeholders}, embeddings={num_embeddings}"
+                )
+
     def _video_decoder_to_tensor(self, vdw: VideoDecoderWrapper) -> torch.Tensor:
         """Convert a VideoDecoderWrapper to a (sampled_frames, C, H, W) uint8 tensor.
 
@@ -148,6 +163,7 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         mm_items, input_ids, _ = self.process_and_combine_mm_data(
             base_output, self.mm_tokens
         )
+        self._validate_precomputed_image_token_counts(mm_items)
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),
