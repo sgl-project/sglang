@@ -4,15 +4,16 @@
 # The AMD runners are docker-in-docker with ephemeral storage, so an image
 # pulled by one job is gone before the next job starts and every job re-pulls
 # ~23GB from Docker Hub. The volume mounted at /home/runner/sglang-data is the
-# only thing that survives between jobs, and unlike the in-network registry it
-# is reachable from both mi30x and mi35x. So the first job to miss pays a pull
-# and seeds a tarball; later jobs `docker load` it instead.
+# only thing that survives between jobs. So the first job to miss pays a pull
+# and seeds a tarball there; later jobs `docker load` it instead.
 #
 # Every operation here is best-effort. A cache that is full, slow, locked or
 # corrupt must never fail a test job -- the caller falls back to pulling.
 #
+# Whether to cache at all is the caller's decision: pass a directory to
+# image_cache_init to enable, or the empty string to disable.
+#
 # Environment:
-#   AMD_CI_IMAGE_TARBALL_CACHE=0     disable entirely
 #   AMD_CI_IMAGE_CACHE_MIN_FREE_GB   don't seed below this much free space (default 120)
 #   AMD_CI_IMAGE_CACHE_MAX_AGE_DAYS  prune tarballs older than this (default 1)
 
@@ -25,11 +26,10 @@ IMAGE_CACHE_MAX_AGE_DAYS="${AMD_CI_IMAGE_CACHE_MAX_AGE_DAYS:-1}"
 # Leaves IMAGE_CACHE_DIR empty when caching is unavailable or switched off.
 image_cache_init() {
   local cache_host="${1:-}"
-  if [[ "${AMD_CI_IMAGE_TARBALL_CACHE:-1}" == "0" ]]; then
-    echo "Image tarball cache disabled by AMD_CI_IMAGE_TARBALL_CACHE=0"
+  if [[ -z "${cache_host}" ]]; then
     return 0
   fi
-  if [[ -z "${cache_host}" || ! -d "${cache_host}" ]]; then
+  if [[ ! -d "${cache_host}" ]]; then
     echo "Image tarball cache unavailable: no persistent volume at '${cache_host}'" >&2
     return 0
   fi

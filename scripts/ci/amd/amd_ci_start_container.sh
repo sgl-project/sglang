@@ -22,11 +22,10 @@ VERSION_RESOLVE_SECONDS=$SECONDS
 ROCM_VERSION="rocm700"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
-# In-network mirror of rocm/sgl-dev, populated by the nightly release workflow.
-# Only the MI300 scale sets can route to it, so it is enabled per architecture
-# once the GPU arch is known below. AMD_CI_DOCKER_REGISTRY_MIRROR overrides that
-# either way: a host:port to retarget it, or the empty string to always pull
-# from Docker Hub.
+# In-network mirror of rocm/sgl-dev, reachable from the mi30x fleet, so it is
+# enabled per architecture once the GPU arch is known below.
+# AMD_CI_DOCKER_REGISTRY_MIRROR overrides that either way: a host:port to
+# retarget it, or the empty string to always pull from Docker Hub.
 DEFAULT_DOCKER_REGISTRY_MIRROR="10.44.14.109:5000"
 
 # Parse command line arguments
@@ -63,7 +62,9 @@ while [[ $# -gt 0 ]]; do
       echo "  ENABLE_CACHE_HOST=1|0"
       echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
       echo "  AMD_CI_DOCKER_REGISTRY_MIRROR=HOST:PORT"
-      echo "      In-network registry to pull rocm/sgl-dev from before falling back to Docker Hub. Defaults to ${DEFAULT_DOCKER_REGISTRY_MIRROR} on mi30x and to none on mi35x, which cannot route to it. Set to the empty string to always use Docker Hub."
+      echo "      In-network registry to pull rocm/sgl-dev from before falling back to Docker Hub. Defaults to ${DEFAULT_DOCKER_REGISTRY_MIRROR} on mi30x and to none elsewhere. Set to the empty string to always use Docker Hub."
+      echo "  AMD_CI_IMAGE_TARBALL_CACHE=1|0"
+      echo "      Cache the image as a tarball on the persistent volume so later jobs load instead of pulling. Defaults to on for mi30x, off elsewhere."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -99,9 +100,9 @@ case "${GPU_ARCH}" in
     ;;
 esac
 
-# Enable the mirror only where it is routable. Probes from every linux-mi35x-*
-# pool time out after a flat 15s, so attempting it there only delays the Docker
-# Hub pull that has to happen anyway.
+# The mirror lives in the mi30x fleet's network. Other pools sit in a different
+# CSP and cannot route to it, where the attempt only adds a 15s connect timeout
+# ahead of the Docker Hub pull that has to happen anyway.
 if [[ -n "${AMD_CI_DOCKER_REGISTRY_MIRROR+x}" ]]; then
   LOCAL_DOCKER_REGISTRY="${AMD_CI_DOCKER_REGISTRY_MIRROR}"
 elif [[ "${GPU_ARCH}" == "mi30x" ]]; then
@@ -293,9 +294,16 @@ esac
 # before the image is acquired rather than just before `docker run`.
 # shellcheck source=scripts/ci/amd/amd_ci_image_cache.sh
 source "$(dirname "${BASH_SOURCE[0]}")/amd_ci_image_cache.sh"
-if [[ -n "${CACHE_VOLUME}" ]]; then
+if [[ "${AMD_CI_IMAGE_TARBALL_CACHE:-}" == "0" ]]; then
+  echo "Image tarball cache disabled by AMD_CI_IMAGE_TARBALL_CACHE=0"
+  image_cache_init ""
+elif [[ -z "${CACHE_VOLUME}" ]]; then
+  echo "No persistent volume mounted; image tarball cache unavailable."
+  image_cache_init ""
+elif [[ "${AMD_CI_IMAGE_TARBALL_CACHE:-}" == "1" || "${GPU_ARCH}" == "mi30x" ]]; then
   image_cache_init "${CACHE_HOST}"
 else
+  echo "Image tarball cache is mi30x-only for now; set AMD_CI_IMAGE_TARBALL_CACHE=1 to opt ${GPU_ARCH} in."
   image_cache_init ""
 fi
 
