@@ -836,6 +836,7 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
             bytes: Some(token.as_bytes().to_vec()),
             token,
             logprob,
+            token_id: u32::try_from(token_id).ok(),
             top_logprobs,
         });
     }
@@ -1020,6 +1021,7 @@ mod tests {
         let logprobs = chat_logprobs(Some(&extras));
         let token = &logprobs.content.unwrap()[0];
         assert_eq!(token.token, "x");
+        assert_eq!(token.token_id, Some(7));
         assert_eq!(token.top_logprobs.len(), 2);
         assert_eq!(token.top_logprobs[1].token, "y");
     }
