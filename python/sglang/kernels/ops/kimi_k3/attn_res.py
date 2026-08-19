@@ -34,11 +34,12 @@ def _jit_fused_tma_module(
     """Compile and cache the warp-specialized TMA aggregation kernel (per-row
     bulk copies into chunk slots; chunk_rows / occupancy / consumer_regs are
     tuning knobs). The smem ring is frozen at 2 chunk slots and PDL is always
-    on: the kernel targets SM100+, where both are unconditional wins."""
+    on: the kernel targets SM100+ except SM12x."""
     major, minor = torch.cuda.get_device_capability()
-    if major < 10:
+    if major < 10 or major == 12:
         raise RuntimeError(
-            "attn_res_fused_tma requires SM100+ (tcgen05, cp.async.bulk)"
+            "attn_res_fused_tma requires SM100+ excluding SM12x; "
+            f"SM{major}{minor} is unsupported"
         )
     args = make_cpp_args(
         _DIM,

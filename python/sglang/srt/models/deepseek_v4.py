@@ -401,6 +401,31 @@ def _freqs_cis_to_cos_sin(
     return cos, sin
 
 
+def _apply_gguf_grouped_wo_a(
+    o: torch.Tensor,
+    qweight: torch.Tensor,
+    qweight_type: int,
+    o_lora_rank: int,
+    matmul_fn: Optional[Callable] = None,
+) -> torch.Tensor:
+    if matmul_fn is None:
+        from sglang.srt.layers.quantization.gguf import fused_mul_mat_gguf
+
+        matmul_fn = fused_mul_mat_gguf
+
+    group_outputs = []
+    for group_id in range(o.shape[1]):
+        start = group_id * o_lora_rank
+        group_outputs.append(
+            matmul_fn(
+                o[:, group_id, :].contiguous(),
+                qweight[start : start + o_lora_rank],
+                qweight_type,
+            )
+        )
+    return torch.stack(group_outputs, dim=1)
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
@@ -533,8 +558,11 @@ class MqaAttentionBase(nn.Module):
             else wo_b_reduce_results
         )
         if wo_a_keeps_quant_config is None:
+            keep_source_quant = (
+                quant_config is not None and quant_config.get_name() == "expert_pack"
+            )
             wo_a_quant_config: Optional[QuantizationConfig] = (
-                quant_config if fp8 else None
+                quant_config if fp8 or keep_source_quant else None
             )
         elif wo_a_keeps_quant_config:
             wo_a_quant_config = quant_config
@@ -752,6 +780,11 @@ class MQALayer(MqaAttentionBase):
         self.compressor = None
         self.indexer = None
         if self.compress_ratio in (4, 128):
+            expert_pack_quant_config = (
+                quant_config
+                if quant_config is not None and quant_config.get_name() == "expert_pack"
+                else None
+            )
             self.compressor = Compressor(
                 config,
                 layer_id=self.layer_id,
@@ -761,6 +794,7 @@ class MQALayer(MqaAttentionBase):
                 head_dim=self.head_dim,
                 rotate=False,
                 prefix=add_prefix("compressor", prefix),
+                quant_config=expert_pack_quant_config,
                 rotary_emb=self.rotary_emb,
             )
             if self.compress_ratio == 4:
@@ -1581,8 +1615,17 @@ class MQALayer(MqaAttentionBase):
             )
             o = output
         else:
-            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            o = torch.einsum("tgd,grd->tgr", o, wo_a)
+            wo_a_weight = getattr(self.wo_a, "weight", None)
+            if wo_a_weight is not None:
+                wo_a = wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1)
+                o = torch.einsum("tgd,grd->tgr", o, wo_a)
+            else:
+                o = _apply_gguf_grouped_wo_a(
+                    o,
+                    self.wo_a.qweight,
+                    self.wo_a.qweight_type.weight_type,
+                    self.o_lora_rank,
+                )
 
         o, _ = self.wo_b(o.flatten(1))
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
@@ -2453,10 +2496,17 @@ class DeepseekV4Model(nn.Module):
         self.pp_group = get_pp_group()
         self.hidden_size = config.hidden_size
         if self.pp_group.is_first_rank:
+            embedding_quant_config = (
+                quant_config
+                if quant_config is not None and quant_config.get_name() == "expert_pack"
+                else None
+            )
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 enable_tp=not is_dp_attention_enabled(),
+                quant_config=embedding_quant_config,
+                prefix=add_prefix("embed_tokens", prefix),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -3152,10 +3202,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         is_nextn: bool = False,
         num_hidden_layers: Optional[int] = None,
     ) -> str:
-        if name == "embed.weight":
-            return "model.embed_tokens.weight"
-        if name == "head.weight":
-            return "lm_head.weight"
+        if name.startswith("embed."):
+            return "model.embed_tokens." + name.removeprefix("embed.")
+        if name.startswith("head."):
+            return "lm_head." + name.removeprefix("head.")
         if name == "norm.weight":
             return "model.norm.weight"
         if name.startswith("hc_head_"):
@@ -3294,7 +3344,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
         if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
-            weights = _dequant_fp8_wo_a_streaming(weights)
+            weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
 
@@ -3491,7 +3541,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 or name == "lm_head.weight"
                             ) and not self.pp_group.is_last_rank:
                                 continue
-                            elif COMPRESSOR_PART in name:
+                            elif COMPRESSOR_PART in name and ".wkv_gate." not in name:
                                 is_kv = name.endswith(".wkv.weight")
                                 is_wgate = name.endswith(".wgate.weight")
                                 assert is_kv != is_wgate
@@ -3528,6 +3578,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 or name.endswith(".wq_a.weight_scale_inv")
                                 or name.endswith(".wkv.weight")
                                 or name.endswith(".wkv.weight_scale_inv")
+                                or name.endswith(".wq_a.qweight")
+                                or name.endswith(".wkv.qweight")
+                                or name.endswith(".wq_a.qweight_type")
+                                or name.endswith(".wkv.qweight_type")
                             ):
                                 is_q = ".wq_a." in name
                                 param_name = name.replace(
@@ -3542,8 +3596,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     loaded_weight
                                 )
                                 if len(bucket) == 2:
-                                    fused_weight = torch.cat(
-                                        [bucket["q"], bucket["kv"]], dim=0
+                                    fused_weight = _fuse_deepseek_v4_wqkv_a_pair(
+                                        param_name, bucket
                                     )
                                     param = params_dict[param_name]
                                     weight_loader = auto_weight_loader(param)
@@ -3738,3 +3792,32 @@ def _dequant_fp8_wo_a(
         yield name, _dequant_fp8(weight, scale)
 
     yield from weights_dict.items()
+
+
+def _prepare_deepseek_v4_weights(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    quant_config: Optional[QuantizationConfig],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Keep Expert Pack GGUF weights on the streaming load path."""
+
+    if quant_config is not None and quant_config.get_name() == "expert_pack":
+        logger.info("Keep Expert Pack GGUF weights on the streaming load path")
+        return weights
+    return _dequant_fp8_wo_a_streaming(weights)
+
+
+def _fuse_deepseek_v4_wqkv_a_pair(
+    param_name: str, bucket: dict[str, torch.Tensor]
+) -> torch.Tensor:
+    """Fuse Q/KV rows while preserving their common GGUF type scalar."""
+
+    q = bucket["q"]
+    kv = bucket["kv"]
+    if param_name.endswith(".qweight_type"):
+        if q.numel() != 1 or kv.numel() != 1 or q.item() != kv.item():
+            raise ValueError(
+                f"cannot fuse different GGUF qweight types for {param_name}: "
+                f"q={q.tolist()} kv={kv.tolist()}"
+            )
+        return q
+    return torch.cat([q, kv], dim=0)
