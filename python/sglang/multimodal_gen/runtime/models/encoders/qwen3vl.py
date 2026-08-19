@@ -596,13 +596,6 @@ class Qwen3VLTextModel(nn.Module):
 
         hidden_states = inputs_embeds
 
-        # create position embeddings to be shared across the decoder layers
-        if current_platform.is_npu():
-            # Text-encoder offload can leave position IDs and RoPE buffers on CPU.
-            # On NPU, both must be on the same device as the hidden states before RoPE.
-            position_ids = position_ids.to(hidden_states.device)
-            self.rotary_emb.to(hidden_states.device)
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         # decoder layers
