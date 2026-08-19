@@ -95,6 +95,110 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
+
+def _is_gfx950_supported() -> bool:
+    if not (_use_aiter and _is_gfx95_supported):
+        return False
+    try:
+        return "gfx950" in torch.cuda.get_device_properties(0).gcnArchName
+    except Exception:
+        return False
+
+
+_enable_fused_ar_mxfp4_quant = _is_gfx950_supported()
+
+
+def _try_fused_allreduce_rmsnorm_quant(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    layernorm: torch.nn.Module,
+    quant_format: str,
+    emit_bf16: bool = False,
+    fuse_quant: bool = False,
+):
+    """Try an AITER fused AR+RMSNorm+quant epilogue.
+
+    Returns None when unsupported, so callers fall back to
+    forward_with_allreduce_fusion. New quant formats plug in here rather than as
+    branches inside LayerCommunicator.prepare_attn.
+
+    ``fuse_quant`` is opt-in per model: enable it only once the model's consumers
+    can ingest the quantized tuple. hidden_states comes back as
+    ``(quant, scale)``, or ``(bf16, quant, scale)`` under ``emit_bf16`` for
+    consumers that also need the unquantized bf16 (Qwen3.5 GDN ``in_proj_ba``).
+    """
+    if not fuse_quant:
+        return None
+
+    if not (_use_aiter and _is_gfx95_supported):
+        return None
+
+    if (
+        _enable_fused_ar_mxfp4_quant
+        and ("mxfp4" in quant_format)
+        and not get_bool_env_var("SGLANG_DISABLE_FUSED_AR_MXFP4_QUANT", "false")
+    ):
+        from sglang.srt.distributed.communication_op import (
+            tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant,
+        )
+
+        # GemmaRMSNorm normalizes with ``(1 + weight)``; it pre-folds this into
+        # ``gemma_weight``. Pass the folded weight so the fused kernel matches
+        # the eager norm (raw ``weight`` here silently corrupts the output).
+        norm_weight = getattr(layernorm, "gemma_weight", layernorm.weight)
+        quant_result = tensor_model_parallel_fused_allreduce_rmsnorm_mxfp4_quant(
+            hidden_states,
+            residual,
+            norm_weight,
+            layernorm.variance_epsilon,
+            emit_bf16=emit_bf16,
+        )
+        if quant_result is None:
+            return None
+
+        if emit_bf16:
+            (
+                hidden_states_fp4,
+                residual,
+                hidden_states_scale,
+                normed_hidden_states,
+            ) = quant_result
+            return (
+                (
+                    normed_hidden_states,
+                    hidden_states_fp4,
+                    hidden_states_scale,
+                ),
+                residual,
+            )
+
+        hidden_states_fp4, residual, hidden_states_scale = quant_result
+        return (
+            (hidden_states_fp4, hidden_states_scale),
+            residual,
+        )
+
+    # FP8 per-token fused AR+RMSNorm+quant. Engages when the consumer GEMM
+    # expects per-token (1xK) activation scales (SGLANG_USE_AITER_FP8_PER_TOKEN),
+    # e.g. a MXFP4-AttnFP8 model whose attention/GDN input projections are FP8.
+    # Shares the SGLANG_DISABLE_FUSED_AR_QUANT opt-out with the per-group path.
+    if (
+        quant_format == "fp8_per_token"
+        and hasattr(layernorm, "forward_with_allreduce_fusion_quant_per_token")
+        and not get_bool_env_var("SGLANG_DISABLE_FUSED_AR_QUANT", "false")
+    ):
+        return layernorm.forward_with_allreduce_fusion_quant_per_token(
+            hidden_states,
+            residual,
+            use_attn_tp_group=False,
+            keep_bf16=emit_bf16,
+        )
+
+    # Future hook: FP8 per-group fused AR+RMSNorm+quant can be added here and
+    # return the same (hidden_states, residual) contract.
+    return None
+
+
 if _use_aiter:
     from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
     from aiter.ops.rmsnorm import rmsnorm_quant as _aiter_rmsnorm_quant
@@ -510,6 +614,8 @@ class LayerCommunicator:
         captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_format: str = "",
+        emit_bf16: bool = False,
+        fuse_quant: bool = False,
     ):
         hidden_states, residual = self.prepare_attn(
             hidden_states,
@@ -517,6 +623,8 @@ class LayerCommunicator:
             forward_batch,
             quant_format=quant_format,
             post_residual_addition=post_residual_addition,
+            emit_bf16=emit_bf16,
+            fuse_quant=fuse_quant,
         )
         if captured_last_layer_outputs is not None:
             gathered_last_layer_output = self._communicate_simple_fn(
@@ -566,6 +674,8 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
+        emit_bf16: bool = False,
+        fuse_quant: bool = False,
     ):
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
@@ -584,18 +694,31 @@ class LayerCommunicator:
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
-                    quant_result = None
+                    quant_result = _try_fused_allreduce_rmsnorm_quant(
+                        hidden_states,
+                        residual,
+                        self.input_layernorm,
+                        quant_format,
+                        emit_bf16=emit_bf16,
+                        fuse_quant=fuse_quant,
+                    )
+                    # Else per-group FP8 fused path (opt-in via
+                    # enable_fused_ar_quant, #24651). Needs a positive per-group
+                    # FP8 signal (quant_format == "fp8"); an empty quant_format
+                    # means a bf16 consumer that must get a plain tensor, not a
+                    # (fp8, scale) tuple. "fp8_per_token"/"mxfp4" handled above.
                     if (
-                        self.enable_fused_ar_quant
+                        quant_result is None
+                        and quant_format == "fp8"
+                        and self.enable_fused_ar_quant
                         and _use_aiter
                         and hasattr(
                             self.input_layernorm,
                             "forward_with_allreduce_fusion_quant_per_group",
                         )
                     ):
-                        # Try fused AR+RMSNorm+per-group-quant. Internally
-                        # falls back to AR+RMSNorm + separate quant when the
-                        # fully-fused kernel cannot service the shape.
+                        # Internally falls back to AR+RMSNorm + separate quant
+                        # when the fully-fused kernel cannot service the shape.
                         quant_result = self.input_layernorm.forward_with_allreduce_fusion_quant_per_group(
                             hidden_states,
                             residual,
@@ -622,7 +745,11 @@ class LayerCommunicator:
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
                         hidden_states, *_, _ = fused_rms_mxfp4_quant(
                             hidden_states,
-                            self.input_layernorm.weight,
+                            getattr(
+                                self.input_layernorm,
+                                "gemma_weight",
+                                self.input_layernorm.weight,
+                            ),
                             self.input_layernorm.variance_epsilon,
                             None,
                             None,
@@ -637,7 +764,11 @@ class LayerCommunicator:
                         _dsa_needs_bf16 = get_attn_tp_context().is_dsa
                         hidden_states, _unq_bf16, _, _res = fused_rms_fp8_group_quant(
                             hidden_states,
-                            self.input_layernorm.weight,
+                            getattr(
+                                self.input_layernorm,
+                                "gemma_weight",
+                                self.input_layernorm.weight,
+                            ),
                             self.input_layernorm.variance_epsilon,
                             inp2=None,
                             inp2_weight=None,
@@ -659,10 +790,22 @@ class LayerCommunicator:
                                 _unq_bf16,
                             )
 
-                    elif _use_aiter and (quant_format == "fp8_per_token"):
+                    elif (
+                        _use_aiter
+                        and (quant_format == "fp8_per_token")
+                        and not emit_bf16
+                    ):
+                        # gemma_weight (weight + 1) makes the aiter rmsnorm match
+                        # GemmaRMSNorm; plain RMSNorm falls back to raw weight.
+                        # emit_bf16 (GDN in_proj_ba sidecar) is unsupported by
+                        # this 2-tuple fast path, so those layers use plain norm.
                         hidden_states = _fused_rmsnorm_fp8_per_token_quant(
                             hidden_states,
-                            self.input_layernorm.weight.data,
+                            getattr(
+                                self.input_layernorm,
+                                "gemma_weight",
+                                self.input_layernorm.weight.data,
+                            ),
                             self.input_layernorm.variance_epsilon,
                         )
 
@@ -672,7 +815,11 @@ class LayerCommunicator:
                     if _use_aiter and _is_gfx95_supported and ("mxfp4" in quant_format):
                         hidden_states, *_, residual = fused_rms_mxfp4_quant(
                             hidden_states,
-                            self.input_layernorm.weight,
+                            getattr(
+                                self.input_layernorm,
+                                "gemma_weight",
+                                self.input_layernorm.weight,
+                            ),
                             self.input_layernorm.variance_epsilon,
                             None,
                             None,
@@ -687,7 +834,11 @@ class LayerCommunicator:
                         hidden_states, _unq_bf16, _, residual = (
                             fused_rms_fp8_group_quant(
                                 hidden_states,
-                                self.input_layernorm.weight,
+                                getattr(
+                                    self.input_layernorm,
+                                    "gemma_weight",
+                                    self.input_layernorm.weight,
+                                ),
                                 self.input_layernorm.variance_epsilon,
                                 inp2=None,
                                 inp2_weight=None,
@@ -709,12 +860,23 @@ class LayerCommunicator:
                                 hidden_states[1],
                                 _unq_bf16,
                             )
-                    elif _use_aiter and (quant_format == "fp8_per_token"):
+                    elif (
+                        _use_aiter
+                        and (quant_format == "fp8_per_token")
+                        and not emit_bf16
+                    ):
+                        # See the residual-is-None branch above: gemma_weight for
+                        # Gemma norms, and ``emit_bf16`` layers (GDN bf16 sidecar)
+                        # fall through to the plain fused norm below.
                         if post_residual_addition is not None:
                             residual = residual + post_residual_addition
                         hidden_states, residual = _fused_rmsnorm_fp8_per_token_quant(
                             hidden_states,
-                            self.input_layernorm.weight.data,
+                            getattr(
+                                self.input_layernorm,
+                                "gemma_weight",
+                                self.input_layernorm.weight.data,
+                            ),
                             self.input_layernorm.variance_epsilon,
                             residual=residual,
                         )
