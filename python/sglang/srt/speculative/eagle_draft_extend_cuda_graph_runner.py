@@ -188,8 +188,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 (self.max_bs,), self.captured_req_width, dtype=torch.int32
             )
             select_index = (
-                torch.arange(self.max_bs, dtype=torch.int64)
-                * self.captured_req_width
+                torch.arange(self.max_bs, dtype=torch.int64) * self.captured_req_width
                 + self.captured_req_width
                 - 1
             )
