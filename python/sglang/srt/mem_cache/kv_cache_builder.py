@@ -45,6 +45,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 
 if TYPE_CHECKING:
@@ -74,7 +75,7 @@ def get_draft_kv_pool(
         return None
 
     # V2 workers nest the draft runner under `.draft_worker`.
-    if server_args.enable_multi_layer_eagle:
+    if get_spec().enable_multi_layer_eagle:
         draft_runner = draft_worker.draft_worker.draft_runner_list[0]
     else:
         draft_runner = draft_worker.draft_worker.draft_runner
