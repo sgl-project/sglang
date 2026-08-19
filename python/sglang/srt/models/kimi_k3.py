@@ -73,6 +73,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -106,6 +107,7 @@ from sglang.srt.models.kimi_k3_vl import (
 )
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     fill_transparent_bg,
@@ -141,12 +143,33 @@ def _cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-# MegaMoE SiTU sentinel: DeepGEMM 0.1.5.post1+ selects the K3 SiTU
-# activation when activation_clamp == 0.03125 (2^-5: exactly representable and
-# unused by any legitimate swiglu clamp; the host asserts clamp >= 0 so a
-# negative sentinel is impossible). beta=4.0 / linear_beta=25.0 are baked into
-# the DeepGEMM kernel.
-_K3_MEGA_SITU_SENTINEL_CLAMP = 0.03125
+def _uses_modelopt_fp8_pb_wo(
+    quant_config: Optional[QuantizationConfig], prefix: str
+) -> bool:
+    resolver = getattr(quant_config, "_resolve_quant_algo", None)
+    return resolver is not None and resolver(prefix) == "FP8_PB_WO"
+
+
+def _maybe_map_fp8_pb_scale_name(name: str, params_dict: dict) -> str:
+    """Map ModelOpt FP8_PB_WO scale keys to SGLang block-FP8 params."""
+    if name.endswith(".weight_scale"):
+        candidate = name.removesuffix(".weight_scale") + ".weight_scale_inv"
+        if candidate in params_dict:
+            return candidate
+    return name
+
+
+def _get_k3_dense_weight(module: nn.Module) -> torch.Tensor:
+    """Return a dense weight with serialized block-FP8 scales applied."""
+    weight = module.weight.data
+    if not hasattr(module, "weight_scale_inv"):
+        return weight
+    return block_quant_dequant(
+        weight,
+        module.weight_scale_inv,
+        module.quant_method.weight_block_size,
+        module.params_dtype,
+    )
 
 
 def _k3_bf16_gemm(
@@ -464,17 +487,17 @@ class KimiK3MoE(nn.Module):
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
-            # flashinfer_mxfp4 + situ consumes precomputed routing
-            # (PackedPrecomputed): keep the radix router in the TopK layer
-            # and hand its ids/weights to the MoE op. Other quantized paths
-            # keep the runner-resolved format (marlin -> standard anyway,
-            # bypassed only for the public logits-routing path).
+            # TRT-LLM cannot consume fused-front's row-strided router logits;
+            # keep K3's FP32 router and pass precomputed top-k instead.
             output_format=(
                 TopKOutputFormat.STANDARD
                 if quant_config is None
                 or (
                     config.hidden_act == "situ"
-                    and get_moe_runner_backend().is_flashinfer_mxfp4()
+                    and (
+                        get_moe_runner_backend().is_flashinfer_mxfp4()
+                        or get_moe_runner_backend().is_flashinfer_trtllm()
+                    )
                 )
                 # mega pre-dispatch consumes raw topk_ids/topk_weights
                 or get_moe_a2a_backend().is_megamoe()
@@ -487,9 +510,8 @@ class KimiK3MoE(nn.Module):
         # through it when enabled — the megamoe backend's non-mega fallback is
         # a StandardDispatcher without a2a, which is wrong for scattered
         # tokens — so SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK must
-        # cover the per-rank prefill chunk. SiTU is selected inside the
-        # DeepGEMM mega kernel via a sentinel activation_clamp with the K3
-        # constants baked in.
+        # cover the per-rank prefill chunk. The DeepGEMM MegaMoE SiTU kernel
+        # bakes in the K3 activation constants.
         self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
         self._mega_intermediate_size = moe_intermediate_size
         self._mega_top_k = config.num_experts_per_token
@@ -499,7 +521,7 @@ class KimiK3MoE(nn.Module):
                 config.activation_situ_beta,
                 config.activation_situ_linear_beta,
             ) == (4.0, 25.0), (
-                "mega SiTU kernel patch bakes beta=4.0/linear_beta=25.0; "
+                "MegaMoE SiTU kernel bakes beta=4.0/linear_beta=25.0; "
                 "got a checkpoint with different constants"
             )
 
@@ -802,10 +824,7 @@ class KimiK3MoE(nn.Module):
             self.experts.mega_l2_weights,
             buf,
             recipe=(1, 1, 32),
-            activation="swiglu",
-            # Sentinel: selects the K3 SiTU branch in the DeepGEMM mega kernel
-            # (beta=4.0 / linear_beta=25.0 baked in).
-            activation_clamp=_K3_MEGA_SITU_SENTINEL_CLAMP,
+            activation="situ",
             fast_math=True,
         )
         y = y[:num_tokens]
@@ -1396,11 +1415,12 @@ class KimiK3DeltaAttention(nn.Module):
         self.use_full_rank_gate = config.linear_attn_config.get(
             "use_full_rank_gate", False
         )
+        self._bfa_uses_block_fp8 = self.use_full_rank_gate and _uses_modelopt_fp8_pb_wo(
+            quant_config, f"{prefix}.b_proj"
+        )
 
         # The fused path hardcodes tp_size sharding, so require attn_tp == tp.
-        # For the full-rank gate (K3) the checkpoint quantizes only the MoE
-        # experts; attention linears resolve to UnquantizedLinearMethod, so a
-        # non-None quant_config is fine for the merged projection.
+        # Full-rank K3 also fuses mixed block-FP8 attention projections.
         self.do_fuse_qkvbfg = self.attn_tp_size == self.tp_size and (
             quant_config is None or self.use_full_rank_gate
         )
@@ -1436,6 +1456,8 @@ class KimiK3DeltaAttention(nn.Module):
                 tp_rank=self.attn_tp_rank,
                 tp_size=self.attn_tp_size,
                 prefix=f"{prefix}.b_proj",
+                # TP8 shards K3's 96 beta rows below the 128-row FP8 block.
+                skip_block_quant_check=self._bfa_uses_block_fp8,
             )
             self.f_a_proj = ReplicatedLinear(
                 self.hidden_size,
@@ -1456,6 +1478,7 @@ class KimiK3DeltaAttention(nn.Module):
             # Merged [f_a | b] weight, built after weight loading by
             # _merge_bfa_weights().
             self._bfa_w: Optional[torch.Tensor] = None
+            self._bfa_f_b_w: Optional[torch.Tensor] = None
         elif self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -1672,15 +1695,24 @@ class KimiK3DeltaAttention(nn.Module):
         and the width is padded to a multiple of 8 so every fused-output row
         stays 16-byte aligned for vectorized consumers (tiny-GEMM on f_b).
 
-        Called once from load_weights (after all weights are loaded, before
-        cuda graph capture)."""
+        Called once after weight loading. Block-FP8 inputs are dequantized into
+        the BF16 tiny-GEMM buffers here."""
         if not self.use_full_rank_gate:
             return
         if _is_npu:
             return
-        self._bfa_w, sizes = _merge_weights_as_views(
-            [self.f_a_proj, self.b_proj], pad_rows_to=8
-        )
+        mods = [self.f_a_proj, self.b_proj]
+        if self._bfa_uses_block_fp8:
+            weights = [_get_k3_dense_weight(mod) for mod in mods]
+            sizes = [weight.shape[0] for weight in weights]
+            pad = (-sum(sizes)) % 8
+            if pad:
+                weights.append(weights[0].new_zeros((pad, weights[0].shape[1])))
+            self._bfa_w = torch.cat(weights, dim=0).contiguous()
+            self._bfa_f_b_w = _get_k3_dense_weight(self.f_b_proj).contiguous()
+        else:
+            self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
+            self._bfa_f_b_w = self.f_b_proj.weight
         self._bfa_fa_size, self._bfa_b_size = sizes
 
     def _prepare_fused_decode(self) -> None:
@@ -1759,7 +1791,7 @@ class KimiK3DeltaAttention(nn.Module):
                     alt.wait_stream(cur)
                     with torch.cuda.stream(alt):
                         bfa = gemm(hidden_states, w)
-                        forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
+                        forget_gate = gemm(bfa[..., :n_fa], self._bfa_f_b_w)
                         beta = bfa[..., n_fa : n_fa + n_b]
                     fused_states, _ = self.fused_qkvg_proj(hidden_states)
                     qkv, g_proj_states = torch.split(
@@ -1771,7 +1803,7 @@ class KimiK3DeltaAttention(nn.Module):
                 fused_states, _ = self.fused_qkvg_proj(hidden_states)
                 qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
                 bfa = gemm(hidden_states, w)
-                forget_gate = gemm(bfa[..., :n_fa], self.f_b_proj.weight)
+                forget_gate = gemm(bfa[..., :n_fa], self._bfa_f_b_w)
                 beta = bfa[..., n_fa : n_fa + n_b]
             else:
                 fused_states, _ = self.fused_qkvg_proj(hidden_states)
@@ -2894,6 +2926,8 @@ class KimiK3LinearForCausalLM(nn.Module):
         for args in weights:
             name, loaded_weight = args[:2]
             kwargs = args[2] if len(args) > 2 else {}
+            if name.endswith(".weight_scale") and loaded_weight.ndim == 4:
+                loaded_weight = loaded_weight[:, 0, :, 0]
 
             layer_id = get_layer_id(name)
             if layer_id is not None and (
@@ -2915,13 +2949,20 @@ class KimiK3LinearForCausalLM(nn.Module):
 
             # MLA: fuse q_a_proj + kv_a_proj_with_mqa → fused_qkv_a_proj_with_mqa
             if ".q_a_proj." in name or ".kv_a_proj_with_mqa." in name:
+                is_q_a = ".q_a_proj." in name
                 fused_name = name.replace(".q_a_proj.", ".fused_qkv_a_proj_with_mqa.")
                 fused_name = fused_name.replace(
                     ".kv_a_proj_with_mqa.", ".fused_qkv_a_proj_with_mqa."
                 )
+                fused_name = _maybe_map_fp8_pb_scale_name(fused_name, params_dict)
                 if fused_name in params_dict:
                     param = params_dict[fused_name]
-                    if ".q_a_proj." in name:
+                    if fused_name.endswith(".weight_scale_inv"):
+                        offset = 0 if is_q_a else _cdiv(self.config.q_lora_rank, 128)
+                        param.data[offset : offset + loaded_weight.shape[0]].copy_(
+                            loaded_weight
+                        )
+                    elif is_q_a:
                         param.data[: loaded_weight.shape[0]].copy_(loaded_weight)
                     else:
                         q_lora_rank = self.config.q_lora_rank or 0
@@ -2958,6 +2999,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 name = name.replace(weight_name, param_name)
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                name = _maybe_map_fp8_pb_scale_name(name, params_dict)
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -2994,13 +3036,18 @@ class KimiK3LinearForCausalLM(nn.Module):
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None:
                         continue
+                    name = _maybe_map_fp8_pb_scale_name(name, params_dict)
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight, **kwargs)
+                    if name.endswith(".b_proj.weight_scale_inv"):
+                        # All TP ranks share K3's single beta output-scale block.
+                        param.data.copy_(loaded_weight)
+                    else:
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight, **kwargs)
             loaded_params.add(name)
 
         self.post_load_weights()
@@ -3018,7 +3065,8 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer, PPMissingLayer):
                 continue
             self_attn = layer.self_attn
-            w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
+            kv_b_weight = _get_k3_dense_weight(self_attn.kv_b_proj)
+            w_kc, w_vc = kv_b_weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
@@ -3076,7 +3124,7 @@ class KimiK3LinearForCausalLM(nn.Module):
 
             if precompile_k3_recompute_w_u_kernel(
                 num_heads=layer.self_attn.local_num_heads,
-                dtype=layer.self_attn.o_proj.weight.dtype,
+                dtype=layer.self_attn.o_proj.params_dtype,
                 device=layer.self_attn.dt_bias.device,
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
@@ -3087,6 +3135,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
     supports_cuda_vmm_feature_transport = True
+    encoder_media_processor_config = EncoderMediaProcessorConfig(
+        image_decode_mode="nvjpeg_fancy",
+        preserve_media_metadata=True,
+    )
 
     # Raw HF checkpoint prefixes, before hf_to_sglang_mapper is applied.
     encoder_only_safetensors_weight_prefixes = (
@@ -3271,49 +3323,79 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 for item in selected_items
             ]
             if any(config is not None for config in deferred):
-                if not all(config is not None for config in deferred):
-                    raise ValueError(
-                        "Kimi-K3 cannot mix deferred and preprocessed image features"
-                    )
-                first_config = deferred[0]
-                backend = first_config["backend"]
-                if any(config["backend"] != backend for config in deferred):
-                    raise ValueError(
-                        "Kimi-K3 cannot mix deferred preprocessing backends"
-                    )
-                if backend == "gpu":
-                    from sglang.srt.multimodal.processors.kimi_k25 import (
-                        _gpu_preprocess_images,
-                    )
+                materialized = [None] * len(selected_items)
+                deferred_by_backend = {}
+                for index, (item, config) in enumerate(zip(selected_items, deferred)):
+                    if config is None:
+                        if not isinstance(item.feature, torch.Tensor):
+                            raise TypeError(
+                                "Kimi-K3 image feature must be a torch.Tensor, "
+                                f"got {type(item.feature)}"
+                            )
+                        materialized[index] = item.feature
+                    else:
+                        deferred_by_backend.setdefault(config.backend, []).append(index)
 
-                    image_scale, image_bias = normalization_tensors(
-                        first_config["image_mean"], first_config["image_std"], device
-                    )
-                    pixel_values, _ = _gpu_preprocess_images(
-                        [item.feature for item in selected_items],
-                        [config["resize_config"] for config in deferred],
-                        image_scale,
-                        image_bias,
-                        self.vision_tower.patch_size,
-                        to_chw=lambda image: to_chw_uint8(image, device=device),
-                        post_resize=lambda x: fill_transparent_bg(
-                            x, first_config["transparent_bg_config"]
-                        ),
-                    )
-                elif backend == "cpu":
-                    from sglang.srt.multimodal.kimi_k3_image_processing import (
-                        materialize_kimi_k3_cpu_features,
-                    )
+                for backend, indices in deferred_by_backend.items():
+                    group_items = [selected_items[index] for index in indices]
+                    group_configs = [deferred[index] for index in indices]
+                    first_config = group_configs[0]
+                    if backend == "gpu":
+                        from sglang.srt.multimodal.processors.kimi_k25 import (
+                            _gpu_preprocess_images,
+                        )
 
-                    pixel_values = materialize_kimi_k3_cpu_features(
-                        selected_items, self._encoder_image_processor
-                    )
-                    pixel_values = pixel_values.to(device, non_blocking=True)
-                else:
-                    raise ValueError(
-                        f"Unsupported Kimi-K3 deferred preprocessing backend: {backend}"
-                    )
-                return pixel_values.to(dtype=target_dtype)
+                        image_scale, image_bias = normalization_tensors(
+                            first_config.image_mean,
+                            first_config.image_std,
+                            device,
+                        )
+                        pixel_values, produced_grids = _gpu_preprocess_images(
+                            [item.feature for item in group_items],
+                            [config.resize_config for config in group_configs],
+                            image_scale,
+                            image_bias,
+                            self.vision_tower.patch_size,
+                            to_chw=lambda image: to_chw_uint8(image, device=device),
+                            post_resize=lambda x: fill_transparent_bg(
+                                x, first_config.transparent_bg_config
+                            ),
+                        )
+                        expected_grids = grid_thws_host[indices]
+                        if not torch.equal(produced_grids.cpu(), expected_grids):
+                            raise ValueError(
+                                "Kimi-K3 deferred GPU preprocessing produced wrong grids"
+                            )
+                    elif backend == "cpu":
+                        from sglang.srt.multimodal.kimi_k3_image_processing import (
+                            materialize_kimi_k3_cpu_features,
+                        )
+
+                        pixel_values = materialize_kimi_k3_cpu_features(
+                            group_items, self._encoder_image_processor
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unsupported Kimi-K3 deferred preprocessing backend: {backend}"
+                        )
+
+                    patch_counts = [
+                        int(grid_thws_host[index].prod().item()) for index in indices
+                    ]
+                    if sum(patch_counts) != pixel_values.shape[0]:
+                        raise ValueError(
+                            "Kimi-K3 deferred feature length does not match image grids"
+                        )
+                    for index, feature in zip(
+                        indices, pixel_values.split(patch_counts), strict=True
+                    ):
+                        materialized[index] = feature
+
+                return materialize_multimodal_features(
+                    materialized,
+                    device=device,
+                    dtype=target_dtype,
+                )
 
             features = []
             for item in selected_items:

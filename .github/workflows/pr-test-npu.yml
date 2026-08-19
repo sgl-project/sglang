@@ -194,7 +194,7 @@ jobs:
           bash scripts/ci/npu/npu_ci_install_dependency.sh a3
           # copy required file from our daily cache
           cp ~/.cache/modelscope/hub/datasets/otavia/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json /tmp
-          # copy gsm8k dataset
+          # copy gsm8k dataset from cache
           cp ~/.cache/modelscope/hub/datasets/tmp/test.jsonl /tmp
 
       - name: Run test
