@@ -79,7 +79,13 @@ def argmax_and_softmax_prob(
     row_max_col = row_max.unsqueeze(1)
     denom: Optional[torch.Tensor] = None
     for start in range(0, full_logits_2d.shape[1], vocab_chunk):
-        shifted = full_logits_2d[:, start : start + vocab_chunk] - row_max_col
+        # Subtract and exponentiate in fp32. In the input dtype, exp() rounds
+        # every term before the fp32 sum sees it, and bf16's 8-bit mantissa is
+        # coarse enough for that to move `prob` across a strict threshold. The
+        # fp32 transient stays [rows, vocab_chunk] -- bounded by the chunk, not
+        # the vocab -- so this does not reintroduce the full-width copy.
+        shifted = full_logits_2d[:, start : start + vocab_chunk].to(torch.float32)
+        shifted.sub_(row_max_col)
         shifted.exp_()
         part = shifted.sum(dim=-1, dtype=torch.float32)
         denom = part if denom is None else denom + part

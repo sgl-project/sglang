@@ -19,6 +19,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -95,26 +96,58 @@ class TestArgmaxAndSoftmaxProb(CustomTestCase):
         self.assertTrue(torch.equal(ids, torch.argmax(logits, dim=-1)))
         self.assertEqual(((prob > 0.5) != (want_prob > 0.5)).sum().item(), 0)
 
+    def test_bf16_input_decides_the_threshold_correctly_at_the_boundary(self):
+        # Randomly drawn logits almost never land near 0.5, so the threshold
+        # check above cannot see rounding. Build rows whose top two logits are
+        # nearly tied, which puts the argmax probability just above 0.5, and
+        # require every decision to match the exact fp32 answer. Exponentiating
+        # in bf16 instead of fp32 gets ~4% of these rows wrong.
+        rows, vocab = 512, 8192
+        logits = torch.full((rows, vocab), -30.0)
+        logits[:, 0] = 0.0
+        logits[:, 1] = torch.linspace(-0.05, 0.05, rows)
+        bf16 = logits.bfloat16()
+
+        _, want_prob = _reference(bf16.float())
+        self.assertTrue(0.5 < want_prob.max() < 0.52, want_prob.max())
+
+        _, prob = argmax_and_softmax_prob(bf16, vocab_chunk=4096)
+        self.assertEqual(((prob > 0.5) != (want_prob > 0.5)).sum().item(), 0)
+
     def test_lm_head_dtype_input_never_materializes_a_full_width_fp32(self):
         # This is the memory claim, and it must hold without the fused kernel --
         # that is the whole reason the caller may hand over lm_head-dtype logits
-        # before a kernel package ships. Route a bf16 [rows, vocab] through the
-        # portable path and assert no allocation is as wide as the input: the
-        # chunked reduction's transients are [rows, vocab_chunk].
+        # before a kernel package ships. Intercept every op so the assertion
+        # does not depend on which allocating API the implementation happens to
+        # call: the chunked reduction's fp32 transients must stay
+        # [rows, vocab_chunk], never [rows, vocab].
         rows, vocab, chunk = 8, 4096, 1024
         logits = self._logits(rows, vocab, dtype=torch.bfloat16)
-        widths = []
-        real_empty, real_exp = torch.empty_like, torch.Tensor.exp_
 
-        def record(t, *a, **kw):
-            widths.append(t.shape[-1] if t.dim() == 2 else 0)
-            return real_empty(t, *a, **kw)
+        class _RecordFp32Widths(TorchDispatchMode):
+            def __init__(self):
+                self.widths = []
 
-        with patch("torch.empty_like", record):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                out = func(*args, **(kwargs or {}))
+                for t in out if isinstance(out, (list, tuple)) else [out]:
+                    if (
+                        isinstance(t, torch.Tensor)
+                        and t.dim() == 2
+                        and t.dtype == torch.float32
+                    ):
+                        self.widths.append(t.shape[-1])
+                return out
+
+        tracker = _RecordFp32Widths()
+        with tracker:
             ids, prob = argmax_and_softmax_prob(logits, vocab_chunk=chunk)
 
         self.assertEqual(prob.shape, (rows,))
-        self.assertTrue(all(w <= chunk for w in widths), widths)
+        # The path must produce fp32 work (that is the precision fix) but never
+        # a full-width copy; an empty list would mean the tracker saw nothing.
+        self.assertTrue(tracker.widths, "no fp32 2-D tensors observed")
+        self.assertLessEqual(max(tracker.widths), chunk, tracker.widths)
 
 
 if __name__ == "__main__":
