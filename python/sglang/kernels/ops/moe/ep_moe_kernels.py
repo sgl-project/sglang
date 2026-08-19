@@ -1584,9 +1584,7 @@ def moe_ep_deepgemm_preprocess(
     # scale afterward can change the represented activation by up to 2x.
     from sglang.srt.layers import deep_gemm_wrapper
 
-    if is_fp8 and (
-        use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_PACKED_SCALES
-    ):
+    if is_fp8 and (use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_PACKED_SCALES):
         from sglang.kernels.ops.quantization.minimax_quant_ue8m0 import (
             per_token_quant_fp8_ue8m0_scatter,
         )

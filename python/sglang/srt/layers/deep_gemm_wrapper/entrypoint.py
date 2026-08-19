@@ -85,9 +85,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
         from flashinfer.gemm import batch_deepgemm_fp8_nt_groupwise
 
         flashinfer_backend = (
-            "deepgemm"
-            if DEEPGEMM_MASKED_FP8_BACKEND == "flashinfer"
-            else "cake"
+            "deepgemm" if DEEPGEMM_MASKED_FP8_BACKEND == "flashinfer" else "cake"
         )
         lhs_scale = _unpack_packed_ue8m0_scale(lhs[1], collapse_mn=False)
         rhs_scale = getattr(rhs[1], "_batch_deepgemm_fp8_scale", None)
@@ -181,8 +179,10 @@ def _unpack_packed_ue8m0_scale(
             "batch DeepGEMM FP8 expects packed UE8M0 scales with dtype "
             f"int32 and rank 3, got dtype={scale.dtype}, shape={scale.shape}"
         )
-    exponents = scale.contiguous().view(torch.uint8).reshape(
-        *scale.shape[:-1], scale.shape[-1] * 4
+    exponents = (
+        scale.contiguous()
+        .view(torch.uint8)
+        .reshape(*scale.shape[:-1], scale.shape[-1] * 4)
     )
     unpacked = (exponents.to(torch.int32) << 23).view(torch.float32)
     if collapse_mn:

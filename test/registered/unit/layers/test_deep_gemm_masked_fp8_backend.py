@@ -139,9 +139,7 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
         ).reshape(1, 1, 8)
         packed = exponents.view(torch.int32)
 
-        unpacked = entrypoint._unpack_packed_ue8m0_scale(
-            packed, collapse_mn=False
-        )
+        unpacked = entrypoint._unpack_packed_ue8m0_scale(packed, collapse_mn=False)
 
         expected = (exponents.to(torch.int32) << 23).view(torch.float32)
         torch.testing.assert_close(unpacked, expected, rtol=0, atol=0)
@@ -154,9 +152,7 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
         exponents = torch.cat((first.repeat(128, 1), second.repeat(128, 1)), dim=0)
         packed = exponents.reshape(1, 256, 4).view(torch.int32)
 
-        unpacked = entrypoint._unpack_packed_ue8m0_scale(
-            packed, collapse_mn=True
-        )
+        unpacked = entrypoint._unpack_packed_ue8m0_scale(packed, collapse_mn=True)
 
         expected_exp = torch.stack((first, second)).reshape(1, 2, 4)
         expected = (expected_exp.to(torch.int32) << 23).view(torch.float32)
@@ -183,9 +179,7 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
                 "DEEPGEMM_MASKED_FP8_BACKEND",
                 "cake",
             ),
-            deep_gemm_runner.envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override(
-                "compact"
-            ),
+            deep_gemm_runner.envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override("compact"),
         ):
             with self.assertRaisesRegex(ValueError, "require.*masked"):
                 deep_gemm_runner._should_use_masked_standard_layout(None, None, None)
