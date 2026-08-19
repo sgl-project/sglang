@@ -95,6 +95,7 @@ class PrefillDelayer:
         if self._max_delay_ms is None:
             self._max_delay_ms = 5000.0
         self._queue_trigger_enabled = self._queue_min_ratio is not None
+        self._prefill_max_requests = server_args.prefill_max_requests
         logger.info(
             f"PrefillDelayer initialized with "
             f"max_delay_passes={self._max_delay_passes} "
@@ -250,9 +251,14 @@ class PrefillDelayer:
             # and fragment prefill into many tiny batches.
             queue_condition = False
             if self._queue_trigger_enabled and global_running_batch_max > 0:
+                queue_capacity = (
+                    self._prefill_max_requests
+                    if self._prefill_max_requests is not None
+                    else global_max_prefill_bs_max
+                )
                 queue_min_effective = min(
                     int(global_running_batch_max * self._queue_min_ratio),
-                    global_max_prefill_bs_max,
+                    queue_capacity,
                 )
                 queue_condition = (
                     queue_min_effective > 0
