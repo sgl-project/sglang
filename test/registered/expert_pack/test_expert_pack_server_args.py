@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -167,6 +168,68 @@ class TestExpertPackServerArgs(unittest.TestCase):
         self.assertEqual(args.model_loader_extra_config["pack_path"], str(pack))
         self.assertEqual(args.model_loader_extra_config["manifest_path"], str(manifest))
         self.assertEqual(args.model_loader_extra_config["read_splits"], 1)
+
+    def test_raw_deepseek_gguf_is_prepared_inside_server_startup(self):
+        with tempfile.TemporaryDirectory() as value:
+            root = Path(value)
+            gguf = root / "DeepSeek-V4-Flash.gguf"
+            gguf.write_bytes(b"gguf")
+            artifact_dir = root / "artifact"
+            model_dir = artifact_dir / "model-meta"
+            model_dir.mkdir(parents=True)
+            config = model_dir / "config.json"
+            config.write_text("{}\n", encoding="utf-8")
+            pack = root / "DeepSeek-V4-Flash.expert-pack"
+            pack.write_bytes(b"pack")
+            manifest = root / "DeepSeek-V4-Flash.expert-pack.manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "complete": True,
+                        "source": {"sha256": "1" * 64},
+                        "model": {
+                            "model_identity_sha256": "2" * 64,
+                            "config_sha256": "3" * 64,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            args = ServerArgs(model_path="dummy")
+            args.model_path = str(gguf)
+            args.tokenizer_path = str(gguf)
+            args.load_format = "expert_pack"
+            args.model_loader_extra_config = {"read_splits": 2}
+            args.model_config = SimpleNamespace(
+                hf_config=SimpleNamespace(model_type="deepseek_v4")
+            )
+
+            with (
+                patch(
+                    "sglang.srt.model_loader.expert_pack_runtime."
+                    "_deepseek_artifact_dir_for_source",
+                    return_value=artifact_dir,
+                ),
+                patch(
+                    "sglang.srt.model_loader.expert_pack_runtime."
+                    "_prepare_deepseek_model_metadata",
+                    return_value=config,
+                ),
+                patch(
+                    "sglang.srt.model_loader.expert_pack_runtime."
+                    "_prepare_deepseek_pack",
+                    return_value=(pack, manifest),
+                ),
+            ):
+                args._handle_expert_pack()
+
+        self.assertEqual(args.model_path, str(model_dir))
+        self.assertEqual(args.tokenizer_path, str(model_dir))
+        self.assertEqual(args.model_loader_extra_config["pack_path"], str(pack))
+        self.assertEqual(args.model_loader_extra_config["manifest_path"], str(manifest))
+        self.assertEqual(args.model_loader_extra_config["source_path"], str(gguf))
+        self.assertEqual(args.model_loader_extra_config["read_splits"], 2)
 
 
 if __name__ == "__main__":

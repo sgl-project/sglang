@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Benchmark an existing DeepSeek V4 Flash Expert Pack on one RTX 5090."""
+"""Run a one-shot DeepSeek V4 Flash expert-pack benchmark on one RTX 5090."""
 
 from __future__ import annotations
 
 import argparse
 import fcntl
 import hashlib
-import importlib.metadata
 import json
 import os
 import signal
@@ -20,9 +19,8 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_PROMPT = "Please introduce Shenzhen"
-DEFAULT_WARMUP_PROMPT = "Briefly explain why the sky appears blue."
-CHAT_PREFIX = "<｜begin▁of▁sentence｜>You are a helpful assistant.<｜User｜>"
-CHAT_SUFFIX = "<｜Assistant｜><think>"
+CHAT_PREFIX = "<\uff5cbegin\u2581of\u2581sentence\uff5c>You are a helpful assistant.<\uff5cUser\uff5c>"
+CHAT_SUFFIX = "<\uff5cAssistant\uff5c><think>"
 DEFAULT_LOCK = Path("/tmp/sglang-deepseek-v4-5090-benchmark.lock")
 METADATA_FORMAT_VERSION = 4
 ACTIVE_MOE_LAYERS = tuple(range(43))
@@ -32,30 +30,24 @@ def cache_root() -> Path:
     return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")).expanduser()
 
 
-def source_fingerprint(path: Path) -> str:
+def artifact_dir_for_source(path: Path) -> Path:
     stat = path.stat()
-    return hashlib.sha256(
+    fingerprint = hashlib.sha256(
         f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:{METADATA_FORMAT_VERSION}".encode()
     ).hexdigest()[:20]
-
-
-def artifact_dir_for_source(path: Path) -> Path:
-    return (
-        cache_root()
-        / "sglang-expert-pack"
-        / "deepseek-v4-flash"
-        / source_fingerprint(path)
-    )
+    return cache_root() / "sglang-expert-pack" / "deepseek-v4-flash" / fingerprint
 
 
 def find_sglang_repo() -> Path:
-    configured = os.getenv("SGLANG_REPO")
+    configured = os.environ.get("SGLANG_REPO")
     if configured:
         return Path(configured).expanduser().resolve()
     for candidate in (SCRIPT_DIR, *SCRIPT_DIR.parents):
-        if (candidate / "python" / "sglang").is_dir():
+        if (candidate / "python" / "sglang").is_dir() and (
+            candidate / "tools" / "expert_pack"
+        ).is_dir():
             return candidate
-    raise RuntimeError("cannot locate the SGLang checkout; set SGLANG_REPO")
+    raise RuntimeError("could not locate the SGLang repository")
 
 
 def format_prompt(prompt: str) -> str:
@@ -87,353 +79,33 @@ def detect_rtx_5090() -> str:
         None,
     )
     if gpu_zero is None or "5090" not in gpu_zero:
-        detected = ", ".join(rows) if rows else "none"
-        raise RuntimeError(f"CUDA device 0 must be an RTX 5090; detected: {detected}")
+        raise RuntimeError(
+            f"CUDA device 0 must be an RTX 5090; detected: {', '.join(rows) or 'none'}"
+        )
     return gpu_zero
 
 
-def _digest(value: Any, field: str) -> str:
-    digest = str(value or "").lower()
-    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
-        raise ValueError(f"manifest {field} is not a SHA-256 digest")
-    return digest
-
-
-def _sha256(path: Path, chunk_bytes: int = 32 * 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb", buffering=0) as stream:
-        while chunk := stream.read(chunk_bytes):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _gguf_value(reader: object, name: str) -> object:
-    fields = getattr(reader, "fields")
-    if name not in fields:
-        raise ValueError(f"GGUF metadata is missing required field: {name}")
-    return fields[name].contents()
-
-
-def _model_config_from_gguf(reader: object) -> dict[str, Any]:
-    value = lambda name: _gguf_value(reader, f"deepseek4.{name}")
-    architecture = _gguf_value(reader, "general.architecture")
-    if architecture != "deepseek4":
-        raise ValueError(f"expected GGUF architecture deepseek4, got {architecture!r}")
-    if int(value("expert_gating_func")) != 4:
-        raise ValueError("unsupported deepseek4.expert_gating_func; expected 4")
-    swiglu_limits = [float(item) for item in value("swiglu_clamp_exp")]
-    if not swiglu_limits or any(item != swiglu_limits[0] for item in swiglu_limits):
-        raise ValueError("deepseek4.swiglu_clamp_exp must be constant")
-    tokens = _gguf_value(reader, "tokenizer.ggml.tokens")
-    return {
-        "architectures": ["DeepseekV4ForCausalLM"],
-        "attention_bias": False,
-        "attention_dropout": 0.0,
-        "bos_token_id": int(_gguf_value(reader, "tokenizer.ggml.bos_token_id")),
-        "eos_token_id": int(_gguf_value(reader, "tokenizer.ggml.eos_token_id")),
-        "expert_dtype": "fp4",
-        "hc_eps": float(value("hyper_connection.epsilon")),
-        "hc_mult": int(value("hyper_connection.count")),
-        "hc_sinkhorn_iters": int(value("hyper_connection.sinkhorn_iterations")),
-        "head_dim": int(value("attention.key_length")),
-        "hidden_act": "silu",
-        "hidden_size": int(value("embedding_length")),
-        "index_head_dim": int(value("attention.indexer.key_length")),
-        "index_n_heads": int(value("attention.indexer.head_count")),
-        "index_topk": int(value("attention.indexer.top_k")),
-        "initializer_range": 0.02,
-        "max_position_embeddings": int(value("context_length")),
-        "model_type": "deepseek_v4",
-        "moe_intermediate_size": int(value("expert_feed_forward_length")),
-        "n_routed_experts": int(value("expert_count")),
-        "n_shared_experts": int(value("expert_shared_count")),
-        "norm_topk_prob": bool(value("expert_weights_norm")),
-        "num_attention_heads": int(value("attention.head_count")),
-        "num_experts_per_tok": int(value("expert_used_count")),
-        "num_hidden_layers": int(value("block_count")),
-        "num_hash_layers": int(value("hash_layer_count")),
-        "num_key_value_heads": int(value("attention.head_count_kv")),
-        "num_nextn_predict_layers": 1,
-        "o_groups": int(value("attention.output_group_count")),
-        "o_lora_rank": int(value("attention.output_lora_rank")),
-        "q_lora_rank": int(value("attention.q_lora_rank")),
-        "qk_rope_head_dim": int(value("rope.dimension_count")),
-        "quantization_config": {
-            "activation_scheme": "dynamic",
-            "fmt": "e4m3",
-            "quant_method": "fp8",
-            "scale_fmt": "ue8m0",
-            "weight_block_size": [128, 128],
-        },
-        "rms_norm_eps": float(value("attention.layer_norm_rms_epsilon")),
-        "rope_scaling": {
-            "beta_fast": float(value("rope.scaling.yarn_beta_fast")),
-            "beta_slow": float(value("rope.scaling.yarn_beta_slow")),
-            "factor": float(value("rope.scaling.factor")),
-            "original_max_position_embeddings": int(
-                value("rope.scaling.original_context_length")
-            ),
-            "type": str(value("rope.scaling.type")),
-        },
-        "rope_theta": float(value("rope.freq_base")),
-        "routed_scaling_factor": float(value("expert_weights_scale")),
-        "scoring_func": "sqrtsoftplus",
-        "sliding_window": int(value("attention.sliding_window")),
-        "swiglu_limit": swiglu_limits[0],
-        "tie_word_embeddings": False,
-        "topk_method": "noaux_tc",
-        "torch_dtype": "bfloat16",
-        "transformers_version": importlib.metadata.version("transformers"),
-        "use_cache": True,
-        "vocab_size": len(tokens),
-        "compress_rope_theta": float(value("attention.compress_rope_freq_base")),
-        "compress_ratios": [int(item) for item in value("attention.compress_ratios")],
+def build_server_command(args: argparse.Namespace) -> list[str]:
+    extra_config = {
+        "cache_vram_mib": args.expert_cache_mib,
+        "cache_vram_reserve_mib": args.expert_cache_reserve_mib,
+        "stage_slots": args.stage_slots,
+        "read_splits": args.read_splits,
+        "direct_io": args.direct_io,
+        "stats_flush_interval": len(ACTIVE_MOE_LAYERS),
+        "stats_path": str(args.stats_path),
     }
-
-
-def _write_tokenizer_from_gguf(
-    reader: object, output_dir: Path, config: dict[str, Any]
-) -> None:
-    from tokenizers import AddedToken, Regex, normalizers, pre_tokenizers
-    from transformers.integrations.ggml import convert_gguf_tokenizer
-
-    tokenizer_type = _gguf_value(reader, "tokenizer.ggml.model")
-    pre_tokenizer_type = _gguf_value(reader, "tokenizer.ggml.pre")
-    if tokenizer_type != "gpt2" or pre_tokenizer_type != "joyai-llm":
-        raise ValueError(
-            f"unsupported GGUF tokenizer: model={tokenizer_type!r} pre={pre_tokenizer_type!r}"
-        )
-    tokens = list(_gguf_value(reader, "tokenizer.ggml.tokens"))
-    token_types = list(_gguf_value(reader, "tokenizer.ggml.token_type"))
-    tokenizer_data = {
-        "tokenizer_type": tokenizer_type,
-        "tokens": tokens,
-        "token_type": token_types,
-        "merges": list(_gguf_value(reader, "tokenizer.ggml.merges")),
-        "bos_token_id": config["bos_token_id"],
-        "eos_token_id": config["eos_token_id"],
-        "pad_token_id": int(_gguf_value(reader, "tokenizer.ggml.padding_token_id")),
-    }
-    tokenizer, _ = convert_gguf_tokenizer("gpt2", tokenizer_data)
-    tokenizer.add_special_tokens(
-        [
-            AddedToken(token, normalized=False, special=True)
-            for token, token_type in zip(tokens, token_types)
-            if token_type in (3, 4)
-        ]
-    )
-    tokenizer.normalizer = normalizers.Sequence([])
-    tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
-        [
-            pre_tokenizers.Split(Regex(r"\p{N}{1,3}"), behavior="isolated"),
-            pre_tokenizers.Split(
-                Regex(r"[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+"),
-                behavior="isolated",
-            ),
-            pre_tokenizers.Split(
-                Regex(
-                    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|"
-                    r"[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+|"
-                    r" ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
-                ),
-                behavior="isolated",
-            ),
-            pre_tokenizers.ByteLevel(
-                add_prefix_space=False, trim_offsets=True, use_regex=False
-            ),
-        ]
-    )
-    tokenizer.save(str(output_dir / "tokenizer.json"))
-    token = lambda token_id: {
-        "__type": "AddedToken",
-        "content": tokens[token_id],
-        "lstrip": False,
-        "normalized": False,
-        "rstrip": False,
-        "single_word": False,
-    }
-    tokenizer_config = {
-        "add_bos_token": bool(_gguf_value(reader, "tokenizer.ggml.add_bos_token")),
-        "add_eos_token": bool(_gguf_value(reader, "tokenizer.ggml.add_eos_token")),
-        "bos_token": token(config["bos_token_id"]),
-        "chat_template": _gguf_value(reader, "tokenizer.chat_template"),
-        "clean_up_tokenization_spaces": False,
-        "eos_token": token(config["eos_token_id"]),
-        "model_max_length": config["max_position_embeddings"],
-        "pad_token": token(int(_gguf_value(reader, "tokenizer.ggml.padding_token_id"))),
-        "tokenizer_class": "PreTrainedTokenizerFast",
-        "unk_token": None,
-    }
-    (output_dir / "tokenizer_config.json").write_text(
-        json.dumps(tokenizer_config, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
-def prepare_model_metadata(args: argparse.Namespace) -> Path:
-    source = args.gguf
-    output_dir = artifact_dir_for_source(source) / "model-meta"
-    marker = output_dir / "metadata.json"
-    stat = source.stat()
-    if (
-        marker.is_file()
-        and (output_dir / "config.json").is_file()
-        and (output_dir / "tokenizer.json").is_file()
-    ):
-        try:
-            metadata = json.loads(marker.read_text(encoding="utf-8"))
-            if (
-                metadata.get("size") == stat.st_size
-                and metadata.get("mtime_ns") == stat.st_mtime_ns
-            ):
-                return output_dir / "config.json"
-        except (OSError, ValueError):
-            pass
-    try:
-        import gguf
-    except ImportError as exc:
-        raise RuntimeError(
-            "the gguf Python package is required to prepare DeepSeek metadata"
-        ) from exc
-    output_dir.mkdir(parents=True, exist_ok=True)
-    reader = gguf.GGUFReader(str(source), "r")
-    config = _model_config_from_gguf(reader)
-    (output_dir / "config.json").write_text(
-        json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    generation_config = {
-        "_from_model_config": True,
-        "bos_token_id": config["bos_token_id"],
-        "eos_token_id": config["eos_token_id"],
-        "do_sample": True,
-        "temperature": float(_gguf_value(reader, "general.sampling.temp")),
-        "top_p": float(_gguf_value(reader, "general.sampling.top_p")),
-    }
-    (output_dir / "generation_config.json").write_text(
-        json.dumps(generation_config, indent=2) + "\n", encoding="utf-8"
-    )
-    _write_tokenizer_from_gguf(reader, output_dir, config)
-    marker.write_text(
-        json.dumps(
-            {
-                "format_version": METADATA_FORMAT_VERSION,
-                "gguf": str(source),
-                "size": stat.st_size,
-                "mtime_ns": stat.st_mtime_ns,
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    return output_dir / "config.json"
-
-
-def prepare_expert_pack(
-    args: argparse.Namespace, model_config: Path
-) -> tuple[Path, Path]:
-    tool = args.sglang_repo / "tools" / "expert_pack" / "prepare_deepseek_pack.py"
-    if not tool.is_file():
-        raise FileNotFoundError(f"missing DeepSeek Expert Pack preparer: {tool}")
-    subprocess.run(
-        [
-            sys.executable,
-            str(tool),
-            "--gguf",
-            str(args.gguf),
-            "--model-config",
-            str(model_config),
-        ],
-        cwd=args.sglang_repo,
-        check=True,
-    )
-    return (
-        args.gguf.parent / "DeepSeek-V4-Flash.expert-pack",
-        args.gguf.parent / "DeepSeek-V4-Flash.expert-pack.manifest.json",
-    )
-
-
-def validate_artifacts(args: argparse.Namespace) -> dict[str, Any]:
-    for name in ("model_path", "tokenizer_path"):
-        path = getattr(args, name)
-        if not path.is_dir():
-            raise FileNotFoundError(
-                f"--{name.replace('_', '-')} is not a directory: {path}"
-            )
-    for name in ("source_path", "pack_path", "manifest_path"):
-        path = getattr(args, name)
-        if not path.is_file():
-            raise FileNotFoundError(f"--{name.replace('_', '-')} is not a file: {path}")
-
-    try:
-        args.artifact_dir.relative_to(args.sglang_repo)
-    except ValueError:
-        pass
-    else:
-        raise ValueError("--artifact-dir must be outside the SGLang checkout")
-    args.artifact_dir.mkdir(parents=True, exist_ok=True)
-
-    manifest = json.loads(args.manifest_path.read_text(encoding="utf-8"))
-    if not manifest.get("complete"):
-        raise ValueError("Expert Pack manifest is not complete")
-    if manifest.get("format") != "SGLANG-EXPERTPACK-v1":
-        raise ValueError(f"unsupported Expert Pack format: {manifest.get('format')!r}")
-    if int(manifest.get("pack_size", -1)) != args.pack_path.stat().st_size:
-        raise ValueError("Expert Pack size does not match its manifest")
-
-    source = manifest.get("source") or {}
-    model = manifest.get("model") or {}
-    if int(source.get("size", -1)) != args.source_path.stat().st_size:
-        raise ValueError("GGUF source size does not match its manifest")
-    source_sha256 = _digest(source.get("sha256"), "source.sha256")
-    model_identity_sha256 = _digest(
-        model.get("model_identity_sha256") or model.get("ollama_manifest_sha256"),
-        "model.ollama_manifest_sha256",
-    )
-    config_sha256 = _digest(model.get("config_sha256"), "model.config_sha256")
-    if args.validate_only and args.verify_source_sha256:
-        if _sha256(args.source_path) != source_sha256:
-            raise ValueError("GGUF source SHA-256 does not match its manifest")
-    if args.validate_only and args.verify_pack_sha256:
-        pack_sha256 = _digest(manifest.get("pack_sha256"), "pack_sha256")
-        if _sha256(args.pack_path) != pack_sha256:
-            raise ValueError("Expert Pack SHA-256 does not match its manifest")
-
-    return {
-        "manifest": manifest,
-        "loader_extra_config": {
-            "pack_path": str(args.pack_path),
-            "manifest_path": str(args.manifest_path),
-            "source_path": str(args.source_path),
-            "source_sha256": source_sha256,
-            "ollama_manifest_sha256": model_identity_sha256,
-            "config_sha256": config_sha256,
-            "cache_vram_mib": args.expert_cache_mib,
-            "cache_vram_reserve_mib": args.expert_cache_reserve_mib,
-            "stage_slots": args.stage_slots,
-            "read_splits": args.read_splits,
-            "direct_io": args.direct_io,
-            "stats_flush_interval": args.stats_flush_interval,
-            "stats_path": str(args.stats_path),
-        },
-    }
-
-
-def build_server_command(
-    args: argparse.Namespace, loader_extra_config: dict[str, Any]
-) -> list[str]:
     return [
         sys.executable,
         "-m",
         "sglang.launch_server",
         "--model-path",
-        str(args.model_path),
-        "--tokenizer-path",
-        str(args.tokenizer_path),
+        str(args.gguf),
+        "--trust-remote-code",
         "--load-format",
         "expert_pack",
         "--model-loader-extra-config",
-        json.dumps(loader_extra_config, separators=(",", ":")),
+        json.dumps(extra_config, separators=(",", ":")),
         "--attention-backend",
         "dsv4",
         "--tp-size",
@@ -459,12 +131,10 @@ def build_server_command(
     ]
 
 
-def start_server(
-    args: argparse.Namespace, loader_extra_config: dict[str, Any]
-) -> subprocess.Popen:
+def start_server(args: argparse.Namespace) -> subprocess.Popen:
     if port_in_use(args.host, args.port):
         raise RuntimeError(f"server address is already in use: {server_url(args)}")
-
+    args.server_log.parent.mkdir(parents=True, exist_ok=True)
     log = args.server_log.open("wb", buffering=0)
     env = os.environ.copy()
     python_path = [str(args.sglang_repo), str(args.sglang_repo / "python")]
@@ -488,10 +158,10 @@ def start_server(
         )
         if value
     )
-    command = build_server_command(args, loader_extra_config)
+    command = build_server_command(args)
     print(
-        f"SERVICE_STARTING url={server_url(args)} "
-        f"timeout={args.startup_timeout:.0f}s log={args.server_log}",
+        f"SERVICE_STARTING url={server_url(args)} timeout={args.startup_timeout:.0f}s "
+        f"log={args.server_log}",
         flush=True,
     )
     process = subprocess.Popen(
@@ -583,8 +253,7 @@ def generate(
         method="POST",
     )
     started = time.perf_counter_ns()
-    first_token = None
-    last_token = None
+    first_token = last_token = None
     completion_tokens = 0
     prompt_tokens = None
     output = ""
@@ -623,7 +292,6 @@ def generate(
             finish_reason = meta.get("finish_reason", finish_reason)
     if stream_output:
         print(flush=True)
-
     if first_token is None or last_token is None or prompt_tokens is None:
         raise RuntimeError(
             "SGLang response did not contain complete token timing metadata"
@@ -651,28 +319,13 @@ def generate(
     }
 
 
-def run_benchmark(
-    args: argparse.Namespace, loader_extra_config: dict[str, Any]
-) -> dict[str, Any]:
+def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     process = None
     try:
-        stats_path = getattr(args, "stats_path", None)
-        if stats_path is not None and stats_path.exists():
-            stats_path.unlink()
-        process = start_server(args, loader_extra_config)
-        if args.warmup:
-            generate(
-                args,
-                DEFAULT_WARMUP_PROMPT,
-                args.warmup_tokens,
-                stream_output=False,
-            )
-        return generate(
-            args,
-            args.prompt,
-            args.max_new_tokens,
-            stream_output=True,
-        )
+        if args.stats_path.exists():
+            args.stats_path.unlink()
+        process = start_server(args)
+        return generate(args, args.prompt, args.max_new_tokens, stream_output=True)
     finally:
         stop_server(process, args)
 
@@ -711,26 +364,14 @@ def _git_sha(repo: Path) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-def write_report(
-    args: argparse.Namespace,
-    gpu: str,
-    artifacts: dict[str, Any],
-    result: dict[str, Any],
-) -> None:
-    stats = None
-    if args.stats_path.is_file():
-        stats = json.loads(args.stats_path.read_text(encoding="utf-8"))
+def write_report(args: argparse.Namespace, gpu: str, result: dict[str, Any]) -> None:
     report = {
         "format": "SGLANG-DEEPSEEK-V4-FLASH-EXPERT-PACK-BENCHMARK-v1",
         "git_sha": _git_sha(args.sglang_repo),
         "gpu": gpu,
-        "model_path": str(args.model_path),
-        "source_path": str(args.source_path),
-        "pack_path": str(args.pack_path),
-        "manifest_path": str(args.manifest_path),
-        "loader_extra_config": artifacts["loader_extra_config"],
+        "source_path": str(args.gguf),
         "result": result,
-        "expert_pack_stats": stats,
+        "expert_pack_stats": read_stats(args.stats_path),
         "server_log": str(args.server_log),
     }
     temporary = args.report_path.with_suffix(args.report_path.suffix + ".tmp")
@@ -747,7 +388,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--gguf",
         type=Path,
         required=True,
-        help="DeepSeek-V4-Flash source GGUF; all other assets are derived",
+        help="DeepSeek-V4-Flash source GGUF; server startup derives all artifacts",
     )
     parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.set_defaults(
@@ -755,8 +396,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         temperature=0.0,
         top_p=0.95,
         seed=20260810,
-        warmup=False,
-        warmup_tokens=20,
         host="127.0.0.1",
         port=30000,
         startup_timeout=1200,
@@ -769,51 +408,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         expert_cache_reserve_mib=2 * 1024,
         stage_slots=12,
         read_splits=4,
-        stats_flush_interval=len(ACTIVE_MOE_LAYERS),
         direct_io=True,
-        verify_source_sha256=False,
-        verify_pack_sha256=False,
-        validate_only=False,
     )
     args = parser.parse_args(argv)
-
-    args.sglang_repo = find_sglang_repo()
-    args.gguf = args.gguf.expanduser().resolve(strict=True)
-    args.source_path = args.gguf
-    args.artifact_dir = artifact_dir_for_source(args.gguf).resolve()
-    args.model_path = args.artifact_dir / "model-meta"
-    args.tokenizer_path = args.model_path
-    args.pack_path = args.gguf.parent / "DeepSeek-V4-Flash.expert-pack"
-    args.manifest_path = (
-        args.gguf.parent / "DeepSeek-V4-Flash.expert-pack.manifest.json"
-    )
-    args.server_log = args.artifact_dir / "deepseek-v4-5090-server.log"
-    args.stats_path = args.artifact_dir / "deepseek-v4-expert-pack.stats.json"
-    args.report_path = args.artifact_dir / "deepseek-v4-5090-benchmark.json"
-
-    positive = (
-        "max_new_tokens",
-        "warmup_tokens",
-        "port",
-        "startup_timeout",
-        "request_timeout",
-        "watchdog_timeout",
-        "context_length",
-        "max_total_tokens",
+    if args.max_new_tokens < 1:
+        parser.error("--max-new-tokens must be positive")
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
+    for name in (
         "expert_cache_mib",
         "expert_cache_reserve_mib",
         "stage_slots",
         "read_splits",
-    )
-    for name in positive:
-        if getattr(args, name) <= 0:
+    ):
+        if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
-    if args.stats_flush_interval < 0:
-        parser.error("--stats-flush-interval cannot be negative")
-    if args.port > 65535:
-        parser.error("--port must be between 1 and 65535")
-    if not 0 < args.mem_fraction_static <= 1:
-        parser.error("--mem-fraction-static must be in (0, 1]")
+    args.gguf = args.gguf.expanduser().resolve(strict=True)
+    args.sglang_repo = find_sglang_repo()
+    args.artifact_dir = artifact_dir_for_source(args.gguf).resolve()
+    args.server_log = args.artifact_dir / "deepseek-v4-5090-server.log"
+    args.stats_path = args.artifact_dir / "deepseek-v4-expert-pack.stats.json"
+    args.report_path = args.artifact_dir / "deepseek-v4-5090-benchmark.json"
     return args
 
 
@@ -825,17 +440,22 @@ def print_result(result: dict[str, Any], gpu: str) -> None:
     print(f"gpu: {gpu}")
     print(f"prompt_tokens: {result['prompt_tokens']}")
     print(f"completion_tokens: {result['completion_tokens']}")
-    print(f"ttft_ms: {result['ttft_ms']:.3f}")
-    print(f"prefill_token_rate: {result['prefill_token_rate']:.3f} tok/s")
-    print(f"decode_token_rate: {result['decode_token_rate']:.3f} tok/s")
-    print(f"tpot_ms: {result['tpot_ms']:.3f} ms/token")
-    print(f"end_to_end_token_rate: {result['end_to_end_token_rate']:.3f} tok/s")
+    for name, suffix in (
+        ("ttft_ms", ""),
+        ("prefill_token_rate", " tok/s"),
+        ("decode_token_rate", " tok/s"),
+        ("tpot_ms", " ms/token"),
+        ("end_to_end_token_rate", " tok/s"),
+    ):
+        value = result[name]
+        print(f"{name}: {'n/a' if value is None else f'{value:.3f}'}{suffix}")
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     signal.signal(signal.SIGTERM, handle_termination)
     signal.signal(signal.SIGHUP, handle_termination)
+    args.artifact_dir.mkdir(parents=True, exist_ok=True)
     lock = DEFAULT_LOCK.open("w")
     try:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -847,36 +467,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     lock.write(f"{os.getpid()}\n")
     lock.flush()
-
     try:
         gpu = detect_rtx_5090()
-        config_path = prepare_model_metadata(args)
-        args.model_path = config_path.parent
-        args.tokenizer_path = config_path.parent
-        args.pack_path, args.manifest_path = prepare_expert_pack(args, config_path)
-        artifacts = validate_artifacts(args)
-        if args.validate_only:
-            print(
-                json.dumps(
-                    {
-                        "status": "PASS",
-                        "manifest": str(args.manifest_path),
-                        "pack": str(args.pack_path),
-                        "source": str(args.source_path),
-                        "metadata": str(config_path.parent),
-                    },
-                    sort_keys=True,
-                )
-            )
-            return 0
-        print(
-            f"HARDWARE_READY gpu={gpu} metadata={config_path.parent} pack={args.pack_path}",
-            flush=True,
-        )
-        result = run_benchmark(args, artifacts["loader_extra_config"])
+        print(f"MODEL_INPUT_READY gpu={gpu} gguf={args.gguf}", flush=True)
+        result = run_benchmark(args)
         stats = read_stats(args.stats_path)
         audit_routes(stats, result["prompt_tokens"] + result["completion_tokens"])
-        write_report(args, gpu, artifacts, result)
+        write_report(args, gpu, result)
         print_result(result, gpu)
         print(f"report: {args.report_path}")
         print(f"server_log: {args.server_log}")

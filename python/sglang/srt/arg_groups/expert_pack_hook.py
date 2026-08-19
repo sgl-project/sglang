@@ -89,11 +89,21 @@ def handle_expert_pack(server_args: Any) -> None:
         and raw_model_path.suffix.lower() == ".gguf"
     ):
         try:
-            from sglang.srt.model_loader.expert_pack_runtime import (
-                prepare_raw_kimi_server_args,
-            )
+            from sglang.srt.model_loader import expert_pack_runtime
 
-            prepare_raw_kimi_server_args(server_args, loader_config)
+            model_name = raw_model_path.name.upper()
+            if "KIMI" in model_name:
+                expert_pack_runtime.prepare_raw_kimi_server_args(
+                    server_args, loader_config
+                )
+            elif "DEEPSEEK" in model_name:
+                expert_pack_runtime.prepare_raw_deepseek_server_args(
+                    server_args, loader_config
+                )
+            else:
+                expert_pack_runtime.prepare_raw_expert_pack_server_args(
+                    server_args, loader_config
+                )
             server_args.model_loader_extra_config = loader_config
         except Exception as exc:
             errors.append(f"failed to prepare raw expert_pack GGUF input: {exc}")
