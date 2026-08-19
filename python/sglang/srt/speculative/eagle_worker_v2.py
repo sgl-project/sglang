@@ -195,6 +195,31 @@ def _use_aiter_draft_topk1(
     )
 
 
+def _try_greedy_draft_extend_topk1(
+    next_token_logits: torch.Tensor,
+    topk: int,
+    hot_token_id: Optional[torch.Tensor],
+    use_rejection_sampling: bool,
+) -> Optional[tuple]:
+    """Greedy draft-extend selection, or None to keep softmax + fast_topk.
+
+    Eligible ROCm AITER requests reuse the same raw-logit helper as
+    `draft_forward`. CUDA topk=1 keeps `argmax`. Other cases return None.
+    """
+    if _use_aiter_draft_topk1(topk, hot_token_id, use_rejection_sampling):
+        logits = (
+            next_token_logits
+            if next_token_logits.stride(1) == 1
+            else next_token_logits.contiguous()
+        )
+        return _aiter_draft_topk1(logits)
+    if topk == 1 and not _is_hip and not use_rejection_sampling:
+        topk_index = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+        topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+        return topk_p, topk_index
+    return None
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -1069,22 +1094,28 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
             )
-        elif self.topk == 1 and not _is_hip:
-            # Keep ROCm on the established softmax + fast_topk path here:
-            # AITER greedy_sample differs for rows containing NaN logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            )
-            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
-            ret_draft_probs = None
         else:
-            probs = renorm_draft_probs(
+            greedy = _try_greedy_draft_extend_topk1(
                 draft_logits_output.next_token_logits,
-                batch.sampling_info,
-                get_spec().speculative_use_rejection_sampling,
+                self.topk,
+                self.hot_token_id,
+                use_rejection_sampling=False,
             )
-            ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
-            ret_draft_probs = None
+            if greedy is not None:
+                # Same raw-logit greedy path as draft_forward on eligible
+                # AITER topk=1 requests. Finite logits match softmax+max;
+                # mixing AITER in draft_forward with softmax here left a
+                # full-vocab softmax after selected-row LM-head pruning.
+                ret_topk_p, ret_topk_index = greedy
+                ret_draft_probs = None
+            else:
+                probs = renorm_draft_probs(
+                    draft_logits_output.next_token_logits,
+                    batch.sampling_info,
+                    get_spec().speculative_use_rejection_sampling,
+                )
+                ret_topk_p, ret_topk_index = fast_topk(probs, self.topk, dim=-1)
+                ret_draft_probs = None
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
