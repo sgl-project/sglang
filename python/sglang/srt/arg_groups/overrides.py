@@ -1924,13 +1924,22 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
                 "DeepSeek V4 with fp4_e2m1 KV cache currently supports only "
                 "--fp4-kv-cache-recipe=mxfp4."
             )
-        if is_cuda():
-            major, _ = get_device_capability()
-            if major != 9:
-                raise ValueError(
-                    "DeepSeek V4 MXFP4 KV cache (--kv-cache-dtype fp4_e2m1) "
-                    f"requires an SM90 (Hopper) GPU, got SM{major}."
-                )
+        # get_device() reports "cuda" on ROCm as well, so gate on is_cuda()
+        # (true CUDA: torch.version.cuda is set), not the device string.
+        # Without this, ROCm/XPU/MUSA accept fp4_e2m1 at startup and die
+        # later at the JIT compile instead.
+        if not is_cuda():
+            raise ValueError(
+                "DeepSeek V4 MXFP4 KV cache (--kv-cache-dtype fp4_e2m1) "
+                "requires a CUDA SM90 (Hopper) GPU; this process is not "
+                "running on CUDA."
+            )
+        major, _ = get_device_capability()
+        if major != 9:
+            raise ValueError(
+                "DeepSeek V4 MXFP4 KV cache (--kv-cache-dtype fp4_e2m1) "
+                f"requires an SM90 (Hopper) GPU, got SM{major}."
+            )
     assert kv_cache_dtype in [
         "fp8_e4m3",
         "bfloat16",
