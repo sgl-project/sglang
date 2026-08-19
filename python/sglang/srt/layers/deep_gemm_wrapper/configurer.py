@@ -46,13 +46,12 @@ if DEEPGEMM_MASKED_FP8_BACKEND != "native" and not DEEPGEMM_BLACKWELL:
         "and SGLANG_ENABLE_JIT_DEEPGEMM=1"
     )
 
-# FlashInfer's batch DeepGEMM API and the Cake backend expose a float32
-# groupwise-scale ABI. Keep UE8M0 quantization on Blackwell, but write those
-# exact powers of two directly into row-major float32 activation scales for
-# public batch backends. Native DeepGEMM keeps its packed exponent layout.
+# Cake consumes the same packed UE8M0 ABI as native DeepGEMM, so both paths
+# keep the quantizer's MN-major int32 scale buffers zero-copy.  The FlashInfer
+# reference backend retains the public row-major float32 scale ABI.
 DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
 DEEPGEMM_MASKED_FP8_PACKED_SCALES = (
-    DEEPGEMM_SCALE_UE8M0 and DEEPGEMM_MASKED_FP8_BACKEND == "native"
+    DEEPGEMM_SCALE_UE8M0 and DEEPGEMM_MASKED_FP8_BACKEND in ("native", "cake")
 )
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
 DEEPGEMM_MASKED_NEED_TMA_ALIGNED_SCALES = DEEPGEMM_NEED_TMA_ALIGNED_SCALES

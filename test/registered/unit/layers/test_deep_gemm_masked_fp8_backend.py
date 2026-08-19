@@ -52,15 +52,12 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
         flashinfer_gemm = types.ModuleType("flashinfer.gemm")
         flashinfer_gemm.batch_deepgemm_fp8_nt_groupwise = run
         flashinfer.gemm = flashinfer_gemm
+        unpack = Mock(side_effect=[self.lhs_api_scale, self.rhs_api_scale])
         with (
             patch.object(entrypoint, "DEEPGEMM_MASKED_FP8_BACKEND", backend),
             patch.object(entrypoint, "_sanity_check_input"),
             patch.object(entrypoint, "_ensure_cuda", side_effect=lambda pair: pair),
-            patch.object(
-                entrypoint,
-                "_unpack_packed_ue8m0_scale",
-                side_effect=[self.lhs_api_scale, self.rhs_api_scale],
-            ),
+            patch.object(entrypoint, "_unpack_packed_ue8m0_scale", unpack),
             patch.dict(
                 sys.modules,
                 {"flashinfer": flashinfer, "flashinfer.gemm": flashinfer_gemm},
@@ -74,16 +71,22 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
                 expected_m=1,
             )
         self.assertIs(result, self.out)
+        expected_lhs_scale = self.lhs[1] if backend == "cake" else self.lhs_api_scale
+        expected_rhs_scale = self.rhs[1] if backend == "cake" else self.rhs_api_scale
         run.assert_called_once_with(
             self.lhs[0],
             self.rhs[0],
-            self.lhs_api_scale,
-            self.rhs_api_scale,
+            expected_lhs_scale,
+            expected_rhs_scale,
             self.masked_m,
             1,
             out=self.out,
             backend="deepgemm" if backend == "flashinfer" else "cake",
         )
+        if backend == "cake":
+            unpack.assert_not_called()
+        else:
+            self.assertEqual(unpack.call_count, 2)
 
     def test_flashinfer_reference_route(self):
         self._run("flashinfer")
@@ -116,7 +119,7 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
                     overlap_args=object(),
                 )
 
-    def test_native_backend_keeps_packed_activation_quantization(self):
+    def test_packed_backend_keeps_packed_activation_quantization(self):
         gateup = torch.empty((2, 3, 16), dtype=torch.bfloat16)
         masked_m = torch.tensor([1, 2], dtype=torch.int32)
         expected = (object(), object())
