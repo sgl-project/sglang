@@ -5,7 +5,6 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.kernels.ops.quantization import fp8_kernel
 from sglang.srt.layers.deep_gemm_wrapper import entrypoint
 from sglang.srt.layers.moe.moe_runner import deep_gemm as deep_gemm_runner
 
@@ -22,6 +21,8 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
     def setUp(self):
         self.lhs = (_FakeTensor((256, 256, 7168)), _FakeTensor((256, 256, 56)))
         self.rhs = (_FakeTensor((256, 4096, 7168)), _FakeTensor((256, 32, 56)))
+        self.lhs_api_scale = _FakeTensor((256, 256, 56))
+        self.rhs_api_scale = _FakeTensor((256, 32, 56))
         self.out = _FakeTensor((256, 256, 4096))
         self.masked_m = _FakeTensor((256,))
 
@@ -35,6 +36,11 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
             patch.object(entrypoint, "DEEPGEMM_MASKED_FP8_BACKEND", backend),
             patch.object(entrypoint, "_sanity_check_input"),
             patch.object(entrypoint, "_ensure_cuda", side_effect=lambda pair: pair),
+            patch.object(
+                entrypoint,
+                "_unpack_packed_ue8m0_scale",
+                side_effect=[self.lhs_api_scale, self.rhs_api_scale],
+            ),
             patch.dict(
                 sys.modules,
                 {"flashinfer": flashinfer, "flashinfer.gemm": flashinfer_gemm},
@@ -51,8 +57,8 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
         run.assert_called_once_with(
             self.lhs[0],
             self.rhs[0],
-            self.lhs[1],
-            self.rhs[1],
+            self.lhs_api_scale,
+            self.rhs_api_scale,
             self.masked_m,
             1,
             out=self.out,
@@ -90,19 +96,19 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
                     overlap_args=object(),
                 )
 
-    def test_standard_scale_backend_quantizes_down_input_row_major(self):
+    def test_batch_backend_keeps_native_packed_activation_quantization(self):
         gateup = torch.empty((2, 3, 16), dtype=torch.bfloat16)
         masked_m = torch.tensor([1, 2], dtype=torch.int32)
         expected = (object(), object())
         with (
             patch.object(
                 deep_gemm_runner.deep_gemm_wrapper,
-                "DEEPGEMM_MASKED_FP8_STANDARD_SCALES",
+                "DEEPGEMM_SCALE_UE8M0",
                 True,
             ),
             patch.object(
-                fp8_kernel,
-                "sglang_per_token_group_quant_fp8",
+                deep_gemm_runner,
+                "per_token_group_quant",
                 return_value=expected,
             ) as quant,
         ):
@@ -115,9 +121,42 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
             )
 
         self.assertIs(result, expected)
-        self.assertFalse(quant.call_args.kwargs["scale_ue8m0"])
+        self.assertTrue(quant.call_args.kwargs["scale_ue8m0"])
         self.assertTrue(quant.call_args.kwargs["fuse_silu_and_mul"])
         self.assertIs(quant.call_args.kwargs["masked_m"], masked_m)
+        self.assertTrue(quant.call_args.kwargs["column_major_scales"])
+
+    def test_unpack_packed_ue8m0_activation_scale_is_lossless(self):
+        exponents = torch.tensor(
+            [[[[120, 121, 122, 123], [124, 125, 126, 127]]]],
+            dtype=torch.uint8,
+        ).reshape(1, 1, 8)
+        packed = exponents.view(torch.int32)
+
+        unpacked = entrypoint._unpack_packed_ue8m0_scale(
+            packed, collapse_mn=False
+        )
+
+        expected = (exponents.to(torch.int32) << 23).view(torch.float32)
+        torch.testing.assert_close(unpacked, expected, rtol=0, atol=0)
+        self.assertEqual(unpacked.shape, (1, 1, 8))
+        self.assertTrue(unpacked.is_contiguous())
+
+    def test_unpack_packed_ue8m0_weight_scale_collapses_repeated_rows(self):
+        first = torch.tensor([120, 121, 122, 123], dtype=torch.uint8)
+        second = torch.tensor([124, 125, 126, 127], dtype=torch.uint8)
+        exponents = torch.cat((first.repeat(128, 1), second.repeat(128, 1)), dim=0)
+        packed = exponents.reshape(1, 256, 4).view(torch.int32)
+
+        unpacked = entrypoint._unpack_packed_ue8m0_scale(
+            packed, collapse_mn=True
+        )
+
+        expected_exp = torch.stack((first, second)).reshape(1, 2, 4)
+        expected = (expected_exp.to(torch.int32) << 23).view(torch.float32)
+        torch.testing.assert_close(unpacked, expected, rtol=0, atol=0)
+        self.assertEqual(unpacked.shape, (1, 2, 4))
+        self.assertTrue(unpacked.is_contiguous())
 
     def test_batch_backend_forces_masked_layout(self):
         with (

@@ -186,7 +186,7 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
         self.assertTrue(layer.weight_scale.format_ue8m0)
         requant.assert_called_once()
 
-    def test_fp8_moe_preserves_standard_scales_for_batch_api(self):
+    def test_fp8_moe_requants_weights_for_batch_api(self):
         method = fp8_quant.Fp8MoEMethod.__new__(fp8_quant.Fp8MoEMethod)
         method.convert_mxfp8_to_block = False
         method.use_mxfp8 = False
@@ -210,8 +210,6 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
             _is_fp8_fnuz=False,
             _use_aiter=False,
         ), patch.object(
-            deep_gemm_wrapper, "DEEPGEMM_MASKED_FP8_STANDARD_SCALES", True
-        ), patch.object(
             method, "is_deepgemm_moe_runner_backend_enabled", return_value=True
         ), patch.object(
             fp8_quant,
@@ -227,7 +225,7 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
                     layer.w13_weight,
                     layer.w13_weight_scale_inv,
                     BLOCK_SIZE,
-                    use_deepgemm_runner=False,
+                    use_deepgemm_runner=True,
                     output_dtype=torch.bfloat16,
                     weight_shape=layer.w13_weight.shape[-2:],
                 ),
@@ -235,14 +233,14 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
                     layer.w2_weight,
                     layer.w2_weight_scale_inv,
                     BLOCK_SIZE,
-                    use_deepgemm_runner=False,
+                    use_deepgemm_runner=True,
                     output_dtype=torch.bfloat16,
                     weight_shape=layer.w2_weight.shape[-2:],
                 ),
             ],
         )
-        self.assertFalse(layer.w13_weight_scale_inv.format_ue8m0)
-        self.assertFalse(layer.w2_weight_scale_inv.format_ue8m0)
+        self.assertTrue(layer.w13_weight_scale_inv.format_ue8m0)
+        self.assertTrue(layer.w2_weight_scale_inv.format_ue8m0)
 
 
 if __name__ == "__main__":

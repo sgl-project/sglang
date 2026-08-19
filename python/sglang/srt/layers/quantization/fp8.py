@@ -1714,10 +1714,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         weight,
                         weight_scale,
                         weight_block_size,
-                        use_deepgemm_runner=(
-                            will_use_deepgemm
-                            and not deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_STANDARD_SCALES
-                        ),
+                        use_deepgemm_runner=will_use_deepgemm,
                         output_dtype=torch.bfloat16,
                         weight_shape=weight.shape[-2:],
                     )

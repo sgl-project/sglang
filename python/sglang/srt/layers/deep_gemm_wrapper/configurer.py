@@ -43,18 +43,17 @@ if DEEPGEMM_MASKED_FP8_BACKEND not in ("native", "flashinfer", "cake"):
         "SGLANG_DEEPGEMM_MASKED_FP8_BACKEND must be one of: "
         "native, flashinfer, cake"
     )
+if DEEPGEMM_MASKED_FP8_BACKEND != "native" and not DEEPGEMM_BLACKWELL:
+    raise ValueError(
+        "FlashInfer batch DeepGEMM FP8 backends require Blackwell "
+        "and SGLANG_ENABLE_JIT_DEEPGEMM=1"
+    )
 
-# FlashInfer's batch DeepGEMM API and the Cake backend share the public
-# float32 groupwise-scale ABI. Keep that masked-MoE ABI separate from the
-# process-wide Blackwell UE8M0 setting: changing the masked backend must not
-# silently change the dense/attention GEMMs elsewhere in the same model.
-DEEPGEMM_MASKED_FP8_STANDARD_SCALES = DEEPGEMM_MASKED_FP8_BACKEND != "native"
+# FlashInfer's batch DeepGEMM API and the Cake backend expose a float32
+# groupwise-scale ABI. On Blackwell the model must still be quantized with the
+# native packed UE8M0 ABI; the wrapper losslessly expands those exponent bytes
+# to float32 powers of two only at the public API boundary.
 DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
-DEEPGEMM_MASKED_FP8_PACKED_SCALES = (
-    DEEPGEMM_SCALE_UE8M0 and not DEEPGEMM_MASKED_FP8_STANDARD_SCALES
-)
+DEEPGEMM_MASKED_FP8_PACKED_SCALES = DEEPGEMM_SCALE_UE8M0
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
-DEEPGEMM_MASKED_NEED_TMA_ALIGNED_SCALES = (
-    DEEPGEMM_NEED_TMA_ALIGNED_SCALES
-    and not DEEPGEMM_MASKED_FP8_STANDARD_SCALES
-)
+DEEPGEMM_MASKED_NEED_TMA_ALIGNED_SCALES = DEEPGEMM_NEED_TMA_ALIGNED_SCALES

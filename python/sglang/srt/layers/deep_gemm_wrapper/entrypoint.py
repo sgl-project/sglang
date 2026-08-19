@@ -11,7 +11,6 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_MASKED_FP8_BACKEND,
     DEEPGEMM_MASKED_FP8_PACKED_SCALES,
     DEEPGEMM_MASKED_NEED_TMA_ALIGNED_SCALES,
-    DEEPGEMM_MASKED_FP8_STANDARD_SCALES,
     DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
@@ -65,12 +64,8 @@ def grouped_gemm_nt_f8f8bf16_masked(
     _, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
 
-    _sanity_check_input(
-        lhs, require_ue8m0=not DEEPGEMM_MASKED_FP8_STANDARD_SCALES
-    )
-    _sanity_check_input(
-        rhs, require_ue8m0=not DEEPGEMM_MASKED_FP8_STANDARD_SCALES
-    )
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
 
     lhs = _ensure_cuda(lhs)
     rhs = _ensure_cuda(rhs)
@@ -94,6 +89,14 @@ def grouped_gemm_nt_f8f8bf16_masked(
             if DEEPGEMM_MASKED_FP8_BACKEND == "flashinfer"
             else "cake"
         )
+        lhs_scale = _unpack_packed_ue8m0_scale(lhs[1], collapse_mn=False)
+        rhs_scale = getattr(rhs[1], "_batch_deepgemm_fp8_scale", None)
+        if rhs_scale is None:
+            rhs_scale = _unpack_packed_ue8m0_scale(rhs[1], collapse_mn=True)
+            # Expert weights are immutable after model loading. Cache their
+            # expanded scale once instead of allocating/converting it for
+            # every MoE invocation.
+            rhs[1]._batch_deepgemm_fp8_scale = rhs_scale
         logger.info_once(
             "Using FlashInfer batch DeepGEMM API backend=%s for masked FP8 MoE "
             "(B=%d, M=%d, N=%d, K=%d, expected_m=%d, "
@@ -106,16 +109,16 @@ def grouped_gemm_nt_f8f8bf16_masked(
             expected_m,
             lhs[0].is_contiguous(),
             rhs[0].is_contiguous(),
-            lhs[1].is_contiguous(),
-            rhs[1].is_contiguous(),
+            lhs_scale.is_contiguous(),
+            rhs_scale.is_contiguous(),
             masked_m.is_contiguous(),
             out.is_contiguous(),
         )
         return batch_deepgemm_fp8_nt_groupwise(
             lhs[0],
             rhs[0],
-            lhs[1],
-            rhs[1],
+            lhs_scale,
+            rhs_scale,
             masked_m,
             expected_m,
             out=out,
@@ -161,6 +164,35 @@ def _ensure_cuda(
         pair[0].cuda() if not pair[0].is_cuda else pair[0],
         pair[1].cuda() if not pair[1].is_cuda else pair[1],
     )
+
+
+def _unpack_packed_ue8m0_scale(
+    scale: torch.Tensor, *, collapse_mn: bool
+) -> torch.Tensor:
+    """Expand native packed UE8M0 bytes to exact float32 powers of two.
+
+    Activation scales are packed as ``[B, M, K/512]`` and expand directly to
+    ``[B, M, K/128]``. Weight scales repeat each 128-row block across its rows;
+    collapsing that dimension produces the public API shape
+    ``[B, N/128, K/128]``. The FP8 payload is left untouched.
+    """
+    if scale.dtype != torch.int32 or scale.dim() != 3:
+        raise ValueError(
+            "batch DeepGEMM FP8 expects packed UE8M0 scales with dtype "
+            f"int32 and rank 3, got dtype={scale.dtype}, shape={scale.shape}"
+        )
+    exponents = scale.contiguous().view(torch.uint8).reshape(
+        *scale.shape[:-1], scale.shape[-1] * 4
+    )
+    unpacked = (exponents.to(torch.int32) << 23).view(torch.float32)
+    if collapse_mn:
+        if scale.shape[-2] % 128 != 0:
+            raise ValueError(
+                "packed weight scale row count must be divisible by 128, "
+                f"got shape={scale.shape}"
+            )
+        unpacked = unpacked[:, ::128, :]
+    return unpacked.contiguous()
 
 
 def grouped_gemm_nt_bf16_masked(
@@ -322,9 +354,7 @@ def configure_deep_gemm_num_sms(num_sms):
             deep_gemm.set_num_sms(original_num_sms)
 
 
-def _sanity_check_input(
-    x_fp8: Tuple[torch.Tensor, torch.Tensor], *, require_ue8m0: bool = True
-):
+def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):
     if not _SANITY_CHECK:
         return
 
@@ -332,7 +362,7 @@ def _sanity_check_input(
 
     if x_scale.dtype == torch.int:
         return
-    if not DEEPGEMM_SCALE_UE8M0 or not require_ue8m0:
+    if not DEEPGEMM_SCALE_UE8M0:
         return
 
     from sglang.srt.layers.quantization.fp8_utils import ceil_to_ue8m0
