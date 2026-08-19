@@ -65,7 +65,7 @@ def test_worker_records_replica_lifetime_peak():
 
     with (
         patch.object(current_platform, "is_cpu", return_value=False),
-        patch.object(current_platform, "is_mps", return_value=False),
+        patch.object(current_platform, "is_cuda", return_value=True),
         patch.object(current_platform, "get_device", return_value=torch.device("cpu")),
         patch.object(
             gpu_worker_module, "capture_memory_snapshot", side_effect=snapshots

@@ -709,7 +709,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
     def _record_lifetime_peak_memory(self, output_metrics: list[Any]) -> None:
         """Record the largest allocator peak across this request's replica."""
-        if current_platform.is_cpu() or current_platform.is_mps():
+        if not current_platform.is_cuda():
             return
 
         peak = torch.tensor(
