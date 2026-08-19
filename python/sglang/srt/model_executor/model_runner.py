@@ -505,6 +505,7 @@ class ModelRunner:
             get_model=lambda: self.model,
             tp_rank=self.ps.tp_rank,
             gpu_id=self.gpu_id,
+            worker="draft" if self.is_draft_worker else "target",
         )
 
     def init_ngram_embedding_manager(self):
@@ -584,8 +585,7 @@ class ModelRunner:
         if self.is_draft_worker:
             disable_routed_experts_capture_for_draft(self.model)
         self.maybe_init_expert_backup_client()
-        if not self.is_draft_worker:
-            self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
+        self.remote_instance_weight_transporter.maybe_register_and_publish_weight_info()
         self.layer_info: ModelLayerInfo = resolve_layer_indices(
             model=self.model,
             model_config=self.model_config,

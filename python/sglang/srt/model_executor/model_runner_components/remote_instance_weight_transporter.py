@@ -25,6 +25,7 @@ class RemoteInstanceWeightTransporter:
     get_model: Callable[[], torch.nn.Module]
     tp_rank: int
     gpu_id: int
+    worker: str = "target"
     engine: Optional[Any] = None
     session_id: str = ""
     weight_info: Optional[dict[str, tuple[int, int, int]]] = None
@@ -99,6 +100,7 @@ class RemoteInstanceWeightTransporter:
         url = f"{bootstrap_url}/register_parallelism_config"
         payload = {
             "tp_rank": self.tp_rank,
+            "worker": self.worker,
             "parallelism_config": self.parallelism_config.to_dict(),
         }
         for attempt in range(24):
@@ -147,6 +149,7 @@ class RemoteInstanceWeightTransporter:
 
         payload = {
             "tp_rank": self.tp_rank,
+            "worker": self.worker,
             "transfer_engine_info": {
                 "session_id": self.session_id,
                 "weights_info_dict": self.weight_info,
