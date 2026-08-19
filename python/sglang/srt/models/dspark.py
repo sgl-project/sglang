@@ -9,6 +9,9 @@ from torch import nn
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
+from sglang.srt.layers.logits_processor import (
+    should_apply_lm_head_quant_method,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
@@ -410,19 +413,12 @@ class DSparkDraftMixin:
         if self.logits_mup_width_multiplier:
             hidden = hidden / self.logits_mup_width_multiplier
         weight = self.lm_head.weight
-        if weight.shape[1] != hidden.shape[-1]:
-            # Quantized target lm_head (e.g. NVFP4 packed [vocab, 2560] for a
-            # 5120-hidden target): a dense matmul against the packed layout is
-            # invalid. Mirror LogitsProcessor._compute_lm_head and route
-            # through the quant method so its dequantize path applies.
-            quant_method = getattr(self.lm_head, "quant_method", None)
-            if quant_method is None or not callable(
-                getattr(quant_method, "apply", None)
-            ):
-                raise ValueError(
-                    "DSpark draft: target lm_head has a packed weight layout "
-                    f"({tuple(weight.shape)}) but no applicable quant method."
-                )
+        quant_method = getattr(self.lm_head, "quant_method", None)
+        if should_apply_lm_head_quant_method(self.lm_head, quant_method):
+            # Quantized target lm_head (e.g. NVFP4 packed weights): a dense
+            # matmul against the quantized layout is invalid or incorrect.
+            # Mirror LogitsProcessor._compute_lm_head and route through the
+            # quant method so its dequantize path applies.
             local_logits = quant_method.apply(
                 self.lm_head, hidden, getattr(self.lm_head, "bias", None)
             )
