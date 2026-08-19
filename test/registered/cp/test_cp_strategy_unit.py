@@ -1003,6 +1003,39 @@ class TestCPInterleaveStrategy(CustomTestCase):
             self.assertTrue(torch.equal(helper_x, expected_x))
             self.assertTrue(torch.equal(helper_positions, expected_positions))
 
+    def test_interleave_shard_row_pitch_is_not_inflated(self):
+        """A round-robin shard must not keep the cp_size-inflated row pitch.
+
+        The strided view taken for rank cp_rank has stride(0) == cp_size *
+        row_numel. When tokens == cp_size the shard is a single row, and a
+        size-1 outer dimension imposes no contiguity constraint, so
+        is_contiguous() is True regardless of stride(0) and .contiguous() is a
+        no-op. A kernel that derives its row pitch from stride(0) then reads
+        past the end of the tensor.
+        """
+        cp_size = 4
+        row_numel = 8
+        for tokens in (cp_size, 4 * cp_size):
+            x = torch.arange(tokens * row_numel).view(tokens, row_numel)
+            for rank in range(cp_size):
+                with self.subTest(tokens=tokens, rank=rank):
+                    strategy = InterleaveCPStrategy(cp_size=cp_size)
+                    with get_parallel().override(
+                        attn_cp_rank=rank, attn_cp_size=cp_size
+                    ):
+                        shard = strategy._interleave_shard(x)
+                    self.assertEqual(shard.stride(0), x.stride(0))
+                    self.assertTrue(torch.equal(shard, x[rank::cp_size]))
+
+    def test_interleave_shard_does_not_copy_for_cp_size_one(self):
+        """cp_size == 1 shards the whole tensor and must stay a view."""
+        x = torch.arange(4 * 8).view(4, 8)
+        strategy = InterleaveCPStrategy(cp_size=1)
+        with get_parallel().override(attn_cp_rank=0, attn_cp_size=1):
+            shard = strategy._interleave_shard(x)
+        self.assertEqual(shard.data_ptr(), x.data_ptr())
+        self.assertTrue(torch.equal(shard, x))
+
     def test_interleave_padding_preserves_shard_and_gather(self):
         cp_size = 4
         total_tokens = 10
