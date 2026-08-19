@@ -179,7 +179,7 @@ class TestMoeLoraRouting(CustomTestCase):
         happened once, when a raised kernel ceiling never reached the
         dispatch — so the values AND the edge behavior are pinned together.
         """
-        from sglang.srt.lora.moe import fused_align
+        from sglang.srt.lora.moe import aligned_route as fused_align
         from sglang.srt.lora.moe.routing import (
             FUSED_ALIGN_MIN_PAIRS,
             FUSED_ALIGN_MIN_VIRTUAL_EXPERTS,
@@ -204,7 +204,7 @@ class TestMoeLoraRouting(CustomTestCase):
             (1024, 1024, False),  # small V, P = 8192: below the P edge
             (40960, 8, True),  # above the JIT ceiling: fused is the only path
         )
-        original = fused_align.fused_align_block_size
+        original = fused_align.build
         for num_virtual, num_tokens, expects_fused in cases:
             num_local_experts = num_virtual // 32
             with self.subTest(V=num_virtual, P=num_tokens * 8):
@@ -225,7 +225,7 @@ class TestMoeLoraRouting(CustomTestCase):
                         calls.append(True)
                         return original(*args, **kwargs)
 
-                    fused_align.fused_align_block_size = spy
+                    fused_align.build = spy
                     route = build_virtual_expert_routing(
                         ids,
                         slots,
@@ -237,7 +237,7 @@ class TestMoeLoraRouting(CustomTestCase):
                         tensor_prefix="test:route",
                     )
                 finally:
-                    fused_align.fused_align_block_size = original
+                    fused_align.build = original
                 self.assertEqual(
                     bool(calls),
                     expects_fused,

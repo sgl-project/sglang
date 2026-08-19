@@ -17,18 +17,6 @@ from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 FUSED_ALIGN_MIN_VIRTUAL_EXPERTS = 8192
 FUSED_ALIGN_MIN_PAIRS = 16384
 
-# Bin ceiling and smallest pair counts at which counting a block's pairs beats
-# one atomic per pair; outside them the helpers below keep the per-pair path.
-COUNT_MAX_BINS = 512
-COUNT_MIN_PAIRS = 16384
-CLAIM_MIN_PAIRS_PER_BUCKET = 12288
-
-
-def count_bins(num_buckets: int, num_pairs: int) -> int:
-    """Bins for counting inside a block, or 0 to add one pair at a time."""
-    bins = 1 << num_buckets.bit_length()  # one spare bin, for masked-off lanes
-    return bins if bins <= COUNT_MAX_BINS and num_pairs >= COUNT_MIN_PAIRS else 0
-
 
 class RouteViewKind(str, Enum):
     RAW = "raw"
@@ -128,44 +116,6 @@ def virtual_expert_ids_inline(
 
 
 @triton.jit
-def add_counts_inline(
-    counts_ptr,
-    virtual_ids,
-    mask,
-    NUM_BUCKETS: tl.constexpr,
-    BINS: tl.constexpr,
-):
-    """Count these pairs, one atomic per bucket when BINS is nonzero."""
-    buckets = tl.where(virtual_ids < 0, NUM_BUCKETS - 1, virtual_ids)
-    if BINS == 0:
-        tl.atomic_add(counts_ptr + buckets, 1, mask=mask)
-    else:
-        mine = tl.histogram(tl.where(mask, buckets, BINS - 1), BINS)
-        bins = tl.arange(0, BINS)
-        tl.atomic_add(counts_ptr + bins, mine, mask=(bins < NUM_BUCKETS) & (mine > 0))
-
-
-@triton.jit
-def claim_slots_inline(
-    cursor_ptr,
-    virtual_ids,
-    mask,
-    NUM_BUCKETS: tl.constexpr,
-    PER_BLOCK: tl.constexpr,
-):
-    """A slot per pair; PER_BLOCK claims each bucket's run at once, reordering it."""
-    buckets = tl.where(virtual_ids < 0, NUM_BUCKETS - 1, virtual_ids)
-    if not PER_BLOCK:
-        return tl.atomic_add(cursor_ptr + buckets, 1, mask=mask)
-    slots = tl.zeros(buckets.shape, dtype=tl.int32)
-    for bucket in tl.static_range(NUM_BUCKETS):
-        mine = tl.where(mask & (buckets == bucket), 1, 0).to(tl.int32)
-        start = tl.atomic_add(cursor_ptr + bucket, tl.sum(mine))
-        slots = tl.where(mine == 1, start + tl.cumsum(mine) - mine, slots)
-    return slots
-
-
-@triton.jit
 def _build_virtual_topk_ids_kernel(
     topk_ids_ptr,
     token_lora_mapping_ptr,
@@ -223,18 +173,6 @@ def _build_virtual_topk_ids(
     return virtual_topk_ids
 
 
-def _routing_capacity(
-    num_pairs: int,
-    block_size: int,
-    num_virtual_experts: int,
-) -> int:
-    if num_pairs == 0:
-        return 0
-    max_nonempty_buckets = min(num_pairs, num_virtual_experts + 1)
-    upper_bound = num_pairs + max_nonempty_buckets * (block_size - 1)
-    return triton.cdiv(triton.cdiv(upper_bound, block_size) * block_size, 4) * 4
-
-
 def build_virtual_expert_routing(
     topk_ids: torch.Tensor,
     token_lora_mapping: torch.Tensor,
@@ -278,7 +216,7 @@ def build_virtual_expert_routing(
         num_virtual >= FUSED_ALIGN_MIN_VIRTUAL_EXPERTS
         or topk_ids.numel() >= FUSED_ALIGN_MIN_PAIRS
     ):
-        from sglang.srt.lora.moe.fused_align import fused_align_block_size
+        from sglang.srt.lora.moe import aligned_route
 
         if workspace is None or tensor_prefix is None:
             raise ValueError(
@@ -286,25 +224,18 @@ def build_virtual_expert_routing(
                 f"(view={view.value}, virtual experts={num_virtual}, "
                 f"pairs={topk_ids.numel()})"
             )
-        sorted_pair_ids, block_virtual_expert_ids, num_pairs_post_padded = (
-            fused_align_block_size(
-                topk_ids,
-                token_lora_mapping,
-                num_local_experts=num_local_experts,
-                is_shared_outer=is_shared_outer,
-                max_loras=max_loras,
-                block_size=block_size,
-                capacity=_routing_capacity(topk_ids.numel(), block_size, num_virtual),
-                workspace=workspace,
-                tensor_prefix=tensor_prefix,
-            )
+        per_expert, shared = aligned_route.build(
+            topk_ids,
+            token_lora_mapping,
+            num_local_experts=num_local_experts,
+            max_loras=max_loras,
+            block_size=block_size,
+            workspace=workspace,
+            tensor_prefix=tensor_prefix,
+            need_per_expert=not is_shared_outer,
+            need_shared=is_shared_outer,
         )
-        return RouteView(
-            **common,
-            maybe_sorted_pair_ids=sorted_pair_ids,
-            maybe_block_virtual_expert_ids=block_virtual_expert_ids,
-            maybe_num_pairs_post_padded=num_pairs_post_padded,
-        )
+        return shared if is_shared_outer else per_expert
 
     virtual_topk_ids = _build_virtual_topk_ids(
         topk_ids,

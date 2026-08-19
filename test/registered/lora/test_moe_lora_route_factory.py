@@ -166,12 +166,12 @@ def _load_route_factory():
     routing.RouteView = _HostRouteView
     routing.build_virtual_expert_routing = lambda *args, **kwargs: None
 
-    joint_routing = types.ModuleType("sglang.srt.lora.moe.joint_routing")
+    aligned_route = types.ModuleType("sglang.srt.lora.moe.aligned_route")
 
     def unexpected_joint_route(*_args, **_kwargs):
         raise AssertionError("the standard route plan must not use R10")
 
-    joint_routing.build_joint_shared_routes = unexpected_joint_route
+    aligned_route.build = unexpected_joint_route
 
     workspace = types.ModuleType("sglang.srt.lora.moe.workspace")
     workspace.MoeLoraWorkspace = object
@@ -186,7 +186,7 @@ def _load_route_factory():
         **packages,
         "sglang.srt.lora.moe.execution_plan": PLAN,
         routing.__name__: routing,
-        joint_routing.__name__: joint_routing,
+        aligned_route.__name__: aligned_route,
         workspace.__name__: workspace,
         module_name: module,
     }
@@ -198,7 +198,7 @@ def _load_route_factory():
 ROUTE_FACTORY = _load_route_factory()
 
 
-def _load_joint_routing():
+def _load_aligned_route():
     package_names = (
         "sglang",
         "sglang.srt",
@@ -220,21 +220,14 @@ def _load_joint_routing():
     routing = types.ModuleType("sglang.srt.lora.moe.routing")
     routing.RouteViewKind = _RouteViewKind
     routing.RouteView = _HostRouteView
-    routing._routing_capacity = lambda num_pairs, block_size, num_virtual: (
-        block_size * ((num_pairs + block_size - 1) // block_size + num_virtual)
-    )
     routing.virtual_expert_ids_inline = lambda *_args, **_kwargs: None
-    routing.add_counts_inline = lambda *_args, **_kwargs: None
-    routing.claim_slots_inline = lambda *_args, **_kwargs: None
-    routing.count_bins = lambda num_buckets, num_pairs: 0
-    routing.CLAIM_MIN_PAIRS_PER_BUCKET = 12288
 
     workspace = types.ModuleType("sglang.srt.lora.moe.workspace")
     workspace.MoeLoraWorkspace = object
 
-    module_name = "_host_joint_routing"
+    module_name = "_host_aligned_route"
     spec = importlib.util.spec_from_file_location(
-        module_name, LORA_MOE / "joint_routing.py"
+        module_name, LORA_MOE / "aligned_route.py"
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -253,7 +246,7 @@ def _load_joint_routing():
     return module
 
 
-JOINT_ROUTING = _load_joint_routing()
+ALIGNED_ROUTE = _load_aligned_route()
 
 
 def _load_routing():
@@ -454,6 +447,9 @@ class TestRoutePdlWiring(unittest.TestCase):
             max_loras,
             block_size,
             workspace,
+            tensor_prefix,
+            need_per_expert,
+            need_shared,
         ):
             joint_calls.append(block_size)
             route = _route(
@@ -488,7 +484,7 @@ class TestRoutePdlWiring(unittest.TestCase):
 
         with (
             mock.patch.object(
-                ROUTE_FACTORY, "build_joint_shared_routes", side_effect=fake_joint
+                ROUTE_FACTORY.aligned_route, "build", side_effect=fake_joint
             ),
             mock.patch.object(
                 ROUTE_FACTORY, "build_virtual_expert_routing", side_effect=fake_route
@@ -511,19 +507,20 @@ class TestRoutePdlWiring(unittest.TestCase):
         recorders = [_KernelRecorder() for _ in range(3)]
         with (
             _arch_pdl(bool(use_pdl)),
-            mock.patch.object(JOINT_ROUTING, "_joint_hist_kernel", recorders[0]),
-            mock.patch.object(JOINT_ROUTING, "_dual_scan_kernel", recorders[1]),
-            mock.patch.object(
-                JOINT_ROUTING, "_joint_expand_scatter_kernel", recorders[2]
-            ),
+            mock.patch.object(ALIGNED_ROUTE, "_hist_kernel", recorders[0]),
+            mock.patch.object(ALIGNED_ROUTE, "_scan_kernel", recorders[1]),
+            mock.patch.object(ALIGNED_ROUTE, "_place_kernel", recorders[2]),
         ):
-            routes = JOINT_ROUTING.build_joint_shared_routes(
+            routes = ALIGNED_ROUTE.build(
                 torch.tensor([[0, 1]], dtype=torch.int32),
                 torch.tensor([0], dtype=torch.int32),
                 num_local_experts=2,
                 max_loras=2,
                 block_size=16,
                 workspace=_Workspace(),
+                tensor_prefix="joint_route",
+                need_per_expert=True,
+                need_shared=True,
             )
         return routes, recorders
 
@@ -544,16 +541,16 @@ class TestRoutePdlWiring(unittest.TestCase):
             self.assertNotIn("launch_pdl", recorder.calls[0][2])
 
     def test_joint_kernel_dependency_operations_are_complete(self):
-        source = (LORA_MOE / "joint_routing.py").read_text()
+        source = (LORA_MOE / "aligned_route.py").read_text()
         tree = ast.parse(source)
         function_nodes = {
             node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
         }
         functions = {name: ast.unparse(node) for name, node in function_nodes.items()}
 
-        hist = functions["_joint_hist_kernel"]
-        scan = functions["_dual_scan_kernel"]
-        expand = functions["_joint_expand_scatter_kernel"]
+        hist = functions["_hist_kernel"]
+        scan = functions["_scan_kernel"]
+        expand = functions["_place_kernel"]
         self.assertIn("gdc_launch_dependents", hist)
         self.assertNotIn("gdc_wait", hist)
         self.assertIn("gdc_wait", scan)
@@ -565,7 +562,7 @@ class TestRoutePdlWiring(unittest.TestCase):
         # overlap scan work while still waiting before cursor consumption.
         scan_ifs = [
             node
-            for node in function_nodes["_dual_scan_kernel"].body
+            for node in function_nodes["_scan_kernel"].body
             if isinstance(node, ast.If)
         ]
         self.assertEqual(len(scan_ifs), 2)
@@ -575,7 +572,7 @@ class TestRoutePdlWiring(unittest.TestCase):
             pdl_body.index("gdc_wait"),
             pdl_body.index("gdc_launch_dependents"),
         )
-        self.assertIn("tl.program_id", ast.unparse(scan_ifs[1].test))
+        self.assertIn("tl.program_id", scan)
         self.assertTrue(scan_ifs[1].orelse)
 
 

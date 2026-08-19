@@ -4,12 +4,12 @@ from dataclasses import dataclass
 
 import torch
 
+from sglang.srt.lora.moe import aligned_route
 from sglang.srt.lora.moe.execution_plan import (
     MoeLoraExecutionPlan,
     RouteBuilderFamily,
     RouteRequirement,
 )
-from sglang.srt.lora.moe.joint_routing import build_joint_shared_routes
 from sglang.srt.lora.moe.routing import (
     RouteView,
     RouteViewKind,
@@ -78,13 +78,16 @@ def build_routes(
         )
 
     if plan.route_builder is RouteBuilderFamily.JOINT_SHARED_OUTER:
-        per_expert, shared = build_joint_shared_routes(
+        per_expert, shared = aligned_route.build(
             topk_ids,
             token_lora_mapping,
             num_local_experts=num_local_experts,
             max_loras=max_loras,
             block_size=block_size,
             workspace=workspace,
+            tensor_prefix="joint_route",
+            need_per_expert=True,
+            need_shared=True,
         )
         values["aligned_per_expert"] = per_expert
         values["aligned_shared_outer"] = shared
