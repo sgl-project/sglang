@@ -1433,13 +1433,18 @@ async def benchmark(
     )
 
     # Run warmup requests
+    warmup_pbar = warmup_pbar = None if disable_tqdm else tqdm(total=warmup_requests)
     warmup_tasks = []
     for _ in range(warmup_requests):
         warmup_tasks.append(
-            asyncio.create_task(request_func(request_func_input=test_input))
+            asyncio.create_task(
+                limited_request_func(request_func_input=test_input, pbar=warmup_pbar)
+            )
         )
 
     warmup_outputs = await asyncio.gather(*warmup_tasks)
+    if warmup_pbar is not None:
+        warmup_pbar.close()
     if is_multi_turn:
         warmup_outputs = [x for output in warmup_outputs for x in output]
 
@@ -1462,8 +1467,6 @@ async def benchmark(
     ) or flush_cache
     if should_flush_cache:
         flush_server_cache(base_url, backend, flush_cache_timeout)
-
-    time.sleep(1.0)
 
     # Build profile URLs for PD separated mode (do this once at the beginning)
     pd_profile_urls = []
