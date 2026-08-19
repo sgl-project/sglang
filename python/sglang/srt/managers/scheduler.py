@@ -2121,7 +2121,7 @@ class Scheduler(
             tp_worker=self.tp_worker,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             spec_algorithm=self.spec_algorithm,
-            get_running_batch=lambda: self.running_batch,
+            get_num_running_reqs=self.get_num_running_reqs,
             get_waiting_queue=lambda: self.waiting_queue,
             waiting_queue_prefix_matched=lambda: self.policy.waiting_queue_prefix_matched(
                 self.waiting_queue
@@ -2139,6 +2139,13 @@ class Scheduler(
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
         )
+
+    def get_num_running_reqs(self) -> int:
+        """Return this DP rank's decode requests across all PP slots."""
+        if self.ps.pp_size == 1:
+            return len(self.running_batch.reqs)
+        else:
+            return self._pp_get_num_running_reqs()
 
     def init_output_streamer(self) -> None:
         self.output_streamer = SchedulerOutputStreamer(
