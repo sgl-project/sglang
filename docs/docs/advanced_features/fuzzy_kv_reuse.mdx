@@ -1,0 +1,64 @@
+---
+title: "Fuzzy KV Cache Reuse"
+metatags:
+    description: "Opt-in radix cache backend that reuses KV cache across prompts with matching content at different positions. Semantic donor lookup with position-corrected reuse."
+---
+
+Fuzzy KV cache reuse extends the radix cache so that KV computed for one request can be reused by a later request even when the two prompts are not byte-identical. Exact prefix matching still runs first. When it leaves part of a prompt uncovered, a pluggable match provider can nominate donor KV from a previously finished request. The donor KV is copied into slots owned by the new request and its rotary position encoding is corrected to the new positions before the forward pass runs, so the reused cache behaves as if it had been computed in place.
+
+The feature is fully opt-in. It only activates when you select the backend explicitly, and a server started without it behaves exactly as before.
+
+## When it helps
+
+Workloads that resend near-identical content where the shared part does not sit at a common prefix. Typical examples are a shared document wrapped in different task instructions, or session content resent with a shifted header. Exact prefix caching recovers nothing in these cases because the first differing token ends the match.
+
+## Enabling
+
+Install the default provider dependency and select the backend at launch:
+
+```bash
+pip install "sglang[fuzzy-semantic]"
+
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen2.5-7B-Instruct \
+  --radix-cache-backend fuzzy_match \
+  --fuzzy-model-arch qwen2.5-7b
+```
+
+Selecting `--radix-cache-backend fuzzy_match` is the only switch. There is no separate enable flag.
+
+## How a request is served
+
+1. Exact prefix matching runs as usual and covers whatever it can.
+2. If the uncovered suffix is long enough to be worth a lookup, the provider searches previously finished requests for a donor whose content matches the suffix.
+3. A match must clear the quality gates below. Accepted donor KV is copied into request-owned slots with rotary position correction, and the donor's radix node is lock-protected so eviction cannot free it while the request is running.
+4. Tokens not covered by the exact prefix or the accepted match are computed normally.
+
+The reused span is contiguous and anchors at the exact prefix boundary. Requests the provider cannot serve fall through to the normal compute path with no overhead beyond the lookup.
+
+## Providers and tuning
+
+The default provider is `SemanticEmbedding`, which finds donor candidates by embedding similarity and then verifies token-level reuse before accepting anything. It requires the `semblend` package, installed by the `fuzzy-semantic` extra.
+
+| Argument | Default | Description |
+| --- | --- | --- |
+| `--fuzzy-match-provider` | `SemanticEmbedding` | `FuzzyMatchProvider` implementation used by the backend. |
+| `--fuzzy-min-match-length` | `16` | Minimum token span a fuzzy match may reuse. Prompts whose exact prefix anchor is shorter than this skip the fuzzy lookup. |
+| `--fuzzy-semantic-threshold` | `0.60` | Cosine similarity threshold for `SemanticEmbedding` matches. Higher is stricter and yields fewer, higher-precision matches. |
+| `--fuzzy-min-reuse-ratio` | `0.50` | Minimum fraction of the prompt a donor must cover for a hit to be accepted. |
+| `--fuzzy-model-arch` | `None` | Architecture tag passed to the provider to select alignment presets, for example `qwen2.5-7b`. |
+
+Very short uncovered suffixes also skip the lookup, since they cannot amortize the embedding cost.
+
+## Observability
+
+Reuse is visible in the server log. `fuzzy match success` marks an accepted match with its similarity and reuse ratio, `Realized N fuzzy tokens` marks the position-corrected copy, and the prefill batch line reports the reused token count. Accepted mass is also reported to clients through the cached token details, so hit rates can be measured from responses.
+
+## Limitations
+
+- Position-corrected realization currently supports standard multi-head attention KV layouts. Models with MLA-style pools fall back to exact-only matching.
+- The reused span is a single contiguous range per request in this version.
+- Input token logprobs are not available for reused spans, matching the existing behavior of exact prefix caching.
+- Quality depends on the provider's gates. The defaults are conservative, and lowering the similarity threshold or reuse ratio trades precision for hit rate.
+
+Details on the provider interface and the internal call chain live in the module README at `python/sglang/srt/mem_cache/fuzzy_match/README.md`.

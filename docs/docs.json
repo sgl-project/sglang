@@ -106,6 +106,10 @@
       "destination": "/docs/advanced_features/forward_hooks"
     },
     {
+      "source": "/advanced_features/fuzzy_kv_reuse.html",
+      "destination": "/docs/advanced_features/fuzzy_kv_reuse"
+    },
+    {
       "source": "/advanced_features/hicache.html",
       "destination": "/docs/advanced_features/hicache"
     },
@@ -947,6 +951,7 @@
                   "docs/advanced_features/hicache_storage_runtime_attach_detach"
                 ]
               },
+              "docs/advanced_features/fuzzy_kv_reuse",
               "docs/advanced_features/vlm_query",
               "docs/advanced_features/dp_for_multi_modal_encoder",
               "docs/advanced_features/cuda_graph_for_multi_modal_encoder",
