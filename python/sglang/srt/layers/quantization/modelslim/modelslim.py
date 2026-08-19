@@ -22,7 +22,9 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimMXFP8Scheme,
     ModelSlimW4A4Int4,
     ModelSlimW4A4Int4MoE,
+    ModelSlimW4A4MXFP4MoE,
     ModelSlimW4A8Int8MoE,
+    ModelSlimW4A8MXFP4MoE,
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
 )
@@ -137,6 +139,66 @@ class ModelSlimConfig(QuantizationConfig):
                     "forward_npu",
                     [npu_wrapper_rmsnorm_forward],
                 )
+        # DSpark checkpoint weights use mtp.<stage>.*, while the runtime draft
+        # model constructs canonical modules under stages.<stage>.*.  Keep
+        # this transformation in sync with
+        # DeepseekV4ForCausalLMDSpark._remap_dspark_weight_name.  Merely
+        # replacing ``mtp`` with ``stages`` is insufficient: it silently
+        # misses ModelSlim lookups such as stages.0.mlp.experts and
+        # stages.0.self_attn.
+        dspark_quant_aliases = {}
+        for name, scheme in quant_config.items():
+            if not isinstance(name, str) or not name.startswith("mtp."):
+                continue
+
+            parts = name.split(".", 2)
+            if len(parts) != 3:
+                continue
+
+            stage_id, rest = parts[1], parts[2]
+            if not stage_id.isdigit():
+                continue
+
+            # The draft model attaches the target model's shared embedding and
+            # LM head; mtp-local copies are not runtime draft modules.
+            if rest.startswith(("embed.", "embed_tokens.", "head.", "lm_head.")):
+                continue
+            if rest.startswith("markov_head."):
+                alias = f"markov_head.{rest[len('markov_head.'):]}"
+            elif rest.startswith("confidence_head."):
+                alias = f"confidence_head.{rest[len('confidence_head.'):]}"
+            else:
+                mapped_rest = rest
+                if mapped_rest.startswith("attn."):
+                    mapped_rest = "self_attn." + mapped_rest.removeprefix("attn.")
+                elif mapped_rest.startswith("ffn."):
+                    mapped_rest = "mlp." + mapped_rest.removeprefix("ffn.")
+                elif mapped_rest.startswith("attn_norm."):
+                    mapped_rest = "input_layernorm." + mapped_rest.removeprefix(
+                        "attn_norm."
+                    )
+                elif mapped_rest.startswith("ffn_norm."):
+                    mapped_rest = (
+                        "post_attention_layernorm."
+                        + mapped_rest.removeprefix("ffn_norm.")
+                    )
+                mapped_rest = mapped_rest.replace(".w1.", ".gate_proj.")
+                mapped_rest = mapped_rest.replace(".w2.", ".down_proj.")
+                mapped_rest = mapped_rest.replace(".w3.", ".up_proj.")
+                mapped_rest = mapped_rest.replace(".gate.tid2eid", ".topk.tid2eid")
+                mapped_rest = mapped_rest.replace(
+                    ".gate.bias", ".gate.e_score_correction_bias"
+                )
+                alias = f"stages.{stage_id}.{mapped_rest}"
+
+            dspark_quant_aliases[alias] = scheme
+
+        quant_config = {
+            **dspark_quant_aliases,
+            **quant_config,
+        }
+
+        self.quant_description = quant_config
 
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)
@@ -275,6 +337,8 @@ class ModelSlimConfig(QuantizationConfig):
         prefix: str,
     ):
         moe_quant_schemes = [
+            ("W4A4_MXFP4", ModelSlimW4A4MXFP4MoE),
+            ("W4A8_MXFP", ModelSlimW4A8MXFP4MoE),
             ("W4A4_DYNAMIC", ModelSlimW4A4Int4MoE),
             ("W4A8_DYNAMIC", ModelSlimW4A8Int8MoE),
             ("W8A8_DYNAMIC", ModelSlimW8A8Int8MoE),
@@ -532,8 +596,8 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale,
             w2_weight_scale=layer.w2_weight_scale,
-            w13_weight_offset=layer.w13_weight_offset,
-            w2_weight_offset=layer.w2_weight_offset,
+            w13_weight_offset=getattr(layer, "w13_weight_offset", None),
+            w2_weight_offset=getattr(layer, "w2_weight_offset", None),
             w13_scale_bias=getattr(layer, "w13_scale_bias", None),
             w2_scale_bias=getattr(layer, "w2_scale_bias", None),
             w13_weight_bias=getattr(layer, "w13_weight_bias", None),

@@ -68,6 +68,9 @@ class PipelineStage(StageDedupMixin, ABC):
     # calling super().__init__() still see a consistent explicit-range gate.
     _current_use_nvtx: bool = False
     _current_batch_is_warmup: bool = False
+    _component_residency_manager = None
+    _registered_stage_name: str | None = None
+    _profile_stage_name: str | None = None
 
     def __init__(self):
         self.server_args = get_global_server_args()
@@ -161,28 +164,21 @@ class PipelineStage(StageDedupMixin, ABC):
         self._profile_stage_name = stage_name
 
     def _component_stage_name(self, stage_name: str | None = None) -> str:
-        return (
-            stage_name
-            or getattr(self, "_registered_stage_name", None)
-            or self.__class__.__name__
-        )
+        return stage_name or self._registered_stage_name or self.__class__.__name__
 
     def _active_component_stage_name(self) -> str:
         """Stage name reported by the residency manager.
 
-        Only valid between ``before_stage`` and ``after_stage``; outside
-        that window the manager state still holds the previous stage's
-        name. Use :meth:`_component_stage_name` for the static identity.
+        During execution this comes from the manager; otherwise the registered
+        stage name provides the static identity.
         """
-        manager = getattr(self, "_component_residency_manager", None)
-        manager_state = getattr(manager, "state", None)
-        manager_stage_name = getattr(manager_state, "stage_name", None)
-        if manager_stage_name is not None:
-            return manager_stage_name
+        manager = self._component_residency_manager
+        if manager is not None and manager.state.stage_name is not None:
+            return manager.state.stage_name
         return self._component_stage_name()
 
     def _active_profile_stage_name(self) -> str:
-        return getattr(self, "_profile_stage_name", None) or self.__class__.__name__
+        return self._profile_stage_name or self.__class__.__name__
 
     def _finish_active_component_use(self) -> None:
         if self._component_residency_manager is not None:
@@ -240,6 +236,24 @@ class PipelineStage(StageDedupMixin, ABC):
         )
         with self._use_component(use, module) as component:
             yield component
+
+    def begin_declared_component_use(
+        self,
+        *,
+        component_name: str,
+        module=None,
+        phase: str | None = None,
+        target_dtype: torch.dtype | None = None,
+    ) -> None:
+        """Keep a declared component active until the next use interval begins."""
+        if self._component_residency_manager is None:
+            return
+        use = self._declared_component_use(
+            component_name=component_name,
+            phase=phase,
+            target_dtype=target_dtype,
+        )
+        self._component_residency_manager.begin_use(use, module=module)
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None

@@ -42,7 +42,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
 
@@ -342,7 +342,7 @@ class LRUList:
             raise Exception(msg)
 
 
-class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
+class SWARadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.req_to_token_pool = params.req_to_token_pool
@@ -350,8 +350,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self.page_size = params.page_size
         self.disable = params.disable
         self.is_eagle = params.is_eagle
-        self.enable_kv_cache_events = params.enable_kv_cache_events
-        self.kv_event_queue = []
+        self.kv_events = KVCacheEventRecorder(
+            enabled=params.enable_kv_cache_events, page_size=self.page_size
+        )
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -407,7 +408,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(is_swa_list=False)
         self.swa_lru_list = LRUList(is_swa_list=True)
-        self._record_all_cleared_event()
+        self.kv_events.record_all_cleared()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -609,7 +610,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 assert x.full_lock_ref == 0, f"node is in use, {x.id=}"
 
                 # 1. free node kv indices, evict full and swa tokens
-                self._record_remove_event(x)
+                self.kv_events.record_remove(x)
                 self.token_to_kv_pool_allocator.free(x.value)
                 full_num_evicted += len(x.value)
                 # Tombstoned leaves had their SWA freed earlier in `dec_swa_lock_only`
@@ -674,7 +675,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         x.full_lock_ref == 0
                     ), f"leaf node with full lock must also have swa lock, {x.id=}"
                     # 1. a leaf node, free full and swa tokens
-                    self._record_remove_event(x)
+                    self.kv_events.record_remove(x)
                     self.token_to_kv_pool_allocator.free(x.value)
                     full_num_evicted += len(x.value)
                     swa_num_evicted += len(x.value)
@@ -1326,7 +1327,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         if not swa_tombstone:
             self.swa_lru_list.insert_mru(new_node)
             self.swa_evictable_size_ += len(value)
-        self._record_store_event(new_node)
+        self.kv_events.record_store(new_node)
         return new_node
 
     def _iteratively_delete_tombstone_leaf(
@@ -1344,7 +1345,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 node.parent.swa_lock_ref == 0
             ), f"tombstone swa_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.swa_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
-            self._record_remove_event(node.parent)
+            self.kv_events.record_remove(node.parent)
             self.token_to_kv_pool_allocator.free(node.parent.value)
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)
