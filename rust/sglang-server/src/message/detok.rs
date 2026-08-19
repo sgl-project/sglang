@@ -1,7 +1,7 @@
 //! Messages to a Detokenizer shard.
 
 use super::ids::Rid;
-use super::response::{ChunkEvent, ResponseSink};
+use super::response::{ChunkEvent, EmbeddingEvent, ResponseSink};
 
 /// Messages to a Detokenizer shard. `Register` carries the per-request sink for
 /// the shard's local `rid -> sink` map. The rid STRING is the identity: `Rid::hash`
@@ -24,6 +24,8 @@ pub enum DetokMsg {
     /// One decode step's chunks for *this shard*. Batched because `from-scheduler` blocks
     /// per send.
     Chunks(Vec<ChunkEvent>),
+    /// Terminal embedding outputs for this shard. No token decoder is involved.
+    Embeddings(Vec<EmbeddingEvent>),
     /// Decode a complete token-id sequence — the backend of
     /// [`RequestKind::Detokenize`](super::RequestKind::Detokenize), the one
     /// request kind the detok stage itself answers (it never reaches the

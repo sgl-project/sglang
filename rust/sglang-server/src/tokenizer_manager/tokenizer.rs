@@ -185,6 +185,24 @@ impl TokenizerWorker {
 impl Runnable for TokenizerWorker {
     fn run(self) {
         while let Ok(mut req) = self.rx.recv() {
+            // Embeddings share the tokenizer pool but do not run any generation
+            // normalization (stop windows or automatic-special stripping).
+            if let RequestKind::Embedding(e) = &mut req.kind {
+                let event = match self.tokenizer.encode(e.text.as_deref().unwrap_or("")) {
+                    Ok(ids) => {
+                        e.input_ids = Some(ids);
+                        Event::TokenizeDone
+                    }
+                    Err(err) => Event::Error(err),
+                };
+                let _ = req.state.apply(event);
+                if self.tm.send(TmEvent::Tokenized(req)).is_err() {
+                    tracing::error!("tm inbox closed; dropping request");
+                    break;
+                }
+                continue;
+            }
+
             // The tokenizer pool only ever receives generate requests. Encode,
             // then advance the FSM: `TokenizeDone` on success (→ PreSendValidating).
             let event = {
@@ -230,7 +248,8 @@ impl Runnable for TokenizerWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::request::{GenerateRequest, RequestKind};
+    use crate::message::ids::Rid;
+    use crate::message::request::{EmbeddingRequest, GenerateRequest, RequestKind};
     use crate::message::response::ResponseSink;
     use crate::message::sampling::SamplingParams;
     use crate::utils::fsm::RequestState;
@@ -243,6 +262,39 @@ mod tests {
         fn encode(&self, text: &str) -> Result<TokenIds, Error> {
             Ok(text.split_whitespace().map(|_| 1i32).collect())
         }
+    }
+
+    #[test]
+    fn embedding_text_is_tokenized_without_generation_logic() {
+        let (req_tx, req_rx) = flume::unbounded::<Request>();
+        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+        let worker = TokenizerWorker::new(req_rx, tm_tx, Arc::new(WordTokenizer));
+        let (sink, _source) = mpsc::channel(1);
+        let rid = Rid::from("embedding-tokenize");
+        req_tx
+            .send(Request {
+                rid: rid.clone(),
+                state: RequestState::Tokenizing,
+                sink: ResponseSink::Local(sink),
+                kind: RequestKind::Embedding(Box::new(EmbeddingRequest::new(
+                    rid,
+                    Some("hello world".into()),
+                    None,
+                    None,
+                    None,
+                ))),
+            })
+            .unwrap();
+        drop(req_tx);
+        worker.run();
+        let TmEvent::Tokenized(request) = tm_rx.recv().unwrap() else {
+            panic!("expected tokenized request")
+        };
+        assert!(matches!(request.state, RequestState::PreSendValidating));
+        let RequestKind::Embedding(embedding) = request.kind else {
+            panic!("expected embedding")
+        };
+        assert_eq!(embedding.input_ids, Some(vec![1, 1]));
     }
 
     /// The scheduler's stop-match window must reach the wire as a TOKEN count, as

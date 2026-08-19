@@ -58,6 +58,8 @@ pub enum ResponseItem {
     /// client-bound JSON like `Control` and not a generation frame. Generation
     /// and control drains never see it.
     Data(Bytes),
+    /// One terminal dense embedding. It bypasses token decoding entirely.
+    Embedding(EmbeddingEvent),
     /// Terminal failure: handler emits an error frame (stream) or status (unary).
     Error(Error),
 }
@@ -71,6 +73,104 @@ pub const DISPATCH_TAG_BATCH: u8 = 2;
 /// A per-request failure `[rid, message]`: the Python drain couldn't decode a
 /// header, so it routes a 400 back to that request instead of crashing the loop.
 pub const DISPATCH_TAG_ERROR: u8 = 3;
+/// Dense embedding batch: compact msgpack metadata plus contiguous LE f32 data.
+pub const DISPATCH_TAG_EMBEDDING: u8 = 4;
+
+#[derive(Debug, Clone)]
+pub struct EmbeddingEvent {
+    pub rid: Rid,
+    pub embedding: Vec<f32>,
+    pub prompt_tokens: u32,
+    pub finish_reason: Option<FinishReason>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct EmbeddingHeader {
+    pub rids: Vec<String>,
+    pub finished_reasons: Vec<Option<FinishReason>>,
+    pub prompt_tokens: Vec<u32>,
+    pub embedding_lengths: Vec<u32>,
+}
+
+/// Frame an embedding batch without putting vectors through msgpack.
+pub fn frame_egress_embedding(header: &[u8], data: &[u8]) -> Bytes {
+    let mut buf = Vec::with_capacity(1 + 4 + header.len() + data.len());
+    buf.push(DISPATCH_TAG_EMBEDDING);
+    buf.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    buf.extend_from_slice(header);
+    buf.extend_from_slice(data);
+    Bytes::from(buf)
+}
+
+/// Strict, atomic decoder for a columnar dense-embedding frame (tag stripped).
+/// The callback is invoked only after the entire header and data buffer validate.
+pub fn for_each_embedding(body: &[u8], mut route: impl FnMut(EmbeddingEvent)) -> Decoded {
+    let mut decoded = Decoded::default();
+    if body.len() < 4 {
+        return decoded;
+    }
+    let hlen = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let Some(header_bytes) = body.get(4..4usize.saturating_add(hlen)) else {
+        return decoded;
+    };
+    let mut header = match rmp_serde::from_slice::<EmbeddingHeader>(header_bytes) {
+        Ok(header) => header,
+        Err(_) => {
+            decoded.rids = recover_rids(header_bytes);
+            return decoded;
+        }
+    };
+    let n = header.rids.len();
+    decoded.rids = header
+        .rids
+        .iter()
+        .map(|rid| Rid::from(rid.as_str()))
+        .collect();
+    if header.finished_reasons.len() != n
+        || header.prompt_tokens.len() != n
+        || header.embedding_lengths.len() != n
+    {
+        return decoded;
+    }
+    let Some(values) = header
+        .embedding_lengths
+        .iter()
+        .try_fold(0usize, |sum, &len| sum.checked_add(len as usize))
+    else {
+        return decoded;
+    };
+    let Some(expected_bytes) = values.checked_mul(4) else {
+        return decoded;
+    };
+    let data = &body[4 + hlen..];
+    if data.len() != expected_bytes {
+        return decoded;
+    }
+
+    // Validate and materialize everything before routing any item.
+    let mut events = Vec::with_capacity(n);
+    let mut offset = 0usize;
+    for i in 0..n {
+        let Some(embedding) = take_f32(data, &mut offset, header.embedding_lengths[i] as usize)
+        else {
+            return decoded;
+        };
+        events.push(EmbeddingEvent {
+            rid: std::mem::take(&mut header.rids[i]).into(),
+            embedding,
+            prompt_tokens: header.prompt_tokens[i],
+            finish_reason: header.finished_reasons[i].take(),
+        });
+    }
+    if offset != data.len() {
+        return decoded;
+    }
+    for event in events {
+        route(event);
+    }
+    decoded.ok = true;
+    decoded
+}
 
 /// Read `n` little-endian f32s from `data` at `*off`, advancing `*off`. `None` when
 /// the range runs past the buffer (a malformed / positional-ABI-drifted frame): the
@@ -629,6 +729,70 @@ mod tests {
         );
         assert_eq!(&multi[5..8], &header); // header
         assert_eq!(&multi[8..], &[10, 11, 12, 13, 14]); // columns end-to-end
+    }
+
+    fn embedding_frame(lengths: Vec<u32>, values: &[f32]) -> Bytes {
+        let header = EmbeddingHeader {
+            rids: (0..lengths.len()).map(|i| format!("e{i}")).collect(),
+            finished_reasons: vec![None; lengths.len()],
+            prompt_tokens: (0..lengths.len()).map(|i| i as u32 + 1).collect(),
+            embedding_lengths: lengths,
+        };
+        let encoded = rmp_serde::to_vec(&header).unwrap();
+        let mut data = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        frame_egress_embedding(&encoded, &data)
+    }
+
+    #[test]
+    fn embedding_round_trip_and_ragged_lengths() {
+        let frame = embedding_frame(vec![2, 1], &[0.5, -2.0, 7.0]);
+        let mut events = Vec::new();
+        let decoded = for_each_embedding(&frame[1..], |event| events.push(event));
+        assert!(decoded.ok);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].rid.as_str(), "e0");
+        assert_eq!(events[0].embedding, vec![0.5, -2.0]);
+        assert_eq!(events[0].prompt_tokens, 1);
+        assert_eq!(events[1].embedding, vec![7.0]);
+        assert_eq!(events[1].prompt_tokens, 2);
+    }
+
+    #[test]
+    fn empty_embedding_is_valid() {
+        let frame = embedding_frame(vec![0], &[]);
+        let mut events = Vec::new();
+        let decoded = for_each_embedding(&frame[1..], |event| events.push(event));
+        assert!(decoded.ok);
+        assert!(events[0].embedding.is_empty());
+    }
+
+    #[test]
+    fn malformed_embedding_frame_is_atomic_and_recovers_rids() {
+        for frame in [
+            embedding_frame(vec![2, 2], &[1.0, 2.0, 3.0]),
+            embedding_frame(vec![1], &[1.0, 2.0]),
+        ] {
+            let mut delivered = 0;
+            let decoded = for_each_embedding(&frame[1..], |_| delivered += 1);
+            assert!(!decoded.ok);
+            assert_eq!(delivered, 0, "malformed frame must not partially deliver");
+            assert!(!decoded.rids.is_empty());
+        }
+
+        let header = rmp_serde::to_vec(&(
+            vec!["a", "b"],
+            vec![Option::<FinishReason>::None],
+            vec![1u32, 2],
+            vec![1u32, 1],
+        ))
+        .unwrap();
+        let frame = frame_egress_embedding(&header, &[0; 8]);
+        let decoded = for_each_embedding(&frame[1..], |_| panic!("partial delivery"));
+        assert!(!decoded.ok);
+        assert_eq!(decoded.rids, vec![Rid::from("a"), Rid::from("b")]);
     }
 
     /// A batch frame (the fast path) decodes into per-request ChunkEvents, with

@@ -185,6 +185,16 @@ impl Server {
         )
     }
 
+    /// Push a whole dense embedding batch as one columnar frame. Numeric values
+    /// are contiguous little-endian f32 bytes and never enter msgpack/PyO3 one
+    /// element at a time.
+    fn push_embedding(&self, py: Python<'_>, header: &[u8], data: PyBackedBytes) -> bool {
+        self.push_frame(
+            py,
+            crate::message::response::frame_egress_embedding(header, data.as_ref()),
+        )
+    }
+
     /// Push a control-request result. Blocks for backpressure; `False` only on
     /// shutdown.
     fn push_control_result(&self, py: Python<'_>, rid: &str, payload: &[u8]) -> bool {

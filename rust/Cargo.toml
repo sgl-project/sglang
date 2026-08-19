@@ -17,6 +17,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 async-stream = "0.3"
 bytes = "1"
+base64 = "0.22"
 futures = "0.3"
 pyo3 = { version = "0.29.0", features = ["extension-module"] }
 serde = { version = "1", features = ["derive"] }

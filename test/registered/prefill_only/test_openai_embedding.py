@@ -1,7 +1,11 @@
+import base64
 import json
+import struct
 import unittest
+from typing import ClassVar
 
 import openai
+import requests
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import (
@@ -14,6 +18,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_rust_server_built,
     popen_launch_server,
 )
 
@@ -23,6 +28,8 @@ register_cpu_ci(est_time=91, suite="base-c-test-cpu")
 
 
 class TestOpenAIEmbedding(CustomTestCase):
+    env = None
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_EMBEDDING_MODEL_NAME_FOR_TEST
@@ -37,6 +44,7 @@ class TestOpenAIEmbedding(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
             other_args=other_args,
+            env=cls.env,
         )
         cls.base_url += "/v1"
 
@@ -58,8 +66,31 @@ class TestOpenAIEmbedding(CustomTestCase):
             model=self.model, input=["Hello world", "Test text"]
         )
         self.assertEqual(len(response.data), 2)
+        self.assertEqual([item.index for item in response.data], [0, 1])
         self.assertTrue(len(response.data[0].embedding) > 0)
         self.assertTrue(len(response.data[1].embedding) > 0)
+        self.assertEqual(response.usage.prompt_tokens, response.usage.total_tokens)
+
+    def test_embedding_base64(self):
+        response = requests.post(
+            self.base_url + "/embeddings",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "input": ["Hello world", "Test text"],
+                "encoding_format": "base64",
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        body = response.json()
+        self.assertEqual([item["index"] for item in body["data"]], [0, 1])
+        for item in body["data"]:
+            raw = base64.b64decode(item["embedding"])
+            self.assertGreater(len(raw), 0)
+            self.assertEqual(len(raw) % 4, 0)
+            struct.unpack(f"<{len(raw) // 4}f", raw)
+        self.assertEqual(body["usage"]["prompt_tokens"], body["usage"]["total_tokens"])
 
     def test_embedding_single_batch_str(self):
         """Test embedding with a List[str] and length equals to 1"""
@@ -199,6 +230,16 @@ class TestMatryoshkaEmbeddingModel(CustomTestCase):
                     dimensions=dimensions,
                 )
             self.assertEqual(cm.exception.status_code, 400)
+
+
+@unittest.skipUnless(
+    is_rust_server_built(),
+    "embedded rust server extension not built",
+)
+class TestOpenAIEmbeddingWithRust(TestOpenAIEmbedding):
+    """Run the same server fixture and matrix with only the frontend switched."""
+
+    env: ClassVar[dict[str, str]] = {"SGLANG_RUST_SERVER": "1"}
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ pub(super) async fn submit(
         // Generate rids are already final: `GenerateBody::into_requests` normalized the
         // client's, or minted one. Control requests have no client-facing rid.
         RequestKind::Generate(g) => g.rid.clone(),
+        RequestKind::Embedding(e) => e.rid.clone(),
         RequestKind::Control(c) => c.rid().into(),
         // Internal service call — no client-facing rid; mint a fresh one.
         RequestKind::Detokenize { .. } => Rid::new(),

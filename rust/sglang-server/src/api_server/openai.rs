@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 
 mod chat;
 mod completions;
+mod embeddings;
 mod models;
 mod reasoning;
 mod template;
@@ -36,6 +37,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(models::routes())
         .merge(completions::routes())
+        .merge(embeddings::routes())
         .merge(chat::routes())
 }
 
@@ -135,7 +137,9 @@ async fn collect_output(
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return Err((status, error.to_string()));
             }
-            Some(ResponseItem::Control(_)) | Some(ResponseItem::Data(_)) => {}
+            Some(ResponseItem::Control(_))
+            | Some(ResponseItem::Data(_))
+            | Some(ResponseItem::Embedding(_)) => {}
             None => {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,

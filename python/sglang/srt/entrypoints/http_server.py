@@ -2237,7 +2237,9 @@ def _execute_server_warmup(server_args: ServerArgs):
         else:
             request_name = "/generate"
     else:
-        request_name = "/encode"
+        request_name = (
+            "/v1/embeddings" if envs.SGLANG_RUST_SERVER.get() else "/encode"
+        )
     max_new_tokens = 8 if model_info["is_generation"] else 1
     json_data = {
         "sampling_params": {
@@ -2304,6 +2306,13 @@ def _execute_server_warmup(server_args: ServerArgs):
             server_args.debug_tensor_dump_input_file
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
+
+    if envs.SGLANG_RUST_SERVER.get() and not model_info["is_generation"]:
+        embedding_input = json_data.get("input_ids", json_data.get("text"))
+        json_data = {
+            "model": model_info.get("served_model_name", get_serving().served_model_name),
+            "input": embedding_input,
+        }
 
     # Send a warmup request
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()

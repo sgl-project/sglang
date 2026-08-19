@@ -8,7 +8,7 @@ use bytes::Bytes;
 use itertools::izip;
 use serde::Deserialize;
 
-use super::io_struct::{ControlRequest, TokenizedGenerateReqInput};
+use super::io_struct::{ControlRequest, TokenizedEmbeddingReqInput, TokenizedGenerateReqInput};
 use super::response::ResponseSink;
 use super::sampling::{SamplingParams, SamplingParamsInput};
 use super::types::{OneOrMany, OneOrManyItem, TokenIds};
@@ -573,6 +573,9 @@ pub struct SchedulerRequest {
 pub enum RequestKind {
     /// `/generate`: tokenize (if needed) then push a `TokenizedGenerateReqInput`.
     Generate(Box<GenerateRequest>),
+    /// `/v1/embeddings`: tokenize (if needed), then push a real
+    /// `TokenizedEmbeddingReqInput` to the existing Python scheduler.
+    Embedding(Box<EmbeddingRequest>),
     /// A control endpoint (e.g. `/server_info`, `/health`): no tokenization, and
     /// the response is a single non-streamed JSON result.
     Control(Box<ControlRequest>),
@@ -583,6 +586,63 @@ pub enum RequestKind {
     /// (the raw UTF-8 text). First caller: `/v1/completions` `echo` for
     /// token-id prompts; a future `/detokenize` parity endpoint maps 1:1.
     Detokenize { token_ids: TokenIds },
+}
+
+/// One item of an OpenAI embedding request. Batch requests are fanned out at
+/// the HTTP boundary so every item has its own scheduler lifecycle and RID.
+#[derive(Debug)]
+pub struct EmbeddingRequest {
+    pub rid: Rid,
+    pub text: Option<String>,
+    pub input_ids: Option<TokenIds>,
+    pub dimensions: Option<i64>,
+    pub priority: Option<i64>,
+    /// Scheduler ABI filler. Embeddings do not sample, but the Python request
+    /// struct requires a SamplingParams value with zero generated tokens.
+    pub sampling_params: SamplingParams,
+}
+
+impl EmbeddingRequest {
+    pub fn new(
+        rid: Rid,
+        text: Option<String>,
+        input_ids: Option<TokenIds>,
+        dimensions: Option<i64>,
+        priority: Option<i64>,
+    ) -> Self {
+        Self {
+            rid,
+            text,
+            input_ids,
+            dimensions,
+            priority,
+            sampling_params: SamplingParams {
+                max_new_tokens: Some(0),
+                // The Rust ingress intentionally skips generation normalization.
+                // Keep Python's msgspec __post_init__ from resetting the already
+                // materialized internal stop lists back to None on decode.
+                is_normalized: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    pub fn already_tokenized(&self) -> bool {
+        self.input_ids.as_ref().is_some_and(|ids| !ids.is_empty())
+    }
+
+    pub fn encode_header(&self) -> Result<Bytes, Error> {
+        TokenizedEmbeddingReqInput::from(self).encode()
+    }
+
+    pub fn encode_data_buf(&self) -> Bytes {
+        let ids = self.input_ids.as_deref().unwrap_or(&[]);
+        let mut buf = Vec::with_capacity(ids.len() * 8);
+        for &id in ids {
+            buf.extend_from_slice(&(id as i64).to_le_bytes());
+        }
+        Bytes::from(buf)
+    }
 }
 
 /// A single in-flight `/generate` request (per-item from
