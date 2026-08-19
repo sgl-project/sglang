@@ -99,14 +99,16 @@ class Cosmos3ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         # The vision encoder weights live in a separate ``vision_encoder/``
         # subfolder, so load them as a secondary weight source.
         server_args = get_global_server_args()
-        self.secondary_weights = [
-            DefaultModelLoader.Source(
-                model_or_path=server_args.model_path,
-                revision=getattr(server_args, "revision", None),
-                prefix="",
-                allow_patterns_overrides=["vision_encoder/*.safetensors"],
+        self.secondary_weights = []
+        if not self.language_model_only:
+            self.secondary_weights.append(
+                DefaultModelLoader.Source(
+                    model_or_path=server_args.model_path,
+                    revision=getattr(server_args, "revision", None),
+                    prefix="",
+                    allow_patterns_overrides=["vision_encoder/*.safetensors"],
+                )
             )
-        ]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         return super().load_weights(self.hf_to_sglang_mapper.apply(weights))
