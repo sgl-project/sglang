@@ -16,13 +16,13 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 class TestFp8UtilsMxfp4(CustomTestCase):
     def test_fake_flashinfer_mxfp8_quantize_linear_scale_shape(self):
-        input = torch.empty((3, 60), dtype=torch.bfloat16)
+        input = torch.empty((2, 3, 60), dtype=torch.bfloat16)
 
         quantized, scale = _fake_flashinfer_mxfp8_quantize(input, False, alignment=64)
 
-        self.assertEqual(quantized.shape, torch.Size([3, 64]))
+        self.assertEqual(quantized.shape, torch.Size([6, 64]))
         self.assertEqual(quantized.dtype, torch.float8_e4m3fn)
-        self.assertEqual(scale.shape, torch.Size([6]))
+        self.assertEqual(scale.shape, torch.Size([12]))
         self.assertEqual(scale.dtype, torch.uint8)
 
     def test_fake_flashinfer_mxfp8_quantize_swizzled_scale_shape(self):
