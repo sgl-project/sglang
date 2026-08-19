@@ -28,8 +28,8 @@ class SanaVAEArchConfig(VAEArchConfig):
 class SanaVAEConfig(VAEConfig):
     arch_config: SanaVAEArchConfig = field(default_factory=SanaVAEArchConfig)
 
-    # DC-AE does not currently support tiling in our wrapper.
-    # Enable these once the diffusers AutoencoderDC adds tiling support.
+    # NOTE: these flags are not read by the AutoencoderDC wrapper. Tiled decode
+    # for DC-AE is controlled by SanaPipelineConfig.vae_tiling (--vae-tiling).
     use_tiling: bool = False
     use_temporal_tiling: bool = False
     use_parallel_tiling: bool = False

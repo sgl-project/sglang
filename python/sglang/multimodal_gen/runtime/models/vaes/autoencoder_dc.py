@@ -139,6 +139,16 @@ class AutoencoderDC(nn.Module, LayerwiseOffloadableModuleMixin):
         # Proxy to the inner diffusers model, which already implements tiled
         # decode; this wrapper just didn't forward the call before.
         self._ensure_inner_model()
+        if self._spatial_parallel_decode_enabled:
+            # Tiling runs diffusers' tiled_decode independently inside each
+            # rank's height shard, which breaks the halo exchange of the
+            # spatially sharded decoder (mismatched collective rounds / wrong
+            # neighbours). Keep the two mutually exclusive.
+            logger.warning_once(
+                "AutoencoderDC: --vae-tiling is ignored because spatial-shard "
+                "parallel decode is enabled; the two cannot be combined."
+            )
+            return
         self._inner_model.enable_tiling(*args, **kwargs)
 
     def disable_tiling(self):
