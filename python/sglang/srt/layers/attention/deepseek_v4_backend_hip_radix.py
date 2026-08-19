@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -28,7 +29,14 @@ from sglang.srt.layers.attention.dsv4.compressor_v2 import (
     FusedCompressMetadata,
     create_paged_compressor_data,
 )
+from sglang.srt.layers.attention.dsv4.dcp import (
+    build_local_page_table,
+    local_swa_lens,
+    select_dcp_attn_sink,
+    validate_dsv4_dcp_topology,
+)
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, dcp_a2a_lse_reduce
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
     copy_metadata,
@@ -232,7 +240,12 @@ class DSV4AttnMetadata:
             ],
         )
 
-    def init_compression_metadata(self, unified_swa_pages: int = 0):
+    def init_compression_metadata(
+        self,
+        unified_swa_pages: int = 0,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
+    ):
         assert self.page_table.dim() == 2
         assert (
             self.raw_out_loc.shape == self.seq_lens_casual.shape
@@ -255,6 +268,8 @@ class DSV4AttnMetadata:
             self.page_table,
             self.page_size,
             compute_page_indices=True,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
         )
 
         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
@@ -263,8 +278,16 @@ class DSV4AttnMetadata:
         if unified_swa_pages:
             if self.unified is None:
                 self.unified = UnifiedKvMetadata()
-            self.unified.c4_out_loc = self.c4_out_loc + unified_swa_pages
-            self.unified.c128_out_loc = self.c128_out_loc + unified_swa_pages
+            self.unified.c4_out_loc = torch.where(
+                self.c4_out_loc >= 0,
+                self.c4_out_loc + unified_swa_pages,
+                self.c4_out_loc,
+            )
+            self.unified.c128_out_loc = torch.where(
+                self.c128_out_loc >= 0,
+                self.c128_out_loc + unified_swa_pages,
+                self.c128_out_loc,
+            )
 
     _CP_REINDEX_FIELDS = [
         "seq_lens_casual",
@@ -468,6 +491,39 @@ class DeepseekV4HipRadixBackend(
             getattr(model_runner, "is_draft_worker", False)
             and model_runner.spec_algorithm.is_dspark()
         )
+        self.is_draft_worker = getattr(model_runner, "is_draft_worker", False)
+        allocator = model_runner.token_to_kv_pool_allocator
+        self.dsv4_dcp_size = (
+            getattr(allocator, "dcp_size", 1) if not self.is_draft_worker else 1
+        )
+        self.dsv4_dcp_rank = (
+            getattr(allocator, "dcp_rank", 0) if not self.is_draft_worker else 0
+        )
+        if self.dsv4_dcp_size > 1:
+            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
+                is_unified_kv_triton,
+            )
+            from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+
+            if not is_unified_kv_triton():
+                raise NotImplementedError(
+                    "DeepSeek V4 DCP requires "
+                    "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton."
+                )
+            parallel = get_parallel()
+            validate_dsv4_dcp_topology(
+                dcp_size=self.dsv4_dcp_size,
+                dcp_rank=self.dsv4_dcp_rank,
+                attn_tp_size=parallel.attn_tp_size,
+                attn_tp_rank=parallel.attn_tp_rank,
+                attn_dp_size=parallel.attn_dp_size,
+            )
+            if is_dsa_enable_prefill_cp():
+                raise NotImplementedError(
+                    "DeepSeek V4 DCP cannot be combined with DSA prefill context "
+                    "parallelism until the two-dimensional token/head exchange is "
+                    "implemented."
+                )
         self.target_verify_num_draft_tokens = self.speculative_num_draft_tokens
         if self.is_dspark_draft:
             assert self.speculative_num_draft_tokens is not None
@@ -1159,6 +1215,8 @@ class DeepseekV4HipRadixBackend(
             win=pool.unified_swa_window,
             ring_stride=pool.unified_swa_ring_size,
             swa_pages=pool.unified_swa_pages,
+            dcp_size=self.dsv4_dcp_size,
+            dcp_rank=self.dsv4_dcp_rank,
         )
         # SWA ring write target, same value for every layer this forward.
         req_slot = state_slot.to(torch.int64)
@@ -1277,24 +1335,62 @@ class DeepseekV4HipRadixBackend(
             elif compress_ratio == 4:
                 kv_indices = unified_metadata.csa_indices
                 kv_indptr = unified_metadata.csa_indptr
-                runtime.fill_compress_tail(
-                    indices=kv_indices,
-                    indptr=kv_indptr,
-                    prefix_len=core_attn_metadata.swa_topk_lengths[:T],
-                    page_indices=c4_pi[:T],
-                    valid_len=core_attn_metadata.c4_sparse_topk_lengths_raw[:T],
-                    swa_pages=swa_pages,
-                )
+                if self.dsv4_dcp_size == 1:
+                    runtime.fill_compress_tail(
+                        indices=kv_indices,
+                        indptr=kv_indptr,
+                        prefix_len=core_attn_metadata.swa_topk_lengths[:T],
+                        page_indices=c4_pi[:T],
+                        valid_len=core_attn_metadata.c4_sparse_topk_lengths_raw[:T],
+                        swa_pages=swa_pages,
+                    )
             else:
                 raise ValueError(f"bad compress_ratio {compress_ratio}")
-            return runtime.decode(
+            if self.dsv4_dcp_size == 1:
+                return runtime.decode(
+                    q=q,
+                    unified_kv=unified,
+                    kv_indices=kv_indices,
+                    kv_indptr=kv_indptr,
+                    attn_sink=attn_sink,
+                    softmax_scale=self.softmax_scale,
+                )
+
+            group = get_parallel().dcp_group
+            local_num_heads = q.shape[1]
+            q = group.all_gather(q.contiguous(), dim=1).contiguous()
+            shifted_sink = select_dcp_attn_sink(
+                attn_sink,
+                local_num_heads,
+                get_parallel().attn_tp_rank,
+                self.dsv4_dcp_size,
+                self.dsv4_dcp_rank,
+            ) - torch.log(
+                torch.tensor(
+                    float(self.dsv4_dcp_size),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+            )
+            partial_out, partial_lse = runtime.decode(
                 q=q,
                 unified_kv=unified,
                 kv_indices=kv_indices,
                 kv_indptr=kv_indptr,
-                attn_sink=attn_sink,
+                attn_sink=shifted_sink,
                 softmax_scale=self.softmax_scale,
+                return_lse=True,
             )
+            comm_backend = get_parallel().dcp_comm_backend
+            if comm_backend in ("a2a", "fi_a2a"):
+                return dcp_a2a_lse_reduce(
+                    partial_out.contiguous(),
+                    partial_lse.contiguous(),
+                    group,
+                    is_lse_base_on_e=True,
+                    comm_backend=comm_backend,
+                )
+            return cp_lse_ag_out_rs_mha(partial_out, partial_lse, group)
 
         # prefill / extend
         state_slot = core_attn_metadata.unified.pf_state_slot
@@ -1356,23 +1452,61 @@ class DeepseekV4HipRadixBackend(
             swa_pages=swa_pages,
             c128_page_indices=c128_pi,
             c4_sparse_page_indices=c4_pi,
+            dcp_size=self.dsv4_dcp_size,
+            dcp_rank=self.dsv4_dcp_rank,
         )
 
         if kpre_p.shape[0] < T + 1:
             pad = T + 1 - kpre_p.shape[0]
             kpre_p = torch.cat([kpre_p, kpre_p[-1:].expand(pad)])
             kext_p = torch.cat([kext_p, kext_p[-1:].expand(pad)])
-        o = runtime.prefill(
-            q=q,
-            unified_kv=unified,
-            kv_indices_prefix=kpre_i,
-            kv_indptr_prefix=kpre_p,
-            kv_extend=kv,
-            kv_indices_extend=kext_i,
-            kv_indptr_extend=kext_p,
-            attn_sink=attn_sink,
-            softmax_scale=self.softmax_scale,
-        )
+        if self.dsv4_dcp_size == 1:
+            o = runtime.prefill(
+                q=q,
+                unified_kv=unified,
+                kv_indices_prefix=kpre_i,
+                kv_indptr_prefix=kpre_p,
+                kv_extend=kv,
+                kv_indices_extend=kext_i,
+                kv_indptr_extend=kext_p,
+                attn_sink=attn_sink,
+                softmax_scale=self.softmax_scale,
+            )
+        else:
+            group = get_parallel().dcp_group
+            local_num_heads = q.shape[1]
+            q = group.all_gather(q.contiguous(), dim=1).contiguous()
+            dcp_sink = select_dcp_attn_sink(
+                attn_sink,
+                local_num_heads,
+                get_parallel().attn_tp_rank,
+                self.dsv4_dcp_size,
+                self.dsv4_dcp_rank,
+            )
+            partial_out, partial_lse = runtime.prefill(
+                q=q,
+                unified_kv=unified,
+                kv_indices_prefix=kpre_i,
+                kv_indptr_prefix=kpre_p,
+                kv_extend=kv,
+                kv_indices_extend=kext_i,
+                kv_indptr_extend=kext_p,
+                attn_sink=dcp_sink,
+                softmax_scale=self.softmax_scale,
+                return_lse=True,
+                replicated_logit_shift=-math.log(float(self.dsv4_dcp_size)),
+            )
+            comm_backend = get_parallel().dcp_comm_backend
+            if comm_backend in ("a2a", "fi_a2a"):
+                o = dcp_a2a_lse_reduce(
+                    partial_out.contiguous(),
+                    partial_lse.contiguous(),
+                    group,
+                    is_lse_base_on_e=True,
+                    comm_backend=comm_backend,
+                )
+            else:
+                o = cp_lse_ag_out_rs_mha(partial_out, partial_lse, group)
 
         # write this chunk's SWA K into the ring for future chunks / decode
         # only the final-window tokens per request
@@ -1683,12 +1817,20 @@ class DeepseekV4HipRadixBackend(
         )
 
         raw_positions = seq_lens_casual - 1
-        swa_topk_lengths = torch.clamp(seq_lens_casual, max=SWA_WINDOW)
+        swa_topk_lengths = local_swa_lens(
+            seq_lens_casual,
+            SWA_WINDOW,
+            self.dsv4_dcp_size,
+            self.dsv4_dcp_rank,
+        ).to(torch.int32)
 
-        page_table = req_to_token[
-            req_pool_indices_repeated, : max_seq_len : self.page_size
-        ]
-        page_table = (page_table // self.page_size).to(torch.int32)
+        page_table = build_local_page_table(
+            req_to_token,
+            req_pool_indices_repeated,
+            max_seq_len,
+            self.page_size,
+            self.dsv4_dcp_size,
+        )
 
         core_attn_metadata = DSV4AttnMetadata(
             page_size=self.page_size,
@@ -1704,7 +1846,9 @@ class DeepseekV4HipRadixBackend(
 
         if need_compress:
             core_attn_metadata.init_compression_metadata(
-                unified_swa_pages=getattr(self.token_to_kv_pool, "unified_swa_pages", 0)
+                unified_swa_pages=getattr(self.token_to_kv_pool, "unified_swa_pages", 0),
+                dcp_size=self.dsv4_dcp_size,
+                dcp_rank=self.dsv4_dcp_rank,
             )
             core_attn_metadata.init_flashmla_related()
         else:

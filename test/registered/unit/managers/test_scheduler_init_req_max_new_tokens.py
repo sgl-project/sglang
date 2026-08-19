@@ -50,11 +50,15 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         max_req_len: int = 128,
         max_total_num_tokens: int = 1024,
         page_size: int = 1,
+        allocation_page_size: int | None = None,
     ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_req_len = max_req_len
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=allocation_page_size or page_size
+        )
         scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         return scheduler
 
@@ -75,15 +79,18 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         max_new_tokens = req.sampling_params.max_new_tokens
 
         input_len = len(req.origin_input_ids)
-        page_size = scheduler.page_size
+        page_size = scheduler.token_to_kv_pool_allocator.page_size
         paged_input_len = -(-input_len // page_size) * page_size
         limit = scheduler.max_new_tokens_limit
         limit_active = limit is not None and limit > 0
 
         def satisfies_rules(candidate: int) -> bool:
             context_ok = input_len + candidate < scheduler.max_req_len
+            logical_capacity = (
+                scheduler.max_total_num_tokens * get_parallel().attn_dcp_size
+            )
             budget_ok = (
-                paged_input_len + candidate + page_size < scheduler.max_total_num_tokens
+                paged_input_len + candidate + page_size < logical_capacity
             )
             limit_ok = not limit_active or candidate <= limit
             requested_ok = requested is None or candidate <= requested
@@ -142,6 +149,20 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             self.assertEqual(
                 self._init_and_check(scheduler, req),
                 max_total_num_tokens - paged_input_len - page_size - 1,
+            )
+
+    def test_dcp_budget_uses_widened_allocation_page(self):
+        with get_parallel().override(attn_dcp_size=8):
+            scheduler = self._new_scheduler(
+                max_req_len=1 << 20,
+                max_total_num_tokens=1024,
+                page_size=256,
+                allocation_page_size=2048,
+            )
+            req = self._new_req(max_new_tokens=1 << 20, input_len=1)
+            self.assertEqual(
+                self._init_and_check(scheduler, req),
+                1024 * 8 - 2048 - 2048 - 1,
             )
 
     def test_min_new_tokens_clamped_to_limit(self):

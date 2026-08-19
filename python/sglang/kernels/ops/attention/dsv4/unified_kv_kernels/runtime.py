@@ -36,6 +36,7 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode import (
 )
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_decode_indices import (
     write_v4_paged_decode_indices,
+    write_v4_paged_single_stream_indices,
 )
 from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_prefill import (
     sparse_attn_v4_paged_prefill,
@@ -169,6 +170,118 @@ def _lengths_to_indptr(lengths: torch.Tensor) -> torch.Tensor:
     return F.pad(torch.cumsum(lengths, dim=0, dtype=torch.int32), (1, 0))
 
 
+def build_dcp_decode_streams_reference(
+    *,
+    state_slot: torch.Tensor,
+    positions: torch.Tensor,
+    hca_page_indices: torch.Tensor,
+    win: int,
+    ring_stride: int,
+    swa_pages: int,
+    dcp_size: int,
+    dcp_rank: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    if dcp_size < 1 or not 0 <= dcp_rank < dcp_size:
+        raise ValueError(
+            f"Invalid DCP geometry: dcp_size={dcp_size}, dcp_rank={dcp_rank}"
+        )
+    device = positions.device
+    swa_segments = []
+    hca_segments = []
+    for row, position in enumerate(positions.tolist()):
+        start = max(0, position - win + 1)
+        owned_positions = torch.tensor(
+            [
+                key_position
+                for key_position in range(start, position + 1)
+                if key_position % dcp_size == dcp_rank
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        swa = (
+            state_slot[row].to(torch.int32) * ring_stride
+            + owned_positions % ring_stride
+        )
+        hca_valid = hca_page_indices[row]
+        hca_valid = hca_valid[hca_valid >= 0].to(torch.int32) + swa_pages
+        swa_segments.append(swa)
+        hca_segments.append(torch.cat((swa, hca_valid)))
+
+    swa_lens = torch.tensor(
+        [segment.numel() for segment in swa_segments],
+        dtype=torch.int32,
+        device=device,
+    )
+    hca_lens = torch.tensor(
+        [segment.numel() for segment in hca_segments],
+        dtype=torch.int32,
+        device=device,
+    )
+    swa_indices = (
+        torch.cat(swa_segments)
+        if swa_segments
+        else torch.empty(0, dtype=torch.int32, device=device)
+    )
+    hca_indices = (
+        torch.cat(hca_segments)
+        if hca_segments
+        else torch.empty(0, dtype=torch.int32, device=device)
+    )
+    return (
+        swa_indices,
+        _lengths_to_indptr(swa_lens),
+        hca_indices,
+        _lengths_to_indptr(hca_lens),
+    )
+
+
+def build_dcp_csa_stream_reference(
+    *,
+    state_slot: torch.Tensor,
+    positions: torch.Tensor,
+    c4_page_indices: torch.Tensor,
+    win: int,
+    ring_stride: int,
+    swa_pages: int,
+    dcp_size: int,
+    dcp_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    device = positions.device
+    segments = []
+    for row, position in enumerate(positions.tolist()):
+        start = max(0, position - win + 1)
+        swa = torch.tensor(
+            [
+                state_slot[row].item() * ring_stride
+                + key_position % ring_stride
+                for key_position in range(start, position + 1)
+                if key_position % dcp_size == dcp_rank
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        c4 = c4_page_indices[row]
+        c4 = c4[c4 >= 0].to(torch.int32) + swa_pages
+        segments.append(torch.cat((swa, c4)))
+    lengths = torch.tensor(
+        [segment.numel() for segment in segments],
+        dtype=torch.int32,
+        device=device,
+    )
+    indices = (
+        torch.cat(segments)
+        if segments
+        else torch.empty(0, dtype=torch.int32, device=device)
+    )
+    return indices, _lengths_to_indptr(lengths)
+
+
 def decode(
     *,
     q: torch.Tensor,  # [T, H, D] (local heads)
@@ -177,9 +290,16 @@ def decode(
     kv_indptr: torch.Tensor,
     attn_sink: torch.Tensor,  # [H] fp32
     softmax_scale: float,
-) -> torch.Tensor:
+    return_lse: bool = False,
+):
     return sparse_attn_v4_paged_decode(
-        q, unified_kv, kv_indices, kv_indptr, attn_sink, softmax_scale
+        q,
+        unified_kv,
+        kv_indices,
+        kv_indptr,
+        attn_sink,
+        softmax_scale,
+        return_lse=return_lse,
     )
 
 
@@ -246,6 +366,8 @@ def build_decode_streams(
     win: int,  # SWA attention window length
     ring_stride: int,  # SWA ring per-slot stride
     swa_pages: int,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
@@ -255,6 +377,14 @@ def build_decode_streams(
     state_slot = state_slot.to(torch.int32)
     positions = positions.to(torch.int32)
     hca_width = hca_page_indices.shape[1]
+
+    if dcp_size > 1:
+        starts = torch.clamp(positions - win + 1, min=0)
+        first_owned = starts + torch.remainder(dcp_rank - starts, dcp_size)
+        swa_len = torch.clamp(
+            (positions + 1 - first_owned + dcp_size - 1) // dcp_size,
+            min=0,
+        ).to(torch.int32)
 
     swa_p = _lengths_to_indptr(swa_len)
     hca_p = _lengths_to_indptr(swa_len + hca_len)
@@ -279,6 +409,8 @@ def build_decode_streams(
             T=N,
             win=win,
             ring_stride=ring_stride,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
         )
         fill_compress_tail(
             indices=hca_i,
@@ -289,6 +421,42 @@ def build_decode_streams(
             swa_pages=swa_pages,
         )
     return swa_i, swa_p, hca_i, hca_p, csa_i, csa_p
+
+
+def update_dcp_csa_stream(
+    *,
+    indices: torch.Tensor,
+    indptr: torch.Tensor,
+    state_slot: torch.Tensor,
+    positions: torch.Tensor,
+    swa_len: torch.Tensor,
+    c4_page_indices: torch.Tensor,
+    c4_len: torch.Tensor,
+    win: int,
+    ring_stride: int,
+    swa_pages: int,
+    dcp_size: int,
+    dcp_rank: int,
+) -> None:
+    indptr.copy_(_lengths_to_indptr(swa_len + c4_len))
+    write_v4_paged_single_stream_indices(
+        state_slot=state_slot,
+        positions=positions,
+        indptr=indptr,
+        indices=indices,
+        win=win,
+        ring_stride=ring_stride,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+    )
+    fill_compress_tail(
+        indices=indices,
+        indptr=indptr,
+        prefix_len=swa_len,
+        page_indices=c4_page_indices,
+        valid_len=c4_len,
+        swa_pages=swa_pages,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +472,8 @@ def _prefill_lengths_kernel(
     win: tl.constexpr,
     Wc: tl.constexpr,
     HAS_COMPRESS: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Per token: write extend/prefix segment lengths"""
@@ -313,7 +483,13 @@ def _prefill_lengths_kernel(
     tpic = pos - cstart
     swa_low = tl.maximum(pos - win + 1, 0)
     extend_count = tl.minimum(tpic + 1, win)
-    prefix_swa_count = tl.minimum(tl.maximum(cstart - swa_low, 0), win)
+    first_owned = swa_low + (
+        DCP_RANK + DCP_SIZE - (swa_low % DCP_SIZE)
+    ) % DCP_SIZE
+    prefix_swa_count = tl.maximum(
+        tl.cdiv(cstart - first_owned, DCP_SIZE),
+        0,
+    )
     tl.store(extend_len_ptr + t, extend_count)
     if HAS_COMPRESS:
         nc = 0
@@ -344,6 +520,8 @@ def _build_prefill_indices_kernel(
     win: tl.constexpr,
     Wc: tl.constexpr,
     HAS_COMPRESS: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Per token: write extend rows + prefix (SWA ring slots ++ swa_pages+compressed slots) as two ragged segments"""
@@ -356,7 +534,13 @@ def _build_prefill_indices_kernel(
     tpic = pos - cstart
     swa_low = tl.maximum(pos - win + 1, 0)
     extend_count = tl.minimum(tpic + 1, win)
-    prefix_swa_count = tl.minimum(tl.maximum(cstart - swa_low, 0), win)
+    first_owned = swa_low + (
+        DCP_RANK + DCP_SIZE - (swa_low % DCP_SIZE)
+    ) % DCP_SIZE
+    prefix_swa_count = tl.maximum(
+        tl.cdiv(cstart - first_owned, DCP_SIZE),
+        0,
+    )
 
     ebase = tl.load(ext_indptr_ptr + t)
     pbase = tl.load(pre_indptr_ptr + t)
@@ -372,7 +556,7 @@ def _build_prefill_indices_kernel(
     for off in tl.range(0, win, BLOCK):
         k = off + tl.arange(0, BLOCK)
         m = k < prefix_swa_count
-        gp = swa_low + k
+        gp = first_owned + k * DCP_SIZE
         tl.store(pre_out_ptr + pbase + k, s * ring_stride + (gp % ring_stride), mask=m)
 
     # ---- prefix compressed: swa_pages + front-packed page index ----
@@ -401,12 +585,15 @@ def build_prefill_indices(
     swa_pages: int,
     c128_page_indices: Optional[torch.Tensor],
     c4_sparse_page_indices: Optional[torch.Tensor],
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build ragged prefill indices: prefix (SWA ring + swa_pages + compressed) into unified_kv + extend into current-chunk kv; returns (prefix_indices, prefix_indptr, extend_indices, extend_indptr)."""
     device = state_slot.device
     T = state_slot.shape[0]
     assert positions.is_contiguous() and chunk_start.is_contiguous()
     assert cu_q.is_contiguous() and state_slot.is_contiguous()
+    assert dcp_size >= 1 and 0 <= dcp_rank < dcp_size
 
     if compress_ratio == 0:
         page_idx = None
@@ -436,6 +623,8 @@ def build_prefill_indices(
         win=win,
         Wc=Wc if has_compress else 1,
         HAS_COMPRESS=has_compress,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
         BLOCK=block,
         num_warps=4,
     )
@@ -460,6 +649,8 @@ def build_prefill_indices(
         win=win,
         Wc=Wc if has_compress else 1,
         HAS_COMPRESS=has_compress,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
         BLOCK=block,
         num_warps=4,
     )
@@ -477,7 +668,9 @@ def prefill(
     kv_indptr_extend: torch.Tensor,
     attn_sink: torch.Tensor,
     softmax_scale: float,
-) -> torch.Tensor:
+    return_lse: bool = False,
+    replicated_logit_shift: float = 0.0,
+):
     return sparse_attn_v4_paged_prefill(
         q,
         unified_kv,
@@ -488,4 +681,6 @@ def prefill(
         kv_indptr_extend,
         attn_sink,
         softmax_scale,
+        return_lse=return_lse,
+        replicated_logit_shift=replicated_logit_shift,
     )
