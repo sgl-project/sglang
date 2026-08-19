@@ -123,9 +123,18 @@ class MoeRunner:
             )
 
             if self.runner_core is None and self.fused_func is None:
+                supported = FusedOpPool.a2a_backends_for(runner_backend_name)
+                if supported:
+                    raise NotImplementedError(
+                        f"MoE runner backend {runner_backend_name!r} has no fused "
+                        f"func for a2a backend {a2a_backend_name!r}. Supported a2a "
+                        f"backend(s) for this runner: {supported}. Set "
+                        f"--moe-a2a-backend to one of them."
+                    )
                 raise NotImplementedError(
-                    f"Runner backend {runner_backend} requires a fused func for a2a backend "
-                    f"{a2a_backend_name}, but none is registered."
+                    f"MoE runner backend {runner_backend_name!r} has no fused func "
+                    f"for a2a backend {a2a_backend_name!r}, and none is registered "
+                    f"for any a2a backend, so it cannot run on the fused-only path."
                 )
 
         self.down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = None

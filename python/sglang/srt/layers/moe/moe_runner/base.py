@@ -139,6 +139,15 @@ class FusedOpPool:
         fused_func = cls._fused_funcs.get(key)
         return fused_func
 
+    @classmethod
+    def a2a_backends_for(cls, runner_name: str) -> list[str]:
+        """The a2a backend names that have a fused func registered for
+        ``runner_name`` (sorted). Used to build an actionable error when a
+        fused-only runner is paired with an unsupported a2a backend."""
+        return sorted(
+            a2a for (a2a, runner) in cls._fused_funcs if runner == runner_name
+        )
+
 
 class PermuteMethodPool:
     _pre_permute_methods: dict[
