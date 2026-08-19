@@ -21,6 +21,7 @@ class CompactMambaPrefillCheckpoints(msgspec.Struct, frozen=True):
 
 class MambaSSUBackend(ABC):
     prefill_requires_chunk_metadata = False
+    prefill_supports_direct_checkpoints = False
 
     def prefill_metadata_chunk_size(self, chunk_size: int) -> int:
         """Physical chunk size used to construct this backend's metadata."""
@@ -159,6 +160,7 @@ class FlashInferSSUBackend(MambaSSUBackend):
         self._prefill_backend = None
         self._prefill_runners = {}
         self._zero_initial_states = {}
+        self._compact_checkpoint_states = {}
 
     @property
     def name(self) -> str:
@@ -302,6 +304,32 @@ class FlashInferSSUBackend(MambaSSUBackend):
                 device=x.device,
             )
             self._zero_initial_states[key] = states
+        return states
+
+    def _get_compact_checkpoint_states(
+        self,
+        *,
+        x: torch.Tensor,
+        B: torch.Tensor,
+        num_checkpoints: int,
+        state_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        key = (
+            x.device.index,
+            num_checkpoints,
+            x.shape[2],
+            x.shape[3],
+            B.shape[3],
+            state_dtype,
+        )
+        states = self._compact_checkpoint_states.get(key)
+        if states is None:
+            states = torch.empty(
+                (num_checkpoints, x.shape[2], x.shape[3], B.shape[3]),
+                dtype=state_dtype,
+                device=x.device,
+            )
+            self._compact_checkpoint_states[key] = states
         return states
 
     def _run_compact_checkpoints(
@@ -449,6 +477,8 @@ class FlashInferSSUBackend(MambaSSUBackend):
         checkpoint_seq_indices: tuple[int, ...] = (),
         checkpoint_seq_starts: tuple[int, ...] = (),
         checkpoint_lengths: tuple[int, ...] = (),
+        checkpoint_token_indices: torch.Tensor | None = None,
+        checkpoint_state_slots: torch.Tensor | None = None,
     ):
         if self._prefill_backend is None:
             return self._prefill_kernel(
@@ -543,23 +573,37 @@ class FlashInferSSUBackend(MambaSSUBackend):
             seq_idx=seq_idx,
             chunk_size=chunk_size,
         )
-        compact_checkpoints = self._run_compact_checkpoints(
-            x=x,
-            dt=dt,
-            A=A,
-            B=B,
-            C=C,
-            D=D,
-            z=z,
-            dt_bias=dt_bias,
-            dt_softplus=dt_softplus,
-            dt_limit=dt_limit,
-            initial_states=initial_states,
-            checkpoint_seq_indices=checkpoint_seq_indices,
-            checkpoint_seq_starts=checkpoint_seq_starts,
-            checkpoint_lengths=checkpoint_lengths,
-            chunk_size=chunk_size,
-        )
+        direct_checkpoint_states = None
+        if self._prefill_backend == "cake" and checkpoint_seq_indices:
+            if checkpoint_token_indices is None or checkpoint_state_slots is None:
+                raise ValueError("Cake compact checkpoints require device metadata")
+            direct_checkpoint_states = self._get_compact_checkpoint_states(
+                x=x,
+                B=B,
+                num_checkpoints=len(checkpoint_seq_indices),
+                state_dtype=state_dtype,
+            )
+            compact_checkpoints = CompactMambaPrefillCheckpoints(
+                direct_checkpoint_states
+            )
+        else:
+            compact_checkpoints = self._run_compact_checkpoints(
+                x=x,
+                dt=dt,
+                A=A,
+                B=B,
+                C=C,
+                D=D,
+                z=z,
+                dt_bias=dt_bias,
+                dt_softplus=dt_softplus,
+                dt_limit=dt_limit,
+                initial_states=initial_states,
+                checkpoint_seq_indices=checkpoint_seq_indices,
+                checkpoint_seq_starts=checkpoint_seq_starts,
+                checkpoint_lengths=checkpoint_lengths,
+                chunk_size=chunk_size,
+            )
         output, varlen_states = runner.run(
             x_padded,
             dt_padded,
@@ -575,6 +619,17 @@ class FlashInferSSUBackend(MambaSSUBackend):
             seq_idx=seq_idx,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
+            checkpoint_token_indices=(
+                checkpoint_token_indices
+                if direct_checkpoint_states is not None
+                else None
+            ),
+            checkpoint_state_slots=(
+                checkpoint_state_slots
+                if direct_checkpoint_states is not None
+                else None
+            ),
+            checkpoint_states=direct_checkpoint_states,
             out=None,
             return_final_states=True,
         )
@@ -624,6 +679,8 @@ class FlashInferSSDCombinedSSUBackend(FlashInferSSUBackend):
 
 class CakeSSUBackend(FlashInferSSDCombinedSSUBackend):
     """Cake SSDCombined prefill with FlashInfer selective-state-update decode."""
+
+    prefill_supports_direct_checkpoints = True
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -771,6 +828,13 @@ def mamba_chunk_scan_combined(*args, **kwargs):
 def mamba_prefill_requires_chunk_metadata() -> bool:
     """Whether the selected prefill backend needs logical chunks unconditionally."""
     return bool(getattr(_mamba_ssu_backend, "prefill_requires_chunk_metadata", False))
+
+
+def mamba_prefill_supports_direct_checkpoints() -> bool:
+    """Whether prefill can emit selected radix checkpoint states in one pass."""
+    return bool(
+        getattr(_mamba_ssu_backend, "prefill_supports_direct_checkpoints", False)
+    )
 
 
 def mamba_prefill_metadata_chunk_size(chunk_size: int) -> int:

@@ -39,6 +39,7 @@ def _flashinfer_backend_without_imports():
     backend._prefill_backend = "cute"
     backend._prefill_runners = {}
     backend._zero_initial_states = {}
+    backend._compact_checkpoint_states = {}
     return backend
 
 
@@ -196,6 +197,57 @@ def test_ssd_prefill_returns_compact_unaligned_radix_checkpoint(monkeypatch):
     assert torch.equal(
         replay_kwargs["seq_idx"], torch.zeros((1, 128), dtype=torch.int32)
     )
+
+
+def test_cake_prefill_fuses_compact_checkpoint_into_main_run(monkeypatch):
+    backend = _flashinfer_backend_without_imports()
+    backend._prefill_backend = "cake"
+    runner = _FakeSSDCombined()
+    monkeypatch.setattr(backend, "_get_prefill_runner", lambda **_: runner)
+
+    nheads, headdim, ngroups, dstate = 2, 4, 1, 3
+    x = torch.randn(1, 256, nheads, headdim, dtype=torch.bfloat16)
+    dt = torch.randn(1, 256, nheads, dtype=torch.bfloat16)
+    B = torch.randn(1, 256, ngroups, dstate, dtype=torch.bfloat16)
+    C = torch.randn_like(B)
+    checkpoint_tokens = torch.tensor([-1, 256], dtype=torch.int32)
+    checkpoint_slots = torch.tensor([-1, 0], dtype=torch.int32)
+    intermediate, final = backend.chunk_scan_combined(
+        x,
+        dt,
+        -torch.ones(nheads),
+        B,
+        C,
+        128,
+        seq_idx=torch.cat(
+            (
+                torch.zeros(128, dtype=torch.int32),
+                torch.ones(128, dtype=torch.int32),
+            )
+        ).unsqueeze(0),
+        chunk_indices=torch.arange(2, dtype=torch.int32),
+        chunk_offsets=torch.zeros(2, dtype=torch.int32),
+        cu_seqlens=torch.tensor([0, 128, 256], dtype=torch.int32),
+        dt_softplus=True,
+        out=torch.empty_like(x),
+        return_varlen_states=True,
+        return_intermediate_states=True,
+        state_dtype=torch.bfloat16,
+        checkpoint_seq_indices=(1,),
+        checkpoint_seq_starts=(128,),
+        checkpoint_lengths=(128,),
+        checkpoint_token_indices=checkpoint_tokens,
+        checkpoint_state_slots=checkpoint_slots,
+    )
+
+    assert isinstance(intermediate, ssu_dispatch.CompactMambaPrefillCheckpoints)
+    assert intermediate.states.shape == (1, nheads, headdim, dstate)
+    assert final.shape == (2, nheads, headdim, dstate)
+    assert len(runner.calls) == 1
+    kwargs = runner.calls[0][-1]
+    assert kwargs["checkpoint_states"] is intermediate.states
+    assert kwargs["checkpoint_token_indices"] is checkpoint_tokens
+    assert kwargs["checkpoint_state_slots"] is checkpoint_slots
 
 
 def test_flashinfer_prefill_refuses_non_sglang_return_contract():
