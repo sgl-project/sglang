@@ -593,9 +593,24 @@ class OpenAIServingResponses(OpenAIServingChat):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
         processed_messages = self._process_messages(chat_request, is_multimodal)
 
-        if is_multimodal:
-            request_prompts = [processed_messages.prompt]
-            engine_prompts = [processed_messages.prompt]
+        if is_multimodal and self.chat_encoding_spec == "kimi_k3":
+            # The kimi_k3 custom encoder yields non-empty prompt_ids but leaves
+            # prompt == "" (decode only runs in the prompt_ids-is-None branch).
+            # Pass input_ids so the MM processor expands placeholders instead of
+            # re-tokenizing an empty prompt. Mirrors serving_chat's handling.
+            request_prompts = [processed_messages.prompt_ids]
+            engine_prompts = [processed_messages.prompt_ids]
+        elif is_multimodal:
+            if (
+                self.chat_encoding_spec == "inkling"
+                and isinstance(processed_messages.prompt_ids, list)
+                and processed_messages.prompt_ids
+            ):
+                request_prompts = [processed_messages.prompt_ids]
+                engine_prompts = [processed_messages.prompt_ids]
+            else:
+                request_prompts = [processed_messages.prompt]
+                engine_prompts = [processed_messages.prompt]
         else:
             request_prompts = [processed_messages.prompt_ids]
             engine_prompts = [processed_messages.prompt_ids]
