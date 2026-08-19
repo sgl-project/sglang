@@ -14,5 +14,6 @@ pub mod health;
 pub mod policies;
 pub mod proxy;
 pub mod server;
+pub mod session_stats;
 pub mod tokenizer;
 pub mod workers;
