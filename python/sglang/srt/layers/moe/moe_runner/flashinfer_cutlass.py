@@ -8,6 +8,7 @@ Quantization methods prepare a small quant_info payload and route through
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -89,6 +90,10 @@ class FlashInferCutlassMxfp4MoeQuantInfo(MoeQuantInfo):
     swiglu_beta: Optional[torch.Tensor] = None
     swiglu_limit: Optional[torch.Tensor] = None
 
+    # Optional per-expert SiTU scales, fp32 [E].
+    situ_beta: Optional[torch.Tensor] = None
+    situ_linear_beta: Optional[torch.Tensor] = None
+
     # TP/EP topology (forwarded to the FlashInfer kernel)
     moe_tp_size: int = 1
     moe_tp_rank: int = 0
@@ -111,22 +116,44 @@ def _flashinfer_cutlass_fused_moe():
     return cutlass_fused_moe, ActivationType
 
 
+def flashinfer_cutlass_supports_situ() -> bool:
+    """Return whether the installed FlashInfer exposes the CUTLASS SiTU API."""
+    try:
+        cutlass_fused_moe, activation_type = _flashinfer_cutlass_fused_moe()
+        parameters = inspect.signature(cutlass_fused_moe).parameters
+    except (ImportError, RuntimeError, TypeError, ValueError):
+        return False
+    return (
+        hasattr(activation_type, "Situ")
+        and "situ_beta" in parameters
+        and "situ_linear_beta" in parameters
+    )
+
+
 def _activation_type(runner_config: MoeRunnerConfig):
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import get_activation_type
 
     _, ActivationType = _flashinfer_cutlass_fused_moe()
-    activation = ActivationType(
-        get_activation_type(
-            runner_config.activation,
-            is_gated=runner_config.is_gated,
+    situ_type = getattr(ActivationType, "Situ", None)
+    if runner_config.activation == "situ" and runner_config.is_gated:
+        if situ_type is None:
+            raise RuntimeError("FlashInfer CUTLASS SiTU support is not available.")
+        activation = situ_type
+    else:
+        activation = ActivationType(
+            get_activation_type(
+                runner_config.activation,
+                is_gated=runner_config.is_gated,
+            )
         )
-    )
     supported = {
         ActivationType.Swiglu,
         ActivationType.Geglu,
         ActivationType.Relu2,
         ActivationType.Identity,
     }
+    if situ_type is not None:
+        supported.add(situ_type)
     assert activation in supported, (
         f"Activation {runner_config.activation!r} "
         f"(is_gated={runner_config.is_gated}) maps to {activation.name}, "
@@ -308,7 +335,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
         quant_info, FlashInferCutlassMxfp4MoeQuantInfo
     ), f"Unexpected quant_info type for flashinfer_mxfp4: {type(quant_info)}"
 
-    flashinfer_cutlass_fused_moe, ActivationType = _flashinfer_cutlass_fused_moe()
+    flashinfer_cutlass_fused_moe, _ = _flashinfer_cutlass_fused_moe()
 
     x = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
@@ -342,6 +369,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
     if weight_global_scale is not None:
         from flashinfer import mxfp8_quantize
 
+        x = x.contiguous()
         x, input_sf = mxfp8_quantize(
             x,
             is_sf_swizzled_layout=True,
@@ -380,13 +408,15 @@ def fused_experts_none_to_flashinfer_mxfp4(
         swiglu_alpha=quant_info.swiglu_alpha,
         swiglu_beta=quant_info.swiglu_beta,
         swiglu_limit=quant_info.swiglu_limit,
+        situ_beta=quant_info.situ_beta,
+        situ_linear_beta=quant_info.situ_linear_beta,
         tp_size=quant_info.moe_tp_size,
         tp_rank=quant_info.moe_tp_rank,
         ep_size=quant_info.moe_ep_size,
         ep_rank=quant_info.moe_ep_rank,
         use_w4_group_scaling=not use_mxfp8_act_scaling,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
-        activation_type=ActivationType.Swiglu,
+        activation_type=_activation_type(runner_config),
         tune_max_num_tokens=next_power_of_2(x.shape[0]),
         output=out,
         use_fused_finalize=envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get(),
