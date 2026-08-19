@@ -41,9 +41,10 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
     eight otherwise-idle ranks during encoding.
     """
 
-    layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
-
     supports_dp_encode = True
+    # The inherited text-layer list covers Qwen's language stack; reference
+    # modes also execute the embedded visual tower.
+    layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
     supported_checkpoint_quantization_methods = frozenset({"fp8"})
 
     @staticmethod
@@ -191,7 +192,18 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                 )
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             try:
-                weight_loader(param, loaded_weight.to(param.dtype))
+                can_keep_checkpoint_tensor = bool(
+                    getattr(self, "_mps_zero_copy_weight_loading", False)
+                    and weight_loader is default_weight_loader
+                    and param.device.type == "cpu"
+                    and loaded_weight.device.type == "cpu"
+                    and loaded_weight.dtype == param.dtype
+                    and tuple(loaded_weight.shape) == tuple(param.shape)
+                )
+                if can_keep_checkpoint_tensor:
+                    param.data = loaded_weight
+                else:
+                    weight_loader(param, loaded_weight.to(param.dtype))
             except Exception as exc:
                 raise RuntimeError(
                     "Failed to load MiniMax H3 Qwen3-VL weight "
