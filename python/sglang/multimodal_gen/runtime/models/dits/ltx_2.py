@@ -230,12 +230,12 @@ def _ltx2_try_fused_ada_values9(
     if (
         _LTX2_FUSED_ADA_VALUES_RUNTIME_DISABLED
         or get_tp_world_size() != 1
-        or not (timestep.is_cuda or timestep.is_npu)
+        or not current_platform.tensor_on_device(timestep)
         or timestep.dtype != torch.bfloat16
         or timestep.ndim != 3
         or int(timestep.shape[0]) != int(batch_size)
         or not timestep.is_contiguous()
-        or not (scale_shift_table.is_cuda or scale_shift_table.is_npu)
+        or not current_platform.tensor_on_device(scale_shift_table)
         or scale_shift_table.dtype not in (torch.bfloat16, torch.float32)
         or scale_shift_table.ndim != 2
         or int(scale_shift_table.shape[0]) != 9
