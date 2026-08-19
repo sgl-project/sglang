@@ -362,14 +362,14 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         linear_attn_prefill_backend="flashinfer",
     )
     CAKE_PREFILL_CASE = GDNAttentionCase(
-        name="flashinfer_cake_gdn_tp4_prefill_b4_s64",
+        name="flashinfer_cake_gdn_tp4_prefill_b5_s64",
         backend="flashinfer",
         forward_mode=ForwardMode.EXTEND,
         num_k_heads=4,
         num_v_heads=8,
         page_size=16,
-        prefix_lens=(4, 7, 10, 13),
-        extend_lens=(64,) * 4,
+        prefix_lens=(4, 7, 10, 13, 16),
+        extend_lens=(64,) * 5,
         linear_attn_decode_backend="flashinfer",
         linear_attn_prefill_backend="flashinfer",
     )
@@ -424,6 +424,7 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             self.CAKE_PREFILL_CASE,
             head_k_dim=self.HEAD_DIM,
             head_v_dim=self.HEAD_DIM,
+            max_context_len=128,
         )
         initial_ssm_states = _ssm_states(fixture).clone()
         with mock.patch.object(

@@ -190,6 +190,10 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self._cake_gdn_prefill_dummies = {}
         self._cake_gdn_dt_bias_fp32 = {}
         self._cake_gdn_logged_routes = set()
+        self._flashinfer_gdn_should_use_cp_host = None
+        self._flashinfer_gdn_num_sms = None
+        self._flashinfer_gdn_device_name = None
+        self._flashinfer_gdn_device_capability = None
 
         if self.use_state_pool:
             cake_gdn_api = _get_cake_gdn_decode_api()
@@ -203,6 +207,18 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                     pass
                 else:
                     self._cake_gdn_api = cake_gdn_api
+                    try:
+                        from flashinfer.gdn_kernels.delta_rule_dsl.varlen_helper import (
+                            should_use_cp_host,
+                        )
+                    except ImportError:
+                        pass
+                    else:
+                        props = torch.cuda.get_device_properties()
+                        self._flashinfer_gdn_should_use_cp_host = should_use_cp_host
+                        self._flashinfer_gdn_num_sms = props.multi_processor_count
+                        self._flashinfer_gdn_device_name = props.name
+                        self._flashinfer_gdn_device_capability = capability
 
         if sm_major == 9 and self._prefill_fn is None:
             raise RuntimeError("FlashInfer GDN prefill kernel is unavailable.")
@@ -457,6 +473,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         if (
             self._cake_gdn_api is None
+            or self._flashinfer_gdn_should_use_cp_host is None
             or layer_id is None
             or not seq_lens_cpu
             or num_state_checkpoints != 0
@@ -499,6 +516,16 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             or tuple(state.stride()[1:]) != (128 * 128, 128, 1)
             or state.stride(0) < num_v_heads * 128 * 128
         ):
+            return None
+        if self._flashinfer_gdn_should_use_cp_host(
+            num_seqs * num_v_heads,
+            self._flashinfer_gdn_num_sms,
+            self._flashinfer_gdn_device_name,
+            device_capability=self._flashinfer_gdn_device_capability,
+        ):
+            # The frozen public API defaults to use_cp="auto". Preserve that
+            # independent route instead of intercepting the call with Cake's
+            # explicitly non-CP backend.
             return None
 
         try:

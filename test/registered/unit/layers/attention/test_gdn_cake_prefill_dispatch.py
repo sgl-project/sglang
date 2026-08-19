@@ -22,7 +22,7 @@ class _CakeAPI:
     def __init__(self):
         self.select_cake_gdn_prefill_variant = MagicMock(
             return_value=SimpleNamespace(
-                route_id="cake.gdn_prefill.noncp.dvsplit",
+                route_id="cake.gdn_prefill.noncp.full_dv",
                 variant_name="prefill_bf16_indexed",
             )
         )
@@ -37,14 +37,18 @@ def _kernel_and_inputs():
     kernel._cake_gdn_arch = "sm_100a"
     kernel._cake_gdn_entries = {"prefill_bf16_indexed": entry}
     kernel._cake_gdn_logged_routes = set()
+    kernel._flashinfer_gdn_should_use_cp_host = MagicMock(return_value=False)
+    kernel._flashinfer_gdn_num_sms = 148
+    kernel._flashinfer_gdn_device_name = "NVIDIA B200"
+    kernel._flashinfer_gdn_device_capability = (10, 0)
 
-    total_tokens = 128
+    total_tokens = 320
     q = torch.empty(total_tokens, 4, 128, dtype=torch.bfloat16)
     k = torch.empty_like(q)
     v = torch.empty(total_tokens, 8, 128, dtype=torch.bfloat16)
-    state = torch.empty(5, 8, 128, 128, dtype=torch.bfloat16)
-    state_indices = torch.tensor([3, 1], dtype=torch.int32)
-    cu_seqlens = torch.tensor([0, 64, 128], dtype=torch.int32)
+    state = torch.empty(7, 8, 128, 128, dtype=torch.bfloat16)
+    state_indices = torch.tensor([5, 3, 1, 6, 2], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 64, 128, 192, 256, 320], dtype=torch.int32)
     alpha = torch.empty(total_tokens, 8, dtype=torch.float32)
     beta = torch.empty_like(alpha)
     output = torch.empty_like(v)
@@ -66,7 +70,7 @@ def _kernel_and_inputs():
         state=state,
         state_indices=state_indices,
         cu_seqlens=cu_seqlens,
-        seq_lens_cpu=[64, 64],
+        seq_lens_cpu=[64] * 5,
         layer_id=7,
         num_state_checkpoints=0,
         state_checkpoint_every_n_tokens=0,
@@ -82,13 +86,13 @@ class TestCakeGDNPrefillDispatch(unittest.TestCase):
 
         result = kernel._try_cake_prefill(**inputs)
 
-        self.assertEqual(tuple(result.shape), (1, 128, 8, 128))
+        self.assertEqual(tuple(result.shape), (1, 320, 8, 128))
         api.select_cake_gdn_prefill_variant.assert_called_once_with(
             arch="sm_100a",
             io_dtype="bfloat16",
             state_dtype="bfloat16",
-            num_seqs=2,
-            total_seq_len=128,
+            num_seqs=5,
+            total_seq_len=320,
             max_seq_len=64,
             num_q_heads=4,
             num_k_heads=4,
@@ -109,7 +113,15 @@ class TestCakeGDNPrefillDispatch(unittest.TestCase):
         self.assertIs(args[12], workspace)
         self.assertEqual(args[13], inputs["state"].stride(0))
         self.assertEqual(args[14], inputs["state"].stride(0))
-        self.assertEqual(args[20:24], (32, 32, 1, 1))
+        self.assertEqual(args[20:24], (40, 40, 1, 1))
+
+    def test_public_auto_cp_route_is_not_intercepted(self):
+        kernel, api, entry, inputs, *_ = _kernel_and_inputs()
+        kernel._flashinfer_gdn_should_use_cp_host.return_value = True
+
+        self.assertIsNone(kernel._try_cake_prefill(**inputs))
+        api.select_cake_gdn_prefill_variant.assert_not_called()
+        entry.assert_not_called()
 
     def test_checkpoint_and_missing_cpu_metadata_fail_closed(self):
         for override in (
