@@ -1049,9 +1049,7 @@ class ModelRunner:
     def load_model(self):
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(
-            f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
+        logger.info(f"Load weight begin. avail mem={before_avail_memory:.2f} GB")
 
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":
