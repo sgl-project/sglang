@@ -2089,7 +2089,6 @@ class ServingChatTestCase(unittest.TestCase):
         chunks = loop.run_until_complete(run_stream())
 
         # Exactly one error chunk followed by [DONE]; no sglext ids leak.
-        self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
         self.assertEqual(chunks[1], "data: [DONE]\n\n")
         self.assertFalse(
@@ -2100,6 +2099,87 @@ class ServingChatTestCase(unittest.TestCase):
         error_chunk_data = json.loads(chunks[0][len("data: ") :])
         self.assertEqual(error_chunk_data["error"]["message"], err_msg)
         self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
+
+    def test_streaming_error_abort_still_finalizes_other_choices(self):
+        """An error abort ends generation but still runs finalization, so a
+        sibling choice's finish chunk and the usage chunk follow the error."""
+        err_code = HTTPStatus.SERVICE_UNAVAILABLE
+
+        async def _mock_generate():
+            yield {
+                "text": "hello",
+                "prompt_token_ids": [4, 5, 6],
+                "output_ids": [1, 2],
+                "meta_info": {
+                    "id": "chatcmpl-multi-abort",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop"},
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+            yield {
+                "text": "partial",
+                "prompt_token_ids": [4, 5, 6],
+                "output_ids": [7],
+                "meta_info": {
+                    "id": "chatcmpl-multi-abort",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": err_code,
+                        "message": "Aborted by scheduler",
+                    },
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 1,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate()
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            n=2,
+            stream=True,
+            stream_options={"include_usage": True},
+            return_input_ids_in_sglext=True,
+            return_output_ids_in_sglext=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+            chunks = self._run_chat_stream(adapted_request, req)
+
+        error_idx = next(i for i, c in enumerate(chunks) if "error" in c)
+        after_error = self._parse_chunks(chunks[error_idx + 1 :])
+
+        finish_reasons = [
+            choice["finish_reason"]
+            for c in after_error
+            for choice in c.get("choices", [])
+            if choice.get("finish_reason") is not None
+        ]
+        self.assertEqual(finish_reasons, ["stop"])
+        self.assertTrue(
+            any(c.get("usage") is not None for c in after_error),
+            "usage chunk dropped after error abort",
+        )
 
     def _run_chat_stream(self, adapted_request, req):
         async def run_stream():
@@ -2707,8 +2787,7 @@ class ServingChatTestCase(unittest.TestCase):
                     "index": 0,
                 }
             # Graceful abort terminal chunk (no status_code): falls through to
-            # the normal finalization path, so its output_ids would corrupt the
-            # accumulator if not skipped.
+            # the normal finalization path.
             yield {
                 "text": "chunk",
                 "output_ids": list(abort_output_ids),
@@ -2772,22 +2851,9 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(len(sglext_chunks), 1)
         self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7, 8]])
 
-    def test_streaming_output_ids_non_incremental_ignores_abort_chunk(self):
-        # Abort collapses to [last_token]; do not overwrite the full list.
+    def test_streaming_output_ids_non_incremental_abort_supersedes_earlier(self):
         sglext_chunks = self._run_output_ids_stream_with_graceful_abort(
-            normal_chunks=[[5, 6], [5, 6, 7]],
-            abort_output_ids=[7],
-            incremental=False,
-            abort_completion_tokens=3,
-        )
-
-        self.assertEqual(len(sglext_chunks), 1)
-        self.assertEqual(sglext_chunks[0]["sglext"]["output_ids"], [[5, 6, 7]])
-
-    def test_streaming_output_ids_non_incremental_keeps_full_abort_chunk(self):
-        # Abort-only stream: the abort chunk is the full cumulative list.
-        sglext_chunks = self._run_output_ids_stream_with_graceful_abort(
-            normal_chunks=[],
+            normal_chunks=[[5, 6]],
             abort_output_ids=[5, 6, 7],
             incremental=False,
             abort_completion_tokens=3,

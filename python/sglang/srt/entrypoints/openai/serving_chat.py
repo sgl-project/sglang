@@ -1542,6 +1542,7 @@ class OpenAIServingChat(OpenAIServingBase):
         output_ids: Dict[int, List[int]] = {}
 
         stream_started = False
+        error_aborted = False
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
@@ -1604,14 +1605,9 @@ class OpenAIServingChat(OpenAIServingBase):
                                 keep = completion_tokens[index] - len(accumulated)
                                 chunk_output_ids = chunk_output_ids[: max(keep, 0)]
                             accumulated.extend(chunk_output_ids)
-                        elif (
-                            finish_reason_type != "abort"
-                            or len(chunk_output_ids) == completion_tokens[index]
-                        ):
+                        else:
                             # Intermediate chunks share the live state.output_ids
-                            # list; the final chunk is a stable copy. Skip a
-                            # collapsed abort ([last_token]), but keep a full
-                            # abort payload.
+                            # list; the final chunk is a stable copy.
                             output_ids[index] = chunk_output_ids
 
                 # Handle logprobs
@@ -1645,11 +1641,8 @@ class OpenAIServingChat(OpenAIServingBase):
                             code.value,
                         )
                         yield f"data: {error}\n\n"
-                        # Terminate the stream immediately: skip finalization so
-                        # no buffered event (e.g. sglext.output_ids) is emitted
-                        # after the error.
-                        yield "data: [DONE]\n\n"
-                        return
+                        error_aborted = True
+                        break
                     finish_reasons[index] = finish_reason
 
                 # First chunk with role
@@ -1739,12 +1732,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 if first_details is not None:
                     sglext_details = cached_tokens_details_from_dict(first_details)
 
+            # Omit token ids after an error abort.
             sglext_input_ids = None
-            if return_input_ids and input_ids:
+            if return_input_ids and input_ids and not error_aborted:
                 sglext_input_ids = list(input_ids)
 
             sglext_output_ids = None
-            if return_output_ids and output_ids:
+            if return_output_ids and output_ids and not error_aborted:
                 sglext_output_ids = [
                     list(output_ids.get(i, [])) for i in range(request.n)
                 ]
