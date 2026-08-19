@@ -938,9 +938,25 @@ def test_configure_resolves_residency_policy(monkeypatch):
 def test_configure_offloads_all_layer_groups_before_moving_non_layers(monkeypatch):
     _patch_fake_device(monkeypatch)
     model = _MultiGroupComponent()
+    initialization_order = []
+    initialize_layer_weights = LayerwiseOffloadManager._initialize_layer_weights
+
+    def record_initialization(manager):
+        initialization_order.append(manager.layers_attr_str)
+        initialize_layer_weights(manager)
+
+    monkeypatch.setattr(
+        LayerwiseOffloadManager,
+        "_initialize_layer_weights",
+        record_initialization,
+    )
 
     model.configure_layerwise_offload(_server_args())
 
+    assert initialization_order == ["large_blocks", "small_blocks"]
+    assert [
+        manager.layers_attr_str for manager in model.layerwise_offload_managers
+    ] == ["small_blocks", "large_blocks"]
     assert len(model.to_parameter_shapes) == 1
     shapes_at_move = model.to_parameter_shapes[0]
     assert shapes_at_move["non_layer"] == (2,)

@@ -205,6 +205,16 @@ class LayerwiseOffloadManager:
         except Exception:
             return None
 
+    def _managed_parameter_bytes(self) -> int:
+        total_bytes = 0
+        for name, tensor in self.model.named_parameters():
+            layer_idx = self._match_layer_idx(name)
+            if layer_idx is None or layer_idx >= self.num_layers:
+                continue
+            local_tensor = self._to_local_tensor(tensor)
+            total_bytes += local_tensor.numel() * local_tensor.element_size()
+        return total_bytes
+
     def _get_shared_empty_tensor(self, dtype: torch.dtype) -> torch.Tensor:
         placeholder = self._offload_placeholders.get(dtype)
         if placeholder is None:
@@ -1040,7 +1050,15 @@ class LayerwiseOffloadableModuleMixin:
                 for manager in self.layerwise_offload_managers
                 if manager.enabled
             ]
-            for manager in enabled_managers:
+            initialization_order = sorted(
+                enabled_managers,
+                key=lambda manager: manager._managed_parameter_bytes(),
+                reverse=True,
+            )
+            # release the largest managed groups first when checkpoint loading
+            # already placed weights on the accelerator; keep the stored manager
+            # order unchanged for prefetch and forward lifecycle semantics
+            for manager in initialization_order:
                 manager._initialize_layer_weights()
 
             # Every managed layer group must be replaced before moving the
