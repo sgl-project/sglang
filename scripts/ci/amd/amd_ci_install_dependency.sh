@@ -134,6 +134,10 @@ else
   install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e "python[${EXTRAS}]"
 fi
 
+# shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../utils/sgl_eval_ref.sh"
+install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "$SGL_EVAL_SPEC"
+
 if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
 else
@@ -145,6 +149,12 @@ else
   docker cp lmms-eval ci_sglang:/
   docker exec ci_sglang git config --global --add safe.directory /lmms-eval
   install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
+
+  # lmms-eval v0.4.1 pulls latex2sympy2, which pins antlr4-python3-runtime==4.7.2
+  # and uninstalls the 4.9.3 that sgl-eval's latex2sympy2_extended requires, so
+  # every `sgl-eval run mmlu` dies with "Unsupported ANTLR version 4.7.2". Pin it
+  # back, the same way the CUDA installer does after its own lmms-eval install.
+  install_with_retry docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache "antlr4-python3-runtime==4.9.3" --force-reinstall --no-deps
 
   git_clone_with_retry https://github.com/akao-amd/human-eval.git human-eval
   docker cp human-eval ci_sglang:/
@@ -238,6 +248,19 @@ DOCKERFILE="docker/rocm.Dockerfile"
 GPU_ARCH="${GPU_ARCH:-mi30x}"
 echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 
+# ROCm 7.0 keeps the Triton its base image ships; later ROCm images run on the
+# Triton AITER pins, so a rebuilt AITER has to bring its own along.
+IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
+case "${IMAGE_HIP_VERSION}" in
+    7.0*) INSTALL_AITER_TRITON="false" ;;
+    7.*)  INSTALL_AITER_TRITON="true" ;;
+    *)
+        echo "[CI-AITER-CHECK] ERROR: Unsupported or empty HIP version: '${IMAGE_HIP_VERSION}'"
+        exit 1
+        ;;
+esac
+echo "[CI-AITER-CHECK] Container HIP=${IMAGE_HIP_VERSION}, install AITER's Triton on rebuild=${INSTALL_AITER_TRITON}"
+
 #############################################
 # 1. Extract AITER_COMMIT from correct Dockerfile block
 #############################################
@@ -292,7 +315,6 @@ else
     NEED_REBUILD="true"
 fi
 
-
 #############################################
 # 4. Rebuild AITER if needed
 #############################################
@@ -328,6 +350,18 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
         GPU_ARCH_LIST="gfx942"
     fi
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
+
+    # Run the installer here rather than letting setup.py do it: setup.py
+    # swallows its errors, and the AITER_USE_SYSTEM_TRITON=1 below then keeps
+    # whatever Triton is already installed. Doing it up front fails closed.
+    if [[ "${INSTALL_AITER_TRITON}" == "true" ]]; then
+        docker exec ci_sglang bash -c "
+            set -euo pipefail
+            cd /sgl-workspace/aiter
+            test -f .github/scripts/install_triton.sh
+            bash .github/scripts/install_triton.sh
+        "
+    fi
 
     # build AITER
     docker exec ci_sglang bash -c "

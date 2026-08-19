@@ -73,11 +73,15 @@ from sglang.multimodal_gen.configs.pipeline_configs.krea2 import Krea2PipelineCo
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_video_moe import (
     LingBotVideoMoEPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
+    LongCatImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.longlive2 import LongLive2T2VConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     LTX2PipelineConfig,
     LTX23PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2_5 import LTX25PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
     MOVA720PConfig,
@@ -91,6 +95,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana import SanaPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
+    SanaVideoPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
@@ -142,12 +149,16 @@ from sglang.multimodal_gen.configs.sample.lingbot_video_moe import (
 from sglang.multimodal_gen.configs.sample.lingbot_world import (
     LingBotWorldSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.longcat_image import (
+    LongCatImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.longlive2 import LongLive2SamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
     LTX23HQSamplingParams,
     LTX23SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.ltx_2_5 import LTX25SamplingParams
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
@@ -161,6 +172,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
+from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
@@ -682,7 +694,9 @@ def _register_configs():
         hf_model_paths=["Lightricks/LTX-2"],
         model_detectors=[
             lambda path: "ltx" in path.lower() and "video" in path.lower(),
-            lambda path: "ltx-2" in path.lower() and "ltx-2.3" not in path.lower(),
+            lambda path: "ltx-2" in path.lower()
+            and "ltx-2.3" not in path.lower()
+            and "ltx-2.5" not in path.lower(),
         ],
     )
     register_configs(
@@ -691,6 +705,18 @@ def _register_configs():
         hf_model_paths=["Lightricks/LTX-2.3"],
         model_detectors=[
             lambda path: "ltx-2.3" in path.lower(),
+        ],
+    )
+    # Keeps the LTX-2 pipeline class; only component geometry and the pinned
+    # distilled schedule differ. Only the `-Diffusers` repo is listed --
+    # `Lightricks/LTX-2.5` is a split pack of bare `.safetensors` and would need
+    # a model overlay first.
+    register_configs(
+        sampling_param_cls=LTX25SamplingParams,
+        pipeline_config_cls=LTX25PipelineConfig,
+        hf_model_paths=["Lightricks/LTX-2.5-Diffusers"],
+        model_detectors=[
+            lambda path: "ltx-2.5" in path.lower(),
         ],
     )
     # register dedicated sampling params for LTX2TwoStageHQPipeline
@@ -1068,20 +1094,38 @@ def _register_configs():
         ],
     )
 
+    # SANA-Video (register before generic SANA to avoid detector overlap).
+    register_configs(
+        sampling_param_cls=SanaVideoSamplingParams,
+        pipeline_config_cls=SanaVideoPipelineConfig,
+        hf_model_paths=[
+            "Efficient-Large-Model/SANA-Video_2B_480p_diffusers",
+        ],
+        model_detectors=[
+            lambda hf_id: (
+                "sana-video" in hf_id.lower() or "sana_video" in hf_id.lower()
+            )
+        ],
+    )
+
     # Cosmos3 — single checkpoint serves T2V, I2V, and T2I. Mode is dispatched
     # per-request inside the pipeline from ``num_frames`` and ``image_path``.
-    # Both Nano (16B) and Super (64B) share the same pipeline; arch dimensions
-    # come from ``transformer/config.json`` via ``update_model_arch``.
+    # All variants share the same pipeline; arch dimensions (size, activation,
+    # QK-norm) come from ``transformer/config.json`` via ``update_model_arch``.
     register_configs(
         sampling_param_cls=Cosmos3SamplingParams,
         pipeline_config_cls=Cosmos3Config,
         hf_model_paths=[
             "nvidia/Cosmos3-Nano",
+            "nvidia/Cosmos3-Nano-Policy-DROID",
             "nvidia/Cosmos3-Super",
             "nvidia/Cosmos3-Super-Text2Image",
             "nvidia/Cosmos3-Super-Image2Video",
+            "nvidia/Cosmos3-Edge",
         ],
-        model_detectors=[lambda hf_id: "cosmos3omnidiffuserspipeline" in hf_id.lower()],
+        # Match both the new ``Cosmos3OmniPipeline`` and the legacy
+        # ``Cosmos3OmniDiffusersPipeline`` ``_class_name`` (diffusers rename).
+        model_detectors=[lambda hf_id: "cosmos3omni" in hf_id.lower()],
     )
 
     # SANA
@@ -1101,6 +1145,8 @@ def _register_configs():
                 "sana" in hf_id.lower()
                 and "sana-wm" not in hf_id.lower()
                 and "sana_wm" not in hf_id.lower()
+                and "sana-video" not in hf_id.lower()
+                and "sana_video" not in hf_id.lower()
             )
         ],
     )
@@ -1184,6 +1230,18 @@ def _register_configs():
         pipeline_config_cls=LingBotVideoMoEPipelineConfig,
         model_detectors=[
             lambda hf_id: "lingbot-video-moe" in hf_id.lower(),
+        ],
+    )
+
+    # LongCat-Image
+    register_configs(
+        sampling_param_cls=LongCatImageSamplingParams,
+        pipeline_config_cls=LongCatImagePipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image",
+        ],
+        model_detectors=[
+            lambda hf_id: "longcat" in hf_id.lower() and "edit" not in hf_id.lower(),
         ],
     )
 

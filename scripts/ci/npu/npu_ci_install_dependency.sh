@@ -60,7 +60,7 @@ ${PIP_INSTALL} triton-ascend==3.2.1.dev20260530 --extra-index-url=https://mirror
 
 
 ### Install sgl-kernel-npu
-SGLANG_KERNEL_NPU_TAG="2026.7.27"
+SGLANG_KERNEL_NPU_TAG="2026.8.10"
 mkdir sgl-kernel-npu
 (cd sgl-kernel-npu && wget "${GITHUB_PROXY_URL:=""}https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann9.0.0-${DEVICE_TYPE}-$(arch).zip" \
 && unzip ./sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann9.0.0-${DEVICE_TYPE}-$(arch).zip \
@@ -84,3 +84,8 @@ rm -rf cann-custom-ops
 ### Install SGLang
 rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
 ${UV_PIP_INSTALL} -v -e "python[dev_npu]"
+
+### Install sgl-eval
+# shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
+source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"
+${UV_PIP_INSTALL} "$SGL_EVAL_SPEC"
