@@ -36,7 +36,7 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 _PACKAGE_ROOT = pathlib.Path(sglang.__file__).resolve().parent
 _RUST_MODEL_INFO = (
     pathlib.Path(__file__).resolve().parents[4]
-    / "rust/sglang-server/src/api_server/common.rs"
+    / "rust/sglang-server/src/http_server/common.rs"
 )
 
 # The tokenizer process is the one whose control-plane writes a served request
