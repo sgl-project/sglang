@@ -316,6 +316,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             hidden_size=input_embeds_hidden_size,
             dtype=self.model_runner.dtype,
             enable_mamba_track=self.mamba_track_enabled,
+            pp_size=model_runner.server_args.pp_size,
+            hc_hidden_size=model_runner.model_config.hc_hidden_size,
+            pp_proxy_topk_size=model_runner.get_pp_proxy_topk_size(),
+            pp_proxy_residual_num_blocks=(
+                model_runner.get_pp_proxy_residual_num_blocks()
+            ),
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
@@ -368,6 +374,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._capture_lora = False
         self.enable_cp_v2_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
+        self._static_pp_proxy_tensors = (
+            PPProxyTensors(self.buffers.pp_proxy_tensors)
+            if self.buffers.pp_proxy_tensors is not None
+            else None
+        )
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
         try:
@@ -683,11 +694,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             if self._uses_eager_prefill_tail():
                 # BCG / Full: capture the transformer body only.
                 positions = self._get_layer_model_positions(forward_batch)
+                input_ids = forward_batch.input_ids
+                input_embeds = forward_batch.input_embeds
+                layer_kwargs = {}
+                if self._static_pp_proxy_tensors is not None:
+                    layer_kwargs["pp_proxy_tensors"] = self._static_pp_proxy_tensors[
+                        :num_tokens
+                    ]
+                    if not self.model_runner.pp_group.is_first_rank:
+                        input_ids = None
+                        input_embeds = None
                 return self.layer_model.forward(
-                    forward_batch.input_ids,
+                    input_ids,
                     positions,
                     forward_batch,
-                    forward_batch.input_embeds,
+                    input_embeds,
+                    **layer_kwargs,
                 )
             # tc_piecewise: compile/capture the outer model.forward path.
             return self.model_runner.model.forward(
@@ -1470,6 +1492,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_bs=bs,
             raw_num_tokens=num_tokens,
             padded_num_tokens=static_num_tokens,
+            pp_proxy_tensors=kwargs.get("pp_proxy_tensors"),
         )
 
         registry = self.buffer_registry
@@ -1765,9 +1788,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if isinstance(output, EmbeddingPoolerOutput):
             return output
         assert isinstance(output, PPProxyTensors)
-        raise NotImplementedError(
-            "PPProxyTensors is not supported in PrefillCudaGraphRunner yet."
-        )
+        return output[: self.raw_num_tokens]
 
     def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
         if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
