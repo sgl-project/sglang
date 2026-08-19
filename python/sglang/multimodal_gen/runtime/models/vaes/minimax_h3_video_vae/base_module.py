@@ -14,7 +14,7 @@ from sglang.kernels.ops.activation.activation import (
 )
 from sglang.kernels.ops.diffusion import try_fused_scaled_residual_add_exact
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.srt.layers.activation import SiluAndMul
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMu
 
 from .attention import Attention
 from .vit_utils import _env_flag, _vit_torch_compile_kwargs
