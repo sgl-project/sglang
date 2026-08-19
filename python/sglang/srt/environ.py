@@ -688,6 +688,7 @@ class Envs:
     DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)  # This argument is deprecated
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
     SGLANG_LM_HEAD_TP = EnvInt(1)
+    SGLANG_ATTN_O_TP_SIZE = EnvInt(1)
 
     # MTHREADS & MUSA
     SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)

@@ -2147,6 +2147,11 @@ _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
 _LM_HEAD_TP: Optional[GroupCoordinator] = None
+_ATTN_O_TP: Optional[GroupCoordinator] = None
+
+def get_attn_o_tp_group() -> GroupCoordinator:
+    assert _ATTN_O_TP is not None, "attn_o model parallel group is not initialized"
+    return _ATTN_O_TP
 
 
 def get_moe_dp_group() -> GroupCoordinator:
@@ -2811,6 +2816,25 @@ def initialize_model_parallel(
                 group_name="lm_head_tp",
             )
 
+        attn_o_tp_size = envs.SGLANG_ATTN_O_TP_SIZE.get()
+        if attn_o_tp_size > 1:
+            assert world_size % attn_o_tp_size == 0, f"attn_o_tp_size ({attn_o_tp_size}) is not divided by world_size ({world_size})"
+            global _ATTN_O_TP
+            assert (
+                    _ATTN_O_TP is None
+            ), f"attn_o model parallel group is already initialized"
+            num_attn_o_tp_groups = world_size // attn_o_tp_size
+            group_ranks = []
+            for i in range(num_attn_o_tp_groups):
+                ranks = list(range(i * attn_o_tp_size, (i + 1) * attn_o_tp_size))
+                group_ranks.append(ranks)
+            _ATTN_O_TP = init_model_parallel_group(
+                group_ranks,
+                get_world_group().local_rank,
+                backend,
+                group_name="attn_o_tp",
+            )
+
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
     global _PP
@@ -3074,6 +3098,15 @@ def get_lm_head_tensor_parallel_world_size():
 def get_lm_head_tensor_parallel_rank():
     """Return my rank for the lm head tensor parallel group."""
     return get_lm_head_tp_group().rank_in_group
+
+
+def get_attn_o_tensor_parallel_world_size():
+    """Return world size for the attn_o tensor parallel group."""
+    return get_attn_o_tp_group().world_size
+
+def get_attn_o_tensor_parallel_rank():
+    """Return my rank for the attn_o tensor parallel group."""
+    return get_attn_o_tp_group().rank_in_group
 
 
 def destroy_model_parallel():
