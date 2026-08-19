@@ -130,10 +130,19 @@ For quantized transformer checkpoints, prefer:
 - `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
 
 Component checkpoint paths are selected separately, so changing DiT precision
-never silently changes prompt embeddings. For a native text encoder:
+never silently changes prompt embeddings. Use
+`--component-paths.<component> {MODEL}` or its shorter
+`--<component>-path {MODEL}` form for any component key from `model_index.json`.
+For a native text encoder:
 
 - `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias
 - Quantization metadata is auto-detected from that checkpoint. Each native encoder must explicitly support the serialized format; this is not blanket quantization support for every component, and unsupported combinations fail before weight loading.
+
+The same contract applies to every weighted component: path routing is generic,
+while quantized materialization is capability-based. Native auxiliary loaders
+that only understand unquantized state dicts reject quantization metadata before
+model construction. See [Quantized Component Repositories](../quantization#quantized-component-repositories)
+for the current component matrix.
 
 For supported realtime causal video models, `--kv-cache-quant {off|int4|int2}`
 compresses completed KV-cache chunks independently of transformer weight

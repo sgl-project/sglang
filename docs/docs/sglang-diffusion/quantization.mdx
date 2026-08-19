@@ -2,7 +2,7 @@
 title: "Quantization"
 tag: "approx"
 metatags:
-    description: "Configure transformer and native text-encoder checkpoint quantization, plus Quant-VideoGen causal KV-cache quantization in SGLang-Diffusion."
+    description: "Configure quantized component repositories, transformer and native text-encoder checkpoint quantization, plus Quant-VideoGen causal KV-cache quantization in SGLang-Diffusion."
 ---
 
 SGLang-Diffusion supports quantized transformer checkpoints and selected
@@ -20,6 +20,7 @@ Use these paths:
 - `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
 - `--component-paths.text_encoder`: replace a native text encoder with a checkpoint whose `quantization_config` is auto-detected
 - `--text-encoder-path`: shorter alias for `--component-paths.text_encoder`
+- `--component-paths.<component>` / `--<component>-path`: replace any named pipeline component with an independent repo or local directory
 - `--kv-cache-quant`: compress completed causal KV-cache chunks for supported realtime models
 
 Recommended example for pre-quantized checkpoints:
@@ -44,6 +45,32 @@ NOTE: Some model-specific integrations also accept a quantized repo or local
 directory directly as `--model-path`, but that is a compatibility path. If a
 repo contains multiple candidate checkpoints, pass
 `--transformer-weights-path` explicitly.
+
+## Quantized Component Repositories
+
+Every component can point to an independent repository, but path routing does
+not imply that every loader can materialize every quantization format. SGLang
+detects checkpoint quantization before native weight loading and selects one of
+three explicit outcomes:
+
+- load through an SGLang quantization implementation;
+- delegate a standard component to Transformers or Diffusers;
+- reject the checkpoint before loading when neither path can restore it.
+
+| Component path | Quantized checkpoint behavior |
+| --- | --- |
+| `transformer`, `transformer_2`, `audio_dit`, `video_dit` | Uses the SGLang transformer quantization adapters documented below. |
+| `text_encoder*`, `image_encoder*` | Requires the native encoder class to declare support for the detected format. MiniMax-H3 FP8 and model-managed integrations such as Ideogram are supported; unknown combinations fail closed. |
+| `vae`, `video_vae`, `audio_vae` | A standard top-level Diffusers `quantization_config` is delegated to `AutoModel.from_pretrained`. Native-only VAEs and nested/compression metadata fail closed. |
+| Library-managed generic components | Uses the upstream Transformers or Diffusers `AutoModel` loader and inherits its format support. |
+| Native auxiliary components that load raw state dicts | Quantized checkpoints are rejected before model construction until that component has a quantized materialization implementation. This includes connectors, duration heads, bridges, diffusion decoders, sound tokenizers, spatial upsamplers, vocoders, and the native PE model. |
+
+`--quantization` remains a transformer option. There is intentionally no
+generic per-component quantization override: a string option without a matching
+materialization backend would advertise support that the component does not
+have. Pre-quantized component repositories should carry their quantization
+metadata. A quantized weight file without matching config metadata cannot be
+identified or restored generically.
 
 ## Quant Families
 

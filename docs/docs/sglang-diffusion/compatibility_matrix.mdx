@@ -716,6 +716,12 @@ component directory.
 The same overrides can also be provided in config files through
 `component_paths.<component>`.
 
+Component path overrides are generic, but quantized checkpoint support is
+loader-specific. A native loader that cannot restore the detected quantization
+format fails before weight loading instead of silently casting the checkpoint
+into an unquantized module. See
+[Quantized Component Repositories](./quantization#quantized-component-repositories).
+
 ### Common Syntax
 
 CLI:

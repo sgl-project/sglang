@@ -9,7 +9,7 @@ from transformers import AutoTokenizer
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
-    ComponentLoader,
+    UnquantizedComponentLoader,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.models.encoders.mistral_3 import (
     Ministral3ForCausalLM,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import get_hf_config
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -116,7 +117,7 @@ class SGLangPEModelWrapper:
         return self
 
 
-class PELoader(ComponentLoader):
+class PELoader(UnquantizedComponentLoader):
     """Loader for prompt-enhancement causal LM (Ministral-3 based)."""
 
     component_names = ["pe"]
@@ -132,6 +133,12 @@ class PELoader(ComponentLoader):
             return SGLangPEModelWrapper(server_args.pe_server_url)
 
         logger.info("Loading PE model from %s ...", component_model_path)
+        model_config = get_hf_config(
+            component_model_path,
+            trust_remote_code=server_args.trust_remote_code,
+            revision=server_args.revision,
+        )
+        self.ensure_unquantized_checkpoint(model_config, component_name)
 
         pe_tokenizer_dir = os.path.join(
             os.path.dirname(component_model_path), "pe_tokenizer"
@@ -170,6 +177,7 @@ class PELoader(ComponentLoader):
 
         model = Ministral3ForCausalLM.from_pretrained(
             component_model_path,
+            config=model_config,
             torch_dtype=torch.bfloat16,
             trust_remote_code=server_args.trust_remote_code,
         )
