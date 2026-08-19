@@ -202,25 +202,21 @@ pub async fn chat_completions(
     // decode peer (`NoDecodeWorkersAvailable`) bubble up as 503 so
     // operators can alert on prefill-vs-decode pool imbalance.
     let decode_peer: Option<Arc<Worker>> = if worker.mode() == WorkerMode::Prefill {
-        Some(
-            resolver
-                .decode_with_affinity(&model_id, &worker.url)
-                .map_err(|e| match e {
-                    PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
-                        model: model_str.clone(),
-                    },
-                    PdResolveError::NoDecodeWorkersAvailable => {
-                        ApiError::NoDecodeWorkersAvailable {
-                            model: model_str.clone(),
-                        }
-                    }
-                    PdResolveError::NoPrefillWorkersAvailable => {
-                        ApiError::NoPrefillWorkersAvailable {
-                            model: model_str.clone(),
-                        }
-                    }
-                })?,
-        )
+        let selection = resolver
+            .decode_with_affinity(&model_id, &worker.url)
+            .map_err(|e| match e {
+                PdResolveError::NoHealthyWorkers => ApiError::NoHealthyWorkers {
+                    model: model_str.clone(),
+                },
+                PdResolveError::NoDecodeWorkersAvailable => ApiError::NoDecodeWorkersAvailable {
+                    model: model_str.clone(),
+                },
+                PdResolveError::NoPrefillWorkersAvailable => ApiError::NoPrefillWorkersAvailable {
+                    model: model_str.clone(),
+                },
+            })?;
+        ctx.metrics.record_decode_affinity(selection.outcome);
+        Some(selection.worker)
     } else {
         None
     };
