@@ -1775,6 +1775,8 @@ class HiRadixCache(RadixCache):
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
+        # Scheduler-call parity with UnifiedRadixCache; unused in cache mode.
+        matched_prefix_tokens: Optional[List[int]] = None,
     ):
         prefetch_key = RadixKey(
             new_input_tokens,

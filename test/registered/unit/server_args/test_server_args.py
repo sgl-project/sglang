@@ -2212,5 +2212,35 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args._check_two_batch_overlap()
 
 
+class TestDcpKvEventContract(CustomTestCase):
+    """DCP widens the radix-tree page to page_size * dcp_size, which the
+    advertised KV-event block size must reflect."""
+
+    KV_EVENTS = '{"publisher":"zmq","topic":"kv","endpoint":"tcp://*:5557"}'
+
+    def test_kv_events_descriptor_reports_logical_block_size(self):
+        """Advertising the physical page_size made every KV-aware router hash
+        prompts at a width no emitted block can match, silently pinning its
+        hit rate to zero while stores kept applying cleanly."""
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=4,
+            dcp_size=4,
+            page_size=64,
+            kv_events_config=self.KV_EVENTS,
+        )
+        self.assertEqual(args.describe_kv_events_publisher()["block_size"], 256)
+        args = ServerArgs(
+            model_path="dummy", page_size=64, kv_events_config=self.KV_EVENTS
+        )
+        self.assertEqual(args.describe_kv_events_publisher()["block_size"], 64)
+
+    def test_kv_event_block_size_widens_a_single_token_page(self):
+        # page_size=1 + DCP is a real deployment shape: the allocator is still
+        # paged, at dcp_size.
+        args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
+        self.assertEqual(args.kv_event_block_size, 8)
+
+
 if __name__ == "__main__":
     unittest.main()
