@@ -18,6 +18,7 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -138,6 +139,38 @@ def _pil_to_uint8_tensor(image: PIL.Image.Image) -> torch.Tensor:
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
 
 
+def _resize_center_crop_uint8_cthw(
+    frames: torch.Tensor, height: int, width: int
+) -> torch.Tensor:
+    """Resize and center-crop ``uint8 [3, T, H, W]`` transfer frames."""
+    if frames.ndim != 4 or frames.shape[0] != 3:
+        raise ValueError(
+            "Transfer frames must have shape [3, T, H, W], got "
+            f"{tuple(frames.shape)}"
+        )
+    orig_h, orig_w = int(frames.shape[2]), int(frames.shape[3])
+    scale = max(width / orig_w, height / orig_h)
+    resize_h = int(np.ceil(scale * orig_h))
+    resize_w = int(np.ceil(scale * orig_w))
+    frames_tchw = frames.permute(1, 0, 2, 3).to(dtype=torch.float32)
+    resized = F.interpolate(
+        frames_tchw,
+        size=(resize_h, resize_w),
+        mode="bilinear",
+        align_corners=False,
+    )
+    top = (resize_h - height) // 2
+    left = (resize_w - width) // 2
+    cropped = resized[:, :, top : top + height, left : left + width]
+    return (
+        cropped.round()
+        .clamp(0, 255)
+        .to(torch.uint8)
+        .permute(1, 0, 2, 3)
+        .contiguous()
+    )
+
+
 def _pad_transfer_frames(video: torch.Tensor, target_frames: int) -> torch.Tensor:
     """Pad ``[1, 3, T, H, W]`` with reflected temporal content."""
     if video.ndim != 5 or video.shape[0] != 1 or video.shape[1] != 3:
@@ -185,13 +218,17 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         if not frames:
             raise ValueError(f"No frames decoded from transfer video: {control_path!r}")
         frames = frames[:max_frames]
-        processed = [
-            _pil_to_uint8_tensor(
-                _resize_crop_pil(frame.convert("RGB"), target_w, target_h)
+        frames_cthw = torch.stack(
+            [_pil_to_uint8_tensor(frame.convert("RGB")) for frame in frames],
+            dim=1,
+        )
+        return (
+            _resize_center_crop_uint8_cthw(
+                frames_cthw, height=target_h, width=target_w
             )
-            for frame in frames
-        ]
-        return torch.stack(processed, dim=1).unsqueeze(0).contiguous()
+            .unsqueeze(0)
+            .contiguous()
+        )
 
     @staticmethod
     def _get_transfer_num_chunks(

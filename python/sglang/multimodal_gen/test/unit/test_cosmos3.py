@@ -63,6 +63,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     Cosmos3TokenizationStage,
     _inject_caption_metadata,
     _pad_transfer_frames,
+    _resize_center_crop_uint8_cthw,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
     EMBODIMENT_TO_DOMAIN_ID,
@@ -1028,6 +1029,31 @@ class TestCosmos3Transfer(unittest.TestCase):
         frames = frames.expand(1, 3, 3, 1, 1)
         padded = _pad_transfer_frames(frames, 5)
         self.assertEqual(padded[0, 0, :, 0, 0].tolist(), [0, 1, 2, 2, 1])
+
+    def test_transfer_resize_matches_vllm_omni(self):
+        frames = torch.arange(3 * 2 * 2 * 3, dtype=torch.uint8).reshape(
+            3, 2, 2, 3
+        )
+
+        actual = _resize_center_crop_uint8_cthw(frames, height=3, width=3)
+
+        resized = torch.nn.functional.interpolate(
+            frames.permute(1, 0, 2, 3).float(),
+            size=(3, 5),
+            mode="bilinear",
+            align_corners=False,
+        )
+        expected = (
+            resized[:, :, :, 1:4]
+            .round()
+            .clamp(0, 255)
+            .to(torch.uint8)
+            .permute(1, 0, 2, 3)
+            .contiguous()
+        )
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(tuple(actual.shape), (3, 2, 3, 3))
+        self.assertEqual(actual.dtype, torch.uint8)
 
     def test_transfer_chunks_stitch_without_duplicate_overlap(self):
         class Scheduler:
