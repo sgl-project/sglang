@@ -13,11 +13,9 @@ from sglang.srt.lora.moe.execution_plan import (
 )
 from sglang.srt.lora.moe.joint_routing import build_joint_shared_routes
 from sglang.srt.lora.moe.routing import (
-    FusedAlignScratch,
     RouteView,
     RouteViewKind,
     build_virtual_expert_routing,
-    uses_fused_align,
 )
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
@@ -50,67 +48,6 @@ class MoeLoraRoutes:
         return route
 
 
-def _aligned_pair_route(
-    topk_ids: torch.Tensor,
-    token_lora_mapping: torch.Tensor,
-    *,
-    is_shared_outer: bool,
-    num_local_experts: int,
-    max_loras: int,
-    block_size: int,
-    workspace: MoeLoraWorkspace,
-    scratch_prefix: str,
-) -> RouteView:
-    """Build an aligned route with caller-owned fused metadata.
-
-    The scan kernel restores ``counts`` to zero after its final read, so the
-    workspace initializes that tensor only when storage is first allocated.
-    Supplying the retained scalar directly also avoids a follow-up device copy.
-    The dispatch is checked before allocation, so the JIT path keeps
-    its own metadata without paying for unused fused scratch.
-    """
-    lora_experts_per_adapter = 1 if is_shared_outer else num_local_experts
-    num_virtual_experts = lora_experts_per_adapter * max_loras
-    padded_count = None
-    scratch = None
-    if uses_fused_align(topk_ids, num_virtual_experts=num_virtual_experts):
-        device = topk_ids.device
-        num_buckets = num_virtual_experts + 1
-
-        def counter(name: str, size: int, *, zero_first: bool = False):
-            return workspace.tensor(
-                f"{scratch_prefix}:{name}",
-                (size,),
-                dtype=torch.int32,
-                device=device,
-                **({"zero_on_first_allocation": True} if zero_first else {}),
-            )
-
-        padded_count = counter("padded_pairs", 1)
-        scratch = FusedAlignScratch(
-            counts=counter("counts", num_buckets, zero_first=True),
-            block_cumulative=counter("block_cumulative", num_buckets + 1),
-            cursor=counter("cursor", num_buckets),
-            bucket_end=counter("bucket_end", num_buckets),
-        )
-    # These two move together, and validate_shared_outer enforces it: a shared
-    # adapter has exactly ONE LoRA expert, so the validity test would end in
-    # ``lora_expert_id < 1`` -- always true. Passing the local expert count
-    # restores the bound, without which a routed expert this rank does not own
-    # would be accepted as a valid pair.
-    return build_virtual_expert_routing(
-        topk_ids,
-        token_lora_mapping,
-        lora_experts_per_adapter=lora_experts_per_adapter,
-        shared_outer_local_expert_count=num_local_experts if is_shared_outer else None,
-        max_loras=max_loras,
-        block_size=block_size,
-        view=RouteViewKind.ALIGNED,
-        num_pairs_post_padded_out=padded_count,
-        fused_align_scratch=scratch,
-    )
-
-
 def build_routes(
     plan: MoeLoraExecutionPlan,
     *,
@@ -141,7 +78,7 @@ def build_routes(
         )
     if RouteRequirement.RAW_SHARED_OUTER in requirements:
         # One LoRA expert per adapter, with the local expert count restoring
-        # the ownership bound (see _aligned_pair_route).
+        # the ownership bound (see the shared-outer note below).
         values["raw_shared_outer"] = build_virtual_expert_routing(
             topk_ids,
             token_lora_mapping,
@@ -165,24 +102,29 @@ def build_routes(
         values["aligned_shared_outer"] = shared
     else:
         if RouteRequirement.ALIGNED_PER_EXPERT in requirements:
-            values["aligned_per_expert"] = _aligned_pair_route(
+            values["aligned_per_expert"] = build_virtual_expert_routing(
                 topk_ids,
                 token_lora_mapping,
-                is_shared_outer=False,
-                num_local_experts=num_local_experts,
+                lora_experts_per_adapter=num_local_experts,
                 max_loras=max_loras,
                 block_size=block_size,
+                view=RouteViewKind.ALIGNED,
                 workspace=workspace,
                 scratch_prefix="route:aligned_per_expert",
             )
         if RouteRequirement.ALIGNED_SHARED_OUTER in requirements:
-            values["aligned_shared_outer"] = _aligned_pair_route(
+            # A shared adapter has exactly ONE LoRA expert, so the generic
+            # validity test would end in ``lora_expert_id < 1`` -- always true.
+            # The local expert count restores the bound, without which a routed
+            # expert this rank does not own would pass as a valid pair.
+            values["aligned_shared_outer"] = build_virtual_expert_routing(
                 topk_ids,
                 token_lora_mapping,
-                is_shared_outer=True,
-                num_local_experts=num_local_experts,
+                lora_experts_per_adapter=1,
+                shared_outer_local_expert_count=num_local_experts,
                 max_loras=max_loras,
                 block_size=block_size,
+                view=RouteViewKind.ALIGNED,
                 workspace=workspace,
                 scratch_prefix="route:aligned_shared_outer",
             )
@@ -216,13 +158,15 @@ def build_routes(
             device=topk_ids.device,
             zero_on_first_allocation=True,
         )
-        values["shared_token"] = _aligned_pair_route(
+        # Shared-outer, so the same expert-range bound as above applies.
+        values["shared_token"] = build_virtual_expert_routing(
             token_experts,
             shared_token_lora_mapping,
-            is_shared_outer=True,
-            num_local_experts=num_local_experts,
+            lora_experts_per_adapter=1,
+            shared_outer_local_expert_count=num_local_experts,
             max_loras=max_loras,
             block_size=block_size,
+            view=RouteViewKind.ALIGNED,
             workspace=workspace,
             scratch_prefix="route:shared_token",
         )

@@ -382,13 +382,21 @@ class TestRoutePdlWiring(unittest.TestCase):
             topk_ids,
             token_lora_mapping,
             *,
-            is_shared_outer,
-            num_local_experts,
+            lora_experts_per_adapter,
             max_loras,
             block_size,
-            workspace,
-            scratch_prefix,
+            view,
+            shared_outer_local_expert_count=None,
+            lora_expert_map=None,
+            workspace=None,
+            scratch_prefix=None,
         ):
+            # Shared-outer routes key on one LoRA expert and carry the local
+            # expert count as the range bound; per-expert routes do neither.
+            self.assertEqual(
+                lora_experts_per_adapter == 1,
+                shared_outer_local_expert_count is not None,
+            )
             calls.append(scratch_prefix)
             return _route(
                 topk_ids,
@@ -398,7 +406,7 @@ class TestRoutePdlWiring(unittest.TestCase):
             )
 
         with mock.patch.object(
-            ROUTE_FACTORY, "_aligned_pair_route", side_effect=fake_aligned
+            ROUTE_FACTORY, "build_virtual_expert_routing", side_effect=fake_aligned
         ):
             for plan in (reference, shared_down, shared_token):
                 ROUTE_FACTORY.build_routes(
@@ -468,16 +476,17 @@ class TestRoutePdlWiring(unittest.TestCase):
             view,
             shared_outer_local_expert_count=None,
             lora_expert_map=None,
-            num_pairs_post_padded_out=None,
-            fused_align_scratch=None,
+            workspace=None,
+            scratch_prefix=None,
         ):
             standard_calls.append(view)
-            num_pairs_post_padded_out.fill_(block_size)
+            padded = torch.zeros(1, dtype=torch.int32)
+            padded.fill_(block_size)
             return _route(
                 topk_ids,
                 token_lora_mapping,
                 block_size=block_size,
-                padded_count=num_pairs_post_padded_out,
+                padded_count=padded,
             )
 
         with (
@@ -604,8 +613,8 @@ class TestSharedTokenRoute(unittest.TestCase):
             view,
             shared_outer_local_expert_count=None,
             lora_expert_map=None,
-            num_pairs_post_padded_out=None,
-            fused_align_scratch=None,
+            workspace=None,
+            scratch_prefix=None,
         ):
             calls.append(
                 (
@@ -614,12 +623,13 @@ class TestSharedTokenRoute(unittest.TestCase):
                     route_token_lora_mapping.clone(),
                 )
             )
-            num_pairs_post_padded_out.fill_(block_size)
+            padded = torch.zeros(1, dtype=torch.int32)
+            padded.fill_(block_size)
             return _route(
                 route_topk_ids,
                 route_token_lora_mapping,
                 block_size=block_size,
-                padded_count=num_pairs_post_padded_out,
+                padded_count=padded,
             )
 
         with (
@@ -649,7 +659,17 @@ class TestSharedTokenRoute(unittest.TestCase):
         self.assertIn("route:shared_token_lora_mapping", workspace.tensors)
 
     def test_large_shared_token_route_cannot_overwrite_retained_pair_counts(self):
-        """Every retained fused route owns its scalar, even at shared bucket V."""
+        """Every retained fused route gets its OWN workspace keys, even when the
+        per-expert and shared-outer bucket counts collide (num_local_experts=1).
+
+        The hazard is the fused builder's process-global scratch cache, which is
+        keyed by bucket count alone: two routes at the same V would share one
+        scalar, and the T-row shared-token plan would clobber the T*K-row pair
+        plan. build_virtual_expert_routing allocates per ``scratch_prefix``
+        instead, so what this has to pin is that build_routes hands every route
+        a DISTINCT prefix -- storage isolation per name is the workspace's own
+        contract.
+        """
         reference = SERIAL_MATERIALIZED_REFERENCE
         shared_plan = dataclasses.replace(
             reference,
@@ -676,7 +696,7 @@ class TestSharedTokenRoute(unittest.TestCase):
         for num_local_experts in (1, 2):
             with self.subTest(num_local_experts=num_local_experts):
                 workspace = _Workspace()
-                cached_counts: dict[int, torch.Tensor] = {}
+                prefixes = []
 
                 def fake_route(
                     route_topk_ids,
@@ -688,39 +708,34 @@ class TestSharedTokenRoute(unittest.TestCase):
                     view,
                     shared_outer_local_expert_count=None,
                     lora_expert_map=None,
-                    num_pairs_post_padded_out=None,
-                    fused_align_scratch=None,
+                    workspace=None,
+                    scratch_prefix=None,
                 ):
                     self.assertEqual(view, "aligned")
-                    num_virtual = lora_experts_per_adapter * max_loras
-                    cached_count = cached_counts.setdefault(
-                        num_virtual, torch.zeros(1, dtype=torch.int32)
+                    self.assertIsNotNone(workspace)
+                    prefixes.append(scratch_prefix)
+                    # Model the real allocation: one scalar per route, named.
+                    padded = workspace.tensor(
+                        f"{scratch_prefix}:padded_pairs",
+                        (1,),
+                        dtype=torch.int32,
+                        device=route_topk_ids.device,
                     )
-                    # Model the fused builder's cache entry keyed only by
-                    # bucket count. The pair plans have T*K rows; the later
-                    # shared-token plan has T rows and overwrites the same
-                    # shared-outer entry (and the per-expert entry at E=1).
-                    cached_count.fill_(route_topk_ids.numel())
-                    self.assertIsNotNone(num_pairs_post_padded_out)
-                    self.assertIsNotNone(fused_align_scratch)
-                    num_pairs_post_padded_out.fill_(route_topk_ids.numel())
+                    padded.fill_(route_topk_ids.numel())
                     return _route(
                         route_topk_ids,
                         route_token_lora_mapping,
                         block_size=block_size,
-                        padded_count=num_pairs_post_padded_out,
+                        padded_count=padded,
                         lora_experts_per_adapter=lora_experts_per_adapter,
                         max_loras=max_loras,
                         shared_outer_local_expert_count=shared_outer_local_expert_count,
                     )
 
-                with (
-                    _arch_pdl(False),
-                    mock.patch.object(
-                        ROUTE_FACTORY,
-                        "build_virtual_expert_routing",
-                        side_effect=fake_route,
-                    ),
+                with mock.patch.object(
+                    ROUTE_FACTORY,
+                    "build_virtual_expert_routing",
+                    side_effect=fake_route,
                 ):
                     routes = ROUTE_FACTORY.build_routes(
                         shared_plan,
@@ -732,8 +747,18 @@ class TestSharedTokenRoute(unittest.TestCase):
                         workspace=workspace,
                     )
 
+                # Distinct prefix per route is the whole guarantee.
+                self.assertEqual(
+                    set(prefixes),
+                    {
+                        "route:aligned_per_expert",
+                        "route:aligned_shared_outer",
+                        "route:shared_token",
+                    },
+                )
+                self.assertEqual(len(prefixes), len(set(prefixes)))
+
                 pair_count = num_tokens * top_k
-                token_count = num_tokens
                 self.assertEqual(
                     routes.aligned_per_expert.maybe_num_pairs_post_padded.item(),
                     pair_count,
@@ -744,48 +769,19 @@ class TestSharedTokenRoute(unittest.TestCase):
                 )
                 self.assertEqual(
                     routes.shared_token.maybe_num_pairs_post_padded.item(),
-                    token_count,
+                    num_tokens,
                 )
-
-                shared_cached_count = cached_counts[2]
-                self.assertEqual(shared_cached_count.item(), token_count)
-                for route in (
-                    routes.aligned_per_expert,
-                    routes.aligned_shared_outer,
-                    routes.shared_token,
-                ):
-                    self.assertNotEqual(
-                        route.maybe_num_pairs_post_padded.data_ptr(),
-                        shared_cached_count.data_ptr(),
+                # ... and the scalars are separate storage, so the T-row plan
+                # cannot have overwritten either T*K-row one.
+                pointers = {
+                    route.maybe_num_pairs_post_padded.data_ptr()
+                    for route in (
+                        routes.aligned_per_expert,
+                        routes.aligned_shared_outer,
+                        routes.shared_token,
                     )
-                self.assertTrue(
-                    {
-                        "route:aligned_per_expert:padded_pairs",
-                        "route:aligned_shared_outer:padded_pairs",
-                        "route:shared_token:padded_pairs",
-                    }.issubset(workspace.tensors)
-                )
-                scratch_fields = (
-                    "counts",
-                    "block_cumulative",
-                    "cursor",
-                    "bucket_end",
-                )
-                route_scratch = [
-                    {
-                        workspace.tensors[f"{prefix}:{field}"].data_ptr()
-                        for field in scratch_fields
-                    }
-                    for prefix in (
-                        "route:aligned_per_expert",
-                        "route:aligned_shared_outer",
-                        "route:shared_token",
-                    )
-                ]
-                for index, pointers in enumerate(route_scratch):
-                    self.assertEqual(len(pointers), len(scratch_fields))
-                    for other in route_scratch[index + 1 :]:
-                        self.assertTrue(pointers.isdisjoint(other))
+                }
+                self.assertEqual(len(pointers), 3)
 
 
 class TestRunnerRouteSelectionSource(unittest.TestCase):

@@ -72,6 +72,7 @@ from sglang.kernels.ops.moe.virtual_experts import (
     _align_block_size_jit,
     _align_block_size_torch,
 )
+from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
 # The shared JIT align primitive supports at most 8191 real expert buckets.
 # This backend switches to its own fused builder at V >= 8192, so it does not
@@ -467,8 +468,8 @@ def build_virtual_expert_routing(
     lora_expert_map: torch.Tensor | None = None,
     shared_outer_local_expert_count: int | None = None,
     view: RouteViewKind = RouteViewKind.ALIGNED,
-    num_pairs_post_padded_out: torch.Tensor | None = None,
-    fused_align_scratch: FusedAlignScratch | None = None,
+    workspace: MoeLoraWorkspace | None = None,
+    scratch_prefix: str | None = None,
 ) -> RouteView:
     """Build exactly the requested route representation and nothing more.
 
@@ -478,10 +479,10 @@ def build_virtual_expert_routing(
     Requires ``lora_experts_per_adapter == 1`` and local-domain ids — global
     callers localize first, production's convention.
 
-    ``num_pairs_post_padded_out`` is an optional graph-stable destination for
-    the fused aligned path. The JIT aligned path already owns its scalar and
-    leaves this buffer unused. ``fused_align_scratch`` similarly replaces the
-    fused path's process-global serial fallback with caller-owned metadata.
+    ``workspace`` plus ``scratch_prefix`` make the fused aligned path's
+    metadata layer-owned and graph-stable. They are meaningless on every other
+    path, which is why the fused branch allocates them itself instead of
+    making each caller predict the dispatch.
     """
     if view not in RouteViewKind:
         raise ValueError(
@@ -530,6 +531,32 @@ def build_virtual_expert_routing(
         # this is also the only CUDA-speed option.
         from sglang.srt.lora.moe.fused_align import fused_align_block_size
 
+        # A caller holding the layer workspace gets graph-stable buffers keyed
+        # by its route name; the scan restores ``counts`` to zero after its
+        # final read, so that one is initialized only when storage is first
+        # allocated. Without a workspace (tests, benchmarks) the fused kernel
+        # falls back to its own process-global cache.
+        padded_count = scratch = None
+        if workspace is not None:
+            num_buckets = num_virtual + 1
+
+            def counter(name: str, size: int, *, zero_first: bool = False):
+                return workspace.tensor(
+                    f"{scratch_prefix}:{name}",
+                    (size,),
+                    dtype=torch.int32,
+                    device=topk_ids.device,
+                    **({"zero_on_first_allocation": True} if zero_first else {}),
+                )
+
+            padded_count = counter("padded_pairs", 1)
+            scratch = FusedAlignScratch(
+                counts=counter("counts", num_buckets, zero_first=True),
+                block_cumulative=counter("block_cumulative", num_buckets + 1),
+                cursor=counter("cursor", num_buckets),
+                bucket_end=counter("bucket_end", num_buckets),
+            )
+
         sorted_pair_ids, block_virtual_expert_ids, num_pairs_post_padded = (
             fused_align_block_size(
                 topk_ids,
@@ -540,8 +567,8 @@ def build_virtual_expert_routing(
                 capacity=_routing_capacity(topk_ids.numel(), block_size, num_virtual),
                 lora_expert_map=lora_expert_map,
                 shared_outer_local_expert_count=shared_outer_local_expert_count,
-                num_pairs_post_padded_out=num_pairs_post_padded_out,
-                scratch=fused_align_scratch,
+                num_pairs_post_padded_out=padded_count,
+                scratch=scratch,
             )
         )
         return RouteView(
