@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import (
+    get_encoder_data_parallel_group,
     get_local_torch_device,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -420,17 +421,19 @@ class TextEncoderLoader(ComponentLoader):
             model_config,
             component_model_path,
         )
+        encoder_dp_group = get_encoder_data_parallel_group()
+        prefer_dp = (
+            server_args.batching_max_size > 1
+            and encoder_dp_group is not None
+            and encoder_dp_group.world_size > 1
+            and issubclass(model_cls, TextEncoder)
+            and model_cls.supports_dp_encode
+        )
         # real dims are populated now; resolve fold vs replicate
         finalize_encoder_folding(
             encoder_config,
             server_args.encoder_parallel,
-            prefer_dp=(
-                server_args.batching_max_size > 1
-                and (server_args.tp_size or 1) == 1
-                and (server_args.dp_size or 1) == 1
-                and issubclass(model_cls, TextEncoder)
-                and model_cls.supports_dp_encode
-            ),
+            prefer_dp=prefer_dp,
         )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
             encoder_index
@@ -527,7 +530,7 @@ class TextEncoderLoader(ComponentLoader):
             )
             component_starts_on_cpu = False
 
-        if component_starts_on_cpu and not current_platform.is_mps():
+        if component_starts_on_cpu:
             model_device = torch.device("cpu")
         else:
             model_device = local_torch_device
@@ -556,6 +559,12 @@ class TextEncoderLoader(ComponentLoader):
                 )
             model.bind_encoder_tp_group(encoder_tp_group)
 
+            if current_platform.is_mps() and component_starts_on_cpu:
+                # the h3 encoder is layered immediately after this loader returns
+                # compatible CPU safetensors stay mapped instead of copying the
+                # full Qwen checkpoint into unified memory
+                model._mps_zero_copy_weight_loading = True
+
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
                 self._get_all_weights(
@@ -578,7 +587,10 @@ class TextEncoderLoader(ComponentLoader):
 
             if component_starts_on_cpu:
                 if current_platform.is_mps():
-                    model = model.to(local_torch_device)
+                    logger.info(
+                        "Keeping %s on CPU for MPS layerwise offload",
+                        model.__class__.__name__,
+                    )
                 else:
                     model = model.to("cpu")
             else:
