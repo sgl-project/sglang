@@ -315,7 +315,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.decode_cuda_graph_metadata = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
 
-        # Pinned host buffers for the fast prefill path plan
+        # Pinned host control metadata shared by stock capture planning and
+        # the sync-free replay planner.
         if not skip_prefill:
             self.fast_plan_qo_indptr_cpu = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device="cpu", pin_memory=True
@@ -391,7 +392,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
                 seq_lens_cpu=seq_lens_cpu,
-                in_capture=True,
             )
             if forward_mode.is_target_verify():
                 # use sync-free fast_mla_prefill_plan for replay
@@ -405,7 +405,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
-                in_capture=False,
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -529,7 +528,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        in_capture: bool,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -582,15 +580,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 ],
                 use_ragged=False,
                 spec_info=spec_info,
-                qo_indptr_cpu=(
-                    None if in_capture else self.fast_plan_qo_indptr_cpu[: bs + 1]
-                ),
-                kv_indptr_cpu=(
-                    None if in_capture else self.fast_plan_kv_indptr_cpu[: bs + 1]
-                ),
-                kv_len_arr_cpu=(
-                    None if in_capture else self.fast_plan_kv_len_arr_cpu[:bs]
-                ),
+                qo_indptr_cpu=self.fast_plan_qo_indptr_cpu[: bs + 1],
+                kv_indptr_cpu=self.fast_plan_kv_indptr_cpu[: bs + 1],
+                kv_len_arr_cpu=self.fast_plan_kv_len_arr_cpu[:bs],
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
