@@ -1379,13 +1379,7 @@ class DeepseekV4HipRadixBackend(
                 get_parallel().attn_tp_rank,
                 self.dsv4_dcp_size,
                 self.dsv4_dcp_rank,
-            ) - torch.log(
-                torch.tensor(
-                    float(self.dsv4_dcp_size),
-                    dtype=torch.float32,
-                    device=q.device,
-                )
-            )
+            ) - math.log(float(self.dsv4_dcp_size))
             partial_out, partial_lse = runtime.decode(
                 q=q,
                 unified_kv=unified,

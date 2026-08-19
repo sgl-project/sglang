@@ -1,5 +1,6 @@
 import pytest
 import torch
+import math
 from types import SimpleNamespace
 
 from sglang.kernels.ops.attention.dsv4.compress import (
@@ -32,6 +33,7 @@ from sglang.kernels.ops.attention.deepseek_v4_rope import (
 from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     DeepseekV4HipRadixBackend,
 )
+from sglang.srt.layers.attention.dsv4.dcp import select_dcp_attn_sink
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -142,6 +144,33 @@ def test_dspark_graph_replay_normalizes_padded_cpu_seq_lens() -> None:
             dtype=torch.int32,
             device=DEVICE,
         ),
+    )
+
+
+def test_dcp_sink_shift_is_cuda_graph_capture_safe() -> None:
+    dcp_size = 8
+    local_heads = 16
+    attn_sink = torch.arange(128, dtype=torch.float32, device=DEVICE)
+    shifted_sink = torch.empty_like(attn_sink)
+    graph = torch.cuda.CUDAGraph()
+
+    with torch.cuda.graph(graph):
+        shifted_sink.copy_(
+            select_dcp_attn_sink(
+                attn_sink,
+                local_heads,
+                attn_tp_rank=0,
+                dcp_size=dcp_size,
+                dcp_rank=0,
+            )
+            - math.log(float(dcp_size))
+        )
+
+    attn_sink.add_(3.0)
+    graph.replay()
+    torch.testing.assert_close(
+        shifted_sink,
+        attn_sink - math.log(float(dcp_size)),
     )
 
 
