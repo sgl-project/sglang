@@ -29,7 +29,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     suppress_stdout,
 )
-from sglang.srt.utils import is_shm_available
 
 try:
     import torch_musa  # noqa: F401
@@ -162,6 +161,7 @@ class GroupCoordinator:
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
     ):
+        self.group_name = group_name
         self.unique_name = _get_unique_name(group_name)
         self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
@@ -353,64 +353,83 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
-        else:
-            custom_ar = self.srt_custom_allreduce
-            if (
-                not async_op
-                and custom_ar is not None
-                and op == torch.distributed.ReduceOp.SUM
-                and not input_.is_cpu
-                and not custom_ar.disabled
-                and custom_ar.should_custom_ar(input_)
-            ):
-                if custom_ar._IS_CAPTURING:
-                    return custom_ar.custom_all_reduce(input_)
-                return custom_ar._all_reduce_impl(input_, registered=False)
-            if (
-                current_platform.is_cpu()
-                and is_shm_available(input_.dtype, self.world_size, len(self.ranks))
-                and op is torch.distributed.ReduceOp.SUM
-            ):
-                # for CPU platform, intra-node case we could speedup with shared memory based comm ops
-                torch.ops.sgl_kernel.shm_allreduce(
-                    input_, int(torch.distributed.ReduceOp.SUM)
-                )
-            else:
-                torch.distributed.all_reduce(
-                    input_, op=op, group=self.device_group, async_op=async_op
-                )
+
+        custom_ar = self.srt_custom_allreduce
+        if (
+            not async_op
+            and custom_ar is not None
+            and op == torch.distributed.ReduceOp.SUM
+            and not input_.is_cpu
+            and not custom_ar.disabled
+            and custom_ar.should_custom_ar(input_)
+        ):
+            if custom_ar._IS_CAPTURING:
+                return custom_ar.custom_all_reduce(input_)
+            return custom_ar._all_reduce_impl(input_, registered=False)
+        if current_platform.is_cpu() and self.device_communicator is not None:
+            return self.device_communicator.all_reduce(
+                input_,
+                op=op,
+                group=self.device_group,
+                async_op=async_op,
+            )
+        torch.distributed.all_reduce(
+            input_,
+            op=op,
+            group=self.device_group,
+            async_op=async_op,
+        )
         return input_
 
     def all_gather(
         self, input_: torch.Tensor, dim: int = 0, separate_tensors: bool = False
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         world_size = self.world_size
-        # Bypass the function if we are using only 1 GPU.
+
+        # Bypass the function if world size is 1.
         if world_size == 1:
-            return input_
+            return [input_] if separate_tensors else input_
+
         assert (
             -input_.dim() <= dim < input_.dim()
         ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
         if dim < 0:
             # Convert negative dim to positive.
             dim += input_.dim()
-        # Allocate output tensor.
-        input_size = list(input_.size())
-        input_size[0] *= world_size
-        output_tensor = torch.empty(
-            input_size, dtype=input_.dtype, device=input_.device
-        )
 
-        # All-gather.
-        if current_platform.is_cpu() and is_shm_available(
-            input_.dtype, self.world_size, len(self.ranks)
-        ):
-            return torch.ops.sgl_kernel.shm_allgather(input_, dim)
-        else:
-            torch.distributed.all_gather_into_tensor(
-                output_tensor, input_, group=self.device_group
+        # Use group-aware CPU SHM.
+        if current_platform.is_cpu() and self.device_communicator is not None:
+            output_tensor = self.device_communicator.all_gather(
+                input_,
+                dim=dim,
+                group=self.device_group,
             )
 
+            if separate_tensors:
+                return list(
+                    torch.split(
+                        output_tensor,
+                        input_.size(dim),
+                        dim=dim,
+                    )
+                )
+
+            return output_tensor
+        # Fallback: torch.distributed.
+        input_size = list(input_.size())
+        input_size[0] *= world_size
+
+        output_tensor = torch.empty(
+            input_size,
+            dtype=input_.dtype,
+            device=input_.device,
+        )
+
+        torch.distributed.all_gather_into_tensor(
+            output_tensor,
+            input_,
+            group=self.device_group,
+        )
         if dim != 0:
             input_size[0] //= world_size
             output_tensor = output_tensor.reshape(

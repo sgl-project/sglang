@@ -48,6 +48,7 @@ from torch.distributed import ProcessGroup
 
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from ..utils.distributed import RankGenerator
@@ -204,7 +205,9 @@ def init_parallel_group_coordinator(
             group_ranks=group_ranks,
             local_rank=local_rank,
             torch_distributed_backend=backend,
-            use_device_communicator=parallel_mode != "tensor",
+            use_device_communicator=(
+                parallel_mode != "tensor" or current_platform.is_cpu()
+            ),
             use_srt_custom_allreduce=parallel_mode == "tensor",
             group_name=(
                 "tp_group"

@@ -116,6 +116,109 @@ def reduce_scatter_tensor_fn(rank, world_size):
         torch.testing.assert_close(output_tensor, output_shm)
 
 
+def init_group(rank):
+    group_ranks_list = [[0, 2], [1, 3]]
+
+    groups = [dist.new_group(ranks=ranks, backend="gloo") for ranks in group_ranks_list]
+
+    group_idx = rank % 2
+    group = groups[group_idx]
+    group_ranks = group_ranks_list[group_idx]
+
+    group_size = dist.get_world_size(group)
+    group_rank = dist.get_rank(group)
+
+    group_name = f"test_group_{os.environ['MASTER_PORT']}_" + "_".join(
+        map(str, group_ranks)
+    )
+
+    handle = torch.ops.sgl_kernel.shm_group_initialize(
+        group_name,
+        group_size,
+        group_rank,
+    )
+
+    return group, handle
+
+
+def group_all_reduce_fn(rank, world_size):
+    group, handle = init_group(rank)
+
+    op = dist.ReduceOp.SUM
+
+    for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+        for size in [(2, 10), (600000,)]:
+            tensor = torch.randn(size, dtype=dtype)
+            tensor_shm = copy.deepcopy(tensor)
+
+            dist.all_reduce(tensor, op=op, group=group)
+
+            torch.ops.sgl_kernel.shm_group_allreduce(
+                handle,
+                tensor_shm,
+            )
+
+            torch.testing.assert_close(tensor, tensor_shm)
+
+
+def group_all_gather_fn(rank, world_size):
+    group, handle = init_group(rank)
+
+    group_size = dist.get_world_size(group)
+
+    for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+        tensor = torch.randn(2, 10, dtype=dtype)
+
+        input_size = tensor.size()
+        output_size = (input_size[0] * group_size,) + input_size[1:]
+
+        output_tensor = torch.empty(
+            output_size,
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        output_shm = torch.empty(
+            output_size,
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+
+        dist.all_gather_into_tensor(
+            output_tensor,
+            tensor,
+            group=group,
+        )
+
+        torch.ops.sgl_kernel.shm_group_allgather(
+            handle,
+            output_shm,
+            tensor,
+        )
+
+        torch.testing.assert_close(output_tensor, output_shm)
+
+
+def group_all_to_all_fn(rank, world_size):
+    group, handle = init_group(rank)
+
+    group_size = dist.get_world_size(group)
+
+    for dtype in [torch.float32, torch.bfloat16, torch.float16]:
+        tensor = torch.randn(group_size * 2, 10, dtype=dtype)
+        output_tensor = torch.empty_like(tensor)
+        output_shm = torch.empty_like(tensor)
+
+        dist.all_to_all_single(output_tensor, tensor, group=group)
+
+        torch.ops.sgl_kernel.shm_group_alltoall(
+            handle,
+            output_shm,
+            tensor,
+        )
+
+        torch.testing.assert_close(output_tensor, output_shm)
+
+
 class TestComm(CustomTestCase):
     def _spawn_and_check(self, fn, world_size=2):
         mp.set_start_method("spawn", force=True)
@@ -155,6 +258,15 @@ class TestComm(CustomTestCase):
 
     def test_reduce_scatter_tensor(self):
         self._spawn_and_check(reduce_scatter_tensor_fn)
+
+    def test_group_all_reduce(self):
+        self._spawn_and_check(group_all_reduce_fn, world_size=4)
+
+    def test_group_all_gather(self):
+        self._spawn_and_check(group_all_gather_fn, world_size=4)
+
+    def test_group_all_to_all(self):
+        self._spawn_and_check(group_all_to_all_fn, world_size=4)
 
 
 if __name__ == "__main__":

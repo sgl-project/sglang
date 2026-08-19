@@ -467,6 +467,18 @@ void shm_allgather_into_tensor(at::Tensor& output_tensor, at::Tensor& data);
 // shared memory reduce_scatter_tensor
 void shm_reduce_scatter_tensor(at::Tensor& output_tensor, at::Tensor& data, int64_t op);
 
+// group shared memory init
+int64_t shm_group_initialize(const std::string& group_name, int64_t group_size, int64_t group_rank);
+
+// group shared memory all_gather
+void shm_group_allgather(int64_t handle, at::Tensor& output_tensor, at::Tensor& data);
+
+// group shared memory all_to_all
+void shm_group_alltoall(int64_t handle, at::Tensor& output_tensor, at::Tensor& data);
+
+// group shared memory all_reduce
+void shm_group_allreduce(int64_t handle, at::Tensor& input);
+
 // rope
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     at::Tensor& positions,
@@ -917,11 +929,23 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // raw base pointers), which schema-level alias annotations cannot express.
   m.def("copy_all_layer_kv_cache_cpu(Tensor data_ptrs, Tensor strides, Tensor tgt_loc, Tensor src_loc) -> ()");
   m.impl("copy_all_layer_kv_cache_cpu", torch::kCPU, &copy_all_layer_kv_cache_cpu);
-}
 
+  m.def("shm_group_initialize(str group_name, int group_size, int group_rank) -> int");
+  m.impl("shm_group_initialize", torch::kCPU, &shm_group_initialize);
+
+  m.def("shm_group_allgather(int handle, Tensor(a!) output_tensor, Tensor data) -> ()");
+  m.impl("shm_group_allgather", torch::kCPU, &shm_group_allgather);
+
+  m.def("shm_group_alltoall(int handle, Tensor(a!) output_tensor, Tensor data) -> ()");
+  m.impl("shm_group_alltoall", torch::kCPU, &shm_group_alltoall);
+
+  m.def("shm_group_allreduce(int handle, Tensor(a!) input) -> ()");
+  m.impl("shm_group_allreduce", torch::kCPU, &shm_group_allreduce);
+}
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
   m.impl("init_cpu_threads_env", init_cpu_threads_env);
   m.impl("initialize", &initialize);
+  m.impl("shm_group_initialize", &shm_group_initialize);
 }
 
 REGISTER_EXTENSION(common_ops)
