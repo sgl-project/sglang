@@ -169,17 +169,61 @@ This is paid ONCE PER MoE LAYER per forward, not once per forward — each
 layer routes its tokens differently, so the route cannot be reused. Multiply
 by the model's MoE layer count before comparing against anything.
 
-Two open leads, both UNCHANGED pending end-to-end evidence:
+End-to-end share, measured 2026-08-19 on B200 tp4, Qwen3.5-35B (40 MoE
+layers, top-8, 256 experts), one 8192-token prefill chunk = 65,536 pairs,
+rank-0 torch profile:
 
-- The plan kernel is a single thread block, so it grows with bucket count:
-  2.3us at 513 buckets, 8.9us at 8193, where it is half the build and 149 of
-  the GPU's SMs are idle. A two-pass multi-block scan would fix it. Only
-  configs with many adapters resident reach the bad end.
-- Atomic contention is harmless until one bucket takes more than about 4,000
-  pairs, then the count and place kernels nearly triple. Shared-outer with a
-  single live adapter is exactly that case (28.1us vs 10.9us with four
-  adapters) and it is a shipping config. A per-thread-block histogram, or
-  warp-aggregated slot claims, would fix it for small bucket counts only.
+| route family | builder | per layer | per prefill | share of prefill |
+|---|---|---|---|---|
+| per-expert (`prefill.serial`) | `fused_align` | 43.7us | 1.75ms | 2.4% (ttft 74.4ms) |
+| shared-outer (`prefill.token_dedup`) | `joint_routing` | 116.4us | 4.66ms | 5.4% (ttft 86.8ms) |
+
+Read that before optimizing either file. The shared-outer plan needs two
+aligned views at once, so it takes the JOINT builder and `fused_align` never
+runs; the per-expert plan needs one and takes `fused_align`. Per-expert DECODE
+takes neither -- 8 pairs is below `FUSED_ALIGN_MIN_PAIRS`, so it runs the JIT
+id pass at 1.2us per layer.
+
+BEWARE when A/B-ing adapter counts: at batch size 1 a single request uses a
+single adapter, so `max_loras_per_batch` 1 and 4 put every pair on the SAME
+counter and measure identically (58.0 vs 58.5us here). That flatness is not
+evidence of no contention -- it is evidence the knob did nothing.
+
+Verdicts on the two leads this evidence settles:
+
+- The single-thread-block plan kernel is NOT worth fixing. It is 2.7-3.8us per
+  layer in both families, 0.13% of the step. Its 8.9us at 8193 buckets only
+  arrives with many adapters resident, which batch-1 serving never reaches.
+- Atomic contention IS worth fixing, in `joint_routing`. Its count kernel does
+  two tallies per pair: the per-expert one spreads over 257-1025 counters, the
+  shared one over `adapters + 1`. Isolated at 65,536 pairs, the shared tally
+  alone costs 44.2us against 16.4us for the per-expert one, and aggregating it
+  per thread block takes the whole kernel 53.0 -> 18.3us (2.9x). The place
+  kernel's slot claims behave the same, 44.1 -> 11.2us on the contended part.
+  Estimated 2.7ms off the 4.66ms build, about 3% of the prefill step.
+
+That fix CANNOT simply replace the current code -- block aggregation pays a
+fixed per-block cost, so it loses badly on small work. Measured win factor by
+pairs and live adapters (above 1.00 means aggregation wins):
+
+| pairs | 1 live | 2 | 4 | 8 |
+|---|---|---|---|---|
+| 65,536 | 4.78x | 2.31x | 1.27x | 1.28x |
+| 32,768 | 2.39x | 1.32x | 0.73x | 0.71x |
+| 16,384 | 1.28x | 0.72x | 0.44x | 0.45x |
+| 4,096 | 0.66x | 0.56x | 0.40x | 0.38x |
+| 512 | 0.33x | 0.32x | 0.31x | 0.38x |
+
+The crossover sits near 12,000 pairs per bucket. Pick between the two paths on
+the host from the pair count and bucket count, both known before launch, so
+each call site keeps one launch shape and graph capture is unaffected. Do NOT
+branch inside the kernel on a device value.
+
+Remaining untested lead: once the shared tally is aggregated, the per-expert
+tally is what is left (16.4 of the 18.3us). 257 counters is mild but not free,
+and `fused_align`'s count kernel has the same shape at 21.4us per layer. A
+shared-memory histogram could take both further; the whole `fused_align`
+builder is only 2.4% of prefill, so the ceiling there is small.
 
 Not a lead, and worth recording so nobody re-derives it: the padding fill's
 2D tile is `EXPAND_BLOCK x routing_block_size`, which looks like it should
