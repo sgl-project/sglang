@@ -200,11 +200,11 @@ export const config = {
           disableReason: (s) => (s.hw === "a3" ? "Only Modelslim (W4A8) is supported on this recipe." : ""),
         },
         {
+          // A3 only (NPU W4A8 checkpoint); hidden on the GPU recipes.
           id: "modelslim",
           label: "Modelslim (W4A8)",
           subtitle: "ModelScope NPU checkpoint",
-          disabled: (s) => s.hw !== "a3",
-          disableReason: (s) => (s.hw !== "a3" ? "Only MXFP4 / NVFP4 are supported on this recipe." : ""),
+          showWhen: (s) => s.hw === "a3",
         },
         {
           id: "nvfp4",
@@ -653,10 +653,8 @@ export const config = {
     // ----- Card: "Parsers" -----
     parsers: {
       items: [
-        // A3's launch script ships a fixed parser set (reasoning on, tool-call
-        // off) with nothing to toggle, so the card hides entirely there.
-        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser kimi_k3",
-          hide: { hw: ["a3"] } },
+        { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser kimi_k3" },
+        // Tool calling is not yet supported on the NPU, so the item hides on a3.
         { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser kimi_k3",
           hide: { hw: ["a3"] } },
       ],
@@ -735,34 +733,22 @@ export const config = {
         //   EAGLE   --speculative-num-steps N           (chain; topk>1 is a tree)
         // Only DSPARK is selectable today, so only its form is emitted.
         id: "proposedDraftTokens", title: "Proposed Draft Tokens",
-        showWhen: (b) => b.spec === "dspark",
+        // The A3 recipe pins the shipped block size (7); nothing to tune, so
+        // the row hides there.
+        showWhen: (b) => b.spec === "dspark" && b.hw !== "a3",
         control: "slider",
         stripPrefixes: [
           "--speculative-dspark-block-size",
           "--speculative-dflash-block-size",
           "--speculative-num-steps",
         ],
-        // A3 pins the shipped block size; the other stops drop off the slider
-        // scale there (the engine skips disabled stops).
         options: [
-          { id: "1", label: "1", flags: ["--speculative-dspark-block-size 1"],
-            disable: [{ when: { hw: ["a3"] },
-              reason: "Not offered on the single supported A3 configuration." }] },
-          { id: "2", label: "2", flags: ["--speculative-dspark-block-size 2"],
-            disable: [{ when: { hw: ["a3"] },
-              reason: "Not offered on the single supported A3 configuration." }] },
-          { id: "3", label: "3", flags: ["--speculative-dspark-block-size 3"],
-            disable: [{ when: { hw: ["a3"] },
-              reason: "Not offered on the single supported A3 configuration." }] },
-          { id: "4", label: "4", flags: ["--speculative-dspark-block-size 4"],
-            disable: [{ when: { hw: ["a3"] },
-              reason: "Not offered on the single supported A3 configuration." }] },
-          { id: "5", label: "5", flags: ["--speculative-dspark-block-size 5"],
-            disable: [{ when: { hw: ["a3"] },
-              reason: "Not offered on the single supported A3 configuration." }] },
-          { id: "6", label: "6", flags: ["--speculative-dspark-block-size 6"],
-            disable: [{ when: { hw: ["a3"] },
-              reason: "Not offered on the single supported A3 configuration." }] },
+          { id: "1", label: "1", flags: ["--speculative-dspark-block-size 1"] },
+          { id: "2", label: "2", flags: ["--speculative-dspark-block-size 2"] },
+          { id: "3", label: "3", flags: ["--speculative-dspark-block-size 3"] },
+          { id: "4", label: "4", flags: ["--speculative-dspark-block-size 4"] },
+          { id: "5", label: "5", flags: ["--speculative-dspark-block-size 5"] },
+          { id: "6", label: "6", flags: ["--speculative-dspark-block-size 6"] },
           { id: "7", label: "7", flags: ["--speculative-dspark-block-size 7"] },
         ],
       },
@@ -795,13 +781,13 @@ export const config = {
         // without --speculative-dspark-sps-table-path (every step still
         // verifies full width); fails fast with ReplaySSM or DCP > 1.
         id: "raggedVerify", title: "Ragged Verify Mode (spec)",
-        showWhen: (b) => b.spec === "dspark",
+        // The A3 recipe pins static (in its env); nothing to tune, so the row
+        // hides there.
+        showWhen: (b) => b.spec === "dspark" && b.hw !== "a3",
         stripEnv: ["SGLANG_RAGGED_VERIFY_MODE"],
         options: [
           { id: "static",  label: "Auto (static)" },
-          { id: "compact", label: "Compact (requires SPS table)", env: ["SGLANG_RAGGED_VERIFY_MODE=compact"],
-            disable: [{ when: { hw: ["a3"] },
-              reason: "Not offered on the single supported A3 configuration." }] },
+          { id: "compact", label: "Compact (requires SPS table)", env: ["SGLANG_RAGGED_VERIFY_MODE=compact"] },
         ],
       },
       {

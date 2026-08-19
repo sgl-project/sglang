@@ -1383,24 +1383,20 @@ export const Playground = ({ config }) => {
           // `control: "slider"` renders the same option list as a range input —
           // for dense ordered scales (1..7) where chips are just noise. Option
           // ORDER is the scale; the option id is still what apply() consumes.
-          // Disabled stops have no range-input equivalent, so they drop off the
-          // scale entirely (a fully-disabled row renders nothing).
           if (spec.control === "slider") {
-            const stops = opts.filter((c) => !c.disabled);
-            if (!stops.length) continue;
-            const idx = Math.max(0, stops.findIndex((c) => c.value === display));
-            const cur = stops[idx];
+            const idx = Math.max(0, opts.findIndex((c) => c.value === display));
+            const cur = opts[idx];
             cards.push(
               <div key={`${axisId}-${spec.id}`} style={s.card}>
                 <div style={s.compactRow}>
                   <span style={s.axisTitle}>{spec.title}</span>
                   <input
                     type="range"
-                    min={0} max={stops.length - 1} step={1}
+                    min={0} max={opts.length - 1} step={1}
                     value={idx}
                     onChange={(e) => setValue({
                       ...value,
-                      [spec.id]: stops[Number(e.target.value)].value,
+                      [spec.id]: opts[Number(e.target.value)].value,
                     })}
                     style={{ flex: 1, minWidth: "120px", accentColor: "#D45D44" }}
                   />
