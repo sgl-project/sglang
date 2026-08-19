@@ -782,5 +782,147 @@ class TestSWASplitLeafOnInsert(CustomTestCase):
         tree.sanity_check()
 
 
+# Optimization: SWA eviction deprioritizes the trailing sliding window of each
+# branch. Tombstoning a node inside that window makes the whole branch
+# unmatchable (_match_prefix_helper needs `sliding_window_size` consecutive
+# non-tombstone tokens after a tombstone), while evicting a node closer to the
+# root only costs that prefix.
+class TestSWADeprioritizeBranchTailEviction(CustomTestCase):
+    def _match_len(self, tree, token_ids):
+        match = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", token_ids)))
+        )
+        return match.device_indices.shape[0]
+
+    def _two_branch_tree(self, *, window, page_size, unit):
+        """shared -> tail1 / shared -> other, with tail1 as the SWA LRU node.
+
+        `unit` scales every segment so the shape stays page-aligned.
+        """
+        tree, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            kv_size=256,
+            kv_size_swa=128,
+            max_context_len=128,
+            sliding_window_size=window,
+            page_size=page_size,
+        )
+        shared = list(range(0, 2 * unit))
+        branch1 = shared + list(range(100, 100 + unit))
+        branch2 = shared + list(range(200, 200 + 2 * unit))
+
+        _insert(tree, allocator, shared)
+        _insert(tree, allocator, branch1)
+        _insert(tree, allocator, branch2)
+        # Refresh branch2 so `shared` becomes MRU and branch1's tail is the
+        # least recently used SWA node -- the agentic "parked in a tool call"
+        # ordering that used to get the tail evicted first.
+        self._match_len(tree, branch2)
+        return tree, shared, branch1, branch2
+
+    def test_tail_survives_and_prefix_stays_reusable(self):
+        window, unit = 4, 4
+        tree, shared, branch1, branch2 = self._two_branch_tree(
+            window=window, page_size=1, unit=unit
+        )
+        self.assertEqual(self._match_len(tree, branch1), len(branch1))
+
+        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=window))
+
+        # The `shared` internal node is tombstoned instead of the tail, which
+        # frees more SWA tokens than requested and keeps both branches
+        # matchable: one full window of non-tombstone tokens still follows the
+        # tombstone.
+        self.assertGreaterEqual(result.swa_num_tokens_evicted, window)
+        self.assertEqual(result.num_tokens_evicted, 0)
+        self.assertEqual(self._match_len(tree, branch1), len(branch1))
+        self.assertEqual(self._match_len(tree, branch2), len(branch2))
+        tree.sanity_check()
+
+    def test_tail_split_across_several_small_nodes_is_protected(self):
+        # shared(8) -> t1(2) -> t2(2): neither tail node alone covers the
+        # window, so both must be skipped until the accumulated distance from
+        # a branch end reaches `sliding_window_size`.
+        window = 4
+        tree, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            kv_size=256,
+            kv_size_swa=128,
+            max_context_len=128,
+            sliding_window_size=window,
+            page_size=1,
+        )
+        shared = list(range(8))
+        branch1_short = shared + [101, 102]
+        branch1 = branch1_short + [103, 104]
+        branch2 = shared + list(range(200, 208))
+
+        _insert(tree, allocator, shared)
+        _insert(tree, allocator, branch1_short)
+        _insert(tree, allocator, branch1)
+        _insert(tree, allocator, branch2)
+        self._match_len(tree, branch2)
+
+        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=2))
+
+        self.assertGreaterEqual(result.swa_num_tokens_evicted, 2)
+        self.assertEqual(self._match_len(tree, branch1), len(branch1))
+        self.assertEqual(self._match_len(tree, branch2), len(branch2))
+        tree.sanity_check()
+
+    def test_page_aligned_tail_is_protected(self):
+        # page_size > 1: the protected tail rounds up to a page boundary, so
+        # the shape is scaled by `unit` to stay page-aligned.
+        for window, page_size, unit in [(4, 2, 4), (4, 4, 4), (3, 2, 4)]:
+            with self.subTest(window=window, page_size=page_size):
+                tree, _, branch1, branch2 = self._two_branch_tree(
+                    window=window, page_size=page_size, unit=unit
+                )
+                tail_size = _expected_tail_size(window, page_size)
+
+                result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=tail_size))
+
+                self.assertGreaterEqual(result.swa_num_tokens_evicted, tail_size)
+                self.assertEqual(self._match_len(tree, branch1), len(branch1))
+                self.assertEqual(self._match_len(tree, branch2), len(branch2))
+                tree.sanity_check()
+
+    def test_fallback_evicts_tail_when_nothing_else_is_left(self):
+        # A single branch: every SWA-evictable node is a branch tail, so the
+        # first pass finds no candidate and the fallback must still meet the
+        # eviction target instead of returning short.
+        window = 4
+        tree, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            kv_size=128,
+            kv_size_swa=64,
+            sliding_window_size=window,
+            page_size=1,
+        )
+        token_ids = list(range(window))
+        _insert(tree, allocator, token_ids)
+        self.assertEqual(tree.swa_evictable_size(), window)
+
+        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=window))
+
+        self.assertGreaterEqual(result.swa_num_tokens_evicted, window)
+        self.assertEqual(tree.swa_evictable_size(), 0)
+        tree.sanity_check()
+
+    def test_evictable_size_balances_after_full_eviction(self):
+        window, unit = 4, 4
+        tree, _, branch1, _ = self._two_branch_tree(
+            window=window, page_size=1, unit=unit
+        )
+        total_swa = tree.swa_evictable_size()
+
+        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=total_swa))
+
+        self.assertEqual(result.swa_num_tokens_evicted, total_swa)
+        self.assertEqual(tree.swa_evictable_size(), 0)
+        self.assertEqual(tree.swa_protected_size_, 0)
+        tree.sanity_check()
+
+
 if __name__ == "__main__":
     unittest.main()
