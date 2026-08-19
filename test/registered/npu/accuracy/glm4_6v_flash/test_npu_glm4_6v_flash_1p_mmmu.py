@@ -16,7 +16,7 @@ register_npu_ci(
 ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
-    "DEEPEP_HCCL_BUFFSIZE": "1000",
+    "HCCL_BUFFSIZE": "1000",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
@@ -57,7 +57,7 @@ OTHER_ARGS = [
 ]
 
 
-class TestGLM4_6V_Flash_MMMU(TestNpuAccuracyTestCaseBase):
+class TestQwen3(TestNpuAccuracyTestCaseBase):
     model = GLM_4_6V_FLASH_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS

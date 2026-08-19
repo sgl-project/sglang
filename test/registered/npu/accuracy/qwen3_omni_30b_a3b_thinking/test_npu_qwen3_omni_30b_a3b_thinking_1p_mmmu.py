@@ -25,7 +25,7 @@ ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
     "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "200",
-    "DEEPEP_HCCL_BUFFSIZE": "400",
+    "HCCL_BUFFSIZE": "400",
 }
 
 OTHER_ARGS = [
@@ -85,7 +85,7 @@ OTHER_ARGS = [
 ]
 
 
-class TestQwen3_Omni_30B_A3B_Thinking_MMMU(TestNpuAccuracyTestCaseBase):
+class TestQwen3(TestNpuAccuracyTestCaseBase):
     model = QWEN3_OMNI_30B_A3B_THINKING_MODEL_PATH
     envs = ENVS
     other_args = OTHER_ARGS
