@@ -698,7 +698,7 @@
             "expected_e2e_ms": 31484.37,
             "expected_avg_denoise_ms": 741.58,
             "expected_median_denoise_ms": 746.28
-        }
+        },
         "minimax_h3_t2va_2npu": {
             "stages_ms": {
                 "InputValidationStage": 0.11,
