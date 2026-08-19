@@ -13,8 +13,6 @@ register_cpu_ci(
     suite="base-a-test-cpu",
     nightly=False,
     disabled=None,
-    stage=None,
-    runner_config=None,
 )
 
 

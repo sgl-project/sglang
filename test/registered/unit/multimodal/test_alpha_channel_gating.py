@@ -16,8 +16,6 @@ register_cpu_ci(
     suite="base-a-test-cpu",
     nightly=False,
     disabled=None,
-    stage=None,
-    runner_config=None,
 )
 
 _RGBA_PIXEL = (10, 20, 30, 200)
