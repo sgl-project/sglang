@@ -1220,7 +1220,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     variant_label,
                     dsa_variant,
                 )
-                # NOTE (Deleter-D): hook `attn_backend`, not model_runner.attn_backend — adaptive spec runners own a different backend, and the wrong one leaves warmup-mutated metadata in the graph (IMA on first replay).
+                # NOTE (Deleter-D): hook `attn_backend`, not model_runner.attn_backend
+                # adaptive spec runners own a different backend, and the wrong one
+                # leaves warmup-mutated metadata in the graph (IMA on first replay).
                 post_warmup_hook = getattr(
                     attn_backend,
                     "on_after_cuda_graph_warmup",
