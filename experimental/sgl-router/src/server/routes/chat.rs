@@ -144,6 +144,15 @@ struct RequestProbe {
     max_tokens: Option<serde_json::Value>,
     #[serde(default)]
     max_completion_tokens: Option<serde_json::Value>,
+    /// Probed only to decide whether a configured `--default-top-k` /
+    /// `--default-top-p` should be injected: a present value means the client
+    /// set it, so the default is skipped. Raw `Value` (like `max_tokens`) so a
+    /// mistyped sampling value doesn't fail the probe — the engine validates
+    /// the schema. `null` deserializes to `None` (same as absent).
+    #[serde(default)]
+    top_k: Option<serde_json::Value>,
+    #[serde(default)]
+    top_p: Option<serde_json::Value>,
 }
 
 /// RAII guard that records `sgl_router_request_duration_seconds` when
@@ -228,6 +237,11 @@ async fn chat_completions_inner(
     // below — otherwise an unbounded request generates until EOS or the
     // engine's full context window fills.
     let inject_max_tokens = output_budget_action(ctx.config.model.max_output_tokens, &probe)?;
+
+    // Sampling defaults: inject the configured `--default-top-k` / `--default-top-p`
+    // only when the request omitted the field, so a client value always wins.
+    let inject_top_k = default_when_absent(ctx.config.model.default_top_k, &probe.top_k);
+    let inject_top_p = default_when_absent(ctx.config.model.default_top_p, &probe.top_p);
 
     // PD pool isolation: for PD-mode deployments, prefill traffic
     // selects from the prefill pool only. Plain-mode deployments fall
@@ -776,6 +790,8 @@ async fn chat_completions_inner(
         bootstrap.as_ref(),
         rid_to_inject,
         inject_max_tokens,
+        inject_top_k,
+        inject_top_p,
     )?;
     let at_post_build = start.elapsed();
 
@@ -1511,6 +1527,9 @@ struct BootstrapFields {
 /// the bytes here (matching the pre-refactor behavior). The body shape was
 /// validated by `parse_probe`; the non-object arm defends against a TOCTOU
 /// regression rather than panicking.
+// Injects a fixed set of independent, clearly-named request fields; a params
+// struct would add indirection without improving the call sites.
+#[allow(clippy::too_many_arguments)]
 fn build_outgoing_body(
     body: &Bytes,
     value: Option<serde_json::Value>,
@@ -1518,8 +1537,16 @@ fn build_outgoing_body(
     bootstrap: Option<&BootstrapFields>,
     rid: Option<&str>,
     max_tokens: Option<u64>,
+    top_k: Option<i64>,
+    top_p: Option<f64>,
 ) -> Result<Bytes, ApiError> {
-    if input_ids.is_none() && bootstrap.is_none() && rid.is_none() && max_tokens.is_none() {
+    if input_ids.is_none()
+        && bootstrap.is_none()
+        && rid.is_none()
+        && max_tokens.is_none()
+        && top_k.is_none()
+        && top_p.is_none()
+    {
         // Nothing to inject — forward the original bytes (cheap Arc clone).
         return Ok(body.clone());
     }
@@ -1558,6 +1585,19 @@ fn build_outgoing_body(
             "max_tokens".to_string(),
             serde_json::Value::Number(cap.into()),
         );
+    }
+    if let Some(k) = top_k {
+        // Fill-if-absent (the caller decided via `default_when_absent`), so a
+        // client-supplied `top_k` is never overridden.
+        obj.insert("top_k".to_string(), serde_json::Value::Number(k.into()));
+    }
+    if let Some(p) = top_p {
+        // f64 -> JSON number. `from_f64` only returns None for NaN/inf, which
+        // the CLI validation already rules out; skip defensively rather than
+        // emit invalid JSON if it somehow isn't finite.
+        if let Some(n) = serde_json::Number::from_f64(p) {
+            obj.insert("top_p".to_string(), serde_json::Value::Number(n));
+        }
     }
     if let Some(ids) = input_ids {
         obj.insert(
@@ -1939,6 +1979,17 @@ fn request_is_multimodal(value: &serde_json::Value) -> bool {
 /// (non-numeric string, bool, …) neither rejects nor injects: it forwards
 /// untouched so the engine — authoritative for the request schema —
 /// produces its own 4xx with the better message.
+/// The sampling default to inject: the configured value, but only when the
+/// request omitted the field. `requested` is the probe's raw `Option<Value>`;
+/// `None` means absent or explicit `null`, in which case the default applies.
+/// A present client value returns `None` (inject nothing), so it always wins.
+fn default_when_absent<T: Copy>(
+    configured: Option<T>,
+    requested: &Option<serde_json::Value>,
+) -> Option<T> {
+    configured.filter(|_| requested.is_none())
+}
+
 fn output_budget_action(
     cap: Option<std::num::NonZeroU64>,
     probe: &RequestProbe,
@@ -2341,8 +2392,17 @@ mod tests {
             port: None,
             room: 42,
         };
-        let injected =
-            build_outgoing_body(&body, Some(value), None, Some(&bootstrap), None, None).unwrap();
+        let injected = build_outgoing_body(
+            &body,
+            Some(value),
+            None,
+            Some(&bootstrap),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&injected).unwrap();
         assert_eq!(parsed.get("bootstrap_port"), Some(&serde_json::Value::Null));
         assert_eq!(
@@ -2579,7 +2639,8 @@ mod tests {
             Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let ids = [1u32, 2, 3];
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), None, None, None).unwrap();
+        let out = build_outgoing_body(&body, Some(value), Some(&ids), None, None, None, None, None)
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
         assert!(
@@ -2594,7 +2655,8 @@ mod tests {
     fn build_outgoing_body_no_injection_returns_original_bytes() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out = build_outgoing_body(&body, Some(value), None, None, None, None).unwrap();
+        let out =
+            build_outgoing_body(&body, Some(value), None, None, None, None, None, None).unwrap();
         assert_eq!(
             out, body,
             "no injection must forward the original bytes unchanged"
@@ -2607,10 +2669,42 @@ mod tests {
     #[test]
     fn build_outgoing_body_injects_default_max_tokens() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
-        let out = build_outgoing_body(&body, None, None, None, None, Some(131072)).unwrap();
+        let out =
+            build_outgoing_body(&body, None, None, None, None, Some(131072), None, None).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("max_tokens"), Some(&serde_json::json!(131072)));
         assert!(parsed.get("messages").is_some());
+    }
+
+    #[test]
+    fn build_outgoing_body_injects_default_top_k_and_top_p() {
+        let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
+        let out = build_outgoing_body(&body, None, None, None, None, None, Some(1000), Some(0.95))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed.get("top_k"), Some(&serde_json::json!(1000)));
+        assert_eq!(parsed.get("top_p"), Some(&serde_json::json!(0.95)));
+        assert!(parsed.get("messages").is_some());
+    }
+
+    /// `default_when_absent` fills the configured default only when the request
+    /// omitted the field (absent OR explicit `null`); a client value always wins.
+    #[test]
+    fn default_when_absent_fills_only_when_missing() {
+        // absent -> default applies
+        let p = probe_of(r#"{"model":"x","messages":[]}"#);
+        assert_eq!(default_when_absent(Some(1000_i64), &p.top_k), Some(1000));
+        assert_eq!(default_when_absent(Some(0.95_f64), &p.top_p), Some(0.95));
+        // explicit null is treated as absent -> default still applies
+        let p = probe_of(r#"{"model":"x","messages":[],"top_k":null,"top_p":null}"#);
+        assert_eq!(default_when_absent(Some(1000_i64), &p.top_k), Some(1000));
+        // client value present -> default skipped (client wins)
+        let p = probe_of(r#"{"model":"x","messages":[],"top_k":5,"top_p":0.1}"#);
+        assert_eq!(default_when_absent(Some(1000_i64), &p.top_k), None);
+        assert_eq!(default_when_absent(Some(0.95_f64), &p.top_p), None);
+        // no configured default -> nothing injected regardless of the request
+        let p = probe_of(r#"{"model":"x","messages":[]}"#);
+        assert_eq!(default_when_absent(None::<i64>, &p.top_k), None);
     }
 
     fn probe_of(body: &str) -> RequestProbe {
@@ -2734,8 +2828,17 @@ mod tests {
     fn build_outgoing_body_injects_rid() {
         let body = Bytes::from_static(br#"{"model":"x","messages":[]}"#);
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let out = build_outgoing_body(&body, Some(value), None, None, Some("router-abc123"), None)
-            .unwrap();
+        let out = build_outgoing_body(
+            &body,
+            Some(value),
+            None,
+            None,
+            Some("router-abc123"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed.get("rid").and_then(|r| r.as_str()),
@@ -2761,8 +2864,17 @@ mod tests {
             port: Some(9),
             room: 5,
         };
-        let out = build_outgoing_body(&body, Some(value), Some(&ids), Some(&bootstrap), None, None)
-            .unwrap();
+        let out = build_outgoing_body(
+            &body,
+            Some(value),
+            Some(&ids),
+            Some(&bootstrap),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([7, 8])));
         assert_eq!(
@@ -2856,7 +2968,8 @@ mod tests {
             port: Some(1),
             room: 2,
         };
-        let out = build_outgoing_body(&body, None, None, Some(&bootstrap), None, None).unwrap();
+        let out = build_outgoing_body(&body, None, None, Some(&bootstrap), None, None, None, None)
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(
             parsed.get("bootstrap_room"),
