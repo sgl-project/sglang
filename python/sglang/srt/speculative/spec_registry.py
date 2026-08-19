@@ -92,10 +92,6 @@ class CustomSpecAlgo:
     def supports_target_verify_for_draft(self) -> bool:
         return False
 
-    def is_last_shared_read_phase(self, forward_mode) -> bool:
-        # The step's last shared-buffer-reading phase owns the shared-read-done publish.
-        return forward_mode.is_draft_extend_v2()
-
     def supports_ragged_verify(self) -> bool:
         return False
 
@@ -156,10 +152,14 @@ class CustomSpecAlgo:
     def build_disagg_draft_input(
         self,
         batch: ScheduleBatch,
-        server_args: ServerArgs,
         last_tokens_tensor: torch.Tensor,
         future_map: FutureMap,
     ) -> Optional[SpecInput]:
+        """Build the disaggregation draft input for ``batch``, or ``None``.
+
+        The speculative config comes from ``runtime_context.get_spec()``, which
+        follows a runtime override where the startup record does not.
+        """
         return None
 
 
