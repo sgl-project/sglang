@@ -16,19 +16,29 @@ from sglang.srt.layers.moe.moe_runner import deep_gemm as deep_gemm_runner
 
 
 class _FakeTensor:
-    def __init__(self, shape):
+    def __init__(self, shape, dtype=None):
         self.shape = shape
+        self.dtype = dtype
 
     def is_contiguous(self):
         return True
 
+    def contiguous(self):
+        return self
+
 
 class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
     def setUp(self):
-        self.lhs = (_FakeTensor((256, 256, 7168)), _FakeTensor((256, 256, 56)))
-        self.rhs = (_FakeTensor((256, 4096, 7168)), _FakeTensor((256, 32, 56)))
-        self.lhs_api_scale = _FakeTensor((256, 256, 56))
-        self.rhs_api_scale = _FakeTensor((256, 32, 56))
+        self.lhs = (
+            _FakeTensor((256, 256, 7168)),
+            _FakeTensor((256, 256, 56), torch.int32),
+        )
+        self.rhs = (
+            _FakeTensor((256, 4096, 7168)),
+            _FakeTensor((256, 32, 56), torch.int32),
+        )
+        self.lhs_api_scale = _FakeTensor((256, 256, 56), torch.float32)
+        self.rhs_api_scale = _FakeTensor((256, 32, 56), torch.float32)
         self.out = _FakeTensor((256, 256, 4096))
         self.masked_m = _FakeTensor((256,))
 
@@ -102,7 +112,7 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
                     overlap_args=object(),
                 )
 
-    def test_batch_backend_keeps_native_packed_activation_quantization(self):
+    def test_native_backend_keeps_packed_activation_quantization(self):
         gateup = torch.empty((2, 3, 16), dtype=torch.bfloat16)
         masked_m = torch.tensor([1, 2], dtype=torch.int32)
         expected = (object(), object())
@@ -110,6 +120,11 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
             patch.object(
                 deep_gemm_runner.deep_gemm_wrapper,
                 "DEEPGEMM_SCALE_UE8M0",
+                True,
+            ),
+            patch.object(
+                deep_gemm_runner.deep_gemm_wrapper,
+                "DEEPGEMM_MASKED_FP8_PACKED_SCALES",
                 True,
             ),
             patch.object(
@@ -131,6 +146,42 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
         self.assertTrue(quant.call_args.kwargs["fuse_silu_and_mul"])
         self.assertIs(quant.call_args.kwargs["masked_m"], masked_m)
         self.assertTrue(quant.call_args.kwargs["column_major_scales"])
+
+    def test_batch_backend_writes_row_major_float_ue8m0_directly(self):
+        gateup = torch.empty((2, 3, 16), dtype=torch.bfloat16)
+        masked_m = torch.tensor([1, 2], dtype=torch.int32)
+        expected = (object(), object())
+        with (
+            patch.object(
+                deep_gemm_runner.deep_gemm_wrapper,
+                "DEEPGEMM_SCALE_UE8M0",
+                True,
+            ),
+            patch.object(
+                deep_gemm_runner.deep_gemm_wrapper,
+                "DEEPGEMM_MASKED_FP8_PACKED_SCALES",
+                False,
+            ),
+            patch(
+                "sglang.kernels.ops.quantization.fp8_kernel."
+                "sglang_per_token_group_quant_fp8",
+                return_value=expected,
+            ) as quant,
+        ):
+            result = deep_gemm_runner._varlen_deep_gemm_silu_mul_quant(
+                gateup,
+                masked_m,
+                group_size=4,
+                topk=1,
+                num_real_tokens=2,
+            )
+
+        self.assertIs(result, expected)
+        self.assertTrue(quant.call_args.kwargs["scale_ue8m0"])
+        self.assertTrue(quant.call_args.kwargs["fuse_silu_and_mul"])
+        self.assertFalse(quant.call_args.kwargs["column_major_scales"])
+        self.assertFalse(quant.call_args.kwargs["scale_tma_aligned"])
+        self.assertIs(quant.call_args.kwargs["masked_m"], masked_m)
 
     def test_unpack_packed_ue8m0_activation_scale_is_lossless(self):
         exponents = torch.tensor(

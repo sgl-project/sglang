@@ -1607,7 +1607,17 @@ def moe_ep_deepgemm_preprocess(
         )
         gateup_input_scale = gateup_input_scale.transpose(1, 2)
     elif is_fp8:
-        hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
+        direct_ue8m0 = (
+            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and not deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_PACKED_SCALES
+        )
+        hidden_states, scale = per_token_group_quant_fp8(
+            hidden_states,
+            block_k,
+            column_major_scales=False,
+            scale_tma_aligned=False,
+            scale_ue8m0=direct_ue8m0,
+        )
         gateup_input_scale = torch.empty(
             (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
             device=hidden_states.device,

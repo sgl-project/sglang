@@ -47,10 +47,12 @@ if DEEPGEMM_MASKED_FP8_BACKEND != "native" and not DEEPGEMM_BLACKWELL:
     )
 
 # FlashInfer's batch DeepGEMM API and the Cake backend expose a float32
-# groupwise-scale ABI. On Blackwell the model must still be quantized with the
-# native packed UE8M0 ABI; the wrapper losslessly expands those exponent bytes
-# to float32 powers of two only at the public API boundary.
+# groupwise-scale ABI. Keep UE8M0 quantization on Blackwell, but write those
+# exact powers of two directly into row-major float32 activation scales for
+# public batch backends. Native DeepGEMM keeps its packed exponent layout.
 DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
-DEEPGEMM_MASKED_FP8_PACKED_SCALES = DEEPGEMM_SCALE_UE8M0
+DEEPGEMM_MASKED_FP8_PACKED_SCALES = (
+    DEEPGEMM_SCALE_UE8M0 and DEEPGEMM_MASKED_FP8_BACKEND == "native"
+)
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
 DEEPGEMM_MASKED_NEED_TMA_ALIGNED_SCALES = DEEPGEMM_NEED_TMA_ALIGNED_SCALES
