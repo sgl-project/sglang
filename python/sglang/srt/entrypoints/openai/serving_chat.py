@@ -21,6 +21,18 @@ class ThinkingMode(str, Enum):
 import jinja2
 import orjson
 from fastapi import Request
+
+try:
+    from mistral_common.exceptions import MistralCommonException
+
+    _MISTRAL_COMMON_ERRORS: tuple[type[BaseException], ...] = (MistralCommonException,)
+except ImportError:
+    _MISTRAL_COMMON_ERRORS = ()
+
+_CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
+    jinja2.TemplateError,
+    TypeError,
+) + _MISTRAL_COMMON_ERRORS
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
@@ -1367,7 +1379,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids = self.tokenizer_manager.tokenizer.encode(
                         rendered_prompt, **encode_kwargs
                     )
-                except (jinja2.TemplateError, TypeError) as template_error:
+                except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)
                     # should be treated as client errors (400 BadRequest)
