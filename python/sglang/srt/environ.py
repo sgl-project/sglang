@@ -1531,10 +1531,6 @@ class Envs:
     # Upper bound on tokens in one b12x MoE call, used to size its scratch
     # workspace at load time. Track --chunked-prefill-size if that is raised.
     SGLANG_B12X_MAX_TOKENS = EnvInt(4096)
-    # Directory to import b12x from, ahead of the pip-installed one -- for
-    # deployments that carry the 0.15.3 tree as a directory instead of
-    # pip-installing the pinned source commit (see mxfp4_b12x_moe.py).
-    SGLANG_B12X_PATH = EnvStr("")
 
 
 envs = Envs()

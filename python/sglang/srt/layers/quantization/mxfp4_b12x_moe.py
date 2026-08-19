@@ -26,14 +26,13 @@ MoE surface matches the released wheel::
 (``--no-deps``: b12x's metadata pulls a newer torch and breaks the rest of the
 image.) Later b12x generations changed the W4A16 kernels (0.20.0) and then the
 API (1.2.x); anything but 0.15.3 is rejected at startup rather than silently
-producing different numerics -- see :func:`_check_b12x_version`.
+producing different numerics -- see :func:`_require_015_generation`.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import sys
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -57,46 +56,8 @@ _B12X_INSTALL_HINT = (
 )
 
 
-def _select_b12x_distribution() -> None:
-    """Put a local b12x tree on sys.path ahead of whatever pip installed.
-
-    For deployments that carry the 0.15.3 tree as a directory (e.g. extracted
-    from the dspark reference image) instead of pip-installing the pinned
-    source commit. Unset (the default) is a no-op.
-    """
-    path = envs.SGLANG_B12X_PATH.get()
-    if not path:
-        return
-    if not os.path.isdir(os.path.join(path, "b12x")):
-        raise FileNotFoundError(f"SGLANG_B12X_PATH={path!r} has no b12x package.")
-    loaded = sys.modules.get("b12x")
-    if loaded is not None:
-        # Idempotent: this runs once per expert layer. Only a b12x already
-        # imported from somewhere else is a problem, and it is fatal -- the
-        # generations share a module name but not an API.
-        want = os.path.realpath(path)
-        got = os.path.realpath(os.path.dirname(os.path.dirname(loaded.__file__)))
-        if want != got:
-            raise RuntimeError(
-                f"SGLANG_B12X_PATH={path!r} came too late: b12x was already "
-                f"imported from {loaded.__file__}."
-            )
-        return
-    sys.path.insert(0, path)
-
-
-def is_b12x_available() -> bool:
-    try:
-        _select_b12x_distribution()
-        import b12x.integration.tp_moe  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
-
-
-def _check_b12x_version() -> None:
-    """This backend is validated against b12x 0.15.3, and only 0.15.3.
+def _require_015_generation() -> None:
+    """This backend runs against b12x 0.15.3, and only 0.15.3.
 
     Later generations rewrote the W4A16 kernels behind the same
     ``b12x.integration`` API (0.20.0) and then replaced the API (1.2.x), so a
@@ -107,15 +68,16 @@ def _check_b12x_version() -> None:
     import importlib.metadata
 
     try:
+        import b12x  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(f"b12x is not installed. {_B12X_INSTALL_HINT}") from e
+    try:
         version = importlib.metadata.version("b12x")
     except importlib.metadata.PackageNotFoundError:
         return
     if version != "0.15.3":
-        import b12x
-
         raise RuntimeError(
-            f"b12x at {b12x.__file__} is version {version}; this backend is "
-            "validated against 0.15.3 only. Install the pinned source commit: "
+            f"b12x {version} is installed; this backend requires 0.15.3. "
             f"{_B12X_INSTALL_HINT}"
         )
 
@@ -280,12 +242,7 @@ class Mxfp4B12xMoEMethod:
     """b12x MXFP4 MoE: one fused W4A16 kernel per expert layer."""
 
     def __init__(self, fp8_method, prefix: str):
-        if not is_b12x_available():
-            raise RuntimeError(
-                "The b12x MoE backend needs the 0.15.3-generation b12x "
-                f"package: {_B12X_INSTALL_HINT}"
-            )
-        _check_b12x_version()
+        _require_015_generation()
         if not is_sm120_supported():
             raise RuntimeError("Mxfp4B12xMoEMethod requires SM120 or SM121.")
         self._fp8 = fp8_method
