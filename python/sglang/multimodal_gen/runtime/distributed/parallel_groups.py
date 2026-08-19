@@ -3,6 +3,8 @@
 
 import torch
 
+from .group_coordinator import new_device_group
+
 
 class Singleton:
     _instance = None
@@ -62,28 +64,28 @@ def set_seq_parallel_pg_by_sp_groups(
             for i in range(num_ulysses_pgs):
                 idx = list(range(i * sp_ulysses_degree, (i + 1) * sp_ulysses_degree))
                 ulysses_ranks = _map_indices_to_ranks(sp_ranks, idx)
-                group = torch.distributed.new_group(ulysses_ranks)
+                group = new_device_group(ulysses_ranks)
                 if rank in ulysses_ranks:
                     ulyssess_pg = group
 
             for i in range(num_ring_pgs):
                 idx = list(range(i, sp_degree, num_ring_pgs))
                 ring_ranks = _map_indices_to_ranks(sp_ranks, idx)
-                group = torch.distributed.new_group(ring_ranks)
+                group = new_device_group(ring_ranks)
                 if rank in ring_ranks:
                     ring_pg = group
         else:
             for i in range(num_ring_pgs):
                 idx = list(range(i * sp_ring_degree, (i + 1) * sp_ring_degree))
                 ring_ranks = _map_indices_to_ranks(sp_ranks, idx)
-                group = torch.distributed.new_group(ring_ranks)
+                group = new_device_group(ring_ranks)
                 if rank in ring_ranks:
                     ring_pg = group
 
             for i in range(num_ulysses_pgs):
                 idx = list(range(i, sp_degree, num_ulysses_pgs))
                 ulysses_ranks = _map_indices_to_ranks(sp_ranks, idx)
-                group = torch.distributed.new_group(ulysses_ranks)
+                group = new_device_group(ulysses_ranks)
                 if rank in ulysses_ranks:
                     ulyssess_pg = group
 
