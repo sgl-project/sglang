@@ -937,6 +937,19 @@ class GroupCoordinator:
             total_bytes = input_.numel() * input_.element_size()
             use_1stage_ar = total_bytes <= 128 * 1024
 
+        # TC-piecewise CUDA-graph capture guard (mirrors fused_allreduce_rmsnorm).
+        # When AITER's global _IS_CAPTURING is set but the current stream is not
+        # capturing, custom_fused_ar_rms_quant returns dummy zero outputs that
+        # would be consumed downstream as real (fp8, residual, per-token scale).
+        # Return None so the caller falls back to the plain fused AR+RMSNorm
+        # registered path plus a separate per-token quant, correct under capture.
+        if (
+            getattr(ca_comm, "_IS_CAPTURING", False)
+            and not torch.cuda.is_current_stream_capturing()
+            and is_in_tc_piecewise_cuda_graph()
+        ):
+            return None
+
         try:
             return ca_comm.custom_fused_ar_rms_quant(
                 input_,
