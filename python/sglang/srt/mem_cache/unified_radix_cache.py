@@ -652,7 +652,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if not getattr(self, "aoh_radix_anchor_only", False):
             return sequence_len
         return get_aoh_cacheable_prefix_len(
-            sequence_len, self.aoh_sink_size, self.page_size
+            sequence_len,
+            self.aoh_sink_size,
+            self.page_size,
+            is_eagle=self.tree_core.is_eagle,
         )
 
     def cache_finished_req(
@@ -689,6 +692,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         result = None
         insert_params = None
+        should_insert = False
 
         if is_insert:
             insert_params = InsertParams(
@@ -708,8 +712,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
 
-            # Truncate if needed; the tail free is deferred and batched with
-            # the unaligned tail below so a shared boundary page is emitted once.
+            should_insert = effective_cache_len > 0
+            if should_insert and getattr(self, "aoh_radix_anchor_only", False):
+                candidate_key = RadixKey(
+                    token_ids[:effective_cache_len],
+                    req.extra_key,
+                    is_bigram=self.tree_core.is_eagle,
+                ).page_aligned(self.page_size)
+                should_insert = len(candidate_key) > 0
+
+        if should_insert:
+            # Truncate if needed; the tail free is deferred and batched with the
+            # unaligned tail below so a shared boundary page is emitted once.
             kv_indices_full = kv_indices
             tail_free_start = None
             if effective_cache_len < len(token_ids):
@@ -740,7 +754,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self._dec_req_lock(req, skip_swa=req.swa_prefix_lock_released)
 
-        if is_insert and result is not None and result.last_device_node is not None:
+        if should_insert and result is not None and result.last_device_node is not None:
             req.last_node = result.last_device_node
 
         # cleanup
@@ -778,7 +792,7 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(full_token_ids)
             ]
-            req.prefix_indices = kv_indices
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
@@ -823,6 +837,13 @@ class UnifiedRadixCache(BasePrefixCache):
             req.extra_key,
             is_bigram=self.tree_core.is_eagle,
         ).page_aligned(self.page_size)
+        if not len(radix_key) and getattr(self, "aoh_radix_anchor_only", False):
+            req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
+            for comp in self._components_tuple:
+                comp.cleanup_after_caching_req(
+                    req, is_finished=False, insert_params=insert_params
+                )
+            return
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 

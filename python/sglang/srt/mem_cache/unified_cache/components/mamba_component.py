@@ -540,6 +540,21 @@ class MambaComponent(TreeComponent):
                     cache_len -= int(write_pos_buf[req.mamba_pool_idx].item())
                     write_pos_buf[req.mamba_pool_idx] = 0
 
+        aoh_anchor_only = getattr(self.cache, "aoh_radix_anchor_only", False)
+        aoh_anchor_state_mismatch = cache_len != token_ids_len
+        if (
+            aoh_anchor_only
+            and not self.cache.enable_mamba_extra_buffer
+            and len(req.get_fill_ids()) != token_ids_len
+        ):
+            # no_buffer retains only the live state at the request's full
+            # position; token_ids_len has already been truncated to the anchor.
+            aoh_anchor_state_mismatch = True
+        if aoh_anchor_only and aoh_anchor_state_mismatch:
+            # Attaching the available active/track state to a shorter AoH anchor
+            # would restore a future state when another request matches it.
+            return 0
+
         if is_finished:
             if cache_len is None:
                 cache_len = 0

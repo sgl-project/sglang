@@ -26,7 +26,11 @@ def normalize_aoh_window(
 
 
 def get_aoh_cacheable_prefix_len(
-    sequence_len: int, sink_size: int, page_size: int = 1
+    sequence_len: int,
+    sink_size: int,
+    page_size: int = 1,
+    *,
+    is_eagle: bool = False,
 ) -> int:
     """Return the AoH prefix that can safely be shared by a radix tree.
 
@@ -36,8 +40,13 @@ def get_aoh_cacheable_prefix_len(
     shared length is rounded to a complete page so a private tail cannot free
     the same physical page; attention still masks tokens beyond ``sink_size``.
     """
+    logical_sequence_len = max(0, sequence_len - 1) if is_eagle else sequence_len
     cacheable_len = ((sink_size + page_size - 1) // page_size) * page_size
-    return min(sequence_len, cacheable_len)
+    logical_cacheable_len = min(logical_sequence_len, cacheable_len)
+    if is_eagle and logical_cacheable_len > 0:
+        # An EAGLE radix key with N logical bigrams requires N+1 raw tokens.
+        return logical_cacheable_len + 1
+    return logical_cacheable_len
 
 
 def get_aoh_kv_groups(
@@ -85,13 +94,104 @@ def get_aoh_kv_group(
     )[0]
 
 
-def get_aoh_max_kv_pages(sink_size: int, recent_size: int, page_size: int) -> int:
-    """Return the fixed decode page-table width for arbitrary AoH sizes."""
+def get_aoh_max_kv_pages(
+    sink_size: int, recent_size: int, page_size: int, max_query_len: int = 1
+) -> int:
+    """Return the fixed page-table width for AoH decode or linear verification."""
+    if min(sink_size, recent_size, page_size, max_query_len) <= 0:
+        raise ValueError("AoH sink, recent, page, and query sizes must be positive.")
+    anchor_pages = (sink_size + page_size - 1) // page_size
+    max_tail_pages = (recent_size + max_query_len + 2 * page_size - 3) // page_size
+    return anchor_pages + max_tail_pages
+
+
+def get_aoh_speculative_query_len(num_query_tokens: int, batch_size: int) -> int:
+    """Return the uniform per-request query length for linear verification."""
+    if batch_size <= 0 or num_query_tokens % batch_size:
+        raise RuntimeError(
+            "AoH speculative verification requires an equal number of query "
+            f"tokens per request, got {num_query_tokens} tokens for batch size "
+            f"{batch_size}."
+        )
+    return num_query_tokens // batch_size
+
+
+def get_aoh_decode_mask_periodic_start(
+    sink_size: int, recent_size: int, page_size: int
+) -> int:
+    """Return the first decode length whose compact mask is page-periodic."""
     if sink_size <= 0 or recent_size <= 0 or page_size <= 0:
         raise ValueError("AoH sink, recent, and page sizes must be positive.")
-    anchor_pages = (sink_size + page_size - 1) // page_size
-    max_tail_pages = (recent_size + 2 * page_size - 2) // page_size
-    return anchor_pages + max_tail_pages
+    anchor_page_end = ((sink_size + page_size - 1) // page_size) * page_size
+    return anchor_page_end + recent_size
+
+
+def build_aoh_decode_mask(
+    plan: AoHPagePlan, page_size: int, max_kv_pages: int
+) -> tuple[bool, ...]:
+    """Build the padded compact decode mask represented by an AoH page plan."""
+    if page_size <= 0 or max_kv_pages <= 0:
+        raise ValueError("AoH page size and maximum page count must be positive.")
+    if len(plan.page_starts) > max_kv_pages:
+        raise ValueError("AoH page plan exceeds the decode mask width.")
+
+    mask = []
+    for page_idx in range(max_kv_pages):
+        page_start = (
+            plan.page_starts[page_idx] if page_idx < len(plan.page_starts) else 0
+        )
+        for offset in range(page_size):
+            position = page_start + offset
+            keep = (
+                page_idx < len(plan.page_starts)
+                and position < plan.total_kv_len
+                and (position < plan.anchor_end or position >= plan.tail_start)
+            )
+            mask.append(not keep)
+    return tuple(mask)
+
+
+def get_aoh_prefill_chunk_size(
+    *,
+    query_start: int,
+    remaining_query_len: int,
+    sink_size: int,
+    recent_size: int,
+    page_size: int,
+    max_mask_elements: int,
+) -> int:
+    """Return the largest page-aligned AoH prefill chunk within a mask budget."""
+    if query_start < 0 or remaining_query_len <= 0:
+        raise ValueError("AoH prefill query positions must be non-negative.")
+    if min(sink_size, recent_size, page_size, max_mask_elements) <= 0:
+        raise ValueError("AoH prefill sizes and mask budget must be positive.")
+
+    def fits(query_len: int) -> bool:
+        plan = build_aoh_page_plan(
+            total_kv_len=query_start + query_len,
+            query_len=query_len,
+            sink_size=sink_size,
+            recent_size=recent_size,
+            page_size=page_size,
+        )
+        return query_len * len(plan.page_starts) * page_size <= max_mask_elements
+
+    if not fits(1):
+        raise ValueError("AoH prefill mask budget cannot fit one query row.")
+    if fits(remaining_query_len):
+        return remaining_query_len
+
+    low, high, best = 1, remaining_query_len - 1, 1
+    while low <= high:
+        candidate = (low + high) // 2
+        if fits(candidate):
+            best = candidate
+            low = candidate + 1
+        else:
+            high = candidate - 1
+
+    aligned = best // page_size * page_size
+    return aligned if aligned else best
 
 
 @dataclass(frozen=True)
@@ -223,8 +323,13 @@ def build_aoh_page_plan(
     )
 
     # A plain causal template is valid only while the anchor and rolling tail
-    # overlap. Once a middle gap exists, each query needs an explicit mask.
-    can_use_causal_template = tail_start <= anchor_end
+    # overlap for every query. Once the last query has a middle gap, the whole
+    # chunk needs the explicit per-query mask.
+    last_query_pos = total_kv_len - 1 if query_len else total_kv_len
+    last_tail_start = max(
+        min(sink_size, last_query_pos), last_query_pos - recent_size + 1
+    )
+    can_use_causal_template = last_tail_start <= anchor_end
 
     return AoHPagePlan(
         page_starts=page_starts,

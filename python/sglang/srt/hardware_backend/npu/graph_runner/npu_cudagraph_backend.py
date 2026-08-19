@@ -38,6 +38,23 @@ if TYPE_CHECKING:
     )
 
 
+def _validate_per_record_graph_update(graph, cpu_update_input: list) -> None:
+    """Reject truncated per-record updates before TorchNPU can deadlock replay."""
+    records = getattr(
+        getattr(graph, "graph_dispatch_mode", None), "graph_dispatch_records", None
+    )
+    if (
+        len(cpu_update_input) > 1
+        and records is not None
+        and len(records) != len(cpu_update_input)
+    ):
+        raise RuntimeError(
+            "NPU Graph captured "
+            f"{len(records)} FIA records but received {len(cpu_update_input)} "
+            "per-record update inputs."
+        )
+
+
 class NPUCudaGraphBackend(BaseCudaGraphBackend):
     """One torch.npu.NPUGraph per shape; attention metadata captured
     inside the graph. replay_with_input_update substitutes fresh
@@ -165,15 +182,28 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             cpu_update_input = [{attr_name: seq_lens}]
 
         graph = self._graphs[shape_key]
+        _validate_per_record_graph_update(graph, cpu_update_input)
+        update_error = []
 
         def _update():
-            self._device_module.set_device(self._device_id)
-            graph.update(cpu_update_input=cpu_update_input)
+            try:
+                self._device_module.set_device(self._device_id)
+                # Empty inputs still update the corresponding graph record.
+                # TorchNPU records an ExternalEvent for every FIA record during
+                # capture; skipping a static streaming record leaves its replay
+                # wait event unsignaled and deadlocks the graph.
+                graph.update(cpu_update_input=cpu_update_input)
+            except BaseException as exc:
+                update_error.append(exc)
 
         thread = threading.Thread(target=_update)
         thread.start()
-        graph.replay()
-        thread.join()
+        try:
+            graph.replay()
+        finally:
+            thread.join()
+        if update_error:
+            raise update_error[0]
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:

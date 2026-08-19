@@ -7,9 +7,11 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     get_tensor_size_bytes,
+    move_kv_cache_native,
     unwrap_write_loc,
 )
 from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
@@ -133,6 +135,26 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         # implementation relies on self.data_strides / self.data_ptrs, which the
         # NPU paged buffer layout never builds.
         self._kv_copy_config = None
+
+    def _move_kv_cache_impl(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        # Ascend stores non-FIA KV as [layer, page, slot, head, dim], while FIA
+        # flattens page and slot into one token dimension per layer.
+        page_size = 1 if self.use_fia else self.page_size
+        move_kv_cache_native(
+            self.k_buffer,
+            self.v_buffer,
+            tgt_loc,
+            src_loc,
+            page_size=page_size,
+        )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if self.layer_num == 0:
+            return
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+        self._move_kv_cache_impl(tgt_loc, src_loc)
 
     # for disagg
     def get_contiguous_buf_infos(self):

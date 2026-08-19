@@ -162,8 +162,8 @@ class TritonAttnBackend(AttentionBackend):
         max_bs = model_runner.req_to_token_pool.size
         self.sliding_window_size = model_runner.sliding_window_size
         self.is_aoh = model_runner.is_aoh
-        self.aoh_sink_size = model_runner.server_args.aoh_sink_size
-        self.aoh_recent_size = model_runner.server_args.aoh_recent_size
+        self.aoh_sink_size = model_runner.aoh_sink_size
+        self.aoh_recent_size = model_runner.aoh_recent_size
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token

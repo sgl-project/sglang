@@ -65,6 +65,26 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 
 
+def _build_aoh_graph_update_inputs(
+    layer_modes: list[str],
+    full_kv_lens: list[int],
+    retrieval_length_attr: str = "actual_seq_lengths_kv",
+) -> list[dict[str, list[int]]]:
+    if not layer_modes:
+        raise RuntimeError("AoH NPU Graph has no attention layer modes.")
+
+    update_inputs = []
+    for mode in layer_modes:
+        if mode == "streaming":
+            # The streaming record was captured with a fixed compact KV width.
+            update_inputs.append({})
+        elif mode == "retrieval":
+            update_inputs.append({retrieval_length_attr: full_kv_lens})
+        else:
+            raise RuntimeError(f"AoH NPU Graph has invalid attention mode: {mode}.")
+    return update_inputs
+
+
 @contextmanager
 def patch_model_npu(
     model: torch.nn.Module,
@@ -109,6 +129,19 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self.update_attr_name = None
         self.update_attr_type = None
         self.model_runner = model_runner
+        self.aoh_graph_modes = (
+            frozenset(model_runner.aoh_attention_layer_modes)
+            if model_runner.is_aoh
+            else frozenset()
+        )
+        if model_runner.is_aoh:
+            if self.aoh_graph_modes == {"streaming"}:
+                update_strategy = "static-streaming"
+            elif self.aoh_graph_modes == {"retrieval"}:
+                update_strategy = "uniform-retrieval"
+            else:
+                update_strategy = "per-layer-mixed"
+            logger.info("AoH NPU Graph update strategy: %s", update_strategy)
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
         self.if_use_v2 = any(
@@ -243,15 +276,49 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 seq_lens_cpu = forward_batch.seq_lens.cpu() + self.captured_req_width
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
             else:
-                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
-                    self.bs - self.raw_bs
+                seq_lens_cpu = (
+                    forward_batch.seq_lens_cpu
+                    if self.model_runner.is_aoh
+                    and forward_batch.seq_lens_cpu is not None
+                    else forward_batch.seq_lens.cpu()
                 )
-            output = self.backend.replay_with_input_update(
-                graph_key,
-                seq_lens=seq_lens,
-                attr_name=self._get_update_attr_name(),
-                attr_type=self._get_update_attr_type(),
-            )
+                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+            if self.model_runner.is_aoh:
+                layer_modes = self.model_runner.aoh_attention_layer_modes
+                unique_modes = self.aoh_graph_modes
+                # AoH target verification uses FIA V1 for both retrieval and
+                # streaming records so every captured layer has the same graph
+                # update ABI.
+                retrieval_length_attr = "actual_seq_lengths_kv"
+                if unique_modes == {"streaming"}:
+                    # Streaming FIA is captured with a fixed compact KV width;
+                    # the replay-time mask excludes padding and stale page slots.
+                    output = self.backend.replay(graph_key, forward_batch)
+                elif unique_modes == {"retrieval"}:
+                    output = self.backend.replay_with_input_update(
+                        graph_key,
+                        seq_lens=seq_lens,
+                        attr_name=retrieval_length_attr,
+                        attr_type=[],
+                    )
+                else:
+                    cpu_update_input = _build_aoh_graph_update_inputs(
+                        layer_modes,
+                        seq_lens,
+                        retrieval_length_attr,
+                    )
+                    output = self.backend.replay_with_input_update(
+                        graph_key,
+                        seq_lens=None,
+                        cpu_update_input=cpu_update_input,
+                    )
+            else:
+                output = self.backend.replay_with_input_update(
+                    graph_key,
+                    seq_lens=seq_lens,
+                    attr_name=self._get_update_attr_name(),
+                    attr_type=self._get_update_attr_type(),
+                )
         else:
             output = self.backend.replay(graph_key, forward_batch)
 

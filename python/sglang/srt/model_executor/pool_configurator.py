@@ -654,13 +654,18 @@ class AoHPoolConfigurator(MemoryPoolConfigurator):
             else sa.max_prefill_tokens
         )
         max_extend_tokens = min(sa.max_prefill_tokens, chunked_limit)
+        max_draft_tokens = int(
+            getattr(sa, "max_speculative_num_draft_tokens", None)
+            or getattr(sa, "speculative_num_draft_tokens", None)
+            or 1
+        )
         # The compact page table may retain one partial page at each side of
-        # the evicted middle. Size from rounded runtime arguments, not a
-        # particular sink/window configuration.
+        # the evicted middle. Speculative verify also holds its uncommitted
+        # linear chain until acceptance is resolved.
         per_request = (
             get_aoh_max_kv_pages(
-                sa.aoh_sink_size,
-                sa.aoh_recent_size + eviction_interval,
+                kvc.aoh_sink_size,
+                kvc.aoh_recent_size + eviction_interval + max_draft_tokens - 1,
                 self._page_size,
             )
             * self._page_size

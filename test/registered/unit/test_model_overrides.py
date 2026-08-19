@@ -1574,6 +1574,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 hf.layer_types = layer_types
             defaults = dict(
                 disable_radix_cache=False,
+                aoh_config=None,
                 mamba_radix_cache_strategy="auto",
                 disable_overlap_schedule=False,
                 page_size=None,
@@ -1594,6 +1595,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _view("Qwen3NextForCausalLM", disable_radix_cache=True)
             ),
             {},
+        )
+        # AoH uses UnifiedRadixCache for its anchor-and-recent state even when
+        # ordinary prefix reuse is disabled, so paged Mamba needs extra_buffer.
+        self.assertEqual(
+            _mamba_radix_cache_resolution(
+                _view(
+                    "Qwen3_5MoeForConditionalGeneration",
+                    disable_radix_cache=True,
+                    aoh_config="/tmp/aoh.json",
+                    page_size=128,
+                )
+            ),
+            {
+                "uses_mamba_radix_cache": True,
+                "mamba_radix_cache_strategy": "extra_buffer",
+            },
         )
         # auto + overlap wanted + extra-buffer support -> extra_buffer
         self.assertEqual(

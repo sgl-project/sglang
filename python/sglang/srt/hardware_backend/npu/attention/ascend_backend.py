@@ -27,13 +27,22 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.aoh import (
     AoHPagePlan,
+    build_aoh_decode_mask,
     build_aoh_page_plan,
+    get_aoh_decode_mask_periodic_start,
     get_aoh_max_kv_pages,
+    get_aoh_prefill_chunk_size,
+    get_aoh_speculative_query_len,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_flags, get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_current_device_stream_fast,
+    get_int_env_var,
+    is_pin_memory_available,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -47,6 +56,7 @@ from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 FULL_ATTENTION_WINDOW = 2147483647
+_AOH_DECODE_MASK_TEMPLATE_MAX_BYTES = 4 * 1024 * 1024
 
 
 def _is_dflash_verify(spec_info: Optional[SpecInput]) -> bool:
@@ -68,6 +78,25 @@ def _reshape_kv_for_fia_nz(
 ) -> torch.Tensor:
     """Reshapes a tensor for FIA NZ format."""
     return tensor.view(-1, 1, num_heads * head_dim // 16, page_size, 16)
+
+
+@dataclass
+class AoHPrefillChunk:
+    query_offset: int
+    query_len: int
+    actual_kv_len: int
+    block_table: torch.Tensor
+    attn_mask: torch.Tensor
+    sparse_mode: int
+
+
+@dataclass
+class AoHDecodeScratch:
+    page_starts_cpu: torch.Tensor
+    valid_pages_cpu: torch.Tensor
+    mask_cpu: torch.Tensor
+    page_starts: torch.Tensor
+    valid_pages: torch.Tensor
 
 
 @dataclass
@@ -98,7 +127,9 @@ class ForwardMetadata:
     # swa attention mask for graph mode decode
     swa_mask: Optional[torch.Tensor] = None
     aoh_mask: Optional[torch.Tensor] = None
-    aoh_kv_lens: Optional[torch.Tensor] = None
+    aoh_kv_lens: Optional[list[int]] = None
+    aoh_decode_scratch: Optional[AoHDecodeScratch] = None
+    aoh_prefill_chunks: Optional[dict[int, list[AoHPrefillChunk]]] = None
 
     # prefix cache
     prefix_lens: Optional[torch.Tensor] = None
@@ -360,12 +391,77 @@ class AscendAttnBackend(AttentionBackend):
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
         self.is_hybrid_swa = model_runner.is_hybrid_swa
         self.is_aoh = model_runner.is_aoh
-        self.aoh_sink_size = model_runner.server_args.aoh_sink_size
-        self.aoh_recent_size = model_runner.server_args.aoh_recent_size
+        self.has_aoh_streaming_layers = self.is_aoh and any(
+            mode == "streaming" for mode in model_runner.aoh_attention_layer_modes
+        )
+        if self.is_aoh and not self.has_aoh_streaming_layers:
+            logger.info(
+                "AoH NPU rank is retrieval-only; compact decode metadata is disabled."
+            )
+        self.aoh_sink_size = model_runner.aoh_sink_size
+        self.aoh_recent_size = model_runner.aoh_recent_size
+        if self.is_aoh and (
+            self.page_size < 128 or self.page_size > 512 or self.page_size % 128 != 0
+        ):
+            raise ValueError(
+                "AoH on Ascend FIA V2 requires --page-size to be a multiple of "
+                f"128 in [128, 512], got {self.page_size}."
+            )
+        self.aoh_max_query_len = int(
+            model_runner.server_args.max_speculative_num_draft_tokens or 1
+        )
+        if self.has_aoh_streaming_layers and self.aoh_max_query_len > 1:
+            logger.info(
+                "AoH NPU speculative Graph attention: streaming=FIA V1 BSH Q=1, "
+                "retrieval=FIA V1 BSH Q=1."
+            )
         self.aoh_max_kv_pages = get_aoh_max_kv_pages(
+            self.aoh_sink_size,
+            self.aoh_recent_size,
+            self.page_size,
+            self.aoh_max_query_len,
+        )
+        aoh_prefill_mask_max_mb = get_int_env_var("SGLANG_AOH_PREFILL_MASK_MAX_MB", 4)
+        if aoh_prefill_mask_max_mb <= 0:
+            raise ValueError("SGLANG_AOH_PREFILL_MASK_MAX_MB must be positive.")
+        self.aoh_prefill_mask_max_elements = aoh_prefill_mask_max_mb * 1024 * 1024
+        if self.is_aoh:
+            logger.info("AoH NPU prefill mask budget: %d MiB", aoh_prefill_mask_max_mb)
+        self.aoh_max_kv_len = self.aoh_max_kv_pages * self.page_size
+        self.aoh_decode_mask_periodic_start = get_aoh_decode_mask_periodic_start(
             self.aoh_sink_size, self.aoh_recent_size, self.page_size
         )
-        self.aoh_max_kv_len = self.aoh_max_kv_pages * self.page_size
+        self.aoh_decode_mask_templates_cpu = None
+        mask_template_numel = (self.page_size + 1) * self.aoh_max_kv_len
+        if (
+            self.is_hybrid_swa
+            and self.has_aoh_streaming_layers
+            and mask_template_numel <= _AOH_DECODE_MASK_TEMPLATE_MAX_BYTES
+        ):
+            template_rows = []
+            for offset in range(self.page_size):
+                seq_len = self.aoh_decode_mask_periodic_start + offset
+                plan = build_aoh_page_plan(
+                    total_kv_len=seq_len,
+                    query_len=1,
+                    sink_size=self.aoh_sink_size,
+                    recent_size=self.aoh_recent_size,
+                    page_size=self.page_size,
+                )
+                template_rows.append(
+                    build_aoh_decode_mask(plan, self.page_size, self.aoh_max_kv_pages)
+                )
+            template_rows.append((True,) * self.aoh_max_kv_len)
+            self.aoh_decode_mask_templates_cpu = torch.tensor(
+                template_rows,
+                dtype=torch.bool,
+                pin_memory=is_pin_memory_available(self.device),
+            )
+            logger.info(
+                "AoH NPU decode mask templates enabled: rows=%d width=%d",
+                self.page_size + 1,
+                self.aoh_max_kv_len,
+            )
         if self.is_aoh and not self.use_fia:
             raise ValueError("AoH on Ascend requires ASCEND_USE_FIA=1.")
         if self.is_hybrid_swa:
@@ -457,6 +553,7 @@ class AscendAttnBackend(AttentionBackend):
         *,
         query: torch.Tensor,
         layer: RadixAttention,
+        seq_idx: int,
         req_pool_idx: torch.Tensor,
         total_kv_len: int,
         k_cache: torch.Tensor,
@@ -472,29 +569,55 @@ class AscendAttnBackend(AttentionBackend):
             dtype=query.dtype,
         )
 
-        # A sub-query cannot need keys older than recent_size. Splitting here
-        # keeps explicit masks O(query_len * recent_size), independent of the
-        # scheduler's prefill chunk size.
-        for query_offset in range(0, query_len, self.aoh_recent_size):
-            sub_query_len = min(self.aoh_recent_size, query_len - query_offset)
-            sub_total_kv_len = prefix_len + query_offset + sub_query_len
-            plan = build_aoh_page_plan(
-                total_kv_len=sub_total_kv_len,
-                query_len=sub_query_len,
-                sink_size=self.aoh_sink_size,
-                recent_size=self.aoh_recent_size,
-                page_size=self.page_size,
-            )
-            block_table = self._get_aoh_block_table(req_pool_idx, plan).unsqueeze(0)
-            if plan.can_use_causal_template:
-                attn_mask = self.fia_mask.unsqueeze(0)
-                sparse_mode = 3
-            else:
-                attn_mask = self._get_aoh_mask(plan).unsqueeze(0)
-                sparse_mode = 0
+        if self.forward_metadata.aoh_prefill_chunks is None:
+            self.forward_metadata.aoh_prefill_chunks = {}
+        chunks = self.forward_metadata.aoh_prefill_chunks.get(seq_idx)
+        if chunks is None:
+            chunks = []
+            query_offset = 0
+            while query_offset < query_len:
+                sub_query_len = get_aoh_prefill_chunk_size(
+                    query_start=prefix_len + query_offset,
+                    remaining_query_len=query_len - query_offset,
+                    sink_size=self.aoh_sink_size,
+                    recent_size=self.aoh_recent_size,
+                    page_size=self.page_size,
+                    max_mask_elements=self.aoh_prefill_mask_max_elements,
+                )
+                plan = build_aoh_page_plan(
+                    total_kv_len=prefix_len + query_offset + sub_query_len,
+                    query_len=sub_query_len,
+                    sink_size=self.aoh_sink_size,
+                    recent_size=self.aoh_recent_size,
+                    page_size=self.page_size,
+                )
+                if plan.can_use_causal_template:
+                    attn_mask = self.fia_mask.unsqueeze(0)
+                    sparse_mode = 3
+                else:
+                    attn_mask = self._get_aoh_mask(plan).unsqueeze(0)
+                    sparse_mode = 0
+                chunks.append(
+                    AoHPrefillChunk(
+                        query_offset=query_offset,
+                        query_len=sub_query_len,
+                        actual_kv_len=plan.actual_kv_len,
+                        block_table=self._get_aoh_block_table(
+                            req_pool_idx, plan
+                        ).unsqueeze(0),
+                        attn_mask=attn_mask,
+                        sparse_mode=sparse_mode,
+                    )
+                )
+                query_offset += sub_query_len
+            self.forward_metadata.aoh_prefill_chunks[seq_idx] = chunks
 
+        for chunk in chunks:
             result, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                query=query[None, query_offset : query_offset + sub_query_len],
+                query=query[
+                    None,
+                    chunk.query_offset : chunk.query_offset + chunk.query_len,
+                ],
                 key=k_cache.view(
                     -1,
                     self.page_size,
@@ -508,18 +631,20 @@ class AscendAttnBackend(AttentionBackend):
                 num_query_heads=layer.tp_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="BSND",
-                block_table=block_table,
+                block_table=chunk.block_table,
                 block_size=self.page_size,
-                actual_seq_qlen=[sub_query_len],
-                actual_seq_kvlen=[plan.actual_kv_len],
-                atten_mask=attn_mask,
-                sparse_mode=sparse_mode,
+                actual_seq_qlen=[chunk.query_len],
+                actual_seq_kvlen=[chunk.actual_kv_len],
+                atten_mask=chunk.attn_mask,
+                sparse_mode=chunk.sparse_mode,
                 softmax_scale=layer.scaling,
                 pre_tokens=FULL_ATTENTION_WINDOW,
                 next_tokens=0,
                 learnable_sink=sinks,
             )
-            output[query_offset : query_offset + sub_query_len] = result[0]
+            output[chunk.query_offset : chunk.query_offset + chunk.query_len] = result[
+                0
+            ]
         return output
 
     def _fill_aoh_decode_metadata(
@@ -529,9 +654,10 @@ class AscendAttnBackend(AttentionBackend):
         seq_lens_cpu: torch.Tensor,
         block_tables: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
-        kv_lens: Optional[torch.Tensor] = None,
         create_kv_lens: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        scratch: Optional[AoHDecodeScratch] = None,
+        query_len: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[int]]]:
         bs = len(seq_lens_cpu)
         if block_tables is None:
             block_tables = torch.zeros(
@@ -539,25 +665,18 @@ class AscendAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-        else:
-            block_tables.fill_(0)
         if mask is None:
             mask = torch.ones(
-                (bs, 1, self.aoh_max_kv_len),
+                (bs, query_len, self.aoh_max_kv_len),
                 dtype=torch.bool,
                 device=self.device,
             )
-        else:
-            mask.fill_(True)
-        if kv_lens is None and create_kv_lens:
-            kv_lens = torch.zeros(bs, dtype=torch.int32, device=self.device)
-
         plans = []
         for seq_idx in range(bs):
             seq_len = int(seq_lens_cpu[seq_idx].item())
             plan = build_aoh_page_plan(
                 total_kv_len=seq_len,
-                query_len=1 if seq_len > 0 else 0,
+                query_len=query_len if seq_len > 0 else 0,
                 sink_size=self.aoh_sink_size,
                 recent_size=self.aoh_recent_size,
                 page_size=self.page_size,
@@ -569,53 +688,84 @@ class AscendAttnBackend(AttentionBackend):
                 )
             plans.append(plan)
 
-        page_starts_cpu = torch.zeros((bs, self.aoh_max_kv_pages), dtype=torch.int64)
-        page_counts_cpu = torch.tensor(
-            [len(plan.page_starts) for plan in plans], dtype=torch.int64
-        )
+        if scratch is None:
+            page_starts_cpu = torch.zeros(
+                (bs, self.aoh_max_kv_pages), dtype=torch.int64
+            )
+            valid_pages_cpu = torch.zeros((bs, self.aoh_max_kv_pages), dtype=torch.bool)
+        else:
+            page_starts_cpu = scratch.page_starts_cpu
+            valid_pages_cpu = scratch.valid_pages_cpu
+            page_starts_cpu.zero_()
+            valid_pages_cpu.zero_()
         for seq_idx, plan in enumerate(plans):
+            for page_idx, page_start in enumerate(plan.page_starts):
+                page_starts_cpu[seq_idx, page_idx] = page_start
             if plan.page_starts:
-                page_starts_cpu[seq_idx, : len(plan.page_starts)] = torch.tensor(
-                    plan.page_starts, dtype=torch.int64
-                )
+                valid_pages_cpu[seq_idx, : len(plan.page_starts)] = True
 
-        page_starts = page_starts_cpu.to(self.device, non_blocking=True)
-        page_counts = page_counts_cpu.to(self.device, non_blocking=True)
-        valid_pages = torch.arange(self.aoh_max_kv_pages, device=self.device).unsqueeze(
-            0
-        ) < page_counts.unsqueeze(1)
+        if scratch is None:
+            page_starts = page_starts_cpu.to(self.device, non_blocking=True)
+            valid_pages = valid_pages_cpu.to(self.device, non_blocking=True)
+        else:
+            scratch.page_starts.copy_(page_starts_cpu, non_blocking=True)
+            scratch.valid_pages.copy_(valid_pages_cpu, non_blocking=True)
+            page_starts = scratch.page_starts
+            valid_pages = scratch.valid_pages
         full_locs = self.req_to_token[req_pool_indices[:bs].unsqueeze(1), page_starts]
         mapped_blocks = (
             self.full_to_swa_index_mapping[full_locs] // self.page_size
         ).to(torch.int32)
         block_tables.copy_(torch.where(valid_pages, mapped_blocks, 0))
 
-        key_positions = (
-            page_starts.unsqueeze(-1)
-            + torch.arange(self.page_size, device=self.device).view(1, 1, -1)
-        ).reshape(bs, -1)
-        seq_lens = seq_lens_cpu[:bs].to(self.device, non_blocking=True).view(bs, 1)
-        anchor_ends = torch.clamp(seq_lens, max=self.aoh_sink_size)
-        tail_starts = torch.clamp(
-            seq_lens - self.aoh_recent_size, min=self.aoh_sink_size
-        )
-        valid_keys = (
-            valid_pages.unsqueeze(-1).expand(-1, -1, self.page_size).reshape(bs, -1)
-        )
-        keep = (
-            valid_keys
-            & (key_positions < seq_lens)
-            & ((key_positions < anchor_ends) | (key_positions >= tail_starts))
-        )
-        mask[:, 0, :].copy_(~keep)
-        if kv_lens is not None:
-            kv_lens.copy_(
-                torch.tensor(
-                    [plan.actual_kv_len for plan in plans],
-                    dtype=torch.int32,
-                    device=self.device,
-                )
+        use_mask_templates = (
+            query_len == 1
+            and scratch is not None
+            and self.aoh_decode_mask_templates_cpu is not None
+            and all(
+                seq_len == 0 or seq_len >= self.aoh_decode_mask_periodic_start
+                for seq_len in (plan.total_kv_len for plan in plans)
             )
+        )
+        if use_mask_templates:
+            for seq_idx, plan in enumerate(plans):
+                template_idx = (
+                    self.page_size
+                    if plan.total_kv_len == 0
+                    else (plan.total_kv_len - self.aoh_decode_mask_periodic_start)
+                    % self.page_size
+                )
+                scratch.mask_cpu[seq_idx, 0].copy_(
+                    self.aoh_decode_mask_templates_cpu[template_idx]
+                )
+            mask.copy_(scratch.mask_cpu, non_blocking=True)
+        else:
+            key_positions = (
+                page_starts.unsqueeze(-1)
+                + torch.arange(self.page_size, device=self.device).view(1, 1, -1)
+            ).reshape(bs, -1)
+            seq_lens = seq_lens_cpu[:bs].to(self.device, non_blocking=True)
+            anchor_ends = torch.clamp(seq_lens, max=self.aoh_sink_size).view(bs, 1, 1)
+            query_positions = (
+                seq_lens.view(bs, 1, 1)
+                - query_len
+                + torch.arange(query_len, device=self.device).view(1, query_len, 1)
+            )
+            tail_starts = torch.clamp(
+                query_positions - self.aoh_recent_size + 1,
+                min=self.aoh_sink_size,
+            )
+            valid_keys = (
+                valid_pages.unsqueeze(-1).expand(-1, -1, self.page_size).reshape(bs, -1)
+            )
+            key_positions = key_positions.view(bs, 1, -1)
+            keep = (
+                valid_keys.view(bs, 1, -1)
+                & (key_positions <= query_positions)
+                & ((key_positions < anchor_ends) | (key_positions >= tail_starts))
+            )
+            mask[:, :query_len, :].copy_(~keep)
+        kv_lens = [plan.actual_kv_len for plan in plans] if create_kv_lens else None
         return block_tables, mask, kv_lens
 
     def update_verify_buffers_to_fill_after_draft(
@@ -654,8 +804,14 @@ class AscendAttnBackend(AttentionBackend):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
         seq_lens_max = forward_batch.seq_lens.max()
+        target_verify_query_len = (
+            int(forward_batch.spec_info.draft_token_num)
+            if forward_batch.forward_mode.is_target_verify()
+            and forward_batch.spec_info is not None
+            else self.speculative_num_draft_tokens
+        )
         if forward_batch.forward_mode.is_target_verify():
-            seq_lens_max += self.speculative_num_draft_tokens
+            seq_lens_max += target_verify_query_len
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
@@ -681,18 +837,31 @@ class AscendAttnBackend(AttentionBackend):
                     .to(torch.int32)
                     .contiguous()
                 )
-            if self.is_aoh and forward_batch.forward_mode.is_decode_or_idle():
+            if self.has_aoh_streaming_layers and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            ):
+                aoh_query_len = (
+                    int(forward_batch.spec_info.draft_token_num)
+                    if forward_batch.forward_mode.is_target_verify()
+                    and forward_batch.spec_info is not None
+                    else 1
+                )
+                aoh_seq_lens_cpu = (
+                    forward_batch.seq_lens_cpu
+                    if forward_batch.seq_lens_cpu is not None
+                    else forward_batch.seq_lens.cpu()
+                )
+                if forward_batch.forward_mode.is_target_verify():
+                    aoh_seq_lens_cpu = aoh_seq_lens_cpu + aoh_query_len
                 (
                     self.forward_metadata.aoh_block_tables,
                     self.forward_metadata.aoh_mask,
                     self.forward_metadata.aoh_kv_lens,
                 ) = self._fill_aoh_decode_metadata(
                     req_pool_indices=forward_batch.req_pool_indices,
-                    seq_lens_cpu=(
-                        forward_batch.seq_lens_cpu
-                        if forward_batch.seq_lens_cpu is not None
-                        else forward_batch.seq_lens.cpu()
-                    ),
+                    seq_lens_cpu=aoh_seq_lens_cpu,
+                    query_len=aoh_query_len,
                 )
         if forward_batch.extend_seq_lens is not None:
             self.forward_metadata.extend_seq_lens = forward_batch.extend_seq_lens
@@ -707,6 +876,9 @@ class AscendAttnBackend(AttentionBackend):
             ).int()
 
         self.forward_metadata.seq_lens_cpu_int = forward_batch.seq_lens_cpu.int()
+        self.forward_metadata.seq_lens_cpu_list = (
+            self.forward_metadata.seq_lens_cpu_int.tolist()
+        )
         if (
             not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
@@ -717,7 +889,7 @@ class AscendAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_target_verify() and not _is_dflash_verify(
             forward_batch.spec_info
         ):
-            self.forward_metadata.seq_lens_cpu_int += self.speculative_num_draft_tokens
+            self.forward_metadata.seq_lens_cpu_int += target_verify_query_len
         elif (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
@@ -734,11 +906,15 @@ class AscendAttnBackend(AttentionBackend):
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
         ):
+            query_len = (
+                target_verify_query_len
+                if forward_batch.forward_mode.is_target_verify()
+                else self.speculative_num_draft_tokens
+            )
             self.forward_metadata.actual_seq_lengths_q = torch.arange(
-                self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens
-                + forward_batch.seq_lens.shape[0] * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
+                query_len,
+                query_len + forward_batch.seq_lens.shape[0] * query_len,
+                query_len,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -798,18 +974,18 @@ class AscendAttnBackend(AttentionBackend):
             ),
         }
         if self.is_hybrid_swa:
-            if self.is_aoh:
+            if self.has_aoh_streaming_layers:
                 self.graph_metadata["aoh_block_tables"] = torch.empty(
                     (max_bs, self.aoh_max_kv_pages),
                     dtype=torch.int32,
                     device=self.device,
                 )
                 self.graph_metadata["aoh_mask"] = torch.ones(
-                    (max_bs, 1, self.aoh_max_kv_len),
+                    (max_bs, self.aoh_max_query_len, self.aoh_max_kv_len),
                     dtype=torch.bool,
                     device=self.device,
                 )
-            else:
+            elif not self.is_aoh:
                 self.graph_metadata["block_tables_swa"] = torch.empty(
                     (max_bs, total_context_len // self.page_size),
                     dtype=torch.int32,
@@ -852,12 +1028,45 @@ class AscendAttnBackend(AttentionBackend):
         metadata = ForwardMetadata()
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         if self.is_hybrid_swa:
-            if self.is_aoh:
+            if self.has_aoh_streaming_layers:
+                aoh_query_len = (
+                    self.speculative_num_draft_tokens
+                    if forward_mode.is_target_verify()
+                    else 1
+                )
                 metadata.aoh_block_tables = self.graph_metadata["aoh_block_tables"][
                     :bs, :
                 ]
-                metadata.aoh_mask = self.graph_metadata["aoh_mask"][:bs]
-            else:
+                metadata.aoh_mask = self.graph_metadata["aoh_mask"][:bs, :aoh_query_len]
+                pin_memory = is_pin_memory_available(self.device)
+                metadata.aoh_decode_scratch = AoHDecodeScratch(
+                    page_starts_cpu=torch.empty(
+                        (bs, self.aoh_max_kv_pages),
+                        dtype=torch.int64,
+                        pin_memory=pin_memory,
+                    ),
+                    valid_pages_cpu=torch.empty(
+                        (bs, self.aoh_max_kv_pages),
+                        dtype=torch.bool,
+                        pin_memory=pin_memory,
+                    ),
+                    mask_cpu=torch.empty(
+                        (bs, aoh_query_len, self.aoh_max_kv_len),
+                        dtype=torch.bool,
+                        pin_memory=pin_memory,
+                    ),
+                    page_starts=torch.empty(
+                        (bs, self.aoh_max_kv_pages),
+                        dtype=torch.int64,
+                        device=self.device,
+                    ),
+                    valid_pages=torch.empty(
+                        (bs, self.aoh_max_kv_pages),
+                        dtype=torch.bool,
+                        device=self.device,
+                    ),
+                )
+            elif not self.is_aoh:
                 metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][
                     :bs, :
                 ]
@@ -934,6 +1143,11 @@ class AscendAttnBackend(AttentionBackend):
         Public entry: :py:meth:`init_forward_metadata_out_graph`.
         """
         metadata = self.graph_metadata[bs]
+        target_verify_query_len = (
+            int(spec_info.draft_token_num)
+            if forward_mode.is_target_verify() and spec_info is not None
+            else self.speculative_num_draft_tokens
+        )
 
         # refill the captured SWA write-target buffer in place from the live loc
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
@@ -944,21 +1158,29 @@ class AscendAttnBackend(AttentionBackend):
             )
         max_len = seq_lens_cpu[:bs].max().item()
         if forward_mode.is_target_verify() and not _is_dflash_verify(spec_info):
-            max_len += self.speculative_num_draft_tokens
+            max_len += target_verify_query_len
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             max_len += self.speculative_step_id + 1
         max_seq_pages = (max_len + self.page_size - 1) // self.page_size
 
         if self.is_hybrid_swa:
-            if self.is_aoh:
+            if self.has_aoh_streaming_layers:
+                aoh_query_len = (
+                    target_verify_query_len if forward_mode.is_target_verify() else 1
+                )
+                aoh_seq_lens_cpu = seq_lens_cpu[:bs]
+                if forward_mode.is_target_verify():
+                    aoh_seq_lens_cpu = aoh_seq_lens_cpu + aoh_query_len
                 self._fill_aoh_decode_metadata(
                     req_pool_indices=req_pool_indices[:bs],
-                    seq_lens_cpu=seq_lens_cpu[:bs],
+                    seq_lens_cpu=aoh_seq_lens_cpu,
                     block_tables=metadata.aoh_block_tables,
                     mask=metadata.aoh_mask,
                     create_kv_lens=False,
+                    scratch=metadata.aoh_decode_scratch,
+                    query_len=aoh_query_len,
                 )
-            else:
+            elif not self.is_aoh:
                 metadata.block_tables_swa[:bs, :max_seq_pages].copy_(
                     self.full_to_swa_index_mapping[
                         self.req_to_token[req_pool_indices[:bs], :max_len]
@@ -985,7 +1207,7 @@ class AscendAttnBackend(AttentionBackend):
         metadata.block_tables[bs:, :].fill_(0)
 
         if forward_mode.is_target_verify():
-            seq_lens = seq_lens + self.speculative_num_draft_tokens
+            seq_lens = seq_lens + target_verify_query_len
         elif forward_mode.is_decode_or_idle() and spec_info is not None:
             seq_lens = seq_lens + self.speculative_step_offset_npu
         metadata.seq_lens[:bs].copy_(seq_lens[:bs])
@@ -1561,7 +1783,7 @@ class AscendAttnBackend(AttentionBackend):
                         q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
                         # FIA BSND with paged KV cache (reads prefix tokens from cache)
-                        seq_lens_cpu = forward_batch.seq_lens.cpu().tolist()
+                        seq_lens_cpu = self.forward_metadata.seq_lens_cpu_list
                         attn_out = torch.empty(
                             (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                             device=q.device,
@@ -1581,6 +1803,7 @@ class AscendAttnBackend(AttentionBackend):
                                 result = self._forward_aoh_extend_fia(
                                     query=q[q_len_offset : q_len_offset + q_len],
                                     layer=layer,
+                                    seq_idx=seq_idx,
                                     req_pool_idx=forward_batch.req_pool_indices[
                                         seq_idx
                                     ],
@@ -2277,14 +2500,28 @@ class AscendAttnBackend(AttentionBackend):
                     np.array(forward_batch.extend_seq_lens_cpu).cumsum().tolist()
                 )
             else:
+                query_len = (
+                    int(forward_batch.spec_info.draft_token_num)
+                    if forward_batch.spec_info is not None
+                    else self.speculative_num_draft_tokens
+                )
                 actual_seq_lengths = np.arange(
-                    self.speculative_num_draft_tokens,
-                    self.speculative_num_draft_tokens + query.shape[0],
-                    self.speculative_num_draft_tokens,
+                    query_len,
+                    query_len + query.shape[0],
+                    query_len,
                 )
 
             is_swa_layer = layer.sliding_window_size != -1
-            if (
+            is_aoh_streaming = self.is_aoh and layer.aoh_mode == "streaming"
+            if is_aoh_streaming:
+                block_table = self.forward_metadata.aoh_block_tables
+                mask = self.forward_metadata.aoh_mask
+                actual_seq_lengths_kv = (
+                    [self.aoh_max_kv_len] * len(actual_seq_lengths)
+                    if self.graph_mode
+                    else self.forward_metadata.aoh_kv_lens
+                )
+            elif (
                 is_swa_layer
                 and self.is_hybrid_swa
                 and hasattr(self.forward_metadata, "block_tables_swa")
@@ -2293,14 +2530,110 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 block_table = self.forward_metadata.block_tables
 
-            if layer.attn_type == AttentionType.ENCODER_ONLY:
-                mask = None
-                sparse_mode = 0
-            else:
-                mask = self.mtp_mask
-                sparse_mode = 4 if is_swa_layer else 3
+            if not is_aoh_streaming:
+                if layer.attn_type == AttentionType.ENCODER_ONLY:
+                    mask = None
+                    sparse_mode = 0
+                else:
+                    mask = self.mtp_mask
+                    sparse_mode = 4 if is_swa_layer else 3
 
-            if self.is_hybrid_swa:
+            if is_aoh_streaming:
+                # TND MTP accepts only the fixed optimized causal mask, while
+                # AoH needs its compact anchor-and-tail mask for every request.
+                # Flatten each request/token pair to Q=1 because small-Q MTP
+                # split-fuse does not support the full per-request mask used by
+                # AoH. NPU Graph uses the same FIA V1 path as AoH decode; FIA V2
+                # can capture this shape but may stall asynchronously on replay.
+                query_len = get_aoh_speculative_query_len(
+                    query.shape[0], forward_batch.batch_size
+                )
+                query_bsnd = query.view(
+                    forward_batch.batch_size, query_len, *query.shape[1:]
+                )
+                flat_batch_size = forward_batch.batch_size * query_len
+                flat_query = query_bsnd.reshape(
+                    flat_batch_size, 1, *query_bsnd.shape[2:]
+                )
+                flat_block_table = block_table.repeat_interleave(query_len, dim=0)
+                flat_mask = mask.reshape(flat_batch_size, 1, mask.shape[-1])
+                flat_kv_lens = [
+                    kv_len for kv_len in actual_seq_lengths_kv for _ in range(query_len)
+                ]
+                if self.graph_mode:
+                    flat_query = flat_query.reshape(
+                        flat_batch_size,
+                        1,
+                        layer.tp_q_head_num * layer.qk_head_dim,
+                    )
+                    workspace = (
+                        torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+                            flat_query,
+                            k_cache,
+                            v_cache,
+                            block_table=flat_block_table,
+                            block_size=self.page_size,
+                            num_heads=layer.tp_q_head_num,
+                            num_key_value_heads=layer.tp_k_head_num,
+                            input_layout="BSH",
+                            scale=layer.scaling,
+                            actual_seq_lengths_kv=flat_kv_lens,
+                            atten_mask=flat_mask,
+                            sparse_mode=0,
+                        )
+                    )
+                    attn_output = torch.empty(
+                        (
+                            flat_batch_size,
+                            1,
+                            layer.tp_q_head_num * layer.v_head_dim,
+                        ),
+                        dtype=q.dtype,
+                        device=q.device,
+                    )
+                    softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
+                    torch_npu.npu_fused_infer_attention_score.out(
+                        flat_query,
+                        k_cache,
+                        v_cache,
+                        block_table=flat_block_table,
+                        block_size=self.page_size,
+                        num_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="BSH",
+                        scale=layer.scaling,
+                        actual_seq_lengths_kv=flat_kv_lens,
+                        atten_mask=flat_mask,
+                        sparse_mode=0,
+                        workspace=workspace,
+                        out=[attn_output, softmax_lse],
+                    )
+                else:
+                    attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                        flat_query,
+                        k_cache,
+                        v_cache,
+                        block_table=flat_block_table,
+                        block_size=self.page_size,
+                        num_query_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="BSND",
+                        atten_mask=flat_mask,
+                        softmax_scale=layer.scaling,
+                        actual_seq_qlen=[1] * flat_batch_size,
+                        actual_seq_kvlen=flat_kv_lens,
+                        sparse_mode=0,
+                        pre_tokens=FULL_ATTENTION_WINDOW,
+                        next_tokens=0,
+                        learnable_sink=sinks,
+                    )
+                attn_output = attn_output.view(
+                    forward_batch.batch_size,
+                    query_len,
+                    layer.tp_q_head_num,
+                    layer.v_head_dim,
+                )
+            elif self.is_hybrid_swa and not self.is_aoh:
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
                     query,
                     k_cache,
@@ -2316,11 +2649,15 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_kvlen=actual_seq_lengths_kv,
                     sparse_mode=sparse_mode,
                     pre_tokens=(
-                        layer.sliding_window_size
-                        if is_swa_layer
-                        else FULL_ATTENTION_WINDOW
+                        FULL_ATTENTION_WINDOW
+                        if is_aoh_streaming or not is_swa_layer
+                        else layer.sliding_window_size
                     ),
-                    next_tokens=0 if is_swa_layer else FULL_ATTENTION_WINDOW,
+                    next_tokens=(
+                        FULL_ATTENTION_WINDOW
+                        if is_aoh_streaming or not is_swa_layer
+                        else 0
+                    ),
                     learnable_sink=sinks,
                 )
             else:
@@ -2328,7 +2665,7 @@ class AscendAttnBackend(AttentionBackend):
                     query,
                     k_cache,
                     v_cache,
-                    block_table=self.forward_metadata.block_tables,
+                    block_table=block_table,
                     block_size=self.page_size,
                     num_heads=layer.tp_q_head_num,
                     num_key_value_heads=layer.tp_k_head_num,
@@ -2525,36 +2862,15 @@ class AscendAttnBackend(AttentionBackend):
                     v,
                 )
 
-        if is_aoh_streaming and sinks is not None:
-            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
-                -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+        if self.is_aoh and sinks is not None:
+            raise NotImplementedError(
+                "AoH attention with learnable sinks is not supported "
+                "by NPU Graph. Use --disable-cuda-graph."
             )
-            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
-                -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
-            )
-            query = q.view(-1, 1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
-            batch_size = query.shape[0]
-            attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                query=query,
-                key=k_cache,
-                value=v_cache,
-                num_query_heads=layer.tp_q_head_num,
-                num_key_value_heads=layer.tp_k_head_num,
-                input_layout="BSND",
-                block_size=self.page_size,
-                atten_mask=self.forward_metadata.aoh_mask,
-                sparse_mode=0,
-                softmax_scale=layer.scaling,
-                block_table=self.forward_metadata.aoh_block_tables,
-                actual_seq_qlen=[1] * batch_size,
-                actual_seq_kvlen=[self.aoh_max_kv_len] * batch_size,
-                pre_tokens=FULL_ATTENTION_WINDOW,
-                next_tokens=0,
-                learnable_sink=sinks,
-            )
-            return attn_output.view(batch_size, layer.tp_q_head_num * layer.v_head_dim)
 
-        if not is_aoh_streaming and (sinks is not None or self.is_hybrid_swa):
+        # AoH layers fall through to V1 FIA so NPUGraph can update retrieval
+        # layers with full lengths and streaming layers with compact lengths.
+        if not self.is_aoh and (sinks is not None or self.is_hybrid_swa):
             # Use SWA block tables if hybrid SWA is enabled for this layer
             if self._is_swa_layer(layer):
                 block_tables = self.forward_metadata.block_tables_swa
@@ -2843,6 +3159,16 @@ class AscendAttnBackend(AttentionBackend):
 
         if not self.use_mla:
             is_aoh_streaming = self.is_aoh and layer.aoh_mode == "streaming"
+            if (
+                self.graph_mode
+                and self.is_aoh
+                and not is_aoh_streaming
+                and sinks is not None
+            ):
+                raise NotImplementedError(
+                    "AoH retrieval attention with learnable sinks is not supported "
+                    "by NPU Graph. Use --disable-cuda-graph."
+                )
             # In cross attention layer, when there is no vision input,the values of k and v is None
             if save_kv_cache and k is not None and v is not None:
                 # support cross attention
@@ -2880,7 +3206,11 @@ class AscendAttnBackend(AttentionBackend):
                     block_tables = self.forward_metadata.block_tables
                 if self.use_fia:
                     if is_aoh_streaming:
-                        actual_seq_len_kv = self.forward_metadata.aoh_kv_lens
+                        actual_seq_len_kv = (
+                            [self.aoh_max_kv_len] * forward_batch.batch_size
+                            if self.graph_mode
+                            else self.forward_metadata.aoh_kv_lens
+                        )
                     elif self.forward_metadata.seq_lens_cpu_int is None:
                         actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
                     else:

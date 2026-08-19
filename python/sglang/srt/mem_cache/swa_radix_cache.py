@@ -514,7 +514,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             ]
 
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
-            req.prefix_indices = kv_indices
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
         token_ids = req.get_fill_ids()

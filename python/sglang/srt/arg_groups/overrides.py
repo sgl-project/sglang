@@ -297,7 +297,9 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
     This is the one definition of the predicate: ``ServerArgs`` delegates its
     member to it, and the runtime_context accessor is its post-publish sibling
     (which cannot reuse it, because the two leaves land in different bags)."""
-    return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
+    return (
+        cfg.disable_radix_cache is False or getattr(cfg, "aoh_config", None) is not None
+    ) and cfg.mamba_radix_cache_strategy in (
         "extra_buffer",
         "extra_buffer_lazy",
     )
@@ -306,9 +308,8 @@ def mamba_extra_buffer_of(cfg: Any) -> bool:
 def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
     """The lazy variant of :func:`mamba_extra_buffer_of`."""
     return (
-        cfg.disable_radix_cache is False
-        and cfg.mamba_radix_cache_strategy == "extra_buffer_lazy"
-    )
+        cfg.disable_radix_cache is False or getattr(cfg, "aoh_config", None) is not None
+    ) and cfg.mamba_radix_cache_strategy == "extra_buffer_lazy"
 
 
 def collect_model_override_declarations(
@@ -1569,7 +1570,7 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     if not ((spec is not None and spec.uses_mamba_radix_cache) or in_branch):
         return {}
 
-    if view.disable_radix_cache:
+    if view.disable_radix_cache and getattr(view, "aoh_config", None) is None:
         return {}
 
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}

@@ -106,6 +106,16 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
 _is_npu = is_npu()
 
 
+def _get_hybrid_swa_pool_class(mha_pool_class: type) -> type:
+    if _is_npu:
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMHATokenToKVPool,
+        )
+
+        return NPUMHATokenToKVPool
+    return mha_pool_class
+
+
 def _should_enable_lazy_compaction() -> bool:
     """Lazy compaction default — ON unless
     `SGLANG_DISABLE_LAZY_COMPACTION=1` (escape hatch for A/B / rollback).
@@ -201,6 +211,8 @@ class KVCacheConfigurator:
     token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator]
     memory_pool_config: Optional[MemoryPoolConfig]
     is_aoh: bool = False
+    aoh_sink_size: int = 0
+    aoh_recent_size: int = 0
     aoh_streaming_layer_ids: list[int] = field(default_factory=list)
     aoh_retrieval_layer_ids: list[int] = field(default_factory=list)
     draft_model_idx: Optional[int] = None
@@ -1373,7 +1385,7 @@ class KVCacheConfigurator:
         swa_pool_class = (
             MHATokenToKVPoolMXFP8
             if self.kv_cache_dtype_str == "mxfp8"
-            else mha_pool_class
+            else _get_hybrid_swa_pool_class(mha_pool_class)
         )
         swa_attention_layer_ids = (
             self.aoh_streaming_layer_ids

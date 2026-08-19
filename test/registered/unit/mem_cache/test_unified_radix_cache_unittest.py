@@ -220,6 +220,37 @@ class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
         self.assertIsNot(COMPONENT_REGISTRY[ComponentType.FULL], _FakeFullComponent)
 
 
+class TestUnifiedRadixDisabledCache(CustomTestCase):
+    def test_unfinished_prefix_indices_do_not_alias_request_pool(self):
+        params = CacheInitParams(
+            req_to_token_pool=ReqToTokenPool(
+                size=1,
+                max_context_len=8,
+                device="cpu",
+                enable_memory_saver=False,
+            ),
+            token_to_kv_pool_allocator=None,
+            page_size=1,
+            disable=True,
+            tree_components=(ComponentType.FULL,),
+            component_registry_override={ComponentType.FULL: _FakeFullComponent},
+        )
+        cache = UnifiedRadixCache(params=params)
+        req = mock.Mock()
+        req.req_pool_idx = 0
+        req.session = None
+        req.get_fill_ids.return_value = array("q", [1, 2, 3])
+        cache.req_to_token_pool.req_to_token[0, :3] = torch.tensor(
+            [11, 12, 13], dtype=torch.int32
+        )
+
+        cache.cache_unfinished_req(req)
+        cache.req_to_token_pool.req_to_token[0, :3] = 0
+
+        self.assertEqual(req.prefix_indices.dtype, torch.int64)
+        torch.testing.assert_close(req.prefix_indices.cpu(), torch.tensor([11, 12, 13]))
+
+
 class TestUnifiedTreeNodeGetPrefixHashValues(CustomTestCase):
     def test_get_prefix_hash_values_not_shared_across_calls(self):
         """Regression guard for cached mutable prefix hash lists (#26177)."""

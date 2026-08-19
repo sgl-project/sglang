@@ -261,8 +261,8 @@ def build_kv_cache(
     )
     if tp_worker.model_runner.is_aoh:
         tree_cache.is_aoh = True
-        tree_cache.aoh_sink_size = server_args.aoh_sink_size
-        tree_cache.aoh_recent_size = server_args.aoh_recent_size
+        tree_cache.aoh_sink_size = tp_worker.model_runner.aoh_sink_size
+        tree_cache.aoh_recent_size = tp_worker.model_runner.aoh_recent_size
         # Only anchors are content-stable in a shared radix tree. The moving
         # AoH tail remains request-private and is re-prefilled after a match.
         # Use the global sidecar decision so all TP ranks match the same prefix.

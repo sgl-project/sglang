@@ -387,6 +387,7 @@ class _FakeResolvedArgs:
     prefill_attention_backend: A[str | None, Arg(help="pab"), NS("exec.kernel")] = None
     decode_attention_backend: A[str | None, Arg(help="dab"), NS("exec.kernel")] = None
     disable_radix_cache: A[bool, Arg(help="drc"), NS("memory")] = False
+    aoh_config: A[str | None, Arg(help="aoh"), NS("schedule")] = None
     mamba_radix_cache_strategy: A[str, Arg(help="mrcs"), NS("exec.mamba")] = "auto"
     speculative_num_draft_tokens: A[int | None, Arg(help="d"), NS("spec")] = None
     speculative_adaptive: A[bool, Arg(help="a"), NS("spec")] = False
@@ -997,21 +998,27 @@ class TestDerivedPredicatesAgreeAcrossTiers(_IsolatedServerArgs):
         )
 
         for disable_radix_cache in (False, True):
-            for strategy in self._STRATEGIES:
-                with self.subTest(radix=disable_radix_cache, strategy=strategy):
-                    args = _FakeResolvedArgs(
-                        disable_radix_cache=disable_radix_cache,
-                        mamba_radix_cache_strategy=strategy,
-                    )
-                    get_context().set_server_args(args)
-                    self.assertEqual(
-                        ServerArgs.enable_mamba_extra_buffer(args),
-                        mamba_extra_buffer_enabled(),
-                    )
-                    self.assertEqual(
-                        ServerArgs.enable_mamba_extra_buffer_lazy(args),
-                        mamba_extra_buffer_lazy_enabled(),
-                    )
+            for aoh_config in (None, "/tmp/aoh.json"):
+                for strategy in self._STRATEGIES:
+                    with self.subTest(
+                        radix=disable_radix_cache,
+                        aoh=aoh_config,
+                        strategy=strategy,
+                    ):
+                        args = _FakeResolvedArgs(
+                            disable_radix_cache=disable_radix_cache,
+                            aoh_config=aoh_config,
+                            mamba_radix_cache_strategy=strategy,
+                        )
+                        get_context().set_server_args(args)
+                        self.assertEqual(
+                            ServerArgs.enable_mamba_extra_buffer(args),
+                            mamba_extra_buffer_enabled(),
+                        )
+                        self.assertEqual(
+                            ServerArgs.enable_mamba_extra_buffer_lazy(args),
+                            mamba_extra_buffer_lazy_enabled(),
+                        )
 
     def test_attention_backends_match_the_member(self):
         from sglang.srt.runtime_context import attention_backends

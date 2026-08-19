@@ -346,9 +346,12 @@ class ModelRunner:
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.is_aoh = False
+        self.aoh_sink_size = server_args.aoh_sink_size
+        self.aoh_recent_size = server_args.aoh_recent_size
         self.aoh_has_streaming = False
         self.aoh_streaming_layer_ids: list[int] = []
         self.aoh_retrieval_layer_ids: list[int] = []
+        self.aoh_attention_layer_modes: list[str] = []
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.enable_elastic_ep = server_args.elastic_ep_backend is not None
@@ -606,6 +609,8 @@ class ModelRunner:
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_swa_compress=self.is_hybrid_swa_compress,
             is_aoh=self.is_aoh,
+            aoh_sink_size=self.aoh_sink_size,
+            aoh_recent_size=self.aoh_recent_size,
             aoh_streaming_layer_ids=self.aoh_streaming_layer_ids,
             aoh_retrieval_layer_ids=self.aoh_retrieval_layer_ids,
             use_mla_backend=self.use_mla_backend,
@@ -681,13 +686,21 @@ class ModelRunner:
         if self.server_args.aoh_config is None:
             return
         if self.is_draft_worker:
-            raise ValueError("AoH does not support speculative draft workers.")
+            logger.info(
+                "AoH is configured on the speculative target model only; "
+                "the draft worker keeps its native attention."
+            )
+            return
+        if self.use_mla_backend:
+            raise ValueError(
+                "AoH v1 supports MHA/GQA attention only; MLA uses a shared latent "
+                "KV representation that cannot be routed by KV-head group."
+            )
         if self.ps.pp_size != 1:
             raise ValueError("AoH v1 supports pp-size=1 only.")
         if get_parallel().attn_dcp_size != 1:
             raise ValueError("AoH v1 supports attention DCP=1 only.")
-        if not self.spec_algorithm.is_none():
-            raise ValueError("AoH v1 does not support speculative decoding.")
+        self._validate_aoh_speculative_compatibility()
         if self.server_args.disaggregation_mode != "null":
             raise ValueError("AoH v1 does not support PD disaggregation.")
         if self.server_args.enable_hierarchical_cache:
@@ -709,28 +722,8 @@ class ModelRunner:
             raise ValueError("AoH v1 does not support --enable-unified-memory.")
         if self.server_args.max_running_requests is None:
             raise ValueError("AoH v1 requires an explicit --max-running-requests.")
-        if self.server_args.aoh_sink_size <= 0 or self.server_args.aoh_recent_size <= 0:
-            raise ValueError("AoH sink and recent sizes must both be positive.")
-        raw_window = (
-            self.server_args.aoh_sink_size,
-            self.server_args.aoh_recent_size,
-        )
-        (
-            self.server_args.aoh_sink_size,
-            self.server_args.aoh_recent_size,
-        ) = normalize_aoh_window(*raw_window, self.model_config.context_len)
-        if raw_window != (
-            self.server_args.aoh_sink_size,
-            self.server_args.aoh_recent_size,
-        ):
-            logger.warning(
-                "AoH window %s exceeds the model context and was normalized to %s.",
-                raw_window,
-                (
-                    self.server_args.aoh_sink_size,
-                    self.server_args.aoh_recent_size,
-                ),
-            )
+        self._configure_aoh_window()
+        self._validate_aoh_mamba_cache_compatibility()
 
         sidecar = AoHConfig.load(self.server_args.aoh_config)
         self.aoh_has_streaming = any(
@@ -747,7 +740,7 @@ class ModelRunner:
                 "attention because the Triton backend needs independent native-SWA "
                 "and AoH window metadata."
             )
-        configured_full_layer_ids = self.model_config.full_attention_layer_ids
+        configured_full_layer_ids = self._get_aoh_full_attention_layer_ids()
         full_attention_layer_ids = (
             None
             if configured_full_layer_ids is None
@@ -775,6 +768,8 @@ class ModelRunner:
 
         self.aoh_streaming_layer_ids = []
         self.aoh_retrieval_layer_ids = []
+        # Model module order is also the NPU Graph FIA capture/update order.
+        self.aoh_attention_layer_modes = []
         for layer in attention_layers:
             configured_modes = sidecar.layer_modes.get(layer.layer_id)
             if configured_modes is None:
@@ -802,14 +797,19 @@ class ModelRunner:
                 )
             mode = modes.pop()
             layer.aoh_mode = mode
+            self.aoh_attention_layer_modes.append(mode)
             if mode == "streaming":
-                layer.sliding_window_size = (
-                    self.server_args.aoh_sink_size + self.server_args.aoh_recent_size
-                )
+                layer.sliding_window_size = self.aoh_sink_size + self.aoh_recent_size
                 self.aoh_streaming_layer_ids.append(layer.layer_id)
             else:
                 layer.sliding_window_size = -1
                 self.aoh_retrieval_layer_ids.append(layer.layer_id)
+
+        logger.info(
+            "AoH local attention modes: retrieval=%d, streaming=%d",
+            len(self.aoh_retrieval_layer_ids),
+            len(self.aoh_streaming_layer_ids),
+        )
 
         configured_layer_ids = {layer.layer_id for layer in attention_layers}
         unexpected_layer_ids = set(sidecar.layer_modes).difference(configured_layer_ids)
@@ -818,6 +818,18 @@ class ModelRunner:
                 "AoH config contains non-attention layers for this model: "
                 f"{sorted(unexpected_layer_ids)}."
             )
+        tp_mixed_layer_ids = sorted(
+            layer_id
+            for layer_id, modes in sidecar.layer_modes.items()
+            if len(set(modes)) > 1
+        )
+        if kv_tp_size > 1 and tp_mixed_layer_ids:
+            logger.warning(
+                "AoH modes differ across TP ranks for layers %s. Decode latency "
+                "can remain bounded by each layer's retrieval rank even when other "
+                "ranks use compact streaming attention.",
+                tp_mixed_layer_ids,
+            )
         # AoH reuses the hybrid-SWA scheduler and allocator, but replaces the
         # contiguous-window eviction rule with an anchor-and-recent rule. A TP
         # rank may own only retrieval groups, in which case it keeps the normal
@@ -825,20 +837,64 @@ class ModelRunner:
         self.is_aoh = True
         self.is_hybrid_swa = bool(self.aoh_streaming_layer_ids)
         if self.is_hybrid_swa:
-            self.sliding_window_size = (
-                self.server_args.aoh_sink_size + self.server_args.aoh_recent_size
-            )
+            self.sliding_window_size = self.aoh_sink_size + self.aoh_recent_size
         logger.info(
             "AoH enabled: rank=%s streaming_layers=%s retrieval_layers=%s "
             "sink=%s recent=%s radix_cache=%s cuda_graph=%s",
             self.ps.tp_rank,
             self.aoh_streaming_layer_ids,
             self.aoh_retrieval_layer_ids,
-            self.server_args.aoh_sink_size,
-            self.server_args.aoh_recent_size,
+            self.aoh_sink_size,
+            self.aoh_recent_size,
             not self.server_args.disable_radix_cache,
             not self.server_args.disable_cuda_graph,
         )
+
+    def _validate_aoh_speculative_compatibility(self) -> None:
+        if self.spec_algorithm.is_none():
+            return
+        if not self.spec_algorithm.is_eagle():
+            raise ValueError(
+                "AoH speculative decoding currently supports the EAGLE/NEXTN "
+                "family only."
+            )
+        if self.server_args.speculative_eagle_topk != 1:
+            raise ValueError(
+                "AoH speculative decoding requires --speculative-eagle-topk 1 "
+                "because streaming KV uses a linear verification chain."
+            )
+
+    def _configure_aoh_window(self) -> None:
+        if self.aoh_sink_size <= 0 or self.aoh_recent_size <= 0:
+            raise ValueError("AoH sink and recent sizes must both be positive.")
+        raw_window = (self.aoh_sink_size, self.aoh_recent_size)
+        self.aoh_sink_size, self.aoh_recent_size = normalize_aoh_window(
+            *raw_window, self.model_config.context_len
+        )
+        if raw_window != (self.aoh_sink_size, self.aoh_recent_size):
+            logger.warning(
+                "AoH window %s exceeds the model context and was normalized to %s.",
+                raw_window,
+                (self.aoh_sink_size, self.aoh_recent_size),
+            )
+
+    def _get_aoh_full_attention_layer_ids(self) -> Optional[list[int]]:
+        # Hybrid-SWA configs publish an explicit full-attention subset. Models
+        # such as Qwen3.6 do not; their RadixAttention modules are the subset.
+        return getattr(self.model_config, "full_attention_layer_ids", None)
+
+    def _validate_aoh_mamba_cache_compatibility(self) -> None:
+        if (
+            self.server_args.uses_mamba_radix_cache
+            and self.page_size != 1
+            and not self.server_args.enable_mamba_extra_buffer()
+        ):
+            raise ValueError(
+                "AoH with a paged Mamba RadixCache requires "
+                "--mamba-radix-cache-strategy extra_buffer when --page-size is "
+                f"{self.page_size}. Remove the deprecated "
+                "--mamba-scheduler-strategy no_buffer."
+            )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
