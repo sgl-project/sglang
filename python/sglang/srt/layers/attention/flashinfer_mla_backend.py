@@ -64,9 +64,10 @@ if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._dynamo.config.suppress_errors = True
 
 if is_flashinfer_available():
-    from flashinfer import (
+    from flashinfer import BatchPrefillWithRaggedKVCacheWrapper
+    from flashinfer.mla import (
         BatchMLAPagedAttentionWrapper,
-        BatchPrefillWithRaggedKVCacheWrapper,
+        MLAPlanMetadata,
     )
 
 
@@ -390,6 +391,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
                 seq_lens_cpu=seq_lens_cpu,
+                in_capture=True,
             )
             if forward_mode.is_target_verify():
                 # use sync-free fast_mla_prefill_plan for replay
@@ -403,6 +405,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 forward_mode=forward_mode,
                 spec_info=spec_info,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
+                in_capture=False,
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -526,6 +529,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        in_capture: bool,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -578,9 +582,15 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 ],
                 use_ragged=False,
                 spec_info=spec_info,
-                qo_indptr_cpu=self.fast_plan_qo_indptr_cpu[: bs + 1],
-                kv_indptr_cpu=self.fast_plan_kv_indptr_cpu[: bs + 1],
-                kv_len_arr_cpu=self.fast_plan_kv_len_arr_cpu[:bs],
+                qo_indptr_cpu=(
+                    None if in_capture else self.fast_plan_qo_indptr_cpu[: bs + 1]
+                ),
+                kv_indptr_cpu=(
+                    None if in_capture else self.fast_plan_kv_indptr_cpu[: bs + 1]
+                ),
+                kv_len_arr_cpu=(
+                    None if in_capture else self.fast_plan_kv_len_arr_cpu[:bs]
+                ),
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
@@ -663,10 +673,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 )
             o = q.new_empty(q.shape)
             o = prefill_wrapper_paged.run(
-                q,
-                q_rope,
-                k_buf[:, :, : layer.v_head_dim],
-                k_buf[:, :, layer.v_head_dim :],
+                query=(q, q_rope),
+                kv_cache=k_buf,
                 out=o,
             )
 
@@ -722,10 +730,8 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         # for decode and dcp_world_size > 1, lse should be returned to compute final attn_out
         # Direct call to run without the wrapper
         o = decode_wrapper.run(
-            q_nope,
-            q_rope,
-            k_buffer[:, :, : layer.v_head_dim],
-            k_buffer[:, :, layer.v_head_dim :],
+            query=(q_nope, q_rope),
+            kv_cache=k_buffer,
             out=o,
             # for decode forward_batch, each dcp rank computes total q and partial kv, thus, we need to return_lse for online softmax to get final attn_output
             return_lse=(
@@ -824,7 +830,7 @@ class FlashInferMLAIndicesUpdaterDecode:
             # On the cuda-graph replay path `kv_indices` IS the capture-stable
             # buffer (fast_decode_kwargs["kv_indices"] == cuda_graph_kv_indices)
             # that the captured wrapper reads, and `fast_mla_decode_plan` ignores
-            # the kv_indices argument entirely -- rebinding the local name to a
+            # metadata.kv_indices entirely -- rebinding the local name to a
             # fresh tensor would leave the graph reading VIRTUAL ids. Only the
             # [:paged_kernel_lens_sum] prefix the index kernel just filled is
             # translated; the stale tail is left alone so it can never index the
@@ -849,33 +855,36 @@ class FlashInferMLAIndicesUpdaterDecode:
 
         if not init_metadata_replay:
             wrapper.plan(
-                q_indptr,
-                kv_indptr,
-                kv_indices,
-                kv_lens,
-                self.num_local_heads,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-                1,
-                False,
-                sm_scale,
-                self.data_type,
-                self.data_type,
+                metadata=MLAPlanMetadata.csr(q_indptr, kv_indptr, kv_indices, kv_lens),
+                num_heads=self.num_local_heads,
+                head_dim_ckv=self.kv_lora_rank,
+                head_dim_kpe=self.qk_rope_head_dim,
+                page_size=1,
+                causal=False,
+                sm_scale=sm_scale,
+                q_data_type=self.data_type,
+                kv_data_type=self.data_type,
+                query_layout="split",
+                kv_cache_layout="packed",
             )
         else:
             wrapper.plan(
-                fast_decode_kwargs["qo_indptr_cpu"],
-                fast_decode_kwargs["kv_indptr_cpu"],
-                kv_indices,
-                fast_decode_kwargs["kv_len_arr_cpu"],
-                self.num_local_heads,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-                1,
-                False,
-                sm_scale,
-                self.data_type,
-                self.data_type,
+                metadata=MLAPlanMetadata.csr(
+                    fast_decode_kwargs["qo_indptr_cpu"],
+                    fast_decode_kwargs["kv_indptr_cpu"],
+                    kv_indices,
+                    fast_decode_kwargs["kv_len_arr_cpu"],
+                ),
+                num_heads=self.num_local_heads,
+                head_dim_ckv=self.kv_lora_rank,
+                head_dim_kpe=self.qk_rope_head_dim,
+                page_size=1,
+                causal=False,
+                sm_scale=sm_scale,
+                q_data_type=self.data_type,
+                kv_data_type=self.data_type,
+                query_layout="split",
+                kv_cache_layout="packed",
             )
 
 
@@ -1037,18 +1046,22 @@ class FlashInferMLAIndicesUpdaterPrefill:
             )
 
             wrapper_paged.plan(
-                plan_qo_indptr,
-                plan_kv_indptr,
-                kv_indices,
-                plan_kv_len_arr,
-                self.num_local_heads,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-                1,
-                True,
-                sm_scale,
-                self.q_data_type,
-                self.data_type,
+                metadata=MLAPlanMetadata.csr(
+                    plan_qo_indptr,
+                    plan_kv_indptr,
+                    kv_indices,
+                    plan_kv_len_arr,
+                ),
+                num_heads=self.num_local_heads,
+                head_dim_ckv=self.kv_lora_rank,
+                head_dim_kpe=self.qk_rope_head_dim,
+                page_size=1,
+                causal=True,
+                sm_scale=sm_scale,
+                q_data_type=self.q_data_type,
+                kv_data_type=self.data_type,
+                query_layout="split",
+                kv_cache_layout="packed",
             )
 
 
@@ -1217,10 +1230,8 @@ class FlashInferMLAMultiStepDraftBackend:
 
 def fast_mla_decode_plan(
     self,
-    qo_indptr_cpu: torch.Tensor,
-    kv_indptr_cpu: torch.Tensor,
-    kv_indices: torch.Tensor,
-    kv_len_arr_cpu: torch.Tensor,
+    *,
+    metadata: MLAPlanMetadata,
     num_heads: int,
     head_dim_ckv: int,
     head_dim_kpe: int,
@@ -1229,11 +1240,22 @@ def fast_mla_decode_plan(
     sm_scale: float,
     q_data_type: torch.dtype,
     kv_data_type: torch.dtype,
+    query_layout: str = "packed",
+    kv_cache_layout: str = "packed",
 ) -> None:
     """A faster version of BatchMLAPagedAttentionWrapper::plan,
     for skipping the stream synchronization in original plan function during
     cuda graph replaying.
     """
+    del query_layout, kv_cache_layout
+    qo_indptr_cpu = metadata.qo_indptr
+    kv_indptr_cpu = metadata.kv_indptr
+    kv_len_arr_cpu = metadata.kv_len_arr
+    if qo_indptr_cpu is None or kv_indptr_cpu is None or kv_len_arr_cpu is None:
+        raise ValueError("fast MLA decode plan requires CSR metadata")
+
+    # The generated FA plan consumes CPU indptr/length metadata only. The
+    # capture-stable `metadata.kv_indices` remains owned by the wrapper run path.
     self._causal = causal
     self._page_size = page_size
     self._sm_scale = sm_scale
@@ -1257,10 +1279,8 @@ def fast_mla_decode_plan(
 
 def fast_mla_prefill_plan(
     self,
-    qo_indptr_cpu: torch.Tensor,
-    kv_indptr_cpu: torch.Tensor,
-    kv_indices: torch.Tensor,
-    kv_len_arr_cpu: torch.Tensor,
+    *,
+    metadata: MLAPlanMetadata,
     num_heads: int,
     head_dim_ckv: int,
     head_dim_kpe: int,
@@ -1269,6 +1289,8 @@ def fast_mla_prefill_plan(
     sm_scale: float,
     q_data_type: torch.dtype,
     kv_data_type: torch.dtype,
+    query_layout: str = "packed",
+    kv_cache_layout: str = "packed",
 ) -> None:
     """Sync-free BatchMLAPagedAttentionWrapper.plan for the target-verify CUDA
     graph replay. Like fast_mla_decode_plan it hands host-known qo/kv indptr +
@@ -1278,6 +1300,19 @@ def fast_mla_prefill_plan(
     the bound buffers here exactly as stock plan()'s use_cuda_graph branch does
     (host->device / device->device, non-blocking).
     """
+    del query_layout, kv_cache_layout
+    qo_indptr_cpu = metadata.qo_indptr
+    kv_indptr_cpu = metadata.kv_indptr
+    kv_indices = metadata.kv_indices
+    kv_len_arr_cpu = metadata.kv_len_arr
+    if (
+        qo_indptr_cpu is None
+        or kv_indptr_cpu is None
+        or kv_indices is None
+        or kv_len_arr_cpu is None
+    ):
+        raise ValueError("fast MLA prefill plan requires complete CSR metadata")
+
     self._causal = causal
     self._page_size = page_size
     self._sm_scale = sm_scale
