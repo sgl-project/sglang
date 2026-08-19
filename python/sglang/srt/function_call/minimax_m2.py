@@ -264,6 +264,15 @@ class MinimaxM2Detector(BaseFormatDetector):
 
             # We're in a tool call, try to parse function name if not sent yet
             if not self._function_name_sent:
+                end_pos = self._buf.find(self.tool_call_end_token)
+                next_function_pos = self._buf.find(self.tool_call_prefix)
+                if end_pos != -1 and (
+                    next_function_pos == -1 or end_pos < next_function_pos
+                ):
+                    self._buf = self._buf[end_pos + len(self.tool_call_end_token) :]
+                    self._reset_streaming_state(False)
+                    continue
+
                 # Look for function name pattern: <invoke name=name>
                 function_match = re.search(r"<invoke name=\"([^>]+)\">", self._buf)
                 if function_match:
