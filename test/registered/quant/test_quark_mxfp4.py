@@ -286,8 +286,6 @@ class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
 
     def test_gsm8k(self):
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 reference accuracy: ~0.948.
-        # MI355X: mean 0.916 over 10 runs (min 0.898, max 0.926), so 0.92 clears
-        # only about 1 run in 10.
         self._test_gsm8k(accuracy_threshold=0.89)
 
 
