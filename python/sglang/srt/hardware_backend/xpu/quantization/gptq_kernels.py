@@ -15,6 +15,7 @@ from sglang.srt.hardware_backend.xpu.quantization.int4pack_utils import (
     xpu_int4pack_mm,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -59,16 +60,18 @@ class GPTQXPULinearKernel:
             act_perm = torch.argsort(g_idx, stable=True).to(torch.int64)
             codes = codes[act_perm, :]
             sorted_g = g_idx[act_perm].to(torch.int64)
-            # Each contiguous gs-block must belong to a single group, otherwise
-            # this (typically row-parallel) shard splits a group across the K
-            # boundary and torch's contiguous-group mm cannot represent it.
             blocks = sorted_g.view(-1, group_size)
             if not torch.equal(blocks, blocks[:, :1].expand_as(blocks)):
-                raise ValueError(
-                    "GPTQ act_order on XPU requires every group_size block of "
-                    "input channels to map to a single group. This shard splits "
-                    "a group across the K (row-parallel) boundary, which the "
-                    "native XPU INT4 packed-mm path cannot represent."
+                tp_size = get_parallel().tp_size
+                tp_hint = (
+                    f" Got tp_size={tp_size}; please use --tp-size 1."
+                    if tp_size > 1
+                    else ""
+                )
+                raise NotImplementedError(
+                    "GPTQ act_order on XPU requires each group_size block of "
+                    "input channels to map to a single group, but this shard "
+                    "splits a group across the K boundary." + tp_hint
                 )
             # Reorder scales/zeros to follow the block group order.
             block_gid = blocks[:, 0]  # [num_blocks]

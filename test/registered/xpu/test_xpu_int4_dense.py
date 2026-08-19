@@ -4,11 +4,12 @@ import unittest
 
 import torch
 
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=20, suite="stage-a-test-1-gpu-xpu")
+register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 
 DEV = "xpu"
 
@@ -150,7 +151,7 @@ class TestXPUInt4DenseKernel(CustomTestCase):
                             ):
                                 self._run_gptq(m, k, n, gs, dtype, desc_act, fmt)
 
-    def _run_gptq(self, m, k, n, gs, dtype, desc_act, fmt):
+    def _run_gptq(self, m, k, n, gs, dtype, desc_act, fmt, tp_size=1):
         from sglang.srt.hardware_backend.xpu.quantization.gptq_kernels import (
             GPTQXPULinearKernel,
         )
@@ -181,13 +182,61 @@ class TestXPUInt4DenseKernel(CustomTestCase):
         layer.g_idx = torch.nn.Parameter(g_idx, requires_grad=False)
 
         kernel = GPTQXPULinearKernel(_gptq_config(gs, desc_act, fmt))
-        kernel.process_weights_after_loading(layer)
+        with get_parallel().override(tp_size=tp_size):
+            kernel.process_weights_after_loading(layer)
         out = kernel.apply(layer, x)
 
         self.assertEqual(tuple(out.shape), (m, n))
         self.assertTrue(torch.isfinite(out).all())
         rel = (out - ref).abs().max().item() / ref.abs().max().item()
         self.assertLess(rel, REL_TOL[dtype], f"rel={rel:.2e}")
+
+    def test_gptq_act_order_rejects_split_group_shard(self):
+        from sglang.srt.hardware_backend.xpu.quantization.gptq_kernels import (
+            GPTQXPULinearKernel,
+        )
+
+        k, n, gs = 128, 64, 32
+        # A row-parallel shard of a permuted K owns only part of every group, so
+        # after sorting each gs-block still straddles two groups.
+        g_idx = (torch.arange(2 * k, device=DEV) // gs)[0::2].to(torch.int32)
+
+        # Only g_idx matters here; the payload is never reached.
+        layer = _make_layer()
+        layer.qweight = torch.nn.Parameter(
+            torch.zeros(k // 8, n, dtype=torch.int32, device=DEV), requires_grad=False
+        )
+        layer.qzeros = torch.nn.Parameter(
+            torch.zeros(k // gs, n // 8, dtype=torch.int32, device=DEV),
+            requires_grad=False,
+        )
+        layer.scales = torch.nn.Parameter(
+            torch.ones(k // gs, n, device=DEV, dtype=torch.float16),
+            requires_grad=False,
+        )
+        layer.g_idx = torch.nn.Parameter(g_idx, requires_grad=False)
+        kernel = GPTQXPULinearKernel(_gptq_config(gs, True, ""))
+
+        # The limit is representability, not TP: tp_size only decides whether the
+        # actionable --tp-size hint is appended. The layer is safe to reuse
+        # because the check fires before any weight is replaced.
+        for tp_size, pattern in (
+            (1, r"K boundary\.$"),
+            (2, r"tp_size=2.*--tp-size 1"),
+        ):
+            with self.subTest(tp_size=tp_size):
+                with get_parallel().override(tp_size=tp_size):
+                    with self.assertRaisesRegex(NotImplementedError, pattern):
+                        kernel.process_weights_after_loading(layer)
+
+    def test_gptq_group_aligned_shard_allows_tensor_parallel(self):
+        # Whole-group shards stay representable, so TP is only rejected when a
+        # group is actually split (act_order) -- not for TP as such.
+        for dtype in (torch.float16, torch.bfloat16):
+            for desc_act in (False, True):
+                for k, n, gs in SHAPES:
+                    with self.subTest(dtype=dtype, desc_act=desc_act, K=k, N=n, gs=gs):
+                        self._run_gptq(8, k, n, gs, dtype, desc_act, "", tp_size=2)
 
 
 if __name__ == "__main__":
