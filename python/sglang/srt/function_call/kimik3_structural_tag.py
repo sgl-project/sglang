@@ -267,6 +267,85 @@ def _restrict_schema_type(
     return _with_root_definitions(result, root_schema)
 
 
+_PROPERTY_NAME_KEYWORDS = ("properties", "patternProperties", "dependentSchemas")
+# Definition pools are only reachable through a $ref, which the walk follows, so
+# scanning them directly would let an unreferenced definition speak for the whole
+# schema. Literal keywords hold values, not property names: a non-ASCII enum or
+# const compiles fine (only its \u-escaped spelling is refused, and models emit
+# raw UTF-8), so they are not a source of unsatisfiable grammars.
+_NON_PROPERTY_KEYWORDS = (
+    "$defs",
+    "definitions",
+    "const",
+    "enum",
+    "default",
+    "examples",
+)
+
+
+def _declares_non_ascii_property(
+    schema: Any,
+    root: Optional[Dict[str, Any]] = None,
+    depth: int = 0,
+    seen_refs: Optional[Set[str]] = None,
+) -> bool:
+    """Does this schema declare a property name xgrammar cannot express?
+
+    XGrammar builds a literal matcher for each declared property name and clamps
+    it to ASCII, so an object schema naming a non-ASCII property (an emoji or CJK
+    key) compiles to a grammar that rejects every instance -- a forced tool call
+    on it can only fail. Drop back to the bare type constraint for that argument
+    instead: an unconstrained object still admits the key, raw or escaped.
+
+    Only what this argument can actually reach counts. ``_restrict_schema_type``
+    copies the root ``$defs`` onto every argument, so walking them blindly would
+    strip the constraints off every argument of the tool because of one key in a
+    definition none of them reference.
+    """
+    if depth > 64 or not isinstance(schema, (dict, list)):
+        return False
+    if isinstance(schema, list):
+        return any(
+            _declares_non_ascii_property(item, root, depth + 1, seen_refs)
+            for item in schema
+        )
+    if root is None:
+        root = schema
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        seen_refs = set() if seen_refs is None else seen_refs
+        if ref not in seen_refs:
+            seen_refs.add(ref)
+            target = _resolve_local_ref(ref, root)
+            if target is not None and _declares_non_ascii_property(
+                target, root, depth + 1, seen_refs
+            ):
+                return True
+
+    for keyword in _PROPERTY_NAME_KEYWORDS:
+        names = schema.get(keyword)
+        if isinstance(names, dict) and any(not str(key).isascii() for key in names):
+            return True
+    required = schema.get("required")
+    if isinstance(required, list) and any(
+        isinstance(item, str) and not item.isascii() for item in required
+    ):
+        return True
+    dependent_required = schema.get("dependentRequired")
+    if isinstance(dependent_required, dict) and any(
+        not str(key).isascii()
+        or (isinstance(names, list) and any(not str(n).isascii() for n in names))
+        for key, names in dependent_required.items()
+    ):
+        return True
+    return any(
+        _declares_non_ascii_property(value, root, depth + 1, seen_refs)
+        for key, value in schema.items()
+        if key not in _NON_PROPERTY_KEYWORDS
+    )
+
+
 def _value_format(
     schema: Union[bool, Dict[str, Any]],
     json_type: str,
@@ -274,6 +353,8 @@ def _value_format(
 ) -> Format:
     if loose_string and json_type == "string":
         return AnyTextFormat()
+    if _declares_non_ascii_property(schema):
+        schema = {"type": json_type}
     # XGrammar 0.2.1 miscompiles a one-sided negative integer lower bound:
     # {"type": "integer", "minimum": -N} accepts the incomplete value "-"
     # and rejects every valid negative integer. Splitting the range at zero
