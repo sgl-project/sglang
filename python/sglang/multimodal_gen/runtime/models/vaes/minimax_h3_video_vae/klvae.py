@@ -501,6 +501,17 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         dec = self._assemble_tiles(rows, y_overlap, x_overlap)
         return dec
 
+    def enable_tiling(self) -> None:
+        """Turn on tiled decode for subsequent decodes.
+
+        `decoder_tiling` is read per decode in `_adaptive_decode`, so setting
+        it here takes effect on the next call. Models that already tile from
+        their VAE config (MiniMax-H3) are unaffected; this exists so the
+        runtime `--vae-tiling` switch reaches this VAE at all instead of
+        raising into the caller's guard.
+        """
+        self.decoder_tiling = True
+
     def _adaptive_encode(self, x):
         if self.encoder_tiling:
             return self.tiled_encode(x)
