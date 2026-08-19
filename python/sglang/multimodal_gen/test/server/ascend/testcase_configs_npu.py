@@ -200,7 +200,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
                 "seed": 1101,
             },
         ),
-        run_perf_check=False,
+        run_perf_check=True,
         run_consistency_check=False,
         run_component_accuracy_check=False,
         run_models_api_check=False,
