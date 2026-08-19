@@ -620,9 +620,16 @@ def suppress_stdout():
 
 class GenerationTimer:
     def __init__(self):
-        self.start_time = 0.0
-        self.end_time = 0.0
-        self.duration = 0.0
+        self.start_time: float | None = None
+        self.end_time: float | None = None
+
+    @property
+    def duration(self) -> float:
+        """Return elapsed time even while the timing context is still active."""
+        if self.start_time is None:
+            return 0.0
+        end_time = self.end_time if self.end_time is not None else time.perf_counter()
+        return end_time - self.start_time
 
 
 @contextmanager
@@ -645,7 +652,6 @@ def log_generation_timer(
     try:
         yield timer
         timer.end_time = time.perf_counter()
-        timer.duration = timer.end_time - timer.start_time
         logger.info(
             f"Pixel data generated successfully in {GREEN}%.2f{RESET} seconds",
             timer.duration,
