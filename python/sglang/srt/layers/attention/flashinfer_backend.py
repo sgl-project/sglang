@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
+from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
     create_flashinfer_kv_indices_triton,
@@ -281,6 +281,7 @@ def fast_prefill_plan(
         fixed_split_size if fixed_split_size is not None else -1,
         False,  # disable_split_kv
         0,  # num_colocated_ctas
+        0,  # uniform_q_len
     ]
     self._plan_info = self._cached_module.plan(*args)
 

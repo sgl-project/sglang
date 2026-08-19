@@ -72,7 +72,8 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
     def test_supported_multimodal_model_upgrades_default_to_tc_piecewise(self):
         args = ServerArgs(model_path="dummy")
         args.model_config = SimpleNamespace(
-            is_multimodal_piecewise_cuda_graph_supported=True
+            is_multimodal_piecewise_cuda_graph_supported=True,
+            is_multimodal_breakable_cuda_graph_supported=False,
         )
         args.cuda_graph_config = CudaGraphConfig(
             prefill=PhaseConfig(backend=Backend.BREAKABLE)

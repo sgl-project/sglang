@@ -53,6 +53,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     field_serializer,
     field_validator,
     model_serializer,
@@ -219,7 +220,10 @@ class JsonSchemaResponseFormat(BaseModel):
     description: Optional[str] = None
     # use alias to workaround pydantic conflict
     schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    strict: Optional[bool] = None
+    # The OpenAI wire contract accepts JSON booleans only; StrictBool rejects
+    # the values lax pydantic would coerce ("yes", "on", 0, 1, ...), matching
+    # OpenAI's 422 behavior. Omitted (None) keeps its meaning.
+    strict: Optional[StrictBool] = None
 
 
 class ResponseFormat(BaseModel):
@@ -348,6 +352,7 @@ class CompletionRequest(BaseModel):
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
+    return_spec_tokens_details: bool = False
     return_token_ids: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -386,7 +391,7 @@ class CompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
-    # Extra key for classifying the request (e.g. cache_salt)
+    # Extra key for caller-defined request classification
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
@@ -409,6 +414,20 @@ class CompletionRequest(BaseModel):
         return v
 
 
+class SpecTokensDetails(BaseModel):
+    """Per-request speculative decoding statistics."""
+
+    spec_accept_rate: float = 0.0
+    spec_accept_length: float = 0.0
+    spec_cap_length: float = 0.0
+    spec_block_accept_length: float = 0.0
+    spec_num_correct_drafts: int = 0
+    spec_num_proposed_drafts: int = 0
+    spec_verify_ct: int = 0
+    spec_correct_drafts_histogram: List[int] = Field(default_factory=list)
+    spec_cap_lens_histogram: List[int] = Field(default_factory=list)
+
+
 class SglExt(BaseModel):
     """SGLang extension fields for OpenAI-compatible responses.
 
@@ -418,6 +437,9 @@ class SglExt(BaseModel):
 
     routed_experts: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
+    spec_tokens_details: Optional[Union[SpecTokensDetails, List[SpecTokensDetails]]] = (
+        None
+    )
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -529,6 +551,14 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    content_hash: Optional[str] = None
+
+    @field_validator("content_hash")
+    @classmethod
+    def validate_content_hash(cls, value: Optional[str]) -> Optional[str]:
+        from sglang.srt.multimodal.cache import parse_content_hash
+
+        return parse_content_hash(value)
 
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
@@ -784,9 +814,11 @@ class ChatCompletionRequest(BaseModel):
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
+    return_spec_tokens_details: bool = False
     return_prompt_token_ids: bool = False
     return_token_ids: bool = False
     return_meta_info: bool = False
+    return_sampling_mask: bool = False
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
@@ -848,7 +880,7 @@ class ChatCompletionRequest(BaseModel):
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
-    # Extra key for classifying the request (e.g. cache_salt)
+    # Extra key for caller-defined request classification
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
@@ -1068,6 +1100,14 @@ class ChatCompletionRequest(BaseModel):
         )
 
         if tool_call_constraint and has_existing_constraints:
+            if self.tool_choice == "required" or isinstance(
+                self.tool_choice, ToolChoice
+            ):
+                raise ValueError(
+                    "tool_choice 'required' or a named tool cannot be combined with "
+                    "response_format, regex, or ebnf: the tool-call constraint and the "
+                    "output constraint cannot both be honored."
+                )
             logger.warning("Constrained decoding is not compatible with tool calls.")
         elif tool_call_constraint:
             constraint_type, constraint_value = tool_call_constraint
@@ -1104,7 +1144,7 @@ class ChatCompletionResponseChoice(BaseModel):
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
     prompt_token_ids: Optional[List[int]] = None
-    token_ids: Optional[List[int]] = None
+    response_token_ids: Optional[List[int]] = None
     meta_info: Optional[Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
@@ -1114,8 +1154,8 @@ class ChatCompletionResponseChoice(BaseModel):
             data.pop("hidden_states", None)
         if self.prompt_token_ids is None:
             data.pop("prompt_token_ids", None)
-        if self.token_ids is None:
-            data.pop("token_ids", None)
+        if self.response_token_ids is None:
+            data.pop("response_token_ids", None)
         if self.meta_info is None:
             data.pop("meta_info", None)
         return data
@@ -1536,7 +1576,7 @@ class ResponsesRequest(BaseModel):
     priority: int = Field(default=0, description="Request priority")
     extra_key: Optional[str] = Field(
         default=None,
-        description="Extra key for classifying the request (e.g. cache_salt)",
+        description="Extra key for caller-defined request classification",
     )
     cache_salt: Optional[str] = Field(
         default=None, description="Cache salt for request caching"

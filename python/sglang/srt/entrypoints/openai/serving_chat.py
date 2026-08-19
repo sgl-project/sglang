@@ -21,6 +21,18 @@ class ThinkingMode(str, Enum):
 import jinja2
 import orjson
 from fastapi import Request
+
+try:
+    from mistral_common.exceptions import MistralCommonException
+
+    _MISTRAL_COMMON_ERRORS: tuple[type[BaseException], ...] = (MistralCommonException,)
+except ImportError:
+    _MISTRAL_COMMON_ERRORS = ()
+
+_CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
+    jinja2.TemplateError,
+    TypeError,
+) + _MISTRAL_COMMON_ERRORS
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
@@ -58,9 +70,12 @@ from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_for_response,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
+    process_spec_tokens_details_from_ret,
     should_include_usage,
+    spec_tokens_details_from_meta_info,
     to_openai_style_logprobs,
 )
+from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -816,6 +831,9 @@ class OpenAIServingChat(OpenAIServingBase):
         if not request.messages:
             return "Messages cannot be empty."
 
+        if request.return_sampling_mask and not request.return_meta_info:
+            return "return_sampling_mask requires return_meta_info=true."
+
         media_error = self._validate_media_content(request)
         if media_error:
             return media_error
@@ -1004,6 +1022,7 @@ class OpenAIServingChat(OpenAIServingBase):
             return_logprob=request.logprobs,
             logprob_start_len=-1,
             top_logprobs_num=request.top_logprobs or 0,
+            return_sampling_mask=request.return_sampling_mask,
             stream=request.stream,
             return_text_in_logprobs=True,
             modalities=processed_messages.modalities,
@@ -1018,7 +1037,8 @@ class OpenAIServingChat(OpenAIServingBase):
             routed_experts_start_len=request.routed_experts_start_len,
             rid=request.rid,
             session_id=request.session_id,
-            extra_key=self._compute_extra_key(request),
+            extra_key=request.extra_key,
+            cache_salt=request.cache_salt,
             require_reasoning=processed_messages.require_reasoning,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
@@ -1032,6 +1052,11 @@ class OpenAIServingChat(OpenAIServingBase):
             return_prompt_token_ids=request.return_prompt_token_ids
             or request.return_token_ids,
         )
+        if (
+            raw_request is not None
+            and envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get()
+        ):
+            apply_header_overrides(adapted_request, raw_request.headers)
 
         return adapted_request, request
 
@@ -1354,7 +1379,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     prompt_ids = self.tokenizer_manager.tokenizer.encode(
                         rendered_prompt, **encode_kwargs
                     )
-                except (jinja2.TemplateError, TypeError) as template_error:
+                except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)
                     # should be treated as client errors (400 BadRequest)
@@ -1504,6 +1529,7 @@ class OpenAIServingChat(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
+        spec_tokens_details = {}
         image_tokens = {}
         audio_tokens = {}
         video_tokens = {}
@@ -1535,6 +1561,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
+                if request.return_spec_tokens_details:
+                    spec_tokens_details[index] = spec_tokens_details_from_meta_info(
+                        content["meta_info"]
+                    )
                 image_tokens[index] = content["meta_info"].get("image_tokens", 0)
                 audio_tokens[index] = content["meta_info"].get("audio_tokens", 0)
                 video_tokens[index] = content["meta_info"].get("video_tokens", 0)
@@ -1655,15 +1685,36 @@ class OpenAIServingChat(OpenAIServingBase):
                     (v for v in routed_experts.values() if v is not None), None
                 )
 
-            sglext_details = None
+            sglext_cached_tokens_details = None
             if request.return_cached_tokens_details and cached_tokens_details:
                 first_details = next(
                     (v for v in cached_tokens_details.values() if v is not None), None
                 )
                 if first_details is not None:
-                    sglext_details = cached_tokens_details_from_dict(first_details)
+                    sglext_cached_tokens_details = cached_tokens_details_from_dict(
+                        first_details
+                    )
 
-            if sglext_routed is not None or sglext_details is not None:
+            sglext_spec_tokens_details = None
+            if request.return_spec_tokens_details and spec_tokens_details:
+                spec_details = [
+                    spec_tokens_details[index]
+                    for index in sorted(spec_tokens_details)
+                    if spec_tokens_details[index] is not None
+                ]
+                if spec_details:
+                    sglext_spec_tokens_details = (
+                        spec_details if request.n > 1 else spec_details[0]
+                    )
+
+            if any(
+                obj is not None
+                for obj in [
+                    sglext_routed,
+                    sglext_cached_tokens_details,
+                    sglext_spec_tokens_details,
+                ]
+            ):
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
@@ -1671,7 +1722,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     sglext=SglExt(
                         routed_experts=sglext_routed,
-                        cached_tokens_details=sglext_details,
+                        cached_tokens_details=sglext_cached_tokens_details,
+                        spec_tokens_details=sglext_spec_tokens_details,
                     ),
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
@@ -1771,11 +1823,24 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        spec_details = [
+            detail
+            for detail in (
+                process_spec_tokens_details_from_ret(item, request) for item in ret
+            )
+            if detail is not None
+        ]
+        spec_tokens_details = (
+            spec_details
+            if request.n > 1
+            else (spec_details[0] if spec_details else None)
+        )
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or spec_tokens_details:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                spec_tokens_details=spec_tokens_details,
             )
 
         for idx, ret_item in enumerate(ret):
@@ -1866,7 +1931,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
                 hidden_states=hidden_states,
                 prompt_token_ids=choice_prompt_token_ids,
-                token_ids=choice_token_ids,
+                response_token_ids=choice_token_ids,
                 meta_info=choice_meta_info,
             )
             choices.append(choice_data)
@@ -1996,15 +2061,25 @@ class OpenAIServingChat(OpenAIServingBase):
             parser = FunctionCallParser(
                 tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
             )
-            should_try_parser = (
-                not is_required
-                or parser.detector.supports_structural_tag()
+            detector_owns_format = (
+                parser.detector.supports_structural_tag()
                 or parser.detector.parses_required_natively()
             )
+            should_try_parser = not is_required or detector_owns_format
             if should_try_parser and parser.has_tool_call(text):
                 try:
                     text, call_info_list = parser.parse_non_stream(text)
                     if not call_info_list:
+                        logger.warning(
+                            "Tool call marker present but no complete call parsed "
+                            "from %s output; dropping the incomplete call",
+                            self.tool_call_parser,
+                        )
+                        logger.debug(
+                            "Unparsed tool call output (%d chars): %r",
+                            len(text),
+                            text[:2000],
+                        )
                         return ToolCallProcessingResult(None, text, finish_reason)
 
                     tool_calls = []
@@ -2030,6 +2105,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     logger.error(f"Tool call parsing error: {e}")
                     return ToolCallProcessingResult(None, text, finish_reason)
 
+            if is_required and detector_owns_format:
+                logger.warning(
+                    "Required tool call missing from %s output (%d chars)",
+                    self.tool_call_parser,
+                    len(text),
+                )
+                logger.debug("Unparsed required tool call output: %r", text[:2000])
+                return ToolCallProcessingResult(None, text, finish_reason)
+
         # json_schema constraint → JSON array output for required/named
         if is_required:
             original_finish_type = finish_reason["type"]
@@ -2038,12 +2122,28 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason["matched"] = None
             try:
                 tool_call_data = orjson.loads(text)
+                if isinstance(tool_call_data, dict):
+                    tool_call_data = [tool_call_data]
+                if not isinstance(tool_call_data, list):
+                    raise ValueError(
+                        "expected a JSON array of tool calls, got "
+                        f"{type(tool_call_data).__name__}"
+                    )
+                if not all(
+                    isinstance(tool, dict) and "name" in tool for tool in tool_call_data
+                ):
+                    raise ValueError(
+                        "every tool call must be a JSON object with a 'name'"
+                    )
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
+                    parameters = json.dumps(
+                        tool.get("parameters", {}), ensure_ascii=False
+                    )
                     call_info = ToolCallItem(
                         tool_index=i,
                         name=tool["name"],
-                        parameters=json.dumps(tool["parameters"], ensure_ascii=False),
+                        parameters=parameters,
                     )
                     tool_id = self._process_tool_call_id(
                         call_info, history_tool_calls_cnt
@@ -2054,15 +2154,14 @@ class OpenAIServingChat(OpenAIServingBase):
                             index=i,
                             function=FunctionResponse(
                                 name=tool["name"],
-                                arguments=json.dumps(
-                                    tool["parameters"], ensure_ascii=False
-                                ),
+                                arguments=parameters,
                             ),
                         )
                     )
                 return ToolCallProcessingResult(tool_calls, "", finish_reason)
             except Exception as e:
                 logger.error(f"Tool call parsing error: {e}")
+                logger.debug("Unparsed required tool call output: %r", text[:2000])
                 finish_reason["type"] = original_finish_type
                 return ToolCallProcessingResult(None, text, finish_reason)
 
