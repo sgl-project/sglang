@@ -346,7 +346,8 @@ struct AllReducePullImpl {
   static_assert(kWorldSize <= kMaxWorldSize);
 
   template <bool kFence, uint32_t kRounds = 2>
-  static SGL_DEVICE uint32_t sync_enter_pull(const AllReduceParams<kWorldSize>& params) {
+  static SGL_DEVICE uint32_t sync_enter_pull(
+      const AllReduceParams<kWorldSize>& params, uint32_t* s_counter_out = nullptr) {
     uint32_t current_counter_val = 0;
     if (const auto tx = threadIdx.x; tx < kWorldSize) {
       device::PDLWaitPrimary<kUsePDL>();
@@ -355,6 +356,7 @@ struct AllReducePullImpl {
       const auto counter = semaphore->counter_ptr();
       const auto current = tx == params.rank ? counter->inc(kRounds * kWorldSize) : 0;
       current_counter_val = current;
+      if (s_counter_out != nullptr && tx == params.rank) *s_counter_out = current;
       if constexpr (kFence) {
         semaphore->put_release();
       } else {
@@ -490,19 +492,6 @@ struct AllReducePullImpl {
     const auto rem_vecs = total_num_vecs % kWorldSize;
     const auto local_vec_bias = avg_vecs * params.rank + min(params.rank, rem_vecs);
     const auto local_num_vecs = avg_vecs + (params.rank < rem_vecs ? 1 : 0);
-    __shared__ uint32_t s_phase;
-    device::PDLWaitPrimary<kUsePDL>();
-    if (threadIdx.x == 0) {
-      const auto semaphore = &params.pull_semaphores[params.rank][blockIdx.x];
-      s_phase = (semaphore->counter_ptr()->get() / kWorldSize) % 2;
-    }
-    __syncthreads();
-
-    uint8_t* gather[kWorldSize];
-#pragma unroll
-    for (uint32_t i = 0; i < kWorldSize; ++i) {
-      gather[i] = params.gather_workspaces[i] + s_phase * params.gather_phase_stride;
-    }
     void* data[kWorldSize];
     if constexpr (kMode == PullMode::Graph) {
 #pragma unroll
@@ -516,7 +505,15 @@ struct AllReducePullImpl {
       }
     }
 
-    sync_enter_pull<false, 1>(params);
+    __shared__ uint32_t s_counter;
+    sync_enter_pull<false, 1>(params, &s_counter);
+    const auto phase = (s_counter / kWorldSize) % 2;
+
+    uint8_t* gather[kWorldSize];
+#pragma unroll
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      gather[i] = params.gather_workspaces[i] + phase * params.gather_phase_stride;
+    }
 
     const auto num_threads = blockDim.x * gridDim.x;
     const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
