@@ -438,31 +438,23 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
 
-        # Activate the forget gate and beta in FP32 before entering the
-        # recurrent kernel to match the checkpoint's verify contract.
-        # This stays in the Ascend backend so shared/GPU model code is unchanged.
-        preactivated_a = fused_kda_gate_npu(
-            dense_a.flatten(-2),
-            layer.A_log,
-            layer.head_k_dim,
-            gate_bias=layer.dt_bias,
-            lower_bound=layer.lower_bound,
-        )
-        preactivated_b = dense_b.float().sigmoid()
+        # Keep raw gates until the recurrent kernel. This preserves the K3 FP32
+        # safe-gate contract while avoiding two per-layer activation launches.
         out = kda_target_verify_npu(
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             q=q,
             k=k,
             v=v,
-            a=preactivated_a,
-            b=preactivated_b,
+            a=dense_a,
+            b=dense_b,
             initial_state_source=cache.temporal,
             initial_state_indices=cache_indices[:batch_size],
             intermediate_states_buffer=intermediate_state,
             intermediate_state_indices=intermediate_indices,
             cache_steps=draft_token_num,
-            gates_are_preactivated=True,
+            gates_are_preactivated=False,
+            lower_bound=layer.lower_bound,
         )
         if dense_token_indices is None:
             return out
