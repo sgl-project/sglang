@@ -870,6 +870,7 @@ class Envs:
     SGLANG_NPU_FUSED_RMS_QUANT = EnvBool(False)
     SGLANG_NPU_FUSED_KDA_VERIFY_GATES = EnvBool(False)
     SGLANG_NPU_FUSED_KDA_RAGGED_IO = EnvBool(False)
+    SGLANG_NPU_FUSED_KDA_ONORM = EnvBool(False)
     SGLANG_NPU_REUSE_KDA_VERIFY_METADATA = EnvBool(False)
     SGLANG_NPU_QUANT_SHARED_AG = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.

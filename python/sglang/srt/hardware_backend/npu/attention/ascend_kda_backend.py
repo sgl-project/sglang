@@ -11,6 +11,7 @@ from sgl_kernel_npu.fla.kda_prefill import (
     recompute_w_u_fwd_npu,
 )
 from sgl_kernel_npu.fla.kda_ragged import (
+    gather_kda_verify_output_norm_npu,
     gather_kda_verify_output_npu,
     scatter_kda_verify_inputs_npu,
 )
@@ -544,6 +545,21 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         if dense_token_indices is None:
             return out
         if envs.SGLANG_NPU_FUSED_KDA_RAGGED_IO.get():
+            onorm_runtime = getattr(layer, "_k3_onorm_runtime", None)
+            if (
+                envs.SGLANG_NPU_FUSED_KDA_ONORM.get()
+                and onorm_runtime is not None
+            ):
+                onorm_gate, onorm_weight, onorm_eps = onorm_runtime
+                out = gather_kda_verify_output_norm_npu(
+                    out,
+                    dense_token_indices,
+                    onorm_gate,
+                    onorm_weight,
+                    eps=onorm_eps,
+                )
+                layer._k3_onorm_consumed = True
+                return out
             return gather_kda_verify_output_npu(out, dense_token_indices)
         padded_out = out.new_zeros(1, num_dense_tokens + 1, *out.shape[2:])
         padded_out[:, :num_dense_tokens] = out
