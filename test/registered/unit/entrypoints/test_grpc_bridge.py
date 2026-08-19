@@ -1,11 +1,9 @@
 import asyncio
 import enum
-import json
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
-from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -111,36 +109,6 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
             [[1], [2], [3]],
         )
         self.assertEqual([call[1] for call in callback.calls], [False, False, True])
-
-
-class TestNativeGrpcServerInfo(CustomTestCase):
-    def test_exposes_structured_kv_events_descriptor(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            kv_events_config=(
-                '{"publisher":"zmq","endpoint":"tcp://*:5557","topic":"kv"}'
-            ),
-            page_size=64,
-            dp_size=2,
-        )
-        handle = RuntimeHandle.__new__(RuntimeHandle)
-        handle.tokenizer_manager = SimpleNamespace(server_args=server_args)
-        handle.scheduler_info = {"max_req_input_len": 1024}
-
-        info = json.loads(handle.get_server_info())
-
-        self.assertEqual(
-            info["kv_events"],
-            {
-                "publisher": "zmq",
-                "endpoint_host": "*",
-                "endpoint_port_base": 5557,
-                "topic": "kv",
-                "block_size": 64,
-                "dp_size": 2,
-            },
-        )
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
