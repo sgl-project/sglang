@@ -4,6 +4,7 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -56,7 +57,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 need_sort,
             )
         else:
-            if _is_npu:
+            # A platform-provided paged allocator class wins here too, so
+            # out-of-tree platforms are not silently bypassed inside the SWA
+            # composite. The _is_npu branch moves into NpuSRTPlatform once
+            # it lands.
+            platform_allocator_cls = current_platform.get_paged_allocator_cls()
+            if platform_allocator_cls is not None:
+                PagedTokenToKVPoolAllocatorClass = platform_allocator_cls
+            elif _is_npu:
                 PagedTokenToKVPoolAllocatorClass = NPUPagedTokenToKVPoolAllocator
             else:
                 PagedTokenToKVPoolAllocatorClass = PagedTokenToKVPoolAllocator

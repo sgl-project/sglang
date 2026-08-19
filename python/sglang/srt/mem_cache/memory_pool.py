@@ -79,7 +79,6 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
     is_cuda,
-    is_float4_e2m1fn_x2,
     is_hip,
     is_npu,
     next_power_of_2,
@@ -3620,34 +3619,20 @@ class HybridLinearKVPool(KVCache):
         self._full_translate = lambda ids: ids
         self.use_mla = use_mla
         if full_kv_pool is not None:
-            # Shared-KV-pool path: the caller built a UnifiedMHATokenToKVPool
-            # aliasing the shared byte buffer.
+            # Pre-built full-attention pool: the unified-memory path's
+            # UnifiedMHATokenToKVPool aliasing the shared byte buffer, or a
+            # platform-provided pool (NPU / out-of-tree) resolved by
+            # KVCacheConfigurator._build_platform_hybrid_full_kv_pool.
             self.full_kv_pool = full_kv_pool
         elif not use_mla:
-            TokenToKVPoolClass = MHATokenToKVPool
-            quant_method_kwarg = {"quant_method": quant_method}
-
-            if current_platform.is_out_of_tree():
-                TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
-                quant_method_kwarg = {}
-            elif _is_npu:
-                assert not is_float4_e2m1fn_x2(
-                    dtype
-                ), "FP4 is not supported on NPU yet."
-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                    NPUMHATokenToKVPool,
-                )
-
-                TokenToKVPoolClass = NPUMHATokenToKVPool
-                quant_method_kwarg = {}
-            elif full_kv_pool_class is not None:
-                # Caller-selected MHA layout variant (e.g. the page-major
-                # PageMajorMHATokenToKVPool). NPU / out-of-tree classes keep
-                # priority since they don't understand alternate layouts.
-                TokenToKVPoolClass = full_kv_pool_class
-            else:
-                TokenToKVPoolClass = MHATokenToKVPool
-
+            # In-tree default; ``full_kv_pool_class`` carries the
+            # caller-selected layout variant (e.g. the page-major
+            # PageMajorMHATokenToKVPool).
+            TokenToKVPoolClass = (
+                full_kv_pool_class
+                if full_kv_pool_class is not None
+                else MHATokenToKVPool
+            )
             post_capture_kwargs = (
                 {"post_capture_active": True} if post_capture_active else {}
             )
@@ -3661,22 +3646,11 @@ class HybridLinearKVPool(KVCache):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 enable_kv_cache_copy=enable_kv_cache_copy,
-                **quant_method_kwarg,
+                quant_method=quant_method,
                 **post_capture_kwargs,
             )
         else:
-            TokenToKVPoolClass = MLATokenToKVPool
-
-            if current_platform.is_out_of_tree():
-                TokenToKVPoolClass = current_platform.get_mla_kv_pool_cls()
-            elif _is_npu:
-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                    NPUMLATokenToKVPool,
-                )
-
-                TokenToKVPoolClass = NPUMLATokenToKVPool
-
-            self.full_kv_pool = TokenToKVPoolClass(
+            self.full_kv_pool = MLATokenToKVPool(
                 size=size,
                 page_size=self.page_size,
                 dtype=dtype,
