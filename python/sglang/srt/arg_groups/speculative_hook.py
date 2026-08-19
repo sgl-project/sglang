@@ -191,7 +191,7 @@ def _validate_dcp_spec(server_args: ServerArgs) -> None:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     algo = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
-    if not (algo.is_eagle() or algo.is_dflash()):
+    if not (algo.is_eagle() or algo.is_standalone() or algo.is_dflash()):
         return
 
     topk = getattr(server_args, "speculative_eagle_topk", None)

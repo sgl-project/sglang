@@ -1,8 +1,8 @@
 """CPU unit test for the DCP x speculative-decoding tree-drafting guard.
 
-``_validate_dcp_spec`` rejects ``--speculative-eagle-topk > 1`` under ``--dcp-size > 1``
-for chain-draft algorithms (EAGLE/EAGLE3/DFLASH). DSPARK ships with DCP and must not
-be gated.
+The DCP verify path folds draft tokens as a linear causal chain, so EAGLE /
+EAGLE3 / STANDALONE / DFLASH require topk == 1. DSPARK is not gated: it never
+resolves speculative_eagle_topk and already ships with DCP.
 """
 
 import unittest
@@ -34,12 +34,12 @@ class TestDCPSpecTopkGuard(CustomTestCase):
         self.assertIn("chain speculative drafts", str(ctx.exception))
 
     def test_rejects_tree_draft_under_dcp(self):
-        for algo in ("EAGLE", "EAGLE3"):
+        for algo in ("EAGLE", "EAGLE3", "STANDALONE"):
             with self.subTest(algo=algo):
                 self._assert_rejected(algo)
 
     def test_allows_chain_draft_under_dcp(self):
-        for algo in ("EAGLE", "EAGLE3", "DFLASH"):
+        for algo in ("EAGLE", "EAGLE3", "STANDALONE", "DFLASH"):
             for topk in (None, 1):
                 with self.subTest(algo=algo, topk=topk):
                     self._validate(algo, topk, dcp_size=8)
