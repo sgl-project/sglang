@@ -37,14 +37,10 @@ from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
+# Detect the target hardware defensively: a non-ROCm / non-gfx95 (or otherwise
+# broken) environment simply skips this test.
 try:
-    from sglang.srt.layers.linear import ColumnParallelLinear
-    from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
-    from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import (
-        QuarkW8A8Fp8,
-    )
     from sglang.srt.models.deepseek_common.utils import (
-        _is_per_channel_dynamic_fp8,
         _use_aiter,
         _use_aiter_bpreshuffle_gfx95,
     )
@@ -54,6 +50,18 @@ try:
     )
 except Exception:
     _HAS_PATH = False
+
+# On the gfx95 runner (where this coverage is required) the Quark/linear imports
+# are NOT guarded: an API move or an incompatible pinned Quark/AITER build must
+# fail loudly here rather than silently degrade into a green skip and lose MI35x
+# layer-routing coverage.
+if _HAS_PATH:
+    from sglang.srt.layers.linear import ColumnParallelLinear
+    from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+    from sglang.srt.layers.quantization.quark.schemes.quark_w8a8_fp8 import (
+        QuarkW8A8Fp8,
+    )
+    from sglang.srt.models.deepseek_common.utils import _is_per_channel_dynamic_fp8
 
 # (input, output) widths for the two ColumnParallelLinear attn projections.
 _PROJ_WIDTHS = {"q_b": (1536, 12288), "kv_b": (512, 16384)}
