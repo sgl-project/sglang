@@ -29,7 +29,13 @@ concurrency:
 jobs:
   publish:
     if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish')
-    runs-on: linux-mi300-1gpu-sglang
+    # TEST-ONLY (branch bingxche/rocm715-fullflow): main builds this on
+    # linux-mi300-1gpu-sglang, which is the GPU test pool; a dispatch sat queued
+    # there for 30+ minutes behind PR jobs. Every other release-docker-amd-*
+    # workflow builds on amd-docker-scale, which needs no GPU and is where the
+    # rocm720/rocm724/rocm10 staging images are built today. Restore the
+    # linux-mi300-1gpu-sglang line before merging anything from this branch.
+    runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
       fail-fast: false
