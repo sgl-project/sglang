@@ -74,6 +74,24 @@ def select_dcp_attn_sink(
     return attn_sink[head_start:head_end].contiguous()
 
 
+def select_dsv4_attn_sink_input(
+    global_attn_sink: torch.Tensor,
+    local_attn_sink: torch.Tensor,
+    local_num_heads: int,
+    dcp_size: int,
+) -> torch.Tensor:
+    if dcp_size < 1:
+        raise ValueError(f"Invalid DCP size: {dcp_size}")
+    if dcp_size == 1:
+        if local_num_heads > local_attn_sink.numel():
+            raise ValueError(
+                f"Local sink has {local_attn_sink.numel()} heads, "
+                f"need {local_num_heads}"
+            )
+        return local_attn_sink[:local_num_heads].contiguous()
+    return global_attn_sink
+
+
 def localize_full_indices(
     global_indices: torch.Tensor,
     dcp_size: int,

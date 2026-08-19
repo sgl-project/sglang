@@ -52,6 +52,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
+from sglang.srt.layers.attention.dsv4.dcp import select_dsv4_attn_sink_input
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
@@ -1610,14 +1611,20 @@ class MQALayer(MqaAttentionBase):
         )
 
         if is_unified_kv_triton():
+            attn_q = q_out if q_out is not None else q
             o = attn_backend.forward(
-                q=q_out if q_out is not None else q,
+                q=attn_q,
                 k=attn_k,
                 v=attn_k,
                 layer=self.attn_mqa,
                 forward_batch=forward_batch,
                 compress_ratio=self.compress_ratio,
-                attn_sink=self.attn_sink,
+                attn_sink=select_dsv4_attn_sink_input(
+                    self.attn_sink,
+                    attn_sink,
+                    attn_q.shape[1],
+                    attn_backend.dsv4_dcp_size,
+                ),
                 save_kv_cache=kv is not None,
             )
         else:
