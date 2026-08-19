@@ -256,9 +256,9 @@ class TargetVerifyExecutor:
             if seq_lens_cpu_backup is not None:
                 batch.seq_lens_cpu = seq_lens_cpu_backup + verify_w
                 batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-            elif draft_input.reserved_seq_lens_cpu is not None:
-                batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-                batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+            elif draft_input.nxt_kv_lens_cpu is not None:
+                batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+                batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
         result = self._forward_prepared_verify(
             batch=batch,
