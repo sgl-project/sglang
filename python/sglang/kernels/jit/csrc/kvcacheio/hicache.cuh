@@ -3,6 +3,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 
@@ -319,10 +320,11 @@ struct HiCacheKernel {
     RuntimeCheck(kElementSize == element_bytes, "HicacheKernel: cache dimension mismatch.");
 
     const auto device = indices_device.unwrap();
-    const auto k_cache_dst_ptr = device_accessible_ptr(k_cache_dst, device);
-    const auto v_cache_dst_ptr = device_accessible_ptr(v_cache_dst, device);
-    const auto k_cache_src_ptr = device_accessible_ptr(k_cache_src, device);
-    const auto v_cache_src_ptr = device_accessible_ptr(v_cache_src, device);
+    runtime::DeviceGuard device_guard(device.device_id);
+    const auto k_cache_dst_ptr = runtime::device_accessible_ptr(k_cache_dst);
+    const auto v_cache_dst_ptr = runtime::device_accessible_ptr(v_cache_dst);
+    const auto k_cache_src_ptr = runtime::device_accessible_ptr(k_cache_src);
+    const auto v_cache_src_ptr = runtime::device_accessible_ptr(v_cache_src);
     const auto indices_dst_ptr = indices_dst.data_ptr();
     const auto indices_src_ptr = indices_src.data_ptr();
     const auto length = static_cast<uint32_t>(L.unwrap());
@@ -441,8 +443,9 @@ struct HiCacheKernel {
     RuntimeCheck(kElementSize == element_bytes, "HicacheKernel MLA: cache dimension mismatch.");
 
     const auto device = indices_device.unwrap();
-    const auto cache_dst_ptr = device_accessible_ptr(cache_dst, device);
-    const auto cache_src_ptr = device_accessible_ptr(cache_src, device);
+    runtime::DeviceGuard device_guard(device.device_id);
+    const auto cache_dst_ptr = runtime::device_accessible_ptr(cache_dst);
+    const auto cache_src_ptr = runtime::device_accessible_ptr(cache_src);
     const auto indices_dst_ptr = indices_dst.data_ptr();
     const auto indices_src_ptr = indices_src.data_ptr();
     const auto length = static_cast<uint32_t>(L.unwrap());
