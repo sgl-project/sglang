@@ -886,7 +886,27 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        if self.paged_mqa_logits_backend.is_torch():
+        if self.paged_mqa_logits_backend.is_triton():
+            if not forward_batch.forward_mode.is_decode_or_idle():
+                raise RuntimeError(
+                    "The SM80 Triton DSA paged-MQA backend currently supports "
+                    "only ordinary eager decode. Target verify and draft extend "
+                    "v2 are not supported yet; select "
+                    "--dsa-paged-mqa-logits-backend torch for those modes."
+                )
+            from sglang.kernels.ops.attention.dsa.triton_paged_mqa_logits_sm80 import (
+                triton_paged_mqa_logits,
+            )
+
+            logits = triton_paged_mqa_logits(
+                q_fp8[:q_offset],
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32,
+                block_tables[:q_offset],
+                max_seq_len,
+            )
+        elif self.paged_mqa_logits_backend.is_torch():
             logits = torch_paged_mqa_logits(
                 q_fp8[:q_offset],
                 kv_cache_fp8,

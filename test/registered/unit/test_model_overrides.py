@@ -1289,6 +1289,34 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     {},
                 )
 
+            with patch.object(
+                overrides_module, "get_device_capability", return_value=(8, 0)
+            ):
+                self.assertEqual(
+                    _apply_torch_dsa_constraints(
+                        _view(
+                            dsa_prefill_backend="flashmla_sparse",
+                            dsa_decode_backend="fa3",
+                            dsa_paged_mqa_logits_backend="triton",
+                        ),
+                        {},
+                    ),
+                    {"disable_overlap_schedule": True},
+                )
+
+            with patch.object(
+                overrides_module, "get_device_capability", return_value=(9, 0)
+            ):
+                with self.assertRaisesRegex(ValueError, "requires NVIDIA SM80"):
+                    _apply_torch_dsa_constraints(
+                        _view(
+                            dsa_prefill_backend="flashmla_sparse",
+                            dsa_decode_backend="fa3",
+                            dsa_paged_mqa_logits_backend="triton",
+                        ),
+                        {},
+                    )
+
             with (
                 patch.object(overrides_module, "is_sm80_supported", return_value=True),
                 envs.SGLANG_OPT_USE_TOPK_V2.override(True),

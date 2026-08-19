@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from sglang.srt.utils import is_hip, is_sm100_supported
+from sglang.srt.utils import get_device_capability, is_hip, is_sm100_supported
 
 
 class DSAPagedMQALogitsBackend(Enum):
@@ -10,6 +10,7 @@ class DSAPagedMQALogitsBackend(Enum):
     CUTEDSL = "cutedsl"
     AITER = "aiter"
     TORCH = "torch"
+    TRITON = "triton"
 
     def is_deepgemm(self) -> bool:
         return self == DSAPagedMQALogitsBackend.DEEPGEMM
@@ -22,6 +23,9 @@ class DSAPagedMQALogitsBackend(Enum):
 
     def is_torch(self) -> bool:
         return self == DSAPagedMQALogitsBackend.TORCH
+
+    def is_triton(self) -> bool:
+        return self == DSAPagedMQALogitsBackend.TRITON
 
     def uses_deepgemm_metadata(self) -> bool:
         return self in (
@@ -41,6 +45,20 @@ class DSAPagedMQALogitsBackend(Enum):
 
         if value == "torch":
             return DSAPagedMQALogitsBackend.TORCH
+        if value == "triton":
+            capability = get_device_capability()
+            if capability != (8, 0):
+                capability_text = (
+                    "unavailable"
+                    if capability == (None, None)
+                    else f"{capability[0]}.{capability[1]}"
+                )
+                raise ValueError(
+                    "dsa_paged_mqa_logits_backend='triton' currently requires "
+                    "NVIDIA SM80 (compute capability 8.0); got "
+                    f"{capability_text}."
+                )
+            return DSAPagedMQALogitsBackend.TRITON
         if value == "auto" or value == "deepgemm":
             return DSAPagedMQALogitsBackend.DEEPGEMM
         if value == "aiter":

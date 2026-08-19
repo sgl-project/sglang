@@ -367,6 +367,7 @@ DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = [
     "deepgemm",
     "cutedsl",
     "torch",
+    "triton",
     "aiter",
 ]
 
@@ -1819,7 +1820,7 @@ class ServerArgs:
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(
-            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'torch' (explicit correctness fallback; eager mode only), 'aiter' (ROCm only).",
+            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'torch' (explicit correctness fallback; eager mode only), 'triton' (explicit NVIDIA SM80 kernel; ordinary eager decode only), 'aiter' (ROCm only).",
             choices=DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES,
         ),
         NS("exec.kernel"),

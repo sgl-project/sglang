@@ -1664,23 +1664,34 @@ def _check_tilelang_dsa_fp8_kv(
 
 
 def _apply_torch_dsa_constraints(view: Any, declared: Dict[str, Any]) -> Dict[str, Any]:
-    """Validate first-version Torch DSA constraints during argument resolution."""
+    """Validate first-version Torch/SM80 Triton DSA constraints."""
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+    paged_mqa = getattr(view, "dsa_paged_mqa_logits_backend", "auto")
     uses_torch = "torch" in {
         prefill,
         decode,
-        getattr(view, "dsa_paged_mqa_logits_backend", "auto"),
+        paged_mqa,
     }
-    if not uses_torch:
+    uses_triton_sm80 = paged_mqa == "triton"
+    if not uses_torch and not uses_triton_sm80:
         return declared
 
     if is_hip():
-        raise ValueError("The torch DSA backends are currently CUDA-only.")
+        raise ValueError(
+            "The torch and SM80 Triton DSA backends are currently CUDA-only."
+        )
+    if uses_triton_sm80 and get_device_capability() != (8, 0):
+        capability = get_device_capability()
+        raise ValueError(
+            "The Triton DSA paged-MQA backend currently requires NVIDIA SM80 "
+            "(compute capability 8.0); got "
+            f"{capability[0]}.{capability[1]}."
+        )
     if view.kv_cache_dtype != "bfloat16":
         raise ValueError(
-            "The torch DSA backends currently require "
+            "The torch and SM80 Triton DSA backends currently require "
             "--kv-cache-dtype bfloat16; got "
             f"kv_cache_dtype={view.kv_cache_dtype!r}."
         )
@@ -1691,14 +1702,15 @@ def _apply_torch_dsa_constraints(view: Any, declared: Dict[str, Any]) -> Dict[st
         or graph_config.prefill.backend != Backend.DISABLED
     ):
         raise ValueError(
-            "The torch DSA backends do not support CUDA Graph yet. Use "
+            "The torch and SM80 Triton DSA backends do not support CUDA Graph yet. Use "
             "--disable-cuda-graph (or set both prefill and decode CUDA Graph "
             "backends to 'disabled')."
         )
 
     if not view.disable_overlap_schedule:
         logger.warning(
-            "Disabling overlap scheduling because a torch DSA backend was selected."
+            "Disabling overlap scheduling because a torch or SM80 Triton DSA "
+            "backend was selected."
         )
         declared["disable_overlap_schedule"] = True
 
@@ -1707,7 +1719,7 @@ def _apply_torch_dsa_constraints(view: Any, declared: Dict[str, Any]) -> Dict[st
         # compile for SM80. The explicit Torch DSA configuration must therefore
         # keep the compatible legacy SGL top-k transform selected as well.
         logger.warning(
-            "Disabling SGLANG_OPT_USE_TOPK_V2 for the SM80 torch DSA fallback."
+            "Disabling SGLANG_OPT_USE_TOPK_V2 for the SM80 Torch/Triton DSA path."
         )
         envs.SGLANG_OPT_USE_TOPK_V2.set(False)
     return declared
