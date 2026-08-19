@@ -2,10 +2,13 @@
 
 import pytest
 import torch
-
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
+
 from sglang.kernels.ops.kimi_k3 import mla_q_cache_aiter_hip
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=60, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _available() -> bool:
@@ -39,17 +42,13 @@ def _inputs(tokens: int, cache_dtype=torch.bfloat16, output_dtype=None):
     k_nope = torch.randn(
         tokens, 1, 512, device="cuda", dtype=torch.bfloat16
     ).contiguous()
-    k_pe = torch.randn(
-        tokens, 1, 64, device="cuda", dtype=torch.bfloat16
-    ).contiguous()
+    k_pe = torch.randn(tokens, 1, 64, device="cuda", dtype=torch.bfloat16).contiguous()
     return {
         "q_nope": q_nope,
         "q_pe": q_pe,
         "k_nope": k_nope,
         "k_pe": k_pe,
-        "kv_cache": torch.zeros(
-            tokens + 4, 1, 576, device="cuda", dtype=cache_dtype
-        ),
+        "kv_cache": torch.zeros(tokens + 4, 1, 576, device="cuda", dtype=cache_dtype),
         "slot_mapping": torch.arange(tokens, device="cuda", dtype=torch.int64),
         "positions": torch.arange(tokens, device="cuda", dtype=torch.int64),
         "k_scale": torch.ones(1, device="cuda", dtype=torch.float32),
@@ -68,9 +67,7 @@ def _inputs(tokens: int, cache_dtype=torch.bfloat16, output_dtype=None):
 
 def _reference(values):
     return (
-        torch.cat((values["q_nope"], values["q_pe"]), dim=-1).to(
-            values["out"].dtype
-        ),
+        torch.cat((values["q_nope"], values["q_pe"]), dim=-1).to(values["out"].dtype),
         torch.cat((values["k_nope"], values["k_pe"]), dim=-1).to(
             values["kv_cache"].dtype
         ),
@@ -92,9 +89,7 @@ def test_fused_mla_q_cache_identity_rope(tokens, cache_dtype, output_dtype):
     actual = mla_q_cache_aiter_hip.run(**values)
     torch.cuda.synchronize()
     assert actual is values["out"]
-    torch.testing.assert_close(
-        actual.float(), expected_q.float(), atol=0.02, rtol=0.02
-    )
+    torch.testing.assert_close(actual.float(), expected_q.float(), atol=0.02, rtol=0.02)
     torch.testing.assert_close(
         values["kv_cache"][:tokens].float(),
         expected_k.float(),
@@ -142,3 +137,9 @@ def test_fused_mla_q_cache_support_is_narrow():
     assert mla_q_cache_aiter_hip.covered(**values)
     values["positions"] = values["positions"].to(torch.int32)
     assert not mla_q_cache_aiter_hip.covered(**values)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

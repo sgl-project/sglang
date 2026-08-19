@@ -1869,7 +1869,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             alt_stream=alt_stream,
         )
         self._k3_mla_q_cache_fusion = (
-            envs.SGLANG_K3_AITER_MLA_Q_CACHE_FUSION.get()
+            _is_hip and envs.SGLANG_K3_AITER_MLA_Q_CACHE_FUSION.get()
         )
         if self._k3_mla_q_cache_fusion:
             self.register_buffer(
