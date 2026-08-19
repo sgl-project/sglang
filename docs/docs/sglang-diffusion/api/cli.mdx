@@ -77,6 +77,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--model-path {MODEL}`: model path or Hugging Face model ID
 - `--served-model-name {NAME}`: stable model name exposed by serving APIs. Defaults to `--model-id` when set, otherwise `--model-path`.
 - `--model-variant {NAME}`: semantic checkpoint variant to load when one model repository contains multiple weight partitions. The pipeline maps this stable name to the repository layout before loading; for example, MiniMax-H3 accepts `fl2va` and `ref2va`. This is a server/load-time choice, unlike a request's `task`.
+- `--minimax-h3-adaln-cache-path {FILE}`: advanced MiniMax-H3-only inference cache. It replaces the checkpoint's AdaLN projection weights with precomputed outputs and only accepts requests whose exact FP32 timestep plan is included in the cache. It requires unquantized weights and the matching model variant.
 - `--model-subfolder {PATH}`: advanced direct override for a component subfolder inside the model repository. Prefer `--model-variant` when the pipeline exposes semantic routing. If both are supplied, they must resolve to the same weight partition.
 - `--lora-path {PATH}` and `--lora-nickname {NAME}`: load a LoRA adapter
 - `--lora-weight-name {FILE}`: select one adapter file from a repository that contains multiple LoRA revisions. The Hub download is filtered to that file plus JSON metadata, so unused weights are not downloaded.
@@ -91,7 +92,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--ulysses-degree {N}` and `--ring-degree {N}`: USP parallelism controls
 - `--kv-gather-degree {N}`: sequence-parallel degree that splits rows inside attention and exchanges with one K/V all-gather (queries stay local) instead of Ulysses all-to-all. Non-causal attention only; does not compose with `--ulysses-degree`/`--ring-degree` yet. When no SP degree is set explicitly, `sp_degree=2` defaults to `kv_gather_degree=2` (its measured-win zone) and higher degrees default to Ulysses; under that auto assignment, attention calls the gather path cannot take fall back to the Ulysses exchange, while an explicit degree fails instead of degrading.
 - `--enable-cfg-parallel {true|false}`: enable or explicitly disable CFG parallelism
-- `--encoder-parallel {auto|fold|dp|replicate}`: how the text/image encoders use the GPUs the DiT replica leaves idle during encoding. `auto` (the default for both `generate` and `serve`) TP-folds an encoder wide enough to pay for the per-layer all-reduce, selects DP for a server batch when it can engage, and otherwise replicates; `fold` forces the shard whenever the dims allow it; `dp` splits a batched encode across ranks and needs `--batching-max-size > 1` to engage; `replicate` encodes redundantly on every rank. `fold` and `replicate` are bitwise-identical to single-GPU encoding. See [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel).
+- `--encoder-parallel {auto|fold|dp|replicate}`: how text/image encoders use the GPUs in each DiT replica. `auto` TP-folds an encoder wide enough to benefit, selects batch DP when it can engage, and otherwise keeps the existing encoder TP layout; `fold` shards across the full replica whenever dimensions allow; `dp` splits a batched encode across encoder copies and composes with encoder TP; `replicate` disables folding and batch DP. Encoder collectives never cross `--dp-size` replicas. See [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel).
 - `--warmup-mode {off|request|server}`: control startup warmup for `sglang serve`; `off` skips warmup, `request` primes the request path, and `server` runs a full synthetic server warmup before serving traffic
 - `--enable-torch-compile {true|false}`: compile native diffusion hot paths. When no warmup mode is configured, this also enables server warmup so first real requests do not pay compile latency.
 - `--offload-during-compile {true|false}`: when compile warmup is active, temporarily layerwise-offload DiT weights and move resident non-DiT components off-device so `max-autotune` fits on tighter-memory GPUs; the configured serving residency is restored before real traffic. Skipped under existing layerwise offload, Cache-DiT, or FSDP.
@@ -127,6 +128,12 @@ For quantized transformer checkpoints, prefer:
 - `--transformer-weights-path` for a quantized safetensors file, directory, or repo
 - `--quantization` for online quantization (apply quantization to unquantized models at load time, activations are quantized dynamically)
 - `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
+
+Component checkpoint paths are selected separately, so changing DiT precision
+never silently changes prompt embeddings. For a native text encoder:
+
+- `--component-paths.text_encoder {MODEL}` replaces the text-encoder checkpoint; `--text-encoder-path {MODEL}` is its shorter alias
+- Quantization metadata is auto-detected from that checkpoint. Each native encoder must explicitly support the serialized format; this is not blanket quantization support for every component, and unsupported combinations fail before weight loading.
 
 For supported realtime causal video models, `--kv-cache-quant {off|int4|int2}`
 compresses completed KV-cache chunks independently of transformer weight
@@ -199,33 +206,44 @@ For supported native pipelines, set `SGLANG_CACHE_DIT_ENABLED=true` to enable Ca
 
 For supported image pipelines, breakable CUDA graph can be enabled with `--enable-breakable-cuda-graph`, but you must declare every served resolution in `--warmup-resolutions` so warmup captures matching graph signatures.
 
-### Component CPU Offload
+### Component Residency
 
-Use `--cpu-offload-components` to explicitly select components for coarse CPU offload:
+Use `--component-residency COMPONENT=MODE` to assign one runtime residency mode to each native pipeline component:
 
 ```bash Command
 sglang generate \
   --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
-  --cpu-offload-components dit text_encoder \
+  --component-residency all=resident text_encoder=layerwise-offload vae=component-offload \
   --prompt "A quiet city street after rain"
 ```
 
-Component names are matched against the loaded pipeline's component keys from `model_index.json`, so names such as `transformer_2`, `audio_vae`, and `connectors` are supported without adding them to a registry. The group aliases `dit`, `text_encoder`, `image_encoder`, and `vae` remain available. Use `all` to offload every loaded `torch.nn.Module`, or `none` to disable coarse component CPU offload. Non-module components such as tokenizers and schedulers are unaffected. This unified option cannot be combined with the legacy per-component CPU offload flags. Layerwise offload remains independently controlled by `--layerwise-offload-components`.
+The available modes are:
 
-### Layerwise Offload
+- `resident`: keep the complete component on the accelerator.
+- `component-offload`: keep the complete component on CPU between uses, moving it to the accelerator before each declared use and back to CPU afterward.
+- `layerwise-offload`: keep component weights on CPU and stream its declared layers during execution.
 
-Use layerwise offload when a large component does not fit comfortably in GPU memory. By default, `--dit-layerwise-offload` only applies to legacy DiT components. Use `--layerwise-offload-components` to select pipeline component names explicitly (`--layerwise-offload-modules` is accepted as an alias):
+Selectors match exact loaded component keys from `model_index.json`, including names such as `transformer_2`, `audio_vae`, and `connectors`. The group selectors `dit`, `text_encoder`, `image_encoder`, and `vae` are also available, together with `all`. An exact key overrides a matching group, and a group overrides `all`. Components without a matching canonical selector retain their explicit legacy setting or automatic/model default.
+
+The existing `--dit-cpu-offload`, `--text-encoder-cpu-offload`, `--image-encoder-cpu-offload`, `--vae-cpu-offload`, and `--cpu-offload-components` options remain supported. New and legacy options may be mixed: `--component-residency` wins only for components it matches, while unmatched legacy settings remain effective. Legacy layerwise selectors take precedence over legacy component-offload selectors for the same component. Explicit `--dit-layerwise-offload false` makes the DiT resident unless another explicit DiT selector, such as `--dit-cpu-offload true` or `--component-residency dit=component-offload`, selects a different mode.
+
+Layerwise selection is strict. A native weighted component selected for `layerwise-offload` must declare its layer structure; otherwise startup fails with the unsupported component name instead of silently changing modes. FSDP applies only to resident components. The Diffusers backend supports only pipeline-wide `all=resident` and `all=component-offload`.
+
+### Layerwise Offload Tuning
+
+Use layerwise offload when a component does not fit comfortably in GPU memory. The compatibility options `--dit-layerwise-offload` and `--layerwise-offload-components` remain available (`--layerwise-offload-modules` is an alias), while new deployments can select the mode directly:
 
 ```bash Command
 sglang generate \
   --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --dit-layerwise-offload \
-  --layerwise-offload-components transformer text_encoder \
+  --component-residency transformer=layerwise-offload text_encoder=layerwise-offload \
   --dit-offload-prefetch-size 0 \
   --prompt "A quiet city street after rain"
 ```
 
-The values must match keys in the selected pipeline's `pipeline.modules`, such as `transformer`, `text_encoder`, `image_encoder`, `vae`, `condition_image_encoder`, `spatial_upsampler`, or `vocoder`. Use `all` to select every layerwise-offloadable component. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency.
+Values passed to the compatibility option `--layerwise-offload-components` must match loaded component keys, such as `transformer`, `text_encoder`, `image_encoder`, `vae`, `condition_image_encoder`, `spatial_upsampler`, or `vocoder`. Its `default` group selects text encoders, image encoders, and VAEs. Use `all` to select every layerwise-offloadable component.
+
+Layerwise tuning options such as `--dit-offload-prefetch-size`, `--dit-layerwise-resident-layers`, and `--dit-layerwise-residency-policy` continue to control the streamed layer working set. Prefer the smallest component set that solves the memory issue because layerwise offload can increase latency.
 
 ## Serve
 

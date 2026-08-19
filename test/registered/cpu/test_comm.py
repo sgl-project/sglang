@@ -5,6 +5,7 @@ import traceback
 import unittest
 from multiprocessing import Process
 
+import sgl_kernel  # noqa: F401
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
