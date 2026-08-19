@@ -132,7 +132,6 @@ class _RouteViewKind(str, Enum):
     """Stand-in for routing.RouteViewKind: these tests stub that module."""
 
     RAW = "raw"
-    FUSED_IDS = "fused_ids"
     ALIGNED = "aligned"
 
 
@@ -145,7 +144,6 @@ class _HostRouteView(msgspec.Struct, frozen=True, kw_only=True):
     lora_experts_per_adapter: int
     max_loras: int
     shared_outer_local_expert_count: int | None = None
-    maybe_virtual_topk_ids: torch.Tensor | None = None
     maybe_sorted_pair_ids: torch.Tensor | None = None
     maybe_block_virtual_expert_ids: torch.Tensor | None = None
     maybe_num_pairs_post_padded: torch.Tensor | None = None
@@ -336,7 +334,6 @@ def _route(
     lora_experts_per_adapter: int = 2,
     max_loras: int = 2,
     shared_outer_local_expert_count: int | None = None,
-    virtual_topk_ids: torch.Tensor | None = None,
 ) -> _HostRouteView:
     return _HostRouteView(
         view="aligned",
@@ -347,7 +344,6 @@ def _route(
         lora_experts_per_adapter=lora_experts_per_adapter,
         max_loras=max_loras,
         shared_outer_local_expert_count=shared_outer_local_expert_count,
-        maybe_virtual_topk_ids=virtual_topk_ids,
         maybe_sorted_pair_ids=torch.arange(2, dtype=torch.int32),
         maybe_block_virtual_expert_ids=torch.arange(1, dtype=torch.int32),
         maybe_num_pairs_post_padded=padded_count,

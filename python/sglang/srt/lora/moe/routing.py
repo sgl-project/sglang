@@ -31,15 +31,9 @@ sections 7.1 and 29 R1).  Three views exist:
     Nothing is materialized.  An indexed schedule derives ``(adapter, factor)``
     per pair inline from ``topk_ids`` and ``token_lora_mapping``; building a plan it
     never reads is pure cost.
-``fused_ids``
-    ``virtual_topk_ids`` only.  For a consumer that wants the fused key without
-    the sort-and-pad plan.  Builder-level: no ``RouteRequirement`` names it, so
-    an execution plan cannot request it and ``build_routes`` never returns one;
-    ask ``build_virtual_expert_routing`` directly.
 ``aligned``
-    The block plan, for grouped GEMMs. NOTE: not a superset of ``fused_ids`` —
-    when the config selects the fused kernel, the key array is never
-    materialized and ``virtual_topk_ids`` raises; consumers of the plan read
+    The block plan, for grouped GEMMs. The JIT arm materializes the key array
+    on its way there; the fused arm never does, and consumers of either read
     only the ``[T, K]`` shape off ``topk_ids``.
 
 Which view wins is a property of the CONSUMING kernel, not of routing, so this
@@ -106,14 +100,12 @@ class RouteViewKind(str, Enum):
     parallel tuple has to be kept in step with them.
 
     NOT interchangeable with ``RouteRequirement``: that one crosses these with
-    factor ownership (``aligned_per_expert`` vs ``aligned_shared_outer``), has
-    no member for ``FUSED_IDS`` because no plan requests it as a product, and
+    factor ownership (``aligned_per_expert`` vs ``aligned_shared_outer``) and
     lives in the pydantic plan layer -- which the Triton modules comparing
     views here must not import.
     """
 
     RAW = "raw"
-    FUSED_IDS = "fused_ids"
     ALIGNED = "aligned"
 
 
@@ -148,9 +140,6 @@ class RouteView(msgspec.Struct, frozen=True, kw_only=True):
     # slot 0 with NO map tensor; None everywhere else. Mutually exclusive
     # with the LoRA expert map.
     shared_outer_local_expert_count: int | None = None
-    # Present for `fused_ids`; for `aligned` only when the JIT path built it
-    # (the fused kernel derives keys inline and never materializes this).
-    maybe_virtual_topk_ids: torch.Tensor | None = None
     # Present only for `aligned`.
     maybe_sorted_pair_ids: torch.Tensor | None = None
     maybe_block_virtual_expert_ids: torch.Tensor | None = None
@@ -163,12 +152,6 @@ class RouteView(msgspec.Struct, frozen=True, kw_only=True):
                 f"consumer must request view {needed.value!r} or derive it inline"
             )
         return value
-
-    @property
-    def virtual_topk_ids(self) -> torch.Tensor:
-        return self._require(
-            self.maybe_virtual_topk_ids, "virtual_topk_ids", RouteViewKind.FUSED_IDS
-        )
 
     @property
     def sorted_pair_ids(self) -> torch.Tensor:
@@ -332,19 +315,6 @@ def _routing_capacity(
     return triton.cdiv(triton.cdiv(upper_bound, block_size) * block_size, 4) * 4
 
 
-def _align_virtual_topk_ids(
-    virtual_topk_ids: torch.Tensor,
-    block_size: int,
-    num_virtual_experts: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # Reaching here means the aligned view did NOT dispatch to the fused
-    # builder, i.e. V < FUSED_ALIGN_MIN_VIRTUAL_EXPERTS, which is identically
-    # V <= _JIT_ALIGN_MAX_VIRTUAL_EXPERTS since the two are adjacent. Past that
-    # ceiling the caller holding the SOURCE tensors routes to
-    # fused_align.fused_align_block_size instead; this signature cannot.
-    return _align_block_size_jit(virtual_topk_ids, block_size, num_virtual_experts)
-
-
 def build_virtual_expert_routing(
     topk_ids: torch.Tensor,
     token_lora_mapping: torch.Tensor,
@@ -448,15 +418,14 @@ def build_virtual_expert_routing(
         max_loras,
         shared_outer_local_expert_count=shared_outer_local_expert_count,
     )
-    if view is RouteViewKind.FUSED_IDS:
-        return RouteView(**common, maybe_virtual_topk_ids=virtual_topk_ids)
-
+    # Reaching here means the aligned view did NOT dispatch to the fused
+    # builder, i.e. V < FUSED_ALIGN_MIN_VIRTUAL_EXPERTS, which is identically
+    # V <= _JIT_ALIGN_MAX_VIRTUAL_EXPERTS since the two are adjacent.
     sorted_pair_ids, block_virtual_expert_ids, num_pairs_post_padded = (
-        _align_virtual_topk_ids(virtual_topk_ids, block_size, num_virtual)
+        _align_block_size_jit(virtual_topk_ids, block_size, num_virtual)
     )
     return RouteView(
         **common,
-        maybe_virtual_topk_ids=virtual_topk_ids,
         maybe_sorted_pair_ids=sorted_pair_ids,
         maybe_block_virtual_expert_ids=block_virtual_expert_ids,
         maybe_num_pairs_post_padded=num_pairs_post_padded,

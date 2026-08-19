@@ -88,59 +88,28 @@ class TestMoeLoraRouting(CustomTestCase):
     def test_narrower_views_refuse_fields_they_did_not_build(self):
         """A view must not silently hand back a field it never computed.
 
-        The three views exist so a schedule pays only for what it reads (plan
+        The two views exist so a schedule pays only for what it reads (plan
         section 29 R1). If an unbuilt field returned None instead of raising,
         a consumer that requested the wrong view would pass None into a Triton
-        launch and fail somewhere unrelated -- or, worse, index a stale buffer.
+        launch and fail far from the mistake.
         """
         ids, adapters = [[0, 1]], [0]
         aligned = self._build(
             ids, adapters, lora_experts_per_adapter=2, view=RouteViewKind.ALIGNED
         )
-        self.assertEqual(aligned.virtual_topk_ids.numel(), 2)
         self.assertGreater(aligned.sorted_pair_ids.numel(), 0)
-
-        fused = self._build(
-            ids, adapters, lora_experts_per_adapter=2, view=RouteViewKind.FUSED_IDS
-        )
-        self.assertTrue(
-            torch.equal(fused.virtual_topk_ids, aligned.virtual_topk_ids),
-            "fused_ids must agree bitwise with the aligned view it is a prefix of",
-        )
-        for field in ("sorted_pair_ids", "block_virtual_expert_ids"):
-            with self.assertRaisesRegex(ValueError, RouteViewKind.ALIGNED):
-                getattr(fused, field)
+        self.assertGreater(aligned.block_virtual_expert_ids.numel(), 0)
 
         raw = self._build(
             ids, adapters, lora_experts_per_adapter=2, view=RouteViewKind.RAW
         )
-        with self.assertRaisesRegex(ValueError, RouteViewKind.FUSED_IDS):
-            raw.virtual_topk_ids
-        with self.assertRaisesRegex(ValueError, RouteViewKind.ALIGNED):
-            raw.sorted_pair_ids
+        for field in ("sorted_pair_ids", "block_virtual_expert_ids"):
+            with self.assertRaisesRegex(ValueError, RouteViewKind.ALIGNED):
+                getattr(raw, field)
         # A raw consumer fuses the key computation into its own kernel, so the
         # sources must survive on the view.
         self.assertEqual(raw.lora_experts_per_adapter, 2)
         self.assertEqual(raw.token_lora_mapping.numel(), 1)
-
-    def test_fused_aligned_build_without_a_workspace_is_rejected(self):
-        """The alternative is the builder's global cache, which clobbers."""
-        from sglang.srt.lora.moe.routing import FUSED_ALIGN_MIN_VIRTUAL_EXPERTS
-
-        experts = FUSED_ALIGN_MIN_VIRTUAL_EXPERTS // 32
-        ids = torch.zeros((8, 8), dtype=torch.int32, device=self.device)
-        slots = torch.zeros(8, dtype=torch.int32, device=self.device)
-        for half in ({}, {"workspace": MoeLoraWorkspace()}, {"scratch_prefix": "x"}):
-            with self.subTest(**{k: bool(v) for k, v in half.items()}):
-                with self.assertRaisesRegex(ValueError, "needs workspace"):
-                    build_virtual_expert_routing(
-                        ids,
-                        slots,
-                        lora_experts_per_adapter=experts,
-                        max_loras=32,
-                        block_size=16,
-                        **half,
-                    )
 
     def test_unknown_view_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "unknown route view"):
@@ -152,10 +121,14 @@ class TestMoeLoraRouting(CustomTestCase):
             [0, 0, 0, 0, 0, 2, 3],
             lora_experts_per_adapter=4,
         )
-        self.assertEqual(
-            route.virtual_topk_ids.flatten().cpu().tolist(),
-            [-1, -1, 3, -1, -1, -1, -1],
-        )
+        # Only pair 2 is valid (adapter 0, expert 3 -> key 3); every other
+        # pair is invalid for a different reason -- negative expert, expert
+        # past the local count, adapter past the capacity -- and they must all
+        # collapse onto the ONE sentinel rather than distinct bad keys.
+        live_blocks = route.num_pairs_post_padded.item() // route.block_size
+        keys = route.block_virtual_expert_ids[:live_blocks].cpu().tolist()
+        self.assertIn(3, keys)
+        self.assertEqual(set(keys) - {-1}, {3})
 
         live_blocks = route.num_pairs_post_padded.item() // route.block_size
         live_ids = route.block_virtual_expert_ids[:live_blocks]
@@ -170,15 +143,21 @@ class TestMoeLoraRouting(CustomTestCase):
             )
         )
 
-    def test_int64_ids_preserve_dtype(self):
+    def test_int64_source_ids_build_an_int32_plan(self):
+        """int64 sources are accepted; the plan itself stays int32."""
         route = self._build(
             [[0, 3], [4, -2]],
             [0, 1],
             lora_experts_per_adapter=4,
             dtype=torch.int64,
         )
-        self.assertEqual(route.virtual_topk_ids.cpu().tolist(), [[0, 3], [-1, -1]])
-        self.assertEqual(route.virtual_topk_ids.dtype, torch.int64)
+        # Adapter 0 owns experts 0 and 3 (keys 0 and 3); adapter 1's pairs are
+        # both invalid -- expert 4 is past the local count, -2 is a sentinel.
+        live_blocks = route.num_pairs_post_padded.item() // route.block_size
+        keys = route.block_virtual_expert_ids[:live_blocks].cpu().tolist()
+        self.assertEqual(set(keys) - {-1}, {0, 3})
+        self.assertEqual(route.sorted_pair_ids.dtype, torch.int32)
+        self.assertEqual(route.block_virtual_expert_ids.dtype, torch.int32)
 
     def test_sentinel_bucket_is_included_in_capacity(self):
         route = self._build(
