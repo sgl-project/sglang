@@ -446,38 +446,6 @@ class DiffusionServerBase:
         summary = validator.collect_metrics(perf_record)
         self._print_performance_log(case, summary, scenario)
 
-        expected_load_peak_vram_mb = BASELINE_CONFIG.load_peak_vram_mb.get(case.id)
-        expected_runtime_peak_vram_mb = BASELINE_CONFIG.runtime_peak_vram_mb.get(
-            case.id
-        )
-        has_peak_vram_baselines = bool(
-            BASELINE_CONFIG.load_peak_vram_mb or BASELINE_CONFIG.runtime_peak_vram_mb
-        )
-        if (
-            current_platform.is_cuda()
-            and not is_baseline_generation_mode
-            and has_peak_vram_baselines
-        ):
-            if (
-                expected_load_peak_vram_mb is None
-                or expected_runtime_peak_vram_mb is None
-            ):
-                self._dump_baseline_for_testcase(case, summary, missing_scenario)
-                pytest.fail(
-                    f"Testcase '{case.id}' is missing a load/runtime peak VRAM "
-                    f"baseline in {get_perf_baseline_path()}"
-                )
-            try:
-                validator.validate_peak_vram(
-                    summary,
-                    expected_load_peak_vram_mb,
-                    expected_runtime_peak_vram_mb,
-                )
-            except AssertionError as e:
-                logger.error(f"Peak VRAM validation failed for {case.id}:\n{e}")
-                self._dump_baseline_for_testcase(case, summary, missing_scenario)
-                raise
-
         if case.run_perf_check:
             if is_baseline_generation_mode:
                 _PENDING_BASELINE_DUMPS[case.id] = (summary, missing_scenario)
@@ -490,6 +458,33 @@ class DiffusionServerBase:
                         f"Testcase '{case.id}' not found in {get_perf_baseline_path()}"
                     )
                 return
+
+            if current_platform.is_cuda():
+                expected_load_peak_vram_mb = BASELINE_CONFIG.load_peak_vram_mb.get(
+                    case.id
+                )
+                expected_runtime_peak_vram_mb = (
+                    BASELINE_CONFIG.runtime_peak_vram_mb.get(case.id)
+                )
+                if (
+                    expected_load_peak_vram_mb is None
+                    or expected_runtime_peak_vram_mb is None
+                ):
+                    self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                    pytest.fail(
+                        f"Testcase '{case.id}' is missing a load/runtime peak VRAM "
+                        f"baseline in {get_perf_baseline_path()}"
+                    )
+                try:
+                    validator.validate_peak_vram(
+                        summary,
+                        expected_load_peak_vram_mb,
+                        expected_runtime_peak_vram_mb,
+                    )
+                except AssertionError as e:
+                    logger.error(f"Peak VRAM validation failed for {case.id}:\n{e}")
+                    self._dump_baseline_for_testcase(case, summary, missing_scenario)
+                    raise
 
             # only run performance validation if run_perf_check is True
             try:

@@ -128,5 +128,19 @@
             "expected_median_denoise_ms": 2200.8,
             "estimated_full_test_time_s": 90.0
         }
+    },
+    "load_peak_vram_mb": {
+        "flux_2_klein_base_image_t2i": 1126.0,
+        "flux_image_t2i_layerwise_cpu_offload_5090": 15178.0,
+        "turbo_wan2_1_t2v_1.3b": 4934.0,
+        "wan2_1_t2v_1.3b": 4934.0,
+        "zimage_image_t2i": 13120.0
+    },
+    "runtime_peak_vram_mb": {
+        "flux_2_klein_base_image_t2i": 13180.0,
+        "flux_image_t2i_layerwise_cpu_offload_5090": 25340.0,
+        "turbo_wan2_1_t2v_1.3b": 18222.0,
+        "wan2_1_t2v_1.3b": 18246.0,
+        "zimage_image_t2i": 17776.0
     }
 }
