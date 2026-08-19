@@ -99,7 +99,9 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             "select the non-overlap (synchronous) path."
         )
 
-    kwargs = _draft_config_kwargs(server_args)
+    kwargs = {}
+    if server_args.speculative_draft_model_path:
+        kwargs = _draft_config_kwargs(server_args)
 
     server_args.speculative_algorithm = _resolve_speculative_algorithm_alias(
         server_args.speculative_algorithm,
