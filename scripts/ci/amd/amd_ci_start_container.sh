@@ -391,3 +391,35 @@ docker exec ci_sglang mkdir -p \
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
 # setuptools-scm / vcs_versioning can resolve the package version.
 docker exec ci_sglang git config --global --add safe.directory /sglang-checkout
+
+# TEST-ONLY (branch bingxche/rocm715-fullflow): the ROCm 7.15 images enumerate
+# zero GPUs here (torch.cuda.get_device_capability -> "Invalid device id") while
+# the same image reports device_count 8 on a dev host. Dump the device plumbing
+# on both sides of the container boundary so the cause can be told apart: host
+# driver too old for the 7.15 HSA runtime, missing device nodes, or group
+# permissions. Never fail the job on the probe.
+# Revert before merging anything from this branch.
+{
+  echo "===== rocm715-fullflow GPU visibility probe ====="
+  echo "--- host ---"
+  echo "kernel: $(uname -r)"
+  echo "amdgpu: $(cat /sys/module/amdgpu/version 2>/dev/null || echo unknown)"
+  echo "kfd nodes: $(ls /sys/class/kfd/kfd/topology/nodes 2>/dev/null | tr '\n' ' ' || echo none)"
+  ls -l /dev/kfd 2>&1 | head -3
+  ls -l /dev/dri 2>&1 | head -20
+  echo "podinfo: $(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo absent)"
+  echo "DEVICE_FLAG: ${DEVICE_FLAG}"
+  echo "host id: $(id)"
+  echo "--- container ---"
+  docker exec ci_sglang bash -c '
+    ls -l /dev/kfd 2>&1 | head -3
+    ls -l /dev/dri 2>&1 | head -20
+    echo "container id: $(id)"
+    env | grep -iE "VISIBLE_DEVICES|^HSA_|^ROCR_|^HIP_" | sort
+    echo "-- rocm-smi --"; rocm-smi 2>&1 | head -12
+    echo "-- rocminfo agents --"; rocminfo 2>&1 | grep -E "Name:|Marketing|Runtime Version" | head -12
+    echo "-- torch --"
+    python3 -c "import torch; print(\"torch\", torch.__version__); print(\"is_available\", torch.cuda.is_available()); print(\"device_count\", torch.cuda.device_count())" 2>&1 | tail -5
+  '
+  echo "===== end probe ====="
+} || true
