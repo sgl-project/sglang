@@ -240,6 +240,8 @@ impl AppContext {
                     cache_aware: None,
                     sticky: None,
                     max_output_tokens: None,
+                    default_top_k: None,
+                    default_top_p: None,
                     forward_input_ids: true,
                 },
                 discovery: crate::config::DiscoveryBackend::StaticUrls(
