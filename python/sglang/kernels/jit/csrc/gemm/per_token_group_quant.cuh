@@ -122,8 +122,7 @@ struct ScaleStoreArgs {
                               + token_idx * token_stride   // token
                               + group_idx * group_stride;  // group
       if constexpr (kScaleFp32) {
-        static_cast<T*>(this->base)[offset] =
-            __uint_as_float(static_cast<uint32_t>(scale_inv) << 23);
+        static_cast<T*>(this->base)[offset] = __uint_as_float(static_cast<uint32_t>(scale_inv) << 23);
       } else {
         static_cast<T*>(this->base)[offset] = scale_inv;
       }
@@ -337,8 +336,7 @@ struct QuantTrait {
     }
 
     out.store(params.output.get<Q>(expert_idx, token_idx) + group_offset, lane_id);
-    params.scale.store<kUe8m0, kRowMajor, kAligned, kScaleFp32>(
-        expert_idx, token_idx, group_idx, scale_inv);
+    params.scale.store<kUe8m0, kRowMajor, kAligned, kScaleFp32>(expert_idx, token_idx, group_idx, scale_inv);
   }
 
   SGL_DEVICE static void run_fp32(
@@ -397,8 +395,7 @@ struct QuantTrait {
     }
 
     out.store(params.output.get<Q>(expert_idx, token_idx) + group_offset, lane_id);
-    params.scale.store<kUe8m0, kRowMajor, kAligned, kScaleFp32>(
-        expert_idx, token_idx, group_idx, scale_inv);
+    params.scale.store<kUe8m0, kRowMajor, kAligned, kScaleFp32>(expert_idx, token_idx, group_idx, scale_inv);
   }
 };
 
@@ -516,9 +513,7 @@ QuantHostContext<Trait> build_quant_context( //
   const uint32_t num_scale_groups = G.unwrap();
   CHECK_HOST(hidden_size % Trait::kGroupSize == 0);
   CHECK_HOST(input.size(-1) == hidden_size * kSiluFactor);
-  CHECK_HOST(
-      num_scale_groups ==
-      (Trait::kUe8m0 && !Trait::kScaleFp32 ? div_ceil(num_groups, 4) : num_groups));
+  CHECK_HOST(num_scale_groups == (Trait::kUe8m0 && !Trait::kScaleFp32 ? div_ceil(num_groups, 4) : num_groups));
   // Pack-tail alignment only exists for the 4-per-int32 ue8m0 layouts; fp32
   // scales are unpacked (kAligned is fixed true by the static_assert). Exact
   // match: kAligned = false with an aligned num_groups would make
@@ -586,8 +581,7 @@ template <
     bool kScaleFp32,
     bool kUsePDL>
 struct PerTokenGroupQuantFlatKernel {
-  using Trait =
-      QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul, kScaleFp32>;
+  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul, kScaleFp32>;
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
     using namespace host;
@@ -612,8 +606,7 @@ template <
     bool kScaleFp32,
     bool kUsePDL>
 struct PerTokenGroupQuantMaskedKernel {
-  using Trait =
-      QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul, kScaleFp32>;
+  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul, kScaleFp32>;
 
   // expected_m: optional host-side expected-tokens-per-expert hint (the same
   // hint SGLang passes to deep_gemm's masked grouped GEMM); <= 0 means
