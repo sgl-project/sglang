@@ -1253,18 +1253,22 @@ async def send_weights_to_remote_instance(
 
 @app.get("/get_remote_instance_transfer_engine_info")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def get_remote_instance_transfer_engine_info(rank: int = None):
+async def get_remote_instance_transfer_engine_info(
+    rank: int = None, worker: str = "target"
+):
     """Get the server information (deprecated - use /remote_instance_transfer_engine_info instead)."""
     logger.warning(
         "Endpoint '/get_remote_instance_transfer_engine_info' is deprecated and will be removed in a future version. "
         "Please use '/remote_instance_transfer_engine_info' instead."
     )
-    return await remote_instance_transfer_engine_info(rank=rank)
+    return await remote_instance_transfer_engine_info(rank=rank, worker=worker)
 
 
 @app.get("/remote_instance_transfer_engine_info")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def remote_instance_transfer_engine_info(rank: int = None):
+async def remote_instance_transfer_engine_info(
+    rank: int = None, worker: str = "target"
+):
     if rank is None or rank < 0:
         return ORJSONResponse(
             {"error": {"message": "Missing or invalid rank parameter"}},
@@ -1275,7 +1279,7 @@ async def remote_instance_transfer_engine_info(rank: int = None):
     try:
         resp = requests.get(
             f"{server_args.engine_info_bootstrap_url}/get_transfer_engine_info",
-            params={"rank": rank},
+            params={"rank": rank, "worker": worker},
             timeout=5,
         )
         if resp.status_code == 200:
@@ -1291,7 +1295,7 @@ async def remote_instance_transfer_engine_info(rank: int = None):
 
 @app.get("/parallelism_config")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def parallelism_config(rank: int = None):
+async def parallelism_config(rank: int = None, worker: str = "target"):
     """Get per-rank parallelism config from the bootstrap server."""
     if rank is None or rank < 0:
         return ORJSONResponse(
@@ -1304,7 +1308,7 @@ async def parallelism_config(rank: int = None):
 
         resp = requests.get(
             f"{server_args.engine_info_bootstrap_url}/get_parallelism_config",
-            params={"rank": rank},
+            params={"rank": rank, "worker": worker},
             timeout=5,
         )
         if resp.status_code == 200:

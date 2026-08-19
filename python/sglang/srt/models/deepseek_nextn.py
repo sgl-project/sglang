@@ -332,6 +332,11 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         },
     )
 
+    def mutate_weight_preload(self, name: str) -> str:
+        return name.replace(
+            f"model.layers.{self.config.num_hidden_layers}.", "model.decoder.", 1
+        )
+
     def _resolve_nextn_quant_config(self, config, quant_config):
         if quant_config is None or quant_config.get_name() != "quark":
             return quant_config
