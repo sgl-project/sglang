@@ -11,7 +11,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentCheckpointUnsupportedError,
     ComponentLoader,
+    NativeComponentLoaderRequired,
 )
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
@@ -28,9 +30,39 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
+)
 
 logger = init_logger(__name__)
 VAE_CHANNELS_LAST_3D_ENV = "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D"
+
+
+def _require_native_loader_for_quantized_vae(
+    config: dict, component_name: str, *, native_only: bool = False
+) -> None:
+    quant_spec = resolve_checkpoint_quant_spec(config)
+    if quant_spec is None:
+        return
+
+    method = quant_spec.declared_method or "unspecified"
+    if native_only:
+        raise ComponentCheckpointUnsupportedError(
+            f"{component_name} uses a native-only SGLang implementation that "
+            f"cannot restore quant_method={method!r}; Diffusers fallback is disabled."
+        )
+    if quant_spec.source != "quantization_config":
+        raise ComponentCheckpointUnsupportedError(
+            f"{component_name} checkpoint declares quantization metadata in "
+            f"{quant_spec.source} (quant_method={method!r}), which the Diffusers "
+            "component loader does not restore automatically."
+        )
+
+    raise NativeComponentLoaderRequired(
+        f"{component_name} checkpoint declares quant_method={method!r}; routing "
+        "through Diffusers from_pretrained because the SGLang VAE loader cannot "
+        "restore serialized quantized state."
+    )
 
 
 def _backfill_ltx2_audio_vae_latent_stats(
@@ -98,17 +130,39 @@ class VAELoader(ComponentLoader):
     component_names = ["vae", "audio_vae", "video_vae"]
     expected_library = "diffusers"
 
+    def customized_load_kwargs_for_component(
+        self, server_args: ServerArgs, component_name: str
+    ) -> dict[str, bool]:
+        if current_platform.is_mps() and self._is_component_set_as_layerwise_load(
+            server_args, component_name
+        ):
+            logger.info(
+                "Loading %s on CPU first for MPS layerwise offload", component_name
+            )
+            return {"cpu_offload_flag": True}
+        return {}
+
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        cpu_offload_flag: bool = False,
     ):
         """Load the VAE based on the model path, and inference args."""
         config = get_diffusers_component_config(component_path=component_model_path)
+        server_args.model_paths[component_name] = component_model_path
+        native_only = component_name in getattr(
+            server_args.pipeline_config, "native_only_components", ()
+        )
+        _require_native_loader_for_quantized_vae(
+            config, component_name, native_only=native_only
+        )
+
         class_name = config.pop("_class_name", None)
         assert (
             class_name is not None
         ), "Model config does not contain a _class_name attribute. Only diffusers format is supported."
-
-        server_args.model_paths[component_name] = component_model_path
 
         if component_name in ("vae", "video_vae"):
             pipeline_vae_config_attr = "vae_config"
@@ -133,14 +187,12 @@ class VAELoader(ComponentLoader):
             # NOTE: some post init logics are only available after updated with config
             vae_config.post_init()
 
-        component_starts_on_cpu = server_args.should_start_component_on_cpu(
-            component_name
+        component_starts_on_cpu = (
+            server_args.should_start_component_on_cpu(component_name)
+            or cpu_offload_flag
         )
         target_device = self.target_device(component_starts_on_cpu)
 
-        native_only = component_name in getattr(
-            server_args.pipeline_config, "native_only_components", ()
-        )
         auto_map = config.get("auto_map", {})
         auto_model_map = auto_map.get("AutoModel")
         if auto_model_map and not native_only:
@@ -190,7 +242,11 @@ class VAELoader(ComponentLoader):
             loaded.update(safetensors_load_file(sf_path))
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_name)
         strict_load = native_only
-        vae.load_state_dict(loaded, strict=strict_load)
+        vae.load_state_dict(
+            loaded,
+            strict=strict_load,
+            assign=bool(cpu_offload_flag and current_platform.is_mps()),
+        )
 
         if not strict_load:
             state_keys = set(vae.state_dict().keys())

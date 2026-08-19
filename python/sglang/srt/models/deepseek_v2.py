@@ -525,11 +525,9 @@ class MoEGate(nn.Module):
                 return linear_bf16_fp32(hidden_states, self.weight)
             return F.linear(hidden_states, self.weight, None)
         else:
-            # NOTE(b8zhong): this threshold has been empirically verified
-            max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
             if (
                 _is_cuda
-                and hidden_states.shape[0] <= max_router_gemm_tokens
+                and hidden_states.shape[0] <= 16
                 and hidden_states.shape[1] % 1024 == 0
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
@@ -734,6 +732,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_ascend_fuseep()
                 or get_moe_a2a_backend().is_flashinfer()
                 or get_moe_a2a_backend().is_megamoe()
+                or get_moe_a2a_backend().is_deepep_v2()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
@@ -813,6 +812,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
+            or get_moe_a2a_backend().is_deepep_v2()
         ):
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
@@ -835,6 +835,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_mori()
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
+            or get_moe_a2a_backend().is_deepep_v2()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
@@ -1230,7 +1231,9 @@ class DeepseekV2MoE(nn.Module):
             ),  # block_size
             True,  # is_vnni
         )
-        if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
@@ -2704,7 +2707,10 @@ class DeepseekV2Model(nn.Module):
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, DeepseekV2MoE):
                     # tp_size = get_parallel().tp_size
-                    is_a2a_moe = is_deepep_class_backend()
+                    is_a2a_moe = (
+                        is_deepep_class_backend()
+                        or get_moe_a2a_backend().is_deepep_v2()
+                    )
                     tp_size = 1 if is_a2a_moe else get_parallel().tp_size
                     intermediate_size = (
                         config.moe_intermediate_size * config.n_shared_experts
@@ -2724,10 +2730,11 @@ class DeepseekV2Model(nn.Module):
                 )
             )
         self.layers_to_capture = []
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-            self.enable_a2a_moe = True
-        else:
-            self.enable_a2a_moe = False
+        self.enable_a2a_moe = (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_mooncake()
+            or get_moe_a2a_backend().is_deepep_v2()
+        )
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)

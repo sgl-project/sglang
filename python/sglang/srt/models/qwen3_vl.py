@@ -102,6 +102,25 @@ _is_cpu = is_cpu()
 _VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
 
 
+def _resolve_vision_tp(
+    *,
+    use_data_parallel: bool,
+    tp_size: Optional[int],
+    tp_rank: Optional[int],
+) -> tuple[int, int]:
+    if use_data_parallel:
+        if tp_size is not None or tp_rank is not None:
+            raise ValueError("Explicit vision TP cannot be combined with data parallel")
+        return 1, 0
+    if (tp_size is None) != (tp_rank is None):
+        raise ValueError("Vision tp_size and tp_rank must be set together")
+    if tp_size is None:
+        parallel = get_parallel()
+        return parallel.attn_tp_size, parallel.attn_tp_rank
+    assert tp_rank is not None
+    return tp_size, tp_rank
+
+
 class Qwen3_VisionMLP(nn.Module):
 
     def __init__(
@@ -113,10 +132,15 @@ class Qwen3_VisionMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        tp_size: Optional[int] = None,
+        tp_rank: Optional[int] = None,
     ):
         super().__init__()
-        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
-        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        self.tp_size, self.tp_rank = _resolve_vision_tp(
+            use_data_parallel=use_data_parallel,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+        )
         self.linear_fc1 = ColumnParallelLinear(
             in_features,
             hidden_features,
@@ -145,7 +169,7 @@ class Qwen3_VisionMLP(nn.Module):
 
 
 class Qwen3VLVisionPatchEmbed(nn.Module):
-    def __init__(self, config) -> None:
+    def __init__(self, config, disable_linear: bool = False) -> None:
         super().__init__()
         self.patch_size = config.patch_size
         self.temporal_patch_size = config.temporal_patch_size
@@ -159,6 +183,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
             kernel_size=kernel_size,
             stride=kernel_size,
             bias=True,
+            disable_linear=disable_linear,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -265,6 +290,8 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        tp_size: Optional[int] = None,
+        tp_rank: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
@@ -277,8 +304,11 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         self.norm = norm_layer(
             self.hidden_size if use_postshuffle_norm else context_dim
         )
-        self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
-        self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
+        self.tp_size, self.tp_rank = _resolve_vision_tp(
+            use_data_parallel=use_data_parallel,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+        )
         self.linear_fc1 = ColumnParallelLinear(
             self.hidden_size,
             self.padded_context_dim,
