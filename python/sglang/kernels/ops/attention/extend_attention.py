@@ -609,10 +609,11 @@ def _fwd_kernel(
                 other=0.0,
             )
             if PV_DOT_IN_KV_DTYPE:
-                pv = tl.dot(p.to(v.dtype), v)
+                p = p.to(v.dtype)
             else:
-                pv = tl.dot(p.to(q.dtype), v.to(q.dtype))
-            acc = acc * re_scale[:, None] + pv * v_scale
+                p = p.to(q.dtype)
+                v = v.to(q.dtype)
+            acc = acc * re_scale[:, None] + tl.dot(p, v) * v_scale
 
             e_max = n_e_max
 
@@ -733,9 +734,11 @@ def _fwd_kernel(
                 V_Extend + offs_v, mask=mask_n[:, None] & mask_dv[None, :], other=0.0
             )
             if PV_EXTEND_DOT_IN_V_DTYPE:
-                acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v)
+                p = p.to(v.dtype)
             else:
-                acc = acc * re_scale[:, None] + tl.dot(p.to(q.dtype), v.to(q.dtype))
+                p = p.to(q.dtype)
+                v = v.to(q.dtype)
+            acc = acc * re_scale[:, None] + tl.dot(p, v)
 
             e_max = n_e_max
 
@@ -1289,9 +1292,11 @@ def _fwd_kernel_unified(
                 other=0.0,
             )
             if PV_DOT_IN_KV_DTYPE:
-                acc = acc * re_scale[:, None] + tl.dot(p.to(v.dtype), v)
+                p = p.to(v.dtype)
             else:
-                acc = acc * re_scale[:, None] + tl.dot(p.to(q.dtype), v.to(q.dtype))
+                p = p.to(q.dtype)
+                v = v.to(q.dtype)
+            acc = acc * re_scale[:, None] + tl.dot(p, v)
 
             e_max = n_e_max
 
