@@ -67,45 +67,49 @@ For platform-specific setup, see the [SGLang Diffusion installation guide](/docs
 
 MAGI-2 layers two parallel decompositions over the same ranks. Ulysses sequence
 parallelism spans every rank and shards the packed sequence, and expert
-parallelism shares those same ranks to split the preview MoE by head. There is
-no separate expert-parallel process group to size independently.
+parallelism shares those same ranks to split the preview MoE by head. Expert
+parallelism defaults to the world size, but can be sized below it — which is what
+makes 8 ranks work, since 8 does not divide the 12 MoE heads.
 
-`--num-gpus` must divide every head axis in the model, because a rank owns whole
-heads on all of them. All four are checked at launch rather than deep inside a
-collective:
+`--num-gpus` must divide every Ulysses head axis, because a rank owns whole heads
+on all of them. The MoE heads are sharded by `ep_size` instead, so they are checked
+against that. All four are checked at launch rather than deep inside a collective:
 
-| Axis | Count |
-| --- | ---: |
-| Preview attention heads | 24 |
-| Preview MoE heads (also the expert-parallel degree) | 12 |
-| Refiner attention heads | 32 |
-| Refiner key/value heads (GQA) | 8 |
+| Axis | Count | Divided by |
+| --- | ---: | --- |
+| Preview attention heads | 24 | `--num-gpus` |
+| Refiner attention heads | 32 | `--num-gpus` |
+| Refiner key/value heads (GQA) | 8 | `--num-gpus` |
+| Preview MoE heads | 12 | `ep_size` |
 
-Divisibility alone does not make a count usable, because expert parallelism is also
-what makes the weights fit. The 114B headline is the preview partition — 113.9B
-parameters, 228 GB in BF16 — and only its expert tensors shard; the 6.7B refiner is
-separate and is replicated on every rank. Measured on 143 GB H200 cards, preview
-tier, 20 steps:
+Divisibility alone does not make a count usable, because the expert weights also
+have to fit. The 114B headline is the preview partition — 113.9B parameters, 228 GB
+in BF16 — and only its expert tensors shard; the 6.7B refiner is separate and is
+replicated on every rank. Measured on 143 GB H200 cards, two-stage 1080p tier, 100
+preview plus 5 refiner steps, steady-state clip:
 
-| GPUs | Result |
-| ---: | --- |
-| 4 | **works**, 124s for 20 preview steps |
-| 2 | out of memory during denoise, 132 GiB resident |
-| 1 | out of memory during load |
+| GPUs | `ep_size` | Result |
+| ---: | ---: | --- |
+| 8 | 4 | **253s**, run eager — see below |
+| 4 | 4 (default) | **348s** compiled, the recommended default |
+| 2 | 2 | **689s**, requires `--dit-layerwise-offload` |
+| 1 | 1 | out of memory while loading weights |
 
-**Use 4 GPUs.** 2 divides every head axis and still fails: weights alone come to
-~132 GiB of the card, which leaves nothing for activations. Counts above 4 (6 and
-12, preview-only) satisfy the head axes but were not measured here.
+**Use 4 GPUs unless you have a reason not to.** 8 is 1.37x faster per clip but
+spends 46% more GPU-time to get there, so it buys latency rather than throughput;
+2 and 4 cost the same GPU-seconds per clip. Two concurrent 4-GPU deployments beat
+one 8-GPU deployment on total output.
 
 <Warning>
 6 and 12 GPUs satisfy the preview head axes but fail the refiner's 8 key/value
 heads, so they are preview-only counts.
 
-8 GPUs divides every Ulysses axis but not the preview's 12 MoE heads. The
-reference implementation handles that by padding the head axis to 16 and giving
-the two spare ranks zero-weight experts whose output is discarded; SGLang does
-not implement that padding and rejects the configuration at startup instead. If
-you need 8-way parallelism, run the preview and refiner as separate deployments.
+8 GPUs divides every Ulysses axis but not the preview's 12 MoE heads, so it needs
+an explicit `ep_size` of 4 — two expert-parallel groups of 4 ranks, each holding
+all 12 heads. It also wants **eager mode**: `torch.compile` regresses the preview
+pass badly at this rank count (335s compiled against 184s eager). The reference
+implementation instead pads the head axis to 16 and gives the two spare ranks
+zero-weight experts; SGLang does not need that padding.
 </Warning>
 
 The denoise loop runs both CFG branches itself, so SGLang must not also split CFG
@@ -134,7 +138,7 @@ Slower *and* larger, so put the whole degree in `--ulysses-degree`.
 ## 4. Serve MAGI-2-preview
 
 The recommended four-card launch. Ulysses spans all four ranks, and expert
-parallelism defaults to that same world size:
+parallelism defaults to that same world size, which divides the 12 MoE heads:
 
 ```bash 4 GPUs recommended
 sglang serve \
@@ -249,6 +253,7 @@ The preview DiT's expert weights are the memory driver. There are 256 experts
 per head across 12 heads in each of 36 MoE layers, and they dominate resident
 footprint even though only 6 experts per head are active for a given token. When
 a topology cannot hold them, offload the DiT rather than shrinking the topology.
+On two cards offload is not optional — the expert weights do not fit without it.
 
 ```bash 4 GPUs with DiT layerwise offload
 sglang serve \
@@ -320,8 +325,10 @@ error.
   step-distilled, so this dominates wall-clock time. The refiner runs 5 steps.
 - The refiner, the expert-parallel degree, and the distilled turbo decoder are
   pipeline-configuration fields (`enable_refiner`, `ep_size`, `use_turbo_vae`)
-  with no dedicated CLI flags. Turning off `use_turbo_vae` falls back to the
-  video VAE decode path and is a configuration-only change.
+  with no dedicated CLI flags. Set them by passing a JSON file to
+  `--pipeline-config-path`, for example `{"ep_size": 4}` for the 8-card launch.
+  Turning off `use_turbo_vae` falls back to the video VAE decode path and is a
+  configuration-only change.
 - Audio is delivered as stereo at 44100 Hz. The audio VAE decodes at 51200 Hz
   and is resampled for the container.
 - The text encoder is a Qwen3.5 hybrid backbone loaded through transformers.
@@ -334,43 +341,51 @@ audio-video sequence, both of which depend heavily on GPU model, interconnect,
 offload policy, and the selected quality tier. Benchmark your own topology before
 sizing a deployment; the figures below are one data point, not a target.
 
-Measured on four H200 (143771 MiB each), two-stage 1080p tier, 100 preview steps
-plus 5 refiner steps, one 10-second clip, `--ulysses-degree 4`. The compiled column
-adds `--enable-torch-compile --regional-compile` and is the configuration to deploy;
-both columns are steady state, so the first clip of a process costs more while its
-graphs build:
+Measured on H200 (143771 MiB each), two-stage 1080p tier, 100 preview steps plus 5
+refiner steps, one 10-second clip, seed and prompt held fixed. Each column is that
+topology's best configuration, and all are steady state, so the first clip of a
+process costs more while its graphs build:
 
-| Phase | Eager | Compiled |
-| --- | ---: | ---: |
-| Text encoding | 20.1 s | 9.8 s |
-| Preview denoise (100 steps) | 459.8 s | 316.2 s |
-| Preview-to-refiner handoff | &lt;0.1 s | &lt;0.1 s |
-| Refiner denoise (5 steps) | 104.2 s | 61.0 s |
-| Decode (video and audio) | 17.0 s | 12.4 s |
-| **Total** | **606 s** | **413 s** |
-| Peak memory | 131902 MiB | 85274 MiB |
+| Phase | 2 GPUs | 4 GPUs | 8 GPUs |
+| --- | ---: | ---: | ---: |
+| `ep_size` | 2 | 4 | 4 |
+| Compile | regional | regional | **none** |
+| Offload | layerwise | none | none |
+| Preview denoise (100 steps) | 590.4 s | 286.9 s | 183.9 s |
+| Preview-to-refiner handoff | &lt;0.2 s | &lt;0.2 s | &lt;0.2 s |
+| Refiner denoise (5 steps) | 79.4 s | 41.3 s | 31.6 s |
+| Decode (video and audio) | 7.1 s | 8.8 s | 12.2 s |
+| **Total** | **689 s** | **348 s** | **253 s** |
+| Peak memory | 132208 MiB | 85274 MiB | 126572 MiB |
+| GPU-seconds per clip | 1378 | 1393 | 2028 |
 
-Regional compile is worth 27% of the clip and 46 GiB of peak, so reach for it first.
-Plain `--enable-torch-compile` without `--regional-compile` compiles the whole
-transformer and fails on sm90: inductor autotunes the multi-head MoE GEMMs and asks
-262144 bytes of shared memory against the 232448 available. Pair the two flags.
+Read the last row before choosing 8 GPUs: it is 1.37x faster per clip but spends 46%
+more GPU-time, while 2 and 4 GPUs cost the same GPU-seconds. Decode also moves the
+wrong way with scale, so latency gains come entirely from denoise.
+
+**Compile is not a free win at every rank count.** At 4 GPUs and below, regional
+compile is worth roughly a quarter of the clip and 46 GiB of peak, so reach for it
+first. At 8 GPUs it costs more than it saves — the preview pass measures 335 s
+compiled against 184 s eager — so leave it off there. Plain `--enable-torch-compile`
+without `--regional-compile` compiles the whole transformer and fails on sm90:
+inductor autotunes the multi-head MoE GEMMs and asks 262144 bytes of shared memory
+against the 232448 available. Pair the two flags or use neither.
 
 Expect a couple of percent of drift between processes on a shared machine; compare
 configurations within one run rather than against this table.
 
-Eager, the same clip at the preview-only tier is **478 s**, so the second stage costs
-about 128 s: 104 s of refiner denoise plus a decode that grows from 2.4 s to 17.0 s
-with the larger canvas. Compiled, that second stage is about 81 s. Supplying a
-conditioning image costs a further 17-24 s at either tier, for the extra 1680 patch
-tokens.
+At the preview-only tier the refiner and the larger decode both drop out, which is
+most of the clip's second half. Supplying a conditioning image costs a further
+17-24 s at either tier, for the extra 1680 patch tokens.
 
 Weight loading is separate and paid once per process: roughly 5 minutes for both
 DiTs, the expert tensors dominating.
 
-That text-encoding figure is a cold first clip. The encoder runs on the host and its
-weights are memory-mapped from storage, so later clips in the same process take
-about 9 s. Longer prompts cost more: a 1900-token caption takes about 24 s.
+Text encoding is not in the table because it tracks prompt length rather than rank
+count. The encoder runs on the host and its weights are memory-mapped from storage, so
+a short caption costs about a second once those weights are in the page cache, while a
+1900-token caption takes about 24 s.
 
-The preview pass — 4.6 s/step eager, 3.4 s/step compiled — dominates, so step count
-is the first knob for trading quality against latency; the refiner's 5 steps are not
-worth tuning first.
+The preview pass — 2.9 s/step on four cards, 1.8 s/step on eight — dominates, so step
+count is the first knob for trading quality against latency; the refiner's 5 steps are
+not worth tuning first.

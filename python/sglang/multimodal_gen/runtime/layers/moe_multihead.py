@@ -16,6 +16,10 @@ SWIGLU7_LIMIT = 7.0
 # router uses 1e-20, which is a visible difference at bf16 score magnitudes.
 ROUTE_NORM_EPS = 1e-12
 
+# moe_align_block_size runs 1024 threads and writes prefix[num_experts], so more
+# than this takes an illegal memory access. Experts run in head chunks that fit.
+MAX_KERNEL_EXPERTS = 1023
+
 
 class Magi2MultiHeadRouter(nn.Module):
     """``gate`` is ``[num_heads * num_experts, head_dim]``; returned ids are flattened global ids."""
@@ -91,30 +95,43 @@ class Magi2MultiHeadExperts(nn.Module):
     def __init__(
         self,
         *,
-        num_local_experts: int,
+        num_heads: int,
+        num_experts_per_head: int,
         head_dim: int,
         intermediate_size: int,
     ) -> None:
         super().__init__()
-        self.num_local_experts = num_local_experts
+        self.num_heads = num_heads
+        self.num_experts_per_head = num_experts_per_head
+        self.num_local_experts = num_heads * num_experts_per_head
         self.head_dim = head_dim
         self.intermediate_size = intermediate_size
+        if num_experts_per_head > MAX_KERNEL_EXPERTS:
+            raise ValueError(
+                f"num_experts_per_head ({num_experts_per_head}) exceeds the "
+                f"{MAX_KERNEL_EXPERTS}-expert kernel limit even for one head"
+            )
+        # Balanced, not greedily filled: a trailing chunk of one head returns
+        # wrong values.
+        max_heads = MAX_KERNEL_EXPERTS // num_experts_per_head
+        num_calls = -(-num_heads // max_heads)
+        self.heads_per_call = -(-num_heads // num_calls)
 
         self.w13_weight = nn.Parameter(
-            torch.empty(num_local_experts, 2 * intermediate_size, head_dim)
+            torch.empty(self.num_local_experts, 2 * intermediate_size, head_dim)
         )
         self.w2 = nn.Parameter(
-            torch.empty(num_local_experts, head_dim, intermediate_size)
+            torch.empty(self.num_local_experts, head_dim, intermediate_size)
         )
 
-    # Opaque to dynamo: autotuning these GEMMs asks more shared memory than sm90
-    # has, so a compiled region containing them fails to build.
-    @torch._dynamo.disable()
-    def forward(
+    def _run_heads(
         self,
         tokens: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        num_experts: int,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
@@ -130,8 +147,8 @@ class Magi2MultiHeadExperts(nn.Module):
         runner_config = MoeRunnerConfig(
             # Equal counts: ids are already rank-local, so the kernel's expert
             # filter has nothing to drop.
-            num_experts=self.num_local_experts,
-            num_local_experts=self.num_local_experts,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
             hidden_size=self.head_dim,
             intermediate_size_per_partition=self.intermediate_size,
             top_k=topk_ids.shape[-1],
@@ -148,12 +165,54 @@ class Magi2MultiHeadExperts(nn.Module):
         )
         return fused_experts(
             tokens.contiguous().bfloat16(),
-            self.w13_weight.bfloat16(),
-            self.w2.bfloat16(),
+            w13.bfloat16(),
+            w2.bfloat16(),
             topk_output,
             runner_config,
             fuse_swiglu_interleaved=True,
         ).type_as(tokens)
+
+    # Opaque to dynamo: autotuning these GEMMs asks more shared memory than sm90
+    # has, so a compiled region containing them fails to build.
+    @torch._dynamo.disable()
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.num_heads <= self.heads_per_call:
+            return self._run_heads(
+                tokens,
+                topk_ids,
+                topk_weights,
+                self.w13_weight,
+                self.w2,
+                self.num_local_experts,
+            )
+
+        # Rows are token-major, so a head slice is dim 1 of the unflattened view;
+        # expert rows are head-major, so the same slice is a row range.
+        num_tokens = tokens.shape[0] // self.num_heads
+        tokens_3d = tokens.view(num_tokens, self.num_heads, self.head_dim)
+        ids_3d = topk_ids.view(num_tokens, self.num_heads, -1)
+        weights_3d = topk_weights.view(num_tokens, self.num_heads, -1)
+        out = torch.empty_like(tokens_3d)
+
+        per_head = self.num_experts_per_head
+        for start in range(0, self.num_heads, self.heads_per_call):
+            stop = min(start + self.heads_per_call, self.num_heads)
+            chunk = self._run_heads(
+                tokens_3d[:, start:stop].reshape(-1, self.head_dim),
+                # Ids carry the head offset, so rebase them onto the weight slice.
+                ids_3d[:, start:stop].reshape(-1, ids_3d.shape[-1]) - start * per_head,
+                weights_3d[:, start:stop].reshape(-1, weights_3d.shape[-1]),
+                self.w13_weight[start * per_head : stop * per_head],
+                self.w2[start * per_head : stop * per_head],
+                (stop - start) * per_head,
+            )
+            out[:, start:stop] = chunk.view(num_tokens, stop - start, self.head_dim)
+        return out.reshape(-1, self.head_dim)
 
 
 class Magi2MultiHeadMoE(nn.Module):
@@ -206,7 +265,8 @@ class Magi2MultiHeadMoE(nn.Module):
             route_norm=route_norm,
         )
         self.experts = Magi2MultiHeadExperts(
-            num_local_experts=self.local_num_heads * num_experts,
+            num_heads=self.local_num_heads,
+            num_experts_per_head=num_experts,
             head_dim=self.head_dim,
             intermediate_size=intermediate_size,
         )

@@ -28,7 +28,7 @@ class TestSequenceBucket(unittest.TestCase):
         # Only the refiner uses the block grid (grid-local window attention), and
         # its 8 GQA kv heads cap sp there at these degrees. Preview-only 3/6/12
         # do not divide the bucket, which only costs shard padding.
-        for sp_size in (1, 2, 4):
+        for sp_size in (1, 2, 4, 8):
             with self.subTest(sp_size=sp_size):
                 self.assertEqual(SEQ_BUCKET % sp_size, 0)
 
