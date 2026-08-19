@@ -180,10 +180,14 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         fields["disaggregation_decode_retraction_backup"] = backend
 
     if memory.hicache_ratio is None:
-        # Only a decode server reaches resolution with the ratio unset; host-pool
-        # retraction sizes the host pool 1:1 with the device pool, everything
-        # else keeps the standard default.
-        fields["hicache_ratio"] = 1.0 if backend == "host_pool" else 2.0
+        # Only a decode server reaches resolution with the ratio unset. A
+        # backup-only pool can be small: retractions that overflow it abort their
+        # request instead of crashing the scheduler. Sharing the pool with
+        # HiCache keeps the standard default.
+        if backend == "host_pool" and not memory.enable_hierarchical_cache:
+            fields["hicache_ratio"] = 0.2
+        else:
+            fields["hicache_ratio"] = 2.0
 
     source = "kv_cache_builder.decode_retraction"
     get_context().override(source, **fields)
