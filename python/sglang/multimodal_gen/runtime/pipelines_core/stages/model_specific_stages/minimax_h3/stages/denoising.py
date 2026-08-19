@@ -404,12 +404,20 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
     ) -> None:
         quality = getattr(batch.sampling_params, "quality", "lossless")
         explicit_fields = getattr(batch.sampling_params, "_explicit_fields", ())
-        generic_requested = (
-            super()._cache_dit_requested() and "quality" not in explicit_fields
+        enable_override = batch.sampling_params.enable_cache_dit
+        generic_enabled = (
+            super()._cache_dit_requested()
+            if enable_override is None
+            else enable_override
         )
-        desired_mode = (
-            "high" if quality == "high" else ("generic" if generic_requested else None)
-        )
+        generic_requested = generic_enabled and "quality" not in explicit_fields
+        if enable_override is False:
+            # The per-request kill switch wins over quality="high".
+            desired_mode = None
+        elif quality == "high":
+            desired_mode = "high"
+        else:
+            desired_mode = "generic" if generic_requested else None
         current_mode = getattr(self, "_minimax_h3_cache_mode", None)
         self._minimax_h3_quality = quality
 
@@ -426,9 +434,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             # Cache-DiT still holds references to their inputs. Settle the state
             # fields before restoring the in-place path, so a failure there
             # costs throughput rather than leaving the stage inconsistent.
-            self.transformer = disable_cache_on_transformer(self.transformer)
-            self._cache_dit_enabled = False
-            self._cached_num_steps = None
+            self._unmount_cache_dit()
             self._minimax_h3_cache_mode = None
             self._set_cache_dit_input_preservation(False)
 
@@ -484,6 +490,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         # mounted.
         self._cache_dit_enabled = False
         self._cached_num_steps = None
+        self._cache_dit_active_key = None
         self._minimax_h3_cache_mode = None
         self._set_cache_dit_input_preservation(False)
 

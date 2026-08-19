@@ -8,7 +8,8 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=3600, suite="base-c-test-perf-16-npu-a3")
+register_npu_ci(est_time=1200, suite="base-c-test-perf-16-npu-a3")
+register_npu_ci(est_time=1200, suite="nightly-perf-16-npu-a3", nightly=True)
 
 # Environment variables for DSV4-Flash single-node PD-mix deployment.
 DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
@@ -55,7 +56,7 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     "--watchdog-timeout",
     9000,
     "--mem-fraction-static",
-    0.7,
+    0.6,
     "--prefill-max-requests",
     2,
     "--disable-radix-cache",

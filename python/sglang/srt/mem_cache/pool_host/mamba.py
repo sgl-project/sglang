@@ -129,7 +129,7 @@ class MambaPoolHost(HostKVCache):
             for conv_state in device_pool.mamba_cache.conv
         ]
 
-        self.init_kv_buffer()
+        self.kv_buffer = self.init_kv_buffer()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
@@ -201,6 +201,12 @@ class MambaPoolHost(HostKVCache):
                         allocator=self.allocator,
                     )
                 )
+        # destroy() unregisters via kv_buffer; without this list the pinned
+        # registrations leak past the buffers' mmap. 0-element buffers
+        # (conv-only models' temporal state) were never registered.
+        return [
+            buf for buf in (self.temporal_buffer, *self.conv_buffer) if buf.numel() > 0
+        ]
 
     def _init_write_back_staging_buffers(self):
         self.temporal_staging_buffer = None
