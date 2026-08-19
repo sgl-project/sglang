@@ -991,26 +991,24 @@ class DFlash2DraftModel(DFlashDraftModel):
                 "DFlash2 selector requires a dense FP16/BF16/FP32 target lm_head "
                 "or a supported lm_head.quant_method."
             )
-        if get_parallel().tp_size == 1:
-            org = int(self.lm_head.org_vocab_size)
-            vals, ids = _radix_topk(
-                _project_candidate_logits(
-                    hidden, self.lm_head, num_org=org, use_quant_head=use_quant_head
-                ),
-                k,
-            )
-            return ids.long(), self._transform_unary_logits(vals)
-        shard = self.lm_head.shard_indices
+        parallel = get_parallel()
+        if parallel.tp_size == 1:
+            num_org = int(self.lm_head.org_vocab_size)
+            org_vocab_start = 0
+        else:
+            shard = self.lm_head.shard_indices
+            num_org = int(shard.num_org_elements)
+            org_vocab_start = int(shard.org_vocab_start_index)
+
         vals, ids = _radix_topk(
             _project_candidate_logits(
-                hidden,
-                self.lm_head,
-                num_org=int(shard.num_org_elements),
-                use_quant_head=use_quant_head,
+                hidden, self.lm_head, num_org=num_org, use_quant_head=use_quant_head
             ),
             k,
         )
-        global_ids = ids.long() + int(shard.org_vocab_start_index)
+        if parallel.tp_size == 1:
+            return ids.long(), self._transform_unary_logits(vals)
+        global_ids = ids.long() + org_vocab_start
         gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
         gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
         top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
