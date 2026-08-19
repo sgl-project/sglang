@@ -776,7 +776,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                         ),
                         self.extend_scale_kv_indptr_idx,
                     )
-                elif forward_batch.forward_mode.is_target_verify():
+                elif (
+                    forward_batch.forward_mode.is_target_verify()
+                    and self.decode_fp8_native
+                ):
                     kv_scale = (
                         layer.k_scale_float if layer.k_scale_float is not None else 1.0
                     )
@@ -1265,7 +1268,8 @@ class FlashInferMLAIndicesUpdaterPrefill:
                 plan_kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
             plan_kv_data_type = (
                 self.kv_data_type
-                if is_verify or self.attn_backend.use_dsa_scaled_kv
+                if (is_verify and self.attn_backend.decode_fp8_native)
+                or self.attn_backend.use_dsa_scaled_kv
                 else self.data_type
             )
             wrapper_paged.plan(
