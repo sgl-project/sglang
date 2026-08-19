@@ -641,6 +641,20 @@ class KimiK3MoE(nn.Module):
             and self._shared_experts_comm_group.world_size in (2, 4, 8)
             and self.shared_experts.supports_npu_fused_collective_matmul()
         )
+        self._npu_quant_shared_input = False
+        if (
+            _is_npu
+            and self._shared_experts_attn_tp_comm
+            and self.shared_experts is not None
+            and not self._npu_fused_shared_experts
+        ):
+            from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+                supports_npu_prequantized_input,
+            )
+
+            self._npu_quant_shared_input = supports_npu_prequantized_input(
+                self.shared_experts.gate_up_proj
+            )
 
         # SBO (single batch overlap): the shared experts read a fixed slab of
         # weights the routed path never touches (bf16 — the checkpoint leaves
@@ -1068,12 +1082,50 @@ class KimiK3MoE(nn.Module):
 
     def _prepare_shared_experts_input(
         self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, bool]:
+    ) -> tuple[
+        torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        bool,
+    ]:
         """Gather shared-expert input on the current stream when required."""
         if not self._shared_experts_attn_tp_comm:
             return hidden_states, False
 
         group = self._shared_experts_comm_group
+        if self._npu_quant_shared_input:
+            # Dynamic activation quantization is row-local. Doing it before
+            # the gather preserves the gate-up GEMM input exactly while the
+            # large collective carries INT8 instead of BF16.
+            quant_hidden_states, dynamic_scale = (
+                torch.ops.npu.npu_dynamic_quant(hidden_states)
+            )
+            gathered_hidden_states = torch.empty(
+                (
+                    quant_hidden_states.shape[0] * group.world_size,
+                    *quant_hidden_states.shape[1:],
+                ),
+                dtype=quant_hidden_states.dtype,
+                device=quant_hidden_states.device,
+            )
+            gathered_scale = torch.empty(
+                (
+                    dynamic_scale.shape[0] * group.world_size,
+                    *dynamic_scale.shape[1:],
+                ),
+                dtype=dynamic_scale.dtype,
+                device=dynamic_scale.device,
+            )
+            if group is get_parallel().attn_tp_group:
+                attn_tp_all_gather_into_tensor(
+                    gathered_hidden_states, quant_hidden_states
+                )
+                attn_tp_all_gather_into_tensor(gathered_scale, dynamic_scale)
+            else:
+                group.all_gather_into_tensor(
+                    gathered_hidden_states, quant_hidden_states
+                )
+                group.all_gather_into_tensor(gathered_scale, dynamic_scale)
+            return (gathered_hidden_states, gathered_scale), True
+
         # SP-MoE presents one contiguous token shard per attention-TP rank;
         # a TP8 fused-matmul subgroup reassembles only its half-replica rows.
         if group is get_parallel().attn_tp_group:
@@ -1155,7 +1207,13 @@ class KimiK3MoE(nn.Module):
                     shared_input, shared_output_needs_reduce_scatter = (
                         self._prepare_shared_experts_input(hidden_states)
                     )
-                shared_input.record_stream(self.alt_stream)
+                shared_input_tensors = (
+                    shared_input
+                    if isinstance(shared_input, tuple)
+                    else (shared_input,)
+                )
+                for value in shared_input_tensors:
+                    value.record_stream(self.alt_stream)
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     if self._npu_fused_shared_experts:
