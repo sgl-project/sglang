@@ -327,6 +327,16 @@ class VideoSparseAttentionImpl(AttentionImpl):
                 "video sparse attention stage2_backend must be 'vsa' or 'cake', "
                 f"got {self.stage2_backend!r}"
             )
+        raw_cake_steps = config.get("cake_step_indices")
+        if raw_cake_steps is None:
+            self.cake_step_indices: frozenset[int] | None = None
+        else:
+            if not isinstance(raw_cake_steps, (list, tuple)) or not raw_cake_steps:
+                raise ValueError(
+                    "cake_step_indices must be a non-empty list of denoising step "
+                    "indices"
+                )
+            self.cake_step_indices = frozenset(int(step) for step in raw_cake_steps)
         self._cake_wrapper = None
         self._cake_q2k_num: dict[tuple[int, ...], torch.Tensor] = {}
 
@@ -454,7 +464,10 @@ class VideoSparseAttentionImpl(AttentionImpl):
         attn_metadata: VideoSparseAttentionMetadata,
     ) -> torch.Tensor:
         cur_topk = _compute_cur_topk(attn_metadata)
-        if self.stage2_backend == "cake":
+        if self.stage2_backend == "cake" and (
+            self.cake_step_indices is None
+            or attn_metadata.current_timestep in self.cake_step_indices
+        ):
             return self._forward_cake(
                 query,
                 key,

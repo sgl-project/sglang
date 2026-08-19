@@ -137,6 +137,7 @@ def test_cake_stage2_uses_direct_topk_metadata(monkeypatch):
 
     impl = object.__new__(VideoSparseAttentionImpl)
     impl.stage2_backend = "cake"
+    impl.cake_step_indices = None
     impl.head_size = 128
     impl.softmax_scale = 128**-0.5
     impl._cake_wrapper = None
@@ -160,3 +161,30 @@ def test_cake_stage2_uses_direct_topk_metadata(monkeypatch):
         torch.Size((sequence, 1, 128)),
     )
     assert torch.count_nonzero(output) == 0
+
+
+def test_cake_stage2_step_selection_uses_native_for_excluded_step(monkeypatch):
+    metadata = VideoSparseAttentionMetadataBuilder().build(
+        current_timestep=2,
+        raw_latent_shape=(2, 8, 8),
+        patch_size=(1, 1, 1),
+        VSA_sparsity=0.5,
+        device=torch.device("cpu"),
+    )
+    sequence = metadata.variable_block_sizes.numel() * math.prod(VSA_TILE_SIZE)
+    query = torch.ones(1, sequence, 1, 128, dtype=torch.bfloat16)
+    captured = {}
+
+    def fake_video_sparse_attn(query, key, value, **kwargs):
+        captured["topk"] = kwargs["topk"]
+        return query
+
+    monkeypatch.setattr(vsa_module, "video_sparse_attn", fake_video_sparse_attn)
+    impl = object.__new__(VideoSparseAttentionImpl)
+    impl.stage2_backend = "cake"
+    impl.cake_step_indices = frozenset({0, 1})
+
+    output = impl.forward(query, query, query, query, metadata)
+
+    assert captured["topk"] == _compute_cur_topk(metadata)
+    assert torch.equal(output, query)
