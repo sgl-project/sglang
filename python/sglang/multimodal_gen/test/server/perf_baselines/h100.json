@@ -2998,7 +2998,7 @@
         "turbo_wan2_1_t2v_1.3b": 34340.0,
         "wan22_modelopt_fp8_t2v": 18736.0,
         "wan2_1_i2v_14b_480P_2gpu": 42674.0,
-        "wan2_1_i2v_14b_720P_2gpu": 50216.0,
+        "wan2_1_i2v_14b_720P_2gpu": 51230.0,
         "wan2_1_i2v_14b_lora_2gpu": 51132.0,
         "wan2_1_t2v_1.3b": 18078.0,
         "wan2_1_t2v_1.3b_cfg_parallel": 11972.0,

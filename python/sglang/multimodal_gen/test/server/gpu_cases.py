@@ -756,6 +756,8 @@ TWO_GPU_CASES = [
             extras=[
                 "--model-variant",
                 "ref2va",
+                "--revision",
+                "42ed227ee7df40d41602854ae760620d6eb651fe",
                 "--performance-mode",
                 "memory",
                 "--layerwise-offload-components",
