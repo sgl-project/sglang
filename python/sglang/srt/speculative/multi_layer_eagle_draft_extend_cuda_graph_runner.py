@@ -59,7 +59,7 @@ from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backen
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.runtime_context import get_flags
+from sglang.srt.runtime_context import get_flags, get_parallel, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
 from sglang.srt.speculative.multi_layer_eagle_utils import (
@@ -82,6 +82,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
 )
+from sglang.srt.utils.device_timer import device_timer_ctx
 
 if is_npu():
     from sglang.srt.speculative.multi_layer_eagle_utils import (
@@ -149,7 +150,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
         self.tp_size = model_runner.ps.tp_size
-        self.dp_size = model_runner.server_args.dp_size
+        self.dp_size = get_parallel().dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
@@ -158,10 +159,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         self.require_mlp_sync = require_mlp_sync(model_runner.server_args)
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         self.enable_pdmux = model_runner.server_args.enable_pdmux
-        self.speculative_num_steps = model_runner.server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = (
-            model_runner.server_args.speculative_num_draft_tokens
-        )
+        self.speculative_num_steps = get_spec().speculative_num_steps
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
@@ -190,10 +189,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         # tokens, which lets all steps share one buffer set.
         self.num_front_tokens = eagle_worker.draft_extend_num_front_tokens
         self.captured_req_width = (
-            resolve_num_tokens_per_req(
-                phase="draft_extend", server_args=model_runner.server_args
-            )
-            + self.num_front_tokens
+            resolve_num_tokens_per_req(phase="draft_extend") + self.num_front_tokens
         )
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
@@ -452,7 +448,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 self,
                 run_once,
                 post_warmup_hook=post_warmup_hook,
-                skip_logits=False,
+                run_lm_head=True,
             )
             self.backend.capture_one(
                 shape_key,
@@ -498,7 +494,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
 
         self.bs = bs
         shape_key = self._make_graph_key(bs)
-        return self._replay_graph(shape_key, fb_view)
+        with device_timer_ctx(self.model_runner.device_timer, "eagle_draft_extend"):
+            return self._replay_graph(shape_key, fb_view)
 
 
 class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
@@ -973,7 +970,10 @@ class OneGraphMultiLayerEagleMultiStepDraftExtendCudaGraphRunner(
                 if r is not None:
                     r.deepep_adapter.replay()
             shape_key = first._make_graph_key(self.bs)
-            outs = first.backend.replay(shape_key, self._replay_spec_info)
+            with device_timer_ctx(
+                first.model_runner.device_timer, "eagle_draft_extend"
+            ):
+                outs = first.backend.replay(shape_key, self._replay_spec_info)
             raw_bs = self.raw_bs
             self._cached = {}
             non_null = [r for r in self.runners if r is not None]

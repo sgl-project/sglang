@@ -234,9 +234,3 @@ class DisaggServerArgsMixin:
             default=cls.decoder_sp,
             help="Sequence parallelism for decoder role.",
         )
-        parser.add_argument(
-            "--decoder-tp",
-            type=int,
-            default=cls.decoder_tp,
-            help="Deprecated alias for --decoder-sp.",
-        )

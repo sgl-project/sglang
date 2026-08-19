@@ -466,18 +466,18 @@ class MultimemAllGatherer:
             # Lazy import avoids a module-load dependency on the distributed facade.
             from sglang.srt.distributed import get_tp_group
             from sglang.srt.distributed.parallel_state import in_the_same_node_as
-            from sglang.srt.runtime_context import get_server_args
+            from sglang.srt.runtime_context import get_parallel
 
             tp_group = get_tp_group()
             # Only probe node topology when the deployment can actually span
             # nodes. Check world_size first so a TP=1 gatherer short-circuits
-            # before reading server args (which may be unpublished on offline
-            # paths). On a single node every TP rank is co-located, so skip the
+            # before reading the parallel config (which may be unpublished on
+            # offline paths). On a single node every TP rank is co-located, so skip the
             # in_the_same_node_as() all-reduce, which can segfault under some
             # EP/mooncake setups, and keep multimem enabled.
             if (
                 tp_group.world_size > 1
-                and get_server_args().nnodes > 1
+                and get_parallel().nnodes > 1
                 and not all(in_the_same_node_as(tp_group.cpu_group, source_rank=0))
             ):
                 logger.warning(

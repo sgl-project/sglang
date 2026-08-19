@@ -13,32 +13,14 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
-from sglang.test.ci.ci_register import (
-    register_amd_ci,
-    register_cpu_ci,
-    register_cuda_ci,
-)
+from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
-
-import pytest as _pytest_defer
-
-_DEFER_REASON = (
-    "Temporarily skipped during the ServerArgs config-namespace migration; "
-    "re-enabled once the runtime-config accessor API stabilizes."
-)
-pytestmark = _pytest_defer.mark.skip(reason=_DEFER_REASON)
-
-
-def setUpModule():
-    import unittest
-
-    raise unittest.SkipTest(_DEFER_REASON)
 
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
@@ -109,6 +91,15 @@ def _make_backend_factory(decode_backend, draft_extend_backend, captured_kwargs=
 
 
 class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
+    def setUp(self):
+        # _rebuild_topk1_chain_buffers sizes its preallocation from the
+        # published config: get_exec().graph.cuda_graph_config stays None on
+        # the dummy-boundary publish (no resolution), so
+        # get_schedule().max_running_requests alone sizes the buffers.
+        override = get_context().override_server_args(max_running_requests=8)
+        override.install()
+        self.addCleanup(override.restore)
+
     def test_fast_path_matches_slow_path(self):
         bs = 3
         for num_steps in (1, 2, 3, 4):
@@ -145,6 +136,13 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
 
 
 class TestEagleWorkerV2BackendFallback(CustomTestCase):
+    def setUp(self):
+        # The adaptive state-machine paths write live spec switches through
+        # get_context().override, which needs a published config.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
     def test_missing_seed_cuda_graph_fallback(self):
         graph_result = (
             [],
@@ -186,7 +184,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
                 worker.draft_forward = MagicMock(return_value=graph_result)
                 attn_backend = SimpleNamespace(
-                    get_verify_buffers_to_fill_after_draft=lambda: (None, None),
+                    verify_mask=None,
                     max_context_len=1,
                 )
                 worker.target_worker = SimpleNamespace(

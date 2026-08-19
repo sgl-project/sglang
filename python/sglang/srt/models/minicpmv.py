@@ -1640,6 +1640,14 @@ class MiniCPMV:
 
     minicpmv: nn.Module
 
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        # 4.6 nests a Qwen3.5 LLM under ``text_config``; every other version
+        # builds a dense LLM, for which the Qwen3.5 gate answers None.
+        return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(
+            getattr(hf_config, "text_config", hf_config), quant_config
+        )
+
     def __init__(
         self,
         config: PretrainedConfig,

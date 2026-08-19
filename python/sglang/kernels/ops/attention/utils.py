@@ -31,6 +31,9 @@ from sglang.kernels.ops.kvcache.cache_ops import (
     launch_reshape_and_cache_flash as launch_reshape_and_cache_flash,
 )
 from sglang.kernels.ops.kvcache.cache_ops import (
+    q8kv8_topk_length_from_indices as q8kv8_topk_length_from_indices,
+)
+from sglang.kernels.ops.kvcache.cache_ops import (
     reshape_and_cache_flash as reshape_and_cache_flash,
 )
 from sglang.kernels.ops.kvcache.kv_indices import (

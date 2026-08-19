@@ -15,8 +15,8 @@ from utils import (
 # Docs pages that pin a release branch in their "install from source" snippet,
 # e.g. `git clone -b v0.5.12 https://github.com/sgl-project/sglang.git`.
 FILES_TO_UPDATE = [
-    Path("docs_new/docs/get-started/install.mdx"),
-    Path("docs_new/docs/hardware-platforms/amd_gpu.mdx"),
+    Path("docs/docs/get-started/install.mdx"),
+    Path("docs/docs/hardware-platforms/amd_gpu.mdx"),
 ]
 
 # Matches `git clone -b v<version> https://github.com/sgl-project/sglang.git`,

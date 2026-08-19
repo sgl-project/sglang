@@ -7,16 +7,13 @@
 //!
 //! Port of the design enum:
 //! ```text
-//! Received, Validating, Normalizing, Encoding, Tokenizing, Queued,
-//! Streaming { chunks_sent }, Finalizing, Completed, Failed(Error), Aborted
+//! Received, Validating, Normalizing, Encoding, Tokenizing, PreSendValidating,
+//! Queued, Streaming { chunks_sent }, Finalizing, Completed, Failed(Error),
+//! Aborted
 //! ```
-#![allow(dead_code)] // TODO: remove when the consumer PR lands
 
 use crate::error::Error;
 
-// `Failed(Error)` carries the cause for observability even where it isn't read
-// back yet; `EncodeDone` belongs to the deferred Encoder edge.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum RequestState {
     Received,
@@ -25,6 +22,10 @@ pub enum RequestState {
     Normalizing,
     Encoding,
     Tokenizing,
+    /// Every branch converges here with its final `input_ids`, for the checks
+    /// that need the tokenized length (the input + `max_new_tokens` ceiling).
+    /// The last state before the request leaves Rust.
+    PreSendValidating,
     Queued,
     Streaming {
         chunks_sent: u64,
@@ -38,18 +39,17 @@ pub enum RequestState {
 /// Outcome of validation, selecting the ingress branch.
 #[derive(Debug, Clone, Copy)]
 pub enum ValidationOutcome {
-    /// Has multimodal inputs → Encoding. Deferred: no encoder yet.
-    #[allow(dead_code)]
+    /// Has multimodal inputs → Encoding, where an MM worker runs the native
+    /// pipeline and returns the final expanded `input_ids`.
     HasMultimodal,
     /// Plain text → Tokenizing.
     NeedsTokenize,
-    /// Caller already supplied token ids → straight to Queued.
+    /// Caller already supplied token ids → straight to the pre-send checks.
     AlreadyTokenized,
 }
 
 /// Events that drive transitions. Each variant maps 1:1 to an edge in the
 /// design's transition table.
-#[allow(dead_code)] // EncodeDone is the deferred Encoder edge.
 #[derive(Debug)]
 pub enum Event {
     // --- ingress ---
@@ -57,9 +57,13 @@ pub enum Event {
     NeedsNormalize,
     EncodeDone,
     TokenizeDone,
+    /// The pre-send checks passed; the request may be pushed to the ring.
+    PreSendValidated,
     SchedulerPicked,
     // --- egress ---
-    Chunk { finish: bool },
+    Chunk {
+        finish: bool,
+    },
     FinalFrameSent,
     // --- terminal (valid from any state) ---
     Error(Error),
@@ -112,14 +116,21 @@ impl RequestState {
             // ingress
             (Received, Validated(_)) => Validating,
             // Generate requests pass through Normalizing (sampling-param
-            // normalize/verify); control requests skip straight to Queued.
+            // normalize/verify); control requests skip it, having none.
             (Validating, NeedsNormalize) => Normalizing,
-            (Validating, Validated(AlreadyTokenized)) => Queued,
+            (Validating, Validated(AlreadyTokenized)) => PreSendValidating,
             (Normalizing, Validated(HasMultimodal)) => Encoding,
             (Normalizing, Validated(NeedsTokenize)) => Tokenizing,
-            (Normalizing, Validated(AlreadyTokenized)) => Queued,
-            (Encoding, EncodeDone) => Tokenizing,
-            (Tokenizing, TokenizeDone) => Queued,
+            (Normalizing, Validated(AlreadyTokenized)) => PreSendValidating,
+            // The MM worker returns the *final* placeholder-expanded input_ids,
+            // so an encoded request skips the tokenizer pool — but not the
+            // pre-send checks: expanded image tokens count against the same
+            // input + max_new_tokens ceiling as tokenized text.
+            (Encoding, EncodeDone) => PreSendValidating,
+            // Every ingress branch funnels through the pre-send checks, so they
+            // run exactly once per request no matter how it got its ids.
+            (Tokenizing, TokenizeDone) => PreSendValidating,
+            (PreSendValidating, PreSendValidated) => Queued,
             (Queued, SchedulerPicked) => Streaming { chunks_sent: 0 },
             // egress
             (Streaming { chunks_sent }, Chunk { finish: false }) => Streaming {
@@ -131,5 +142,61 @@ impl RequestState {
         };
         *self = next;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn after(mut state: RequestState, event: Event) -> RequestState {
+        state.apply(event).expect("edge must exist");
+        state
+    }
+
+    /// Every ingress branch — control, client-supplied ids, and text through the
+    /// tokenizer pool — must land in `PreSendValidating`, because that is where
+    /// the checks needing the final `input_ids` run. A branch that reached
+    /// `Queued` directly would skip them silently.
+    #[test]
+    fn every_branch_reaches_the_ring_through_pre_send_validating() {
+        for from in [
+            after(
+                RequestState::Validating,
+                Event::Validated(ValidationOutcome::AlreadyTokenized),
+            ),
+            after(
+                RequestState::Normalizing,
+                Event::Validated(ValidationOutcome::AlreadyTokenized),
+            ),
+            after(RequestState::Tokenizing, Event::TokenizeDone),
+        ] {
+            assert!(
+                matches!(from, RequestState::PreSendValidating),
+                "branch bypassed the pre-send checks: {from:?}"
+            );
+            assert!(matches!(
+                after(from, Event::PreSendValidated),
+                RequestState::Queued
+            ));
+        }
+    }
+
+    /// The converse: `Queued` has no other in-edge, so the checks can't be skipped
+    /// by emitting the wrong event, and can't run twice.
+    #[test]
+    fn queued_has_no_other_in_edge() {
+        for mut state in [
+            RequestState::Validating,
+            RequestState::Normalizing,
+            RequestState::Tokenizing,
+            RequestState::Queued,
+        ] {
+            assert_eq!(
+                state.apply(Event::PreSendValidated),
+                Err(TransitionError::Illegal),
+                "only PreSendValidating may enter Queued"
+            );
+        }
     }
 }

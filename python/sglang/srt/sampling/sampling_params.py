@@ -46,7 +46,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     """
     The sampling parameters.
 
-    See docs_new/docs/basic_usage/sampling_params.mdx
+    See docs/docs/basic_usage/sampling_params.mdx
     for the documentation.
     """
 
@@ -134,6 +134,12 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.no_stop_trim if self.no_stop_trim is not None else False
         )
 
+        # An empty grammar constraint means "unset", not "constrain to nothing".
+        self.json_schema = self.json_schema or None
+        self.regex = self.regex or None
+        self.ebnf = self.ebnf or None
+        self.structural_tag = self.structural_tag or None
+
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
             # top_k = 1 means greedy sampling
@@ -196,9 +202,12 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.json_schema,
             self.regex,
             self.ebnf,
+            self.structural_tag,
         ]  # since mutually exclusive, only one can be set
         if sum(x is not None for x in grammars) > 1:
-            raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
+            raise ValueError(
+                "Only one of json_schema, regex, ebnf, or structural_tag can be set."
+            )
 
     def normalize(self, tokenizer):
         # Process stop strings

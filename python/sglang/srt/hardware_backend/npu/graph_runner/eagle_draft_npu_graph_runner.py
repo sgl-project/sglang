@@ -88,7 +88,7 @@ class EAGLEDraftNpuGraphRunner(EAGLEDraftCudaGraphRunner):
 
     def _replay_graph(self, shape_key, forward_batch):
         hf_config = self.model_runner.model_config.hf_config
-        if not (is_deepseek_dsa(hf_config) and is_deepseek_v4(hf_config)):
+        if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
             seq_lens_for_each_draft_step = []
             for speculative_step_id in range(self.speculative_num_steps - 1):
                 seq_lens_cpu = (
