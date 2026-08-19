@@ -240,38 +240,37 @@ def _resolve_warmup_num_frames(
     server_based_warmup: bool,
 ) -> int:
     num_frames = getattr(sampling_defaults, "num_frames", 1)
-    if (
-        not server_based_warmup
-        or not _is_video_warmup_task(server_args)
-        or num_frames is None
-    ):
-        # use default num frames
+    if not _is_video_warmup_task(server_args) or num_frames is None:
         return num_frames
 
     # Breakable CUDA graph replays only exact latent shapes: the warmup
     # request must run the full serving frame count so its captured graphs
     # match serving signatures (mirrors the uncapped-steps rule in
     # _resolve_warmup_steps).
-    if getattr(server_args, "enable_breakable_cuda_graph", False) is True:
-        return num_frames
+    if (
+        not server_based_warmup
+        or getattr(server_args, "enable_breakable_cuda_graph", False) is True
+    ):
+        warmup_num_frames = num_frames
+    else:
+        warmup_num_frames = min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
 
-    capped_num_frames = min(num_frames, SERVER_WARMUP_MAX_VIDEO_FRAMES)
     return _apply_warmup_frame_contract(
-        server_args, sampling_defaults, num_frames=capped_num_frames
+        server_args, sampling_defaults, num_frames=warmup_num_frames
     )
 
 
 def _apply_warmup_frame_contract(
     server_args: ServerArgs, sampling_defaults: SamplingParams, *, num_frames: int
 ) -> int:
-    """Re-apply the real-request frame contract to a capped warmup frame count.
+    """Re-apply the real-request frame contract to a warmup frame count.
 
-    Warmup requests skip ``SamplingParams._adjust``, so the cap must run the
-    model frame contract itself -- without this, e.g. LongLive2's capped 17
-    frames map to 5 latent frames (not divisible by its 8-frame causal block)
-    and every server warmup fails silently under fail-open. Pipelines that
-    align frames to ``num_gpus`` (rather than sharding the sequence dim) get
-    the same latent alignment real requests get.
+    Warmup requests skip ``SamplingParams._adjust``, so the builder must run
+    the model frame contract itself -- without this, e.g. LongLive2's capped
+    17 frames map to 5 latent frames (not divisible by its 8-frame causal
+    block) and every server warmup fails silently under fail-open. Pipelines
+    that align frames to ``num_gpus`` (rather than sharding the sequence dim)
+    get the same latent alignment real requests get.
     """
     num_frames = server_args.pipeline_config.adjust_num_frames(num_frames)
     if sampling_defaults.adjust_frames and not resolve_sequence_shard(
