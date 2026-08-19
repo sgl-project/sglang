@@ -1285,27 +1285,28 @@ class KVCacheConfigurator:
 
         indexer_layer_ids = None
         if is_dsa_model:
-            is_nextn = self.is_draft_worker and bool(
-                self.model_config.num_nextn_predict_layers
-            )
-            indexer_layer_ids = resolve_dsa_indexer_layer_ids(
-                self.model_config.hf_config,
-                self.layer_info.start_layer,
-                self.layer_info.end_layer,
-                is_nextn=is_nextn,
-            )
-            logger.info(
-                "NPU DSA Indexer cache uses %d physical layer(s) for %d "
-                "local transformer layer(s): %s",
-                len(indexer_layer_ids),
-                self.layer_info.num_effective_layers,
-                indexer_layer_ids,
-            )
-        elif is_dsa_model:
-            logger.info(
-                "NPU DSA Indexer cache keeps the uniform all-layer layout "
-                "for PD disaggregation or HiCache compatibility."
-            )
+            if can_use_compact_npu_dsa_indexer_cache(self.server_args):
+                is_nextn = self.is_draft_worker and bool(
+                    self.model_config.num_nextn_predict_layers
+                )
+                indexer_layer_ids = resolve_dsa_indexer_layer_ids(
+                    self.model_config.hf_config,
+                    self.layer_info.start_layer,
+                    self.layer_info.end_layer,
+                    is_nextn=is_nextn,
+                )
+                logger.info(
+                    "NPU DSA Indexer cache uses %d physical layer(s) for %d "
+                    "local transformer layer(s): %s",
+                    len(indexer_layer_ids),
+                    self.layer_info.num_effective_layers,
+                    indexer_layer_ids,
+                )
+            else:
+                logger.info(
+                    "NPU DSA Indexer cache keeps the uniform all-layer layout "
+                    "for PD disaggregation or HiCache compatibility."
+                )
 
         enable_quant_lightning_indexer = (
             is_dsa_model
