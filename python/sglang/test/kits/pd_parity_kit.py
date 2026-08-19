@@ -9,20 +9,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-KIMI_LINEAR_MODEL = "yujiepan/kimi-linear-tiny-random"
-SERVER_ENV = {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"}
 
-
-class KimiLinearPDParityMixin:
+class PDLogprobParityMixin:
+    # Mix in before the PD server fixture, which owns the P/D launches.
     reference_parallel_args = []
     baseline_args = []
-    extra_prefill_env = SERVER_ENV
-    extra_decode_env = SERVER_ENV
-
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        cls.model = KIMI_LINEAR_MODEL
 
     @staticmethod
     def generate(base_url):
@@ -51,7 +42,7 @@ class KimiLinearPDParityMixin:
             other_args=self.reference_parallel_args
             + ["--trust-remote-code"]
             + self.baseline_args,
-            env=SERVER_ENV,
+            env=self.extra_prefill_env,
         )
         try:
             reference = self.generate(self.lb_url)

@@ -1,14 +1,15 @@
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.pd_parity_kit import PDLogprobParityMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.server_fixtures.kimi_linear_pd_fixture import (
-    KimiLinearPDParityMixin,
-)
 
 register_cuda_ci(est_time=900, stage="base-b", runner_config="2-gpu-large")
+
+KIMI_LINEAR_MODEL = "yujiepan/kimi-linear-tiny-random"
+SERVER_ENV = {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"}
 
 # --attention-backend and --enable-deterministic-inference are deliberately
 # absent: bytes are backend-independent and both paths run identical shapes.
@@ -33,12 +34,13 @@ UNIFIED_MEMORY_ARGS = [
 ]
 
 
-class TestUnifiedMemoryDisaggregation(
-    KimiLinearPDParityMixin, PDDisaggregationServerBase
-):
+class TestUnifiedMemoryDisaggregation(PDLogprobParityMixin, PDDisaggregationServerBase):
     """1 prefill + 1 decode, both with --enable-unified-memory, vs a non-PD
     unified-memory reference server."""
 
+    model = KIMI_LINEAR_MODEL
+    extra_prefill_env = SERVER_ENV
+    extra_decode_env = SERVER_ENV
     prefill_tp_size = 1
     decode_tp_size = 1
     decode_base_gpu_id = 1

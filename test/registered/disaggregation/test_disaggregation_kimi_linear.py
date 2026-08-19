@@ -1,14 +1,15 @@
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.pd_parity_kit import PDLogprobParityMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
-from sglang.test.server_fixtures.kimi_linear_pd_fixture import (
-    KimiLinearPDParityMixin,
-)
 
 register_cuda_ci(est_time=480, stage="base-c", runner_config="4-gpu-h100")
+
+KIMI_LINEAR_MODEL = "yujiepan/kimi-linear-tiny-random"
+SERVER_ENV = {"SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0"}
 
 DETERMINISTIC_ARGS = [
     "--skip-tokenizer-init",
@@ -27,8 +28,11 @@ DETERMINISTIC_ARGS = [
 
 
 class TestKimiLinearHeterogeneousTPDisaggregation(
-    KimiLinearPDParityMixin, PDDisaggregationServerBase
+    PDLogprobParityMixin, PDDisaggregationServerBase
 ):
+    model = KIMI_LINEAR_MODEL
+    extra_prefill_env = SERVER_ENV
+    extra_decode_env = SERVER_ENV
     prefill_tp_size = 2
     decode_tp_size = 1
     decode_base_gpu_id = 2
