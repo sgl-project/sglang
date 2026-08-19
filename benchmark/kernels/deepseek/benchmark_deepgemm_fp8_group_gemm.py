@@ -435,8 +435,8 @@ def get_benchmark(tp_size):
         flops = 2 * m * n * k  # multiply-adds
         tflops = flops / (ms * 1e-3) / 1e12
 
-        print(f"Time: {ms*1000:.2f} ms, TFLOPS: {tflops:.2f}")
-        return ms * 1000, max_ms * 1000, min_ms * 1000  # convert to ms
+        print(f"Time: {ms:.3f} ms, TFLOPS: {tflops:.2f}")
+        return ms, min_ms, max_ms
 
     return benchmark
 
