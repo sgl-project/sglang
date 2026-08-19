@@ -658,6 +658,17 @@ def _wait_for_server_health(
     return False, "Server failed to start within the timeout period"
 
 
+def unified_radix_tree_server_env(
+    tree_core_backend: str, **extra_env: str
+) -> dict[str, str]:
+    return {
+        **os.environ,
+        **extra_env,
+        "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
+        "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": tree_core_backend,
+    }
+
+
 def popen_launch_server(
     model: str,
     base_url: str,

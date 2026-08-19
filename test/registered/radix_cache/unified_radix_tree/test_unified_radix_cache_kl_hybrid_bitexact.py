@@ -67,6 +67,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    unified_radix_tree_server_env,
 )
 
 register_cuda_ci(est_time=2300, stage="base-b", runner_config="1-gpu-large")
@@ -121,14 +122,6 @@ def _base_args(mamba_strategy: str = "extra_buffer") -> list[str]:
     ]
 
 
-def _server_env(tree_core_backend: str) -> dict[str, str]:
-    return {
-        **os.environ,
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
-        "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": tree_core_backend,
-    }
-
-
 class TestUnifiedHybridBitExact(CustomTestCase):
     """Prefill and decode must score a token identically once every kernel on the
     path is batch-invariant, so any drift is a stale conv/mamba checkpoint or a
@@ -162,7 +155,7 @@ class TestUnifiedHybridBitExact(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env=_server_env(cls.tree_core_backend),
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
 
     @classmethod
@@ -220,7 +213,7 @@ class TestUnifiedHybridLazyBitExact(TestUnifiedHybridBitExact):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env=_server_env(cls.tree_core_backend),
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
 
 
@@ -273,7 +266,7 @@ class TestUnifiedHybridHiCacheBitExact(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env=_server_env(cls.tree_core_backend),
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
         cls.input_ids = get_input_ids(
             tokenizer_path=cls.model, num_samples=9, trust_remote_code=True
@@ -355,7 +348,7 @@ class TestUnifiedHybridMTPBitExact(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
-            env=_server_env(cls.tree_core_backend),
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
         )
 
     @classmethod
