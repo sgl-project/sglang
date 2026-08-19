@@ -311,7 +311,7 @@ class HunyuanDetector(BaseFormatDetector):
 
                 calls.append(
                     ToolCallItem(
-                        tool_index=tool_indices.get(function_name, -1),
+                        tool_index=len(calls),
                         name=function_name,
                         parameters=json.dumps(arg_dict, ensure_ascii=False),
                     )
