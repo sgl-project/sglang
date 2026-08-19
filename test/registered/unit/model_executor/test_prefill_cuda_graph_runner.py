@@ -122,20 +122,51 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         model_runner = SimpleNamespace(
             is_draft_worker=False,
             spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
-            server_args=SimpleNamespace(),
+            server_args=SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(
+                    prefill=SimpleNamespace(backend=Backend.TC_PIECEWISE)
+                )
+            ),
         )
 
-        with patch.object(
-            graph_setup,
-            "check_cuda_graph_backend",
-            return_value=False,
-        ):
-            capture = capture_prefill_graph(
-                model_runner=model_runner,
-                eager_runner=eager_runner,
-            )
+        capture = capture_prefill_graph(
+            model_runner=model_runner,
+            eager_runner=eager_runner,
+        )
 
         self.assertIs(capture.runner, eager_runner)
+
+    def test_eagle_target_full_reaches_graph_construction(self):
+        override = get_context().override_server_args(
+            enable_return_hidden_states=True,
+            return_hidden_states_mode="last",
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        model_runner = SimpleNamespace(
+            is_draft_worker=False,
+            model=object(),
+            spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
+            server_args=SimpleNamespace(
+                enable_lora=False,
+                cuda_graph_config=SimpleNamespace(
+                    prefill=SimpleNamespace(backend=Backend.FULL)
+                ),
+            ),
+        )
+
+        with (
+            patch.object(
+                graph_setup,
+                "resolve_language_model",
+                side_effect=RuntimeError("reached graph construction"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "reached graph construction"),
+        ):
+            capture_prefill_graph(
+                model_runner=model_runner,
+                eager_runner=object(),
+            )
 
     def test_prefix_chunk_capacity_is_aggregate_and_can_be_overridden(self):
         model_runner = SimpleNamespace(

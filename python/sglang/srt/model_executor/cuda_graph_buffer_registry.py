@@ -815,7 +815,7 @@ def build_prefill_registry(
     source: Optional[Any] = None,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the **token-axis** FB-shared buffers for the
-    piecewise / breakable (prefill) cuda-graph runners.
+    piecewise / breakable / full (prefill) cuda-graph runners.
 
     ``register_input_embeds`` (default ``True``) registers the multimodal
     ``input_embeds`` slot; the eager extend path passes ``False`` so it is
@@ -910,13 +910,18 @@ def build_prefill_registry(
             # blank real tokens whenever raw < bucket. Recompute the local
             # count against the padded bucket from the batch's un-adjusted
             # global count, mirroring the decode registry's post_fill.
-            if require_gathered_buffer and not enable_prefill_cp:
-                buf.fill_(
-                    compute_local_num_token_non_padded_cpu(
-                        global_num_token_non_padded=fb.num_token_non_padded_cpu,
-                        num_tokens_per_dp=ctx.padded_num_tokens,
+            if require_gathered_buffer:
+                if not enable_prefill_cp:
+                    buf.fill_(
+                        compute_local_num_token_non_padded_cpu(
+                            global_num_token_non_padded=fb.num_token_non_padded_cpu,
+                            num_tokens_per_dp=ctx.padded_num_tokens,
+                        )
                     )
-                )
+            else:
+                # Non-gathered FullCG still needs the live boundary rather
+                # than a stale/absent ForwardBatch tensor.
+                buf.fill_(ctx.raw_num_tokens)
 
         slots.append(
             GraphSlot(
