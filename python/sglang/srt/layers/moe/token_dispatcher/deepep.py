@@ -109,7 +109,7 @@ def _is_mnnvl_fabric_supported() -> bool:
     return is_mnnvl_fabric_supported(torch.cuda.current_device())
 
 
-_V2_TIMING = get_bool_env_var("SGLANG_DEEPEP_V2_TIMING", default="false")
+_V2_TIMING = envs.SGLANG_DEEPEP_V2_TIMING.get()
 _v2_timing_state = {"n": 0, "dispatch_s": 0.0, "combine_s": 0.0}
 
 
@@ -277,7 +277,7 @@ class DeepEPBuffer:
         # `get_combine_config` / `get_nvl_buffer_size_hint` /
         # `get_rdma_buffer_size_hint` calls). Gated behind an env var so
         # the default code path is byte-identical to V1.
-        if have_deepep_v2 and get_bool_env_var("SGLANG_DEEPEP_USE_V2", default="false"):
+        if have_deepep_v2 and envs.SGLANG_DEEPEP_USE_V2.get():
             # Cache on `state.buffer` — the SAME slot the guard at the top of
             # this function checks. An earlier revision wrote `cls._buffer`
             # here, which the guard never reads, so every `_get_buffer()`

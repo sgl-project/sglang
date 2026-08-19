@@ -1018,6 +1018,13 @@ class Envs:
     # semantic token limit; large prefill/chunked-prefill workloads may need a
     # larger value.
     SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # Opt-in: build the classic deepep dispatcher's buffer as a DeepEP v2
+    # ElasticBuffer (MoE-shape ctor, auto-QP sizing). Default keeps the
+    # legacy Buffer path byte-identical.
+    SGLANG_DEEPEP_USE_V2 = EnvBool(False)
+    # Measurement-only wall-clock timing around the V2 dispatch/combine call
+    # sites (synchronizes CUDA; never enable in a perf run).
+    SGLANG_DEEPEP_V2_TIMING = EnvBool(False)
     # 0 lets DeepEP v2 ElasticBuffer choose the communication SM count.
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
