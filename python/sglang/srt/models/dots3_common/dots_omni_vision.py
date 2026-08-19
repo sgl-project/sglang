@@ -3,7 +3,6 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from deep_gemm import per_block_cast_to_fp8
 from torch import nn
 from torch.nn import LayerNorm
 from transformers.configuration_utils import PretrainedConfig
@@ -238,6 +237,8 @@ def _per_block_cast_to_fp8_padded(
         raise ValueError(f"expected 2D tensor, got shape={tuple(x.shape)}")
     if gran_k <= 0:
         raise ValueError(f"gran_k must be positive, got {gran_k}")
+
+    from deep_gemm import per_block_cast_to_fp8
 
     m, n = int(x.shape[0]), int(x.shape[1])
     m_pad = _ceil_to_multiple(m, gran_k)

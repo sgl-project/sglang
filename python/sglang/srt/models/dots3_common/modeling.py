@@ -137,12 +137,20 @@ _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
 _device_sm = get_device_sm()
 
-if not _is_cuda:
-    raise RuntimeError("Dots3 model only supports CUDA backend.")
+# Import-time CUDA kernels would block processor imports on CPU CI.
+if _is_cuda:
+    from sgl_kernel import merge_state_v2
 
-from sgl_kernel import merge_state_v2
+    from sglang.kernels.ops.gemm.dsv3_router_gemm import dsv3_router_gemm
+else:
+    merge_state_v2 = None
+    dsv3_router_gemm = None
 
-from sglang.kernels.ops.gemm.dsv3_router_gemm import dsv3_router_gemm
+
+def _require_cuda() -> None:
+    if not _is_cuda:
+        raise RuntimeError("Dots3 model only supports CUDA backend.")
+
 
 logger = logging.getLogger(__name__)
 
@@ -1516,6 +1524,7 @@ class Dots3DecoderLayer(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         super().__init__()
+        _require_cuda()
         self.hidden_size = config.hidden_size
         self.config = config
         self.layer_id = layer_id
@@ -1718,6 +1727,7 @@ class Dots3Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        _require_cuda()
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
 

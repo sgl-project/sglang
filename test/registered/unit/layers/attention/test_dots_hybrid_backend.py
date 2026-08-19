@@ -3,6 +3,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+
+from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+maybe_stub_sgl_kernel()
+
 import torch
 
 from sglang.srt.layers.attention.dots_hybrid_backend import (
