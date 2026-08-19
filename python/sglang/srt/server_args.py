@@ -9669,6 +9669,13 @@ class ServerArgs:
         ``--speculative-draft-load-format`` needs its own transfer engine."""
         return remote_instance_transfer_engine_of(self, load_format)
 
+    @property
+    def kv_event_block_size(self) -> int:
+        """Width KV events are emitted at: under DCP the radix tree pages at
+        ``page_size * dcp_size`` (``mem_cache/kv_cache_builder.py``).
+        """
+        return self.page_size * self.dcp_size
+
     def describe_kv_events_publisher(self) -> Optional[dict]:
         """Return a structured description of this server's KV-event
         publisher, or `None` if publishing is disabled / misconfigured.
@@ -9694,10 +9701,13 @@ class ServerArgs:
                 "topic": "",                      # ZMQ topic prefix on the
                                                   # SUB filter (empty =
                                                   # subscribe-all)
-                "block_size": <page_size>,        # subscribers MUST hash
-                                                  # prompts at this size
-                "dp_size": <dp_size>,             # number of SUB sockets
-                                                  # to open
+                "block_size": <kv_event_block_size>,  # subscribers MUST
+                                                  # hash prompts at this size
+                "dp_size": <dp_size>,             # number of SUB sockets to
+                                                  # open; not DCP-scaled, as
+                                                  # DCP shards within a rank
+                                                  # rather than adding
+                                                  # publishers
             }
 
         Returns None (i.e. "no publisher to describe") when any of:
@@ -9752,7 +9762,7 @@ class ServerArgs:
             "endpoint_host": host,
             "endpoint_port_base": port,
             "topic": cfg.topic,
-            "block_size": page_size,
+            "block_size": self.kv_event_block_size,
             "dp_size": self.dp_size,
         }
 
