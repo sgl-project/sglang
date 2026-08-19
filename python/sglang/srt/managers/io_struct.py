@@ -206,7 +206,6 @@ class GenerateReqInput:
     use_audio_in_video: bool = False
     # Request-scoped dots.note.omni video preprocessing configuration.
     seq: int = 131072
-    output_reserve: Optional[int] = None
     audio_cap: float = 1.0
     audio_sr: int = 16000
     k_mode: str = "eval_ek"

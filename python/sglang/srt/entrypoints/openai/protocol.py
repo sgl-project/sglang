@@ -869,7 +869,6 @@ class ChatCompletionRequest(BaseModel):
 
     # Per-request dots.note.omni video preprocessing controls.
     seq: int = Field(default=131072, gt=0)
-    output_reserve: Optional[int] = Field(default=None, ge=0)
     audio_cap: float = Field(default=1.0, ge=0)
     audio_sr: int = Field(default=16000, gt=0)
     k_mode: str = "eval_ek"
@@ -941,8 +940,6 @@ class ChatCompletionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_dots_video_preprocess_config(self):
-        if self.output_reserve is not None and self.output_reserve >= self.seq:
-            raise ValueError("output_reserve must be smaller than seq")
         if not self.k_mode:
             raise ValueError("k_mode must not be empty")
         return self

@@ -40,7 +40,6 @@ _VIDEO_PREPROCESS_LOCK = threading.Lock()
 def _build_video_cfg(
     *,
     seq: int,
-    output_reserve: int | None,
     audio_cap: float,
     audio_sr: int,
     max_new_tokens: int,
@@ -49,12 +48,10 @@ def _build_video_cfg(
         raise ValueError(f"seq must be positive, got {seq}")
     if max_new_tokens < 0:
         raise ValueError(f"max_new_tokens must be non-negative, got {max_new_tokens}")
-    configured_reserve = seq // 4 if output_reserve is None else output_reserve
-    effective_reserve = max(configured_reserve, max_new_tokens)
-    if effective_reserve >= seq:
+    if max_new_tokens >= seq:
         raise ValueError(
-            "output_reserve/max_new_tokens must leave room for input: "
-            f"reserve={effective_reserve}, seq={seq}"
+            "max_new_tokens must leave room for input: "
+            f"max_new_tokens={max_new_tokens}, seq={seq}"
         )
     if audio_cap < 0:
         raise ValueError(f"audio_cap must be non-negative, got {audio_cap}")
@@ -63,7 +60,7 @@ def _build_video_cfg(
 
     return {
         "process_audio": audio_cap > 0,
-        "seq_length": seq - effective_reserve,
+        "seq_length": seq - max_new_tokens,
         "reserve_interleave": True,
         "audio_token_ratio_cap": float(audio_cap),
         "audio_sample_rate": int(audio_sr),
@@ -128,7 +125,6 @@ def preprocess_dots_video(
     *,
     tokenizer,
     seq: int = 131072,
-    output_reserve: int | None = None,
     audio_cap: float = 1.0,
     audio_sr: int = 16000,
     k_mode: str = "eval_ek",
@@ -141,7 +137,6 @@ def preprocess_dots_video(
         video_bytes, video_id = _video_payload(raw_video)
         cfg = _build_video_cfg(
             seq=seq,
-            output_reserve=output_reserve,
             audio_cap=audio_cap,
             audio_sr=audio_sr,
             max_new_tokens=max_new_tokens,
@@ -334,7 +329,6 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
                     question,
                     tokenizer=self._tokenizer,
                     seq=request_obj.seq,
-                    output_reserve=request_obj.output_reserve,
                     audio_cap=request_obj.audio_cap,
                     audio_sr=request_obj.audio_sr,
                     k_mode=request_obj.k_mode,

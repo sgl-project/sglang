@@ -1074,7 +1074,6 @@ class OpenAIServingChat(OpenAIServingBase):
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
             seq=request.seq,
-            output_reserve=request.output_reserve,
             audio_cap=request.audio_cap,
             audio_sr=request.audio_sr,
             k_mode=request.k_mode,
