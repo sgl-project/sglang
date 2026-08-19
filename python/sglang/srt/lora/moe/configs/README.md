@@ -184,6 +184,13 @@ rank-0 torch profile:
 Those are after the per-block counting below. Before it they were 43.7us /
 1.75ms / 2.4% and 116.4us / 4.66ms / 5.4%.
 
+Wall clock for that change, shared-outer arm, no profiler attached: prefill
+73.75 -> 70.53ms median, 4.37% faster. Four interleaved servers off/on/off/on,
+8 repeats each, and the two arms' ranges do not overlap (off floor 72.56 vs on
+ceiling 71.44), which is the only reason a 4% effect is believable here -- the
+same measurement WITH the profiler attached swung 71-100ms on one config.
+Removing 3.35ms of kernel time bought 3.22ms of wall clock.
+
 Read that before optimizing either file. The shared-outer plan needs two
 aligned views at once, so it takes the JOINT builder and `fused_align` never
 runs; the per-expert plan needs one and takes `fused_align`. Per-expert DECODE
@@ -243,6 +250,16 @@ What is left: the counting path is bounded at 512 bins, so a per-expert route
 with more than 511 buckets -- 256 experts with 2 or more adapter slots -- still
 counts one pair at a time. Raising `COUNT_MAX_BINS` needs 1024 measured first;
 2048 is known to lose.
+
+MEASURED AND DECLINED, so nobody re-derives it: the plan kernel's `CHUNK` is a
+flat 2048 lanes whatever the bucket count, which is 8x wider than the 257
+buckets a per-expert route has and 1024x wider than the shared route's 2.
+Narrowing it to fit does help that kernel -- at 257 buckets a 512 tile is
+1.70us against 2.10us, and at 2 buckets a 16 tile is 1.31us against 1.98us --
+but the joint kernel scans both routes as two concurrent programs, so only the
+wider one sets the duration: 2.10 -> 1.70us, 0.4us per layer. That is 0.5% of a
+decode step and 0.02% of a prefill, well under what an end-to-end A/B can
+resolve, so the flat 2048 stays. Above 1024 buckets 2048 is simply correct.
 
 Not a lead, and worth recording so nobody re-derives it: the padding fill's
 2D tile is `EXPAND_BLOCK x routing_block_size`, which looks like it should
