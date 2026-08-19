@@ -23,16 +23,28 @@ A plain fp32 single-pass norm fusion looks harmless and is not. On ERNIE-Image i
 ## Enabling the request-gated set
 
 ```bash
-sglang generate --model-path <model> --prompt "..." --quality high
+sglang generate --model-path MODEL_PATH --prompt "..." --quality high
 ```
 
-The server default stays `lossless`; the OpenAI-compatible endpoints carry it per request:
+The server default stays `lossless`; the OpenAI-compatible endpoints carry it per request. Images:
 
 ```bash
 curl -X POST http://${HOST}:${PORT}/v1/images/generations \
   -H 'Content-Type: application/json' \
-  -d '{"model": "<model>", "prompt": "...", "quality": "high"}'
+  -d '{"model": "MODEL_PATH", "prompt": "...", "quality": "high"}'
 ```
+
+Video, same field:
+
+```bash
+curl -X POST http://${HOST}:${PORT}/v1/videos \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "MODEL_PATH", "prompt": "...", "quality": "high"}'
+```
+
+<Warning>
+The `quality` field in a **video response** body is unrelated. It is Sora-compatible response metadata and is always reported as `"standard"`; it does not reflect the sampling quality the request ran with.
+</Warning>
 
 `quality` participates in the dynamic-batch signature, so mixed-quality traffic is batched separately and the transition happens safely at a batch boundary. Mounting is all-or-nothing: if any marked site on a transformer fails its static guards, no site on that transformer is fused.
 
