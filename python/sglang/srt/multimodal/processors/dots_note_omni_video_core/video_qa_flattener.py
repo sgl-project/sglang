@@ -36,75 +36,36 @@ def _sorted_image_keys(video_dict: dict) -> list[str]:
     return [key for _, key in sorted(pairs)]
 
 
-def _uniform_pick_indices(n_total: int, n_keep: int) -> list[int]:
-    """Pick evenly spaced frame indices."""
-    if n_keep >= n_total:
-        return list(range(n_total))
-    if n_keep <= 1:
-        return [n_total // 2]
-    step = (n_total - 1) / (n_keep - 1)
-    return sorted({round(i * step) for i in range(n_keep)})[:n_keep]
-
-
 class VideoQAFlattener:
     """Apply the frame and audio sampling policy used during training."""
 
     def __init__(
         self,
-        fps_scale_range: tuple[float, float] = (1.0, 1.0),
-        min_frames: int = 1,
-        max_frames: int | None = None,
         time_format: str = "random",
         seconds_decimals: int = 1,
         audio_interleave: bool = False,
         ai_seg_min_sec: float = 1.0,
         ai_k_mode: str = "eval30",
-        ai_sample_rate: int = 16000,
+        rng: random.Random | None = None,
     ):
-        lo, hi = map(float, fps_scale_range)
-        if not 0 < lo <= hi <= 1.0:
-            raise ValueError(
-                "fps_scale_range must satisfy 0 < lo <= hi <= 1.0, "
-                f"got {fps_scale_range}"
-            )
         if time_format not in ("hms", "seconds", "random"):
             raise ValueError(f"unsupported time format: {time_format!r}")
         if ai_k_mode not in ("logk", "eval30", "eval_ek", "whole"):
             raise ValueError(f"unsupported audio interleave mode: {ai_k_mode!r}")
 
-        self.fps_scale_lo = lo
-        self.fps_scale_hi = hi
-        self.min_frames = max(1, min_frames)
-        self.max_frames = max_frames
         self.time_format = time_format
         self.seconds_decimals = max(0, int(seconds_decimals))
         self.audio_interleave = bool(audio_interleave)
         self.ai_seg_min_sec = max(1e-6, float(ai_seg_min_sec))
         self.ai_k_mode = ai_k_mode
-        self.ai_sample_rate = int(ai_sample_rate)
-
-    def _sample_n_keep(self, n_total: int) -> int:
-        if n_total <= 0:
-            return 0
-        scale = (
-            self.fps_scale_lo
-            if self.fps_scale_lo == self.fps_scale_hi
-            else random.uniform(self.fps_scale_lo, self.fps_scale_hi)
-        )
-        n_keep = max(self.min_frames, round(n_total * scale))
-        if self.max_frames is not None and self.max_frames > 0:
-            n_keep = min(n_keep, self.max_frames)
-        return min(n_keep, n_total)
+        self.rng = rng or random.Random()
 
     def _subsample_one_video(self, video_dict: dict):
-        """Return sampled frames, timestamps, and optional WAV data."""
+        """Return ordered frames, timestamps, and optional WAV data."""
         original_fps = float(video_dict.get("fps", 1.0)) or 1.0
         image_keys = _sorted_image_keys(video_dict)
-        indices = _uniform_pick_indices(
-            len(image_keys), self._sample_n_keep(len(image_keys))
-        )
-        frames = [video_dict[image_keys[i]] for i in indices]
-        timestamps = [round(i / original_fps, 3) for i in indices]
+        frames = [video_dict[key] for key in image_keys]
+        timestamps = [round(i / original_fps, 3) for i in range(len(image_keys))]
         return frames, timestamps, video_dict.get("audio_0") or None
 
     @staticmethod
@@ -112,12 +73,11 @@ class VideoQAFlattener:
         """Decode a base64 WAV into mono int16 PCM."""
         with wave.open(io.BytesIO(base64.b64decode(audio_b64)), "rb") as wav:
             sample_rate = wav.getframerate()
-            sample_width = wav.getsampwidth()
             channels = wav.getnchannels()
             pcm = np.frombuffer(wav.readframes(wav.getnframes()), dtype=np.int16)
         if channels > 1:
             pcm = pcm.reshape(-1, channels).mean(axis=1).astype(np.int16)
-        return pcm, sample_rate, sample_width, channels
+        return pcm, sample_rate
 
     @staticmethod
     def _encode_wav_b64(pcm, sample_rate: int):
@@ -147,7 +107,7 @@ class VideoQAFlattener:
         if groups == 1:
             return [0, n_frames]
         if self.ai_k_mode == "logk":
-            cuts = sorted(random.sample(range(1, n_frames), groups - 1))
+            cuts = sorted(self.rng.sample(range(1, n_frames), groups - 1))
         else:
             cuts = sorted(
                 {

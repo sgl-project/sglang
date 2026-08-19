@@ -432,7 +432,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
 
 class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
-    """Configurator for hybrid sliding window attention models (Gemma2, Command-R, MiMo).
+    """Configurator for MHA or MLA models with sliding-window layers.
 
     Splits available memory between full attention and SWA pools.
     Does NOT inherit DefaultPoolConfigurator — different coeff model.

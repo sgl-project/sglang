@@ -4,7 +4,6 @@ import hashlib
 import logging
 import os
 import re
-import threading
 import time
 from pathlib import Path
 from typing import Any, ClassVar
@@ -34,7 +33,6 @@ from sglang.srt.utils import VideoData, get_video_bytes
 logger = logging.getLogger(__name__)
 
 _VIDEO_TOKEN_RE = re.compile(r"(<image_\d+>|<audio_\d+>)")
-_VIDEO_PREPROCESS_LOCK = threading.Lock()
 _EXPANDED_VIDEO_MEDIA_RE = re.compile(
     r"<\|sglang_dots_video_(?P<video>\d+)_(?P<modality>image|audio)_(?P<item>\d+)\|>"
 )
@@ -136,47 +134,46 @@ def preprocess_dots_video(
     """Return in-memory timestamp/image/audio content using the server tokenizer."""
     if not k_mode:
         raise ValueError("k_mode must not be empty")
-    with _VIDEO_PREPROCESS_LOCK:
-        video_bytes, video_id = _video_payload(raw_video)
-        cfg = _build_video_cfg(
-            seq=seq,
-            audio_cap=audio_cap,
-            audio_sr=audio_sr,
-            max_new_tokens=max_new_tokens,
-        )
-        from sglang.srt.multimodal.processors.dots_note_omni_video_core import (
-            flatten_runner,
-        )
-        from sglang.srt.multimodal.processors.dots_note_omni_video_core import (
-            preprocess as pp,
-        )
+    video_bytes, video_id = _video_payload(raw_video)
+    cfg = _build_video_cfg(
+        seq=seq,
+        audio_cap=audio_cap,
+        audio_sr=audio_sr,
+        max_new_tokens=max_new_tokens,
+    )
+    from sglang.srt.multimodal.processors.dots_note_omni_video_core import (
+        flatten_runner,
+    )
+    from sglang.srt.multimodal.processors.dots_note_omni_video_core import (
+        preprocess as pp,
+    )
 
-        pp.set_tokenizer(tokenizer)
-        video_b64 = base64.b64encode(video_bytes).decode()
-        sample = {
-            "meta": {"video_0": video_b64},
-            "conversations": [{"from": "user", "value": f"<video_0>{question}"}],
-        }
-        record_key = hashlib.sha1(f"{video_id}|{question}".encode()).hexdigest()
+    video_b64 = base64.b64encode(video_bytes).decode()
+    sample = {
+        "meta": {"video_0": video_b64},
+        "conversations": [{"from": "user", "value": f"<video_0>{question}"}],
+    }
+    record_key = hashlib.sha1(f"{video_id}|{question}".encode()).hexdigest()
 
-        def run(run_cfg):
-            new_meta, conversations = pp.process_sample_video(sample, run_cfg)
-            plan = flatten_runner.build_plan(
-                new_meta,
-                conversations,
-                record_key,
-                k_mode=k_mode,
-                process_audio=run_cfg["process_audio"],
-                audio_sample_rate=audio_sr,
-            )
-            return _flat_video_to_content(flatten_runner.render_flat(plan))
+    def run(run_cfg):
+        new_meta, conversations = pp.process_sample_video(
+            sample, run_cfg, tokenizer=tokenizer
+        )
+        plan = flatten_runner.build_plan(
+            new_meta,
+            conversations,
+            record_key,
+            k_mode=k_mode,
+            process_audio=run_cfg["process_audio"],
+        )
+        return _flat_video_to_content(flatten_runner.render_flat(plan))
 
-        try:
-            return run(cfg)
-        except pp.SkipSample as exc:
-            if "audio_token_ratio_exceed" not in str(exc):
-                raise
-            return run(_cfg_for_pure_visual(cfg))
+    try:
+        return run(cfg)
+    except pp.SkipSample as exc:
+        if "audio_token_ratio_exceed" not in str(exc):
+            raise
+        return run(_cfg_for_pure_visual(cfg))
 
 
 class DotsNoteOmniProcessor(BaseMultimodalProcessor):
@@ -404,7 +401,17 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
         )
 
         if video_data:
-            question = request_obj.video_question or ""
+            video_config = dict(request_obj.video_config or {})
+            question = video_config.pop("_question", "") or ""
+            seq = video_config.pop("seq", 131072)
+            audio_cap = video_config.pop("audio_cap", 1.0)
+            audio_sr = video_config.pop("audio_sr", 16000)
+            k_mode = video_config.pop("k_mode", "eval_ek")
+            if video_config:
+                raise ValueError(
+                    "Unsupported dots note omni video_config fields: "
+                    + ", ".join(sorted(video_config))
+                )
             sampling_params = request_obj.sampling_params or {}
             if not isinstance(sampling_params, dict):
                 raise ValueError(
@@ -425,10 +432,10 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
                         video,
                         question,
                         tokenizer=self._tokenizer,
-                        seq=request_obj.seq,
-                        audio_cap=request_obj.audio_cap,
-                        audio_sr=request_obj.audio_sr,
-                        k_mode=request_obj.k_mode,
+                        seq=seq,
+                        audio_cap=audio_cap,
+                        audio_sr=audio_sr,
+                        k_mode=k_mode,
                         max_new_tokens=max_new_tokens,
                     ),
                 )

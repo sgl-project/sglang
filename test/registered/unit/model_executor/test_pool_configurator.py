@@ -452,6 +452,7 @@ class TestHybridSWAConfigurator(CustomTestCase):
         """Draft SWA tensors consume the same fixed-capacity pool as target SWA."""
         available = 1_000_000
         mr = _make_model_runner(
+            self,
             is_hybrid_swa=True,
             full_attention_layer_ids=[0],
             swa_attention_layer_ids=[1],

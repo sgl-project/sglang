@@ -7845,7 +7845,8 @@ class ServerArgs:
         ]:
             raise ValueError(
                 f"Model type {model_arch} is not supported for encoder disaggregation. "
-                f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2."
+                f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
+                f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2."
             )
 
     def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:

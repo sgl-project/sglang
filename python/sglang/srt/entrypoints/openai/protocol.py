@@ -867,13 +867,8 @@ class ChatCompletionRequest(BaseModel):
     min_dynamic_patch: Optional[int] = None
     use_audio_in_video: bool = False
 
-    # Per-request dots.note.omni video preprocessing controls.
-    seq: int = Field(default=131072, gt=0)
-    audio_cap: float = Field(default=1.0, ge=0)
-    audio_sr: int = Field(default=16000, gt=0)
-    k_mode: str = "eval_ek"
-
     images_config: Optional[Dict] = None
+    video_config: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
@@ -937,12 +932,6 @@ class ChatCompletionRequest(BaseModel):
         if isinstance(value, bool):
             raise ValueError("reasoning_effort must not be a boolean")
         return value
-
-    @model_validator(mode="after")
-    def validate_dots_video_preprocess_config(self):
-        if not self.k_mode:
-            raise ValueError("k_mode must not be empty")
-        return self
 
     @model_validator(mode="before")
     @classmethod

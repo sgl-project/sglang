@@ -229,6 +229,17 @@ def _extract_video_question(request: ChatCompletionRequest) -> Optional[str]:
     return None
 
 
+def _build_video_config(request: ChatCompletionRequest) -> Optional[Dict[str, Any]]:
+    """Build request-scoped video processor config without model-specific fields."""
+    config = dict(request.video_config or {})
+    question = _extract_video_question(request)
+    if question is not None:
+        # Internal metadata derived from the message must not be overridden by
+        # a model-specific public processor option.
+        config["_question"] = question
+    return config or None
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -1069,15 +1080,11 @@ class OpenAIServingChat(OpenAIServingBase):
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
             images_config=getattr(request, "images_config", None),
+            video_config=_build_video_config(request),
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
-            seq=request.seq,
-            audio_cap=request.audio_cap,
-            audio_sr=request.audio_sr,
-            k_mode=request.k_mode,
-            video_question=_extract_video_question(request),
             return_prompt_token_ids=request.return_prompt_token_ids
             or request.return_token_ids,
         )

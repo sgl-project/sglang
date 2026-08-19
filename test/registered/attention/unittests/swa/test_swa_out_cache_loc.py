@@ -82,7 +82,7 @@ class TestSWAKVPoolSetKVBuffer(CustomTestCase):
         )
         self.assertIs(recorded["full_loc"], loc)
 
-    def test_mla_routes_local_layer_id_without_fake_layer(self):
+    def test_composed_mla_pools_route_local_layer_ids(self):
         pool = object.__new__(SWAKVPool)
         pool.layers_mapping = {7: (1, False), 8: (2, True)}
         recorded = {}

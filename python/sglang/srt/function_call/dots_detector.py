@@ -53,7 +53,6 @@ class DotsToolDetector(BaseFormatDetector):
             r"<parameter\s+name\s*=\s*(?P<name>[^>]+)>(?P<value>.*?)</parameter>",
             re.DOTALL,
         )
-        self._last_arguments = ""
 
     @staticmethod
     def _extract_name(value: str) -> str:
@@ -280,7 +279,6 @@ class DotsToolDetector(BaseFormatDetector):
                 logger.warning("Failed to parse streamed dots tool call: %s", exc)
                 normal_parts.append(content.strip())
 
-            self._last_arguments = ""
             self.current_tool_name_sent = False
 
         return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
@@ -332,7 +330,6 @@ class DotsToolDetector(BaseFormatDetector):
                 )
             )
             self.streamed_args_for_tool[self.current_tool_id] += argument_diff
-            self._last_arguments = arguments
 
     def flush_pending_normal_text(self) -> str:
         """Flush a partial opening marker as plain text at end of stream."""

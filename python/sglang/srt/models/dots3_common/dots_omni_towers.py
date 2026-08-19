@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import math
 from collections.abc import Iterable
 from pathlib import Path
@@ -22,8 +21,6 @@ from sglang.srt.models.dots3_common.dots_omni_vision import (
     DotsMoEVitModel,
 )
 
-logger = logging.getLogger(__name__)
-
 
 def _read_json(path: Path) -> dict:
     with path.open() as file:
@@ -39,49 +36,17 @@ def load_omni_component_config(model_dir: Path, component: str) -> dict:
     return config[nested_name]
 
 
-def _load_safetensor_state(model_dir: Path, key_prefix: str) -> dict[str, torch.Tensor]:
-    """Load one tower without materializing unrelated flat-checkpoint shards."""
-    from safetensors import safe_open
-
-    index = _read_json(model_dir / "model.safetensors.index.json")
-    weight_map = index["weight_map"]
-    selected_weights = {
-        name[len(key_prefix) :]: shard
-        for name, shard in weight_map.items()
-        if name.startswith(key_prefix)
-    }
-    if not selected_weights:
-        raise RuntimeError(
-            f"Flat dots.note.omni index has no weights with prefix {key_prefix!r}"
-        )
-    state: dict[str, torch.Tensor] = {}
-    for shard_name in sorted(set(selected_weights.values())):
-        names = [
-            name for name, shard in selected_weights.items() if shard == shard_name
-        ]
-        with safe_open(
-            str(model_dir / shard_name), framework="pt", device="cpu"
-        ) as file:
-            for name in names:
-                state[name] = file.get_tensor(f"{key_prefix}{name}")
-    return state
-
-
 class DotsNoteOmniVisionEncoder(DotsMoEVitModel):
     """Native MoE ViT used by dots.note.omni."""
 
     def __init__(self, model_dir: str):
-        self.model_dir = Path(model_dir)
-        config = DotsMoEVitConfig(
-            **load_omni_component_config(self.model_dir, "vision")
-        )
+        model_dir = Path(model_dir)
+        config = DotsMoEVitConfig(**load_omni_component_config(model_dir, "vision"))
         super().__init__(config)
         self.to(torch.bfloat16)
 
-    def load_converted_weights(self):
-        missing, unexpected = self.load_state_dict(
-            _load_safetensor_state(self.model_dir, "vision_encoder."), strict=False
-        )
+    def load_converted_state(self, state: dict[str, torch.Tensor]):
+        missing, unexpected = self.load_state_dict(state, strict=False)
         if missing:
             raise RuntimeError(f"Dots vision tower missing weights: {missing[:8]}")
         if unexpected:
@@ -94,8 +59,8 @@ class DotsNoteOmniAudioEncoder(OmniAudioModel):
     """Native Dots speech encoder and adapter."""
 
     def __init__(self, model_dir: str):
-        self.model_dir = Path(model_dir)
-        config = OmniAudioConfig(**load_omni_component_config(self.model_dir, "audio"))
+        model_dir = Path(model_dir)
+        config = OmniAudioConfig(**load_omni_component_config(model_dir, "audio"))
         super().__init__(config)
         self.to(torch.bfloat16)
 
@@ -103,10 +68,8 @@ class DotsNoteOmniAudioEncoder(OmniAudioModel):
     def dtype(self):
         return next(self.parameters()).dtype
 
-    def load_converted_weights(self):
-        missing, unexpected = self.load_state_dict(
-            _load_safetensor_state(self.model_dir, "audio_encoder."), strict=True
-        )
+    def load_converted_state(self, state: dict[str, torch.Tensor]):
+        missing, unexpected = self.load_state_dict(state, strict=True)
         if missing or unexpected:
             raise RuntimeError(
                 "Dots audio tower weight mismatch: "

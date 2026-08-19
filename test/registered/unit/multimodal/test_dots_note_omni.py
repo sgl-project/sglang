@@ -212,12 +212,14 @@ class TestDotsNoteOmniProcessMmDataAsync(CustomTestCase):
         return types.SimpleNamespace(
             text=text,
             video_data=video_data,
-            video_question="question",
+            video_config={
+                "_question": "question",
+                "seq": 131072,
+                "audio_cap": 1.0,
+                "audio_sr": 16000,
+                "k_mode": "eval_ek",
+            },
             sampling_params={"max_new_tokens": 16},
-            seq=131072,
-            audio_cap=1.0,
-            audio_sr=16000,
-            k_mode="eval_ek",
             rid="test-rid",
         )
 

@@ -1373,7 +1373,12 @@ class KVCacheConfigurator:
         swa_max_total_num_tokens: int,
         is_dsa_model: bool,
     ) -> KVCache:
-        """Build separate DSA and SWA latent-KV pools for dots.note.omni."""
+        """Build a hybrid MLA pool with independent full/SWA cache geometries.
+
+        Full-attention layers may use either MLA or DSA storage, while sliding
+        layers use MLA storage. The returned ``SWAKVPool`` exposes the common
+        MLA and optional DSA-index interfaces independent of model type.
+        """
         full_pool_class = DSATokenToKVPool if is_dsa_model else MLATokenToKVPool
         common = {
             "page_size": self.server_args.page_size,

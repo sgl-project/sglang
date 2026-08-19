@@ -38,10 +38,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    is_fp8_fnuz,
-    per_token_group_quant_einsum_fp8,
-)
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
     model_forward_maybe_tbo,
@@ -115,13 +112,12 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     _load_fused_indexer_wk,
 )
+from sglang.srt.models.dots3_common.fp8 import per_token_group_quant_einsum_fp8
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_parallel,
-    get_spec,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
@@ -1151,13 +1147,6 @@ class Dots3AttentionMLA(nn.Module):
 
         return q, k, v, g, forward_batch
 
-    def forward_normal_core(self, q, k, v, g, forward_batch):
-        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
-        attn_output = self._apply_attention_gate(attn_output, g)
-        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-        output, _ = self.o_proj(attn_output)
-        return output
-
     def forward_absorb_prepare(
         self,
         positions: torch.Tensor,
@@ -1529,9 +1518,6 @@ class Dots3DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.config = config
-        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            get_spec().speculative_algorithm
-        )
         self.layer_id = layer_id
         self.self_attn = Dots3AttentionMLA(
             config=config,
@@ -1541,8 +1527,6 @@ class Dots3DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
         )
-        self.num_attention_heads = self.self_attn.num_heads
-
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
         is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
@@ -1734,8 +1718,6 @@ class Dots3Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.padding_id = config.pad_token_id
-        self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
 
@@ -2785,16 +2767,29 @@ class DotsNoteOmniForConditionalGeneration(nn.Module):
         return self.thinker.get_input_embeddings()
 
     def load_weights(self, weights, *args, **kwargs):
-        # Tower modules load their own weights from the flat checkpoint.
-        language_weights = (
-            (name, weight)
-            for name, weight in weights
-            if not name.startswith(("audio_encoder.", "vision_encoder."))
-        )
-        self.thinker.language_model.load_weights(language_weights, *args, **kwargs)
-        if self.thinker.visual is not None:
-            self.thinker.visual.load_converted_weights()
-            self.thinker.audio_tower.load_converted_weights()
+        # Partition the flat checkpoint in one pass. This avoids reading the
+        # large tower tensors once through the model loader and again through
+        # safetensors.
+        load_towers = self.thinker.visual is not None
+        vision_state = {}
+        audio_state = {}
+
+        def language_weights():
+            for name, weight in weights:
+                if name.startswith("vision_encoder."):
+                    if load_towers:
+                        vision_state[name.removeprefix("vision_encoder.")] = weight
+                    continue
+                if name.startswith("audio_encoder."):
+                    if load_towers:
+                        audio_state[name.removeprefix("audio_encoder.")] = weight
+                    continue
+                yield name, weight
+
+        self.thinker.language_model.load_weights(language_weights(), *args, **kwargs)
+        if load_towers:
+            self.thinker.visual.load_converted_state(vision_state)
+            self.thinker.audio_tower.load_converted_state(audio_state)
 
     def post_load_weights(self, *args, **kwargs):
         return self.thinker.language_model.post_load_weights(*args, **kwargs)

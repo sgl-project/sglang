@@ -39,7 +39,7 @@ def _plan_interleaved_emissions(flattener, frames, timestamps, audio_b64, video_
 
     bounds = flattener._decide_group_bounds(len(frames), duration)
     try:
-        pcm, sample_rate, _, _ = flattener._decode_wav_b64(audio_b64)
+        pcm, sample_rate = flattener._decode_wav_b64(audio_b64)
     except Exception:  # noqa: BLE001 - malformed audio falls back to one block
         emissions = [
             {"kind": "frame", "ts": timestamp, "b64": frame}
@@ -90,16 +90,14 @@ def build_plan(
     *,
     k_mode: str,
     process_audio: bool,
-    audio_sample_rate: int,
 ):
     """Create a deterministic intermediate plan for one request."""
-    random.seed(_derive_seed(record_key))
+    rng = random.Random(_derive_seed(record_key))
     flattener = VideoQAFlattener(
-        min_frames=4,
         time_format="hms",
         audio_interleave=process_audio,
         ai_k_mode=k_mode,
-        ai_sample_rate=audio_sample_rate,
+        rng=rng,
     )
     old_meta = dict(meta) if meta else {}
     video_pairs = []

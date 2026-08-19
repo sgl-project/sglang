@@ -18,6 +18,7 @@ class Dots3Config(PretrainedConfig):
     model_type = "dots3_note"
     keys_to_ignore_at_inference = ["past_key_values"]
     is_hybrid_swa = True
+    requires_draft_attention_wrapper = True
 
     def __init__(
         self,
@@ -52,8 +53,6 @@ class Dots3Config(PretrainedConfig):
         v_head_dim=128,
         # Dots3 uses one shared MTP layer for NEXTN decoding.
         num_nextn_predict_layers=1,
-        # Defaults to the SWA geometry used by the shared MTP layer.
-        mtp_layer_types=None,
         # Sliding Window Attention (SWA) parameters
         layer_types=None,
         sliding_window_size=512,
@@ -126,7 +125,6 @@ class Dots3Config(PretrainedConfig):
 
         # MTP / NextN
         self.num_nextn_predict_layers = num_nextn_predict_layers
-        self.mtp_layer_types = mtp_layer_types
 
         # Sliding Window Attention (SWA) parameters
         self.layer_types = layer_types
@@ -185,6 +183,34 @@ class Dots3Config(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+    def configure_draft_model(self) -> str:
+        """Configure the recursively shared MTP layer with SWA geometry."""
+        self.num_nextn_predict_layers = 1
+        self.layer_types = ["sliding_attention"]
+        self.attention_gate_type = self.swa_attention_gate_type
+        self.kv_lora_rank = self.swa_kv_lora_rank
+        self.q_lora_rank = self.swa_q_lora_rank
+        self.qk_nope_head_dim = self.swa_qk_nope_head_dim
+        self.qk_rope_head_dim = self.swa_qk_rope_head_dim
+        self.num_attention_heads = self.swa_num_attention_heads
+        self.num_key_value_heads = self.swa_num_key_value_heads
+        self.v_head_dim = self.swa_v_head_dim
+        return "Dots3NoteForCausalLMNextN"
+
+    def wrap_attention_backend(self, runner, full_attn_backend):
+        from sglang.srt.layers.attention.dots_hybrid_backend import (
+            wrap_dots_attention_backend,
+        )
+
+        return wrap_dots_attention_backend(runner, full_attn_backend)
+
+    def wrap_draft_decode_attention_backend(self, backend):
+        from sglang.srt.layers.attention.dots_hybrid_backend import (
+            wrap_dots_draft_decode_backend,
+        )
+
+        return wrap_dots_draft_decode_backend(backend)
 
     def _rope_scaling_validation(self):
         """

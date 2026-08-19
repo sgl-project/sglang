@@ -19,7 +19,12 @@ GB = 1024 * 1024 * 1024
 
 
 class SWAKVPool(BaseSWAKVPool):
-    """KV cache with separate pools for full and SWA attention layers."""
+    """Hybrid full/SWA cache composed from independently configurable pools.
+
+    The default remains two MHA pools. Supplying ``full_kv_pool_class`` and
+    ``swa_kv_pool_class`` enables other KV cache families, including MLA/DSA,
+    without adding model-specific behavior to the pool selector.
+    """
 
     def __init__(
         self,

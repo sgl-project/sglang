@@ -47,10 +47,12 @@ export const config = {
       {"type": "text", "text": "Summarize what happens in this video."}
     ]
   }],
-  "seq": 131072,
-  "audio_cap": 0.5,
-  "audio_sr": 16000,
-  "k_mode": "eval_ek"
+  "video_config": {
+    "seq": 131072,
+    "audio_cap": 0.5,
+    "audio_sr": 16000,
+    "k_mode": "eval_ek"
+  }
 }'`,
 
   dockerImages: {

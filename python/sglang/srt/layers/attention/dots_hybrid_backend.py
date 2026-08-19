@@ -168,11 +168,6 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
         self._active_backend = self.selected_backend(forward_batch)
         _maybe_rebuild_dots_metadata(self, forward_batch)
 
-    def normalize_forward_metadata_for_dp_padding(
-        self, forward_batch: ForwardBatch
-    ) -> None:
-        self.maybe_rebuild_metadata_after_dp_padding(forward_batch)
-
     def select_draft_step_out_cache_loc(self, forward_batch: ForwardBatch):
         """Return this draft step's write locations from a combined SWA buffer."""
         from sglang.srt.layers.attention.flashattention_backend import (
@@ -433,11 +428,6 @@ class DotsHybridAttnBackend(AttentionBackend):
             self.init_forward_metadata(forward_batch)
             self._dp_rebuilt_batch_id = id(forward_batch)
 
-    def normalize_forward_metadata_for_dp_padding(
-        self, forward_batch: ForwardBatch
-    ) -> None:
-        self.maybe_rebuild_metadata_after_dp_padding(forward_batch)
-
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         self.dsa_backend.init_forward_metadata(forward_batch)
         self.swa_backend.init_forward_metadata(forward_batch)
@@ -516,3 +506,49 @@ class DotsHybridAttnBackend(AttentionBackend):
     def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
         backend = self.selected_swa_backend(forward_batch)
         backend.init_mha_chunk_metadata(forward_batch)
+
+
+def _wrap_dots_swa_backend(backend: AttentionBackend) -> AttentionBackend:
+    """Add latent-cache SWA behavior when a backend uses FlashAttention."""
+    from sglang.srt.layers.attention.flashattention_backend import (
+        FlashAttentionBackend,
+    )
+
+    if isinstance(backend, FlashAttentionBackend) or (
+        isinstance(backend, HybridAttnBackend)
+        and (
+            isinstance(backend.prefill_backend, FlashAttentionBackend)
+            or isinstance(backend.decode_backend, FlashAttentionBackend)
+        )
+    ):
+        return DotsSWAMLAAttnBackend(backend)
+    return backend
+
+
+def wrap_dots_draft_decode_backend(backend: AttentionBackend) -> AttentionBackend:
+    """Wrap each per-step backend used by the Dots NextN draft container."""
+    backend.attn_backends = [
+        _wrap_dots_swa_backend(child) for child in backend.attn_backends
+    ]
+    return backend
+
+
+def wrap_dots_attention_backend(runner, full_attn_backend: AttentionBackend):
+    """Construct the Dots target or draft attention backend."""
+    if runner.model_config.is_draft_model:
+        return _wrap_dots_swa_backend(full_attn_backend)
+
+    if runner.model_config.hf_text_config.index_topk is None:
+        return DotsSWAMLAAttnBackend(full_attn_backend)
+
+    from sglang.srt.layers.attention.attention_registry import create_dsa_backend
+
+    swa_backend = (
+        full_attn_backend.prefill_backend
+        if isinstance(full_attn_backend, HybridAttnBackend)
+        else full_attn_backend
+    )
+    return DotsHybridAttnBackend(
+        dsa_backend=create_dsa_backend(runner),
+        swa_backend=DotsSWAMLAAttnBackend(swa_backend),
+    )

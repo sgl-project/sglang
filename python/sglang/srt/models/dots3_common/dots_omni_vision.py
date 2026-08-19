@@ -1,21 +1,14 @@
 import math
 from typing import Any
 
-import deep_gemm
 import torch
 import torch.nn.functional as F
-from deep_gemm import (
-    get_mn_major_tma_aligned_tensor,
-    per_block_cast_to_fp8,
-)
+from deep_gemm import per_block_cast_to_fp8
 from torch import nn
 from torch.nn import LayerNorm
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_fp8,
-)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention as SGLVisionAttention
 from sglang.srt.layers.conv import Conv2dLayer
@@ -256,96 +249,6 @@ def _per_block_cast_to_fp8_padded(
     x_pad = torch.zeros((m_pad, n_pad), dtype=x.dtype, device=x.device)
     x_pad[:m, :n] = x
     return per_block_cast_to_fp8(x_pad.contiguous(), use_ue8m0=use_ue8m0, gran_k=gran_k)
-
-
-def _fp8_blockwise_linear(
-    x_bf16: torch.Tensor,
-    w_fp8: torch.Tensor,
-    w_scale: torch.Tensor,
-    *,
-    out_features: int,
-    x_scale_col_major: torch.Tensor | None = None,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """DeepGEMM implementation of FP8 GEMM"""
-    m, n = x_bf16.shape[0], out_features
-    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
-    if x_scale_col_major is None:
-        x_fp8, x_scale = sglang_per_token_group_quant_fp8(x_bf16, group_size=128)
-        x_scale_col_major = get_mn_major_tma_aligned_tensor(x_scale)
-    else:
-        x_fp8 = x_bf16
-
-    # Run DeepGEMM kernel
-    deep_gemm.fp8_gemm_nt((x_fp8, x_scale_col_major), (w_fp8, w_scale), out)
-
-    if bias is not None:
-        out = out + bias
-    return out
-
-
-class DotsSwiGLUFFNFP8(nn.Module):
-    """SwiGLU FFN with block-FP8 weights and per-token activations."""
-
-    def __init__(
-        self,
-        in_features: int,
-        hidden_features: int,
-        bias: bool = False,
-        block_size: int = 128,
-        group_size: int = 128,
-    ):
-        super().__init__()
-        self.in_features = in_features
-        self.hidden_features = hidden_features
-        self.block_size = block_size
-        self.group_size = group_size
-        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias)
-        self.fc2 = nn.Linear(hidden_features, in_features, bias=bias)
-        self.fc3 = nn.Linear(in_features, hidden_features, bias=bias)
-        self.register_load_state_dict_post_hook(DotsSwiGLUFFNFP8._post_load_repack_fp8)
-        self._repack_fp8_weights()
-
-    @staticmethod
-    def _post_load_repack_fp8(module: "DotsSwiGLUFFNFP8", _incompatible_keys) -> None:
-        module._repack_fp8_weights()
-
-    @torch.no_grad()
-    def _repack_fp8_weights(self) -> None:
-        fc13_weight = torch.cat((self.fc1.weight, self.fc3.weight), dim=0).contiguous()
-        fc13_w_fp8, fc13_w_scale = _per_block_cast_to_fp8_padded(
-            fc13_weight, use_ue8m0=False, gran_k=self.block_size
-        )
-        fc2_w_fp8, fc2_w_scale = _per_block_cast_to_fp8_padded(
-            self.fc2.weight, use_ue8m0=False, gran_k=self.block_size
-        )
-        # Non-persistent: bf16 checkpoints only store ``fc*.weight`` / ``fc*.bias``.
-        self.register_buffer("_fc13_w_fp8", fc13_w_fp8, persistent=False)
-        self.register_buffer("_fc13_w_scale", fc13_w_scale, persistent=False)
-        self.register_buffer("_fc2_w_fp8", fc2_w_fp8, persistent=False)
-        self.register_buffer("_fc2_w_scale", fc2_w_scale, persistent=False)
-
-    def _fc13_bias(self) -> torch.Tensor | None:
-        if self.fc1.bias is None:
-            return None
-        return torch.cat((self.fc1.bias, self.fc3.bias), dim=0).contiguous()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h13 = _fp8_blockwise_linear(
-            x,
-            self._fc13_w_fp8,
-            self._fc13_w_scale,
-            out_features=self.hidden_features * 2,
-            bias=self._fc13_bias(),
-        )
-        h1, h3 = h13.chunk(2, dim=-1)
-        return _fp8_blockwise_linear(
-            F.silu(h1) * h3,
-            self._fc2_w_fp8,
-            self._fc2_w_scale,
-            out_features=self.in_features,
-            bias=self.fc2.bias,
-        )
 
 
 class MoESwiGLUFFN(nn.Module):
@@ -756,12 +659,8 @@ class DotsMoEVitModel(PreTrainedModel):
         mlp = self.blocks[0].mlp
         if isinstance(mlp, DotsSwiGLUFFN):
             return mlp.fc13.weight.dtype
-        if isinstance(mlp, DotsSwiGLUFFNFP8):
-            return mlp.fc1.weight.dtype
         expert = mlp.experts[0]
-        if isinstance(expert, DotsSwiGLUFFN):
-            return expert.fc13.weight.dtype
-        return expert.fc1.weight.dtype
+        return expert.fc13.weight.dtype
 
     @property
     def device(self) -> torch.device:

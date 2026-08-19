@@ -125,10 +125,12 @@ response = client.chat.completions.create(
         }
     ],
     extra_body={
-        "seq": 131072,
-        "audio_cap": 0.5,
-        "audio_sr": 16000,
-        "k_mode": "eval_ek",
+        "video_config": {
+            "seq": 131072,
+            "audio_cap": 0.5,
+            "audio_sr": 16000,
+            "k_mode": "eval_ek",
+        },
     },
 )
 
@@ -145,7 +147,8 @@ Pending update...
 
 </Accordion>
 
-Per-request video preprocessing controls (all optional, passed via `extra_body`):
+Per-request video preprocessing controls are grouped under `video_config` in
+`extra_body`:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -184,7 +187,7 @@ Per-request video preprocessing controls (all optional, passed via `extra_body`)
   </tbody>
 </table>
 
-These controls are request-scoped so that evaluation jobs with different context budgets can share one server. The flattener reserves room for `max_new_tokens` inside the budget and falls back to visual-only processing if audio would exceed the configured token budget.
+These controls are request-scoped so that evaluation jobs with different context budgets can share one server. For example: `extra_body={"video_config": {"seq": 131072, "audio_cap": 0.5}}`. The flattener reserves room for `max_new_tokens` inside the budget and falls back to visual-only processing if audio would exceed the configured token budget.
 
 A request may carry several videos, and videos can be mixed with image and audio parts. Each video is flattened independently under the same per-request budget, and the flattened frames and audio segments are spliced back at the position of their `video_url` part, so the modality ordering of the prompt is preserved.
 

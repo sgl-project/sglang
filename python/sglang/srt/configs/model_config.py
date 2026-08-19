@@ -616,32 +616,11 @@ class ModelConfig:
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model
 
-        dots3_draft_arch = {
-            "Dots3NoteForCausalLM": "Dots3NoteForCausalLMNextN",
-        }.get(self.hf_config.architectures[0])
-        if is_draft_model and dots3_draft_arch is not None:
-            # Configure the shared MTP layer with SWA geometry.
-            self.hf_config.architectures[0] = dots3_draft_arch
-            self.hf_text_config.num_nextn_predict_layers = 1
-            self.hf_text_config.layer_types = ["sliding_attention"]
-            self.hf_text_config.attention_gate_type = (
-                self.hf_text_config.swa_attention_gate_type
-            )
-            self.hf_text_config.kv_lora_rank = self.hf_text_config.swa_kv_lora_rank
-            self.hf_text_config.q_lora_rank = self.hf_text_config.swa_q_lora_rank
-            self.hf_text_config.qk_nope_head_dim = (
-                self.hf_text_config.swa_qk_nope_head_dim
-            )
-            self.hf_text_config.qk_rope_head_dim = (
-                self.hf_text_config.swa_qk_rope_head_dim
-            )
-            self.hf_text_config.num_attention_heads = (
-                self.hf_text_config.swa_num_attention_heads
-            )
-            self.hf_text_config.num_key_value_heads = (
-                self.hf_text_config.swa_num_key_value_heads
-            )
-            self.hf_text_config.v_head_dim = self.hf_text_config.swa_v_head_dim
+        configure_draft_model = getattr(
+            self.hf_text_config, "configure_draft_model", None
+        )
+        if is_draft_model and configure_draft_model is not None:
+            self.hf_config.architectures[0] = configure_draft_model()
 
         if is_draft_model and self.hf_config.architectures[0] in [
             "DeepseekV3ForCausalLM",
@@ -933,14 +912,14 @@ class ModelConfig:
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
-            from sglang.srt.configs.dots3 import Dots3Config
-
-            if isinstance(self.hf_text_config, Dots3Config):
-                self.swa_kv_lora_rank = self.hf_text_config.swa_kv_lora_rank
-                self.swa_qk_rope_head_dim = self.hf_text_config.swa_qk_rope_head_dim
-            else:
-                self.swa_kv_lora_rank = self.kv_lora_rank
-                self.swa_qk_rope_head_dim = self.qk_rope_head_dim
+            self.swa_kv_lora_rank = getattr(
+                self.hf_text_config, "swa_kv_lora_rank", self.kv_lora_rank
+            )
+            self.swa_qk_rope_head_dim = getattr(
+                self.hf_text_config,
+                "swa_qk_rope_head_dim",
+                self.qk_rope_head_dim,
+            )
             self.index_head_dim = (
                 get_dsa_index_head_dim(self.hf_text_config)
                 if is_deepseek_dsa(self.hf_text_config)

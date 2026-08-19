@@ -3,26 +3,8 @@
 import base64
 import io
 import math
-import os
 import re
 import wave
-
-# Keep native decoder libraries from creating a thread pool per request worker.
-for _name in (
-    "OMP_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-    "RAYON_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-    "GOMP_NUM_THREADS",
-    "OMP_THREAD_LIMIT",
-    "MKL_DOMAIN_NUM_THREADS",
-):
-    os.environ.setdefault(_name, "1")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("OMP_DYNAMIC", "FALSE")
-os.environ.setdefault("OMP_NESTED", "FALSE")
 
 import numpy as np
 from PIL import Image
@@ -57,41 +39,17 @@ class SkipSample(Exception):
     """Raised when a video cannot fit or cannot be decoded."""
 
 
-_TOKENIZER = None
-
-
-def set_tokenizer(tokenizer):
-    """Use the tokenizer already loaded by the serving model."""
-    global _TOKENIZER
-    if tokenizer is None:
-        raise ValueError("dots video preprocessing requires a server tokenizer")
-    _TOKENIZER = tokenizer
-
-
-def get_tokenizer():
-    if _TOKENIZER is None:
-        raise RuntimeError("dots video preprocessing tokenizer was not initialized")
-    return _TOKENIZER
-
-
-def tokenize_len(text, tokenizer=None):
+def tokenize_len(text, tokenizer):
     """Count tokens without adding tokenizer special tokens."""
-    tokenizer = tokenizer or get_tokenizer()
     if not text:
         return 0
     return len(tokenizer(text, add_special_tokens=False)["input_ids"])
 
 
 def system_block_tokens(prompt=DEFAULT_SYSTEM_PROMPT, tokenizer=None):
+    if tokenizer is None:
+        raise ValueError("dots video preprocessing requires a tokenizer")
     return tokenize_len(f"{TOK_SYS_START}{prompt}{TOK_SYS_END}\n", tokenizer=tokenizer)
-
-
-def patches_per_frame(height, width):
-    return (height // ALIGN) * (width // ALIGN)
-
-
-def video_segment_tokens(num_frames, height, width):
-    return num_frames * (V2_OVH + patches_per_frame(height, width))
 
 
 def audio_block_tokens(
@@ -112,9 +70,10 @@ def audio_block_tokens(
     return AUDIO_WRAP_TOKENS + padding_tokens
 
 
-def conversation_tokens(conversations, video_meta, tokenizer=None):
-    """Count conversation text and known video placeholders."""
-    tokenizer = tokenizer or get_tokenizer()
+def conversation_tokens(conversations, tokenizer=None):
+    """Count conversation text while preserving video-marker boundaries."""
+    if tokenizer is None:
+        raise ValueError("dots video preprocessing requires a tokenizer")
     total = 0
     for conversation in conversations:
         total += ROLE_WRAP_TOKENS
@@ -124,10 +83,7 @@ def conversation_tokens(conversations, video_meta, tokenizer=None):
                 total += tokenize_len(part, tokenizer=tokenizer)
             else:
                 video_index = int(part)
-                if video_index in video_meta:
-                    total += video_segment_tokens(*video_meta[video_index])
-                else:
-                    total += tokenize_len(f"<video_{video_index}>", tokenizer=tokenizer)
+                total += tokenize_len(f"<video_{video_index}>", tokenizer=tokenizer)
     return total
 
 
@@ -275,21 +231,12 @@ def _find_video_keys(conversations):
 
 
 def _normalize_sample(sample):
-    raw_meta = sample.get("meta")
-    if raw_meta is None:
-        raw_meta = {}
-    if isinstance(raw_meta, np.ndarray):
-        raw_meta = raw_meta.tolist()
-    meta = raw_meta if isinstance(raw_meta, dict) else dict(raw_meta)
-    conversations = sample.get("conversations")
-    if conversations is None:
-        conversations = []
-    if isinstance(conversations, np.ndarray):
-        conversations = conversations.tolist()
+    meta = dict(sample.get("meta") or {})
+    conversations = sample.get("conversations") or []
     return meta, [dict(conversation) for conversation in conversations]
 
 
-def process_sample_video(sample, cfg):
+def process_sample_video(sample, cfg, *, tokenizer):
     """Convert an in-memory video sample into nested frame/audio metadata."""
     meta, conversations = _normalize_sample(sample)
     if not conversations:
@@ -339,10 +286,9 @@ def process_sample_video(sample, cfg):
                     tokens += 3 * max_groups
                 audio_tokens[video_index] = tokens
 
-    tokenizer = get_tokenizer()
     fixed_tokens = (
         system_block_tokens(tokenizer=tokenizer)
-        + conversation_tokens(conversations, {}, tokenizer=tokenizer)
+        + conversation_tokens(conversations, tokenizer=tokenizer)
         + _OVERHEAD_MARGIN
     )
     total_audio_tokens = sum(audio_tokens.values())
