@@ -1279,6 +1279,7 @@ class Envs:
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
+    SGLANG_OPT_MIXED_SPLIT_DECODE_ATTN = EnvBool(True)
 
     # cache, GEMM, and distributed
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
