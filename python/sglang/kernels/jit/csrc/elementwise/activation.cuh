@@ -13,7 +13,7 @@
 #include <limits>
 #include <string>
 
-namespace {
+namespace sglang {
 
 enum class ActivationKind : uint32_t {
   kSiLU,
@@ -55,7 +55,13 @@ struct ActivationParams {
   uint32_t expert_step;
 };
 
-template <typename T, ActivationKind kAct, bool kUsePDL, bool kFilterExpert>
+template <
+    typename T,
+    ActivationKind kAct,
+    bool kUsePDL,
+    bool kFilterExpert,
+    bool kRoundActivation = false,
+    bool kReuseInput = false>
 __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams params) {
   using namespace device;
   constexpr auto kVecSize = kMaxVecBytes / sizeof(T);
@@ -70,7 +76,7 @@ __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams para
   }
   const auto offset = tid % num_vecs;
   const auto input_offset = token_id * (num_vecs * 2) + offset;
-  const auto output_offset = tid;
+  const auto output_offset = kReuseInput ? input_offset : tid;
   PDLWaitPrimary<kUsePDL>();
   const auto gate = device::load_as<vec_t>(params.input, input_offset);
   const auto up = device::load_as<vec_t>(params.input, input_offset + num_vecs);
@@ -79,9 +85,18 @@ __global__ void act_and_mul_kernel(const __grid_constant__ ActivationParams para
   for (int i = 0; i < kVecSize; ++i) {
     const float gate_f32 = device::cast<fp32_t>(gate[i]);
     const float up_f32 = device::cast<fp32_t>(up[i]);
-    out[i] = device::cast<T>(apply_activation_f32<kAct>(gate_f32) * up_f32);
+    if constexpr (kRoundActivation) {
+      const T activated = device::cast<T>(apply_activation_f32<kAct>(gate_f32));
+      out[i] = device::cast<T>(device::cast<fp32_t>(activated) * up_f32);
+    } else {
+      out[i] = device::cast<T>(apply_activation_f32<kAct>(gate_f32) * up_f32);
+    }
   }
-  device::store_as<vec_t>(params.out, out, output_offset);
+  if constexpr (kReuseInput) {
+    device::store_as<vec_t>(const_cast<void*>(params.input), out, output_offset);
+  } else {
+    device::store_as<vec_t>(params.out, out, output_offset);
+  }
   PDLTriggerSecondary<kUsePDL>();
 }
 
@@ -117,26 +132,28 @@ struct ActivationKernel {
   using kernel_fn_t = decltype(&act_and_mul_kernel<T, ActivationKind::kSiLU, kUsePDL, false>);
   using unary_kernel_fn_t = decltype(&act_kernel<T, ActivationKind::kReLU2, kUsePDL>);
 
-  template <ActivationKind kAct, bool kFilterExpert>
-  static constexpr kernel_fn_t activation_kernel = act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert>;
+  template <ActivationKind kAct, bool kFilterExpert, bool kRoundActivation = false, bool kReuseInput = false>
+  static constexpr kernel_fn_t activation_kernel =
+      act_and_mul_kernel<T, kAct, kUsePDL, kFilterExpert, kRoundActivation, kReuseInput>;
 
   static_assert(device::kMaxVecBytes % sizeof(T) == 0, "unsupported data type");
 
-  template <bool kFilterExpert>
+  template <bool kFilterExpert, bool kRoundActivation = false, bool kReuseInput = false>
   static kernel_fn_t select_kernel(const std::string& type) {
     using namespace host;
     if (type == "silu") {
-      return activation_kernel<ActivationKind::kSiLU, kFilterExpert>;
+      return activation_kernel<ActivationKind::kSiLU, kFilterExpert, kRoundActivation, kReuseInput>;
     } else if (type == "gelu") {
-      return activation_kernel<ActivationKind::kGELU, kFilterExpert>;
+      return activation_kernel<ActivationKind::kGELU, kFilterExpert, kRoundActivation, kReuseInput>;
     } else if (type == "gelu_tanh") {
-      return activation_kernel<ActivationKind::kGELUTanh, kFilterExpert>;
+      return activation_kernel<ActivationKind::kGELUTanh, kFilterExpert, kRoundActivation, kReuseInput>;
     } else {
       Panic("unsupported activation type: ", type);
     }
     return nullptr;
   }
 
+  template <bool kRoundActivation = false, bool kReuseInput = false>
   static void launch(
       const tvm::ffi::TensorView& input,
       const tvm::ffi::TensorView& out,
@@ -151,10 +168,11 @@ struct ActivationKernel {
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
 
-    TensorMatcher({N, D_out})  //
-        .with_dtype<T>()
-        .with_device(device_)
-        .verify(out);
+    if constexpr (kReuseInput) {
+      TensorMatcher({N, D_out}).with_strides({D_in, 1}).with_dtype<T>().with_device(device_).verify(out);
+    } else {
+      TensorMatcher({N, D_out}).with_dtype<T>().with_device(device_).verify(out);
+    }
     TensorMatcher({N, D_in})  //
         .with_dtype<T>()
         .with_device(device_)
@@ -166,13 +184,16 @@ struct ActivationKernel {
     if (num_tokens == 0) return;
     RuntimeCheck(hidden_size * 2 == D_in.unwrap(), "invalid activation dimension");
     RuntimeCheck(hidden_size % kVecSize == 0, "hidden size must be divisible by vector size");
+    if constexpr (kReuseInput) {
+      RuntimeCheck(input.data_ptr() == out.data_ptr(), "in-place activation output must alias input");
+    }
     // only get once to avoid overhead
     const auto num_total_items = num_tokens * (hidden_size / kVecSize);
     RuntimeCheck(num_total_items <= std::numeric_limits<uint32_t>::max(), "too many items for 32-bit indexing");
     const auto num_blocks = div_ceil(static_cast<uint32_t>(num_total_items), kBlockSize);
     const auto params = ActivationParams{
         .input = input.data_ptr(),
-        .out = out.data_ptr(),
+        .out = kReuseInput ? nullptr : out.data_ptr(),
         .hidden_dim = hidden_size,
         .num_tokens = num_tokens,
         .expert_ids = expert_ids,
@@ -180,16 +201,26 @@ struct ActivationKernel {
     };
     if (expert_ids != nullptr) {
       RuntimeCheck(expert_step > 0, "expert_step must be positive");
-      const auto kernel = select_kernel<true>(type);
+      const auto kernel = select_kernel<true, kRoundActivation, kReuseInput>(type);
       LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
     } else {
-      const auto kernel = select_kernel<false>(type);
+      const auto kernel = select_kernel<false, kRoundActivation, kReuseInput>(type);
       LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
     }
   }
 
   static void run_activation(const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, std::string type) {
     launch(input, out, type, /*expert_ids=*/nullptr, /*expert_step=*/1);
+  }
+
+  static void
+  run_activation_with_rounding(const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, std::string type) {
+    launch<true>(input, out, type, /*expert_ids=*/nullptr, /*expert_step=*/1);
+  }
+
+  static void run_activation_with_rounding_input_inplace(
+      const tvm::ffi::TensorView input, const tvm::ffi::TensorView out, std::string type) {
+    launch<true, true>(input, out, type, /*expert_ids=*/nullptr, /*expert_step=*/1);
   }
 
   static void run_activation_filtered(
@@ -253,4 +284,4 @@ struct ActivationKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

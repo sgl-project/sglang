@@ -16,7 +16,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora_pipeline import LoRAPipeline
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # isort: off
 from sglang.multimodal_gen.runtime.pipelines_core.stages import (
@@ -25,8 +24,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
 )
 
 # isort: on
-
-logger = init_logger(__name__)
 
 
 class WanDMDPipeline(LoRAPipeline, ComposedPipelineBase):

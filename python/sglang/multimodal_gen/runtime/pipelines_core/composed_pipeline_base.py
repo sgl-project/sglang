@@ -9,7 +9,7 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Literal, cast
+from typing import Any, Callable, Iterator, Literal, cast
 
 import torch
 from tqdm import tqdm
@@ -82,6 +82,7 @@ class ComposedPipelineBase(ABC):
 
     # the name of the pipeline it associated with, in diffusers
     pipeline_name: str
+    default_model_subfolder: str | None = None
 
     def is_lora_effective(self):
         return False
@@ -172,7 +173,32 @@ class ComposedPipelineBase(ABC):
         self.modules[module_name] = module
 
     def _load_config(self) -> dict[str, Any]:
-        model_path = maybe_download_model(self.model_path, force_diffusers_model=True)
+        model_subfolder = self.server_args.model_subfolder
+        if model_subfolder is None and not os.path.isfile(
+            os.path.join(self.model_path, "model_index.json")
+        ):
+            model_subfolder = self.default_model_subfolder
+
+        if model_subfolder is None:
+            model_path = maybe_download_model(
+                self.model_path, force_diffusers_model=True
+            )
+        else:
+            model_subfolder = os.path.normpath(model_subfolder)
+            if (
+                os.path.isabs(model_subfolder)
+                or model_subfolder == ".."
+                or model_subfolder.startswith(f"..{os.sep}")
+            ):
+                raise ValueError(
+                    f"model_subfolder must stay inside the model repository: {model_subfolder!r}"
+                )
+            model_root = maybe_download_model(
+                self.model_path,
+                allow_patterns=[f"{model_subfolder}/**"],
+            )
+            model_path = os.path.join(model_root, model_subfolder)
+
         self.model_path = model_path
         logger.info("Model path: %s", model_path)
         config = verify_model_config_and_directory(model_path)
@@ -444,13 +470,26 @@ class ComposedPipelineBase(ABC):
         component_load_specs: list[ComponentLoadSpec] = []
 
         # enqueue only real weight loads (e.g., scheduler, tokenizer is excluded); skipped/provided modules keep old handling
-        for index, (
-            module_name,
-            (
-                transformers_or_diffusers,
-                architecture,
-            ),
-        ) in enumerate(model_index.items()):
+        for index, (module_name, component_spec) in enumerate(model_index.items()):
+            # Diffusers uses JSON null for unavailable optional components.
+            # Check before unpacking the normal [library, architecture] pair.
+            if component_spec is None:
+                logger.warning(
+                    "Module %s in model_index.json has null value, removing from required_config_modules",
+                    module_name,
+                )
+                if module_name in self.required_config_modules:
+                    self.required_config_modules.remove(module_name)
+                continue
+            if (
+                not isinstance(component_spec, (list, tuple))
+                or len(component_spec) != 2
+            ):
+                raise ValueError(
+                    f"Module {module_name!r} in model_index.json must be null or "
+                    f"a [library, architecture] pair, got {component_spec!r}"
+                )
+            transformers_or_diffusers, architecture = component_spec
             if transformers_or_diffusers is None:
                 logger.warning(
                     "Module %s in model_index.json has null value, removing from required_config_modules",
@@ -1025,4 +1064,28 @@ class ComposedPipelineBase(ABC):
 
         return self.executor.execute_group_with_profiling(
             self.stages, batches, server_args
+        )
+
+    @torch.no_grad()
+    def forward_batch_sequentially(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ) -> Iterator[OutputBatch]:
+        """Yield grouped outputs as each terminal-stage invocation completes."""
+        if len(batches) == 1 and (
+            not server_args.pipeline_config.supports_sequential_multi_output_inference()
+            or max(1, int(batches[0].num_outputs_per_prompt or 1)) == 1
+        ):
+            yield self.forward(batches[0], server_args)
+            return
+
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+        yield from self.executor.execute_group_sequentially_with_profiling(
+            self.stages,
+            batches,
+            server_args,
         )

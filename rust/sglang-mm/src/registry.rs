@@ -1,7 +1,13 @@
-//! Model processor registry.
+//! Model processor registries.
 //!
-//! Each model implements `ImageProcessorSpec` and registers itself. The Python
-//! layer looks up a processor by model name at init time.
+//! Two registries live here:
+//! * [`ImageProcessorSpec`] / [`ProcessorRegistry`] — the Python-facing batch
+//!   preprocess interface (e.g. Inkling), looked up by name at init time.
+//! * [`pipeline_from_spec`] — the pure-Rust request pipeline `sglang-server`'s
+//!   MM workers drive. Each model family implements
+//!   [`crate::pipeline::MmFamilyProcessor`] in `src/<model>/mod.rs`; the Python
+//!   side selects one by serializing a spec
+//!   (`{"family": ..., resolved processor params}`).
 
 /// `(height, width, patches_as_u16_bits, content_hash)` for one image.
 pub type PreprocessedImage = (usize, usize, Vec<u16>, u64);
@@ -58,4 +64,24 @@ pub fn default_registry() -> ProcessorRegistry {
     let mut reg = ProcessorRegistry::new();
     reg.register(Box::new(crate::inkling::InklingProcessor));
     reg
+}
+// --- Server (pure-Rust) request pipeline ---
+
+/// Build a family processor from the Python-side spec JSON. `Err` on an
+/// unknown family or malformed spec — the caller treats that as "no Rust
+/// pipeline".
+pub fn pipeline_from_spec(
+    json: &str,
+) -> Result<Box<dyn crate::pipeline::MmFamilyProcessor>, String> {
+    #[derive(serde::Deserialize)]
+    struct Header {
+        family: String,
+    }
+    let header: Header = serde_json::from_str(json).map_err(|e| format!("mm spec: {e}"))?;
+    match header.family.as_str() {
+        "qwen_vl" => Ok(Box::new(crate::qwen_vl::QwenVlProcessor::from_spec_json(
+            json,
+        )?)),
+        other => Err(format!("unknown mm family: {other}")),
+    }
 }

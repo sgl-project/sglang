@@ -11,10 +11,27 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods
     AttnForwardMethod,
 )
 from sglang.srt.models.deepseek_common.utils import _is_hip
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_sm100_or_sm110_supported, use_intel_amx_backend
 
 MHA_ONE_SHOT_SUPPORTED_BACKENDS = ["fa3", "flashinfer", "flashmla"]
+
+# ROCm runs dedicated MHA/MLA implementations (forward_mha_rocm.py /
+# forward_mla_rocm.py) so the shared CUDA paths carry no AMD branches. Backend
+# handlers keep returning the generic method; the platform swap happens here.
+# MHA_CHUNKED_KV has no ROCm entry because its accumulation step needs the
+# CUDA-only merge_state_v2 kernel.
+_ROCM_FORWARD_METHODS = {
+    AttnForwardMethod.MHA: AttnForwardMethod.MHA_ROCM,
+    AttnForwardMethod.MHA_ONE_SHOT: AttnForwardMethod.MHA_ONE_SHOT_ROCM,
+    AttnForwardMethod.MLA: AttnForwardMethod.MLA_ROCM,
+}
+
+
+def resolve_rocm_forward_method(method: AttnForwardMethod) -> AttnForwardMethod:
+    if not _is_hip:
+        return method
+    return _ROCM_FORWARD_METHODS.get(method, method)
 
 
 class AttentionBackendRegistry:
@@ -80,7 +97,10 @@ def _support_mha_one_shot(attn, forward_batch, backend_name):
 
 
 def _handle_attention_backend(attn, forward_batch, backend_name):
-    if is_in_tc_piecewise_cuda_graph():
+    # Captured prefill (tc_piecewise or breakable) must keep a single attention
+    # path: pin the absorbed MLA method — MHA one-shot/chunked shapes vary with
+    # kv-len and cannot be captured.
+    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
 
     # MLA prefill CP forces absorbed MLA regardless of prefix length: the
@@ -118,7 +138,7 @@ def handle_attention_flashinfer(attn, forward_batch):
 
 def handle_attention_fa3(attn, forward_batch):
     # when deterministic inference is enabled, use MLA
-    if get_server_args().enable_deterministic_inference:
+    if get_exec().deterministic.enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
     else:
         return _handle_attention_backend(attn, forward_batch, "fa3")
@@ -145,7 +165,7 @@ def handle_attention_fa4(attn, forward_batch):
 
 
 def handle_attention_trtllm_mla(attn, forward_batch):
-    if is_in_tc_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
@@ -190,11 +210,11 @@ def handle_attention_dsa(attn, forward_batch):
 
 
 def handle_attention_triton(attn, forward_batch):
-    if is_in_tc_piecewise_cuda_graph():
+    if is_in_tc_piecewise_cuda_graph() or is_in_breakable_cuda_graph():
         return AttnForwardMethod.MLA
 
     # when deterministic inference is enabled, use MLA
-    if get_server_args().enable_deterministic_inference:
+    if get_exec().deterministic.enable_deterministic_inference:
         return _dispatch_mla_subtype(attn, forward_batch)
 
     if (

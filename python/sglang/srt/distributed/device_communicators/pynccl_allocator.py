@@ -15,7 +15,7 @@ from torch.cuda.memory import (
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import torch_release
 
 after_2_8_0 = torch_release >= (2, 8)
@@ -159,7 +159,7 @@ _register_func = None
 
 def is_symmetric_memory_enabled():
     try:
-        return get_server_args().enable_symm_mem
+        return get_exec().comm.enable_symm_mem
     except ValueError:
         return False
 

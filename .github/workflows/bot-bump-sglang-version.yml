@@ -62,7 +62,7 @@ jobs:
 
   run-nightly-tests-amd:
     needs: bump-sglang-version
-    uses: ./.github/workflows/nightly-test-amd.yml
+    uses: ./.github/workflows/nightly-test-amd-rocm720.yml
     with:
       ref: ${{ needs.bump-sglang-version.outputs.branch_name }}
     secrets: inherit
