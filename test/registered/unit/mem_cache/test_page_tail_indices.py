@@ -70,9 +70,9 @@ class TestWritePageTailIndices(CustomTestCase):
                     )
                     if ceiling > end:
                         self.assertTrue(
-                            torch.equal(
-                                rtt[row, end:ceiling] // page_size,
-                                rtt[row, end - 1 : end] // page_size,
+                            torch.all(
+                                rtt[row, end:ceiling] // page_size
+                                == rtt[row, end - 1] // page_size
                             ),
                             where,
                         )
