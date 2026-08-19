@@ -9,7 +9,11 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.moe.routing import virtual_expert_ids_inline
+from sglang.srt.lora.moe.routing import (
+    add_counts_inline,
+    count_bins,
+    virtual_expert_ids_inline,
+)
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
 # Launch tiles; see configs/README.md before changing them.
@@ -34,6 +38,7 @@ def _fused_hist_kernel(
     TOP_K: tl.constexpr,
     SHARED_OUTER: tl.constexpr,
     BLOCK: tl.constexpr,
+    BINS: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
     """Histogram the fused key over pairs; counts arrive zeroed, no memset pass."""
@@ -50,10 +55,11 @@ def _fused_hist_kernel(
         TOP_K=TOP_K,
         SHARED_OUTER=SHARED_OUTER,
     )
-    # Invalid pairs land in the sentinel bucket at NUM_BUCKETS - 1; its blocks
-    # are labelled -1 downstream so LoRA-A skips them and B zero-fills them.
-    buckets = tl.where(virtual_ids < 0, NUM_BUCKETS - 1, virtual_ids)
-    tl.atomic_add(counts_ptr + buckets, 1, mask=pair_mask)
+    # Sentinel-bucket blocks are labelled -1 downstream, so LoRA-A skips them
+    # and B zero-fills them.
+    add_counts_inline(
+        counts_ptr, virtual_ids, pair_mask, NUM_BUCKETS=NUM_BUCKETS, BINS=BINS
+    )
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -246,6 +252,7 @@ def fused_align_block_size(
         TOP_K=top_k,
         SHARED_OUTER=is_shared_outer,
         BLOCK=HIST_BLOCK,
+        BINS=count_bins(num_buckets, num_pairs),
         USE_PDL=use_pdl,
         num_warps=HIST_WARPS,
     )

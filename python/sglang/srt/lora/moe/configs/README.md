@@ -175,8 +175,11 @@ rank-0 torch profile:
 
 | route family | builder | per layer | per prefill | share of prefill |
 |---|---|---|---|---|
-| per-expert (`prefill.serial`) | `fused_align` | 43.7us | 1.75ms | 2.4% (ttft 74.4ms) |
-| shared-outer (`prefill.token_dedup`) | `joint_routing` | 116.4us | 4.66ms | 5.4% (ttft 86.8ms) |
+| per-expert (`prefill.serial`) | `fused_align` | 30.4us | 1.22ms | 1.5% |
+| shared-outer (`prefill.token_dedup`) | `joint_routing` | 32.7us | 1.31ms | 1.5% |
+
+Those are after the per-block counting below. Before it they were 43.7us /
+1.75ms / 2.4% and 116.4us / 4.66ms / 5.4%.
 
 Read that before optimizing either file. The shared-outer plan needs two
 aligned views at once, so it takes the JOINT builder and `fused_align` never
@@ -194,17 +197,29 @@ Verdicts on the two leads this evidence settles:
 - The single-thread-block plan kernel is NOT worth fixing. It is 2.7-3.8us per
   layer in both families, 0.13% of the step. Its 8.9us at 8193 buckets only
   arrives with many adapters resident, which batch-1 serving never reaches.
-- Atomic contention IS worth fixing, in `joint_routing`. Its count kernel does
-  two tallies per pair: the per-expert one spreads over 257-1025 counters, the
-  shared one over `adapters + 1`. Isolated at 65,536 pairs, the shared tally
-  alone costs 44.2us against 16.4us for the per-expert one, and aggregating it
-  per thread block takes the whole kernel 53.0 -> 18.3us (2.9x). The place
-  kernel's slot claims behave the same, 44.1 -> 11.2us on the contended part.
-  Estimated 2.7ms off the 4.66ms build, about 3% of the prefill step.
+- Atomic contention WAS worth fixing, and is fixed: `add_counts_inline` and
+  `claim_slots_inline` in routing.py count a block's pairs before touching
+  global memory, so a block spends one atomic per bucket instead of one per
+  pair. Landed per-layer prefill numbers, 8192-token chunk:
 
-That fix CANNOT simply replace the current code -- block aggregation pays a
-fixed per-block cost, so it loses badly on small work. Measured win factor by
-pairs and live adapters (above 1.00 means aggregation wins):
+| kernel | before | after | |
+|---|---|---|---|
+| joint count | 58.0us | 7.9us | 7.3x |
+| joint plan | 3.8us | 2.9us | 1.3x |
+| joint place | 54.6us | 21.9us | 2.5x |
+| fused count | 21.4us | 8.0us | 2.7x |
+| fused place | 19.6us | 19.6us | no path applies |
+
+  `fused_align`'s place kernel keeps its per-pair claim: handing out individual
+  slots across 257 buckets would need 257 running sums per block, which costs
+  more than the atomics it would replace. Only the shared route, with a handful
+  of buckets, can claim per block.
+
+The per-block paths CANNOT simply replace the per-pair ones -- they pay a fixed
+cost per block, so they lose badly on small work, which is why `count_bins` and
+`CLAIM_MIN_PAIRS_PER_BUCKET` gate them on the host and both per-pair paths
+stay. Measured win factor by pairs and live adapters (above 1.00 means the
+per-block path wins):
 
 | pairs | 1 live | 2 | 4 | 8 |
 |---|---|---|---|---|
@@ -214,16 +229,17 @@ pairs and live adapters (above 1.00 means aggregation wins):
 | 4,096 | 0.66x | 0.56x | 0.40x | 0.38x |
 | 512 | 0.33x | 0.32x | 0.31x | 0.38x |
 
-The crossover sits near 12,000 pairs per bucket. Pick between the two paths on
-the host from the pair count and bucket count, both known before launch, so
-each call site keeps one launch shape and graph capture is unaffected. Do NOT
-branch inside the kernel on a device value.
+The crossover sits near 12,000 pairs per bucket for slot claims. Counting has
+its own bound because it wins at far lower occupancy -- 65,536 pairs over 256
+buckets is only 256 each and still gains 3.7x -- but stops paying above 512
+bins (0.47x at 2048). Both choices are made on the host from the pair and
+bucket counts, so each call site keeps one launch shape and graph capture is
+unaffected. Do NOT branch inside a kernel on a device value.
 
-Remaining untested lead: once the shared tally is aggregated, the per-expert
-tally is what is left (16.4 of the 18.3us). 257 counters is mild but not free,
-and `fused_align`'s count kernel has the same shape at 21.4us per layer. A
-shared-memory histogram could take both further; the whole `fused_align`
-builder is only 2.4% of prefill, so the ceiling there is small.
+What is left: the counting path is bounded at 512 bins, so a per-expert route
+with more than 511 buckets -- 256 experts with 2 or more adapter slots -- still
+counts one pair at a time. Raising `COUNT_MAX_BINS` needs 1024 measured first;
+2048 is known to lose.
 
 Not a lead, and worth recording so nobody re-derives it: the padding fill's
 2D tile is `EXPAND_BLOCK x routing_block_size`, which looks like it should

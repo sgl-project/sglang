@@ -224,6 +224,10 @@ def _load_joint_routing():
         block_size * ((num_pairs + block_size - 1) // block_size + num_virtual)
     )
     routing.virtual_expert_ids_inline = lambda *_args, **_kwargs: None
+    routing.add_counts_inline = lambda *_args, **_kwargs: None
+    routing.claim_slots_inline = lambda *_args, **_kwargs: None
+    routing.count_bins = lambda num_buckets, num_pairs: 0
+    routing.CLAIM_MIN_PAIRS_PER_BUCKET = 12288
 
     workspace = types.ModuleType("sglang.srt.lora.moe.workspace")
     workspace.MoeLoraWorkspace = object

@@ -19,9 +19,13 @@ import triton
 import triton.language as tl
 
 from sglang.srt.lora.moe.routing import (
+    CLAIM_MIN_PAIRS_PER_BUCKET,
     RouteView,
     RouteViewKind,
     _routing_capacity,
+    add_counts_inline,
+    claim_slots_inline,
+    count_bins,
     virtual_expert_ids_inline,
 )
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
@@ -46,6 +50,8 @@ def _joint_hist_kernel(
     TOP_K: tl.constexpr,
     NUM_SHARED_BUCKETS: tl.constexpr,
     BLOCK: tl.constexpr,
+    PER_EXPERT_BINS: tl.constexpr,
+    SHARED_BINS: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
     pair_ids = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -72,21 +78,19 @@ def _joint_hist_kernel(
         TOP_K=TOP_K,
         SHARED_OUTER=True,
     )
-    tl.atomic_add(
-        per_expert_counts_ptr
-        + tl.where(
-            per_expert_ids < 0,
-            NUM_PER_EXPERT_BUCKETS - 1,
-            per_expert_ids,
-        ),
-        1,
-        mask=pair_mask,
+    add_counts_inline(
+        per_expert_counts_ptr,
+        per_expert_ids,
+        pair_mask,
+        NUM_BUCKETS=NUM_PER_EXPERT_BUCKETS,
+        BINS=PER_EXPERT_BINS,
     )
-    tl.atomic_add(
-        shared_counts_ptr
-        + tl.where(shared_ids < 0, NUM_SHARED_BUCKETS - 1, shared_ids),
-        1,
-        mask=pair_mask,
+    add_counts_inline(
+        shared_counts_ptr,
+        shared_ids,
+        pair_mask,
+        NUM_BUCKETS=NUM_SHARED_BUCKETS,
+        BINS=SHARED_BINS,
     )
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -247,6 +251,7 @@ def _joint_expand_scatter_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     PER_EXPERT_SEARCH_STEPS: tl.constexpr,
     SHARED_SEARCH_STEPS: tl.constexpr,
+    SHARED_CLAIM_PER_BLOCK: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -315,25 +320,25 @@ def _joint_expand_scatter_kernel(
         TOP_K=TOP_K,
         SHARED_OUTER=True,
     )
-    per_expert_buckets = tl.where(
-        per_expert_ids < 0,
-        NUM_PER_EXPERT_BUCKETS - 1,
-        per_expert_ids,
-    )
-    shared_buckets = tl.where(shared_ids < 0, NUM_SHARED_BUCKETS - 1, shared_ids)
     if USE_PDL:
         # Key recomputation above is independent of the scan. Cursors below
         # are the first scan-produced values this path consumes.
         tl.extra.cuda.gdc_wait()
-    per_expert_slots = tl.atomic_add(
-        per_expert_cursor_ptr + per_expert_buckets, 1, mask=pair_mask
+    per_expert_slots = claim_slots_inline(
+        per_expert_cursor_ptr,
+        per_expert_ids,
+        pair_mask,
+        NUM_BUCKETS=NUM_PER_EXPERT_BUCKETS,
+        PER_BLOCK=False,
     )
-    tl.store(
-        per_expert_sorted_ptr + per_expert_slots,
-        pair_ids,
-        mask=pair_mask,
+    tl.store(per_expert_sorted_ptr + per_expert_slots, pair_ids, mask=pair_mask)
+    shared_slots = claim_slots_inline(
+        shared_cursor_ptr,
+        shared_ids,
+        pair_mask,
+        NUM_BUCKETS=NUM_SHARED_BUCKETS,
+        PER_BLOCK=SHARED_CLAIM_PER_BLOCK,
     )
-    shared_slots = tl.atomic_add(shared_cursor_ptr + shared_buckets, 1, mask=pair_mask)
     tl.store(shared_sorted_ptr + shared_slots, pair_ids, mask=pair_mask)
 
 
@@ -468,6 +473,8 @@ def build_joint_shared_routes(
         TOP_K=top_k,
         NUM_SHARED_BUCKETS=num_shared_buckets,
         BLOCK=_HIST_BLOCK,
+        PER_EXPERT_BINS=count_bins(num_per_expert_buckets, num_pairs),
+        SHARED_BINS=count_bins(num_shared_buckets, num_pairs),
         USE_PDL=use_pdl,
         num_warps=8,
     )
@@ -533,6 +540,9 @@ def build_joint_shared_routes(
         # the final (sentinel) bucket can be mislabelled as a real expert.
         PER_EXPERT_SEARCH_STEPS=max(1, num_per_expert_buckets.bit_length()),
         SHARED_SEARCH_STEPS=max(1, num_shared_buckets.bit_length()),
+        SHARED_CLAIM_PER_BLOCK=(
+            num_pairs >= CLAIM_MIN_PAIRS_PER_BUCKET * num_shared_buckets
+        ),
         USE_PDL=use_pdl,
         num_warps=4,
         **pdl_kwargs,

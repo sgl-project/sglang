@@ -17,6 +17,19 @@ from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 FUSED_ALIGN_MIN_VIRTUAL_EXPERTS = 8192
 FUSED_ALIGN_MIN_PAIRS = 16384
 
+# Counting a block's pairs first costs one atomic per bucket instead of one per
+# pair, and only pays when many pairs land on few counters -- so both helpers
+# below keep the per-pair path too. Crossover: configs/README.md.
+COUNT_MAX_BINS = 512
+COUNT_MIN_PAIRS = 16384
+CLAIM_MIN_PAIRS_PER_BUCKET = 12288
+
+
+def count_bins(num_buckets: int, num_pairs: int) -> int:
+    """Bins for counting inside a block, or 0 to add one pair at a time."""
+    bins = 1 << num_buckets.bit_length()  # one spare bin, for masked-off lanes
+    return bins if bins <= COUNT_MAX_BINS and num_pairs >= COUNT_MIN_PAIRS else 0
+
 
 class RouteViewKind(str, Enum):
     RAW = "raw"
@@ -113,6 +126,52 @@ def virtual_expert_ids_inline(
         & (lora_expert_ids < LORA_EXPERTS_PER_ADAPTER)
     )
     return tl.where(valid, adapter_ids * LORA_EXPERTS_PER_ADAPTER + lora_expert_ids, -1)
+
+
+@triton.jit
+def add_counts_inline(
+    counts_ptr,
+    virtual_ids,
+    mask,
+    NUM_BUCKETS: tl.constexpr,
+    BINS: tl.constexpr,
+):
+    """Count these pairs; one atomic per bucket when BINS is nonzero.
+
+    Invalid pairs go in the sentinel bucket, masked lanes in the spare bin
+    above it that ``count_bins`` leaves and the store below skips.
+    """
+    buckets = tl.where(virtual_ids < 0, NUM_BUCKETS - 1, virtual_ids)
+    if BINS == 0:
+        tl.atomic_add(counts_ptr + buckets, 1, mask=mask)
+    else:
+        mine = tl.histogram(tl.where(mask, buckets, BINS - 1), BINS)
+        bins = tl.arange(0, BINS)
+        tl.atomic_add(counts_ptr + bins, mine, mask=(bins < NUM_BUCKETS) & (mine > 0))
+
+
+@triton.jit
+def claim_slots_inline(
+    cursor_ptr,
+    virtual_ids,
+    mask,
+    NUM_BUCKETS: tl.constexpr,
+    PER_BLOCK: tl.constexpr,
+):
+    """One slot per pair; PER_BLOCK reserves each bucket's run in one atomic.
+
+    That reorders pairs within a bucket, which means nothing downstream: every
+    consumer writes ``out[pair_id]``.
+    """
+    buckets = tl.where(virtual_ids < 0, NUM_BUCKETS - 1, virtual_ids)
+    if not PER_BLOCK:
+        return tl.atomic_add(cursor_ptr + buckets, 1, mask=mask)
+    slots = tl.zeros(buckets.shape, dtype=tl.int32)
+    for bucket in tl.static_range(NUM_BUCKETS):
+        mine = tl.where(mask & (buckets == bucket), 1, 0).to(tl.int32)
+        start = tl.atomic_add(cursor_ptr + bucket, tl.sum(mine))
+        slots = tl.where(mine == 1, start + tl.cumsum(mine) - mine, slots)
+    return slots
 
 
 @triton.jit
