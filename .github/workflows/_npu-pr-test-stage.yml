@@ -40,6 +40,10 @@ on:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
         type: string
         default: 'false'
+      is_nightly_pipeline_job:
+        description: 'Run the test suite with --nightly (collects nightly-registered tests) and --continue-on-error'
+        type: boolean
+        default: false
       github-token:
         description: 'GitHub token for API calls'
         type: string
@@ -160,6 +164,11 @@ jobs:
                 core.info(`[health-check] Filtered out h20 job: ${j.name}`);
                 return false;
               }
+              // multimodal-gen NPU tests should not cascade fast-fail to perf/accuracy stages.
+              if (baseName === 'multimodal-gen-test-1-npu-a3' || baseName === 'multimodal-gen-test-2-npu-a3') {
+                core.info(`[health-check] Filtered out multimodal-gen NPU job: ${j.name}`);
+                return false;
+              }
               // If the failing step is the health check, it's a cascade — skip it
               const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
               if (failedStep && (failedStep.name.includes('check-pr-test-health') || failedStep.name.includes('Check PR test health'))) {
@@ -177,6 +186,8 @@ jobs:
             }
 
       - name: Install dependencies
+        # Only PR jobs install dependencies
+        if: ${{ inputs.is_nightly_pipeline_job != true }}
         env:
           TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
@@ -204,10 +215,43 @@ jobs:
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+        shell: bash
         run: |
+          # Fail fast on any command error, undefined variable, or pipe failure.
+          set -euo pipefail
+
+          # Install missing python deps (skip if already importable).
+          PYTHON_FOR_SGLANG="python"
+          PIP_INDEXES=("https://pypi.org/simple/" "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple" "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple")
+          PIP_TRUSTED_HOST=cache-service.nginx-pypi-cache.svc.cluster.local
+          install_pkg() {
+            local pkg="$1"
+            ok=0
+            for index in "${PIP_INDEXES[@]}"; do
+              echo "${pkg}: try via ${index}"
+              if ${PYTHON_FOR_SGLANG} -m pip install "${pkg}" --retries 3 --timeout 60 \
+                  -i "${index}" --trusted-host "${PIP_TRUSTED_HOST}"; then
+                ok=1; break
+              fi
+            done
+            [ "${ok}" = "1" ] || { echo "ERROR: failed to install ${pkg}"; exit 1; }
+          }
+          REQUIRED_PIP_PKGS=(tabulate)
+          for pkg in "${REQUIRED_PIP_PKGS[@]}"; do
+            ${PYTHON_FOR_SGLANG} -c "import ${pkg}" 2>/dev/null && { echo "${pkg}: available, skip"; continue; }
+            install_pkg "${pkg}"
+          done
+
           cd test
+          # Append `--nightly` and `--continue-on-error` when the job belongs to the nightly pipeline.
+          # --nightly: Collect test cases registered for nightly runs.
+          # --continue-on-error: Keep running remaining cases even if one fails.
+          NIGHTLY_FLAG=""
+          if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
+            NIGHTLY_FLAG="--nightly --continue-on-error"
+          fi
           python3 run_suite.py --hw npu --suite ${{ inputs.self_name }} \
             --auto-partition-id ${{ matrix.partition }} \
             --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
-            $CONTINUE_ON_ERROR_FLAG
+            $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG
