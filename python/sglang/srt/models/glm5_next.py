@@ -1447,10 +1447,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         input_embeds: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> None:
-        len_input_ids = (
-            input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
-        )
+        if input_ids is not None:
+            len_input_ids = input_ids.shape[0]
+        elif input_embeds is not None:
+            len_input_ids = input_embeds.shape[0]
+        else:
+            len_input_ids = pp_proxy_tensors["hidden_states"].shape[0]
         if self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(
                 len_input_ids, self.cp_size, self.use_dsa, forward_batch
@@ -1484,7 +1488,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
-        self._prepare_context_parallel_metadata(input_ids, input_embeds, forward_batch)
+        self._prepare_context_parallel_metadata(
+            input_ids, input_embeds, forward_batch, pp_proxy_tensors
+        )
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = general_mm_embed_routine(
                 input_ids=input_ids,
