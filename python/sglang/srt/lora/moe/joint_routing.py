@@ -1,15 +1,11 @@
-"""Joint aligned-route construction for shared-factor MoE-LoRA plans.
+"""Build both aligned routes a shared-factor plan needs from one pass over pairs.
 
-Shared-factor execution consumes two aligned views over the same token/expert
-pairs: a per-expert view for the inner factors and a per-adapter view for the
-shared outer factors.  This implementation reads the pair sources once and
-builds both views in one three-launch chain.  It is an explicit candidate;
-the execution plan, never this module, decides whether it is used.
-
-The kernel bodies and three-stage protocol are the qualified R10 candidate
-from ``benchmark/kernels/lora_moe/r10_joint_route.py``.  The production port's
-only structural change is replacing that benchmark's process-global scratch
-cache with the layer-owned :class:`MoeLoraWorkspace`.
+Shared-factor execution groups the same token/expert pairs two ways at once: by
+virtual expert for the inner factors, by adapter alone for the shared outer
+ones. Two independent builds would read the pair sources twice and run two
+three-kernel chains, so every kernel here carries both groupings side by side --
+count both, scan both from one launch of two programs, label and scatter both.
+The execution plan, never this module, decides that it is used.
 """
 
 from __future__ import annotations

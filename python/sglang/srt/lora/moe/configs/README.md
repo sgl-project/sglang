@@ -149,7 +149,10 @@ the first attempt at this sweep measured the shipped config 9.6% FASTER THAN
 ITSELF, and one arch's three stages each +13% while their combination went
 -3.9%. Per-kernel `self_device_time_total` has a <=1% floor.
 
-`joint_routing.py` inherits the same three values without its own sweep; its
+`joint_routing.py`'s kernel bodies come from the qualified R10 candidate in
+`benchmark/kernels/lora_moe/r10_joint_route.py`, with the benchmark's
+process-global scratch replaced by the layer-owned workspace. It inherits
+fused_align's three launch values without its own sweep; its
 kernels write two count arrays per pass, so the shapes need not transfer.
 The JIT id-pass tile in `routing.py` (`block_size = 1024`, a flat map over
 pairs) was never swept either. Both are open, both are ~1-3us of exposure.

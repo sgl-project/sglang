@@ -1,6 +1,11 @@
-"""Build the aligned route in three kernels -- fused key + histogram, padded
-scan, block labels + pair scatter -- with no memset, no per-call metadata, and
-no bucket ceiling.
+"""Sort token/expert pairs into whole route blocks, one group per virtual expert.
+
+One kernel counts the pairs per group, one scans those counts into block-aligned
+runs, one labels each block with its group and scatters the pairs into slots. The
+group key is never materialized: both kernels that need it recompute it, which is
+the [T,K] round trip the JIT path pays along with a ladder that stops at 32767
+groups. routing.py switches here above FUSED_ALIGN_MIN_PAIRS and
+FUSED_ALIGN_MIN_VIRTUAL_EXPERTS.
 """
 
 from __future__ import annotations
@@ -55,8 +60,7 @@ def _fused_hist_kernel(
         TOP_K=TOP_K,
         SHARED_OUTER=SHARED_OUTER,
     )
-    # Sentinel-bucket blocks are labelled -1 downstream, so LoRA-A skips them
-    # and B zero-fills them.
+    # Sentinel blocks are labelled -1, so LoRA-A skips them and B zero-fills.
     add_counts_inline(
         counts_ptr, virtual_ids, pair_mask, NUM_BUCKETS=NUM_BUCKETS, BINS=BINS
     )

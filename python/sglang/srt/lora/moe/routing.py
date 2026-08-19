@@ -17,9 +17,8 @@ from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 FUSED_ALIGN_MIN_VIRTUAL_EXPERTS = 8192
 FUSED_ALIGN_MIN_PAIRS = 16384
 
-# Counting a block's pairs first costs one atomic per bucket instead of one per
-# pair, and only pays when many pairs land on few counters -- so both helpers
-# below keep the per-pair path too. Crossover: configs/README.md.
+# Bin ceiling and smallest pair counts at which counting a block's pairs beats
+# one atomic per pair; outside them the helpers below keep the per-pair path.
 COUNT_MAX_BINS = 512
 COUNT_MIN_PAIRS = 16384
 CLAIM_MIN_PAIRS_PER_BUCKET = 12288
@@ -136,11 +135,7 @@ def add_counts_inline(
     NUM_BUCKETS: tl.constexpr,
     BINS: tl.constexpr,
 ):
-    """Count these pairs; one atomic per bucket when BINS is nonzero.
-
-    Invalid pairs go in the sentinel bucket, masked lanes in the spare bin
-    above it that ``count_bins`` leaves and the store below skips.
-    """
+    """Count these pairs, one atomic per bucket when BINS is nonzero."""
     buckets = tl.where(virtual_ids < 0, NUM_BUCKETS - 1, virtual_ids)
     if BINS == 0:
         tl.atomic_add(counts_ptr + buckets, 1, mask=mask)
@@ -158,11 +153,7 @@ def claim_slots_inline(
     NUM_BUCKETS: tl.constexpr,
     PER_BLOCK: tl.constexpr,
 ):
-    """One slot per pair; PER_BLOCK reserves each bucket's run in one atomic.
-
-    That reorders pairs within a bucket, which means nothing downstream: every
-    consumer writes ``out[pair_id]``.
-    """
+    """A slot per pair; PER_BLOCK claims each bucket's run at once, reordering it."""
     buckets = tl.where(virtual_ids < 0, NUM_BUCKETS - 1, virtual_ids)
     if not PER_BLOCK:
         return tl.atomic_add(cursor_ptr + buckets, 1, mask=mask)
