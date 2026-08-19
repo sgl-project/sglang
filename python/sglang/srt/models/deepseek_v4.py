@@ -55,6 +55,7 @@ from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.communicator_dsa_cp import (
+    cp_requires_shared_expert_hoist,
     dsa_cp_gather_hidden_states,
     dsa_cp_reduce_scatter_hidden_states,
 )
@@ -2165,15 +2166,31 @@ class DeepseekV4DecoderLayer(nn.Module):
         # expert this cancels the TP1 "full-dim" cost in decode (M_local * dim ==
         # M_global * dim/tp), so decode no longer pays the ~dp_size x penalty.
         _shared_local = None
-        _do_shared_local = (
-            _SHARED_EXPERT_LOCAL
-            and _use_tp_moe_gather
-            and getattr(self.mlp, "shared_experts", None) is not None
-            and getattr(self.mlp, "_shared_expert_tp1", False)
+        _has_tp1_shared = cp_requires_shared_expert_hoist(self.mlp)
+        # On the CP path, hoisting the shared expert is REQUIRED for correctness,
+        # not a perf PoC. A TP1 shared expert is replicated across ranks, so it
+        # must never sit inside a tensor that a downstream collective SUMs.
+        # DeepseekV2MoE adds it after its internal all-reduce for exactly this
+        # reason, but under CP that all-reduce is skipped (mlp_reduce_scatter is
+        # True, see should_skip_post_experts_all_reduce) and the sum instead
+        # happens below in dsa_cp_reduce_scatter_hidden_states -- which would
+        # scale the shared expert by cp_size, once per layer. Deliberately NOT
+        # gated on _SHARED_EXPERT_LOCAL: correctness must not depend on a perf
+        # env var.
+        _cp_must_hoist_shared = (
+            _use_cp and get_moe_a2a_backend().is_none() and _has_tp1_shared
+        )
+        _do_shared_local = _cp_must_hoist_shared or (
+            _SHARED_EXPERT_LOCAL and _use_tp_moe_gather and _has_tp1_shared
         )
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
+                # Compute on the LOCAL rows before the gather: the shared expert
+                # is a per-token MLP, so this is identical to computing it on the
+                # gathered buffer and keeping this rank's slice.
+                if _cp_must_hoist_shared and hidden_states.shape[0] > 0:
+                    _shared_local = self.mlp._forward_shared_experts(hidden_states)
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
                 assert moe_a2a_backend.is_deepep() or moe_a2a_backend.is_megamoe(), (
@@ -2211,6 +2228,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
         if _use_cp and get_moe_a2a_backend().is_none():
             hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            # Add the replicated shared expert back AFTER the reduce-scatter so
+            # it is counted once, not once per CP rank.
+            if _shared_local is not None:
+                hidden_states = hidden_states + _shared_local[: hidden_states.shape[0]]
         elif _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
@@ -2480,6 +2501,16 @@ class DeepseekV4DecoderLayer(nn.Module):
 
     def op_cp_gather_a(self, state):
         local = state.pop("hidden_states_mlp_input")
+        # Same correctness constraint as the non-TBO CP path: op_cp_combine_a
+        # reduce-scatters (SUMs) the MoE output across the CP group, so a
+        # replicated TP1 shared expert must be computed on LOCAL rows here and
+        # added back in op_cp_combine_b instead of riding through the sum.
+        state.cp_shared_hoisted = cp_requires_shared_expert_hoist(self.mlp)
+        state.cp_shared_local = (
+            self.mlp._forward_shared_experts(local)
+            if (state.cp_shared_hoisted and local.shape[0] > 0)
+            else None
+        )
         out, event, keepalive = self._cp_tbo_launch(
             state,
             local,
@@ -2504,6 +2535,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 fb,
                 input_ids=global_ids,
                 input_ids_global=global_ids,
+                skip_shared_experts=state.cp_shared_hoisted,
             )
 
     def op_cp_combine_a(self, state):
@@ -2522,7 +2554,13 @@ class DeepseekV4DecoderLayer(nn.Module):
     def op_cp_combine_b(self, state):
         torch.cuda.current_stream().wait_event(state.pop("cp_combine_event"))
         state.pop("cp_combine_keepalive")
-        state.hidden_states_mlp_output = state.pop("local_out")
+        hidden = state.pop("local_out")
+        shared_local = state.pop("cp_shared_local")
+        state.pop("cp_shared_hoisted")
+        # Counted once here, rather than once per CP rank inside the sum.
+        if shared_local is not None:
+            hidden = hidden + shared_local[: hidden.shape[0]]
+        state.hidden_states_mlp_output = hidden
 
 
 class DeepseekV4Model(nn.Module):

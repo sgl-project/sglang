@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.communicator_dsa_cp import cp_requires_shared_expert_hoist
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     get_cp_strategy,
@@ -1148,6 +1149,84 @@ class TestCPInterleaveStrategy(CustomTestCase):
         self.assertIsNone(stream)
         self.assertTrue(torch.equal(full_k_nope, full_latent[:, :3].unsqueeze(1)))
         self.assertTrue(torch.equal(full_k_rope, full_latent[:, 3:].unsqueeze(1)))
+
+
+class TestCPSharedExpertHoist(CustomTestCase):
+    """A replicated (TP1) shared expert must not ride through the CP combine.
+
+    ``dsa_cp_reduce_scatter_hidden_states`` SUMs the MoE output across the CP
+    group. Routed-expert outputs are genuine per-rank partial sums, so summing
+    them is correct; a TP1 shared expert is replicated, so summing it scales it
+    by ``cp_size`` once per layer. ``DeepseekV2MoE`` guards its own internal
+    all-reduce against this, but under CP that all-reduce is skipped and the sum
+    happens in the CP combine instead.
+    """
+
+    def test_predicate_only_fires_for_replicated_shared_expert(self):
+        cases = [
+            (object(), True, True, "TP1 shared expert -> must hoist"),
+            (object(), False, False, "TP-sharded shared expert -> partial sums"),
+            (None, True, False, "no shared expert -> nothing to hoist"),
+            (None, False, False, "neither"),
+        ]
+        for shared, tp1, expected, msg in cases:
+            mlp = SimpleNamespace(shared_experts=shared, _shared_expert_tp1=tp1)
+            self.assertEqual(cp_requires_shared_expert_hoist(mlp), expected, msg)
+
+    def _combine(self, cp_size, rows, hoist):
+        """Model one layer's CP MoE combine and return this rank's local slice.
+
+        Every rank computes the same replicated ``shared`` and its own routed
+        partial; the combine reduce-scatters (SUM) across ranks. Rank 0's slice
+        is returned.
+        """
+        hidden = torch.arange(rows, dtype=torch.float32).reshape(rows, 1)
+        shared = hidden * 10.0  # replicated: identical on every rank
+        # Per-rank routed partials that sum to a known total.
+        routed = [torch.full((rows * cp_size, 1), float(r)) for r in range(cp_size)]
+
+        per_rank_global = []
+        for r in range(cp_size):
+            out = routed[r]
+            if not hoist:
+                # BUG: replicated shared output added before the cross-rank SUM.
+                out = out + shared.repeat(cp_size, 1) * 1.0
+            per_rank_global.append(out)
+
+        summed = torch.stack(per_rank_global, dim=0).sum(dim=0)
+        local = summed.tensor_split(cp_size)[0]
+        if hoist:
+            local = local + shared[: local.shape[0]]
+        return local, shared[: local.shape[0]], routed, rows, cp_size
+
+    def test_hoisted_shared_expert_is_counted_exactly_once(self):
+        for cp_size in (2, 4, 8):
+            rows = 3
+            fixed, shared, routed, rows, cp_size = self._combine(
+                cp_size, rows, hoist=True
+            )
+            routed_total = float(sum(range(cp_size)))
+            expected = torch.full((rows, 1), routed_total) + shared
+            self.assertTrue(
+                torch.equal(fixed, expected),
+                f"cp_size={cp_size}: hoisted combine should count shared once",
+            )
+
+    def test_unhoisted_shared_expert_is_scaled_by_cp_size(self):
+        """Characterizes the bug the hoist prevents (guards against regression)."""
+        for cp_size in (2, 4, 8):
+            rows = 3
+            buggy, shared, _routed, rows, cp_size = self._combine(
+                cp_size, rows, hoist=False
+            )
+            fixed, _, _, _, _ = self._combine(cp_size, rows, hoist=True)
+            # The whole error is the shared expert counted cp_size times
+            # instead of once.
+            self.assertTrue(
+                torch.equal(buggy - fixed, shared * (cp_size - 1)),
+                f"cp_size={cp_size}: un-hoisted shared expert should be "
+                f"{cp_size}x, i.e. off by (cp_size-1)x",
+            )
 
 
 if __name__ == "__main__":

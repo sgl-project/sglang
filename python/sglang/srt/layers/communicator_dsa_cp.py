@@ -92,6 +92,37 @@ def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
     return hidden_states
 
 
+def cp_requires_shared_expert_hoist(mlp) -> bool:
+    """Whether ``mlp``'s shared expert must be computed outside the CP combine.
+
+    ``dsa_cp_reduce_scatter_hidden_states`` SUMs the MoE output across the CP
+    group. That is correct for the routed experts, whose per-rank outputs are
+    genuine partial sums, but wrong for a replicated (TP1) shared expert: every
+    rank holds the identical full value, so summing scales it by ``cp_size`` --
+    once per layer.
+
+    ``DeepseekV2MoE`` already adds a TP1 shared expert *after* its internal
+    post-experts all-reduce for exactly this reason, but under CP that
+    all-reduce is skipped (``mlp_reduce_scatter=True``, see
+    ``should_skip_post_experts_all_reduce``) and the cross-rank sum happens
+    later in the CP combine instead -- outside the reach of that guard.
+
+    Callers must therefore compute the shared expert on their LOCAL rows before
+    the gather, pass ``skip_shared_experts=True`` into the MoE, and add the
+    result back after the reduce-scatter. Because this is a correctness
+    requirement it is deliberately independent of ``SGLANG_DP_SHARED_EXPERT_LOCAL``,
+    which only selects a perf variant of the same hoist on the DP path.
+    """
+    # getattr, not plain access: a dense (non-MoE) layer's mlp has no
+    # shared_experts attribute at all, and DeepseekV2MoE only assigns it when
+    # shared experts are neither fused nor per-rank-slotted. Three sites in
+    # deepseek_v2.py branch on hasattr(self, "shared_experts"), so it cannot be
+    # pre-initialized to None without changing their behaviour.
+    return getattr(mlp, "shared_experts", None) is not None and getattr(
+        mlp, "_shared_expert_tp1", False
+    )
+
+
 class DSACPLayerCommunicator(LayerCommunicator):
     def __init__(
         self,
