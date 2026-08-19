@@ -45,6 +45,11 @@ from sglang.srt.utils.common import is_sm120_supported
 # Suppress TRT-LLM CUTLASS trace logs without overriding user configuration.
 os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
 
+# Route the b12x compile cache through sglang's cache tree (same pattern as
+# DG_JIT_CACHE_DIR in deep_gemm_wrapper). b12x resolves
+# B12X_CUTE_COMPILE_CACHE_DIR at first compile, so import time is early enough.
+os.environ["B12X_CUTE_COMPILE_CACHE_DIR"] = envs.SGLANG_B12X_CACHE_DIR.get()
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -370,7 +375,7 @@ class Mxfp4B12xMoEMethod:
         self._keepalive = (prepared, w13, s13, w2, s2, ones, plan, scratch)
         # b12x will not compile while a CUDA graph is being captured, so every
         # shape a graph can present has to have run once already.
-        if not _B12X_WARMED:
+        if not _B12X_WARMED and envs.SGLANG_B12X_WARMUP.get():
             log_info_on_rank0(
                 logger,
                 f"Compiling b12x W4A16 kernels for {len(counts)} "
