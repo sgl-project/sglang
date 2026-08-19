@@ -48,44 +48,48 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
 }
 
-async fn chat_completions(
-    State(state): State<Arc<AppState>>,
-    body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
-) -> Response {
-    let request = match body {
-        Ok(Json(request)) => request,
-        Err(rejection) => {
-            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
-        }
-    };
-    if request.model != state.server_args.served_model_name {
-        return openai_error(
+pub(in crate::http_server) async fn lower_chat_requests(
+    server_args: &ServerArgs,
+    chat_formatter: Option<ChatFormatter>,
+    request: &mut CreateChatCompletionRequest,
+    response_id: &str,
+) -> Result<Vec<GenerateRequest>, Response> {
+    if request.model != server_args.served_model_name {
+        return Err(openai_error(
             StatusCode::BAD_REQUEST,
             format!("The model `{}` does not exist", request.model),
             false,
-        );
+        ));
     }
     if request.messages.is_empty() {
-        return openai_error(StatusCode::BAD_REQUEST, "messages cannot be empty", false);
+        return Err(openai_error(
+            StatusCode::BAD_REQUEST,
+            "messages cannot be empty",
+            false,
+        ));
     }
     if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
-        return openai_error(
+        return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "image, audio, video, and file message content is not supported",
             false,
-        );
+        ));
     }
     if request.n == Some(0) {
-        return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1", false);
+        return Err(openai_error(
+            StatusCode::BAD_REQUEST,
+            "n must be at least 1",
+            false,
+        ));
     }
     #[allow(deprecated)]
     let max_tokens = request.max_completion_tokens.or(request.max_tokens);
     if max_tokens == Some(0) {
-        return openai_error(
+        return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "max_completion_tokens must be positive",
             false,
-        );
+        ));
     }
     if request.modalities.as_ref().is_some_and(|modalities| {
         serde_json::to_value(modalities).is_ok_and(|value| value.to_string().contains("\"audio\""))
@@ -94,93 +98,43 @@ async fn chat_completions(
         || request.web_search_options.is_some()
         || request.mm_processor_kwargs.is_some()
     {
-        return openai_error(
+        return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "audio, prediction, web search, and multimodal inputs are not supported",
             false,
-        );
+        ));
     }
     #[allow(deprecated)]
     if request.function_call.is_some() || request.functions.is_some() {
-        return openai_error(
+        return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "deprecated function_call/functions are not supported; use tools and tool_choice",
             false,
-        );
+        ));
     }
 
     let tool_choice = dynamo_tool_choice(&request.tool_choice);
-    let tools_enabled = request
-        .tools
-        .as_ref()
-        .is_some_and(|tools| !tools.is_empty())
-        && tool_choice != DynamoToolChoice::None;
-    let parser = tools_enabled
-        .then(|| state.server_args.tool_call_parser.clone())
-        .flatten();
-    if tools_enabled && parser.is_none() {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "tool calls require --tool-call-parser",
-            false,
-        );
-    }
-    // Python gates the split on `request.separate_reasoning` (default true);
-    // the Dynamo request type has no such field, so it is always on when the
-    // server was launched with `--reasoning-parser`.
-    let reasoning_parser = state.server_args.reasoning_parser.clone();
-    let tools = request.tools.as_ref().map(|tools| {
-        tools
-            .iter()
-            .map(|tool| ToolDefinition {
-                name: tool.function.name.clone(),
-                parameters: tool.function.parameters.clone(),
-                strict: tool.function.strict,
-            })
-            .collect::<Vec<_>>()
-    });
-    let tools_slice = tools.as_deref().unwrap_or_default();
-
-    let (request, prompt) = match prepare_chat_request(&state, request).await {
-        Ok(prepared) => prepared,
-        Err(response) => return response,
-    };
-
-    let sampling = match chat_sampling(
-        &request,
+    let parser = resolve_chat_parser(server_args, request, &tool_choice)
+        .map_err(|message| openai_error(StatusCode::BAD_REQUEST, message, false))?;
+    let tools = chat_tool_definitions(request);
+    let prompt = prepare_chat_request(chat_formatter, request).await?;
+    let sampling = chat_sampling(
+        request,
         SamplingDefaults::CHAT,
         parser.as_deref(),
         &tool_choice,
-        tools_slice,
+        tools.as_deref().unwrap_or_default(),
         request.parallel_tool_calls,
-        &state.server_args,
-    ) {
-        Ok(sampling) => sampling,
-        Err(message) => {
-            return openai_error(StatusCode::BAD_REQUEST, message, false);
-        }
-    };
+        server_args,
+    )
+    .map_err(|message| openai_error(StatusCode::BAD_REQUEST, message, false))?;
 
-    let stream = request.stream.unwrap_or(false);
     let n = request.n.unwrap_or(1) as usize;
+    let stream = request.stream.unwrap_or(false);
     let want_logprobs = request.logprobs.unwrap_or(false);
-    let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
-    let stream_tool_choice = request.tool_choice.clone();
-    let uses_tool_call_structural_tag = sampling.structural_tag.is_some();
-    let service_tier = request.service_tier;
-    let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-    let created = unix_seconds_u32();
-    let model = request.model;
-    let include_usage = request
-        .stream_options
-        .is_some_and(|options| options.include_usage)
-        || state.server_args.stream_response_default_include_usage;
-    let mut guard = AbortGuard::new_empty(state.senders.clone());
-    let mut submitted = Vec::with_capacity(n);
-
+    let mut requests = Vec::with_capacity(n);
     let mut prompt = Some(prompt);
     for index in 0..n {
-        let rid = Rid::from_client(&format!("{response_id}-{index}"));
         let choice_prompt = if index + 1 == n {
             prompt.take().expect("last chat choice owns the prompt")
         } else {
@@ -189,8 +143,8 @@ async fn chat_completions(
                 .expect("chat prompt exists until the last choice")
                 .clone()
         };
-        let native = GenerateRequest {
-            rid: rid.clone(),
+        requests.push(GenerateRequest {
+            rid: Rid::from_client(&format!("{response_id}-{index}")),
             text: Some(choice_prompt),
             // Rendered templates own their special tokens — the pool must not
             // add another BOS/EOS (Python's `add_special_tokens=False`).
@@ -202,13 +156,102 @@ async fn chat_completions(
             top_logprobs_num: request.top_logprobs.unwrap_or(0) as i64,
             return_text_in_logprobs: want_logprobs.then_some(true),
             ..Default::default()
-        };
+        });
+    }
+    Ok(requests)
+}
+
+fn resolve_chat_parser(
+    server_args: &ServerArgs,
+    request: &CreateChatCompletionRequest,
+    tool_choice: &DynamoToolChoice,
+) -> Result<Option<String>, &'static str> {
+    let tools_enabled = request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty())
+        && *tool_choice != DynamoToolChoice::None;
+    let parser = tools_enabled
+        .then(|| server_args.tool_call_parser.clone())
+        .flatten();
+    if tools_enabled && parser.is_none() {
+        return Err("tool calls require --tool-call-parser");
+    }
+    Ok(parser)
+}
+
+fn chat_tool_definitions(request: &CreateChatCompletionRequest) -> Option<Vec<ToolDefinition>> {
+    request.tools.as_ref().map(|tools| {
+        tools
+            .iter()
+            .map(|tool| ToolDefinition {
+                name: tool.function.name.clone(),
+                parameters: tool.function.parameters.clone(),
+                strict: tool.function.strict,
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
+async fn chat_completions(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<CreateChatCompletionRequest>, JsonRejection>,
+) -> Response {
+    let mut request = match body {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
+        }
+    };
+    let response_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+    let native_requests = match lower_chat_requests(
+        &state.server_args,
+        state.chat_formatter.clone(),
+        &mut request,
+        &response_id,
+    )
+    .await
+    {
+        Ok(requests) => requests,
+        Err(response) => return response,
+    };
+    let tool_choice = dynamo_tool_choice(&request.tool_choice);
+    let parser = match resolve_chat_parser(&state.server_args, &request, &tool_choice) {
+        Ok(parser) => parser,
+        Err(message) => return openai_error(StatusCode::BAD_REQUEST, message, false),
+    };
+    let tools = chat_tool_definitions(&request);
+    // Python gates the split on `request.separate_reasoning` (default true);
+    // the Dynamo request type has no such field, so it is always on when the
+    // server was launched with `--reasoning-parser`.
+    let reasoning_parser = state.server_args.reasoning_parser.clone();
+    let stream = request.stream.unwrap_or(false);
+    let n = request.n.unwrap_or(1) as usize;
+    let want_logprobs = request.logprobs.unwrap_or(false);
+    let parallel_tool_calls = request.parallel_tool_calls.unwrap_or(true);
+    let stream_tool_choice = request.tool_choice.clone();
+    let uses_tool_call_structural_tag = native_requests
+        .first()
+        .is_some_and(|request| request.sampling_params.structural_tag.is_some());
+    let created = unix_seconds_u32();
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .is_some_and(|options| options.include_usage)
+        || state.server_args.stream_response_default_include_usage;
+    let mut guard = AbortGuard::new_empty(state.senders.clone());
+    let mut submitted = Vec::with_capacity(n);
+
+    for (index, native) in native_requests.into_iter().enumerate() {
+        let rid = native.rid.clone();
         let rx = match submit_generation(&state, native, stream, &mut guard).await {
             Ok(rx) => rx,
             Err(response) => return response,
         };
         submitted.push((index, rid, rx));
     }
+    let model = request.model;
+    let service_tier = request.service_tier;
 
     if stream {
         let event_stream = chat_event_stream(
@@ -252,10 +295,10 @@ async fn chat_completions(
 /// submitted as text — the tokenizer pool encodes it (with
 /// `skip_special_tokens`, since the template owns its special tokens).
 pub(super) async fn prepare_chat_request(
-    state: &AppState,
-    mut request: CreateChatCompletionRequest,
-) -> Result<(CreateChatCompletionRequest, String), Response> {
-    let Some(formatter) = state.chat_formatter.clone() else {
+    chat_formatter: Option<ChatFormatter>,
+    request: &mut CreateChatCompletionRequest,
+) -> Result<String, Response> {
+    let Some(formatter) = chat_formatter else {
         return Err(openai_error(
             StatusCode::BAD_REQUEST,
             "this model has no usable chat template",
@@ -266,15 +309,15 @@ pub(super) async fn prepare_chat_request(
     // `_apply_conversation_template` (`conv.stop_str` + `request.stop`). A
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
-    merge_template_stops(&mut request, &formatter);
-    let prompt = formatter.render(&request).map_err(|error| {
+    merge_template_stops(request, &formatter);
+    let prompt = formatter.render(request).map_err(|error| {
         openai_error(
             StatusCode::BAD_REQUEST,
             format!("chat template render failed: {error}"),
             false,
         )
     })?;
-    Ok((request, prompt))
+    Ok(prompt)
 }
 
 /// Full sampling resolution for an OpenAI request, mirroring the Python
