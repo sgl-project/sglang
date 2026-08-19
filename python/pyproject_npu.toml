@@ -24,7 +24,6 @@ dependencies = [
   "compressed-tensors",
   "datasets",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
-  "easydict",
   "einops",
   "fastapi",
   "gguf",
@@ -69,6 +68,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# easydict is LGPL-3.0. It is not imported by sglang itself; it is only needed at
+# runtime by some trust_remote_code models (e.g. DeepSeek-OCR) so transformers' import
+# validation passes. Kept as an opt-in extra so the default install stays Apache-2.0 clean.
+remote-models = ["easydict"]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 diffusion = [
   "addict",
