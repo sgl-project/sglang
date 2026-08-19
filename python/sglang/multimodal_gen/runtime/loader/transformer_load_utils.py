@@ -14,6 +14,7 @@ from functools import partial
 from typing import Callable, Optional
 
 import torch
+from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME
 from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
@@ -21,6 +22,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     _patch_nunchaku_scales,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    filter_duplicate_safetensors_files,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_OFFLOAD,
     ComponentResidencyError,
@@ -471,6 +475,18 @@ def resolve_transformer_safetensors_to_load(
     else:
         safetensors_list = _list_safetensors_files(component_model_path)
 
+    if safetensors_list:
+        # Diffusers repos occasionally ship more than one shard split for the
+        # same checkpoint (e.g. a 4-way and an 8-way split side by side). The
+        # index file is the authoritative source for which files belong to
+        # the checkpoint that was actually exported; anything else is a
+        # leftover sibling variant.
+        safetensors_list = filter_duplicate_safetensors_files(
+            safetensors_list,
+            os.path.dirname(safetensors_list[0]),
+            SAFE_WEIGHTS_INDEX_NAME,
+        )
+
     safetensors_list = _prefer_mixed_safetensors_files(safetensors_list)
     safetensors_list = _filter_duplicate_precision_variant_safetensors(safetensors_list)
 
@@ -726,13 +742,13 @@ def _resolve_quant_config(
         if server_args.quantization == "modelslim":
             return get_quant_config(hf_config, component_model_path)
 
-        # Online-quant convention: for `fp8` and `mxfp4`, a no-arg
-        # QuantizationConfig() selects the post-load path -- weights load
-        # in source dtype and are quantized in
+        # Online-quant convention: for `fp8`, `mxfp4` and `kitchen_int8`, a
+        # no-arg QuantizationConfig() selects the post-load path -- weights
+        # load in source dtype and are quantized in
         # process_weights_after_loading.
         quant_cls = get_quantization_config(server_args.quantization)
         quant_kwargs = {}
-        if server_args.quantization in {"fp8", "mxfp4"}:
+        if server_args.quantization in {"fp8", "mxfp4", "kitchen_int8"}:
             quant_kwargs["ignored_layers"] = getattr(
                 server_args, "quantization_ignored_layers", None
             )

@@ -21,6 +21,7 @@ from sglang.srt.multimodal.cache import (
     resolve_multimodal_item_hash,
     snapshot_media,
 )
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -216,26 +217,32 @@ class TestMediaIdentity(unittest.TestCase):
                 return {"model_type": "vlm", "architectures": ["VLM"]}
 
         config = Config()
-        args = ServerArgs(
-            model_path="dummy",
-            revision="model-revision",
-            disable_fast_image_processor=False,
-            mm_process_config={"image": {"max_pixels": 1024}},
-        )
-        base = build_processor_fingerprint(Processor("gpu"), config, args)
 
-        changed_backend = build_processor_fingerprint(Processor("cpu"), config, args)
-        changed_args = ServerArgs(
-            model_path="dummy",
-            revision="model-revision",
-            disable_fast_image_processor=False,
-            mm_process_config={"image": {"max_pixels": 2048}},
-        )
-        changed_config = build_processor_fingerprint(
-            Processor("gpu"), config, changed_args
-        )
+        def fingerprint(processor, mm_process_config):
+            # The digest reads the effective config, so the test publishes it
+            # rather than handing one in: that is the only source the function
+            # has, and two callers with the same effective config must agree.
+            publish(
+                ServerArgs(
+                    model_path="dummy",
+                    revision="model-revision",
+                    disable_fast_image_processor=False,
+                    mm_process_config=mm_process_config,
+                ),
+                role="test",
+            )
+            return build_processor_fingerprint(processor, config)
+
+        self.addCleanup(reset_context)
+        small = {"image": {"max_pixels": 1024}}
+        base = fingerprint(Processor("gpu"), small)
+        changed_backend = fingerprint(Processor("cpu"), small)
+        changed_config = fingerprint(Processor("gpu"), {"image": {"max_pixels": 2048}})
+        same_again = fingerprint(Processor("gpu"), small)
+
         self.assertNotEqual(base, changed_backend)
         self.assertNotEqual(base, changed_config)
+        self.assertEqual(base, same_again)
 
     def test_item_hash_namespace_covers_identity_and_processor_output(self):
         digest = snapshot_media(b"image").content_digest
