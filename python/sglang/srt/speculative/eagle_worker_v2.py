@@ -405,16 +405,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Keep imports local so non-HIP environments do not require these.
             # aiter packs draft-extend support into the decode (multi-step)
             # backend; DSV4 exposes it on the draft-extend backend itself.
+            # GLM MI355 MTP uses DeepseekSparseAttnBackend for draft_extend,
+            # not the aiter multi-step container or DSV4 HIP radix.
             from sglang.srt.layers.attention.aiter_backend import (
                 AiterMultiStepDraftBackend,
             )
             from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
                 DeepseekV4HipRadixBackend,
             )
+            from sglang.srt.layers.attention.dsa_backend import (
+                DeepseekSparseAttnBackend,
+            )
 
-            supports_hip_draft_extend_graph = isinstance(
-                self.draft_attn_backend, AiterMultiStepDraftBackend
-            ) or isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
+            supports_hip_draft_extend_graph = (
+                isinstance(self.draft_attn_backend, AiterMultiStepDraftBackend)
+                or isinstance(
+                    self.draft_extend_attn_backend, DeepseekV4HipRadixBackend
+                )
+                or isinstance(
+                    self.draft_extend_attn_backend, DeepseekSparseAttnBackend
+                )
+            )
 
         graph_supported_backend_types = [
             TritonAttnBackend,
