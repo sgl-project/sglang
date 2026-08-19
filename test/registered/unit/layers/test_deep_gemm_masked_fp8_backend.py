@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.kernels.ops.quantization import fp8_kernel
 from sglang.srt.layers.deep_gemm_wrapper import entrypoint
 from sglang.srt.layers.moe.moe_runner import deep_gemm as deep_gemm_runner
 
@@ -100,8 +101,8 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
                 True,
             ),
             patch.object(
-                deep_gemm_runner,
-                "per_token_group_quant",
+                fp8_kernel,
+                "sglang_per_token_group_quant_fp8",
                 return_value=expected,
             ) as quant,
         ):
@@ -114,7 +115,35 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
             )
 
         self.assertIs(result, expected)
-        self.assertFalse(quant.call_args.kwargs["column_major_scales"])
+        self.assertFalse(quant.call_args.kwargs["scale_ue8m0"])
+        self.assertTrue(quant.call_args.kwargs["fuse_silu_and_mul"])
+        self.assertIs(quant.call_args.kwargs["masked_m"], masked_m)
+
+    def test_batch_backend_forces_masked_layout(self):
+        with (
+            patch.object(
+                deep_gemm_runner.deep_gemm_wrapper,
+                "DEEPGEMM_MASKED_FP8_BACKEND",
+                "cake",
+            ),
+            deep_gemm_runner.envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override("auto"),
+        ):
+            self.assertTrue(
+                deep_gemm_runner._should_use_masked_standard_layout(None, None, None)
+            )
+
+        with (
+            patch.object(
+                deep_gemm_runner.deep_gemm_wrapper,
+                "DEEPGEMM_MASKED_FP8_BACKEND",
+                "cake",
+            ),
+            deep_gemm_runner.envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override(
+                "compact"
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "require.*masked"):
+                deep_gemm_runner._should_use_masked_standard_layout(None, None, None)
 
 
 if __name__ == "__main__":
