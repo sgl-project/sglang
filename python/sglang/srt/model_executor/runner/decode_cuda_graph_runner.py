@@ -1037,11 +1037,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # can reuse the memory pool allocated for the large shapes.
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             if not self.enable_pdmux:
-                # Share one capture stream across every pass (see
-                # get_or_create_global_graph_capture_stream): the allocator
-                # partitions the graph pool's segments by stream, so a per-pass
-                # stream re-reserves its MoE / DeepEP scratch instead of reusing
-                # what an earlier pass already left inactive.
                 with (
                     graph_capture(
                         stream=get_or_create_global_graph_capture_stream()
@@ -1225,16 +1220,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     variant_label,
                     dsa_variant,
                 )
-                # NOTE (Deleter-D)
-                # Reset warmup-mutated state on the backend this capture ran
-                # against (`attn_backend` from capture_prepare), NOT
-                # model_runner.attn_backend. They are the same object for the
-                # runner the model_runner owns, but adaptive speculative
-                # decoding builds extra runners bound to their own freshly
-                # created backend while model_runner still points at the active
-                # one; hooking the wrong backend leaves this capture's
-                # warmup-upgraded metadata (raw->full, FlashMLA scheduler meta)
-                # frozen into the graph and produces an IMA on first replay.
+                # NOTE (Deleter-D): hook `attn_backend`, not model_runner.attn_backend — adaptive spec runners own a different backend, and the wrong one leaves warmup-mutated metadata in the graph (IMA on first replay).
                 post_warmup_hook = getattr(
                     attn_backend,
                     "on_after_cuda_graph_warmup",

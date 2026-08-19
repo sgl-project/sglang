@@ -51,8 +51,6 @@ class TestGraphMemoryPool(CustomTestCase):
         device_module = _FakeDeviceModule()
         first = get_or_create_global_graph_memory_pool(device_module)
         second = get_or_create_global_graph_memory_pool(device_module)
-        # One handle for every later backend — that is what makes the captured
-        # graphs share physical memory.
         self.assertIs(first, second)
         self.assertEqual(device_module.handle_ct, 1)
         self.assertIs(get_global_graph_memory_pool(), first)
@@ -82,16 +80,12 @@ class TestGraphCaptureStream(CustomTestCase):
         reset_context()
 
     def test_shared_across_capture_passes(self):
-        # Every capture pass must land on the same stream, or each one gets its
-        # own segments in the shared graph pool.
         first = get_or_create_global_graph_capture_stream()
         second = get_or_create_global_graph_capture_stream()
         self.assertIs(first, second)
 
     def test_leased_from_the_named_stream_slot(self):
         stream = get_or_create_global_graph_capture_stream()
-        # Held in the Resources tier's named-stream registry, so reset_context()
-        # clears it along with the rest of the process-level handles.
         self.assertIs(get_resources().streams[_CAPTURE_STREAM_NAME], stream)
 
     def test_reset_context_drops_the_stream(self):

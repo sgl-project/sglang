@@ -32,8 +32,6 @@ from sglang.srt.cuda_vmm_utils import BumpArenaStub
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_resources, get_stream
 
-# Named slot for the one capture stream (see
-# ``get_or_create_global_graph_capture_stream``).
 _CAPTURE_STREAM_NAME = "cuda_graph_capture"
 from sglang.srt.utils import is_cuda
 
@@ -90,18 +88,8 @@ def get_or_create_global_graph_memory_pool(device_module: Any) -> Any:
 
 
 def get_or_create_global_graph_capture_stream() -> Any:
-    """The one CUDA stream every graph-capture pass captures on.
-
-    The caching allocator partitions segments **by stream**, so a fresh stream
-    per pass leaves the graph pool's scratch (MoE / DeepEP workspaces — ~3.6GB
-    per pass on DeepSeek-V4) reserved once per stream instead of reused: with
-    adaptive speculative decoding that is one pass per candidate step times
-    three runners, i.e. tens of GB of segments that all read back ``inactive``.
-
-    Captures are strictly serial (``Scheduler.init_all_cuda_graphs`` runs the
-    target and draft workers in turn, and the adaptive controller builds one
-    runtime state at a time), so a single shared stream is safe and reserves
-    that scratch exactly once.
+    """Return the shared graph capture stream, creating it on first use so every
+    capture pass reserves the pool's scratch once instead of per stream.
 
     CUDA only — the NPU / XPU / CPU graph runners keep their own streams.
     """

@@ -1327,9 +1327,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.warmup()
         with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             with graph_capture(
-                # Same capture stream as every other pass, so the shared graph
-                # pool's scratch is reused rather than re-reserved per stream
-                # (see get_or_create_global_graph_capture_stream).
                 stream=get_or_create_global_graph_capture_stream()
             ) as graph_capture_context:
                 self.stream = graph_capture_context.stream
