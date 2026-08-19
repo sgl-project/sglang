@@ -108,6 +108,8 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
                 _processor=mock_hf_processor,
                 transport_mode=None,
             )
+        if proc.mm_processor_executor is not None:
+            self.addCleanup(proc.mm_processor_executor.shutdown)
         return proc
 
     def test_configs_extracted(self):
@@ -162,9 +164,21 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         self.assertIsNone(proc.mm_processor_executor)
 
     def test_parallel_workers_require_processor_support(self):
-        proc = self._make_processor({}, mm_processor_worker_num=2)
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+
+        with patch.object(
+            BaseMultimodalProcessor, "supports_mm_processor_concurrency", False
+        ):
+            proc = self._make_processor({}, mm_processor_worker_num=2)
         self.assertEqual(proc.mm_processor_worker_num, 1)
         self.assertIsNone(proc.mm_processor_executor)
+
+    def test_default_is_concurrent(self):
+        proc = self._make_processor({})
+        self.assertEqual(proc.mm_processor_worker_num, 2)
+        self.assertIsNotNone(proc.mm_processor_executor)
 
     def test_explicit_io_worker_count_overrides_auto(self):
         from sglang.srt.multimodal.processors.base_processor import (
