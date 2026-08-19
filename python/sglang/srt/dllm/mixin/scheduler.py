@@ -41,6 +41,12 @@ class SchedulerDllmMixin:
             dllm_config=self.dllm_config,
             abort=self._abort_dllm_req,
         )
+        # Round composition, reported through get_internal_state: the enabled
+        # flag alone cannot distinguish a server that mixes from one that
+        # merely could. Counted unconditionally so the off case reads as a
+        # real zero rather than a missing field.
+        self.dllm_num_rounds = 0
+        self.dllm_num_mixed_rounds = 0
         self.dllm_mixed_batch_enabled = False
         if self.dllm_config is not None and envs.SGLANG_ENABLE_DLLM_MIXED_BATCH.get():
             # Only FDFO rounds can absorb a mixed round for free: a round there
@@ -306,13 +312,18 @@ class SchedulerDllmMixin:
         self: Scheduler, adder: PrefillAdder, running_batch: ScheduleBatch
     ) -> ForwardMode:
         """Process prefill or decode batches for DLLM."""
-        if self.dllm_mixed_batch_enabled:
+        prefill_reqs = self.dllm_manager.get_prefill_requests()
+        if self.dllm_mixed_batch_enabled and self._should_mix_dllm_batches(
+            num_prefill_reqs=len(prefill_reqs),
+            num_decode_reqs=len(self.dllm_manager.get_decode_requests()),
+            round_capacity=max(
+                self.dllm_manager.max_running_reqs - len(running_batch.reqs), 0
+            ),
+        ):
             self._process_dllm_batches_mixed(adder, running_batch=running_batch)
             return ForwardMode.DLLM_EXTEND
 
-
         # Try prefill batch first
-        prefill_reqs = self.dllm_manager.get_prefill_requests()
         if prefill_reqs:
             self._process_batch_by_phase(
                 adder,
@@ -337,6 +348,26 @@ class SchedulerDllmMixin:
                 running_batch=running_batch,
             )
             return ForwardMode.DLLM_EXTEND
+
+    @staticmethod
+    def _should_mix_dllm_batches(
+        *, num_prefill_reqs: int, num_decode_reqs: int, round_capacity: int
+    ) -> bool:
+        """Whether this round has decode work that would otherwise sit behind a
+        partially filled prefill round.
+
+        The mixed path is a restriction of the either/or path, not a
+        replacement: it walks the waiting queue in arrival order rather than
+        prefill-first, and it does not wire priority preemption. Those costs
+        buy nothing on a round that holds only one phase, or on one whose
+        prefill rows already fill the round -- so such rounds stay on the
+        original path.
+        """
+        return (
+            num_prefill_reqs > 0
+            and num_decode_reqs > 0
+            and num_prefill_reqs < round_capacity
+        )
 
     def _process_dllm_batches_mixed(
         self: Scheduler, adder: PrefillAdder, running_batch: ScheduleBatch
@@ -431,6 +462,12 @@ class SchedulerDllmMixin:
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
+
+        if can_run_list:
+            self.dllm_num_rounds += 1
+            num_prefill_rows = sum(req.is_dllm_prefill() for req in can_run_list)
+            if 0 < num_prefill_rows < len(can_run_list):
+                self.dllm_num_mixed_rounds += 1
 
     def _create_dllm_batch(
         self: Scheduler,

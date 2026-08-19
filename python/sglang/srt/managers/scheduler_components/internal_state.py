@@ -138,6 +138,8 @@ class SchedulerInternalStateController:
         # Requested via env var but silently downgraded when FDFO is off, so
         # report what the scheduler actually resolved rather than what was asked.
         state["dllm_mixed_batch_enabled"] = self.scheduler.dllm_mixed_batch_enabled
+        state["dllm_num_rounds"] = self.scheduler.dllm_num_rounds
+        state["dllm_num_mixed_rounds"] = self.scheduler.dllm_num_mixed_rounds
 
     def _add_step_times(self, state: Dict[str, Any]) -> None:
         if self.record_step_time:

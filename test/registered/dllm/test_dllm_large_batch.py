@@ -54,13 +54,25 @@ GSM8K_SCORE_THRESHOLD = 0.88
 
 
 def assert_mixed_rounds(test, expected: bool):
-    """The flag is requested by env var but downgraded when FDFO is off, so the
-    only honest check is what the scheduler resolved -- otherwise a test that
-    fails to pass the flag through looks identical to one that passes it."""
+    """Assert on what the scheduler actually built, not just what it resolved.
+
+    ``dllm_mixed_batch_enabled`` is a startup constant: a server that resolved
+    it to True but never put a prefill row and a decode row in the same round
+    would satisfy it identically. ``dllm_num_mixed_rounds`` counts the rounds
+    whose can_run_list held both phases, so it separates the two. Call this
+    after traffic has flowed -- on an idle server every counter is 0.
+    """
     states = requests.get(test.base_url + "/server_info").json()["internal_states"]
     test.assertTrue(states, "server reported no internal states")
     for state in states:
         test.assertEqual(state["dllm_mixed_batch_enabled"], expected)
+        test.assertGreater(state["dllm_num_rounds"], 0, "no dLLM round was scheduled")
+        if expected:
+            test.assertGreater(
+                state["dllm_num_mixed_rounds"], 0, "no round mixed the two phases"
+            )
+        else:
+            test.assertEqual(state["dllm_num_mixed_rounds"], 0)
 
 
 def _server_args():
@@ -115,12 +127,11 @@ class _Gsm8kAtLargeBatch:
                 f"score={metrics['score']:.4f}\n"
             )
         self.assertGreater(metrics["score"], GSM8K_SCORE_THRESHOLD)
+        # After traffic, not before: the round counters need rounds to have run.
+        assert_mixed_rounds(self, self.mixed_rounds)
 
     def test_gsm8k(self):
         self._run_gsm8k(self.label)
-
-    def test_resolved_mixed_round_mode(self):
-        assert_mixed_rounds(self, self.mixed_rounds)
 
 
 def _launch(cls):
