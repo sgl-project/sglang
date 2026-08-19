@@ -2123,6 +2123,10 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             get_running_batch=lambda: self.running_batch,
             get_waiting_queue=lambda: self.waiting_queue,
+            waiting_queue_prefix_matched=lambda: self.policy.waiting_queue_prefix_matched(
+                self.waiting_queue
+            ),
+            get_recent_cache_hit_rate=lambda: self.metrics_reporter.recent_cache_hit_rate,
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
             get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,

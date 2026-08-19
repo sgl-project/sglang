@@ -130,6 +130,16 @@ _CONFIGURED_SIZE_CALL_SITES = {
     ("srt/models/kimi_k3.py", "configured_tp_size"): (
         "same as kimi_k25: the IPC refcount must agree with the recycler's waiter"
     ),
+    ("srt/mem_cache/kv_cache_builder.py", "configured_tp_size"): (
+        "the retraction capacity estimate reproduces the launcher's per-node "
+        "scheduler count, which is defined over the sizes the user asked for; "
+        "the live property reports the effective topology and is shadowed "
+        "wherever the groups alias, so the configured accessor is the one that "
+        "answers the same question the launcher did"
+    ),
+    ("srt/mem_cache/kv_cache_builder.py", "configured_pp_size"): (
+        "the pp factor of that same per-node count"
+    ),
 }
 
 _DIRECT_BASELINE = 0
