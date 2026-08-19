@@ -632,73 +632,6 @@ class MoeLoraRunner:
             ),
         )
 
-    def _run_gate_up_a(
-        self,
-        plan: MoeLoraExecutionPlan,
-        launch_config: MoeLoraLaunchConfig,
-        routes: MoeLoraRoutes,
-        hidden_states: torch.Tensor,
-        batch: MoeLoraBatch,
-    ) -> torch.Tensor:
-        return self._run_a(
-            launch_config,
-            plan.gate_up_a,
-            hidden_states,
-            batch.gate_up_lora_a.flatten(0, 1),
-            routes,
-            "gate_up_a",
-        )
-
-    def _run_gate_up_b(
-        self,
-        plan: MoeLoraExecutionPlan,
-        launch_config: MoeLoraLaunchConfig,
-        routes: MoeLoraRoutes,
-        rank: torch.Tensor,
-        batch: MoeLoraBatch,
-        num_tokens: int,
-    ) -> torch.Tensor:
-        delta = self.workspace.tensor(
-            "gate_up_b:delta",
-            (
-                num_tokens * self.top_k,
-                self.gate_up_slices * self.intermediate_size,
-            ),
-            dtype=self.lora_delta_dtype,
-            device=rank.device,
-        )
-        self._run_b(
-            launch_config,
-            plan.gate_up_b,
-            rank,
-            batch.gate_up_lora_b.flatten(0, 1),
-            delta,
-            routes,
-        )
-        return delta
-
-    def _run_base_gateup(
-        self,
-        provider: MoeBaseProvider,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> tuple[object, torch.Tensor]:
-        base_gemm_state = provider.prepare(
-            hidden_states,
-            topk_ids,
-            self.top_k,
-            self.workspace,
-        )
-        gateup_out = self.workspace.tensor(
-            "base:gateup",
-            provider.gateup_out_shape(base_gemm_state),
-            dtype=provider.contract.gate_up_output_dtype,
-            device=hidden_states.device,
-        )
-        provider.gateup(base_gemm_state, gateup_out)
-        provider.release_prepared_inputs(base_gemm_state)
-        return base_gemm_state, gateup_out
-
     def _run_early(
         self,
         plan: MoeLoraExecutionPlan,
@@ -713,30 +646,51 @@ class MoeLoraRunner:
         state = _LoraStageState()
 
         def gate_up_a() -> None:
-            state.rank = self._run_gate_up_a(
-                plan,
+            state.rank = self._run_a(
                 launch_config,
-                routes,
+                plan.gate_up_a,
                 hidden_states,
-                batch,
+                batch.gate_up_lora_a.flatten(0, 1),
+                routes,
+                "gate_up_a",
             )
 
         def gate_up_b() -> None:
-            state.delta = self._run_gate_up_b(
-                plan,
-                launch_config,
-                routes,
-                state.rank,
-                batch,
-                num_tokens,
+            delta = self.workspace.tensor(
+                "gate_up_b:delta",
+                (
+                    num_tokens * self.top_k,
+                    self.gate_up_slices * self.intermediate_size,
+                ),
+                dtype=self.lora_delta_dtype,
+                device=state.rank.device,
             )
+            self._run_b(
+                launch_config,
+                plan.gate_up_b,
+                state.rank,
+                batch.gate_up_lora_b.flatten(0, 1),
+                delta,
+                routes,
+            )
+            state.delta = delta
 
         def base() -> tuple[object, torch.Tensor]:
-            return self._run_base_gateup(
-                provider,
+            base_gemm_state = provider.prepare(
                 hidden_states,
                 topk_ids,
+                self.top_k,
+                self.workspace,
             )
+            gateup_out = self.workspace.tensor(
+                "base:gateup",
+                provider.gateup_out_shape(base_gemm_state),
+                dtype=provider.contract.gate_up_output_dtype,
+                device=hidden_states.device,
+            )
+            provider.gateup(base_gemm_state, gateup_out)
+            provider.release_prepared_inputs(base_gemm_state)
+            return base_gemm_state, gateup_out
 
         if plan.early_overlap is EarlyOverlap.NONE:
             gate_up_a()
