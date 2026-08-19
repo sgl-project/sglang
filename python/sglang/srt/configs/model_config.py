@@ -125,6 +125,10 @@ def is_kimi_k3(config) -> bool:
     return _hf_arch(config) == "KimiK3ForConditionalGeneration"
 
 
+def is_dspark_draft(config) -> bool:
+    return _hf_arch(config) == "DSparkDraftModel"
+
+
 def is_qwen3_5(config) -> bool:
     return _hf_arch(config) in (
         "Qwen3_5ForConditionalGeneration",
