@@ -135,16 +135,17 @@ void reduce_all_buffers(
     c10::ScalarType scalar_type,
     int to_buffer_idx,
     char* to_buffer,
-    char** buffers) {
+    char** buffers,
+    int reduce_world_size) {
   switch (scalar_type) {
     case c10::ScalarType::BFloat16:
-      reduce_bf16_buffers(start_elements, num_elements, to_buffer, buffers, world_size);
+      reduce_bf16_buffers(start_elements, num_elements, to_buffer, buffers, reduce_world_size);
       break;
     case c10::ScalarType::Half:
-      reduce_fp16_buffers(start_elements, num_elements, to_buffer, buffers, world_size);
+      reduce_fp16_buffers(start_elements, num_elements, to_buffer, buffers, reduce_world_size);
       break;
     case c10::ScalarType::Float:
-      reduce_fp32_buffers(start_elements, num_elements, to_buffer, buffers, world_size);
+      reduce_fp32_buffers(start_elements, num_elements, to_buffer, buffers, reduce_world_size);
       break;
     default:
       assert(!"Should not get here");
@@ -246,6 +247,22 @@ size_t slice_el_start(size_t chunk_el, int slice_idx) {
   return slice_size * slice_idx;
 }
 
+size_t group_slice_el_start(size_t chunk_el, int slice_idx, int group_size) {
+  const size_t size = chunk_el / group_size;
+  return size * slice_idx;
+}
+size_t group_slice_size(size_t chunk_el, int slice_idx, int group_size) {
+  size_t size = chunk_el / group_size;
+  if (slice_idx == group_size - 1) {
+    size += chunk_el % group_size;
+  }
+  return size;
+}
+char* group_slice_data(char* data_ptr, size_t chunk_el, int el_size, int slice_idx, int group_size) {
+  size_t slice_size = chunk_el / group_size;
+  size_t el_offset = slice_size * slice_idx;
+  return data_ptr + el_offset * el_size;
+}
 void symmetric_naive_all_reduce(char* data_ptr, c10::ScalarType scalar_type, size_t chunk_size, size_t chunk_el) {
   const int state_group = STATE_GROUP_SYMMETRIC_ALLREDUCE;
   static int current_buffer = 0;
@@ -286,7 +303,7 @@ void symmetric_naive_all_reduce(char* data_ptr, c10::ScalarType scalar_type, siz
 
   // each rank reduce the buffer independently so therre is no need for
   // synchronization afterward
-  reduce_all_buffers(0, chunk_el, scalar_type, world_rank, data_ptr, symmetric_buffer[current_buffer]);
+  reduce_all_buffers(0, chunk_el, scalar_type, world_rank, data_ptr, symmetric_buffer[current_buffer], world_size);
 
   // switch buffer
   current_buffer = 1 - current_buffer;
@@ -338,7 +355,8 @@ void distributed_naive_reduce(char* data_ptr, c10::ScalarType scalar_type, size_
       scalar_type,
       world_rank,
       distributed_buffer[current_buffer][world_rank],
-      distributed_buffer[current_buffer]);
+      distributed_buffer[current_buffer],
+      world_size);
   std::atomic_thread_fence(std::memory_order_release);
   workspace[world_rank]->states[state_group] = reduce_current;
 
@@ -504,7 +522,8 @@ void naive_reduce_scatter(
       output_ptr -
           start_el * element_size,  // in reduce_all_buffers, the output_ptr is the buffer for all ranks, but here
                                     // output_ptr is already the local buffer for one rank. Adjust it here.
-      reduce_scatter_buffer[current_buffer]);
+      reduce_scatter_buffer[current_buffer],
+      world_size);
 
   // done
   current_buffer = 1 - current_buffer;
@@ -518,5 +537,409 @@ void reduce_scatter_outer_loop(torch::Tensor& output, torch::Tensor& data, size_
     size_t chunk_el = chunk_size / (data_size / numel);
 
     naive_reduce_scatter(output_ptr, data_ptr, data.scalar_type(), chunk_size, chunk_el, data.element_size());
+  }
+}
+
+#define GROUP_ALLGATHER_MAX_BUF_SIZE MAX_BUF_SIZE
+#define GROUP_ALLTOALL_MAX_BUF_SIZE (64 * 1024 * 1024)
+#define GROUP_SYMMETRIC_ALLREDUCE_MAX_BUF_SIZE MAX_BUF_SIZE
+#define GROUP_DISTRIBUTED_ALLREDUCE_MAX_BUF_SIZE MAX_BUF_SIZE
+#define GROUP_STATE_ALL_GATHER 0
+#define GROUP_STATE_ALL_TO_ALL 1
+#define GROUP_STATE_SYMMETRIC_ALL_REDUCE 2
+#define GROUP_STATE_DISTRIBUTED_ALL_REDUCE 3
+struct group_workspace {
+  enum coll_state states[2];
+  char buffer
+      [2 * GROUP_ALLGATHER_MAX_BUF_SIZE + 2 * GROUP_ALLTOALL_MAX_BUF_SIZE + 2 * GROUP_SYMMETRIC_ALLREDUCE_MAX_BUF_SIZE +
+       2 * GROUP_DISTRIBUTED_ALLREDUCE_MAX_BUF_SIZE];
+};
+#define GROUP_ALLGATHER_BUFFER_OFFSET(current_buffer) current_buffer* GROUP_ALLGATHER_MAX_BUF_SIZE
+#define GROUP_ALLTOALL_BUFFER_OFFSET(current_buffer) \
+  2 * GROUP_ALLGATHER_MAX_BUF_SIZE + current_buffer* GROUP_ALLTOALL_MAX_BUF_SIZE
+#define GROUP_SYMMETRIC_ALLREDUCE_BUFFER_OFFSET(current_buffer)        \
+  2 * GROUP_ALLGATHER_MAX_BUF_SIZE + 2 * GROUP_ALLTOALL_MAX_BUF_SIZE + \
+      current_buffer* GROUP_SYMMETRIC_ALLREDUCE_MAX_BUF_SIZE
+#define GROUP_DISTRIBUTED_ALLREDUCE_BUFFER_OFFSET(current_buffer)                                                   \
+  2 * GROUP_ALLGATHER_MAX_BUF_SIZE + 2 * GROUP_ALLTOALL_MAX_BUF_SIZE + 2 * GROUP_SYMMETRIC_ALLREDUCE_MAX_BUF_SIZE + \
+      current_buffer* GROUP_DISTRIBUTED_ALLREDUCE_MAX_BUF_SIZE
+struct group_shm_context {
+  int group_size;
+  int group_rank;
+
+  // workspace[i] points to group-rank i's shared workspace.
+  struct group_workspace** workspace;
+
+  // buffer[double_buffer_idx][source_group_rank]
+  char** allgather_buffer[2];
+  char** alltoall_buffer[2];
+  char** symmetric_allreduce_buffer[2];
+  char** distributed_allreduce_buffer[2];
+
+  // State must be per context instead of function-static because a process
+  // can participate in multiple ProcessGroups.
+  int allgather_current_buffer;
+  int allgather_state_idx;
+
+  int alltoall_current_buffer;
+  int alltoall_state_idx;
+
+  int symmetric_allreduce_current_buffer;
+  int symmetric_allreduce_state_idx;
+
+  int distributed_allreduce_current_buffer;
+  int distributed_allreduce_state_idx;
+};
+
+static std::vector<struct group_shm_context*> group_shm_contexts;
+static struct group_shm_context* get_group_shm_context(int64_t handle) {
+  TORCH_CHECK(handle >= 0 && handle < static_cast<int64_t>(group_shm_contexts.size()), "Invalid group SHM handle");
+  auto* ctx = group_shm_contexts[handle];
+  TORCH_CHECK(ctx != nullptr, "Group SHM context is null");
+  return ctx;
+}
+
+static void get_group_copy_states(int state_idx, enum coll_state* copy_current, enum coll_state* copy_next) {
+  switch (state_idx) {
+    case 0:
+      *copy_current = coll_allgather_naive__copy_in_done;
+      *copy_next = coll_alt1_allgather_naive__copy_in_done;
+      break;
+
+    case 1:
+      *copy_current = coll_alt1_allgather_naive__copy_in_done;
+      *copy_next = coll_alt2_allgather_naive__copy_in_done;
+      break;
+
+    case 2:
+      *copy_current = coll_alt2_allgather_naive__copy_in_done;
+      *copy_next = coll_allgather_naive__copy_in_done;
+      break;
+
+    default:
+      assert(!"Invalid group SHM state index.");
+  }
+}
+
+static void wait_group_buffer_state_until_2(
+    struct group_shm_context* ctx, int rank, enum coll_state state0, enum coll_state state1, int state_group) {
+  volatile enum coll_state* state_ptr = &(ctx->workspace[rank]->states[state_group]);
+
+  while (1) {
+    volatile enum coll_state cur_state = *state_ptr;
+
+    if (cur_state == state0 || cur_state == state1) {
+      break;
+    }
+  }
+}
+
+int64_t shm_group_initialize(const std::string& group_name, int64_t group_size, int64_t group_rank) {
+  auto* ctx = (struct group_shm_context*)malloc(sizeof(struct group_shm_context));
+  ctx->group_size = static_cast<int>(group_size);
+  ctx->group_rank = static_cast<int>(group_rank);
+
+  ctx->allgather_current_buffer = 0;
+  ctx->allgather_state_idx = 0;
+
+  ctx->alltoall_current_buffer = 0;
+  ctx->alltoall_state_idx = 0;
+
+  ctx->symmetric_allreduce_current_buffer = 0;
+  ctx->symmetric_allreduce_state_idx = 0;
+
+  ctx->distributed_allreduce_current_buffer = 0;
+  ctx->distributed_allreduce_state_idx = 0;
+
+  ctx->workspace = (struct group_workspace**)malloc(group_size * sizeof(struct group_workspace*));
+  ctx->allgather_buffer[0] = (char**)malloc(group_size * sizeof(char*));
+  ctx->allgather_buffer[1] = (char**)malloc(group_size * sizeof(char*));
+  ctx->alltoall_buffer[0] = (char**)malloc(group_size * sizeof(char*));
+  ctx->alltoall_buffer[1] = (char**)malloc(group_size * sizeof(char*));
+  ctx->symmetric_allreduce_buffer[0] = (char**)malloc(group_size * sizeof(char*));
+  ctx->symmetric_allreduce_buffer[1] = (char**)malloc(group_size * sizeof(char*));
+
+  ctx->distributed_allreduce_buffer[0] = (char**)malloc(group_size * sizeof(char*));
+  ctx->distributed_allreduce_buffer[1] = (char**)malloc(group_size * sizeof(char*));
+
+  char shm_name[NAME_BUF_SIZE];
+
+  auto* workspace_buf = (struct group_workspace*)calloc(1, sizeof(struct group_workspace));
+  workspace_buf->states[GROUP_STATE_ALL_GATHER] = coll_alt2_allgather_naive__copy_in_done;
+
+  workspace_buf->states[GROUP_STATE_ALL_TO_ALL] = coll_alt2_allgather_naive__copy_in_done;
+  workspace_buf->states[GROUP_STATE_SYMMETRIC_ALL_REDUCE] = coll_alt2_allreduce_naive__copy_in_done;
+
+  workspace_buf->states[GROUP_STATE_DISTRIBUTED_ALL_REDUCE] = coll_begin;
+
+  snprintf(shm_name, NAME_BUF_SIZE, "%.900s_%d", group_name.c_str(), group_rank);
+
+  SharedData local_shm = {};
+  local_shm.descriptor = -1;
+
+  shared_create(&local_shm, shm_name, workspace_buf, sizeof(struct group_workspace));
+  free(workspace_buf);
+
+  auto* local_workspace = (struct group_workspace*)local_shm.bytes;
+
+  for (int i = 0; i < group_size; ++i) {
+    if (i == group_rank) {
+      ctx->workspace[i] = local_workspace;
+    } else {
+      snprintf(shm_name, NAME_BUF_SIZE, "%.900s_%d", group_name.c_str(), i);
+
+      SharedData peer_shm = {};
+      peer_shm.descriptor = -1;
+
+      do {
+        shared_open(&peer_shm, shm_name, sizeof(struct group_workspace));
+      } while (peer_shm.descriptor == -1 && errno == ENOENT);
+
+      ctx->workspace[i] = (struct group_workspace*)peer_shm.bytes;
+    }
+
+    ctx->allgather_buffer[0][i] = ctx->workspace[i]->buffer + GROUP_ALLGATHER_BUFFER_OFFSET(0);
+    ctx->allgather_buffer[1][i] = ctx->workspace[i]->buffer + GROUP_ALLGATHER_BUFFER_OFFSET(1);
+    ctx->alltoall_buffer[0][i] = ctx->workspace[i]->buffer + GROUP_ALLTOALL_BUFFER_OFFSET(0);
+    ctx->alltoall_buffer[1][i] = ctx->workspace[i]->buffer + GROUP_ALLTOALL_BUFFER_OFFSET(1);
+    ctx->symmetric_allreduce_buffer[0][i] = ctx->workspace[i]->buffer + GROUP_SYMMETRIC_ALLREDUCE_BUFFER_OFFSET(0);
+    ctx->symmetric_allreduce_buffer[1][i] = ctx->workspace[i]->buffer + GROUP_SYMMETRIC_ALLREDUCE_BUFFER_OFFSET(1);
+    ctx->distributed_allreduce_buffer[0][i] = ctx->workspace[i]->buffer + GROUP_DISTRIBUTED_ALLREDUCE_BUFFER_OFFSET(0);
+    ctx->distributed_allreduce_buffer[1][i] = ctx->workspace[i]->buffer + GROUP_DISTRIBUTED_ALLREDUCE_BUFFER_OFFSET(1);
+  }
+
+  const int64_t handle = static_cast<int64_t>(group_shm_contexts.size());
+  group_shm_contexts.push_back(ctx);
+  return handle;
+}
+void group_all_gather(int64_t handle, char* output_ptr, char* input_ptr, size_t data_size) {
+  auto* ctx = get_group_shm_context(handle);
+  enum coll_state copy_current = coll_allgather_naive__copy_in_done;
+
+  enum coll_state copy_next = coll_alt1_allgather_naive__copy_in_done;
+  get_group_copy_states(ctx->allgather_state_idx, &copy_current, &copy_next);
+
+  ctx->allgather_state_idx = (ctx->allgather_state_idx + 1) % 3;
+
+  const int current_buffer = ctx->allgather_current_buffer;
+
+  // Step 1:
+  // publish my complete input into my SHM workspace.
+  parallel_memcpy(ctx->allgather_buffer[current_buffer][ctx->group_rank], input_ptr, data_size);
+
+  std::atomic_thread_fence(std::memory_order_release);
+
+  ctx->workspace[ctx->group_rank]->states[GROUP_STATE_ALL_GATHER] = copy_current;
+
+  // Step 2:
+  // wait for all members of THIS ProcessGroup.
+  for (int i = 0; i < ctx->group_size; ++i) {
+    if (i != ctx->group_rank) {
+      wait_group_buffer_state_until_2(ctx, i, copy_current, copy_next, GROUP_STATE_ALL_GATHER);
+    }
+  }
+
+  // Step 3:
+  // gather every source's complete buffer.
+  for (int src = 0; src < ctx->group_size; ++src) {
+    parallel_memcpy(
+        output_ptr + static_cast<size_t>(src) * data_size, ctx->allgather_buffer[current_buffer][src], data_size);
+  }
+
+  ctx->allgather_current_buffer = 1 - current_buffer;
+}
+
+void group_all_to_all(int64_t handle, char* output_ptr, char* input_ptr, size_t data_size) {
+  auto* ctx = get_group_shm_context(handle);
+  enum coll_state copy_current = coll_allgather_naive__copy_in_done;
+
+  enum coll_state copy_next = coll_alt1_allgather_naive__copy_in_done;
+
+  get_group_copy_states(ctx->alltoall_state_idx, &copy_current, &copy_next);
+
+  ctx->alltoall_state_idx = (ctx->alltoall_state_idx + 1) % 3;
+
+  const int current_buffer = ctx->alltoall_current_buffer;
+
+  // Step 1:
+  // Publish the complete destination-major input:
+  parallel_memcpy(ctx->alltoall_buffer[current_buffer][ctx->group_rank], input_ptr, data_size);
+
+  std::atomic_thread_fence(std::memory_order_release);
+
+  ctx->workspace[ctx->group_rank]->states[GROUP_STATE_ALL_TO_ALL] = copy_current;
+
+  // Step 2:
+  // wait for all members of this actual ProcessGroup.
+  for (int i = 0; i < ctx->group_size; ++i) {
+    if (i != ctx->group_rank) {
+      wait_group_buffer_state_until_2(ctx, i, copy_current, copy_next, GROUP_STATE_ALL_TO_ALL);
+    }
+  }
+  const size_t peer_chunk_size = data_size / static_cast<size_t>(ctx->group_size);
+
+  // Step 3:
+  // Only read the chunk intended for this destination from each source.
+  // group_rank r reads:
+  //     source_buffer + r * peer_chunk_size
+  for (int src = 0; src < ctx->group_size; ++src) {
+    char* src_ptr = ctx->alltoall_buffer[current_buffer][src] + static_cast<size_t>(ctx->group_rank) * peer_chunk_size;
+
+    char* dst_ptr = output_ptr + static_cast<size_t>(src) * peer_chunk_size;
+
+    parallel_memcpy(dst_ptr, src_ptr, peer_chunk_size);
+  }
+  ctx->alltoall_current_buffer = 1 - current_buffer;
+}
+
+void group_symmetric_all_reduce(
+    struct group_shm_context* ctx, char* data_ptr, c10::ScalarType scalar_type, size_t chunk_size, size_t chunk_el) {
+  enum coll_state copy_current = coll_allreduce_naive__copy_in_done;
+  enum coll_state copy_next = coll_alt1_allreduce_naive__copy_in_done;
+
+  get_group_copy_states(ctx->symmetric_allreduce_state_idx, &copy_current, &copy_next);
+
+  ctx->symmetric_allreduce_state_idx = (ctx->symmetric_allreduce_state_idx + 1) % 3;
+
+  const int current_buffer = ctx->symmetric_allreduce_current_buffer;
+
+  // Step 1:
+  // Copy local input into this rank's SHM buffer.
+  parallel_memcpy(ctx->symmetric_allreduce_buffer[current_buffer][ctx->group_rank], data_ptr, chunk_size);
+
+  std::atomic_thread_fence(std::memory_order_release);
+
+  ctx->workspace[ctx->group_rank]->states[GROUP_STATE_SYMMETRIC_ALL_REDUCE] = copy_current;
+
+  // Step 2:
+  // Wait until every rank in THIS ProcessGroup
+  // has published its input.
+  for (int i = 0; i < ctx->group_size; ++i) {
+    if (i != ctx->group_rank) {
+      wait_group_buffer_state_until_2(ctx, i, copy_current, copy_next, GROUP_STATE_SYMMETRIC_ALL_REDUCE);
+    }
+  }
+
+  // Step 3:
+  // Each rank independently reduces all group buffers.
+  reduce_all_buffers(
+      0,
+      chunk_el,
+      scalar_type,
+      ctx->group_rank,
+      data_ptr,
+      ctx->symmetric_allreduce_buffer[current_buffer],
+      ctx->group_size);
+
+  // Step 4:
+  // Switch double buffer.
+  ctx->symmetric_allreduce_current_buffer = 1 - current_buffer;
+}
+
+void group_distributed_reduce(
+    struct group_shm_context* ctx, char* data_ptr, c10::ScalarType scalar_type, size_t chunk_size, size_t chunk_el) {
+  const int state_group = GROUP_STATE_DISTRIBUTED_ALL_REDUCE;
+
+  const int current_buffer = ctx->distributed_allreduce_current_buffer;
+
+  enum coll_state copy_current = coll_allreduce_naive__copy_in_done;
+
+  enum coll_state reduce_current = coll_allreduce_naive__reduce_done;
+
+  enum coll_state copy_next = coll_alt1_allreduce_naive__copy_in_done;
+
+  switch (ctx->distributed_allreduce_state_idx) {
+    case 0:
+      copy_current = coll_allreduce_naive__copy_in_done;
+      reduce_current = coll_allreduce_naive__reduce_done;
+      copy_next = coll_alt1_allreduce_naive__copy_in_done;
+      break;
+
+    case 1:
+      copy_current = coll_alt1_allreduce_naive__copy_in_done;
+      reduce_current = coll_alt1_allreduce_naive__reduce_done;
+      copy_next = coll_allreduce_naive__copy_in_done;
+      break;
+
+    default:
+      assert(!"Should not get here.");
+  }
+
+  ctx->distributed_allreduce_state_idx = (ctx->distributed_allreduce_state_idx + 1) % 2;
+
+  const int element_size = static_cast<int>(chunk_size / chunk_el);
+
+  // Step 1:
+  // Every rank publishes the complete input.
+  parallel_memcpy(ctx->distributed_allreduce_buffer[current_buffer][ctx->group_rank], data_ptr, chunk_size);
+
+  std::atomic_thread_fence(std::memory_order_release);
+
+  ctx->workspace[ctx->group_rank]->states[state_group] = copy_current;
+
+  // Step 2:
+  // Wait until all group members have published input.
+  for (int i = 0; i < ctx->group_size; ++i) {
+    if (i != ctx->group_rank) {
+      wait_group_buffer_state_until_2(ctx, i, copy_current, reduce_current, state_group);
+    }
+  }
+
+  // Step 3:
+  // Reduce only this rank's slice.
+  const size_t start_el = group_slice_el_start(chunk_el, ctx->group_rank, ctx->group_size);
+
+  const size_t local_el = group_slice_size(chunk_el, ctx->group_rank, ctx->group_size);
+
+  reduce_all_buffers(
+      start_el,
+      local_el,
+      scalar_type,
+      ctx->group_rank,
+      ctx->distributed_allreduce_buffer[current_buffer][ctx->group_rank],
+      ctx->distributed_allreduce_buffer[current_buffer],
+      ctx->group_size);
+
+  std::atomic_thread_fence(std::memory_order_release);
+  ctx->workspace[ctx->group_rank]->states[state_group] = reduce_current;
+
+  // Step 4:
+  // Wait until every rank has reduced its own slice.
+  for (int i = 0; i < ctx->group_size; ++i) {
+    if (i != ctx->group_rank) {
+      wait_group_buffer_state_until_2(ctx, i, reduce_current, copy_next, state_group);
+    }
+  }
+
+  // Step 5:
+  // Gather reduced slices from every group rank
+  // back into the local output tensor.
+  for (int i = 0; i < ctx->group_size; ++i) {
+    const int rank = (i + ctx->group_rank) % ctx->group_size;
+    parallel_memcpy(
+        group_slice_data(data_ptr, chunk_el, element_size, rank, ctx->group_size),
+        group_slice_data(
+            ctx->distributed_allreduce_buffer[current_buffer][rank], chunk_el, element_size, rank, ctx->group_size),
+        group_slice_size(chunk_el, rank, ctx->group_size) * element_size);
+  }
+
+  ctx->distributed_allreduce_current_buffer = 1 - current_buffer;
+}
+
+void group_all_reduce(int64_t handle, char* data_ptr, c10::ScalarType scalar_type, size_t data_size, size_t numel) {
+  auto* ctx = get_group_shm_context(handle);
+
+  const size_t element_size = data_size / numel;
+
+  for (size_t offset = 0; offset < data_size; offset += MAX_BUF_SIZE) {
+    char* chunk_ptr = data_ptr + offset;
+    const size_t chunk_size = std::min(static_cast<size_t>(MAX_BUF_SIZE), data_size - offset);
+    const size_t chunk_el = chunk_size / element_size;
+
+    if (chunk_size < NAIVE_ALLREDUCE_THRESHOLD) {
+      group_symmetric_all_reduce(ctx, chunk_ptr, scalar_type, chunk_size, chunk_el);
+    } else {
+      group_distributed_reduce(ctx, chunk_ptr, scalar_type, chunk_size, chunk_el);
+    }
   }
 }
