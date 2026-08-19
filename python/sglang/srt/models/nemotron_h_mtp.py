@@ -366,6 +366,9 @@ class NemotronHForCausalLMMTP(NemotronHForCausalLM):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
+        weights = (
+            (name.removeprefix("language_model."), weight) for name, weight in weights
+        )
         super().load_weights(weights, is_mtp=True)
 
     def set_lm_head_from_target(self, target_lm_head: nn.Module) -> None:

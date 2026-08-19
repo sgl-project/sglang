@@ -69,6 +69,21 @@ class TestDraftModelConfig(CustomTestCase):
         self.assertEqual(config.hf_config.num_nextn_predict_layers, 1)
         self.assertEqual(config.hf_text_config.num_nextn_predict_layers, 1)
 
+    def test_nemotron_h_omni_mtp_uses_language_model_config(self):
+        config = object.__new__(ModelConfig)
+        config.is_draft_model = True
+        config.speculative_algorithm = "EAGLE"
+        config.hf_config = SimpleNamespace(
+            architectures=["NemotronH_Omni_Reasoning_V3"]
+        )
+        config.hf_text_config = SimpleNamespace(architectures=["NemotronHForCausalLM"])
+
+        config._config_draft_model()
+
+        self.assertIs(config.hf_config, config.hf_text_config)
+        self.assertEqual(config.hf_config.architectures, ["NemotronHForCausalLMMTP"])
+        self.assertEqual(config.hf_config.num_nextn_predict_layers, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

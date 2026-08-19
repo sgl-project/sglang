@@ -5730,7 +5730,11 @@ class ServerArgs:
             logger.info(
                 f"Using {attention_backend} as attention backend for {model_arch}."
             )
-        elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
+        elif model_arch in [
+            "NemotronHForCausalLM",
+            "NemotronHPuzzleForCausalLM",
+            "NemotronH_Omni_Reasoning_V3",
+        ]:
             # Quantization / MoE runner / attention backend defaults moved to
             # the override registry (arg_groups/overrides.py:
             # _nemotron_h_overrides).
@@ -9173,7 +9177,7 @@ class ServerArgs:
                 # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE
                 FLA_CHUNK_SIZE = 64
 
-            hf_config = self.get_model_config().hf_config
+            hf_config = self.get_model_config().hf_text_config
             chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
             page_size = resolved_view(self).page_size
             assert (

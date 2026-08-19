@@ -176,6 +176,18 @@ class NemotronH_Nano_VL_V2(EVS):
             x = x.permute(0, 2, 1, 3).contiguous()
         return x
 
+    def _normalize_vision_features(self, features: torch.Tensor) -> torch.Tensor:
+        return features
+
+    def _load_extra_weight(self, name: str, weight: torch.Tensor) -> None:
+        return
+
+    def get_embed_and_head(self):
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed, head):
+        self.language_model.set_embed_and_head(embed, head)
+
     def extract_feature_dynamic(self, pixel_values_list: list[torch.Tensor]):
         """Extract features from variable-size images (dynamic resolution).
 
@@ -188,6 +200,7 @@ class NemotronH_Nano_VL_V2(EVS):
         offset = 0
         for i, num_patches in enumerate(num_patches_list):
             img_feats = features[0, offset : offset + num_patches]
+            img_feats = self._normalize_vision_features(img_feats)
             h_patches = pixel_values_list[i].shape[-2] // patch_size
             w_patches = pixel_values_list[i].shape[-1] // patch_size
             img_feats = img_feats.reshape(1, h_patches, w_patches, -1)
@@ -201,6 +214,7 @@ class NemotronH_Nano_VL_V2(EVS):
     def extract_video_feature_temporal(self, pixel_values, num_frames):
         """Extract video features with temporal compression (tubelet grouping)."""
         vit_embeds = self.vision_model(pixel_values, num_frames=num_frames)
+        vit_embeds = self._normalize_vision_features(vit_embeds)
         num_tubelets = vit_embeds.shape[0]
         patch_size = self.config.patch_size
         h_patches = pixel_values.shape[-2] // patch_size
@@ -227,6 +241,7 @@ class NemotronH_Nano_VL_V2(EVS):
             batch_size = chunk.shape[0]
             vit_embeds = self.vision_model(chunk)
             vit_embeds = vit_embeds.to(dtype=self.model_dtype)
+            vit_embeds = self._normalize_vision_features(vit_embeds)
             vit_embeds = vit_embeds.reshape(batch_size, h_patches, w_patches, -1)
             vit_embeds = self.pixel_shuffle(
                 vit_embeds, scale_factor=self.downsample_ratio
@@ -377,6 +392,8 @@ class NemotronH_Nano_VL_V2(EVS):
                 vision_weights.append((hf_key, w))
             elif is_sound_weights(name):
                 sound_weights.append((name, w))
+            else:
+                self._load_extra_weight(name, w)
 
         self.language_model.load_weights(llm_weights)
         self.vision_model.load_weights(vision_weights)
@@ -388,4 +405,67 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
     pass
 
 
-EntryClass = [NemotronH_Nano_VL_V2, NemotronH_Nano_Omni_Reasoning_V3]
+class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
+    packed_modules_mapping = NemotronHForCausalLM.packed_modules_mapping
+    _hf_projector_weight_names = {
+        "vision_projector.mlp1.norm.": "mlp1.0.",
+        "vision_projector.mlp1.linear1.": "mlp1.1.",
+        "vision_projector.mlp1.linear2.": "mlp1.3.",
+    }
+
+    def __init__(self, config, quant_config=None, prefix: str = ""):
+        super().__init__(config, quant_config, prefix)
+        self.vision_final_layernorm = (
+            nn.LayerNorm(
+                config.vit_hidden_size,
+                eps=config.raw_vision_config.get("layer_norm_eps", 1e-6),
+            ).to(self.model_dtype)
+            if (config.llm_config.num_nextn_predict_layers or 0) > 0
+            else None
+        )
+
+    @property
+    def lm_head(self):
+        return self.language_model.lm_head
+
+    def _normalize_vision_features(self, features: torch.Tensor) -> torch.Tensor:
+        if self.vision_final_layernorm is None:
+            return features
+        return self.vision_final_layernorm(features)
+
+    def _load_extra_weight(self, name: str, weight: torch.Tensor) -> None:
+        prefix = "vision_projector.vision_final_layernorm."
+        if not name.startswith(prefix):
+            return
+        if self.vision_final_layernorm is None:
+            raise ValueError(f"Unexpected vision projector weight: {name}")
+        parameter = dict(self.vision_final_layernorm.named_parameters())[
+            name.removeprefix(prefix)
+        ]
+        default_weight_loader(parameter, weight)
+
+    @classmethod
+    def _remap_checkpoint_weight_name(cls, name: str) -> str:
+        for source, target in cls._hf_projector_weight_names.items():
+            if name.startswith(source):
+                return name.replace(source, target, 1)
+        if name.startswith("vision_model.") and not name.startswith(
+            "vision_model.radio_model."
+        ):
+            return name.replace(
+                "vision_model.", "vision_model.radio_model.hf_model.", 1
+            )
+        return name
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+        super().load_weights(
+            (self._remap_checkpoint_weight_name(name), weight)
+            for name, weight in weights
+        )
+
+
+EntryClass = [
+    NemotronH_Nano_VL_V2,
+    NemotronH_Nano_Omni_Reasoning_V3,
+    NemotronH_Omni_Reasoning_V3,
+]
