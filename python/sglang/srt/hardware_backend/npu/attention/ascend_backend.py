@@ -1190,7 +1190,6 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_qlen,
         actual_seq_lengths_kv,
     ):
-        print(f"{actual_seq_qlen=}")
         seq_len = q_nope.shape[0]
         split_len = (seq_len + 1) // 2
         q_nope_prev, q_nope_next = torch.split(q_nope, split_len, dim=0)
