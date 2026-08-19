@@ -46,7 +46,7 @@ SGLang supports both Python's built-in [unittest](https://docs.python.org/3/libr
 
 **When to add a unit test:** If you modify a file under `python/sglang/srt/`, check whether a corresponding test exists in `test/registered/unit/` and add coverage for your changes. For example:
 
-```
+```text
 srt/mem_cache/radix_cache.py   →  unit/mem_cache/test_radix_cache_unit.py
 srt/sampling/sampling_params.py →  unit/sampling/test_sampling_params.py
 ```
@@ -100,7 +100,7 @@ Please note that the above script is primarily a sanity check, not a rigorous ac
 This test can have significant variance (1%–5%) in accuracy due to batching and the non-deterministic nature of the inference engine.
 Also, do not rely on the "Latency/Output throughput" from this script, as it is not a proper speed test.
 
-GSM8K is too easy for many state-of-the-art models, so use a more challenging or feature-specific evaluation when appropriate. See [Evaluating New Models with SGLang](./evaluating_new_models) for current MMLU, GSM8K, HellaSwag, GPQA, HumanEval, and MMMU commands. Additional examples are available in [test/manual/eval](https://github.com/sgl-project/sglang/tree/main/test/manual/eval).
+GSM8K is too easy for many state-of-the-art models, so use a more challenging or feature-specific evaluation when appropriate. See [Evaluating New Models with SGLang](/docs/developer_guide/evaluating_new_models) for current MMLU, GSM8K, HellaSwag, GPQA, HumanEval, and MMMU commands. Additional examples are available in [test/manual/eval](https://github.com/sgl-project/sglang/tree/main/test/manual/eval).
 
 ## Benchmark the speed
 Refer to [Benchmark and Profiling](./benchmark_and_profiling).
