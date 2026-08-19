@@ -108,55 +108,6 @@ class TestTP(CustomTestCase):
         self.assertGreater(metrics["score"], 0.60)
 
 
-@unittest.skip("covered in test_deepep_large.py")
-class TestNoGatherdBuffer(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "4",
-                "--enable-dp-attention",
-                "--dp",
-                "4",
-                "--moe-dense-tp-size",
-                "1",
-                "--enable-dp-lm-head",
-                "--moe-a2a-backend",
-                "deepep",
-                "--cuda-graph-max-bs-decode",
-                "32",
-                "--max-running-requests",
-                "512",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
-        )
-        metrics = run_eval(args)
-        print(metrics)
-
-        self.assertGreater(metrics["score"], 0.60)
-
-
 class TestTBO(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -207,74 +158,6 @@ class TestTBO(CustomTestCase):
         print(metrics)
 
         self.assertGreater(metrics["score"], 0.60)
-
-
-@unittest.skip("covered in TestMTPWithTBO")
-class TestMTP(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "4",
-                "--enable-dp-attention",
-                "--dp",
-                "2",
-                "--enable-dp-lm-head",
-                "--moe-a2a-backend",
-                "deepep",
-                "--speculative-algo",
-                "EAGLE",
-                "--speculative-draft-model-path",
-                DEFAULT_MODEL_NAME_FOR_TEST_MLA_NEXTN,
-                "--speculative-num-steps",
-                "2",
-                "--speculative-eagle-topk",
-                "3",
-                "--speculative-num-draft-tokens",
-                "3",
-                "--cuda-graph-max-bs-decode",
-                "32",
-                "--max-running-requests",
-                "64",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
-        )
-        metrics = run_eval(args)
-        print(metrics)
-
-        self.assertGreater(metrics["score"], 0.60)
-
-        server_info = requests.get(self.base_url + "/server_info")
-        avg_spec_accept_length = server_info.json()["internal_states"][0][
-            "avg_spec_accept_length"
-        ]
-        print(
-            f"###test_gsm8k (deepseek-v3 mtp + dp + tbo):\n"
-            f"accuracy={metrics['score']=:.3f}\n"
-            f"{avg_spec_accept_length=:.3f}\n"
-        )
-        self.assertGreater(avg_spec_accept_length, 2.1)
 
 
 class TestMTPWithTBO(CustomTestCase):
