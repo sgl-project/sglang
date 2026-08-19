@@ -61,6 +61,8 @@ class ModelTaskType(Enum):
     I2M = auto()  # Image to Mesh
     VLA_ACTION = auto()  # Vision-language-action policy output
 
+    T2A = auto()  # Text to Audio
+
     def is_image_gen(self) -> bool:
         return (
             self == ModelTaskType.T2I
@@ -106,6 +108,8 @@ class ModelTaskType(Enum):
             return DataType.ACTION
         if self.is_mesh_gen():
             return DataType.MESH
+        if self == ModelTaskType.T2A:
+            return DataType.AUDIO
         if self.is_image_gen():
             return DataType.IMAGE
         return DataType.VIDEO
