@@ -5,11 +5,19 @@ on:
     inputs:
       image_refs:
         description: |
-          镜像引用列表，每行一个，不含格式后缀。
+          目标镜像引用列表，每行一个，不含格式后缀。
           格式: iaas-gpu-cn-beijing.cr.volces.com/serving/<framework>:<tag>
           示例: iaas-gpu-cn-beijing.cr.volces.com/serving/sglang:v0.5.16.iaas.202607280000-kimi-k3-cu130
         required: true
         type: string
+      source_image_ref:
+        description: |
+          可选：源镜像引用，用于将旧命名格式的镜像重命名为新 tag（docker pull + tag + push）。
+          留空则跳过重命名，直接对 image_refs 中的镜像补全格式。
+          格式: iaas-gpu-cn-beijing.cr.volces.com/serving/<framework>:<old-tag>
+        required: false
+        type: string
+        default: ""
       sync_to_customer:
         description: "补全格式后触发 Bits 流水线同步到客户仓库"
         required: false
@@ -67,6 +75,30 @@ jobs:
           nydusify --version
           nydus-image --version
 
+      - name: Rename image (old tag -> new tag)
+        if: ${{ inputs.source_image_ref != '' }}
+        env:
+          TARGET_IMAGE_REF: ${{ inputs.image_refs }}
+          SOURCE_IMAGE_REF: ${{ inputs.source_image_ref }}
+        run: |
+          set -euo pipefail
+
+          TARGET="$(echo "${TARGET_IMAGE_REF}" | head -1 | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+          echo "=== $(date '+%H:%M:%S') Rename ==="
+          echo "  Source: ${SOURCE_IMAGE_REF}"
+          echo "  Target: ${TARGET}"
+
+          if docker manifest inspect "${TARGET}" >/dev/null 2>&1; then
+            echo "  Target already exists, skipping rename"
+            exit 0
+          fi
+
+          docker pull "${SOURCE_IMAGE_REF}"
+          docker tag "${SOURCE_IMAGE_REF}" "${TARGET}"
+          docker push "${TARGET}"
+          echo "  Renamed: ${TARGET}"
+
       - name: Backfill image formats
         env:
           IMAGE_REFS: ${{ inputs.image_refs }}
@@ -88,17 +120,13 @@ jobs:
             echo ""
             echo "=== $(date '+%H:%M:%S') ${image_ref} ==="
 
-            # Verify OCI base exists. docker manifest inspect uses docker's
-            # credential store (docker login) and does not require skopeo.
             if ! docker manifest inspect "${image_ref}" >/dev/null 2>&1; then
               echo "  ERROR: base image not found: ${image_ref}"
               return 1
             fi
-            local oci_digest
-            oci_digest=$(docker manifest inspect "${image_ref}" | jq -r '.config.digest // empty')
-            echo "  OCI digest: ${oci_digest}"
+            echo "  OCI base verified"
 
-            # zstd: pull then re-export with zstd compression (same as CI zstd step)
+            # zstd
             if docker manifest inspect "${image_ref}-zstd" >/dev/null 2>&1; then
               echo "  [zstd] already exists"
             else
@@ -115,7 +143,7 @@ jobs:
               echo "  [zstd] published ${image_ref}-zstd"
             fi
 
-            # nydus: nydusify convert (same as CI nydus step)
+            # nydus
             if docker manifest inspect "${image_ref}-nydus" >/dev/null 2>&1; then
               echo "  [nydus] already exists"
             else
@@ -150,13 +178,13 @@ jobs:
           BITS_SPACE_ID="779378790402"
 
           echo "Images to sync:"
-          for image_ref in ${IMAGE_REFS}; do
-            image_ref="${image_ref//[$'\r\n']/}"
-            [[ -z "$image_ref" ]] && continue
-            framework="${image_ref##*/}"; framework="${framework%%:*}"
-            tag="${image_ref##*:}"
+          while IFS= read -r line; do
+            line="${line//[$'\r\n']/}"
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            framework="${line##*/}"; framework="${framework%%:*}"
+            tag="${line##*:}"
             echo "  framework=${framework} tag=${tag}"
-          done
+          done <<< "${IMAGE_REFS}"
 
           echo ""
           echo "Bits 流水线: https://bits.bytedance.net/devops/${BITS_SPACE_ID}/pipeline/detail/${BITS_PIPELINE_ID}"
