@@ -73,17 +73,12 @@ logger = logging.getLogger(__name__)
 
 def _ordered_gguf_shard_ids(shard_ids: list) -> list:
     """Return checkpoint shards in the fused layer's logical output order."""
-    if not shard_ids:
-        return []
-    if all(isinstance(shard_id, int) for shard_id in shard_ids):
-        expected = set(range(len(shard_ids)))
-        if len(set(shard_ids)) != len(shard_ids) or set(shard_ids) != expected:
-            raise ValueError(f"Invalid GGUF merged shard IDs: {shard_ids}")
-        return sorted(shard_ids)
-    if "q" in shard_ids:
-        if len(shard_ids) != 3 or set(shard_ids) != {"q", "k", "v"}:
-            raise ValueError(f"Invalid GGUF QKV shard IDs: {shard_ids}")
+    if len(shard_ids) == 3 and set(shard_ids) == {"q", "k", "v"}:
         return ["q", "k", "v"]
+    if all(isinstance(shard_id, int) for shard_id in shard_ids) and set(
+        shard_ids
+    ) == set(range(len(shard_ids))):
+        return sorted(shard_ids)
     return list(shard_ids)
 
 

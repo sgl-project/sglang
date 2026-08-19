@@ -415,8 +415,6 @@ def validate_artifacts(args: argparse.Namespace) -> dict[str, Any]:
             "direct_io": args.direct_io,
             "stats_flush_interval": args.stats_flush_interval,
             "stats_path": str(args.stats_path),
-            "verify_source_sha256": args.verify_source_sha256,
-            "verify_pack_sha256": args.verify_pack_sha256,
         },
     }
 
@@ -442,9 +440,7 @@ def build_server_command(
         "1",
         "--ep-size",
         "1",
-        "--disable-cuda-graph",
         "--disable-flashinfer-autotune",
-        "--disable-shared-experts-fusion",
         "--skip-server-warmup",
         "--context-length",
         str(args.context_length),
@@ -476,7 +472,6 @@ def start_server(
         python_path.append(env["PYTHONPATH"])
     env["CUDA_VISIBLE_DEVICES"] = "0"
     env["PYTHONPATH"] = os.pathsep.join(python_path)
-    env["SGLANG_OPT_FP8_WO_A_GEMM"] = "0"
     env.setdefault("SGLANG_OPT_USE_TILELANG_INDEXER", "1")
     conda_lib = str(Path(sys.prefix) / "lib")
     cuda_root = Path("/usr/local/cuda")
@@ -776,7 +771,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         read_splits=4,
         stats_flush_interval=len(ACTIVE_MOE_LAYERS),
         direct_io=True,
-        verify_source_sha256=True,
+        verify_source_sha256=False,
         verify_pack_sha256=False,
         validate_only=False,
     )

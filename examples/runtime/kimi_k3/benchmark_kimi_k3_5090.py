@@ -9,8 +9,6 @@ import fcntl
 import hashlib
 import json
 import os
-import re
-import shutil
 import signal
 import socket
 import subprocess
@@ -23,10 +21,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_PROMPT = "请介绍深圳"
 DEFAULT_SERVER_LOG = SCRIPT_DIR / "logs/kimi-k3-5090-benchmark-server.log"
 DEFAULT_LOCK = "/tmp/sglang-kimi-k3-5090-benchmark.lock"
-METADATA_FORMAT_VERSION = 2
+METADATA_FORMAT_VERSION = 3
 ACTIVE_MOE_LAYERS = tuple(range(1, 93))
 IMMUTABLE_TOP_K = 16
-GGUF_SHARD_SUFFIX_RE = re.compile(r"-\d{5}-of-\d{5}\.gguf$")
 
 
 def cache_root() -> Path:
@@ -40,40 +37,6 @@ def artifact_dir_for_source(gguf: Path) -> Path:
         f"{METADATA_FORMAT_VERSION}".encode()
     ).hexdigest()[:20]
     return cache_root() / "sglang-expert-pack" / "kimi-k3" / fingerprint
-
-
-def _tokenizer_candidate(path: Path) -> bool:
-    return (
-        path.is_dir()
-        and (path / "config.json").is_file()
-        and any(
-            (path / name).is_file()
-            for name in ("tokenizer.json", "tiktoken.model", "tokenizer_config.json")
-        )
-    )
-
-
-def resolve_kimi_assets(gguf: Path) -> tuple[Path, Path, Path]:
-    gguf_dir = gguf.parent
-    shard_match = GGUF_SHARD_SUFFIX_RE.search(gguf.name)
-    if shard_match is None:
-        raise RuntimeError(f"Kimi GGUF is not a numbered shard: {gguf}")
-    expert_pack = gguf_dir / f"{gguf.name[: shard_match.start()]}.expert-major.pack"
-    candidates = [gguf_dir / "tokenizer", gguf_dir.parent / "kimi-k3-tokenizer"]
-    candidates.extend(
-        sorted(path for path in gguf_dir.parent.glob("*tokenizer*") if path.is_dir())
-    )
-    tokenizers = []
-    for path in candidates:
-        path = path.resolve()
-        if path not in tokenizers and _tokenizer_candidate(path):
-            tokenizers.append(path)
-    if len(tokenizers) != 1:
-        names = ", ".join(str(path) for path in tokenizers) or "none"
-        raise RuntimeError(
-            f"could not uniquely derive Kimi tokenizer beside {gguf_dir}; candidates: {names}"
-        )
-    return gguf_dir, expert_pack.resolve(), tokenizers[0]
 
 
 def find_sglang_repo() -> Path:
@@ -117,144 +80,6 @@ def detect_rtx_5090() -> str:
     return gpu_zero
 
 
-def prepare_model_metadata(tokenizer_dir: Path, artifact_dir: Path) -> Path:
-    tokenizer_dir = tokenizer_dir.resolve(strict=True)
-    source_config = json.loads(
-        (tokenizer_dir / "config.json").read_text(encoding="utf-8")
-    )
-    if "text_config" not in source_config:
-        raise ValueError("Kimi tokenizer config does not contain text_config")
-    config = dict(source_config["text_config"])
-    config["architectures"] = ["KimiK3LinearForCausalLM"]
-    config["model_type"] = "kimi_linear"
-    config.pop("auto_map", None)
-    config.pop("quantization_config", None)
-
-    output_dir = artifact_dir / "model-meta"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for source in tokenizer_dir.iterdir():
-        if source.is_file() and source.name != "config.json":
-            destination = output_dir / source.name
-            if (
-                not destination.is_file()
-                or destination.stat().st_size != source.stat().st_size
-                or destination.stat().st_mtime_ns != source.stat().st_mtime_ns
-            ):
-                shutil.copy2(source, destination)
-    write_json_atomic(output_dir / "config.json", config)
-    return output_dir
-
-
-def prepare_manifest(args: argparse.Namespace, model_dir: Path) -> Path:
-    manifest = args.artifact_dir / "kimi-k3-expert-pack.manifest.json"
-    command = [
-        sys.executable,
-        str(args.sglang_repo / "tools" / "expert_pack" / "prepare_kimi_manifest.py"),
-        "--gguf-dir",
-        str(args.gguf_dir),
-        "--expert-pack",
-        str(args.expert_pack),
-        "--model-config",
-        str(model_dir / "config.json"),
-        "--tokenizer-dir",
-        str(args.tokenizer_dir),
-        "--output",
-        str(manifest),
-        "--payload-samples",
-        str(args.payload_samples),
-    ]
-    if args.full_source_hashes:
-        command.append("--full-source-hashes")
-    if args.full_pack_hash:
-        command.append("--full-pack-hash")
-    subprocess.run(command, cwd=args.sglang_repo, check=True)
-    return manifest
-
-
-def prepare_expert_pack(args: argparse.Namespace, model_dir: Path) -> Path:
-    tool = args.sglang_repo / "tools" / "expert_pack" / "prepare_kimi_pack.py"
-    if not tool.is_file():
-        raise FileNotFoundError(f"missing Kimi Expert Pack preparer: {tool}")
-    subprocess.run(
-        [
-            sys.executable,
-            str(tool),
-            "--gguf",
-            str(args.gguf),
-            "--model-config",
-            str(model_dir / "config.json"),
-        ],
-        cwd=args.sglang_repo,
-        check=True,
-    )
-    if not args.expert_pack.is_file():
-        raise FileNotFoundError(
-            f"Kimi Expert Pack preparer did not create {args.expert_pack}"
-        )
-    return args.expert_pack
-
-
-def validate_manifest(
-    manifest_path: Path,
-    expert_pack: Path,
-    gguf_dir: Path | None = None,
-    tokenizer_dir: Path | None = None,
-) -> dict:
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    expected_constraints = {
-        "all_selected_experts_must_execute": True,
-        "expert_pruning_allowed": False,
-        "requantization_allowed": False,
-        "top_k": IMMUTABLE_TOP_K,
-        "top_k_is_immutable": True,
-    }
-    if manifest.get("hard_constraints") != expected_constraints:
-        raise ValueError("manifest does not enforce immutable Top-K=16 execution")
-    model = manifest["model"]
-    if tuple(model["active_moe_layer_ids"]) != ACTIVE_MOE_LAYERS:
-        raise ValueError("manifest active MoE layers must be exactly 1..92")
-    if int(model["num_experts_per_token"]) != IMMUTABLE_TOP_K:
-        raise ValueError("manifest changed Kimi K3 Top-K away from 16")
-    pack = manifest["expert_pack"]
-    if Path(pack["path"]).resolve() != expert_pack.resolve(strict=True):
-        raise ValueError("manifest points to a different expert-pack")
-    if int(pack["size"]) != expert_pack.stat().st_size:
-        raise ValueError("expert-pack size changed after preparation")
-    if gguf_dir is not None:
-        shard_paths = [
-            Path(item["path"]).resolve() for item in manifest["source"]["shards"]
-        ]
-        if not shard_paths or any(
-            path.parent != gguf_dir.resolve() for path in shard_paths
-        ):
-            raise ValueError("manifest source shards do not match --gguf directory")
-    if (
-        tokenizer_dir is not None
-        and Path(manifest["tokenizer"]["path"]).resolve() != tokenizer_dir.resolve()
-    ):
-        raise ValueError(
-            "manifest tokenizer does not match derived tokenizer directory"
-        )
-    return manifest
-
-
-def make_prompt(tokenizer_dir: Path, prompt: str) -> tuple[list[int], str]:
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_dir, trust_remote_code=True, local_files_only=True
-    )
-    input_ids = tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}],
-        tokenize=True,
-        add_generation_prompt=True,
-    )
-    prompt_text = tokenizer.decode(input_ids, skip_special_tokens=False)
-    if not input_ids:
-        raise ValueError("Kimi chat template produced an empty prompt")
-    return [int(value) for value in input_ids], prompt_text
-
-
 def server_url(args: argparse.Namespace) -> str:
     return f"http://{args.host}:{args.port}"
 
@@ -267,18 +92,8 @@ def port_in_use(host: str, port: int, timeout: float = 0.5) -> bool:
         return False
 
 
-def start_server(
-    args: argparse.Namespace,
-    model_dir: Path,
-    manifest_path: Path,
-) -> subprocess.Popen:
-    if port_in_use(args.host, args.port):
-        raise RuntimeError(f"server address is already in use: {server_url(args)}")
-    args.server_log.parent.mkdir(parents=True, exist_ok=True)
-    log = args.server_log.open("wb", buffering=0)
+def build_server_command(args: argparse.Namespace) -> list[str]:
     extra_config = {
-        "pack_path": str(args.expert_pack),
-        "manifest_path": str(manifest_path),
         "cache_vram_mib": args.expert_cache_mib,
         "cache_vram_reserve_mib": args.expert_cache_reserve_mib,
         "stage_slots": args.stage_slots,
@@ -286,37 +101,13 @@ def start_server(
         "direct_io": args.direct_io,
         "stats_flush_interval": len(ACTIVE_MOE_LAYERS),
         "stats_path": str(args.stats_path),
-        "verify_pack_sha256": args.verify_pack_sha256,
     }
-    env = os.environ.copy()
-    python_path = [str(args.sglang_repo), str(args.sglang_repo / "python")]
-    if env.get("PYTHONPATH"):
-        python_path.append(env["PYTHONPATH"])
-    env["CUDA_VISIBLE_DEVICES"] = "0"
-    env["PYTHONPATH"] = os.pathsep.join(python_path)
-    conda_lib = str(Path(sys.prefix) / "lib")
-    cuda_root = Path("/usr/local/cuda")
-    if (cuda_root / "bin" / "nvcc").is_file():
-        env["CUDA_HOME"] = str(cuda_root)
-        env["CUDA_PATH"] = str(cuda_root)
-        env["PATH"] = os.pathsep.join((str(cuda_root / "bin"), env.get("PATH", "")))
-    env["LD_LIBRARY_PATH"] = os.pathsep.join(
-        value
-        for value in (
-            conda_lib,
-            str(cuda_root / "lib64") if (cuda_root / "lib64").is_dir() else None,
-            env.get("LD_LIBRARY_PATH"),
-        )
-        if value
-    )
-    command = [
+    return [
         sys.executable,
         "-m",
         "sglang.launch_server",
         "--model-path",
-        str(model_dir),
-        "--tokenizer-path",
-        str(model_dir),
+        str(args.gguf),
         "--trust-remote-code",
         "--load-format",
         "expert_pack",
@@ -326,8 +117,6 @@ def start_server(
         "1",
         "--ep-size",
         "1",
-        "--disable-cuda-graph",
-        "--disable-shared-experts-fusion",
         "--disable-radix-cache",
         "--mamba-radix-cache-strategy",
         "no_buffer",
@@ -350,6 +139,35 @@ def start_server(
         "--port",
         str(args.port),
     ]
+
+
+def start_server(args: argparse.Namespace) -> subprocess.Popen:
+    if port_in_use(args.host, args.port):
+        raise RuntimeError(f"server address is already in use: {server_url(args)}")
+    args.server_log.parent.mkdir(parents=True, exist_ok=True)
+    log = args.server_log.open("wb", buffering=0)
+    env = os.environ.copy()
+    python_path = [str(args.sglang_repo), str(args.sglang_repo / "python")]
+    if env.get("PYTHONPATH"):
+        python_path.append(env["PYTHONPATH"])
+    env["CUDA_VISIBLE_DEVICES"] = "0"
+    env["PYTHONPATH"] = os.pathsep.join(python_path)
+    conda_lib = str(Path(sys.prefix) / "lib")
+    cuda_root = Path("/usr/local/cuda")
+    if (cuda_root / "bin" / "nvcc").is_file():
+        env["CUDA_HOME"] = str(cuda_root)
+        env["CUDA_PATH"] = str(cuda_root)
+        env["PATH"] = os.pathsep.join((str(cuda_root / "bin"), env.get("PATH", "")))
+    env["LD_LIBRARY_PATH"] = os.pathsep.join(
+        value
+        for value in (
+            conda_lib,
+            str(cuda_root / "lib64") if (cuda_root / "lib64").is_dir() else None,
+            env.get("LD_LIBRARY_PATH"),
+        )
+        if value
+    )
+    command = build_server_command(args)
     print(
         f"SERVICE_STARTING url={server_url(args)} timeout={args.startup_timeout:.0f}s "
         f"log={args.server_log}",
@@ -422,6 +240,23 @@ def server_address(url: str) -> tuple[str, int]:
     without_scheme = url.removeprefix("http://")
     host, port = without_scheme.rsplit(":", 1)
     return host, int(port)
+
+
+def make_prompt(model_dir: Path, prompt: str) -> tuple[list[int], str]:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_dir, trust_remote_code=True, local_files_only=True
+    )
+    input_ids = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=True,
+        add_generation_prompt=True,
+    )
+    prompt_text = tokenizer.decode(input_ids, skip_special_tokens=False)
+    if not input_ids:
+        raise ValueError("Kimi chat template produced an empty prompt")
+    return [int(value) for value in input_ids], prompt_text
 
 
 def generate(
@@ -584,13 +419,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--gguf",
         type=Path,
         required=True,
-        help="one Kimi-K3 GGUF shard; sibling shards, Pack and tokenizer are derived",
+        help="one Kimi-K3 GGUF shard; sibling shards and serving artifacts are derived",
     )
+    parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--max-new-tokens", type=int, default=200)
     parser.set_defaults(
         host="127.0.0.1",
         port=30001,
-        prompt=DEFAULT_PROMPT,
         temperature=0.0,
         top_p=0.95,
         seed=20260813,
@@ -605,11 +440,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         stage_slots=16,
         read_splits=1,
         direct_io=True,
-        payload_samples=6,
-        full_source_hashes=False,
-        full_pack_hash=False,
-        verify_pack_sha256=False,
-        prepare_only=False,
     )
     args = parser.parse_args(argv)
     if args.max_new_tokens < 1:
@@ -625,7 +455,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     args.gguf = args.gguf.expanduser().resolve(strict=True)
-    args.gguf_dir, args.expert_pack, args.tokenizer_dir = resolve_kimi_assets(args.gguf)
     args.sglang_repo = find_sglang_repo()
     args.artifact_dir = artifact_dir_for_source(args.gguf).resolve()
     args.server_log = args.artifact_dir / DEFAULT_SERVER_LOG.name
@@ -673,36 +502,22 @@ def main() -> int:
     process = None
     try:
         gpu = detect_rtx_5090()
-        model_dir = prepare_model_metadata(args.tokenizer_dir, args.artifact_dir)
-        args.expert_pack = prepare_expert_pack(args, model_dir)
-        manifest_path = prepare_manifest(args, model_dir)
-        manifest = validate_manifest(
-            manifest_path, args.expert_pack, args.gguf_dir, args.tokenizer_dir
-        )
-        prompt_ids, prompt_text = make_prompt(args.tokenizer_dir, args.prompt)
         prepared = {
-            "status": "prepared",
             "gpu": gpu,
-            "model_metadata": str(model_dir),
-            "manifest": str(manifest_path),
-            "source_inventory_sha256": manifest["source"]["inventory_sha256"],
-            "expert_pack_index_sha256": manifest["expert_pack"]["index_sha256"],
-            "expert_pack_reused": True,
-            "expert_pack_modified": False,
+            "source_gguf": str(args.gguf),
             "top_k": IMMUTABLE_TOP_K,
-            "prompt_token_ids": prompt_ids,
         }
         print(
-            f"MODEL_READY gpu={gpu} top_k={IMMUTABLE_TOP_K} "
-            f"expert_pack={args.expert_pack}",
+            f"MODEL_INPUT_READY gpu={gpu} top_k={IMMUTABLE_TOP_K} gguf={args.gguf}",
             flush=True,
         )
-        if args.prepare_only:
-            return 0
 
         if args.stats_path.exists():
             args.stats_path.unlink()
-        process = start_server(args, model_dir, manifest_path)
+        process = start_server(args)
+        prompt_ids, prompt_text = make_prompt(
+            args.artifact_dir / "model-meta", args.prompt
+        )
         result = generate(
             server_url(args),
             prompt_ids,

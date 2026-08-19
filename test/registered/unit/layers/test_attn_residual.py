@@ -11,8 +11,9 @@ class TestAttnResidual(unittest.TestCase):
         self.assertFalse(_supports_attn_res_tma((9, 0)))
         self.assertTrue(_supports_attn_res_tma((10, 0)))
         self.assertTrue(_supports_attn_res_tma((10, 3)))
-        self.assertFalse(_supports_attn_res_tma((11, 0)))
+        self.assertTrue(_supports_attn_res_tma((11, 0)))
         self.assertFalse(_supports_attn_res_tma((12, 0)))
+        self.assertTrue(_supports_attn_res_tma((13, 0)))
 
 
 if __name__ == "__main__":

@@ -6,7 +6,10 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.quantization.gguf import GGUFLinearMethod
+from sglang.srt.layers.quantization.gguf import (
+    GGUFLinearMethod,
+    _ordered_gguf_shard_ids,
+)
 from sglang.srt.model_loader.kimi_k3_gguf import (
     _kda_a_log_target_value,
     _residual_target_value,
@@ -102,6 +105,10 @@ class TestKimiK3GGUFMapping(unittest.TestCase):
         ):
             output = method.apply(layer, torch.zeros(1, 1))
         torch.testing.assert_close(output, torch.tensor([[0.0, 10.0, 20.0, 30.0]]))
+
+    def test_unknown_gguf_shard_layouts_preserve_checkpoint_order(self) -> None:
+        self.assertEqual(_ordered_gguf_shard_ids(["q", "k"]), ["q", "k"])
+        self.assertEqual(_ordered_gguf_shard_ids([4, 2]), [4, 2])
 
 
 if __name__ == "__main__":

@@ -71,13 +71,16 @@ class TestDeepseekBenchmark(unittest.TestCase):
             command = benchmark.build_server_command(args, extra)
 
             self.assertEqual(command[command.index("--load-format") + 1], "expert_pack")
+            self.assertNotIn("--disable-cuda-graph", command)
+            self.assertNotIn("--disable-shared-experts-fusion", command)
             encoded = command[command.index("--model-loader-extra-config") + 1]
             self.assertEqual(json.loads(encoded), extra)
             self.assertEqual(extra["pack_path"], str(args.pack_path))
             self.assertEqual(extra["manifest_path"], str(args.manifest_path))
             self.assertEqual(extra["source_path"], str(args.source_path))
             self.assertTrue(extra["direct_io"])
-            self.assertTrue(extra["verify_source_sha256"])
+            self.assertNotIn("verify_source_sha256", extra)
+            self.assertNotIn("verify_pack_sha256", extra)
             self.assertEqual(args.report_path.parent, args.artifact_dir)
 
     def test_artifact_directory_inside_checkout_is_rejected(self) -> None:

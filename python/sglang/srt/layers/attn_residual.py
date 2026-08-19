@@ -8,7 +8,7 @@
 #   fast  — warp-specialized TMA kernel: cp.async.bulk producer +
 #           online-softmax consumers over a double-buffered chunk ring, out
 #           norm fused, per-nvb tuned launch config, one persistent CTA per
-#           SM. Taken on SM100+ with H=7168.
+#           SM. Taken on SM100+ except SM12x with H=7168.
 #   hip   — single Triton kernel, everything in one launch; taken on ROCm
 #           within its register budget.
 #   fused — Triton 2-kernel pipeline with full H-parallelism; the fallback
@@ -34,13 +34,13 @@ _HIP_SHAPE_GATE = None
 
 
 def _supports_attn_res_tma(capability: tuple[int, int]) -> bool:
-    """Return whether the device implements the SM10x tcgen05/TMEM ISA."""
+    """Return whether the device is eligible for the TMA fast path."""
     major, _ = capability
-    return major == 10
+    return major >= 10 and major != 12
 
 
 def _use_fast(hidden_size: int) -> bool:
-    """Use the TMA kernel only on SM10x; SM120 lacks tcgen05/TMEM."""
+    """Use the TMA kernel on SM100+ except SM12x."""
     global _FAST_SUPPORTED
     if is_npu():
         return False

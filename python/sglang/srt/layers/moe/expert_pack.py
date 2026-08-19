@@ -249,7 +249,7 @@ class ExpertPackStore:
         read_splits: int = READ_SPLITS,
         direct_io: bool = False,
         stats_flush_interval: int = 0,
-        verify_pack_sha256: bool = True,
+        verify_pack_sha256: bool = False,
         stats_path: str | os.PathLike[str] | None = None,
     ) -> None:
         self.path = Path(pack_path).resolve()

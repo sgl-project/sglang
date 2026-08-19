@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SGLang loader for an exact Ollama GGUF plus routed expert pack."""
+"""SSD expert-pack loader for deepseek-v4-flash and text-only kimi-k3.
+
+Only these two language-model paths are currently supported. The multimodal
+kimi-k3 model is outside the scope of this loader.
+"""
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import time
@@ -15,7 +18,6 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.moe.expert_pack_mxfp4 import prewarm_mxfp4_extension
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.expert_pack import (
     ExpertPackStore,
     KimiGGMLExpertPackStore,
@@ -28,6 +30,10 @@ from sglang.srt.model_loader.deepseek4_gguf import (
     build_deepseek4_checkpoint_name_map,
     routed_expert_tensor,
 )
+from sglang.srt.model_loader.expert_pack_config import (
+    KIMI_K3_MODEL_TYPE,
+    validate_expert_pack_model_config,
+)
 from sglang.srt.model_loader.kimi_k3_gguf import kimi_k3_nonexpert_weights_iterator
 from sglang.srt.model_loader.loader import (
     BaseModelLoader,
@@ -38,14 +44,6 @@ from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.runtime_context import get_server_args
 
 logger = logging.getLogger(__name__)
-
-
-def _sha256(path: Path, chunk_bytes: int = 16 * 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb", buffering=0) as stream:
-        while chunk := stream.read(chunk_bytes):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _bf16_tensor(data: np.ndarray) -> torch.Tensor:
@@ -168,46 +166,25 @@ class ExpertPackModelLoader(BaseModelLoader):
 
     def load_model(self, *, model_config, device_config) -> nn.Module:
         hf_config = model_config.hf_config
-        is_kimi = hf_config.model_type == "kimi_linear"
-        if not is_kimi and hf_config.model_type != "deepseek_v4":
-            raise ValueError("expert_pack supports only DeepSeek-V4 and Kimi-K3")
+        model_kind, model_errors = validate_expert_pack_model_config(hf_config)
+        if model_errors:
+            details = "\n".join(f"- {error}" for error in model_errors)
+            raise ValueError(f"Invalid expert_pack model configuration:\n{details}")
+        is_kimi = model_kind == KIMI_K3_MODEL_TYPE
         server_args = get_server_args()
         if is_kimi:
             if self.manifest_path is None or not self.manifest_path.is_file():
                 raise FileNotFoundError("Kimi-K3 expert_pack requires manifest_path")
-            if server_args.tp_size != 1 or server_args.ep_size != 1:
-                raise ValueError("Kimi-K3 expert_pack requires single-GPU TP=EP=1")
-            required_kimi = {
-                "num_hidden_layers": 93,
-                "num_experts": 896,
-                "num_experts_per_token": 16,
-                "first_k_dense_replace": 1,
-                "routed_expert_hidden_size": 3584,
-                "moe_intermediate_size": 3072,
-                "num_shared_experts": 2,
-                "hidden_act": "situ",
-                "activation_situ_beta": 4.0,
-                "activation_situ_linear_beta": 25.0,
-            }
-            for field, expected in required_kimi.items():
-                if getattr(hf_config, field, None) != expected:
-                    raise ValueError(
-                        f"Kimi-K3 hard constraint {field} must be {expected!r}"
-                    )
-        elif not server_args.disable_shared_experts_fusion:
-            raise ValueError(
-                "expert_pack requires --disable-shared-experts-fusion to keep the "
-                "shared expert on the non-routed GGUF path"
-            )
-        if not server_args.disable_cuda_graph:
-            raise ValueError(
-                "expert_pack v1 requires --disable-cuda-graph because cache slot "
-                "addresses are selected dynamically"
-            )
-        if not is_kimi and envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
-            raise ValueError(
-                "expert_pack requires SGLANG_OPT_FP8_WO_A_GEMM=0 because the "
-                "exact Ollama wo_a tensors are GGUF Q8_0, not FP8"
+
+        if (
+            server_args.tp_size != 1
+            or server_args.dp_size != 1
+            or server_args.ep_size != 1
+            or not server_args.disable_cuda_graph
+            or not server_args.disable_shared_experts_fusion
+        ):
+            raise RuntimeError(
+                "expert_pack ServerArgs invariants were not applied before model load"
             )
 
         if is_kimi:
@@ -223,10 +200,9 @@ class ExpertPackModelLoader(BaseModelLoader):
                     self.config.get("cache_vram_reserve_mib", 2 * 1024)
                 ),
                 stage_slots=int(self.config.get("stage_slots", 16)),
-                read_splits=int(self.config.get("read_splits", 4)),
-                direct_io=bool(self.config.get("direct_io", False)),
+                read_splits=int(self.config.get("read_splits", 1)),
+                direct_io=bool(self.config.get("direct_io", True)),
                 stats_flush_interval=int(self.config.get("stats_flush_interval", 0)),
-                verify_pack_sha256=bool(self.config.get("verify_pack_sha256", False)),
                 stats_path=stats_path,
             )
             weights = kimi_k3_nonexpert_weights_iterator(self.manifest_path)
@@ -248,9 +224,6 @@ class ExpertPackModelLoader(BaseModelLoader):
                 )
             if self.source_path is None or not self.source_path.is_file():
                 raise FileNotFoundError("Ollama source blob is missing")
-            if self.config.get("verify_source_sha256", True):
-                if _sha256(self.source_path) != self.config["source_sha256"]:
-                    raise ValueError("Ollama source blob SHA-256 does not match")
             store = ExpertPackStore(
                 self.pack_path,
                 manifest_path=self.manifest_path,
@@ -274,10 +247,9 @@ class ExpertPackModelLoader(BaseModelLoader):
                         "stage_slots", os.getenv("SGLANG_EXPERT_STAGE_SLOTS", 8)
                     )
                 ),
-                read_splits=int(self.config.get("read_splits", 4)),
-                direct_io=bool(self.config.get("direct_io", False)),
+                read_splits=int(self.config.get("read_splits", 1)),
+                direct_io=bool(self.config.get("direct_io", True)),
                 stats_flush_interval=int(self.config.get("stats_flush_interval", 0)),
-                verify_pack_sha256=bool(self.config.get("verify_pack_sha256", True)),
                 stats_path=stats_path,
             )
             weights = deepseek4_nonexpert_weights_iterator(

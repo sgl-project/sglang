@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,12 +22,8 @@ SPEC.loader.exec_module(benchmark)
 class TestKimiBenchmark(unittest.TestCase):
     def _argv(self, root: Path) -> list[str]:
         gguf_dir = root / "gguf"
-        tokenizer_dir = root / "kimi-k3-tokenizer"
         gguf_dir.mkdir()
-        tokenizer_dir.mkdir()
         (gguf_dir / "KIMI-K3-00001-of-00001.gguf").write_bytes(b"gguf")
-        (tokenizer_dir / "config.json").write_text("{}\n", encoding="utf-8")
-        (tokenizer_dir / "tokenizer.json").write_text("{}\n", encoding="utf-8")
         return [
             "--gguf",
             str(gguf_dir / "KIMI-K3-00001-of-00001.gguf"),
@@ -40,8 +37,7 @@ class TestKimiBenchmark(unittest.TestCase):
             self.assertEqual(args.stats_path.parent, args.artifact_dir)
             self.assertEqual(args.report_path.parent, args.artifact_dir)
             self.assertNotIn(ROOT, args.artifact_dir.parents)
-            self.assertEqual(args.gguf_dir, root / "gguf")
-            self.assertEqual(args.expert_pack.name, "KIMI-K3.expert-major.pack")
+            self.assertEqual(args.gguf.parent, root / "gguf")
 
     def test_artifact_directory_is_derived_and_external(self) -> None:
         with tempfile.TemporaryDirectory(prefix="kimi-benchmark-") as value:
@@ -56,6 +52,20 @@ class TestKimiBenchmark(unittest.TestCase):
             self.assertTrue(args.direct_io)
             with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
                 benchmark.parse_args([*argv, "--direct-io"])
+
+    def test_server_command_leaves_artifact_preparation_to_sglang(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="kimi-benchmark-") as value:
+            args = benchmark.parse_args(self._argv(Path(value)))
+            command = benchmark.build_server_command(args)
+            self.assertEqual(command[command.index("--model-path") + 1], str(args.gguf))
+            self.assertNotIn("--tokenizer-path", command)
+            encoded = command[command.index("--model-loader-extra-config") + 1]
+            loader_config = json.loads(encoded)
+            self.assertNotIn("pack_path", loader_config)
+            self.assertNotIn("manifest_path", loader_config)
+            self.assertNotIn("source_path", loader_config)
+            self.assertEqual(loader_config["read_splits"], 1)
+            self.assertTrue(loader_config["direct_io"])
 
 
 if __name__ == "__main__":

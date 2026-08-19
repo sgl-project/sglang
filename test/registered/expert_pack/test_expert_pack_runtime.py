@@ -165,7 +165,7 @@ class TestExpertPackRuntime(unittest.TestCase):
                     stage_slots=0,
                 )
 
-    def test_parse_and_fail_closed_on_pack_corruption(self):
+    def test_full_pack_verification_is_opt_in(self):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
             pack, manifest, digests = _make_pack(root)
@@ -193,6 +193,21 @@ class TestExpertPackRuntime(unittest.TestCase):
             with pack.open("r+b") as stream:
                 stream.seek(-1, 2)
                 stream.write(b"\x01")
+
+            store = ExpertPackStore(
+                pack,
+                manifest_path=manifest,
+                expected_layers=1,
+                expected_experts=2,
+                expected_top_k=1,
+                expected_source_sha256=digests["source"],
+                expected_manifest_sha256=digests["manifest"],
+                expected_config_sha256=digests["config"],
+                cache_vram_mib=1,
+                stage_slots=1,
+            )
+            store.close()
+
             with self.assertRaisesRegex(ValueError, "SHA-256"):
                 ExpertPackStore(
                     pack,
@@ -205,6 +220,7 @@ class TestExpertPackRuntime(unittest.TestCase):
                     expected_config_sha256=digests["config"],
                     cache_vram_mib=1,
                     stage_slots=1,
+                    verify_pack_sha256=True,
                 )
 
     def test_split_read_ranges_reconstruct_exact_object(self):

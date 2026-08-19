@@ -543,6 +543,9 @@ class ServerArgs:
             '"dummy" will initialize the weights with random values, '
             "which is mainly for profiling."
             '"gguf" will load the weights in the gguf format. '
+            '"expert_pack" will load the supported deepseek-v4-flash or '
+            "text-only Kimi-K3 GGUF model with routed experts stored in an "
+            "SSD expert pack. "
             '"bitsandbytes" will load the weights using bitsandbytes '
             "quantization."
             '"layered" loads weights layer by layer so that one can quantize a '
@@ -3640,6 +3643,11 @@ class ServerArgs:
 
         # Set missing default values.
         self._handle_missing_default_values()
+
+        # expert_pack may replace a raw GGUF input with its generated local
+        # model metadata before any model-specific handler calls get_model_config.
+        # It also establishes eager-only invariants before CUDA graph parsing.
+        self._handle_expert_pack()
 
         # Validate PD disaggregation flags before CUDA graph config.
         self._handle_pd_disaggregation()
@@ -7500,6 +7508,11 @@ class ServerArgs:
                     resolved_draft,
                 )
                 self.speculative_draft_model_path = resolved_draft
+
+    def _handle_expert_pack(self):
+        from sglang.srt.arg_groups.expert_pack_hook import handle_expert_pack
+
+        handle_expert_pack(self)
 
     def _handle_load_format(self):
         # The quantization side of the gguf coupling moved to the pipeline
