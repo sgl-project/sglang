@@ -29,10 +29,10 @@ def tree_mask_numel(
 class VerifyMask(msgspec.Struct, frozen=True):
     """The target-verify mask.
 
-    Speculative tree builders write the buffer in place after draft, which is
-    what lets the worker skip the ``seq_lens_sum`` D2H sync. Keep them together:
-    taking the buffer without its layout has the kernel write a shape the reader
-    does not expect. The kernel writes every cell in the active packed region, so
+    ``build_tree_kernel_efficient`` writes the buffer in place after draft, which
+    is what lets the worker skip the ``seq_lens_sum`` D2H sync. Keep them
+    together: taking the buffer without its layout has the kernel write a shape
+    the reader does not expect. The kernel writes every cell even when unread, so
     the buffer is always allocated. Frozen -- resize by swapping the whole struct,
     never a field, so ``max_bs`` cannot go stale against ``buffer``.
 

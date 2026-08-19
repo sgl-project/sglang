@@ -27,8 +27,9 @@ def decide_needs_cpu_seq_lens(
 ) -> bool:
     """Whether FutureMap must publish seq_lens_cpu / sum.
 
-    OR over per-backend needs_cpu_seq_lens; force True under TBO because it
-    reads the CPU mirror outside the backend layer to split the batch.
+    OR over per-backend needs_cpu_seq_lens; force True under TBO (it reads the
+    CPU mirror outside the backend layer to split the batch) or ngram without precompute enabled (its
+    USE_FULL_MASK verify path reads the host mirror regardless of backend).
     """
     # Local import: keep overlap_utils' module-level deps leaf-only so it stays
     # importable everywhere; spec_info pulls in the spec/schedule_batch graph.

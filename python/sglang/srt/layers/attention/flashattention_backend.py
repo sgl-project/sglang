@@ -509,8 +509,8 @@ class FlashAttentionBackend(AttentionBackend):
                 return
 
             if forward_mode.is_target_verify() and self.topk > 1:
-                # Tree verify metadata depends on the runtime draft tree. Bind
-                # stable buffers now and fill them before each replay.
+                # topk>1 target verify: replay needs spec_info.positions and .custom_mask
+                # which are not populated at capture time.
                 self.forward_metadata = self.target_verify_metadata_topk_normal[bs]
                 self.forward_metadata_spec_decode_expand = (
                     self.target_verify_metadata_topk_expand[bs]
@@ -1300,7 +1300,7 @@ class FlashAttentionBackend(AttentionBackend):
             and (hasattr(layer, "use_irope") and layer.use_irope)
         )
 
-        # Branched-tree verify uses prefix/tree cascade attention.
+        # We do cascade attention for Target Verify with topk > 1
         # We don't use cascade attention for Sliding Window Attention:
         # - Different window sizes should be passed in for each q in the first stage of cascade attention, but FA3 interface doesn't support pass in a list of window sizes.
         # - The overhead of duplicated computation of the common prefix part is small for sliding window layers (seq_len <= window_size), so we can just expand it.
