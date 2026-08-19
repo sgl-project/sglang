@@ -33,6 +33,7 @@ uuid = { workspace = true }
 prost = "0.13"
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 tonic = { version = "0.12", features = ["gzip", "transport"] }
+tonic-reflection = "0.12.3"
 
 [build-dependencies]
 tonic-build = "0.12"
