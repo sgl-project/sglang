@@ -10,11 +10,8 @@ from sglang.srt.lora.moe.execution_plan import (
     RouteBuilderFamily,
     RouteRequirement,
 )
-from sglang.srt.lora.moe.routing import (
-    RouteView,
-    RouteViewKind,
-    build_virtual_expert_routing,
-)
+from sglang.srt.lora.moe.route_view import RouteView, RouteViewKind
+from sglang.srt.lora.moe.routing import build_virtual_expert_routing
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
 

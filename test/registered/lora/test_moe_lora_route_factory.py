@@ -541,7 +541,7 @@ class TestRoutePdlWiring(unittest.TestCase):
             self.assertNotIn("launch_pdl", recorder.calls[0][2])
 
     def test_joint_kernel_dependency_operations_are_complete(self):
-        source = (LORA_MOE / "aligned_route.py").read_text()
+        source = (LORA_MOE / "route_kernels.py").read_text()
         tree = ast.parse(source)
         function_nodes = {
             node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)

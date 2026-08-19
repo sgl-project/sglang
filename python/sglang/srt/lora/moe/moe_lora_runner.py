@@ -87,7 +87,7 @@ from sglang.srt.lora.moe.route_factory import (
     MoeLoraRoutes,
     build_routes,
 )
-from sglang.srt.lora.moe.routing import RouteView
+from sglang.srt.lora.moe.route_view import RouteView
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace, run_parallel
 from sglang.srt.runtime_context import get_lora
 

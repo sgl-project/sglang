@@ -4,10 +4,8 @@ import unittest
 
 import torch
 
-from sglang.srt.lora.moe.routing import (
-    RouteViewKind,
-    build_virtual_expert_routing,
-)
+from sglang.srt.lora.moe.route_view import RouteViewKind
+from sglang.srt.lora.moe.routing import build_virtual_expert_routing
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -180,10 +178,10 @@ class TestMoeLoraRouting(CustomTestCase):
         dispatch — so the values AND the edge behavior are pinned together.
         """
         from sglang.srt.lora.moe import aligned_route as fused_align
+        from sglang.srt.lora.moe.route_view import RouteViewKind
         from sglang.srt.lora.moe.routing import (
             FUSED_ALIGN_MIN_PAIRS,
             FUSED_ALIGN_MIN_VIRTUAL_EXPERTS,
-            RouteViewKind,
             build_virtual_expert_routing,
         )
 

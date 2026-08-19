@@ -1,147 +1,19 @@
 from __future__ import annotations
 
-from enum import Enum
-
-import msgspec
 import torch
 import triton
-import triton.language as tl
 
 from sglang.kernels.ops.moe.virtual_experts import (
     _align_block_size_jit,
 )
+from sglang.srt.lora.moe.route_kernels import _build_virtual_topk_ids_kernel
+from sglang.srt.lora.moe.route_view import RouteView, RouteViewKind
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
 # Smallest bucket count (V) and pair count (P) at which the fused align
 # builder beats the JIT one; either alone is enough to switch.
 FUSED_ALIGN_MIN_VIRTUAL_EXPERTS = 8192
 FUSED_ALIGN_MIN_PAIRS = 16384
-
-
-class RouteViewKind(str, Enum):
-    RAW = "raw"
-    ALIGNED = "aligned"
-
-
-class RouteView(msgspec.Struct, frozen=True, kw_only=True):
-    view: RouteViewKind
-    block_size: int
-    topk_ids: torch.Tensor
-    token_lora_mapping: torch.Tensor
-    num_local_experts: int
-    is_shared_outer: bool
-    max_loras: int
-    # Present only for `aligned`.
-    maybe_sorted_pair_ids: torch.Tensor | None = None
-    maybe_block_virtual_expert_ids: torch.Tensor | None = None
-    maybe_num_pairs_post_padded: torch.Tensor | None = None
-
-    @property
-    def lora_experts_per_adapter(self) -> int:
-        return 1 if self.is_shared_outer else self.num_local_experts
-
-    @property
-    def num_virtual_experts(self) -> int:
-        return self.lora_experts_per_adapter * self.max_loras
-
-    def _require(self, value, field: str, needed: RouteViewKind):
-        if value is None:
-            raise ValueError(
-                f"route view {self.view.value!r} did not build {field}; the "
-                f"consumer must request view {needed.value!r} or derive it inline"
-            )
-        return value
-
-    @property
-    def sorted_pair_ids(self) -> torch.Tensor:
-        return self._require(
-            self.maybe_sorted_pair_ids, "sorted_pair_ids", RouteViewKind.ALIGNED
-        )
-
-    @property
-    def block_virtual_expert_ids(self) -> torch.Tensor:
-        return self._require(
-            self.maybe_block_virtual_expert_ids,
-            "block_virtual_expert_ids",
-            RouteViewKind.ALIGNED,
-        )
-
-    @property
-    def num_pairs_post_padded(self) -> torch.Tensor:
-        return self._require(
-            self.maybe_num_pairs_post_padded,
-            "num_pairs_post_padded",
-            RouteViewKind.ALIGNED,
-        )
-
-
-@triton.jit
-def virtual_expert_ids_inline(
-    topk_ids_ptr,
-    token_lora_mapping_ptr,
-    pair_ids,
-    pair_mask,
-    routed_expert_id_bound,
-    LORA_EXPERTS_PER_ADAPTER: tl.constexpr,
-    MAX_LORAS: tl.constexpr,
-    TOP_K: tl.constexpr,
-    SHARED_OUTER: tl.constexpr,
-):
-    token_ids = pair_ids // TOP_K
-    adapter_ids = tl.load(
-        token_lora_mapping_ptr + token_ids,
-        mask=pair_mask,
-        other=-1,
-    ).to(tl.int32)
-    routed_expert_ids = tl.load(
-        topk_ids_ptr + pair_ids,
-        mask=pair_mask,
-        other=-1,
-    ).to(tl.int32)
-    if SHARED_OUTER:
-        in_range = (routed_expert_ids >= 0) & (
-            routed_expert_ids < routed_expert_id_bound
-        )
-        lora_expert_ids = tl.where(in_range, 0, -1)
-    else:
-        lora_expert_ids = routed_expert_ids
-
-    valid = (
-        (adapter_ids >= 0)
-        & (adapter_ids < MAX_LORAS)
-        & (lora_expert_ids >= 0)
-        & (lora_expert_ids < LORA_EXPERTS_PER_ADAPTER)
-    )
-    return tl.where(valid, adapter_ids * LORA_EXPERTS_PER_ADAPTER + lora_expert_ids, -1)
-
-
-@triton.jit
-def _build_virtual_topk_ids_kernel(
-    topk_ids_ptr,
-    token_lora_mapping_ptr,
-    virtual_topk_ids_ptr,
-    num_pairs,
-    routed_expert_id_bound,
-    LORA_EXPERTS_PER_ADAPTER: tl.constexpr,
-    MAX_LORAS: tl.constexpr,
-    TOP_K: tl.constexpr,
-    SHARED_OUTER: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pair_ids = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    pair_mask = pair_ids < num_pairs
-    virtual_ids = virtual_expert_ids_inline(
-        topk_ids_ptr,
-        token_lora_mapping_ptr,
-        pair_ids,
-        pair_mask,
-        routed_expert_id_bound,
-        LORA_EXPERTS_PER_ADAPTER=LORA_EXPERTS_PER_ADAPTER,
-        MAX_LORAS=MAX_LORAS,
-        TOP_K=TOP_K,
-        SHARED_OUTER=SHARED_OUTER,
-    )
-    tl.store(virtual_topk_ids_ptr + pair_ids, virtual_ids, mask=pair_mask)
 
 
 def _build_virtual_topk_ids(

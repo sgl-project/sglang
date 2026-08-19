@@ -33,7 +33,8 @@ import triton
 import triton.language as tl
 
 from sglang.srt.lora.moe.bf16 import grouped_lora_a
-from sglang.srt.lora.moe.routing import RouteView, virtual_expert_ids_inline
+from sglang.srt.lora.moe.route_kernels import virtual_expert_ids_inline
+from sglang.srt.lora.moe.route_view import RouteView
 
 if TYPE_CHECKING:
     from sglang.srt.lora.moe.execution_plan import LoraASpec

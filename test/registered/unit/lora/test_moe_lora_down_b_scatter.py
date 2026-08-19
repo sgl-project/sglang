@@ -456,10 +456,8 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
         invoke_down_b_scatter,
     )
     from sglang.srt.lora.moe.lora_b import one_launch_sliced_lora_b
-    from sglang.srt.lora.moe.routing import (
-        RouteViewKind,
-        build_virtual_expert_routing,
-    )
+    from sglang.srt.lora.moe.route_view import RouteViewKind
+    from sglang.srt.lora.moe.routing import build_virtual_expert_routing
 
     device = torch.device("cuda")
     seed = 0x5CA7 + num_tokens + num_experts
@@ -584,10 +582,8 @@ def test_scatter_rejects_a_mismatched_route_block() -> None:
     from sglang.srt.lora.moe.base_gemm_provider.down_b_scatter import (
         invoke_down_b_scatter,
     )
-    from sglang.srt.lora.moe.routing import (
-        RouteViewKind,
-        build_virtual_expert_routing,
-    )
+    from sglang.srt.lora.moe.route_view import RouteViewKind
+    from sglang.srt.lora.moe.routing import build_virtual_expert_routing
 
     device = torch.device("cuda")
     topk_ids, token_lora_mapping, _weights, bridge, b_down = _kernel_case(4, 2, 4, 7)

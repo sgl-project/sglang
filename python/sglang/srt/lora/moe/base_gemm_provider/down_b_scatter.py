@@ -58,7 +58,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.moe.routing import RouteView, RouteViewKind
+from sglang.srt.lora.moe.route_view import RouteView, RouteViewKind
 
 
 @triton.jit

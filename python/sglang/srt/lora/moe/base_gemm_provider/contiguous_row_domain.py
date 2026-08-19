@@ -109,7 +109,7 @@ from sglang.srt.lora.moe.base_gemm_provider.masked_fused_middle import (
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 
 if TYPE_CHECKING:
-    from sglang.srt.lora.moe.routing import RouteView
+    from sglang.srt.lora.moe.route_view import RouteView
     from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
 

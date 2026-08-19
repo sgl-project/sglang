@@ -29,7 +29,7 @@ import msgspec
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.lora.moe.routing import RouteView
+    from sglang.srt.lora.moe.route_view import RouteView
     from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
 
