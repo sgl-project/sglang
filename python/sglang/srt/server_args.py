@@ -5351,8 +5351,12 @@ class ServerArgs:
                 # DeepGEMM or require >99KB SMEM (topk_v2).
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+                # The torch fallback materialises x.flatten(1).float(), i.e.
+                # [tokens, hc_mult * hidden] in fp32 (512 MB at ISL 8K), once per
+                # layer, and its fp32 F.linear then lands on a SIMT GEMM with no
+                # Tensor Core use. The TileLang kernel avoids both.
                 if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
-                    envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                    envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(True)
                 if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.is_set():
                     envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
                 # Out of the box the indexer runs the TileLang kernel (works on
