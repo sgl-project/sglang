@@ -182,10 +182,12 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
         for name, loaded_weight in weights:
             if not self.should_materialize_checkpoint_weight(name):
                 continue
-            param = params.get(name)
+            param_name = name.replace(".attn.qkv.", ".attn.qkv_proj.")
+            param = params.get(param_name)
             if param is None:
                 raise KeyError(
-                    f"Unexpected MiniMax H3 Qwen3-VL checkpoint weight: {name}"
+                    "Unexpected MiniMax H3 Qwen3-VL checkpoint weight: "
+                    f"{name} (mapped to {param_name})"
                 )
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             try:
@@ -196,7 +198,7 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                     f"{name!r}: checkpoint={tuple(loaded_weight.shape)}, "
                     f"parameter={tuple(param.shape)}"
                 ) from exc
-            loaded.add(name)
+            loaded.add(param_name)
         return loaded
 
 

@@ -522,6 +522,9 @@ class Envs:
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
     SGLANG_MAX_NEW_TOKENS_LIMIT = EnvInt(None)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    # Window for the token-weighted recent cache-hit rate used to estimate
+    # waiting-queue prefill load.
+    SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
     SGLANG_DATA_PARALLEL_BUDGET_INTERVAL = EnvInt(1)
@@ -1104,14 +1107,6 @@ class Envs:
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PULL_SIZE_KB = EnvInt(None)
     SGLANG_FORCE_CUSTOM_ALL_REDUCE_V2_PUSH_SIZE_KB = EnvInt(None)
-    # Allow CustomAllReduceV2 on a process group that spans nodes (MNNVL
-    # fabric). Requires torch symmetric memory to rendezvous across nodes
-    # (fabric handles + IMEX). Graph zero-copy input registration is not
-    # supported in this mode and is disabled; all-reduce inside CUDA graphs
-    # falls back to eager pull from the symm workspace. Auto-enabled on
-    # MNNVL-fabric devices (GB200/GB300) when nnodes > 1; set 0/1 to
-    # override in either direction.
-    SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE = EnvBool(False)
 
     # ===================================================================
     # RoPE cache
@@ -1194,6 +1189,8 @@ class Envs:
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
+    # Reuse wholly-free graph-pool segments for step-local eager allocations.
+    SGLANG_ENABLE_GRAPH_POOL_BORROW = EnvBool(False)
     # Eager forward wraps the ForwardBatch's own tensors instead of copying them
     # into the CUDA graph buffer registry (no per-iter device-to-device copy).
     SGLANG_EAGER_INPUT_NO_COPY = EnvBool(False)
