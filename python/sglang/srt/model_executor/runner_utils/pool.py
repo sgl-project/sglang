@@ -31,8 +31,6 @@ import torch
 from sglang.srt.cuda_vmm_utils import BumpArenaStub
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_resources, get_stream
-
-_CAPTURE_STREAM_NAME = "cuda_graph_capture"
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
@@ -43,6 +41,8 @@ _borrow_disabled_reason: Optional[str] = None
 _borrow_static_runs: Optional[list[tuple[int, int]]] = None
 _borrow_extents_total = 0
 _largest_logged_graph_pool_borrow = 0
+
+_CAPTURE_STREAM_NAME = "cuda_graph_capture"
 
 
 def disable_graph_pool_borrow(reason: str) -> None:
