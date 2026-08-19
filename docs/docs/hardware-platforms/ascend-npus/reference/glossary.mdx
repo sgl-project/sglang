@@ -97,7 +97,6 @@ section headings, e.g., `W8A8 2P1D 32P` means "W8A8 quantization, 2 prefill node
 | **Tensor Parallelism (TP)**   | `--tp-size`      | Splits model weights across NPUs within a node                          |
 | **Data Parallelism (DP)**     | `--dp-size`      | Replicates the model across nodes for higher throughput                 |
 | **Expert Parallelism (EP)**   | `--ep-size`      | Distributes MoE experts across devices; requires `--moe-a2a-backend`    |
-| **Context Parallelism (CP)**  | `--attn-cp-size` | Splits long context windows across devices for extended sequence length |
 | **Pipeline Parallelism (PP)** | `--pp-size`      | Splits model layers across devices sequentially                         |
 
 ### Speculative decoding

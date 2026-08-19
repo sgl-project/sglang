@@ -153,7 +153,7 @@ class DeepseekV4ModelNextN(nn.Module):
             )
             input_ids_global = input_ids_global.squeeze(-1)
         else:
-            input_ids_global = input_ids
+            input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
         hidden_states, residual, post, comb = self.decoder(
             positions=positions,

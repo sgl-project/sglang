@@ -882,6 +882,20 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
 
+    @patch.object(server_args_module, "is_npu", return_value=True)
+    def test_canonical_prefill_cp_rejects_npu_without_strategy_backend(
+        self, _mock_is_npu
+    ):
+        server_args = self._new_cp_args(
+            enable_prefill_cp=True,
+            cp_strategy="zigzag",
+            attn_cp_size=2,
+            tp_size=2,
+        )
+
+        with self.assertRaisesRegex(ValueError, "not supported on NPU"):
+            server_args._handle_context_parallelism()
+
 
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

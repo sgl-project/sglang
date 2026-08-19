@@ -1360,8 +1360,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
-        elif self.use_fmha_v2 and not cp_v2_active:
-            # CP-v2 must go through cp_strategy.run_attention (per-shard
+        elif self.use_fmha_v2 and not cp_active:
+            # CP must go through cp_strategy.run_attention (per-shard
             # masking); the plain-causal fmha_v2 call below would be wrong.
             paged_kv = torch.stack([k_cache, v_cache], dim=1)
             o = flashinfer.prefill.trtllm_fmha_v2_prefill(

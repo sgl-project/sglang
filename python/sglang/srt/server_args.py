@@ -6477,6 +6477,11 @@ class ServerArgs:
                 )
 
     def _handle_context_parallelism(self):
+        if self.enable_prefill_cp and is_npu():
+            raise ValueError(
+                "Strategy-based prefill context parallelism is not supported on NPU."
+            )
+
         if (
             self.enable_prefill_cp
             and parse_connector_type(self.model_path) != ConnectorType.INSTANCE

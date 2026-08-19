@@ -79,7 +79,7 @@ class TestDeepseekV4RoPEPolicy(CustomTestCase):
             patch.object(deepseek_v4, "get_parallel", return_value=parallel),
             patch.object(
                 deepseek_v4,
-                "resolve_model_attention_partition",
+                "resolve_attention_partition",
                 return_value=(0, 1),
             ),
             patch.object(deepseek_v4, "get_device", return_value=device),

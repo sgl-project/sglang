@@ -16,7 +16,7 @@ This document demonstrates the deployment of DeepSeek-V3.2 on Ascend NPUs using 
 disaggregation mode, feature configuration, and performance optimization.
 
 This document is validated and written based on **SGLang v0.5.16**. The current model (DeepSeek-V3.2) is fully supported in
-this version. To use the latest features (e.g., PD disaggregation, speculative decoding, DSA context parallel), it is
+this version. To use the latest features (e.g., PD disaggregation and speculative decoding), it is
 recommended to use v0.5.16 or a later version.
 
 ## Supported features
@@ -26,7 +26,6 @@ recommended to use v0.5.16 or a later version.
 | Tensor Parallelism            | `--tp-size 32`                                                                                |
 | Data Parallelism              | `--dp-size 8`                                                                                 |
 | Expert Parallelism            | `--ep-size 32 \`<br/>`--moe-a2a-backend deepep \`<br/>`--deepep-mode low_latency`                             |
-| Context Parallelism           | `--enable-prefill-cp \`<br/>`--cp-strategy zigzag \`<br/>`--attn-cp-size 32`  |
 | PD Disaggregation             | `--disaggregation-mode prefill \`<br/>`--disaggregation-transfer-backend ascend`                      |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | Speculative Decoding          | `--speculative-algorithm NEXTN \`<br/>`--speculative-num-steps 3 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 4` |

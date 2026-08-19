@@ -390,10 +390,6 @@ do
         --speculative-draft-model-quantization unquant \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2
 
-        # cp
-        #--enable-prefill-cp \
-        #--cp-strategy zigzag \
-        #--attn-cp-size 4 \
         NODE_RANK=$i
         break
     fi

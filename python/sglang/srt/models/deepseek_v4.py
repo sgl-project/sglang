@@ -45,13 +45,6 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
-from sglang.srt.layers.attention.distributed_layout import (
-    gather_sharded_hidden_states,
-    materialize_global_kv,
-    reduce_scatter_sharded_hidden_states,
-    resolve_model_attention_partition,
-    uses_sharded_prefill_layout,
-)
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.communicator import get_attn_tp_context
@@ -79,6 +72,10 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.model_execution_layout import (
+    get_model_execution_layout,
+    resolve_attention_partition,
+)
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
@@ -458,7 +455,7 @@ class MqaAttentionBase(nn.Module):
         rope_original_seq_len: Optional[int] = None,
     ) -> None:
         super().__init__()
-        attn_tp_rank, attn_tp_size = resolve_model_attention_partition(
+        attn_tp_rank, attn_tp_size = resolve_attention_partition(
             attn_tp_rank, attn_tp_size
         )
         self.attn_tp_rank: int = attn_tp_rank
@@ -1164,7 +1161,7 @@ class MQALayer(MqaAttentionBase):
             q_lora, _ = self.wq_a(x_linear)
             qkv_a = None
 
-        uses_sharded_layout = uses_sharded_prefill_layout(forward_batch)
+        execution_layout = get_model_execution_layout(forward_batch)
         kv: Optional[torch.Tensor]
 
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -1234,10 +1231,10 @@ class MQALayer(MqaAttentionBase):
             )
             kv = None
 
-            if not unified and uses_sharded_layout:
+            if not unified and execution_layout.requires_full_kv:
                 # The distributed layout owner needs bf16 KV before cache storage.
                 kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-                kv = materialize_global_kv(
+                kv = execution_layout.materialize_kv(
                     kv.contiguous(),
                     forward_batch,
                     torch.cuda.current_stream(),
@@ -1282,16 +1279,16 @@ class MQALayer(MqaAttentionBase):
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
                 # The unified two-source path is ROCm-only. A distributed token
                 # layout needs the full current chunk for both sources.
-                if uses_sharded_layout and _is_hip:
-                    kv = materialize_global_kv(
+                if execution_layout.requires_full_kv and _is_hip:
+                    kv = execution_layout.materialize_kv(
                         kv.contiguous(),
                         forward_batch,
                         torch.cuda.current_stream(),
                     )
-            elif uses_sharded_layout:
+            elif execution_layout.requires_full_kv:
                 # Materialize the full current chunk before writing FlashMLA cache.
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-                kv = materialize_global_kv(
+                kv = execution_layout.materialize_kv(
                     kv.contiguous(),
                     forward_batch,
                     torch.cuda.current_stream(),
@@ -1351,7 +1348,7 @@ class MQALayer(MqaAttentionBase):
                 is_in_breakable_cuda_graph()
                 or x.shape[0] <= self._multi_stream_bs_limit
             )
-            and not uses_sharded_prefill_layout(forward_batch)
+            and get_model_execution_layout(forward_batch).allows_parallel_model_branches
             and not (_is_hip and self.compressor is None)
         ) or (
             _is_npu
@@ -1969,14 +1966,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: torch.Tensor,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
-        _uses_sharded_layout = uses_sharded_prefill_layout(forward_batch)
+        execution_layout = get_model_execution_layout(forward_batch)
         _use_tp_moe_gather = (
-            not _uses_sharded_layout
+            execution_layout.allows_parallel_model_branches
             and get_parallel().attn_dp_size > 1
             and get_moe_a2a_backend().is_none()
         )
         _use_tp_attn_a2a_scatter = (
-            not _uses_sharded_layout
+            execution_layout.allows_parallel_model_branches
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
         )
@@ -2010,7 +2007,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             and get_parallel().tp_size == get_parallel().attn_dp_size
         )
         mlp_reduce_scatter = (
-            _uses_sharded_layout or _use_reduce_scatterv or _use_reduce_scatter
+            execution_layout.requires_moe_reduce_scatter
+            or _use_reduce_scatterv
+            or _use_reduce_scatter
         )
         # PoC (SGLANG_DP_SHARED_EXPERT_LOCAL): compute the replicated shared expert
         # on LOCAL hidden before the gather and add it back after the combine
@@ -2028,17 +2027,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             and getattr(self.mlp, "shared_experts", None) is not None
             and getattr(self.mlp, "_shared_expert_tp1", False)
         )
-        if _uses_sharded_layout:
-            moe_a2a_backend = get_moe_a2a_backend()
-            if moe_a2a_backend.is_none():
-                hidden_states = gather_sharded_hidden_states(hidden_states)
-            else:
-                assert moe_a2a_backend.is_deepep() or moe_a2a_backend.is_megamoe(), (
-                    "The sharded prefill layout requires DeepEP or megaMoE "
-                    "(moe_a2a_backend == deepep or megamoe). "
-                    f"Got {moe_a2a_backend.value}."
-                )
-        elif _use_tp_moe_gather:
+        hidden_states = execution_layout.prepare_moe_input(hidden_states)
+        if _use_tp_moe_gather:
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
                 hidden_states,
@@ -2066,9 +2056,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 input_ids_global=input_ids_global,
                 skip_shared_experts=_do_shared_local,
             )
-        if _uses_sharded_layout and get_moe_a2a_backend().is_none():
-            hidden_states = reduce_scatter_sharded_hidden_states(hidden_states)
-        elif _use_tp_moe_gather:
+        hidden_states = execution_layout.restore_moe_output(hidden_states)
+        if _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
@@ -2441,7 +2430,7 @@ class DeepseekV4Model(nn.Module):
             # MTP target-verify also reports is_extend(); only real prefill
             # should enter the prefill TBO strategy.
             and forward_batch.global_forward_mode.is_extend_without_speculative()
-            and not uses_sharded_prefill_layout(forward_batch)
+            and get_model_execution_layout(forward_batch).allows_parallel_model_branches
             and self.pp_group.world_size == 1
         )
 
@@ -2571,7 +2560,7 @@ class DeepseekV4Model(nn.Module):
             )
             input_ids_global = input_ids_global.squeeze(-1)
         else:
-            input_ids_global = input_ids
+            input_ids_global = getattr(forward_batch, "input_ids_global", input_ids)
 
         capture_dspark = self.dspark_layers_to_capture is not None
         dspark_aux_hidden_states: List[torch.Tensor] = []

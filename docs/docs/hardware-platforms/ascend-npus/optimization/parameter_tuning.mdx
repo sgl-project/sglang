@@ -186,21 +186,6 @@ These arguments and environment variables are critical for tuning prefill perfor
       <td>Disables CUDA Graph capture. CUDA Graphs reduce kernel launch overhead for small, predictable batch sizes, making them ideal for decode. For prefill with large and variable batch sizes, CUDA Graphs provide minimal benefit and can cause issues with dynamic shapes. Set this flag on prefill nodes; leave unset on decode nodes.</td>
       <td>true</td>
     </tr>
-    <tr>
-      <td>`--enable-prefill-cp`</td>
-      <td><strong>(DeepSeek V3.2 DSA-specific)</strong> Enables context parallelism for the long-sequence prefill phase of DeepSeek V3.2 with DSA (DeepSeek Sparse Attention). Distributes the sequence across CP ranks to parallelize the computationally expensive DSA prefill for ultra-long contexts.</td>
-      <td>Enabled</td>
-    </tr>
-    <tr>
-      <td>`--cp-strategy`</td>
-      <td>Controls how the long sequence is split across context parallel ranks. Use `zigzag` for balanced causal-attention work or `interleave` for token-interleaved sharding.</td>
-      <td>`zigzag`</td>
-    </tr>
-    <tr>
-      <td>`--attn-cp-size`</td>
-      <td>Specifies the context parallelism group size for attention computation. Larger values distribute the sequence across more ranks, reducing per-rank memory and compute at the cost of increased communication. For models with DSA, this controls the CP size for sparse attention prefill. Set to the number of available devices for maximum parallelization.</td>
-      <td>`32`</td>
-    </tr>
   </tbody>
 </table>
 
@@ -398,7 +383,6 @@ The symbols used are defined as follows:
       <th>Tensor Parallelism</th>
       <th>Data Parallelism</th>
       <th>Expert Parallelism</th>
-      <th>Context Parallelism</th>
       <th>PD Disaggregation</th>
       <th>Quantization</th>
       <th>Chunked Prefill</th>
@@ -421,7 +405,6 @@ The symbols used are defined as follows:
       <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
-      <td>🟢</td>
       <td>🟠</td>
       <td>🟠</td>
       <td>🟢</td>
@@ -438,7 +421,6 @@ The symbols used are defined as follows:
       <td>🟢</td>
       <td></td>
       <td>🟢</td>
-      <td>🟠</td>
       <td>🟢</td>
       <td>🟢</td>
       <td>🟠</td>
@@ -457,7 +439,6 @@ The symbols used are defined as follows:
       <td>🟢</td>
       <td>🟢</td>
       <td></td>
-      <td>🟠</td>
       <td>🟢</td>
       <td>🟢</td>
       <td>🟠</td>
@@ -466,25 +447,6 @@ The symbols used are defined as follows:
       <td>🟢</td>
       <td>🟢</td>
       <td>🟠</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟢</td>
-    </tr>
-    <tr>
-      <td>Context Parallelism</td>
-      <td>🟢</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td></td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟠</td>
-      <td>🟠</td>
-      <td>🟢</td>
-      <td>🟢</td>
-      <td>🟠</td>
-      <td>❔</td>
       <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
@@ -492,7 +454,6 @@ The symbols used are defined as follows:
     </tr>
     <tr>
       <td>PD Disaggregation</td>
-      <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
@@ -515,7 +476,6 @@ The symbols used are defined as follows:
       <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
-      <td>🟢</td>
       <td></td>
       <td>🟠</td>
       <td>🟠</td>
@@ -530,7 +490,6 @@ The symbols used are defined as follows:
     </tr>
     <tr>
       <td>Chunked Prefill</td>
-      <td>🟠</td>
       <td>🟠</td>
       <td>🟠</td>
       <td>🟠</td>
@@ -555,7 +514,6 @@ The symbols used are defined as follows:
       <td>🟠</td>
       <td>🟠</td>
       <td>🟠</td>
-      <td>🟠</td>
       <td></td>
       <td>🟠</td>
       <td>🟢</td>
@@ -568,7 +526,6 @@ The symbols used are defined as follows:
     </tr>
     <tr>
       <td>Speculative Decoding</td>
-      <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
@@ -590,7 +547,6 @@ The symbols used are defined as follows:
       <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
-      <td>🟢</td>
       <td>🟠</td>
       <td>🟢</td>
       <td>🟢</td>
@@ -609,7 +565,6 @@ The symbols used are defined as follows:
       <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
-      <td>🟠</td>
       <td>🟢</td>
       <td>🟠</td>
       <td>🟠</td>
@@ -628,7 +583,6 @@ The symbols used are defined as follows:
       <td>🟢</td>
       <td>🟢</td>
       <td>🟠</td>
-      <td>❔</td>
       <td>🟠</td>
       <td>🟠</td>
       <td>🟠</td>
@@ -644,7 +598,6 @@ The symbols used are defined as follows:
     </tr>
     <tr>
       <td>MLAPO</td>
-      <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
@@ -668,7 +621,6 @@ The symbols used are defined as follows:
       <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
-      <td>🟢</td>
       <td>🟠</td>
       <td>🟠</td>
       <td>🟢</td>
@@ -682,7 +634,6 @@ The symbols used are defined as follows:
     </tr>
     <tr>
       <td>EPLB</td>
-      <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
@@ -701,7 +652,6 @@ The symbols used are defined as follows:
     </tr>
     <tr>
       <td>NZ Weight Format</td>
-      <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
       <td>🟢</td>
@@ -734,10 +684,6 @@ Replicates the model across independent device groups to increase throughput by 
 ### Expert Parallelism (`--ep-size`)
 
 Each device holds a subset of experts and routes tokens via all-to-all communication based on the model's gating network. Supports load balancing methods including default round-robin expert placement and dynamic Expert Parallelism Load Balancing (EPLB).
-
-### Context Parallelism (`--attn-cp-size`)
-
-Splits long input sequences across devices so that the KV cache and attention computation for a single request are distributed. This enables serving very long context lengths (e.g., 128k tokens) that exceed single-device memory. On Ascend, `--attn-cp-size` must equal `--tp-size`.
 
 ### PD Disaggregation (`--disaggregation-mode`)
 
