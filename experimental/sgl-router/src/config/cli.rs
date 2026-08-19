@@ -80,6 +80,17 @@ pub struct Cli {
     /// the only output bound.
     #[arg(long)]
     pub max_output_tokens: Option<NonZeroU64>,
+    /// Default `top_k` sampling value. Injected into the forwarded request body
+    /// ONLY when the request sets no `top_k` (a client-supplied value always
+    /// wins). Unset (default) leaves sampling to the engine's own defaults.
+    /// Must be >= 1. Use this to set a fleet-wide default without editing the
+    /// model's `generation_config.json`.
+    #[arg(long)]
+    pub default_top_k: Option<i64>,
+    /// Default `top_p` sampling value, with the same default-when-absent
+    /// semantics as `--default-top-k`. Must be in (0, 1].
+    #[arg(long)]
+    pub default_top_p: Option<f64>,
     /// Central kill switch for the ingress tokenize offload: when set, the
     /// router NEVER injects its ingress-computed `input_ids` into the
     /// forwarded body, so the engine always tokenizes from `messages` itself.
@@ -570,6 +581,20 @@ impl Cli {
             return Err(anyhow!("--tokenizer-shards must be at least 1"));
         }
 
+        // Validate the sampling defaults up front: a misconfigured default is an
+        // operator error that should fail at startup, not silently inject an
+        // invalid value the engine 400s on every request.
+        if let Some(p) = self.default_top_p {
+            if !(p > 0.0 && p <= 1.0) {
+                return Err(anyhow!("--default-top-p ({p}) must be in (0, 1]"));
+            }
+        }
+        if let Some(k) = self.default_top_k {
+            if k < 1 {
+                return Err(anyhow!("--default-top-k ({k}) must be >= 1"));
+            }
+        }
+
         let circuit_breaker = self.cb_threshold.map(|threshold| CircuitBreakerConfig {
             threshold,
             cool_down_secs: self.cb_cool_down_secs.unwrap_or_else(default_cb_cool_down),
@@ -638,6 +663,8 @@ impl Cli {
                 cache_aware,
                 sticky,
                 max_output_tokens: self.max_output_tokens,
+                default_top_k: self.default_top_k,
+                default_top_p: self.default_top_p,
                 forward_input_ids: !self.disable_input_ids_offload,
             },
             discovery,
@@ -764,6 +791,62 @@ mod tests {
             .chain(extra.iter())
             .map(|s| s.to_string())
             .collect()
+    }
+
+    #[test]
+    fn default_top_k_and_top_p_reach_the_model_config() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--default-top-k",
+            "1000",
+            "--default-top-p",
+            "0.95",
+        ]))
+        .unwrap();
+        assert_eq!(c.model.default_top_k, Some(1000));
+        assert_eq!(c.model.default_top_p, Some(0.95));
+        // Unset -> None: sampling is left entirely to the engine.
+        let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert_eq!(c.model.default_top_k, None);
+        assert_eq!(c.model.default_top_p, None);
+    }
+
+    #[test]
+    fn rejects_out_of_range_default_top_p() {
+        for bad in ["0", "1.5"] {
+            let err = into_config_owned(with_model(&[
+                "--worker-urls",
+                "http://x:30000",
+                "--default-top-p",
+                bad,
+            ]))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("default-top-p"), "got: {err}");
+        }
+        // Boundary: 1.0 is valid (inclusive upper bound).
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--default-top-p",
+            "1",
+        ]))
+        .unwrap();
+        assert_eq!(c.model.default_top_p, Some(1.0));
+    }
+
+    #[test]
+    fn rejects_default_top_k_below_one() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--default-top-k",
+            "0",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("default-top-k"), "got: {err}");
     }
 
     /// Parse under a SHARED env lock, so no sibling test can be mutating

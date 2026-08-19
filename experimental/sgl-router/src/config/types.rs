@@ -384,6 +384,16 @@ pub struct ModelConfig {
     /// `NonZeroU64` rules out a `0` cap, which would reject or zero out
     /// every request.
     pub max_output_tokens: Option<NonZeroU64>,
+    /// Default `top_k` sampling value for this model. Injected into the
+    /// forwarded request body ONLY when the request sets no `top_k` — a
+    /// client-supplied value always wins — mirroring `max_output_tokens`'s
+    /// default-when-absent behavior. `None` (default) leaves sampling to the
+    /// engine's own defaults. Passed through verbatim; the engine validates it.
+    pub default_top_k: Option<i64>,
+    /// Default `top_p` sampling value for this model, with the same
+    /// default-when-absent semantics as [`Self::default_top_k`]. `None`
+    /// (default) leaves it to the engine/request.
+    pub default_top_p: Option<f64>,
     /// Whether the chat handler may forward ingress-computed `input_ids` to
     /// the engine so it skips re-tokenizing (the ingress tokenize offload).
     /// `false` gates ONLY the engine-facing forward — ingress tokenization
