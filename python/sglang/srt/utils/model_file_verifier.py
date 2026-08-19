@@ -47,7 +47,20 @@ class Manifest:
                     k: FileInfo(sha256=v, size=-1) for k, v in data["checksums"].items()
                 }
             )
-        return cls(files={k: FileInfo(**v) for k, v in data["files"].items()})
+        if not isinstance(data, dict) or "files" not in data:
+            raise IntegrityError(
+                "Manifest must be a dict containing a 'files' key "
+                "(or the deprecated 'checksums' key)."
+            )
+        files = {}
+        for name, info in data["files"].items():
+            if not isinstance(info, dict) or "sha256" not in info:
+                raise IntegrityError(
+                    f"Manifest file entry {name!r} must be an object "
+                    f"with a 'sha256' field."
+                )
+            files[name] = FileInfo(sha256=info["sha256"], size=info.get("size", -1))
+        return cls(files=files)
 
     def to_dict(self) -> dict:
         return asdict(self)
