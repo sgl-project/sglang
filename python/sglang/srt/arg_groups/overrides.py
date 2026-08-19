@@ -55,6 +55,7 @@ from sglang.srt.utils.common import (
     is_mps,
     is_musa,
     is_npu,
+    is_sm80_supported,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -1662,6 +1663,68 @@ def _check_tilelang_dsa_fp8_kv(
         )
 
 
+def _apply_torch_dsa_constraints(view: Any, declared: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate first-version Torch/SM80 Triton DSA constraints."""
+
+    prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
+    decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+    paged_mqa = getattr(view, "dsa_paged_mqa_logits_backend", "auto")
+    uses_torch = "torch" in {
+        prefill,
+        decode,
+        paged_mqa,
+    }
+    uses_triton_sm80 = paged_mqa == "triton"
+    if not uses_torch and not uses_triton_sm80:
+        return declared
+
+    if is_hip():
+        raise ValueError(
+            "The torch and SM80 Triton DSA backends are currently CUDA-only."
+        )
+    if uses_triton_sm80 and get_device_capability() != (8, 0):
+        capability = get_device_capability()
+        raise ValueError(
+            "The Triton DSA paged-MQA backend currently requires NVIDIA SM80 "
+            "(compute capability 8.0); got "
+            f"{capability[0]}.{capability[1]}."
+        )
+    if view.kv_cache_dtype != "bfloat16":
+        raise ValueError(
+            "The torch and SM80 Triton DSA backends currently require "
+            "--kv-cache-dtype bfloat16; got "
+            f"kv_cache_dtype={view.kv_cache_dtype!r}."
+        )
+
+    graph_config = view.cuda_graph_config
+    if (
+        graph_config.decode.backend != Backend.DISABLED
+        or graph_config.prefill.backend != Backend.DISABLED
+    ):
+        raise ValueError(
+            "The torch and SM80 Triton DSA backends do not support CUDA Graph yet. Use "
+            "--disable-cuda-graph (or set both prefill and decode CUDA Graph "
+            "backends to 'disabled')."
+        )
+
+    if not view.disable_overlap_schedule:
+        logger.warning(
+            "Disabling overlap scheduling because a torch or SM80 Triton DSA "
+            "backend was selected."
+        )
+        declared["disable_overlap_schedule"] = True
+
+    if is_sm80_supported() and envs.SGLANG_OPT_USE_TOPK_V2.get():
+        # topk_transform_512_v2 uses Hopper thread-block clusters and does not
+        # compile for SM80. The explicit Torch DSA configuration must therefore
+        # keep the compatible legacy SGL top-k transform selected as well.
+        logger.warning(
+            "Disabling SGLANG_OPT_USE_TOPK_V2 for the SM80 Torch/Triton DSA path."
+        )
+        envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+    return declared
+
+
 @register_post_process
 def _dsa_split_backend_resolution(view: Any) -> dict:
     """Slot pass in the DSA arm: default the DSA prefill/decode split
@@ -1702,7 +1765,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             "Set DSA backends for GLM FP8 KV Cache on SM120/SM121: "
             f"prefill={backend}, decode={backend}."
         )
-        return declared
+        return _apply_torch_dsa_constraints(view, declared)
 
     if view.enable_hisparse:
         from sglang.srt.arg_groups.hisparse_hook import _hisparse_default_backend
@@ -1718,7 +1781,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
             f"prefill={prefill}, decode={decode}."
         )
-        return declared
+        return _apply_torch_dsa_constraints(view, declared)
 
     if not user_set_prefill and not user_set_decode and is_hip():
         declared["dsa_prefill_backend"] = "tilelang"
@@ -1744,7 +1807,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
         f"prefill={prefill}, decode={decode}."
     )
-    return declared
+    return _apply_torch_dsa_constraints(view, declared)
 
 
 # Keep in sync with the DeepSeek family list on _deepseek_family_overrides.

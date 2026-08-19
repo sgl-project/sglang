@@ -1189,6 +1189,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "dsa_decode_backend": "fa3",
                 },
             )
+
             # user-set prefill survives; only decode defaulted
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(dsa_prefill_backend="trtllm")),
@@ -1235,6 +1236,114 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "dsa_decode_backend": "tilelang",
                 },
             )
+
+    def test_torch_dsa_backend_constraints(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _apply_torch_dsa_constraints,
+        )
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        def _view(**overrides):
+            defaults = dict(
+                dsa_prefill_backend="torch",
+                dsa_decode_backend="torch",
+                dsa_paged_mqa_logits_backend="torch",
+                kv_cache_dtype="bfloat16",
+                disable_overlap_schedule=False,
+                cuda_graph_config=SimpleNamespace(
+                    decode=SimpleNamespace(backend=Backend.DISABLED),
+                    prefill=SimpleNamespace(backend=Backend.DISABLED),
+                ),
+            )
+            defaults.update(overrides)
+            return ResolvedView(SimpleNamespace(**defaults))
+
+        with patch.object(overrides_module, "is_hip", return_value=False):
+            self.assertEqual(
+                _apply_torch_dsa_constraints(_view(), {}),
+                {"disable_overlap_schedule": True},
+            )
+            # Selecting only the paged-MQA fallback applies the same first-version
+            # eager/BF16 constraints.
+            self.assertEqual(
+                _apply_torch_dsa_constraints(
+                    _view(
+                        dsa_prefill_backend="flashmla_sparse",
+                        dsa_decode_backend="fa3",
+                    ),
+                    {},
+                ),
+                {"disable_overlap_schedule": True},
+            )
+            with self.assertRaisesRegex(ValueError, "bfloat16"):
+                _apply_torch_dsa_constraints(_view(kv_cache_dtype="fp8_e4m3"), {})
+            with self.assertRaisesRegex(ValueError, "--disable-cuda-graph"):
+                _apply_torch_dsa_constraints(
+                    _view(
+                        cuda_graph_config=SimpleNamespace(
+                            decode=SimpleNamespace(backend=Backend.FULL),
+                            prefill=SimpleNamespace(backend=Backend.DISABLED),
+                        )
+                    ),
+                    {},
+                )
+
+            with patch.object(
+                overrides_module, "get_device_capability", return_value=(8, 0)
+            ):
+                self.assertEqual(
+                    _apply_torch_dsa_constraints(
+                        _view(
+                            dsa_prefill_backend="flashmla_sparse",
+                            dsa_decode_backend="fa3",
+                            dsa_paged_mqa_logits_backend="triton",
+                        ),
+                        {},
+                    ),
+                    {"disable_overlap_schedule": True},
+                )
+
+            with patch.object(
+                overrides_module, "get_device_capability", return_value=(9, 0)
+            ):
+                with self.assertRaisesRegex(ValueError, "requires NVIDIA SM80"):
+                    _apply_torch_dsa_constraints(
+                        _view(
+                            dsa_prefill_backend="flashmla_sparse",
+                            dsa_decode_backend="fa3",
+                            dsa_paged_mqa_logits_backend="triton",
+                        ),
+                        {},
+                    )
+
+            with (
+                patch.object(overrides_module, "is_sm80_supported", return_value=True),
+                envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+            ):
+                _apply_torch_dsa_constraints(_view(), {})
+                self.assertFalse(envs.SGLANG_OPT_USE_TOPK_V2.get())
+
+            with (
+                patch.object(overrides_module, "is_sm80_supported", return_value=True),
+                envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+            ):
+                self.assertEqual(
+                    _apply_torch_dsa_constraints(
+                        _view(
+                            dsa_prefill_backend="flashmla_sparse",
+                            dsa_decode_backend="fa3",
+                            dsa_paged_mqa_logits_backend="auto",
+                        ),
+                        {},
+                    ),
+                    {},
+                )
+                self.assertTrue(envs.SGLANG_OPT_USE_TOPK_V2.get())
+
+        with patch.object(overrides_module, "is_hip", return_value=True):
+            with self.assertRaisesRegex(ValueError, "CUDA-only"):
+                _apply_torch_dsa_constraints(_view(), {})
 
     def test_flashinfer_allreduce_fusion_passes(self):
         from sglang.srt.arg_groups.overrides import (
