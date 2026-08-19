@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Optional
 
 import torch
@@ -72,6 +73,9 @@ class _AscendKDAExtendKernel:
             cu_seqlens=query_start_loc,
             output_dtype=k.dtype,
         )
+        if os.getenv("SGLANG_USE_RECOMPUTE_BEFORE", "0") == "1":
+            from sgl_kernel_npu.fla.kda_prefill import recompute_w_u_fwd_npu_before
+            recompute_w_u_fwd_npu = recompute_w_u_fwd_npu_before
         w, u, _, gated_k = recompute_w_u_fwd_npu(
             k=k,
             v=v,
@@ -602,12 +606,19 @@ class AscendKDAHybridLinearAttnBackend:
                             mamba_steps_to_track,
                         )
                     else:
-                        copy_conv_state_to_track(
-                            conv_states,
-                            dst_indices_tensor,
-                            mamba_track_indices,
-                            mamba_steps_to_track,
-                        )
+                        if os.getenv("SGLANG_KDA_USE_CONV_STATE_TRACK_COPY", "0") == "1":
+                            copy_conv_state_to_track(
+                                conv_states,
+                                dst_indices_tensor,
+                                mamba_track_indices,
+                                mamba_steps_to_track,
+                            )
+                        else:
+                            track_mask = mamba_steps_to_track >= 0
+                            src_slots = torch.where(
+                                track_mask, dst_indices_tensor, mamba_track_indices
+                            )
+                            conv_states[:, mamba_track_indices] = conv_states[:, src_slots]
 
                 if not has_conv_snapshots:
                     if dst_indices_tensor.numel() > 0:
