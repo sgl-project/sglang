@@ -25,6 +25,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
 )
 from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.kernels.ops.attention.dsa.transform_index import (
+    prepare_trtllm_nope_sparse_metadata,
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
@@ -3241,6 +3242,9 @@ class DeepseekSparseAttnBackend(
 
         q = q_all.view(batch_size, 1, num_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.real_page_size, self.kv_cache_dim)
+        sparse_mla_top_k_lens = None
+        if self.qk_rope_head_dim == 0:
+            sparse_mla_top_k_lens = prepare_trtllm_nope_sparse_metadata(page_table_1)
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 
@@ -3268,6 +3272,7 @@ class DeepseekSparseAttnBackend(
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
+            sparse_mla_top_k_lens=sparse_mla_top_k_lens,
         )
 
         return out
