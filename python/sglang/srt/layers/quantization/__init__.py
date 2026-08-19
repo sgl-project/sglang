@@ -155,7 +155,7 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
         if quantization not in CPU_QUANTIZATION_METHODS:
             raise ValueError(
                 f"Invalid quantization method on CPU: {quantization}. "
-                f"Available methods on CPU: {list(QUANTIZATION_METHODS.keys())}"
+                f"Available methods on CPU: {list(CPU_QUANTIZATION_METHODS.keys())}"
             )
         else:
             return CPU_QUANTIZATION_METHODS[quantization]
