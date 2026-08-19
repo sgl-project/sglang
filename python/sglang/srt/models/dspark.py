@@ -410,9 +410,26 @@ class DSparkDraftMixin:
         if self.logits_mup_width_multiplier:
             hidden = hidden / self.logits_mup_width_multiplier
         weight = self.lm_head.weight
-        if hidden.dtype != weight.dtype:
-            hidden = hidden.to(weight.dtype)
-        local_logits = torch.matmul(hidden, weight.T)
+        if weight.shape[1] != hidden.shape[-1]:
+            # Quantized target lm_head (e.g. NVFP4 packed [vocab, 2560] for a
+            # 5120-hidden target): a dense matmul against the packed layout is
+            # invalid. Mirror LogitsProcessor._compute_lm_head and route
+            # through the quant method so its dequantize path applies.
+            quant_method = getattr(self.lm_head, "quant_method", None)
+            if quant_method is None or not callable(
+                getattr(quant_method, "apply", None)
+            ):
+                raise ValueError(
+                    "DSpark draft: target lm_head has a packed weight layout "
+                    f"({tuple(weight.shape)}) but no applicable quant method."
+                )
+            local_logits = quant_method.apply(
+                self.lm_head, hidden, getattr(self.lm_head, "bias", None)
+            )
+        else:
+            if hidden.dtype != weight.dtype:
+                hidden = hidden.to(weight.dtype)
+            local_logits = torch.matmul(hidden, weight.T)
         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
         return base_logits, None
 
