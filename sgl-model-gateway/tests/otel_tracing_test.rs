@@ -10,6 +10,7 @@ use std::{
 
 use axum::{body::Body, extract::Request, http::StatusCode};
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
+use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
 use opentelemetry_proto::tonic::collector::trace::v1::{
     trace_service_server::{TraceService, TraceServiceServer},
     ExportTraceServiceRequest, ExportTraceServiceResponse,
@@ -27,7 +28,9 @@ use tokio::sync::oneshot;
 use tonic::metadata::MetadataMap;
 use tonic_v12::{transport::Server, Request as TonicRequest, Response, Status};
 use tower::ServiceExt;
+use tower_http::trace::MakeSpan;
 use tracing::info_span;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::prelude::*;
 
 #[derive(Clone)]
@@ -91,6 +94,48 @@ async fn start_collector(
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     Ok(collector)
+}
+
+#[test]
+fn test_request_span_extracts_inbound_trace_context_parent() {
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+    let provider = opentelemetry_sdk::trace::TracerProvider::builder().build();
+    let tracer = provider.tracer("request-span-test");
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        )
+        .body(Body::empty())
+        .unwrap();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let span = smg::middleware::RequestSpan.make_span(&request);
+        let context = span.context();
+        let span_context = context.span().span_context().clone();
+
+        assert!(
+            span_context.is_valid(),
+            "gateway request span should have a valid OTEL context"
+        );
+        assert_eq!(
+            span_context.trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            "gateway request span should continue the inbound trace"
+        );
+        assert_ne!(
+            span_context.span_id().to_string(),
+            "00f067aa0ba902b7",
+            "gateway request span should create its own span id under the inbound parent"
+        );
+    });
 }
 
 #[tokio::test]
