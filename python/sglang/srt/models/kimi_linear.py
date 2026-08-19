@@ -103,11 +103,7 @@ class KimiMoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
-        # Keep the routing correction bias in fp32: the grouped-topk kernels
-        # Matches DeepseekV2.
-        self.gate.e_score_correction_bias = nn.Parameter(
-            torch.empty(num_experts, dtype=torch.float32)
-        )
+        self.gate.e_score_correction_bias = nn.Parameter(torch.empty(num_experts))
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts,
