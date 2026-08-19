@@ -99,7 +99,10 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
     def test_swa_tail_len_keeps_page_aligned_matchable_window(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
-        queue.scheduler = MagicMock(sliding_window_size=127)
+        queue.scheduler = SimpleNamespace(
+            sliding_window_size=127,
+            server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=True),
+        )
         queue.token_to_kv_pool_allocator = MagicMock(page_size=64)
 
         tail_len = queue._swa_tail_len(895)
