@@ -175,7 +175,8 @@ def preprocess_video_frames_sync(frame_list: List[dict]):
         details = json.loads(frame_list[0]["detail"])
         duration = float(details.get("video_duration", 0))
     if duration == 0:
-        duration = float(frame_list[-1]["timestamp"])
+        base_ts = float(frame_list[0].get("timestamp", 0))
+        duration = float(frame_list[-1]["timestamp"]) - base_ts
     images = [frame["frame_image"] for frame in frame_list]
     if isinstance(images[0], torch.Tensor):
         images = torch.stack(images).permute(0, 2, 3, 1).contiguous()
