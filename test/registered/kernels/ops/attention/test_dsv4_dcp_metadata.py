@@ -1,5 +1,6 @@
 import pytest
 import torch
+from types import SimpleNamespace
 
 from sglang.kernels.ops.attention.dsv4.compress import (
     CompressorDecodePlan,
@@ -28,6 +29,10 @@ from sglang.srt.layers.attention.dsv4.dcp import (
 from sglang.kernels.ops.attention.deepseek_v4_rope import (
     precompute_freqs_cis,
 )
+from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+    DeepseekV4HipRadixBackend,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
@@ -38,6 +43,106 @@ pytestmark = pytest.mark.skipif(
 )
 
 DEVICE = "cuda"
+
+
+@pytest.mark.parametrize("seq_lens_cpu_is_final", [False, True])
+def test_dspark_target_verify_cpu_seq_len_contract(
+    seq_lens_cpu_is_final: bool,
+) -> None:
+    backend = object.__new__(DeepseekV4HipRadixBackend)
+    backend.target_verify_num_draft_tokens = 5
+    backend.cuda_int32_kwargs = {"device": DEVICE, "dtype": torch.int32}
+    backend._move_to_device = lambda values: torch.tensor(
+        values, dtype=torch.int32, device=DEVICE
+    )
+
+    captured = {}
+    backend.init_forward_metadata_prefill = lambda **kwargs: captured.update(kwargs)
+
+    prefix_lens = [97, 255]
+    final_lens = [length + 5 for length in prefix_lens]
+    input_cpu_lens = final_lens if seq_lens_cpu_is_final else prefix_lens
+    req_pool_indices = torch.tensor([3, 7], dtype=torch.int64, device=DEVICE)
+    backend.init_forward_metadata_target_verify_old(
+        max_seq_len=max(final_lens),
+        req_pool_indices=req_pool_indices,
+        seq_lens=torch.tensor(prefix_lens, dtype=torch.int32, device=DEVICE),
+        seq_lens_cpu=input_cpu_lens,
+        out_cache_loc=torch.zeros(10, dtype=torch.int64, device=DEVICE),
+        seq_lens_cpu_is_final=seq_lens_cpu_is_final,
+    )
+
+    assert captured["seq_lens_cpu"] == final_lens
+    torch.testing.assert_close(
+        captured["seq_lens"],
+        torch.tensor(final_lens, dtype=torch.int32, device=DEVICE),
+    )
+    causal_lens, _ = backend.expand_prefill_casually(
+        num_tokens=10,
+        seq_lens=captured["seq_lens_cpu"],
+        extend_seq_lens=captured["extend_seq_lens_cpu"],
+        req_pool_indices=req_pool_indices,
+        padded_num_tokens=None,
+    )
+    torch.testing.assert_close(
+        causal_lens,
+        torch.tensor(
+            list(range(98, 103)) + list(range(256, 261)),
+            dtype=torch.int32,
+            device=DEVICE,
+        ),
+    )
+
+
+def test_dspark_graph_replay_normalizes_padded_cpu_seq_lens() -> None:
+    backend = object.__new__(DeepseekV4HipRadixBackend)
+    backend.target_verify_num_draft_tokens = 5
+    backend.is_dspark_draft = True
+    backend.MAX_SEQ_LEN_FOR_CAPTURE = 1024
+    backend.cuda_int32_kwargs = {"device": DEVICE, "dtype": torch.int32}
+    backend._move_to_device = lambda values: torch.tensor(
+        values, dtype=torch.int32, device=DEVICE
+    )
+
+    captured = {}
+    backend.init_forward_metadata_prefill = lambda **kwargs: captured.update(kwargs)
+    backend.replay_cuda_graph_metadata_from = lambda **kwargs: None
+    forward_batch = SimpleNamespace(
+        batch_size=2,
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        actual_forward_mode=ForwardMode.TARGET_VERIFY,
+        positions=torch.zeros(10, dtype=torch.int64, device=DEVICE),
+        req_pool_indices=torch.tensor([3, 0], dtype=torch.int64, device=DEVICE),
+        seq_lens=torch.tensor([97, 1], dtype=torch.int32, device=DEVICE),
+        seq_lens_sum=103,
+        seq_lens_cpu=torch.tensor([102, 1], dtype=torch.int64),
+        out_cache_loc=torch.zeros(5, dtype=torch.int64, device=DEVICE),
+        num_padding=1,
+        spec_info=None,
+    )
+
+    backend.init_forward_metadata_out_graph(forward_batch)
+
+    assert captured["seq_lens_cpu"] == [102, 6]
+    torch.testing.assert_close(
+        captured["seq_lens"],
+        torch.tensor([102, 6], dtype=torch.int32, device=DEVICE),
+    )
+    causal_lens, _ = backend.expand_prefill_casually(
+        num_tokens=10,
+        seq_lens=captured["seq_lens_cpu"],
+        extend_seq_lens=captured["extend_seq_lens_cpu"],
+        req_pool_indices=forward_batch.req_pool_indices,
+        padded_num_tokens=None,
+    )
+    torch.testing.assert_close(
+        causal_lens,
+        torch.tensor(
+            list(range(98, 103)) + list(range(2, 7)),
+            dtype=torch.int32,
+            device=DEVICE,
+        ),
+    )
 
 
 @pytest.mark.parametrize("dcp_size", [1, 2, 4, 8])
