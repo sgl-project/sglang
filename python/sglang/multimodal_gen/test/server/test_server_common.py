@@ -447,7 +447,11 @@ class DiffusionServerBase:
         self._print_performance_log(case, summary, scenario)
 
         expected_peak_vram_mb = BASELINE_CONFIG.peak_vram_mb.get(case.id)
-        if not is_baseline_generation_mode and BASELINE_CONFIG.peak_vram_mb:
+        if (
+            current_platform.is_cuda()
+            and not is_baseline_generation_mode
+            and BASELINE_CONFIG.peak_vram_mb
+        ):
             if expected_peak_vram_mb is None:
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
                 pytest.fail(
