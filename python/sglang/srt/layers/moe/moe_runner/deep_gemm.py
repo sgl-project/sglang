@@ -311,13 +311,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         K = hidden_states_shape[1]
         scale_block_size = 128
 
-        if all_tokens == 0:
-            dispose_tensor(hidden_states)
-            dispose_tensor(hidden_states_scale)
-            return torch.empty(
-                (0, K), device=hidden_states_device, dtype=torch.bfloat16
-            )
-
         recipe_a, recipe_b = (
             ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
         )
