@@ -87,7 +87,16 @@ def grouped_gemm_nt_f8f8bf16_masked(
         flashinfer_backend = (
             "deepgemm" if DEEPGEMM_MASKED_FP8_BACKEND == "flashinfer" else "cake"
         )
-        lhs_scale = _unpack_packed_ue8m0_scale(lhs[1], collapse_mn=False)
+        lhs_scale = (
+            _unpack_packed_ue8m0_scale(lhs[1], collapse_mn=False)
+            if lhs[1].dtype == torch.int32
+            else lhs[1].contiguous()
+        )
+        if lhs_scale.dtype != torch.float32:
+            raise ValueError(
+                "batch DeepGEMM FP8 activation scales must be packed int32 "
+                f"UE8M0 or row-major float32, got dtype={lhs[1].dtype}"
+            )
         rhs_scale = getattr(rhs[1], "_batch_deepgemm_fp8_scale", None)
         if rhs_scale is None:
             rhs_scale = _unpack_packed_ue8m0_scale(rhs[1], collapse_mn=True)

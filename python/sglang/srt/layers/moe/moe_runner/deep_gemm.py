@@ -1363,8 +1363,27 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale = down_input_scale.transpose(-1, -2)
         return down_input, down_input_scale
 
-    # Keep the native packed UE8M0 quantization for every Blackwell backend.
-    # Public batch APIs receive a lossless FP32 expansion at the GEMM boundary.
+    # Public batch APIs consume row-major float32 scales. Produce exact UE8M0
+    # powers of two directly so every MoE layer avoids a packed-scale expansion.
+    if (
+        deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        and not deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_PACKED_SCALES
+    ):
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        return sglang_per_token_group_quant_fp8(
+            gateup_output,
+            group_size,
+            column_major_scales=False,
+            scale_tma_aligned=False,
+            scale_ue8m0=True,
+            fuse_silu_and_mul=True,
+            masked_m=masked_m,
+        )
+
+    # Native DeepGEMM keeps the packed UE8M0 layout used by its TMA path.
     expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
     return per_token_group_quant(
         gateup_output,
