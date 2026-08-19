@@ -25,6 +25,9 @@ jobs:
     runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
+      # Six flavors publish independently: a failure in one must not cancel the
+      # others mid-push and leave the release tag with a partial image set.
+      fail-fast: false
       matrix:
         rocm_version: ${{ fromJson((github.event_name == 'workflow_dispatch' && inputs.rocm_version != 'all' && inputs.rocm_version != '') && format('["{0}"]', inputs.rocm_version) || '["rocm700", "rocm720", "rocm724"]') }}
         gpu_arch: ['gfx942', 'gfx950']

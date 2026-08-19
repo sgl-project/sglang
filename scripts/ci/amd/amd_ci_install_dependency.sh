@@ -39,12 +39,52 @@ else
   echo "Warning: could not parse GPU architecture from '${HOSTNAME_VALUE}', defaulting to ${GPU_ARCH}"
 fi
 
+# Identify the Dockerfile stage that built this image. Both the python extras
+# below and the AITER pin lookup further down need the flavor, and they have to
+# agree, so detect it once here.
+#
+# Prefer GPU_ARCH stamped into the image (gfx950-rocm724, gfx942, ...).
+# Images built before that ENV existed: 724 stages already set
+# PIP_CONSTRAINT and HSA_ENABLE_IPC_MODE_LEGACY; remaining HIP 7.2* is
+# 720; else 7.0. Do not key off torch 2.11 — 720 may ship that later.
+IMAGE_TORCH_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.__version__)')
+IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
+IMAGE_GPU_ARCH=$(docker exec ci_sglang printenv GPU_ARCH 2>/dev/null || true)
+if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950)(-rocm720|-rocm724)?$ ]]; then
+    echo "[CI-IMAGE] Image GPU_ARCH=${IMAGE_GPU_ARCH}"
+    case "${IMAGE_GPU_ARCH}" in
+        *-rocm724) IMAGE_BASE_ARG_SUFFIX="_ROCM724"; IMAGE_STAGE_SUFFIX="-rocm724" ;;
+        *-rocm720) IMAGE_BASE_ARG_SUFFIX="_ROCM720"; IMAGE_STAGE_SUFFIX="-rocm720" ;;
+        *)         IMAGE_BASE_ARG_SUFFIX=""; IMAGE_STAGE_SUFFIX="" ;;
+    esac
+    IMAGE_GFX="${IMAGE_GPU_ARCH%-*}"
+else
+    IMAGE_PIP_CONSTRAINT=$(docker exec ci_sglang printenv PIP_CONSTRAINT 2>/dev/null || true)
+    IMAGE_HSA_LEGACY=$(docker exec ci_sglang printenv HSA_ENABLE_IPC_MODE_LEGACY 2>/dev/null || true)
+    if [[ -n "${IMAGE_PIP_CONSTRAINT}" || "${IMAGE_HSA_LEGACY}" == "1" ]]; then
+        IMAGE_BASE_ARG_SUFFIX="_ROCM724"
+        IMAGE_STAGE_SUFFIX="-rocm724"
+    elif [[ "${IMAGE_HIP_VERSION}" == 7.2* ]]; then
+        IMAGE_BASE_ARG_SUFFIX="_ROCM720"
+        IMAGE_STAGE_SUFFIX="-rocm720"
+    else
+        IMAGE_BASE_ARG_SUFFIX=""
+        IMAGE_STAGE_SUFFIX=""
+    fi
+    if [[ "${GPU_ARCH}" == "mi35x" ]]; then
+        IMAGE_GFX="gfx950"
+    else
+        IMAGE_GFX="gfx942"
+    fi
+    echo "[CI-IMAGE] Image has no GPU_ARCH stamp; inferred ${IMAGE_GFX}${IMAGE_STAGE_SUFFIX} (PIP_CONSTRAINT='${IMAGE_PIP_CONSTRAINT}', HSA_ENABLE_IPC_MODE_LEGACY='${IMAGE_HSA_LEGACY}', HIP=${IMAGE_HIP_VERSION})"
+    unset IMAGE_PIP_CONSTRAINT IMAGE_HSA_LEGACY
+fi
+unset IMAGE_GPU_ARCH
+
 # Install the required dependencies in CI.
 # ROCm 7.2.4 images ship torch 2.11, which srt_hip cannot satisfy (it pins
 # compressed-tensors 0.15.0, requiring torch<2.11). Select the rocm724 extras.
-IMAGE_TORCH_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.__version__)')
-IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
-if [[ "${IMAGE_TORCH_VERSION}" == 2.11.* ]]; then
+if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" ]]; then
   EXTRAS="${EXTRAS/dev_hip/dev_hip_rocm724}"
 fi
 echo "Image torch ${IMAGE_TORCH_VERSION}, HIP ${IMAGE_HIP_VERSION}; installing python extras: [${EXTRAS}]"
@@ -260,7 +300,6 @@ echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 
 # ROCm 7.0 keeps the Triton its base image ships; later ROCm images run on the
 # Triton AITER pins, so a rebuilt AITER has to bring its own along.
-IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
 case "${IMAGE_HIP_VERSION}" in
     7.0*) INSTALL_AITER_TRITON="false" ;;
     7.*)  INSTALL_AITER_TRITON="true" ;;
@@ -272,52 +311,20 @@ esac
 echo "[CI-AITER-CHECK] Container HIP=${IMAGE_HIP_VERSION}, install AITER's Triton on rebuild=${INSTALL_AITER_TRITON}"
 
 #############################################
-# 1. Extract AITER_COMMIT from the Dockerfile stage that built this image.
-# Prefer GPU_ARCH stamped into the image (gfx950-rocm724, gfx942, ...).
-# Images built before that ENV existed: 724 stages already set
-# PIP_CONSTRAINT and HSA_ENABLE_IPC_MODE_LEGACY; remaining HIP 7.2* is
-# 720; else 7.0. Do not key off torch 2.11 — 720 may ship that later.
+# 1. Extract AITER_COMMIT from the Dockerfile stage that built this image, as
+# identified near the top of this script.
 #############################################
-IMAGE_GPU_ARCH=$(docker exec ci_sglang printenv GPU_ARCH 2>/dev/null || true)
-if [[ "${IMAGE_GPU_ARCH}" =~ ^(gfx942|gfx950)(-rocm720|-rocm724)?$ ]]; then
-    echo "[CI-AITER-CHECK] Image GPU_ARCH=${IMAGE_GPU_ARCH}"
-    case "${IMAGE_GPU_ARCH}" in
-        *-rocm724) _from_suffix="_ROCM724"; _stage_suffix="-rocm724" ;;
-        *-rocm720) _from_suffix="_ROCM720"; _stage_suffix="-rocm720" ;;
-        *)         _from_suffix=""; _stage_suffix="" ;;
-    esac
-    _gfx="${IMAGE_GPU_ARCH%-*}"
+if [[ "${IMAGE_GFX}" == "gfx950" ]]; then
+    _from_line="FROM \$BASE_IMAGE_950${IMAGE_BASE_ARG_SUFFIX} AS gfx950${IMAGE_STAGE_SUFFIX}"
 else
-    IMAGE_PIP_CONSTRAINT=$(docker exec ci_sglang printenv PIP_CONSTRAINT 2>/dev/null || true)
-    IMAGE_HSA_LEGACY=$(docker exec ci_sglang printenv HSA_ENABLE_IPC_MODE_LEGACY 2>/dev/null || true)
-    if [[ -n "${IMAGE_PIP_CONSTRAINT}" || "${IMAGE_HSA_LEGACY}" == "1" ]]; then
-        _from_suffix="_ROCM724"
-        _stage_suffix="-rocm724"
-    elif [[ "${IMAGE_HIP_VERSION}" == 7.2* ]]; then
-        _from_suffix="_ROCM720"
-        _stage_suffix="-rocm720"
-    else
-        _from_suffix=""
-        _stage_suffix=""
-    fi
-    if [[ "${GPU_ARCH}" == "mi35x" ]]; then
-        _gfx="gfx950"
-    else
-        _gfx="gfx942"
-    fi
-    echo "[CI-AITER-CHECK] Image has no GPU_ARCH stamp; inferred ${_gfx}${_stage_suffix} (PIP_CONSTRAINT='${IMAGE_PIP_CONSTRAINT}', HSA_ENABLE_IPC_MODE_LEGACY='${IMAGE_HSA_LEGACY}', HIP=${IMAGE_HIP_VERSION})"
-fi
-if [[ "${_gfx}" == "gfx950" ]]; then
-    _from_line="FROM \$BASE_IMAGE_950${_from_suffix} AS gfx950${_stage_suffix}"
-else
-    _from_line="FROM \$BASE_IMAGE_942${_from_suffix} AS gfx942${_stage_suffix}"
+    _from_line="FROM \$BASE_IMAGE_942${IMAGE_BASE_ARG_SUFFIX} AS gfx942${IMAGE_STAGE_SUFFIX}"
 fi
 echo "[CI-AITER-CHECK] Using ${_from_line} from Dockerfile..."
 REPO_AITER_COMMIT=$(grep -F -A20 "${_from_line}" docker/rocm.Dockerfile \
                     | grep 'AITER_COMMIT_DEFAULT=' \
                     | head -n1 \
                     | sed 's/.*AITER_COMMIT_DEFAULT="\([^"]*\)".*/\1/')
-unset IMAGE_GPU_ARCH IMAGE_PIP_CONSTRAINT IMAGE_HSA_LEGACY _from_suffix _stage_suffix _gfx _from_line
+unset _from_line
 
 
 if [[ -z "${REPO_AITER_COMMIT}" ]]; then
