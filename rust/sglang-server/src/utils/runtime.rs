@@ -19,6 +19,7 @@ use std::thread::JoinHandle;
 
 use crate::message::config::RuntimeConfig;
 use crate::message::detok::DetokMsg;
+use crate::renderer::{RenderJob, RenderWorker};
 
 use super::threads::{join_all_with_timeout, plan_cores, spawn_pool};
 use crate::tokenizer_manager::channel::{
@@ -60,7 +61,7 @@ pub struct Runtime {
 }
 
 /// Live standalone renderer. Unlike [`Runtime`], it owns only the HTTP runtime
-/// and engine-free text processor.
+/// and engine-free text preparation workers.
 pub struct RenderRuntime {
     threads: Mutex<Vec<JoinHandle<()>>>,
     shutdown_tx: Mutex<Option<flume::Sender<()>>>,
@@ -149,6 +150,15 @@ pub fn start_render(cfg: RuntimeConfig) -> Result<RenderRuntime, String> {
             cfg.rust_server_args.http_addr
         )
     })?;
+    let (render_tx, render_rx) = flume::bounded::<RenderJob>(cfg.rust_server_args.channel_cap);
+    let mut threads = Vec::new();
+    spawn_pool(
+        "renderer",
+        None,
+        cfg.server_args.tokenizer_worker_num,
+        &mut threads,
+        |_| RenderWorker::new(render_rx.clone(), text_tokenizer.clone(), limits.clone()),
+    );
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
     let handle = std::thread::Builder::new()
         .name("render-runtime".into())
@@ -161,14 +171,14 @@ pub fn start_render(cfg: RuntimeConfig) -> Result<RenderRuntime, String> {
             runtime.block_on(http_server::app::serve_render(
                 listener,
                 cfg.server_args,
-                text_tokenizer,
-                limits,
+                render_tx,
                 shutdown_rx,
             ));
         })
         .map_err(|error| format!("spawn render runtime: {error}"))?;
+    threads.push(handle);
     Ok(RenderRuntime {
-        threads: Mutex::new(vec![handle]),
+        threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
     })
 }

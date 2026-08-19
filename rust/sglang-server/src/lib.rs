@@ -14,6 +14,7 @@
 mod api_server;
 mod message;
 mod multi_modality;
+mod renderer;
 mod tokenizer_manager;
 mod utils;
 
@@ -277,7 +278,6 @@ impl Renderer {
         let cfg = RuntimeConfig {
             rust_server_args: RustServerServerArgs {
                 http_addr,
-                http_api_worker_num: server_args.http_api_worker_num(),
                 ..Default::default()
             },
             server_args: std::sync::Arc::new(server_args),

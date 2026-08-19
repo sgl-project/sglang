@@ -9,6 +9,7 @@ use axum::Router;
 use super::disaggregation::bootstrap as pd_bootstrap;
 use super::{common, log, native_api, openai, render};
 use crate::message::config::ServerArgs;
+use crate::renderer::RenderJob;
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::Senders;
 
@@ -82,18 +83,16 @@ pub async fn serve(
 
 /// Serve the engine-free, text-only OpenAI render surface. This state has no
 /// scheduler channels, detokenizer, request FSM, or multimodal workers.
-pub async fn serve_render(
+pub(crate) async fn serve_render(
     listener: std::net::TcpListener,
     server_args: Arc<ServerArgs>,
-    tokenizer: Arc<dyn crate::tokenizer_manager::tokenizer::TextTokenizer>,
-    limits: crate::tokenizer_manager::to_scheduler::Limits,
+    jobs: flume::Sender<RenderJob>,
     shutdown: flume::Receiver<()>,
 ) {
     let app = render::routes(render::RenderState::new(
         server_args.clone(),
         openai::load_chat_support(&server_args),
-        tokenizer,
-        limits,
+        jobs,
     ))
     .layer(axum::extract::DefaultBodyLimit::disable());
     let app = log::apply(app, &server_args);

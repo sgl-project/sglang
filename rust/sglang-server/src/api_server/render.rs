@@ -14,44 +14,31 @@ use axum::{
 use dynamo_protocols::types::{CreateChatCompletionRequest, CreateCompletionRequest};
 use futures::future::try_join_all;
 use serde::Serialize;
-use tokio::sync::Semaphore;
+use tokio::sync::oneshot;
 
 use super::openai::{ChatFormatter, lower_chat_requests, lower_completion_requests, openai_error};
 use crate::message::config::ServerArgs;
 use crate::message::request::GenerateRequest;
 use crate::message::sampling::SamplingParams;
-use crate::tokenizer_manager::to_scheduler::{
-    Limits, check_total_tokens, validate_generate_request,
-};
-use crate::tokenizer_manager::tokenizer::{TextTokenizer, tokenize_generate_request};
-use crate::utils::error::Error;
+use crate::renderer::RenderJob;
 
 #[derive(Clone)]
 pub(super) struct RenderState {
     server_args: Arc<ServerArgs>,
     chat_formatter: Option<ChatFormatter>,
-    tokenizer: Arc<dyn TextTokenizer>,
-    auto_specials: Arc<[i32]>,
-    limits: Limits,
-    permits: Arc<Semaphore>,
+    jobs: flume::Sender<RenderJob>,
 }
 
 impl RenderState {
     pub(super) fn new(
         server_args: Arc<ServerArgs>,
         chat_formatter: Option<ChatFormatter>,
-        tokenizer: Arc<dyn TextTokenizer>,
-        limits: Limits,
+        jobs: flume::Sender<RenderJob>,
     ) -> Self {
-        let permits = Arc::new(Semaphore::new(server_args.tokenizer_worker_num.max(1)));
-        let auto_specials = tokenizer.auto_specials().into();
         Self {
             server_args,
             chat_formatter,
-            tokenizer,
-            auto_specials,
-            limits,
-            permits,
+            jobs,
         }
     }
 }
@@ -219,34 +206,33 @@ async fn prepare_one(
     state: &RenderState,
     request: GenerateRequest,
 ) -> Result<PreparedGenerateRequest, Response> {
-    let permit = state.permits.clone().acquire_owned().await.map_err(|_| {
-        openai_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "renderer is shutting down",
-            false,
-        )
-    })?;
-    let tokenizer = state.tokenizer.clone();
-    let auto_specials = state.auto_specials.clone();
-    let limits = state.limits.clone();
-    let mut prepared = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        prepare_text_request(request, tokenizer.as_ref(), &auto_specials, &limits)
-    })
-    .await
-    .map_err(|error| {
-        tracing::error!(%error, "render preprocessing task failed");
-        openai_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "render preprocessing task failed",
-            false,
-        )
-    })?
-    .map_err(|error| {
-        let status =
-            StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        openai_error(status, error.to_string(), false)
-    })?;
+    let (reply, result) = oneshot::channel();
+    state
+        .jobs
+        .send_async(RenderJob { request, reply })
+        .await
+        .map_err(|_| {
+            openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "renderer is shutting down",
+                false,
+            )
+        })?;
+    let mut prepared = result
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "renderer worker dropped reply");
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "render preprocessing worker failed",
+                false,
+            )
+        })?
+        .map_err(|error| {
+            let status = StatusCode::from_u16(error.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            openai_error(status, error.to_string(), false)
+        })?;
     Ok(PreparedGenerateRequest {
         rid: prepared.rid.client_facing().to_owned(),
         input_ids: prepared
@@ -264,28 +250,6 @@ async fn prepare_one(
     })
 }
 
-fn prepare_text_request(
-    mut request: GenerateRequest,
-    tokenizer: &dyn TextTokenizer,
-    auto_specials: &[i32],
-    limits: &Limits,
-) -> Result<GenerateRequest, Error> {
-    validate_generate_request(&request.rid, &request, limits)?;
-    if request.has_multimodal() {
-        return Err(Error::Validation(
-            "multimodal inputs are not supported by the standalone renderer".into(),
-        ));
-    }
-    request
-        .sampling_params
-        .normalize(limits.skip_tokenizer_init, limits.vocab_size)?;
-    if !request.already_tokenized() {
-        tokenize_generate_request(&mut request, tokenizer, auto_specials)?;
-    }
-    check_total_tokens(&mut request, limits)?;
-    Ok(request)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +261,11 @@ mod tests {
 
     use crate::message::request::GenerateBody;
     use crate::message::types::TokenIds;
+    use crate::renderer::RenderWorker;
+    use crate::runtime::Runnable;
+    use crate::tokenizer_manager::to_scheduler::Limits;
+    use crate::tokenizer_manager::tokenizer::TextTokenizer;
+    use crate::utils::error::Error;
 
     struct WordTokenizer;
 
@@ -306,7 +275,28 @@ mod tests {
         }
     }
 
-    fn test_app(enable_chat: bool) -> Router<()> {
+    struct TestApp {
+        router: Option<Router<()>>,
+        workers: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    impl TestApp {
+        async fn request(mut self, request: Request<Body>) -> Response {
+            let response = self
+                .router
+                .take()
+                .expect("test router")
+                .oneshot(request)
+                .await
+                .unwrap();
+            for worker in self.workers.drain(..) {
+                worker.join().unwrap();
+            }
+            response
+        }
+    }
+
+    fn test_app(enable_chat: bool) -> TestApp {
         let server_args = ServerArgs {
             served_model_name: "model".into(),
             tokenizer_path: ".".into(),
@@ -323,12 +313,26 @@ mod tests {
             .then(|| super::super::openai::load_chat_support(&server_args))
             .flatten();
         let limits = Limits::from(&server_args);
-        routes(RenderState::new(
-            Arc::new(server_args),
-            chat_formatter,
-            Arc::new(WordTokenizer),
-            limits,
-        ))
+        let tokenizer: Arc<dyn TextTokenizer> = Arc::new(WordTokenizer);
+        let (jobs, worker_jobs) = flume::bounded(8);
+        let workers = (0..server_args.tokenizer_worker_num)
+            .map(|worker| {
+                let renderer =
+                    RenderWorker::new(worker_jobs.clone(), tokenizer.clone(), limits.clone());
+                std::thread::Builder::new()
+                    .name(format!("test-renderer-{worker}"))
+                    .spawn(move || renderer.run())
+                    .unwrap()
+            })
+            .collect();
+        TestApp {
+            router: Some(routes(RenderState::new(
+                Arc::new(server_args),
+                chat_formatter,
+                jobs,
+            ))),
+            workers,
+        }
     }
 
     #[tokio::test]
@@ -348,7 +352,7 @@ mod tests {
                 .to_string(),
             ))
             .unwrap();
-        let response = test_app(false).oneshot(request).await.unwrap();
+        let response = test_app(false).request(request).await;
         assert_eq!(response.status(), StatusCode::OK);
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
@@ -387,7 +391,7 @@ mod tests {
                 .to_string(),
             ))
             .unwrap();
-        let response = test_app(true).oneshot(request).await.unwrap();
+        let response = test_app(true).request(request).await;
         assert_eq!(response.status(), StatusCode::OK);
         let value: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
@@ -414,7 +418,7 @@ mod tests {
                 .to_string(),
             ))
             .unwrap();
-        let response = test_app(true).oneshot(request).await.unwrap();
+        let response = test_app(true).request(request).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
@@ -440,7 +444,7 @@ mod tests {
                 .to_string(),
             ))
             .unwrap();
-        let response = test_app(false).oneshot(request).await.unwrap();
+        let response = test_app(false).request(request).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
@@ -460,7 +464,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from("{}"))
             .unwrap();
-        let response = test_app(false).oneshot(request).await.unwrap();
+        let response = test_app(false).request(request).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
