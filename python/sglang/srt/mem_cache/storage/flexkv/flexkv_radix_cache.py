@@ -35,6 +35,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
+from flexkv.integration.sglang.connector import (
+    FlexKVConnector,
+    FlexKVHostReleaseShim,
+)
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -44,10 +48,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from flexkv.integration.sglang.connector import (
-    FlexKVConnector,
-    FlexKVHostReleaseShim,
-)
+from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -229,7 +230,12 @@ class FlexKVRadixCache(RadixCache):
         else:
             token_ids_snap = token_ids
         self._load_markers[req.rid] = _LoadBackMarker(
-            key=RadixKey(token_ids_snap, key.extra_key, key.is_bigram),
+            key=RadixKey(
+                token_ids_snap,
+                key.extra_key,
+                key.is_bigram,
+                cache_salt=key.cache_salt,
+            ),
             value_numel=device_len,
         )
         return MatchResult(
@@ -386,8 +392,8 @@ class FlexKVRadixCache(RadixCache):
         self._update_leaf_status(last_node)
         self._update_leaf_status(new_node)
 
-        self._record_store_event(new_node.parent)
-        self._record_store_event(new_node)
+        self.kv_events.record_store(new_node.parent)
+        self.kv_events.record_store(new_node)
 
         return fetched_slots, new_node
 
@@ -407,10 +413,7 @@ class FlexKVRadixCache(RadixCache):
             return
 
         # Compute the committed prefix mirroring LMCRadixCache's logic.
-        from sglang.srt.runtime_context import get_server_args
-
-        global_server_args = get_server_args()
-        topk = global_server_args.speculative_eagle_topk
+        topk = get_spec().speculative_eagle_topk
         enable_kv_committed_len = topk is None or topk == 1
         if enable_kv_committed_len:
             kv_committed_len = req.kv_committed_len
@@ -429,7 +432,13 @@ class FlexKVRadixCache(RadixCache):
         # Anchor on the new last_device_node so FlexKV's lock matches
         # the node we'll later unlock when the store completes.
         match_result = super().match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids,
+                    req.extra_key,
+                    cache_salt=req.cache_salt,
+                )
+            )
         )
         new_last_node = match_result.last_device_node
         if new_last_node is None:
@@ -505,7 +514,7 @@ class FlexKVRadixCache(RadixCache):
         self.flexkv_connector.release_pending(rid)
         self.flexkv_connector.cancel_prefetch(rid)
 
-    def prefetch_request(self, req: "Req") -> None:
+    def prefetch_request(self, req: Req) -> None:
         """Wait-complete FlexKV prefetch for a queued request.
 
         Owns fill-id refresh / page alignment so the scheduler only needs
@@ -543,9 +552,7 @@ class FlexKVRadixCache(RadixCache):
         if not ids:
             return
         try:
-            self.flexkv_connector.prefetch_async(
-                rid, ids, sglang_req_id=rid
-            )
+            self.flexkv_connector.prefetch_async(rid, ids, sglang_req_id=rid)
         except Exception as exc:  # noqa: BLE001
             logger.debug("[FlexKV] prefetch_from_storage: %s", exc)
 

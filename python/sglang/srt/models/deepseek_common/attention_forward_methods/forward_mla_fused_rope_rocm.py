@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
 if _is_cuda:
-    from sgl_kernel import bmm_fp8
+    from sglang.kernels.ops.gemm import bmm_fp8
 
 if _is_hip:
     from sglang.kernels.ops.attention.rocm_mla_decode_rope import (
@@ -29,7 +29,7 @@ if _is_hip:
     )
 
 
-class DeepseekMLARocmForwardMixin:
+class DeepseekMLAFusedRopeRocmForwardMixin:
 
     def init_mla_fused_rope_rocm_forward(self: DeepseekV2AttentionMLA):
         self.rocm_fused_decode_mla = get_bool_env_var(

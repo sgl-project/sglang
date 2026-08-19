@@ -534,7 +534,6 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
         target_dtype: torch.dtype,
         autocast_enabled: bool,
     ) -> torch.Tensor:
-        self._manage_dit_use_site(self.transformer, "transformer", batch)
         rope_start_frame = start_frame
         if self._rope_temporal_offset != 0.0:
             rope_start_frame = start_frame + self._rope_temporal_offset

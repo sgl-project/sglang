@@ -40,7 +40,7 @@ class LatentPreparationFingerprint:
 
 @dataclass(frozen=True)
 class LatentPreparationSpec:
-    """ "dataclass for controlling the LatentPreparationStage runtime semantics"""
+    """Runtime configuration for LatentPreparationStage."""
 
     shape: tuple[int, ...]
     dtype: torch.dtype

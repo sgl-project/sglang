@@ -16,8 +16,12 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
+    set_flashinfer_allreduce_only,
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
+)
+from sglang.srt.distributed.parallel_state import (
+    _tag_groups_for_flashinfer_allreduce_only,
 )
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -28,6 +32,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_available_gpu_memory,
+    is_hip,
     is_host_cpu_arm64,
     is_npu,
     monkey_patch_p2p_access_check,
@@ -39,6 +44,14 @@ logger = logging.getLogger(__name__)
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu_arm64 = is_host_cpu_arm64()
+
+# A representative per-peer payload for materializing the PyNCCL P2P
+# connections used by TP LM-head all-to-all. The input/output tensors are
+# temporary; NCCL owns the transport resources retained after the warmup.
+# In dsv4-pro, assume bs per dp is 120 and the vocab_size is 129280.
+# Therefore, the chunk size that each peer sends is 120*129280/8=1.849MB.
+# The total warmup bytes per peer should be 1.849*2 = 4MB
+_TP_ALL_TO_ALL_WARMUP_BYTES_PER_PEER = 4 << 20
 
 
 class TorchDistributedResult(msgspec.Struct, frozen=True, kw_only=True):
@@ -61,15 +74,7 @@ def init_torch_distributed(
     tic = time.perf_counter()
     logger.info("Init torch distributed begin.")
 
-    try:
-        torch.get_device_module(device).set_device(ps.gpu_id)
-    except Exception:
-        logger.warning(
-            f"Context: {device=} {ps.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {ps.tp_rank=} {ps.tp_size=}"
-        )
-        raise
-
-    backend = _resolve_backend(device=device, server_args=server_args, gpu_id=ps.gpu_id)
+    backend = _resolve_backend(device=device, server_args=server_args)
 
     before_avail_memory = get_available_gpu_memory(device, ps.gpu_id)
     if not server_args.enable_p2p_check:
@@ -101,7 +106,7 @@ def init_torch_distributed(
             attn_cp_size=ps.attn_cp_size,
             moe_ep_size=ps.moe_ep_size,
             moe_dp_size=ps.moe_dp_size,
-            dcp_size=ps.dcp_size,
+            dcp_size=ps.attn_dcp_size,
         )
 
         # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
@@ -112,6 +117,17 @@ def init_torch_distributed(
             _prewarm_nccl(
                 tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
             )
+
+        # CUDA graph capture enables the PyNCCL communicator for TP LM-head
+        # all-to-all. Exercise that exact send/recv path before measuring
+        # pre_model_load_memory so its persistent transport allocations are
+        # included in later KV-cache sizing instead of appearing during capture.
+        if (
+            device == "cuda"
+            and get_parallel().enable_tp_lm_head_all_to_all
+            and ps.tp_size > 1
+        ):
+            _prewarm_tp_lm_head_all_to_all()
 
     pre_model_load_memory = get_available_gpu_memory(
         device,
@@ -143,27 +159,10 @@ def init_torch_distributed(
     )
 
 
-def _resolve_backend(*, device: str, server_args: ServerArgs, gpu_id: int) -> str:
+def _resolve_backend(*, device: str, server_args: ServerArgs) -> str:
     backend = get_default_distributed_backend(device)
     if device == "cuda" and server_args.elastic_ep_backend == "mooncake":
         backend = "mooncake"
-        if server_args.mooncake_ib_device:
-            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-                get_ib_devices_for_gpu,
-            )
-
-            ib_device_for_gpu = get_ib_devices_for_gpu(
-                server_args.mooncake_ib_device, gpu_id
-            )
-            mooncake_ib_device = (
-                ib_device_for_gpu.split(",") if ib_device_for_gpu else []
-            )
-            try:
-                from mooncake import ep as mooncake_ep
-
-                mooncake_ep.set_device_filter(mooncake_ib_device)
-            except:
-                pass  # A warning will be raised in `init_distributed_environment`
     return backend
 
 
@@ -189,6 +188,9 @@ def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
     set_custom_all_reduce(not server_args.disable_custom_all_reduce)
     set_mscclpp_all_reduce(server_args.enable_mscclpp)
     set_torch_symm_mem_all_reduce(server_args.enable_torch_symm_mem)
+    set_flashinfer_allreduce_only(
+        server_args.flashinfer_allreduce_fusion_backend is not None
+    )
 
 
 def _init_cpu_threads_env(
@@ -253,11 +255,17 @@ def _init_parallel_groups(
         moe_data_model_parallel_size=moe_dp_size,
         decode_context_parallel_size=dcp_size,
         duplicate_tp_group=server_args.enable_pdmux,
+        duplicate_attn_cp_group=(
+            is_hip()
+            and server_args.enable_two_batch_overlap
+            and get_parallel().enable_dsa_prefill_context_parallel
+        ),
         enable_symm_mem=server_args.enable_symm_mem,
         recovered_rank=is_ep_joiner,
         rank_offset=rank_offset,
         max_world_size=server_args.max_ep_size,
     )
+    _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(
         server_args=server_args,
         model_config=model_config,
@@ -279,6 +287,40 @@ def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:
     logger.info(
         f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
         f"(tp_size={tp_size}, pp_size={pp_size}, ep_size={moe_ep_size})"
+    )
+
+
+def _prewarm_tp_lm_head_all_to_all() -> None:
+    """Materialize PyNCCL P2P resources before model-memory accounting."""
+    warmup_start = time.perf_counter()
+    tp_group = get_tp_group()
+    pynccl_comm = tp_group.pynccl_comm
+    if pynccl_comm is None or not pynccl_comm.available:
+        raise RuntimeError(
+            "--enable-tp-lm-head-all-to-all requires an available PyNCCL "
+            "communicator for CUDA graph capture."
+        )
+
+    numel = tp_group.world_size * _TP_ALL_TO_ALL_WARMUP_BYTES_PER_PEER
+    warmup_input = torch.empty(numel, dtype=torch.uint8, device=tp_group.device)
+    warmup_output = torch.empty_like(warmup_input)
+
+    # PyNCCL is disabled outside graph-capture contexts by default. Enable it
+    # explicitly so eager startup does not fall back to ProcessGroupNCCL and
+    # miss the P2P resources required by the captured all-to-all.
+    with pynccl_comm.change_state(enable=True):
+        pynccl_comm.all_to_all_single(warmup_output, warmup_input)
+    current_platform.synchronize()
+
+    del warmup_input, warmup_output
+    current_platform.empty_cache()
+    warmup_elapsed = time.perf_counter() - warmup_start
+    logger.info(
+        "TP LM-head PyNCCL all-to-all warmup completed in %.3fs "
+        "(tp_size=%d, bytes_per_peer=%d)",
+        warmup_elapsed,
+        tp_group.world_size,
+        _TP_ALL_TO_ALL_WARMUP_BYTES_PER_PEER,
     )
 
 

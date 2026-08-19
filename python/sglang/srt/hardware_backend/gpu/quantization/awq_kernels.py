@@ -49,8 +49,8 @@ elif is_hip():
         pass
 else:
     try:
-        from sglang.jit_kernel.awq_dequantize import awq_dequantize
-        from sglang.jit_kernel.awq_marlin_repack import (
+        from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
+        from sglang.kernels.ops.quantization.awq_marlin_repack import (
             awq_marlin_moe_repack,
             awq_marlin_repack,
         )

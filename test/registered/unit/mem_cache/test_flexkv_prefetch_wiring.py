@@ -60,9 +60,7 @@ def test_flexkv_radix_prefetch_request_page_aligns_and_launches():
 
     cache.prefetch_request(req)
 
-    req.init_next_round_input.assert_called_once_with(
-        tree_cache=None, cow_mamba=False
-    )
+    req.init_next_round_input.assert_called_once_with(tree_cache=None, cow_mamba=False)
     args, _kwargs = cache.flexkv_connector.prefetch_async.call_args
     assert args[0] == "r1"
     assert list(args[1]) == [1, 2, 3, 4]

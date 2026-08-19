@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import torch
+from flexkv.integration.sglang.connector import (
+    FlexKVConnector,
+    FlexKVHostReleaseShim,
+)
 
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -24,10 +28,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from flexkv.integration.sglang.connector import (
-    FlexKVConnector,
-    FlexKVHostReleaseShim,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -499,7 +499,7 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         # race the layerwise H2D writer. Waiting requests cannot own a lease
         # because every admission rejection runs before init_load_back.
 
-    def prefetch_request(self, req: "Req") -> None:
+    def prefetch_request(self, req: Req) -> None:
         """Wait-complete FlexKV prefetch; see FlexKVRadixCache.prefetch_request."""
         req.init_next_round_input(tree_cache=None, cow_mamba=False)
         fill_ids = req.full_untruncated_fill_ids

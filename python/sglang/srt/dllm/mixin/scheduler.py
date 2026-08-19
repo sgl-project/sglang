@@ -11,6 +11,7 @@ from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.runtime_context import get_exec, get_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ class SchedulerDllmMixin:
     def init_diffusion_llm(self: Scheduler):
         self.dllm_config = (
             DllmConfig.from_server_args(self.server_args)
-            if self.server_args.dllm_algorithm is not None
+            if get_exec().dllm.dllm_algorithm is not None
             else None
         )
         self.dllm_manager = DllmManager(dllm_config=self.dllm_config)
@@ -200,7 +201,7 @@ class SchedulerDllmMixin:
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
-            prefill_max_requests=self.server_args.prefill_max_requests,
+            prefill_max_requests=get_schedule().prefill_max_requests,
             dllm_config=self.dllm_config,
         )
 
