@@ -2,7 +2,8 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from abc import ABC, abstractmethod
-from dataclasses import field
+from dataclasses import dataclass, field
+from typing import Literal
 
 import torch
 from torch import nn
@@ -154,10 +155,22 @@ def finalize_encoder_folding(
         config.parallel_folding_mode = None
 
 
+@dataclass(frozen=True)
+class CheckpointQuantizationCapability:
+    """Quantized-checkpoint contract implemented by a native encoder."""
+
+    backend: Literal["diffusion", "srt"]
+    methods: frozenset[str]
+
+
 class EncoderTensorParallelMixin:
     """Keep an encoder on the TP group that was used to build its shards."""
 
     _encoder_tp_group: GroupCoordinator | None = None
+    checkpoint_quantization_capability: CheckpointQuantizationCapability | None = None
+    # Some encoders own checkpoint quantization end to end because their weight
+    # states or sharding contract cannot use the generic loader lifecycle.
+    manages_checkpoint_quantization = False
 
     def bind_encoder_tp_group(self, tp_group: GroupCoordinator) -> None:
         self._encoder_tp_group = tp_group

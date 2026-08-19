@@ -43,6 +43,31 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+
+def _spec_result(index):
+    return {
+        "text": f"choice-{index}",
+        "meta_info": {
+            "id": "chatcmpl-spec-test",
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "cached_tokens": 0,
+            "finish_reason": {"type": "stop"},
+            "weight_version": "default",
+            "spec_accept_rate": 0.5,
+            "spec_accept_length": 2.0,
+            "spec_cap_length": index + 1.0,
+            "spec_block_accept_length": index + 0.5,
+            "spec_num_correct_drafts": 1,
+            "spec_num_proposed_drafts": 2,
+            "spec_verify_ct": 1,
+            "spec_correct_drafts_histogram": [0, 1],
+            "spec_cap_lens_histogram": [index, 1],
+        },
+        "index": index,
+    }
+
+
 _DSV4_PREVIEW_ENCODER = 'REASONING_EFFORT_MAX = "preview"\n'
 _DSV4_OFFICIAL_ENCODER = (
     "REASONING_EFFORT_PROMPTS: Dict[str, str] = "
@@ -2494,6 +2519,34 @@ class ServingChatTestCase(unittest.TestCase):
             },
         )
 
+    def test_parallel_sampling_returns_spec_details_per_choice(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            n=2,
+            return_spec_tokens_details=True,
+        )
+        ret = [_spec_result(index) for index in range(2)]
+
+        response = self.chat._build_chat_response(req, ret, 1234567890)
+
+        details = response.sglext.spec_tokens_details
+        self.assertEqual([item.spec_cap_length for item in details], [1.0, 2.0])
+        self.assertEqual(
+            [item.spec_cap_lens_histogram for item in details],
+            [[0, 1], [1, 1]],
+        )
+
+        single_req = req.model_copy(update={"n": 1})
+        single_response = self.chat._build_chat_response(
+            single_req, ret[:1], 1234567890
+        )
+        self.assertEqual(
+            single_response.sglext.spec_tokens_details.spec_cap_length,
+            1.0,
+        )
+
     def test_non_streaming_chat_response_returns_requested_token_ids_and_meta_info(
         self,
     ):
@@ -2607,6 +2660,31 @@ class ServingChatTestCase(unittest.TestCase):
                 "storage": 1,
                 "storage_backend": "file",
             },
+        )
+
+    def test_streaming_parallel_sampling_orders_spec_details_by_choice(self):
+        async def mock_generate():
+            for index in (1, 0):
+                yield _spec_result(index)
+
+        self.tm.generate_request.return_value = mock_generate()
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            n=2,
+            stream=True,
+            return_spec_tokens_details=True,
+        )
+
+        parsed = self._parse_chunks(self._run_chat_stream(Mock(), req))
+        details = next(chunk["sglext"] for chunk in parsed if "sglext" in chunk)[
+            "spec_tokens_details"
+        ]
+        self.assertEqual([item["spec_cap_length"] for item in details], [1.0, 2.0])
+        self.assertEqual(
+            [item["spec_cap_lens_histogram"] for item in details],
+            [[0, 1], [1, 1]],
         )
 
     def _collect_continuous_usage(self, cached_tokens):

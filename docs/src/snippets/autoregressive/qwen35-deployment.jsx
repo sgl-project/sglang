@@ -480,6 +480,7 @@ export const Qwen35Deployment = () => {
         // (this recipe uses quick all-reduce instead of AITER allreduce fusion).
         // Add the FP4-specific flags here.
         cmd += ' \\\n  --disable-radix-cache';
+        cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
         // Cap concurrency under MTP to avoid OOM at tp=2.
         if (speculative === 'enabled') {
           cmd += ' \\\n  --max-running-requests 128';

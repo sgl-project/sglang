@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 from sglang.srt.runtime_context import (
+    get_parallel,
     get_schedule,
     get_spec,
     max_speculative_num_draft_tokens,
 )
+
+
+def get_alloc_page_size() -> int:
+    # Mirrors _build_token_to_kv_pool_allocator's DCP branch; the platform
+    # allocators that skip it page smaller, so this is an upper bound for them.
+    return get_schedule().page_size * get_parallel().attn_dcp_size
 
 
 def get_alloc_len_per_decode() -> int:
@@ -21,7 +28,7 @@ def get_alloc_len_per_decode() -> int:
     spec_steps = spec.speculative_num_steps or 1
     spec_topk = spec.speculative_eagle_topk or 1
     spec_tokens = max_speculative_num_draft_tokens()
-    page_size = get_schedule().page_size
+    page_size = get_alloc_page_size()
 
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -80,7 +87,7 @@ def get_req_to_token_extra_context_len() -> int:
     post-publish override.
     """
     extra = 4 + (max_speculative_num_draft_tokens() or 0)
-    page_size = get_schedule().page_size
+    page_size = get_alloc_page_size()
     if page_size > 1:
         # A request opening a page at the context limit publishes a whole page
         # past it; without the headroom that write lands in the neighbor row.
