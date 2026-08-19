@@ -36,10 +36,7 @@ logger = init_logger(__name__)
 
 
 # ==================================SLA Functions===================================
-from sglang.kernels.ops.diffusion.sparse_linear_attn_kernels import (
-    _attn_fwd,
-    get_block_map,
-)
+from sglang.kernels.ops.diffusion import _attn_fwd, get_block_map
 
 
 def _get_cuda_arch(device_index: int) -> str:
