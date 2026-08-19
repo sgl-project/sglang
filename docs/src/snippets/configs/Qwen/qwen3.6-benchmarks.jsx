@@ -3,6 +3,11 @@
 // benchmarkCommands.speed (random isl 8192 / osl 1024, --random-range-ratio 1.0,
 // --warmup-requests 64, --flush-cache), run1 landed. tokens_per_sec_per_gpu =
 // output_throughput / tp * (isl+osl)/osl (tp=1). LL @ conc 1+16, HT @ conc 1024+4096.
+// SPEC NOTE: the low-latency cells run EAGLE/MTP (spec decoding) and were measured with
+// real acceptance on the random dataset (no SGLANG_SIMULATE_ACC_LEN). Random-dataset
+// acceptance length is unrealistic, so the low-latency numbers are PROVISIONAL — pending a
+// SIMULATE_ACC_LEN re-measure (cf. GLM-5.2). Balanced (Xeon) and high-throughput are MTP-off
+// (no spec), so they're unaffected.
 //
 // Pending cells: Xeon (no CPU box). H100 35B-A3B bf16 LL is now measured (tuned
 // mem-fraction 0.93); the single-H100 HT tiers were removed (memory-bound saturation).
