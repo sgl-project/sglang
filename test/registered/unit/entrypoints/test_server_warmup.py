@@ -75,7 +75,9 @@ class TestVlmWarmupImage(CustomTestCase):
             (length,) = struct.unpack(">I", png[offset : offset + 4])
             kind = png[offset + 4 : offset + 8]
             payload = png[offset + 8 : offset + 8 + length]
-            (crc,) = struct.unpack(">I", png[offset + 8 + length : offset + 12 + length])
+            (crc,) = struct.unpack(
+                ">I", png[offset + 8 + length : offset + 12 + length]
+            )
             self.assertEqual(crc, zlib.crc32(kind + payload) & 0xFFFFFFFF, kind)
             chunks.append(kind)
             offset += 12 + length
