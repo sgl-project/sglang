@@ -50,6 +50,15 @@
     },
     "pending_validation": "Exact-final eager and CUDA-graph bitwise matrix over production batch shapes, exact-histogram GB300 micro, then a single-variable production A/B if the TRT final Stage-2 gap exceeds 5%."
   },
+  "eagle_dp_draft_extend_logits_prune": {
+    "parent_commit": "a31c1e52e947bcbdd0d551c5e2323e96a9bf303b",
+    "files": [
+      "python/sglang/srt/speculative/eagle_draft_extend_cuda_graph_runner.py",
+      "python/sglang/srt/speculative/eagle_worker_v2.py"
+    ],
+    "change": "Keep all draft-extend model rows, but compute CUDA-graph lm_head/logits only for the one sampled row per request. The eager fallback is unchanged.",
+    "targeted_validation": "py_compile, manifest parse, and diff-check pass; exact runtime graph, output, and matched-B28 serving gates pending"
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
