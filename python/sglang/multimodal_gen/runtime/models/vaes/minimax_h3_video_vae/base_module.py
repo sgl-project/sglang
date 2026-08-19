@@ -9,12 +9,12 @@ import torch.nn as nn
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
 from sglang.kernels.ops.diffusion import try_fused_scaled_residual_add_exact
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.srt.layers.activation import SiluAndMul
 
 from .attention import Attention
 from .vit_utils import _env_flag, _vit_torch_compile_kwargs
@@ -68,7 +68,7 @@ class FeedForward(nn.Module):
             SiluAndMul()
             if use_gated and activation_fn == "silu" and current_platform.is_npu()
             else None
-        )    
+        )
 
         self.w2 = nn.Linear(inner_dim, dim_out, bias=bias)
         self._compile_forward_enabled = _env_flag(
@@ -81,7 +81,7 @@ class FeedForward(nn.Module):
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.w1(hidden_states)
-    
+
         if self.use_gated:
             if (
                 isinstance(self.act_fn, nn.SiLU)
@@ -98,7 +98,7 @@ class FeedForward(nn.Module):
                 hidden_states = self.act_fn(gate).mul_(hidden_states)
         else:
             hidden_states = self.act_fn(hidden_states)
-    
+
         hidden_states = self.w2(hidden_states)
         return hidden_states
 
