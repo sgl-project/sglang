@@ -1333,10 +1333,15 @@ class IndexerKPool(MultiPlatformOp):
                         pooled_page_table = build_pooled_page_table_64(
                             token_page_table, pool_size
                         )[:pool_pages].contiguous()
+                    seq_len_t = torch.tensor(
+                        [pool_seq_len], dtype=torch.int32, device=q_fp8.device
+                    )
                     k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
                         layer_id,
+                        seq_len_t,
+                        pooled_page_table.unsqueeze(0),
                         pool_seq_len,
-                        pooled_page_table,
+                        pool_seq_len,
                     )
                     k_fp8 = k_fp8.view(torch.float8_e4m3fn)
                     k_scale = k_scale.view(torch.float32).squeeze(-1)

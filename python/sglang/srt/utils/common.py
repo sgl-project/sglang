@@ -1938,7 +1938,6 @@ def load_image(
         image = _load_image(image_file=image_file, gpu_image_decode=gpu_image_decode)
     else:
         raise ValueError(f"Invalid image: {image_file}")
-    image = smart_to_rgb(image)
     if image_size is not None and isinstance(image, Image.Image):
         image_size = (image.width, image.height)
     return image, image_size

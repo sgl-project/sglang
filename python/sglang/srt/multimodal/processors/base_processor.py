@@ -51,6 +51,7 @@ from sglang.srt.utils import (
     load_image,
     load_video,
     logger,
+    smart_to_rgb,
 )
 
 _is_cpu = is_cpu()
@@ -193,6 +194,7 @@ class MultimodalSpecialTokens:
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
+    smart_rgb_conversion = False
     prefer_tokenized_input = False
     precompute_hash_before_cpu_transfer = False
     # Set by processors that already build input_ids from the request's own
@@ -783,8 +785,11 @@ class BaseMultimodalProcessor(ABC):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode
                 # doesn't run later on the event-loop thread.
-                if discard_alpha_channel and img.mode != "RGB":
-                    return img.convert("RGB")
+                if discard_alpha_channel:
+                    if cls.smart_rgb_conversion:
+                        return smart_to_rgb(img)
+                    if img.mode != "RGB":
+                        return img.convert("RGB")
                 img.load()
                 return img
             elif modality == Modality.VIDEO:

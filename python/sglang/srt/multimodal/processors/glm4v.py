@@ -220,6 +220,7 @@ def glm_sample_and_decode_sync(vr, video_config=None):
 
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
+    smart_rgb_conversion = True
     models = [
         m
         for m in [
