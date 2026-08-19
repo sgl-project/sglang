@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
 
-from sglang.srt.mem_cache.events import KVCacheEventMixin
-
 # Tree node id -- the node handle used outside the TreeCore. The concrete tree
 # node is a TreeCore-internal type.
 NodeId = int
@@ -95,6 +93,7 @@ if TYPE_CHECKING:
         MatchPrefixParams,
         MatchResult,
     )
+    from sglang.srt.mem_cache.events import KVCacheEventRecorder
     from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -112,11 +111,10 @@ if TYPE_CHECKING:
     )
 
 
-class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
+class UnifiedTreeCoreInterface(ABC):
     """Methods the Controller invokes on the Tree Core. The Controller treats the
     Tree Core as opaque behind this surface, which grows as tree operations
-    migrate onto the TreeCore. Inherits KVCacheEventMixin for the KV-event API
-    (take_events, _record_* recorders)."""
+    migrate onto the TreeCore."""
 
     # ==== Tree-owned state the Controller reads (or, via its facade setters, writes) ====
     page_size: int
@@ -127,8 +125,13 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     write_through_threshold: int
     is_write_back: bool
     has_swa_host_pool: bool
+    kv_events: KVCacheEventRecorder
 
     # ==== Tree API ====
+
+    def take_events(self) -> list:
+        """Hand the queued KV placement events to the Controller."""
+        return self.kv_events.take()
 
     @abstractmethod
     def reset(self) -> None:
@@ -163,6 +166,26 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     @abstractmethod
     def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
         """The hash chain of the node's ancestors, in root-to-parent order."""
+        ...
+
+    @abstractmethod
+    def get_hash_values(self, node_id: NodeId) -> list[str]:
+        """The hash values owned by this node, excluding its ancestors."""
+        ...
+
+    @abstractmethod
+    def backfill_missing_hash_values(self) -> int:
+        """Hash every node built while storage was disabled; return how many.
+
+        Called when a storage backend is attached at runtime: nodes already in
+        the tree carry no hash, and hashing their descendants against them would
+        restart the page hash chain mid-sequence.
+        """
+        ...
+
+    @abstractmethod
+    def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
+        """The NodeId anchoring matches for the namespace."""
         ...
 
     @abstractmethod
@@ -345,6 +368,17 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         """Evict a component's host-side resources; no-op if the component is absent."""
         ...
 
+    @abstractmethod
+    def evict_excess_path_states(
+        self,
+        tail_node_id: NodeId,
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        """Evict shallow Mamba device checkpoints beyond the per-path cap on the
+        tail's root path, collecting freed values into the caller's dicts."""
+        ...
+
     # ==== HiCache ====
 
     @abstractmethod
@@ -400,8 +434,10 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
         ...
 
     @abstractmethod
-    def prefetch_anchor_info(self, node_id: NodeId) -> Optional[str]:
-        """The anchor node's key extra_key."""
+    def prefetch_anchor_info(
+        self, node_id: NodeId
+    ) -> tuple[Optional[str], Optional[str]]:
+        """The anchor node's key extra_key and cache_salt."""
         ...
 
     @abstractmethod
@@ -438,6 +474,15 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     ) -> list[CacheAction | ComponentAction]:
         """Commit a successful H->D load-back onto the node; returns any cache actions."""
         ...
+
+    @abstractmethod
+    def finish_load_back(self, anchor_node_id: NodeId) -> None:
+        """Clear the in-flight H->D marks on the anchor's root path at ack time."""
+        ...
+
+    # Order-sensitive digest of write_back duplicate-reclaim victim ids,
+    # cross-checked across TP ranks; cores that never reclaim keep 0.
+    write_back_duplicate_reclaim_digest: int = 0
 
     @abstractmethod
     def mark_write_through_pending(self, node_id: NodeId) -> None:

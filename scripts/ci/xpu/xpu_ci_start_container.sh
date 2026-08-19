@@ -128,6 +128,9 @@ echo "Launching container: ${CONTAINER_NAME} from ${IMAGE}"
 # SGLANG_SERVER_LAUNCH_TIMEOUT=36000 matches /data/pgirijal/scripts/setup_upstream_env.sh:
 # 4-GPU MoE loads (Qwen3.5-35B-A3B, gemma-4-26B-A4B, ...) on Arc Pro B60 can
 # take >1h from a cold HF cache, so give sglang server startup a 10h ceiling.
+# SYCL_CACHE_PERSISTENT=0: the SYCL runtime's persistent kernel cache mishandles
+# torch 2.13's XPU aten.topk kernel on compute-runtime 26.05 / IGC 2.28 -- reload
+# segfaults inside libsycl. Keep off until Intel ships a fix in newer runtimes.
 docker run -dt \
   --shm-size 8g \
   --group-add 992 \
@@ -145,7 +148,7 @@ docker run -dt \
   -e NEO_CACHE_DIR=/root/.cache/sglang-xpu/neo \
   -e NEO_CACHE_PERSISTENT=1 \
   -e SYCL_CACHE_DIR=/root/.cache/sglang-xpu/sycl \
-  -e SYCL_CACHE_PERSISTENT=1 \
+  -e SYCL_CACHE_PERSISTENT=0 \
   "${GPU_AFFINITY_ARGS[@]}" \
   --name "${CONTAINER_NAME}" \
   "${IMAGE}"

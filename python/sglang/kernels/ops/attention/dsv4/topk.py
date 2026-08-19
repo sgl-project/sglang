@@ -16,15 +16,18 @@ from .utils import make_name
 
 
 @cache_once
-def _jit_topk_v1_module(topk: int):
+def _jit_topk_v1_module():
+    # topk (<= 1024) is a runtime argument, not a compile-time constant, so a
+    # single module serves every k. Baking it in via -DSGL_TOPK used to build one
+    # module per k, and since the macro fed a `constexpr` rather than a template
+    # parameter every module exported identically mangled symbols -- see the
+    # comment in topk_v1.cuh for how that broke the second module's launch.
     args = make_cpp_args(is_arch_support_pdl())
-    assert topk in (512, 1024), "Only support topk=512 or 1024"
     return load_jit(
-        make_name(f"topk_v1_{topk}"),
+        make_name("topk_v1"),
         *args,
         cuda_files=["deepseek_v4/topk_v1.cuh"],
         cuda_wrappers=[("topk_transform", f"TopKKernel<{args}>::transform")],
-        extra_cuda_cflags=[f"-DSGL_TOPK={topk}"],
     )
 
 
@@ -55,7 +58,7 @@ def topk_transform_512(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
     else:
-        module = _jit_topk_v1_module(out_page_indices.shape[1])
+        module = _jit_topk_v1_module()
         module.topk_transform(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
@@ -86,13 +89,21 @@ def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Ten
 def topk_transform_512_v2(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
-    page_tables: torch.Tensor,
+    page_tables: Optional[torch.Tensor],
     out_page_indices: torch.Tensor,
     page_size: int,
     metadata: torch.Tensor,
-    out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-    """Fused top-k + page-table transform (DeepSeek-V4 top-k v2 kernel).
+    """Fused top-k + optional page-table transform (DeepSeek-V4 top-k v2 kernel).
+
+    Two output modes, chosen by whether ``page_tables`` is given and resolved to
+    a device-side template parameter, so an unused page-table gather is compiled
+    out rather than skipped at runtime:
+
+    * ``page_tables=None`` -- ``out_page_indices`` receives the raw selected
+      indices and no page table is read.
+    * ``page_tables`` given -- ``out_page_indices`` receives the page-table
+      transform of them.
 
     IMPORTANT: every entry of ``seq_lens`` must be NON-NEGATIVE, and
     ``metadata`` must come from :func:`plan_topk_v2` over the same ``seq_lens``
@@ -111,5 +122,4 @@ def topk_transform_512_v2(
         out_page_indices,
         page_size,
         metadata,
-        out_raw_indices,
     )

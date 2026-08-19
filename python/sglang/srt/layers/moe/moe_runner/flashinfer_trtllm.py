@@ -51,6 +51,12 @@ _deferred_finalize_enabled: contextvars.ContextVar[bool] = contextvars.ContextVa
 _TRTLLM_MOE_PDL_MAX_TOKENS = envs.SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS.get()
 
 
+def trtllm_moe_enable_pdl(num_tokens: int) -> bool:
+    from sglang.kernels.jit.utils import is_arch_support_pdl
+
+    return is_arch_support_pdl() and num_tokens <= _TRTLLM_MOE_PDL_MAX_TOKENS
+
+
 @dataclass
 class FlashInferTrtllmDeferredFinalizeOutput:
     gemm2_out: torch.Tensor
@@ -74,7 +80,6 @@ def finalize_flashinfer_trtllm_deferred_output(
     deferred_output: FlashInferTrtllmDeferredFinalizeOutput,
     shared_output: torch.Tensor,
 ) -> torch.Tensor:
-    from sglang.kernels.jit.utils import is_arch_support_pdl
     from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
 
     return moe_finalize_fuse_shared(
@@ -83,7 +88,7 @@ def finalize_flashinfer_trtllm_deferred_output(
         deferred_output.expert_weights,
         shared_output,
         deferred_output.top_k,
-        enable_pdl=is_arch_support_pdl(),
+        enable_pdl=trtllm_moe_enable_pdl(deferred_output.expert_weights.shape[0]),
     )
 
 
@@ -512,6 +517,7 @@ def _compute_g1_scale_c(
     g1_alphas: torch.Tensor,
     g1_alphas_up: torch.Tensor,
     is_gated: bool,
+    activation: Optional[str] = None,
 ) -> torch.Tensor:
     """TRT-LLM GEMM1-output scale for the up (w3) half.
 
@@ -521,6 +527,11 @@ def _compute_g1_scale_c(
     scale passes g1_alphas as g1_alphas_up and recovers the single-scale value;
     non-gated (Relu2) has no gate half, so it is just 1/a2_scale per expert.
     """
+    if activation == "situ":
+        # SiTU consumes both GEMM1 scales before tanh; scale_c carries only
+        # the GEMM2 input requantization factor.
+        num_experts = g1_alphas.shape[0]
+        return w2_input_scale_quant.to(torch.float32).expand(num_experts).contiguous()
     if is_gated:
         return (w2_input_scale_quant * g1_alphas_up).to(torch.float32)
     num_experts = g1_alphas.shape[0]
@@ -591,7 +602,11 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     g1_alphas = cast(torch.Tensor, layer.g1_alphas)
     g1_alphas_up = cast(torch.Tensor, getattr(layer, "g1_alphas_up", g1_alphas))
     g1_scale_c = _compute_g1_scale_c(
-        w2_input_scale_quant, g1_alphas, g1_alphas_up, layer.moe_runner_config.is_gated
+        w2_input_scale_quant,
+        g1_alphas,
+        g1_alphas_up,
+        layer.moe_runner_config.is_gated,
+        activation=layer.moe_runner_config.activation,
     )
     copy_or_rebind_param(layer, "g1_scale_c", g1_scale_c)
 
@@ -607,6 +622,7 @@ def get_activation_type(activation: str, is_gated: bool = True) -> int:
         _ACTIVATION_STR_TO_TYPE = {
             "silu": ActivationType.Swiglu,
             "gelu": ActivationType.Geglu,
+            "situ": ActivationType.Situ,
         }
     else:
         _ACTIVATION_STR_TO_TYPE = {
@@ -646,6 +662,9 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     weight_block_k: int | None = None
     w13_weight_scale_inv: torch.Tensor | None = None
     w2_weight_scale_inv: torch.Tensor | None = None
+    gemm1_alpha: torch.Tensor | None = None
+    gemm1_beta: torch.Tensor | None = None
+    gemm1_clamp_limit: torch.Tensor | None = None
 
     # Per-tensor path
     w13_input_scale: torch.Tensor | None = None
@@ -744,6 +763,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 hidden_states_scale=a_sf_t,
                 gemm1_weights=quant_info.w13_weight,
                 gemm1_weights_scale=quant_info.w13_weight_scale_inv,
+                gemm1_alpha=quant_info.gemm1_alpha,
+                gemm1_beta=quant_info.gemm1_beta,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
                 gemm2_weights=quant_info.w2_weight,
                 gemm2_weights_scale=quant_info.w2_weight_scale_inv,
                 num_experts=quant_info.global_num_experts,
@@ -779,6 +801,9 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 hidden_states_scale=a_sf_t,
                 gemm1_weights=quant_info.w13_weight,
                 gemm1_weights_scale=quant_info.w13_weight_scale_inv,
+                gemm1_alpha=quant_info.gemm1_alpha,
+                gemm1_beta=quant_info.gemm1_beta,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
                 gemm2_weights=quant_info.w2_weight,
                 gemm2_weights_scale=quant_info.w2_weight_scale_inv,
                 output=symm_output,
@@ -942,7 +967,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
-    _SUPPORTED_FP4_ACTIVATIONS = {"silu", "relu2", "gelu"}
+    _SUPPORTED_FP4_ACTIVATIONS = {"silu", "relu2", "gelu", "situ"}
     assert runner_config.activation in _SUPPORTED_FP4_ACTIVATIONS, (
         f"Only {_SUPPORTED_FP4_ACTIVATIONS} are supported for FP4 MoE, "
         f"got '{runner_config.activation}'."
@@ -1078,7 +1103,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             output=symm_output,
-            enable_pdl=hs_fp4.shape[0] <= _TRTLLM_MOE_PDL_MAX_TOKENS,
+            enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
         )[0]
     else:
         assert TopKOutputChecker.format_is_bypassed(topk_output)
@@ -1122,7 +1147,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             do_finalize=not defer_finalize,
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
-            enable_pdl=hs_fp4.shape[0] <= _TRTLLM_MOE_PDL_MAX_TOKENS,
+            enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
         )
         if not defer_finalize:
             moe_kwargs["output"] = symm_output
@@ -1130,13 +1155,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         result = trtllm_fp4_block_scale_moe(**moe_kwargs)
         if defer_finalize:
             gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
-            # FIXME(kpham-sgl): flashinfer sizes this buffer from routing_logits
-            # dtype (fp32 in DSv3 decode) but always writes bf16 weights into it.
-            # Reinterpret the live bf16 prefix. Fix upstream alloc to drop this,
-            # tracking in https://github.com/flashinfer-ai/flashinfer/issues/3595
-            if expert_weights.dtype == torch.float32:
-                n, k = expert_weights.shape
-                expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
             result = FlashInferTrtllmDeferredFinalizeOutput(
                 gemm2_out=gemm2_out,
                 expert_weights=expert_weights,

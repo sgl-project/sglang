@@ -5,6 +5,8 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/device_communicators/pynccl.py
 
 # ===================== import region =====================
+from contextlib import contextmanager
+
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
@@ -231,6 +233,106 @@ class PyNcclCommunicator:
             self.comm,
             cudaStream_t(stream.cuda_stream),
         )
+
+    def group_start(self):
+        self.nccl.ncclGroupStart()
+
+    def group_end(self):
+        self.nccl.ncclGroupEnd()
+
+    def all_to_all_single(
+        self,
+        output: torch.Tensor,
+        input_: torch.Tensor,
+        output_split_sizes: list[int] | None = None,
+        input_split_sizes: list[int] | None = None,
+        stream=None,
+    ) -> None:
+        """Equal-split all-to-all, the dist.all_to_all_single equivalent.
+
+        Exists because ProcessGroupNCCL's collectives cannot be recorded into a
+        CUDA graph: their host-side per-op bookkeeping advances once at capture,
+        so replays leave the ranks disagreeing about which collective is in
+        flight and they hang. Raw ncclSend/ncclRecv inside a group carries no
+        such state, so a captured region can hold the exchange.
+        """
+        if self.disabled:
+            raise RuntimeError(
+                "pynccl all_to_all_single called while the communicator is "
+                "disabled; wrap it in change_state(enable=True)"
+            )
+        assert output.dtype == input_.dtype, (output.dtype, input_.dtype)
+        assert input_.is_contiguous() and output.is_contiguous()
+        if input_split_sizes is None and output_split_sizes is None:
+            assert output.numel() == input_.numel(), (
+                output.numel(),
+                input_.numel(),
+            )
+            assert input_.numel() % self.world_size == 0, (
+                f"all_to_all_single without split sizes needs an equal split, "
+                f"got {input_.numel()} elements over {self.world_size} ranks"
+            )
+        if stream is None:
+            stream = current_stream()
+        # dist.all_to_all_single defines split sizes along dim 0; convert rows
+        # to element counts so n-D tensors split identically to torch
+        in_row = input_.numel() // input_.size(0) if input_.dim() else 1
+        out_row = output.numel() // output.size(0) if output.dim() else 1
+        chunk = input_.numel() // self.world_size
+        if input_split_sizes is None:
+            send_counts = [chunk] * self.world_size
+        else:
+            assert sum(input_split_sizes) == input_.size(0)
+            send_counts = [n * in_row for n in input_split_sizes]
+        if output_split_sizes is None:
+            recv_counts = [chunk] * self.world_size
+        else:
+            assert sum(output_split_sizes) == output.size(0)
+            recv_counts = [n * out_row for n in output_split_sizes]
+        assert len(send_counts) == len(recv_counts) == self.world_size
+        send = input_.view(-1)
+        recv = output.view(-1)
+        dtype = ncclDataTypeEnum.from_torch(input_.dtype)
+        itemsize = input_.element_size()
+        send_off = recv_off = 0
+        self.nccl.ncclGroupStart()
+        for peer in range(self.world_size):
+            self.nccl.ncclSend(
+                buffer_type(send.data_ptr() + send_off * itemsize),
+                send_counts[peer],
+                dtype,
+                peer,
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
+            self.nccl.ncclRecv(
+                buffer_type(recv.data_ptr() + recv_off * itemsize),
+                recv_counts[peer],
+                dtype,
+                peer,
+                self.comm,
+                cudaStream_t(stream.cuda_stream),
+            )
+            send_off += send_counts[peer]
+            recv_off += recv_counts[peer]
+        self.nccl.ncclGroupEnd()
+
+    @contextmanager
+    def change_state(self, enable: bool | None = None):
+        """Enable the communicator for the duration of the block.
+
+        The graph-capture path is the only caller that needs it, so ordinary
+        traffic keeps going through the process group and this stays a scoped
+        override rather than a mode switch.
+        """
+        if enable is None:
+            enable = self.available
+        old_disabled = self.disabled
+        self.disabled = not enable
+        try:
+            yield
+        finally:
+            self.disabled = old_disabled
 
     def broadcast(self, tensor: torch.Tensor, src: int, stream=None):
         if self.disabled:
