@@ -3,7 +3,7 @@ import glob
 import os
 import re
 from collections.abc import Callable, Generator, Iterable
-from contextlib import nullcontext
+from itertools import chain
 from typing import cast
 
 import torch
@@ -15,12 +15,15 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import (
+    get_encoder_data_parallel_group,
     get_local_torch_device,
-    get_tp_group,
 )
-from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    patch_tensor_parallel_group,
+    use_tensor_parallel_group,
+)
+from sglang.multimodal_gen.runtime.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -36,6 +39,7 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
+    EncoderTensorParallelMixin,
     TextEncoder,
     finalize_encoder_folding,
     get_folding_tp_group,
@@ -50,10 +54,100 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
+from sglang.multimodal_gen.runtime.utils.quantization_utils import get_quant_config
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
+
+
+def _configure_text_encoder_quantization(
+    model_config: EncoderConfig,
+    model_cls: type[nn.Module],
+    component_config: dict,
+    component_model_path: str,
+) -> None:
+    if getattr(model_cls, "manages_checkpoint_quantization", False):
+        # Preserve model-owned formats such as Ideogram's bitsandbytes state.
+        # Those models parse metadata, construct layers, and attach quant states
+        # themselves; running the generic lifecycle as well would process twice.
+        return
+
+    quant_config = get_quant_config(
+        component_config,
+        component_model_path,
+    )
+    model_config.quant_config = quant_config
+    if quant_config is None:
+        return
+    if not issubclass(model_cls, TextEncoder):
+        raise ValueError(
+            "A quantized text-encoder checkpoint requires an in-tree native "
+            "TextEncoder; "
+            f"got {model_cls.__name__}"
+        )
+    quant_method = quant_config.get_name()
+    supported_methods = model_cls.supported_checkpoint_quantization_methods
+    if quant_method not in supported_methods:
+        raise ValueError(
+            f"{model_cls.__name__} does not support text-encoder checkpoints "
+            f"quantized with {quant_method!r}; supported methods: "
+            f"{sorted(supported_methods)}"
+        )
+
+
+def _module_tensor_device(module: nn.Module) -> torch.device | None:
+    """Return the device of a module's own tensors.
+
+    Quantized linear layers are expected to keep their parameters and buffers
+    together.  Failing explicitly is safer than staging only part of a layer.
+    """
+
+    devices = {
+        tensor.device
+        for tensor in chain(
+            module.parameters(recurse=False),
+            module.buffers(recurse=False),
+        )
+    }
+    if len(devices) > 1:
+        raise ValueError(
+            f"Cannot stage {type(module).__name__} with tensors on multiple "
+            f"devices: {sorted(map(str, devices))}"
+        )
+    return next(iter(devices), None)
+
+
+def _process_quantized_text_encoder_weights(
+    model: nn.Module,
+    process_device: torch.device,
+) -> int:
+    processed_layers = 0
+    for module in model.modules():
+        if not isinstance(module, LinearBase):
+            continue
+        quant_method = module.quant_method
+        if quant_method is None or isinstance(quant_method, UnquantizedLinearMethod):
+            continue
+
+        origin_device = _module_tensor_device(module)
+        should_stage = origin_device is not None and origin_device != process_device
+        if should_stage:
+            module.to(process_device)
+        try:
+            quant_method.process_weights_after_loading(module)
+            processed_layers += 1
+        finally:
+            # Post-load methods may replace parameters or register buffers. Move
+            # the complete layer back so component residency remains authoritative.
+            if should_stage:
+                module.to(origin_device)
+    if processed_layers == 0:
+        raise ValueError(
+            "The text-encoder checkpoint declares quantization, but the model "
+            "did not construct any quantized linear layers"
+        )
+    return processed_layers
 
 
 class TextEncoderLoader(ComponentLoader):
@@ -321,17 +415,25 @@ class TextEncoderLoader(ComponentLoader):
         model_cls, _ = ModelRegistry.resolve_model_cls(
             getattr(encoder_config, "architectures", [])
         )
+        _configure_text_encoder_quantization(
+            encoder_config,
+            model_cls,
+            model_config,
+            component_model_path,
+        )
+        encoder_dp_group = get_encoder_data_parallel_group()
+        prefer_dp = (
+            server_args.batching_max_size > 1
+            and encoder_dp_group is not None
+            and encoder_dp_group.world_size > 1
+            and issubclass(model_cls, TextEncoder)
+            and model_cls.supports_dp_encode
+        )
         # real dims are populated now; resolve fold vs replicate
         finalize_encoder_folding(
             encoder_config,
             server_args.encoder_parallel,
-            prefer_dp=(
-                server_args.batching_max_size > 1
-                and (server_args.tp_size or 1) == 1
-                and (server_args.dp_size or 1) == 1
-                and issubclass(model_cls, TextEncoder)
-                and model_cls.supports_dp_encode
-            ),
+            prefer_dp=prefer_dp,
         )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
             encoder_index
@@ -378,6 +480,31 @@ class TextEncoderLoader(ComponentLoader):
         component_name: str = "text_encoder",
     ):
         local_torch_device = get_local_torch_device()
+        quant_config = model_config.quant_config
+        param_dtype = PRECISION_TO_TYPE[dtype]
+        if quant_config is not None:
+            if param_dtype not in quant_config.get_supported_act_dtypes():
+                raise ValueError(
+                    f"Text-encoder quantization method {quant_config.get_name()!r} "
+                    f"does not support activation dtype {param_dtype}"
+                )
+            if current_platform.is_mps():
+                raise ValueError(
+                    f"Text-encoder quantization method {quant_config.get_name()!r} "
+                    "is not supported on MPS"
+                )
+            if current_platform.is_cuda():
+                capability = current_platform.get_device_capability()
+                if (
+                    capability is not None
+                    and capability.to_int() < quant_config.get_min_capability()
+                ):
+                    raise ValueError(
+                        f"Text-encoder quantization method {quant_config.get_name()!r} "
+                        "requires CUDA compute capability "
+                        f">= {quant_config.get_min_capability() / 10:.1f}; got "
+                        f"{capability.to_int() / 10:.1f}"
+                    )
 
         if not current_platform.is_cpu():
             component_starts_on_cpu = (
@@ -403,25 +530,15 @@ class TextEncoderLoader(ComponentLoader):
             )
             component_starts_on_cpu = False
 
-        if component_starts_on_cpu and not current_platform.is_mps():
+        if component_starts_on_cpu:
             model_device = torch.device("cpu")
         else:
             model_device = local_torch_device
 
-        # Parallel folding: build + shard the encoder over the folding group (the
-        # idle DiT replica during the encoding stage) instead of the default TP
-        # group, so every encoder folds without threading the group through each layer.
-        fold_ctx = nullcontext()
-        if getattr(model_config, "parallel_folding_mode", None) is not None:
-            folding_group = get_folding_tp_group(model_config)
-            if (
-                isinstance(folding_group, GroupCoordinator)
-                and folding_group is not get_tp_group()
-            ):
-                fold_ctx = patch_tensor_parallel_group(folding_group)
-
-        # patch tp group with folding group to achieve TP among folding group
-        with fold_ctx, set_default_torch_dtype(PRECISION_TO_TYPE[dtype]):
+        encoder_tp_group = get_folding_tp_group(model_config)
+        with use_tensor_parallel_group(encoder_tp_group), set_default_torch_dtype(
+            PRECISION_TO_TYPE[dtype]
+        ):
             with model_device, skip_init_modules():
                 architectures = getattr(model_config, "architectures", [])
                 model_cls, _ = ModelRegistry.resolve_model_cls(architectures)
@@ -435,6 +552,19 @@ class TextEncoderLoader(ComponentLoader):
                 model_config.enable_image_understanding = enable_image_understanding
                 model = model_cls(model_config)
 
+            if not isinstance(model, EncoderTensorParallelMixin):
+                raise TypeError(
+                    f"Native encoder {model_cls.__name__} must inherit "
+                    "EncoderTensorParallelMixin"
+                )
+            model.bind_encoder_tp_group(encoder_tp_group)
+
+            if current_platform.is_mps() and component_starts_on_cpu:
+                # the h3 encoder is layered immediately after this loader returns
+                # compatible CPU safetensors stay mapped instead of copying the
+                # full Qwen checkpoint into unified memory
+                model._mps_zero_copy_weight_loading = True
+
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
                 self._get_all_weights(
@@ -444,9 +574,23 @@ class TextEncoderLoader(ComponentLoader):
                 )
             )
 
+            if quant_config is not None:
+                processed_layers = _process_quantized_text_encoder_weights(
+                    model,
+                    local_torch_device,
+                )
+                logger.info(
+                    "Processed %d %s text-encoder linear layers",
+                    processed_layers,
+                    quant_config.get_name(),
+                )
+
             if component_starts_on_cpu:
                 if current_platform.is_mps():
-                    model = model.to(local_torch_device)
+                    logger.info(
+                        "Keeping %s on CPU for MPS layerwise offload",
+                        model.__class__.__name__,
+                    )
                 else:
                     model = model.to("cpu")
             else:

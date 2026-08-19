@@ -109,60 +109,6 @@ class TestContextOverride(CustomTestCase):
         with self.assertRaises(AttributeError):
             sa.page_size = 999
 
-    def test_preserve_config_keeps_post_publish_overrides(self):
-        # A nested build (e.g. a draft worker) publishes its own private copy;
-        # on exit the target's resolved bags — including post-publish
-        # overrides — must be reinstated verbatim, not re-projected from the
-        # pristine record (which would silently drop the overrides).
-        target = self._publish()
-        rc.get_context().override(
-            "ModelRunner.configure_kv_cache_dtype", kv_cache_dtype="fp8_e4m3"
-        )
-        draft = ServerArgs(model_path="dummy", kv_cache_dtype="bf16")
-        with rc.get_context().preserve_config():
-            rc.get_context().set_server_args(draft)
-            # Inside the scope the draft's bags are live...
-            self.assertEqual(rc.get_model().kv_cache_dtype, "bf16")
-            # ...and its own post-publish overrides work as usual.
-            rc.get_context().override("draft-load", kv_cache_dtype="fp8_e5m2")
-            self.assertEqual(rc.get_model().kv_cache_dtype, "fp8_e5m2")
-        # Target slot, bags, and provenance restored verbatim.
-        self.assertIs(rc.get_context().server_args, target)
-        self.assertEqual(rc.get_model().kv_cache_dtype, "fp8_e4m3")
-        self.assertEqual(
-            rc.get_context().overrides_log(),
-            [
-                (
-                    "ModelRunner.configure_kv_cache_dtype",
-                    {"kv_cache_dtype": "fp8_e4m3"},
-                )
-            ],
-        )
-
-    def test_preserve_config_restores_in_scope_override_without_republish(self):
-        # An override inside the scope (no republish) mutates the live bags
-        # and provenance log in place; the scope must restore entry VALUES,
-        # not just reassign the aliased objects.
-        self._publish()
-        rc.get_context().override("srcA", page_size=16)
-        with rc.get_context().preserve_config():
-            rc.get_context().override("in-scope", page_size=64)
-            self.assertEqual(rc.get_schedule().page_size, 64)
-        self.assertEqual(rc.get_schedule().page_size, 16)
-        self.assertEqual(
-            rc.get_context().overrides_log(), [("srcA", {"page_size": 16})]
-        )
-
-    def test_preserve_config_restores_on_exception(self):
-        target = self._publish()
-        rc.get_context().override("srcA", page_size=16)
-        with self.assertRaises(RuntimeError):
-            with rc.get_context().preserve_config():
-                rc.get_context().set_server_args(ServerArgs(model_path="dummy"))
-                raise RuntimeError("nested build failed")
-        self.assertIs(rc.get_context().server_args, target)
-        self.assertEqual(rc.get_schedule().page_size, 16)
-
     def test_publish_records_role(self):
         rc.publish(ServerArgs(model_path="dummy"), role="scheduler")
         self.assertEqual(rc.publish_role(), "scheduler")

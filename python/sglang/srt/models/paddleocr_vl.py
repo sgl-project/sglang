@@ -13,14 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""PaddleOCR-VL: a NaViT-style SigLIP vision encoder on an ERNIE-4.5 backbone.
 
+The vision tower runs on a *packed* layout: every image of a (possibly
+cross-request) batch is concatenated into one ``[total_patches, dim]`` tensor and
+the per-image boundaries live on the host as ``grid_thws`` plus ``cu_seqlens``.
+Keeping the boundaries host-side is what lets the whole ViT forward run without a
+single device-to-host synchronization, and it lets the shape-independent
+projections run once for the batch instead of once per image.
+"""
+
+import itertools
 from collections.abc import Iterable
-from typing import List, Optional, Set, Tuple, Union
+from typing import List, Optional, Set, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
-from einops import rearrange
 from transformers.activations import GELUActivation
 from transformers.utils import torch_int
 
@@ -43,8 +51,80 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.ernie4 import Ernie4_5_ForCausalLM
 from sglang.srt.utils import add_prefix, is_npu
 
+_is_npu = is_npu()
+
+# Patch counts (t, h, w) of one image, always materialized on the host.
+GridTHW = Tuple[int, int, int]
+
+
+def build_packed_2d_position_ids(
+    grid_thws: List[GridTHW], device: torch.device
+) -> Tuple[torch.Tensor, int]:
+    """Row/column patch indices of a packed batch, plus the rope table size.
+
+    Returns ``([total_patches, 2], max_grid_size)``. ``max_grid_size`` is derived
+    from the host grids rather than from a device-side ``max()``, so building the
+    rope table never synchronizes.
+    """
+    split_hids = list()
+    split_wids = list()
+    for t, h, w in grid_thws:
+        frame_ids = torch.arange(h * w, device=device)
+        hids = frame_ids // w
+        wids = frame_ids - hids * w
+        if t > 1:
+            hids = hids.repeat(t)
+            wids = wids.repeat(t)
+        split_hids.append(hids)
+        split_wids.append(wids)
+
+    if len(grid_thws) == 1:
+        height_position_ids, width_position_ids = split_hids[0], split_wids[0]
+    else:
+        height_position_ids = torch.cat(split_hids, dim=0)
+        width_position_ids = torch.cat(split_wids, dim=0)
+
+    pids = torch.stack([height_position_ids, width_position_ids], dim=-1)
+    max_grid_size = max(max(h, w) for _, h, w in grid_thws)
+    return pids, max_grid_size
+
+
+def merge_patch_neighbourhoods(
+    hidden_states: torch.Tensor,
+    grid_thws: List[GridTHW],
+    merge_kernel_size: Tuple[int, int],
+) -> torch.Tensor:
+    """Group each image's ``m1 x m2`` patch neighbourhoods into single tokens.
+
+    Takes the packed ``[total_patches, dim]`` batch and returns
+    ``[total_patches / (m1 * m2), m1 * m2 * dim]``. Only this step depends on an
+    image's ``h``/``w``, which is why it is separated from the projections that
+    follow: those are row-wise and run once for the whole batch.
+    """
+    m1, m2 = merge_kernel_size
+    dim = hidden_states.shape[-1]
+    merged = hidden_states.new_empty(hidden_states.shape[0] // (m1 * m2), m1 * m2 * dim)
+
+    in_offset = out_offset = 0
+    for t, h, w in grid_thws:
+        num_patches = t * h * w
+        num_merged = num_patches // (m1 * m2)
+        # Row-major patches (t, h, w) regroup as (t, h/m1, m1, w/m2, m2, d); the
+        # merged token concatenates the m1*m2 neighbours along `d`.
+        merged[out_offset : out_offset + num_merged].view(
+            t, h // m1, w // m2, m1, m2, dim
+        ).copy_(
+            hidden_states[in_offset : in_offset + num_patches]
+            .view(t, h // m1, m1, w // m2, m2, dim)
+            .permute(0, 1, 3, 2, 4, 5)
+        )
+        in_offset += num_patches
+        out_offset += num_merged
+    return merged
+
 
 class Projector(nn.Module):
+    """Merge 2x2 patch neighbourhoods, then project into the language space."""
 
     def __init__(
         self,
@@ -73,40 +153,22 @@ class Projector(nn.Module):
     def forward(
         self,
         image_features: torch.Tensor,
-        image_grid_thw: List[Tuple[int, int, int]],
+        grid_thws: List[GridTHW],
     ) -> torch.Tensor:
-        m1, m2 = self.merge_kernel_size
-        if isinstance(image_features, (list, tuple)):
-            processed_features = list()
-            for image_feature, image_grid in zip(image_features, image_grid_thw):
-                image_feature = self.pre_norm(image_feature)
-                t, h, w = image_grid
+        """Project packed ViT features ``[total_patches, dim]`` for the batch.
 
-                image_feature = rearrange(
-                    image_feature,
-                    "(t h p1 w p2) d -> (t h w) (p1 p2 d)",
-                    t=t,
-                    h=h // m1,
-                    p1=m1,
-                    w=w // m2,
-                    p2=m2,
-                )
-                hidden_states = self.linear_1(image_feature)
-                hidden_states = self.act(hidden_states)
-                hidden_states = self.linear_2(hidden_states)
-                processed_features.append(hidden_states)
-
-            return processed_features
-
-        dims = image_features.shape[:-1]
-        dim = image_features.shape[-1]
-        image_features = image_features.view(np.prod(dims), dim)
-        hidden_states = self.pre_norm(image_features).view(-1, self.hidden_size)
-        hidden_states = self.linear_1(hidden_states)
+        Only the 2x2 merge depends on an image's ``h``/``w``; the norm and both
+        projections are row-wise, so they run once over the packed batch. Each
+        image contributes a single strided copy into the merged buffer, so an
+        N-image batch costs N copies plus 3 kernels rather than 4N kernels.
+        """
+        hidden_states = self.pre_norm(image_features)
+        merged = merge_patch_neighbourhoods(
+            hidden_states, grid_thws, self.merge_kernel_size
+        )
+        hidden_states = self.linear_1(merged)
         hidden_states = self.act(hidden_states)
-        hidden_states = self.linear_2(hidden_states)
-
-        return hidden_states.view(*dims, -1)
+        return self.linear_2(hidden_states)
 
 
 class SiglipVisionEmbeddings(nn.Module):
@@ -118,12 +180,16 @@ class SiglipVisionEmbeddings(nn.Module):
         self.image_size = config.image_size
         self.patch_size = config.patch_size
 
+        # kernel_size == stride and padding == 0, so this convolution is exactly
+        # an unfold plus a matmul. Taking that path avoids a cuDNN convolution
+        # launch over a [total_patches, 3, p, p] input on every ViT forward.
         self.patch_embedding = Conv2dLayer(
             in_channels=config.num_channels,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
             stride=self.patch_size,
             padding="valid",
+            disable_linear=False,
         )
 
         self.num_patches = (self.image_size // self.patch_size) ** 2
@@ -139,44 +205,43 @@ class SiglipVisionEmbeddings(nn.Module):
             persistent=False,
         )
 
-    def interpolate_pos_encoding(
-        self,
-        embeddings: torch.Tensor,
-        height: int,
-        width: int,
-        is_after_patchify: bool = False,
-    ) -> torch.Tensor:
-
+    def interpolate_pos_encoding(self, height: int, width: int) -> torch.Tensor:
+        """Resample the square learned position grid onto a ``height x width`` grid."""
         num_positions = self.position_embedding.weight.shape[0]
-
         patch_pos_embed = self.position_embedding.weight.unsqueeze(0)
-
-        dim = embeddings.shape[-1]
-
-        if is_after_patchify:
-            new_height = height
-            new_width = width
-        else:
-            new_height = height // self.patch_size
-            new_width = width // self.patch_size
 
         sqrt_num_positions = torch_int(num_positions**0.5)
         patch_pos_embed = patch_pos_embed.reshape(
-            1, sqrt_num_positions, sqrt_num_positions, dim
+            1, sqrt_num_positions, sqrt_num_positions, self.embed_dim
         )
         patch_pos_embed = patch_pos_embed.permute(0, 3, 1, 2)
 
         patch_pos_embed = nn.functional.interpolate(
             patch_pos_embed,
-            size=(new_height, new_width),
+            size=(height, width),
             mode="bilinear",
             align_corners=False,
         )
 
-        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
-        return patch_pos_embed
+        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(
+            1, -1, self.embed_dim
+        )
+        # Materialize contiguously. The permute leaves the channel dim strided,
+        # and this tensor is cached and broadcast-added to the packed activations
+        # on every forward, so a strided read would be paid over and over.
+        return patch_pos_embed.contiguous()
 
-    def fetch_position_embedding_lfu_cache(self, embeddings, h, w, max_cache: int = 20):
+    def fetch_position_embedding_lfu_cache(
+        self, h: int, w: int, max_cache: int = 20
+    ) -> torch.Tensor:
+        """Return the interpolated position grid for ``(h, w)``, LFU-cached.
+
+        The interpolation depends only on the grid, so document batches that
+        repeat a resolution reuse the tensor instead of re-running the bilinear
+        resample once per image per forward. The cache holds at most `max_cache`
+        grids of `h * w * hidden_size` each (~12 MiB at the checkpoint's default
+        1280-token page budget), evicting the least frequently used.
+        """
         grid = (h, w)
         if grid in self.cache_position_embedding:
             self.cache_position_count[grid] += 1
@@ -190,7 +255,7 @@ class SiglipVisionEmbeddings(nn.Module):
             self.cache_position_count.pop(min_hit_grid)
             self.cache_position_embedding.pop(min_hit_grid)
 
-        position_embedding = self.interpolate_pos_encoding(embeddings, h, w, True)
+        position_embedding = self.interpolate_pos_encoding(h, w)
         self.cache_position_count[grid] = 1
         self.cache_position_embedding[grid] = position_embedding
         return position_embedding
@@ -198,60 +263,38 @@ class SiglipVisionEmbeddings(nn.Module):
     def forward(
         self,
         pixel_values: torch.FloatTensor,
+        grid_thws: List[GridTHW],
         position_ids: Optional[torch.Tensor] = None,
-        image_grid_thw: Optional[
-            List[
-                Union[
-                    Tuple[int, int, int],
-                    List[Tuple[int, int, int]],
-                ]
-            ]
-        ] = None,
-        interpolate_pos_encoding=False,
     ) -> torch.Tensor:
-        if pixel_values.dim() == 4:
-            pixel_values = pixel_values.unsqueeze(0)
         if pixel_values.dim() == 5:
-            if position_ids is None:
-                raise ValueError(
-                    "position_ids cannot be None when pixel_values.dim() is 5."
-                )
-            (
-                batch_size,
-                squence_len,
-                channel,
-                height,
-                width,
-            ) = pixel_values.shape
-            target_dtype = self.patch_embedding.weight.dtype
-            pixel_values = rearrange(pixel_values, "b l c h w -> (b l) c h w")
-            patch_embeds = self.patch_embedding(pixel_values.to(dtype=target_dtype))
-            embeddings = patch_embeds.flatten(-2).squeeze(-1)
-
-            if interpolate_pos_encoding and image_grid_thw is not None:
-                start = 0
-                tmp_embeddings = list()
-                for image_grid in image_grid_thw:
-                    t, h, w = image_grid
-                    end = start + t * h * w
-                    image_embeddings = embeddings[start:end, :]
-                    position_embedding = (
-                        self.interpolate_pos_encoding(image_embeddings, h, w, True)
-                        .squeeze(0)
-                        .repeat(t, 1)
-                    )
-                    image_embeddings = image_embeddings + position_embedding
-                    tmp_embeddings.append(image_embeddings)
-                    start = end
-                embeddings = torch.concat(tmp_embeddings, dim=0).unsqueeze(0)
-            else:
-                embeddings = embeddings + self.packing_position_embedding(position_ids)
-            return embeddings
-        else:
+            # [batch, patches, c, ph, pw] -> [batch * patches, c, ph, pw]
+            pixel_values = pixel_values.flatten(0, 1)
+        if pixel_values.dim() != 4:
             raise ValueError(
                 "Unsupported pixel_values dimension:"
                 f" {pixel_values.dim()}. Expected 4 or 5."
             )
+
+        patch_embeds = self.patch_embedding(
+            pixel_values.to(dtype=self.patch_embedding.weight.dtype)
+        )
+        # Each patch convolves to a 1x1 map, so this is a reshape to [patches, dim].
+        embeddings = patch_embeds.flatten(-2).squeeze(-1)
+
+        if position_ids is None:
+            # Interpolated per-image position grids, added in place so the packed
+            # activation is never copied into a second buffer.
+            offset = 0
+            for t, h, w in grid_thws:
+                num_patches = t * h * w
+                embeddings[offset : offset + num_patches].view(
+                    t, h * w, self.embed_dim
+                ).add_(self.fetch_position_embedding_lfu_cache(h, w))
+                offset += num_patches
+        else:
+            embeddings += self.packing_position_embedding(position_ids)
+
+        return embeddings.unsqueeze(0)
 
 
 class SigLIPRotaryEmbedding(nn.Module):
@@ -347,10 +390,10 @@ class SiglipEncoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cu_seqlens: Optional[List[torch.Tensor]] = None,
-        rope_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        forward_metadata: Optional[VisionAttentionMetadata] = None,
-    ) -> Tuple[torch.FloatTensor]:
+        cu_seqlens: torch.Tensor,
+        rope_emb: Tuple[torch.Tensor, torch.Tensor],
+        forward_metadata: VisionAttentionMetadata,
+    ) -> torch.Tensor:
 
         residual = hidden_states
 
@@ -399,69 +442,38 @@ class SiglipEncoder(nn.Module):
         )
         self.rotary_pos_emb = SigLIPRotaryEmbedding(head_dim // 2)
 
-    @staticmethod
-    def flatten_list(image_grid_thw):
-        tmp_image_grid_thw = list()
-        for image_grid in image_grid_thw:
-            if isinstance(image_grid, list):
-                tmp_image_grid_thw.extend(image_grid)
-            else:
-                tmp_image_grid_thw.append(image_grid)
-        return tmp_image_grid_thw
+    def _build_rope_emb(
+        self, grid_thws: List[GridTHW], device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build the packed 2D rope cos/sin table for the batch."""
+        pids, max_grid_size = build_packed_2d_position_ids(grid_thws, device)
+        rope_emb = self.rotary_pos_emb(max_grid_size)[pids].flatten(1)
+        rope_emb = rope_emb.repeat(1, 2)
+        return rope_emb.cos(), rope_emb.sin()
 
     def forward(
         self,
-        inputs_embeds,
-        cu_seqlens: Optional[List[torch.Tensor]] = None,
-        image_grid_thw: Optional[
-            List[
-                Union[
-                    Tuple[int, int, int],
-                    List[Tuple[int, int, int]],
-                ]
-            ]
-        ] = None,
-        height_position_ids: Optional[torch.Tensor] = None,
-        width_position_ids: Optional[torch.Tensor] = None,
+        inputs_embeds: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        grid_thws: List[GridTHW],
+        max_seqlen: int,
     ) -> torch.Tensor:
-        device = inputs_embeds.device
-        hidden_states = inputs_embeds
-        flatten_image_grid_thw = self.flatten_list(image_grid_thw)
+        rope_emb = self._build_rope_emb(grid_thws, inputs_embeds.device)
 
-        if width_position_ids is None or height_position_ids is None:
-            split_hids = list()
-            split_wids = list()
-            for t, h, w in flatten_image_grid_thw:
-                image_pids = torch.arange(t * h * w, device=device) % (h * w)
-                sample_hids = image_pids // w
-                sample_wids = image_pids % w
-                split_hids.append(sample_hids)
-                split_wids.append(sample_wids)
-            width_position_ids = torch.concat(split_wids, dim=0)
-            height_position_ids = torch.concat(split_hids, dim=0)
-
-        pids = torch.stack(
-            [height_position_ids, width_position_ids],
-            dim=-1,
-        )
-        max_grid_size = pids.max() + 1
-        rope_emb_max_grid = self.rotary_pos_emb(max_grid_size)
-        rope_emb = rope_emb_max_grid[pids].flatten(1)
-        rope_emb = rope_emb.repeat(1, 2)
-        rope_emb = (rope_emb.cos(), rope_emb.sin())
         # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
-        if is_npu() and isinstance(cu_seqlens, torch.Tensor):
+        if _is_npu:
             cu_seqlens = cu_seqlens.to("cpu")
-        attn_cu_seqlens = cu_seqlens
+        # `max_seqlen` comes from the host grids, so the metadata is built once
+        # for every layer without reading a device tensor back.
         forward_metadata = prepare_vision_attention_metadata(
-            attn_cu_seqlens, device=hidden_states.device
+            cu_seqlens, device=inputs_embeds.device, max_seqlen=max_seqlen
         )
-        hidden_states = inputs_embeds
 
+        hidden_states = inputs_embeds
         for encoder_layer in self.layers:
             hidden_states = encoder_layer(
                 hidden_states,
-                cu_seqlens=attn_cu_seqlens,
+                cu_seqlens=cu_seqlens,
                 rope_emb=rope_emb,
                 forward_metadata=forward_metadata,
             )
@@ -490,52 +502,28 @@ class SiglipVisionTransformer(nn.Module):
 
     def forward(
         self,
-        pixel_values,
-        interpolate_pos_encoding: Optional[bool] = False,
+        pixel_values: torch.Tensor,
+        grid_thws: List[GridTHW],
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
         position_ids: Optional[torch.Tensor] = None,
-        height_position_ids: Optional[torch.Tensor] = None,
-        width_position_ids: Optional[torch.Tensor] = None,
-        cu_seqlens: Optional[List[torch.Tensor]] = None,
-        image_grid_thw: Optional[
-            List[
-                Union[
-                    Tuple[int, int, int],
-                    List[Tuple[int, int, int]],
-                ]
-            ]
-        ] = None,
-    ) -> list[torch.Tensor]:
-
+    ) -> torch.Tensor:
         hidden_states = self.embeddings(
             pixel_values,
-            interpolate_pos_encoding=interpolate_pos_encoding,
+            grid_thws=grid_thws,
             position_ids=position_ids,
-            image_grid_thw=image_grid_thw,
         )
 
-        last_hidden_state = self.encoder(
+        hidden_states = self.encoder(
             inputs_embeds=hidden_states,
             cu_seqlens=cu_seqlens,
-            image_grid_thw=image_grid_thw,
-            height_position_ids=height_position_ids,
-            width_position_ids=width_position_ids,
+            grid_thws=grid_thws,
+            max_seqlen=max_seqlen,
         )
 
-        last_hidden_state = self.post_layernorm(last_hidden_state)
-
-        sample_hidden_state = list()
-        if cu_seqlens is None:
-            raise ValueError(
-                "cu_seqlens cannot be None for "
-                "SiglipVisionTransformer output processing."
-            )
-        for i in range(cu_seqlens.shape[0] - 1):
-            start = cu_seqlens[i]
-            end = cu_seqlens[i + 1]
-            tensor = last_hidden_state[:, start:end, :].squeeze(0)
-            sample_hidden_state.append(tensor)
-
-        return sample_hidden_state
+        # Stay packed: the projector slices per image on the host, so splitting
+        # here would index `cu_seqlens` on the device and stall once per image.
+        return self.post_layernorm(hidden_states).squeeze(0)
 
 
 class SiglipVisionModel(nn.Module):
@@ -570,48 +558,38 @@ class SiglipVisionModel(nn.Module):
 
     def forward(
         self,
-        pixel_values,
-        interpolate_pos_encoding: bool = False,
+        pixel_values: torch.Tensor,
+        grid_thws: List[GridTHW],
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
         position_ids: Optional[torch.Tensor] = None,
-        image_grid_thw: Optional[
-            List[
-                Union[
-                    Tuple[int, int, int],
-                    List[Tuple[int, int, int]],
-                ]
-            ]
-        ] = None,
-        cu_seqlens: Optional[List[torch.Tensor]] = None,
-    ) -> list[torch.Tensor]:
-
+    ) -> torch.Tensor:
         return self.vision_model(
             pixel_values=pixel_values,
-            interpolate_pos_encoding=interpolate_pos_encoding,
-            position_ids=position_ids,
-            image_grid_thw=image_grid_thw,
+            grid_thws=grid_thws,
             cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            position_ids=position_ids,
         )
 
 
 class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
 
     def __init__(self, *, config, quant_config=None, prefix: str = ""):
-        super().__init__(config=config, prefix=prefix)
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         config = self.config
 
         self.mlp_AR = Projector(
             config, config.vision_config, prefix=add_prefix("mlp_AR", prefix)
         )
+        # NOTE: only BitsAndBytes 4-bit quantization is exercised for the SigLIP
+        # tower; other methods fall back to bf16 through SiglipMLP's own gate.
         self.visual = SiglipVisionModel(
-            config=config.vision_config, prefix=add_prefix("visual", prefix)
+            config=config.vision_config,
+            quant_config=quant_config,
+            prefix=add_prefix("visual", prefix),
         )
-        if not hasattr(self.model, "get_input_embeddings"):
-            import types
-
-            self.model.get_input_embeddings = types.MethodType(
-                get_input_embeddings, self.model
-            )
-        self.is_mrope_enabled = "mrope_section" in self.config.rope_scaling
+        self.is_mrope_enabled = "mrope_section" in (self.config.rope_scaling or {})
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
@@ -620,46 +598,38 @@ class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
-    def encode_image(self, pixel_values, image_grid_thw):
-        pixel_values = pixel_values.type(self.visual.dtype)
-        siglip_position_ids = list()
-        image_grid_hws = list()
-        cu_seqlens = [0]
-
-        for idx, grid_thw in enumerate(image_grid_thw):
-            thw_tuple = tuple(grid_thw.detach().cpu().numpy().tolist())
-            numel = np.prod(thw_tuple)
-            image_grid_hws.append(thw_tuple)
-            image_position_ids = torch.arange(numel) % np.prod(thw_tuple[1:])
-            siglip_position_ids.append(image_position_ids)
-            cu_seqlens.append(cu_seqlens[-1] + numel)
-
-        siglip_position_ids = torch.concat(siglip_position_ids, dim=0).to(
-            pixel_values.device
+    def encode_image(
+        self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor
+    ) -> torch.Tensor:
+        # One host transfer for the whole batch. Every consumer of the grids
+        # (rope table, patch merge, cu_seqlens) needs them on the host, so
+        # reading them per image would cost one synchronization per image.
+        grid_thws: List[GridTHW] = [(t, h, w) for t, h, w in image_grid_thw.tolist()]
+        seq_lens = [t * h * w for t, h, w in grid_thws]
+        cu_seqlens = torch.tensor(
+            [0, *itertools.accumulate(seq_lens)],
+            dtype=torch.int32,
+            device=pixel_values.device,
         )
-        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32).to(pixel_values.device)
+
         vision_outputs = self.visual(
             pixel_values=pixel_values,
-            image_grid_thw=image_grid_hws,
-            position_ids=siglip_position_ids,
-            interpolate_pos_encoding=True,
+            grid_thws=grid_thws,
             cu_seqlens=cu_seqlens,
+            max_seqlen=max(seq_lens),
         )
-        image_embeds = self.mlp_AR(vision_outputs, image_grid_thw)
-
-        # image_embeds = torch.stack(image_embeds, dim=0)
-        image_embeds = torch.cat(image_embeds, dim=0)
-
-        return image_embeds
+        return self.mlp_AR(vision_outputs, grid_thws)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
-        )
-        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
-        image_embeds = self.encode_image(pixel_values, image_grid_thw)
-
-        return image_embeds
+        if len(items) == 1:
+            # torch.cat allocates even for a single input; a document batch is
+            # usually one image, and its pixel buffer is the largest tensor here.
+            pixel_values = items[0].feature
+            image_grid_thw = items[0].image_grid_thw
+        else:
+            pixel_values = torch.cat([item.feature for item in items], dim=0)
+            image_grid_thw = torch.cat([item.image_grid_thw for item in items], dim=0)
+        return self.encode_image(pixel_values, image_grid_thw)
 
     def forward(
         self,
@@ -670,11 +640,10 @@ class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
     ):
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
-        if not (
-            forward_batch.forward_mode.is_decode()
-            or not forward_batch.contains_image_inputs()
-        ):
-            if self.is_mrope_enabled:
+            if (
+                not forward_batch.forward_mode.is_decode()
+                and forward_batch.contains_image_inputs()
+            ):
                 assert positions.ndim == 2 and positions.size(0) == 3, (
                     "multimodal section rotary embedding requires "
                     f"(3, seq_len) positions, but got {positions.size()}"
@@ -730,11 +699,6 @@ class PaddleOCRVLForConditionalGeneration(Ernie4_5_ForCausalLM):
                     weight_loader(param, loaded_weight)
                 else:
                     raise KeyError(f"Parameter '{name}' not found in model.")
-
-
-# monkey patch
-def get_input_embeddings(self) -> nn.Embedding:
-    return self.embed_tokens
 
 
 EntryClass = [PaddleOCRVLForConditionalGeneration]
