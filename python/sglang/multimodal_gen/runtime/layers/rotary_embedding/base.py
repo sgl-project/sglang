@@ -45,14 +45,14 @@ class RotaryEmbedding(CustomOp):
         self.dtype = dtype
         self.use_precomputed_cache = use_precomputed_cache
         self._is_full_rotation = rotary_dim == head_size
-        self._can_use_complex_style = not is_neox_style
-        self._npu_rotary_mul_style_ok = (
+        self._is_complex_style = not is_neox_style
+        self._is_npu_rotary_mul = (
             current_platform.is_npu()
             and is_neox_style
             and rotary_dim < NPU_ROTARY_MUL_MAX_HEAD_SIZE
         )
 
-        if use_precomputed_cache:
+        if self.use_precomputed_cache:
             cache = self._compute_cos_sin_cache()
             cache = cache.to(dtype)
             self.cos_sin_cache: torch.Tensor
@@ -138,26 +138,26 @@ class RotaryEmbedding(CustomOp):
 
         seq_len = query.shape[1]
 
-        can_use_complex = (
+        support_complex_style = (
             complex_freqs is not None
             and complex_freqs.dim() == 3
-            and self._can_use_complex_style
+            and self._is_complex_style
         )
-        if can_use_complex:
+        if support_complex_style:
             return (
                 _apply_rotary_emb_complex(query, complex_freqs),
                 _apply_rotary_emb_complex(key, complex_freqs),
             )
 
-        can_derive_complex_from_cos_sin = (
+        is_complex_derivable = (
             complex_freqs is None
             and cos is not None
             and sin is not None
-            and self._can_use_complex_style
+            and self._is_complex_style
             and self._is_full_rotation
             and cos.shape[0] == seq_len
         )
-        if can_derive_complex_from_cos_sin:
+        if is_complex_derivable:
             # No fused kernel for interleaved rotation here; complex-multiply
             # is equivalent and needs fewer kernel launches.
             derived_complex_freqs = torch.complex(
@@ -171,12 +171,12 @@ class RotaryEmbedding(CustomOp):
         if cos is not None and sin is not None:
             num_heads = query.shape[2]
 
-            can_use_npu_rotary_mul = (
-                self._npu_rotary_mul_style_ok
+            support_npu_rotary_mul = (
+                self._is_npu_rotary_mul
                 and cos.shape[0] == seq_len
                 and num_heads < NPU_ROTARY_MUL_MAX_NUM_HEADS
             )
-            if can_use_npu_rotary_mul:
+            if support_npu_rotary_mul:
                 # Called directly on the BSND [batch, seq, heads, rotary_dim]
                 # layout (no batch*seq flatten): cos/sin get a batch dim and
                 # a heads dim of 1 and broadcast against query/key (the
@@ -259,14 +259,14 @@ class RotaryEmbedding(CustomOp):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        can_use_cuda = (
+        support_cuda_style = (
             (cos_sin_cache is not None or cos is not None and sin is not None)
             and not self.use_precomputed_cache
             and query.dim() == 4
             and key.dim() == 4
         )
 
-        if not can_use_cuda:
+        if not support_cuda_style:
             return self.forward_native(
                 query=query,
                 key=key,
@@ -337,18 +337,18 @@ class RotaryEmbedding(CustomOp):
             cos_sin = self.cos_sin_cache.index_select(0, positions)
             cos, sin = cos_sin.chunk(2, dim=-1)
 
-        can_derive_complex_from_cos_sin = (
+        is_complex_derivable = (
             not use_precomputed_cache
             and complex_freqs is None
             and cos is not None
             and sin is not None
-            and self._can_use_complex_style
+            and self._is_complex_style
             and query.dim() == 4
             and key.dim() == 4
             and self._is_full_rotation
             and cos.shape[0] == query.shape[1]
         )
-        if can_derive_complex_from_cos_sin:
+        if is_complex_derivable:
             # No fused kernel for interleaved rotation on native backends;
             # complex-multiply is equivalent and needs fewer kernel
             # launches. CUDA has its own fused path (forward_cuda) and
