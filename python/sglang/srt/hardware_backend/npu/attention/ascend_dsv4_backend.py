@@ -535,11 +535,13 @@ class C4IndexerAscendBackendMixin:
         x: torch.Tensor,
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
+        skip_compressor: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         q = self._compute_q_npu(c4_indexer, q_lora, forward_batch.positions)
         weights, _ = c4_indexer.weights_proj(x)
         weights = weights * (c4_indexer.softmax_scale * c4_indexer.n_heads**-0.5)
-        c4_indexer.compressor(x, forward_batch)
+        if not skip_compressor:
+            c4_indexer.compressor(x, forward_batch)
         return q, weights
 
     def _can_use_indexer_multi_stream(self) -> bool:
@@ -559,6 +561,7 @@ class C4IndexerAscendBackendMixin:
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
         q_lora_ready,
+        skip_compressor: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from sglang.srt.hardware_backend.npu.utils import (
             get_indexer_weight_stream,
@@ -573,7 +576,8 @@ class C4IndexerAscendBackendMixin:
         stream_w.wait_stream(cur)
 
         # route-KV write on cur; ordered before the topk read by cur's program order.
-        c4_indexer.compressor(x, forward_batch)
+        if not skip_compressor:
+            c4_indexer.compressor(x, forward_batch)
 
         # weights_proj + scale on stream_w.
         with torch.npu.stream(stream_w):
@@ -777,16 +781,16 @@ class C4IndexerAscendBackendMixin:
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        assert (
-            not skip_compressor
-        ), "skip_compressor=True is not supported on the NPU indexer path"
         self._ensure_npu_c4_indexer(c4_indexer, x.device)
+        # CP path runs the compressor separately under full metadata.
         if self._can_use_indexer_multi_stream():
             q, weights = self._forward_prepare_multi_stream(
-                c4_indexer, x, q_lora, forward_batch, q_lora_ready
+                c4_indexer, x, q_lora, forward_batch, q_lora_ready, skip_compressor
             )
         else:
-            q, weights = self._forward_prepare(c4_indexer, x, q_lora, forward_batch)
+            q, weights = self._forward_prepare(
+                c4_indexer, x, q_lora, forward_batch, skip_compressor
+            )
         topk_idxs = self._forward_indexer(c4_indexer, x, q, weights, forward_batch)
         self.forward_metadata.c4_topk_indices = topk_idxs
 

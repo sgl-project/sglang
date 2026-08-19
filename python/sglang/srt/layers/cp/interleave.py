@@ -122,6 +122,14 @@ class InterleaveCPStrategy(ContextParallelStrategy):
 
         return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
 
+    def local_q_indices(self, num_tokens: int, forward_batch) -> Any:
+        device = getattr(getattr(forward_batch, "input_ids", None), "device", None)
+        if device is None:
+            device = torch.device("cpu")
+        return torch.arange(
+            self.cp_rank, int(num_tokens), self.cp_size, device=device, dtype=torch.long
+        )
+
     def shard_local_tokens(self, input_: Any) -> Any:
         return self._interleave_shard(input_)
 
