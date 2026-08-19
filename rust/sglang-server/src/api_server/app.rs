@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::Router;
 
 use super::disaggregation::bootstrap as pd_bootstrap;
-use super::{common, log, native_api, openai};
+use super::{common, log, native_api, openai, render};
 use crate::message::config::ServerArgs;
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::Senders;
@@ -77,6 +77,30 @@ pub async fn serve(
     // Apply logging and access log middleware.
     let app = log::apply(app, &server_args);
 
+    serve_http(listener, app, shutdown).await;
+}
+
+/// Serve the engine-free, text-only OpenAI render surface. This state has no
+/// scheduler channels, detokenizer, request FSM, or multimodal workers.
+pub async fn serve_render(
+    listener: std::net::TcpListener,
+    server_args: Arc<ServerArgs>,
+    tokenizer: Arc<dyn crate::tokenizer_manager::tokenizer::TextTokenizer>,
+    limits: crate::tokenizer_manager::to_scheduler::Limits,
+    shutdown: flume::Receiver<()>,
+) {
+    let app = render::routes(render::RenderState::new(
+        server_args.clone(),
+        openai::load_chat_support(&server_args),
+        tokenizer,
+        limits,
+    ))
+    .layer(axum::extract::DefaultBodyLimit::disable());
+    let app = log::apply(app, &server_args);
+    serve_http(listener, app, shutdown).await;
+}
+
+async fn serve_http(listener: std::net::TcpListener, app: Router, shutdown: flume::Receiver<()>) {
     // The listener was already bound synchronously in `runtime::start` (so a port
     // conflict fails startup); adopt it into the tokio reactor here.
     let listener = match tokio::net::TcpListener::from_std(listener) {

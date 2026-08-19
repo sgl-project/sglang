@@ -16,6 +16,8 @@ mod reasoning;
 mod template;
 mod tools;
 
+pub(in crate::http_server) use chat::lower_chat_requests;
+pub(in crate::http_server) use completions::lower_completion_requests;
 pub(super) use template::ChatFormatter;
 
 use super::app::AppState;

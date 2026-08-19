@@ -12,4 +12,5 @@ mod log;
 mod native_api;
 mod openai;
 mod prefetch;
+mod render;
 mod submit;
