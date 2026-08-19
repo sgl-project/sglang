@@ -246,6 +246,7 @@ class SchedulerDllmMixin:
             round_capacity=max(
                 self.dllm_manager.max_running_reqs - len(running_batch.reqs), 0
             ),
+            priority_preemption_enabled=self.enable_priority_preemption,
         ):
             self._process_dllm_batches_mixed(adder, running_batch=running_batch)
             return forward_mode
@@ -274,18 +275,29 @@ class SchedulerDllmMixin:
 
     @staticmethod
     def _should_mix_dllm_batches(
-        *, num_prefill_reqs: int, num_decode_reqs: int, round_capacity: int
+        *,
+        num_prefill_reqs: int,
+        num_decode_reqs: int,
+        round_capacity: int,
+        priority_preemption_enabled: bool,
     ) -> bool:
         """Whether this round has decode work that would otherwise sit behind a
         partially filled prefill round.
 
         The mixed path is a restriction of the either/or path, not a
         replacement: it walks the waiting queue in arrival order rather than
-        prefill-first, and it does not wire priority preemption. Those costs
-        buy nothing on a round that holds only one phase, or on one whose
-        prefill rows already fill the round -- so such rounds stay on the
+        prefill-first, and it does not attempt preemption when the round fills.
+        Those costs buy nothing on a round that holds only one phase, or on one
+        whose prefill rows already fill the round -- so such rounds stay on the
         original path.
+
+        Priority preemption is the one difference that is not just a
+        trade-off: taking the mixed path would silently drop it. Until it is
+        wired there, a scheduler running with it enabled keeps every round on
+        the either/or path.
         """
+        if priority_preemption_enabled:
+            return False
         return (
             num_prefill_reqs > 0
             and num_decode_reqs > 0
