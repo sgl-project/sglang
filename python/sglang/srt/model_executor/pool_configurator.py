@@ -979,20 +979,13 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
 
     def _unified_c4_state_pool_size(self, max_running_requests: int) -> int:
-        """Request-scoped c4 state-ring slot count on the unified_kv path.
+        """Exact request-scoped C4 ring size for the unified address contract.
 
-        The c4 compress-state is addressed by
-        ``(swa_loc // swa_page_size) * c4_ring_size + swa_loc % c4_ring_size``.
-        Under unified_kv the SWA pool is a fixed per-request ring with
-        ``swa_pages = num_req_slots * swa_ring_size`` slots, so ``swa_loc`` is
-        bounded by that and the required state slots are
-        ``ceil(num_req_slots * swa_ring_size / swa_page_size) * c4_ring_size``.
-        (Non-speculative: swa_ring_size == swa_page_size, so this reduces to
-        ``num_req_slots * c4_ring_size`` -- exactly the c128 pattern.)
+        Unified C4 state locations are
+        ``req_pool_idx * c4_ring_size + position % c4_ring_size``.
         """
         num_req_slots = self._get_num_req_slots(max_running_requests)
-        swa_pages = ceil_div(num_req_slots * self._swa_ring_size, self.swa_page_size)
-        return swa_pages * self.c4_ring_size
+        return num_req_slots * self.c4_ring_size
 
     def _fixed_c4_state_bytes(self, max_running_requests: int) -> int:
         """Unified_kv c4 (attn + indexer) compress-state is a fixed per-request

@@ -408,6 +408,7 @@ def create_paged_compressor_data(
 
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
+    use_req_ring = compress_ratio == 4 and token_to_kv_pool._unified_kv
     # NOTE: This is actually a proxy, which encounter some bug with tvm-ffi.
     # As a workaround, we use `.detach()` to get the real tensor.
     full_to_swa = token_to_kv_pool.full_to_swa_index_mapping.detach()
@@ -434,6 +435,7 @@ def create_paged_compressor_data(
             full_to_state=full_to_swa,
             swa_page_size=swa_page_size,
             ring_size=ring_size,
+            use_req_ring=use_req_ring,
             num_q_tokens=num_q_tokens,
             use_cuda_graph=use_prefill_cuda_graph,
         )
@@ -446,6 +448,7 @@ def create_paged_compressor_data(
             seq_lens=seq_lens.to(torch.int64),
             swa_page_size=swa_page_size,
             ring_size=ring_size,
+            use_req_ring=use_req_ring,
         )
 
 
