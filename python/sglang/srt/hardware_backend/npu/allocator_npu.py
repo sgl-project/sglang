@@ -1,4 +1,5 @@
-from typing import TYPE_CHECKING, Optional
+import logging
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -10,6 +11,8 @@ from sglang.srt.utils import get_num_new_pages, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
+
+logger = logging.getLogger(__name__)
 
 
 class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
@@ -34,14 +37,19 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
         num_new_pages: int = None,
-        skip_invariant_check: Optional[torch.Tensor] = None,
     ):
-        # skip_invariant_check masks rows whose last_loc is a synthetic
-        # fresh-page anchor installed by the DSV4 c-pool caller.
         if self.debug_mode:
             violation = (last_loc + 1) % self.page_size != prefix_lens % self.page_size
-            if skip_invariant_check is not None:
-                violation = violation & ~skip_invariant_check
+            if bool(violation.any()):
+                # Dump the offending rows so a remote crash log is readable.
+                logger.error(
+                    "alloc_extend invariant violated: page_size=%d rows=%s "
+                    "prefix_lens=%s last_loc=%s",
+                    self.page_size,
+                    violation.nonzero(as_tuple=False).flatten().tolist(),
+                    prefix_lens.cpu().tolist(),
+                    last_loc.cpu().tolist(),
+                )
             assert torch.all(~violation)
 
         if num_new_pages is None:
