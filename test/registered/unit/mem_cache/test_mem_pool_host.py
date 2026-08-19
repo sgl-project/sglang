@@ -3,6 +3,7 @@
 import threading
 import unittest
 
+import psutil
 import torch
 
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -10,6 +11,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     LogicalHostPool,
 )
+from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -196,6 +198,25 @@ class TestLazyHostPoolRelease(CustomTestCase):
             pool.alloc(1)
         with self.assertRaises(ValueError):
             pool.free(torch.tensor([0]))
+
+
+class TestHostMemoryBudget(CustomTestCase):
+    def tearDown(self):
+        base._ranks_per_host = None
+
+    def _budget_with_ranks(self, ranks):
+        base._ranks_per_host = ranks
+        return base.host_memory_budget_bytes()
+
+    def test_budget_is_split_across_co_located_ranks(self):
+        solo = self._budget_with_ranks(1)
+        self.assertEqual(self._budget_with_ranks(4), solo // 4)
+
+    def test_reserve_is_taken_before_the_split(self):
+        # Each rank must not get its own copy of the reserve.
+        free = psutil.virtual_memory().available
+        budget = self._budget_with_ranks(8)
+        self.assertLessEqual(budget * 8, free - base.HICACHE_HOST_MEMORY_RESERVE_BYTES)
 
 
 if __name__ == "__main__":

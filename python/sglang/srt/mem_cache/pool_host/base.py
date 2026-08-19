@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import socket
 import threading
 from functools import wraps
 from typing import Optional
@@ -9,6 +10,7 @@ from typing import Optional
 import psutil
 import torch
 
+from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
@@ -25,6 +27,46 @@ _is_hip = is_hip()
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
+
+_ranks_per_host: Optional[int] = None
+
+
+def ranks_per_host() -> int:
+    """Number of ranks of this job running on the same machine as this one.
+
+    Cached so the collective runs once per process: ranks may build different
+    numbers of host pools, and an uncached call would deadlock on the rank that
+    builds fewer.
+    """
+    global _ranks_per_host
+    if _ranks_per_host is not None:
+        return _ranks_per_host
+
+    _ranks_per_host = 1
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            world_group = get_world_group()
+        except AssertionError:
+            return _ranks_per_host
+        if world_group.world_size > 1:
+            hostname = socket.gethostname()
+            peers = [None] * world_group.world_size
+            torch.distributed.all_gather_object(
+                peers, hostname, group=world_group.cpu_group
+            )
+            _ranks_per_host = peers.count(hostname)
+    return _ranks_per_host
+
+
+def host_memory_budget_bytes() -> int:
+    """Host RAM this rank may claim for a HiCache pool.
+
+    psutil reports the whole machine, so co-located ranks each see the same free
+    memory; without the split every rank sizes its pool against all of it and
+    the host is oversubscribed by the number of ranks it holds.
+    """
+    free = psutil.virtual_memory().available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+    return free // ranks_per_host()
 
 
 def sync_fixed_hicache_size(size: int, host_size: int) -> int:
@@ -139,9 +181,8 @@ class HostKVCache(abc.ABC):
             )
 
         # Verify there is enough available host memory.
-        host_mem = psutil.virtual_memory()
         requested_bytes = self.size * self.size_per_token
-        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        available_bytes = host_memory_budget_bytes()
         if requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
