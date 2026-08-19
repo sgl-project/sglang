@@ -103,7 +103,7 @@ def _torch_cleanup() -> None:
         pass
 
 
-def _run_case(case: DiffusionTestCase) -> tuple[dict, float]:
+def _run_case(case: DiffusionTestCase) -> tuple[dict, float, float]:
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
     mgr = ServerManager(
@@ -151,7 +151,8 @@ def _run_case(case: DiffusionTestCase) -> tuple[dict, float]:
                 "expected_avg_denoise_ms": round(perf.avg_denoise_ms, 2),
                 "expected_median_denoise_ms": round(perf.median_denoise_ms, 2),
             },
-            round(perf.peak_vram_mb, 2),
+            round(perf.load_peak_vram_mb, 2),
+            round(perf.runtime_peak_vram_mb, 2),
         )
     finally:
         ctx.cleanup()
@@ -174,7 +175,8 @@ def main() -> int:
     out_path = Path(args.out) if args.out else baseline_path
     data = json.loads(baseline_path.read_text(encoding="utf-8"))
     scenarios = data.setdefault("scenarios", {})
-    peak_vram_mb = data.setdefault("peak_vram_mb", {})
+    load_peak_vram_mb = data.setdefault("load_peak_vram_mb", {})
+    runtime_peak_vram_mb = data.setdefault("runtime_peak_vram_mb", {})
 
     ids = set(args.case) if args.case else None
     pat = re.compile(args.match) if args.match else None
@@ -203,11 +205,12 @@ def main() -> int:
     for c in cases:
         prev = scenarios.get(c.id, {})
         note = prev.get("notes")
-        baseline, peak_vram = _run_case(c)
+        baseline, load_peak_vram, runtime_peak_vram = _run_case(c)
         if note is not None:
             baseline["notes"] = note
         scenarios[c.id] = baseline
-        peak_vram_mb[c.id] = peak_vram
+        load_peak_vram_mb[c.id] = load_peak_vram
+        runtime_peak_vram_mb[c.id] = runtime_peak_vram
         sys.stdout.write(f"{c.id}\n")
         sys.stdout.flush()
         _torch_cleanup()

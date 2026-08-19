@@ -581,15 +581,27 @@ class PerformanceValidator:
             )
 
     def validate_peak_vram(
-        self, summary: PerformanceSummary, expected_peak_vram_mb: float
+        self,
+        summary: PerformanceSummary,
+        expected_load_peak_vram_mb: float,
+        expected_runtime_peak_vram_mb: float,
     ) -> None:
-        assert summary.peak_vram_mb > 0, "Lifetime peak VRAM metric missing"
+        assert summary.load_peak_vram_mb > 0, "Load peak VRAM metric missing"
+        assert summary.runtime_peak_vram_mb > 0, "Runtime peak VRAM metric missing"
         self._assert_le(
-            "Lifetime Peak VRAM",
-            summary.peak_vram_mb,
-            expected_peak_vram_mb,
-            self.tolerances.peak_vram,
-            min_abs_tolerance=256.0,
+            "Load Peak VRAM",
+            summary.load_peak_vram_mb,
+            expected_load_peak_vram_mb,
+            self.tolerances.load_peak_vram,
+            min_abs_tolerance=128.0,
+            unit=" MiB",
+        )
+        self._assert_le(
+            "Runtime Peak VRAM",
+            summary.runtime_peak_vram_mb,
+            expected_runtime_peak_vram_mb,
+            self.tolerances.runtime_peak_vram,
+            min_abs_tolerance=128.0,
             unit=" MiB",
         )
 

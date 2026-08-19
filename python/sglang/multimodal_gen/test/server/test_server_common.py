@@ -446,20 +446,33 @@ class DiffusionServerBase:
         summary = validator.collect_metrics(perf_record)
         self._print_performance_log(case, summary, scenario)
 
-        expected_peak_vram_mb = BASELINE_CONFIG.peak_vram_mb.get(case.id)
+        expected_load_peak_vram_mb = BASELINE_CONFIG.load_peak_vram_mb.get(case.id)
+        expected_runtime_peak_vram_mb = BASELINE_CONFIG.runtime_peak_vram_mb.get(
+            case.id
+        )
+        has_peak_vram_baselines = bool(
+            BASELINE_CONFIG.load_peak_vram_mb or BASELINE_CONFIG.runtime_peak_vram_mb
+        )
         if (
             current_platform.is_cuda()
             and not is_baseline_generation_mode
-            and BASELINE_CONFIG.peak_vram_mb
+            and has_peak_vram_baselines
         ):
-            if expected_peak_vram_mb is None:
+            if (
+                expected_load_peak_vram_mb is None
+                or expected_runtime_peak_vram_mb is None
+            ):
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
                 pytest.fail(
-                    f"Testcase '{case.id}' has no peak_vram_mb baseline in "
-                    f"{get_perf_baseline_path()}"
+                    f"Testcase '{case.id}' is missing a load/runtime peak VRAM "
+                    f"baseline in {get_perf_baseline_path()}"
                 )
             try:
-                validator.validate_peak_vram(summary, expected_peak_vram_mb)
+                validator.validate_peak_vram(
+                    summary,
+                    expected_load_peak_vram_mb,
+                    expected_runtime_peak_vram_mb,
+                )
             except AssertionError as e:
                 logger.error(f"Peak VRAM validation failed for {case.id}:\n{e}")
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
@@ -492,7 +505,8 @@ class DiffusionServerBase:
             "e2e_ms": summary.e2e_ms,
             "avg_denoise_ms": summary.avg_denoise_ms,
             "median_denoise_ms": summary.median_denoise_ms,
-            "peak_vram_mb": summary.peak_vram_mb,
+            "load_peak_vram_mb": summary.load_peak_vram_mb,
+            "runtime_peak_vram_mb": summary.runtime_peak_vram_mb,
             "stage_metrics": summary.stage_metrics,
             "sampled_steps": summary.sampled_steps,
         }
@@ -525,7 +539,8 @@ class DiffusionServerBase:
                 f"  e2e={summary.e2e_ms:.2f}ms, "
                 f"avg_denoise={summary.avg_denoise_ms:.2f}ms, "
                 f"median_denoise={summary.median_denoise_ms:.2f}ms, "
-                f"peak_vram={summary.peak_vram_mb:.0f}MiB"
+                f"load_peak_vram={summary.load_peak_vram_mb:.0f}MiB, "
+                f"runtime_peak_vram={summary.runtime_peak_vram_mb:.0f}MiB"
             ),
         ]
         if scenario is not None:
@@ -535,9 +550,19 @@ class DiffusionServerBase:
                 f"avg_denoise={scenario.expected_avg_denoise_ms:.2f}ms, "
                 f"median_denoise={scenario.expected_median_denoise_ms:.2f}ms"
             )
-        expected_peak_vram_mb = BASELINE_CONFIG.peak_vram_mb.get(case.id)
-        if expected_peak_vram_mb is not None:
-            lines.append(f"  peak_vram_baseline: {expected_peak_vram_mb:.0f}MiB")
+        expected_load_peak_vram_mb = BASELINE_CONFIG.load_peak_vram_mb.get(case.id)
+        expected_runtime_peak_vram_mb = BASELINE_CONFIG.runtime_peak_vram_mb.get(
+            case.id
+        )
+        if (
+            expected_load_peak_vram_mb is not None
+            and expected_runtime_peak_vram_mb is not None
+        ):
+            lines.append(
+                "  peak_vram_baseline: "
+                f"load={expected_load_peak_vram_mb:.0f}MiB, "
+                f"runtime={expected_runtime_peak_vram_mb:.0f}MiB"
+            )
         if summary.stage_metrics:
             stages = ", ".join(
                 f"{name}={duration:.2f}ms"
@@ -594,9 +619,13 @@ class DiffusionServerBase:
 
 "{case.id}": {json.dumps(baseline, indent=4)}
 
-and set this entry in the top-level "peak_vram_mb" object:
+and set this entry in the top-level "load_peak_vram_mb" object:
 
-"{case.id}": {round(summary.peak_vram_mb, 2)}
+"{case.id}": {round(summary.load_peak_vram_mb, 2)}
+
+and this entry in the top-level "runtime_peak_vram_mb" object:
+
+"{case.id}": {round(summary.runtime_peak_vram_mb, 2)}
 
 """
         logger.error(output)

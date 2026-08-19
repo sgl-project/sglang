@@ -83,8 +83,8 @@ def _generate_diffusion_markdown_report(results: list) -> str:
 
     # Main performance table
     markdown = header
-    markdown += "| Test Suite | Test Name | Modality | E2E (ms) | Avg Denoise (ms) | Median Denoise (ms) | Peak VRAM (MiB) |\n"
-    markdown += "| ---------- | --------- | -------- | -------- | ---------------- | ------------------- | --------------- |\n"
+    markdown += "| Test Suite | Test Name | Modality | E2E (ms) | Avg Denoise (ms) | Median Denoise (ms) | Load Peak VRAM (MiB) | Runtime Peak VRAM (MiB) |\n"
+    markdown += "| ---------- | --------- | -------- | -------- | ---------------- | ------------------- | -------------------- | ----------------------- |\n"
 
     for entry in sorted(results, key=lambda x: (x["class_name"], x["test_name"])):
         modality = entry.get("modality", "image")
@@ -92,7 +92,8 @@ def _generate_diffusion_markdown_report(results: list) -> str:
             f"| {entry['class_name']} | {entry['test_name']} | {modality} | "
             f"{entry['e2e_ms']:.2f} | {entry['avg_denoise_ms']:.2f} | "
             f"{entry['median_denoise_ms']:.2f} | "
-            f"{entry.get('peak_vram_mb', 0):.0f} |\n"
+            f"{entry.get('load_peak_vram_mb', 0):.0f} | "
+            f"{entry.get('runtime_peak_vram_mb', 0):.0f} |\n"
         )
 
     # Video-specific metrics table (if any video tests)
@@ -132,7 +133,7 @@ def pytest_sessionfinish(session):
     # Print to stdout (existing behavior)
     print("\n\n" + "=" * 35 + " Performance Summary " + "=" * 35)
     print(
-        f"{'Test Suite':<30} | {'Test Name':<20} | {'E2E (ms)':>12} | {'Avg Denoise (ms)':>18} | {'Median Denoise (ms)':>20} | {'Peak VRAM (MiB)':>15}"
+        f"{'Test Suite':<30} | {'Test Name':<20} | {'E2E (ms)':>12} | {'Avg Denoise (ms)':>18} | {'Median Denoise (ms)':>20} | {'Load Peak (MiB)':>15} | {'Runtime Peak (MiB)':>18}"
     )
     print(
         "-" * 30
@@ -146,16 +147,19 @@ def pytest_sessionfinish(session):
         + "-" * 20
         + "-+-"
         + "-" * 15
+        + "-+-"
+        + "-" * 18
     )
 
     for entry in sorted_results:
         print(
             f"{entry['class_name']:<30} | {entry['test_name']:<20} | {entry['e2e_ms']:>12.2f} | "
             f"{entry['avg_denoise_ms']:>18.2f} | {entry['median_denoise_ms']:>20.2f} | "
-            f"{entry.get('peak_vram_mb', 0):>15.0f}"
+            f"{entry.get('load_peak_vram_mb', 0):>15.0f} | "
+            f"{entry.get('runtime_peak_vram_mb', 0):>18.0f}"
         )
 
-    print("=" * 109)
+    print("=" * 130)
 
     print("\n\n" + "=" * 36 + " Detailed Reports " + "=" * 37)
     for entry in sorted_results:

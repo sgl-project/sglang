@@ -46,7 +46,8 @@ class ToleranceConfig:
     non_denoise_stage: float
     denoise_step: float
     denoise_agg: float
-    peak_vram: float = 0.05
+    load_peak_vram: float = 0.01
+    runtime_peak_vram: float = 0.02
 
     @classmethod
     def load_profile(cls, all_tolerances: dict, profile_name: str) -> ToleranceConfig:
@@ -87,8 +88,17 @@ class ToleranceConfig:
             denoise_agg=float(
                 os.getenv("SGLANG_DENOISE_AGG_TOLERANCE", tol_data["denoise_agg"])
             ),
-            peak_vram=float(
-                os.getenv("SGLANG_PEAK_VRAM_TOLERANCE", tol_data.get("peak_vram", 0.05))
+            load_peak_vram=float(
+                os.getenv(
+                    "SGLANG_LOAD_PEAK_VRAM_TOLERANCE",
+                    tol_data.get("load_peak_vram", 0.01),
+                )
+            ),
+            runtime_peak_vram=float(
+                os.getenv(
+                    "SGLANG_RUNTIME_PEAK_VRAM_TOLERANCE",
+                    tol_data.get("runtime_peak_vram", 0.02),
+                )
             ),
         )
 
@@ -113,7 +123,8 @@ class BaselineConfig:
     step_fractions: Sequence[float]
     tolerances: ToleranceConfig
     improvement_threshold: float
-    peak_vram_mb: dict[str, float] = field(default_factory=dict)
+    load_peak_vram_mb: dict[str, float] = field(default_factory=dict)
+    runtime_peak_vram_mb: dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> BaselineConfig:
@@ -145,9 +156,13 @@ class BaselineConfig:
             improvement_threshold=data.get("improvement_reporting", {}).get(
                 "threshold", 0.2
             ),
-            peak_vram_mb={
+            load_peak_vram_mb={
                 name: float(value)
-                for name, value in data.get("peak_vram_mb", {}).items()
+                for name, value in data.get("load_peak_vram_mb", {}).items()
+            },
+            runtime_peak_vram_mb={
+                name: float(value)
+                for name, value in data.get("runtime_peak_vram_mb", {}).items()
             },
         )
 
@@ -168,8 +183,17 @@ class BaselineConfig:
             )
 
         self.scenarios.update(scenarios_new)
-        self.peak_vram_mb.update(
-            {name: float(value) for name, value in data.get("peak_vram_mb", {}).items()}
+        self.load_peak_vram_mb.update(
+            {
+                name: float(value)
+                for name, value in data.get("load_peak_vram_mb", {}).items()
+            }
+        )
+        self.runtime_peak_vram_mb.update(
+            {
+                name: float(value)
+                for name, value in data.get("runtime_peak_vram_mb", {}).items()
+            }
         )
         return self
 
@@ -421,7 +445,8 @@ class PerformanceSummary:
     step_metrics: list[float]
     sampled_steps: dict[int, float]
     all_denoise_steps: dict[int, float]
-    peak_vram_mb: float = 0.0
+    load_peak_vram_mb: float = 0.0
+    runtime_peak_vram_mb: float = 0.0
     frames_per_second: float | None = None
     total_frames: int | None = None
     avg_frame_time_ms: float | None = None
@@ -451,12 +476,11 @@ class PerformanceSummary:
                 val = item.get("execution_time_ms", 0.0)
                 stage_metrics[item["name"]] = val
 
-        peak_vram_mb = max(
-            (
-                float(snapshot.get("peak_reserved_mb", 0.0))
-                for snapshot in record.memory_snapshots.values()
-            ),
-            default=0.0,
+        load_peak_vram_mb = float(
+            record.memory_snapshots.get("load_peak", {}).get("peak_reserved_mb", 0.0)
+        )
+        runtime_peak_vram_mb = float(
+            record.memory_snapshots.get("runtime_peak", {}).get("peak_reserved_mb", 0.0)
         )
 
         return PerformanceSummary(
@@ -467,7 +491,8 @@ class PerformanceSummary:
             step_metrics=step_durations,
             sampled_steps=sampled_steps,
             all_denoise_steps=per_step,
-            peak_vram_mb=peak_vram_mb,
+            load_peak_vram_mb=load_peak_vram_mb,
+            runtime_peak_vram_mb=runtime_peak_vram_mb,
         )
 
 

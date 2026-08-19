@@ -8,7 +8,7 @@ import os
 import tempfile
 import time
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterator, List, Union
 
 import numpy as np
@@ -152,11 +152,12 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         self.pipeline: ComposedPipelineBase = None
 
         self.init_device_and_model()
-        self._lifetime_peak_reserved_mb = (
+        self._load_peak_reserved_mb = (
             0.0
             if current_platform.is_cpu()
             else capture_memory_snapshot().peak_reserved_mb
         )
+        self._runtime_peak_reserved_mb = 0.0
         self.sp_group = get_sp_group()
         self.sp_cpu_group = self.sp_group.cpu_group
         self.tp_group = get_tp_group()
@@ -530,7 +531,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING
             )
             if collect_perf and not req.is_warmup:
-                self._record_lifetime_peak_memory(output_metrics)
+                self._record_replica_peak_memory(output_metrics)
 
             if (
                 self.is_output_rank
@@ -701,30 +702,35 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if current_platform.is_cpu():
             return
         peak_reserved_mb = capture_memory_snapshot().peak_reserved_mb
-        self._lifetime_peak_reserved_mb = max(
-            self._lifetime_peak_reserved_mb, peak_reserved_mb
+        self._runtime_peak_reserved_mb = max(
+            self._runtime_peak_reserved_mb, peak_reserved_mb
         )
         if self.is_output_rank:
             output_batch.peak_memory_mb = peak_reserved_mb
 
-    def _record_lifetime_peak_memory(self, output_metrics: list[Any]) -> None:
-        """Record the largest allocator peak across this request's replica."""
+    def _record_replica_peak_memory(self, output_metrics: list[Any]) -> None:
+        """Record replica-wide loading and runtime allocator peaks."""
         if not current_platform.is_cuda():
             return
 
-        peak = torch.tensor(
-            self._lifetime_peak_reserved_mb,
+        peaks = torch.tensor(
+            [self._load_peak_reserved_mb, self._runtime_peak_reserved_mb],
             dtype=torch.float64,
             device=current_platform.get_device(self.local_rank),
         )
-        peak = get_replica_group().all_reduce(peak, op=torch.distributed.ReduceOp.MAX)
+        peaks = get_replica_group().all_reduce(peaks, op=torch.distributed.ReduceOp.MAX)
         if not self.is_output_rank:
             return
 
         snapshot = capture_memory_snapshot()
-        snapshot.peak_reserved_mb = peak.item()
+        load_peak_mb, runtime_peak_mb = peaks.tolist()
         for metrics in output_metrics:
-            metrics.record_memory_snapshot("lifetime_peak", snapshot)
+            metrics.record_memory_snapshot(
+                "load_peak", replace(snapshot, peak_reserved_mb=load_peak_mb)
+            )
+            metrics.record_memory_snapshot(
+                "runtime_peak", replace(snapshot, peak_reserved_mb=runtime_peak_mb)
+            )
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None
