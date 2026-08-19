@@ -232,9 +232,7 @@ def per_token_group_quant(
         assert output_s is not None
         assert out_dtype is None or out_dtype == output_q.dtype
         if unpacked_ue8m0_scales and output_s.dtype != torch.float32:
-            raise ValueError(
-                "unpacked_ue8m0_scales requires a float32 output_s buffer"
-            )
+            raise ValueError("unpacked_ue8m0_scales requires a float32 output_s buffer")
     _per_token_group_quant_custom_op(
         input=input,
         output_q=output_q,
