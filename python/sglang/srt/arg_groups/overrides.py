@@ -1462,7 +1462,11 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
-@_register_for("NemotronHForCausalLM", "NemotronHPuzzleForCausalLM")
+@_register_for(
+    "NemotronHForCausalLM",
+    "NemotronHPuzzleForCausalLM",
+    "NemotronH_Omni_Reasoning_V3",
+)
 def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     """NemotronH quantization / MoE runner / attention backend defaults
     (absorbed from the retired arg_groups/nemotron_h_hook.py; the mamba radix
@@ -1480,7 +1484,12 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
     ]
     quantization = cfg.quantization
     if is_modelopt:
-        assert model_config.hf_config.mlp_hidden_act == "relu2"
+        language_config = (
+            model_config.hf_text_config
+            if model_arch == "NemotronH_Omni_Reasoning_V3"
+            else hf_config
+        )
+        assert language_config.mlp_hidden_act == "relu2"
         if model_config.quantization == "modelopt":
             quant_algo = model_config.hf_config.quantization_config["quant_algo"]
             if quant_algo == "MIXED_PRECISION":
@@ -1771,6 +1780,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "MiniCPMV4_6ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "NemotronH_Omni_Reasoning_V3",
         "FalconH1ForCausalLM",
         "JetNemotronForCausalLM",
         "JetVLMForConditionalGeneration",
@@ -1800,6 +1810,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "GraniteMoeHybridForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "NemotronH_Omni_Reasoning_V3",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
@@ -2233,6 +2244,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3_5ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "NemotronH_Omni_Reasoning_V3",
     }
 )
 

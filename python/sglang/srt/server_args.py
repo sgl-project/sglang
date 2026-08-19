@@ -9905,7 +9905,7 @@ class ServerArgs:
                 # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE
                 FLA_CHUNK_SIZE = 64
 
-            hf_config = self.get_model_config().hf_config
+            hf_config = self.get_model_config().hf_text_config
             chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
             page_size = resolved_view(self).page_size
             assert (
