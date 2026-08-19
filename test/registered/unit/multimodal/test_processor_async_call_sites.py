@@ -141,6 +141,59 @@ def test_overrides_take_the_worker_pools_processor_clone():
     )
 
 
+# Processors that build their whole preprocessing chain themselves and never
+# reach `process_and_combine_mm_data`, so the worker pool cannot help them. They
+# are not broken by concurrency either -- they simply do not participate. Listed
+# explicitly so that adding a processor forces a decision instead of silently
+# leaving it at one-worker speed.
+_NO_WORKER_POOL_ROUTE = {
+    "inkling.py",
+    "lightonocr.py",
+    "llava.py",
+    "mimo_v2.py",
+    "mimo_v2_asr.py",
+    "minicpmv4_6.py",
+    "moss_vl.py",
+    "nano_nemotron_vl.py",
+    "transformers_auto.py",
+    "voxtral.py",
+    "whisper.py",
+}
+
+
+def test_processors_outside_the_worker_pool_are_declared():
+    """A new processor must either route through the pool or be listed here.
+
+    Without this, a processor added on the old call site keeps preprocessing on
+    the event loop and nobody notices: there is no error, just one-worker
+    throughput. Whichever way the list moves, the change should be deliberate.
+    """
+    unrouted = set()
+    for path in sorted(_MULTIMODAL_ROOT.rglob("*.py")):
+        if path.name in _EXEMPT:
+            continue
+        source = path.read_text(encoding="utf-8")
+        entry_points = (
+            "async def process_mm_data_async" in source
+            or "async def _process_special_format" in source
+        )
+        if entry_points and "process_and_combine_mm_data_async" not in source:
+            unrouted.add(path.name)
+
+    newly_unrouted = unrouted - _NO_WORKER_POOL_ROUTE
+    assert not newly_unrouted, (
+        "these processors reach preprocessing without going through the worker "
+        "pool, so they will serve at one-worker speed; either route them through "
+        "`process_and_combine_mm_data_async` or add them to "
+        f"_NO_WORKER_POOL_ROUTE with a reason: {sorted(newly_unrouted)}"
+    )
+    now_routed = _NO_WORKER_POOL_ROUTE - unrouted
+    assert not now_routed, (
+        "these processors now reach the worker pool, so drop them from "
+        f"_NO_WORKER_POOL_ROUTE: {sorted(now_routed)}"
+    )
+
+
 def test_the_scan_actually_finds_call_sites():
     """Guard against the scan silently matching nothing after a rename."""
     assert len(list(_call_sites())) > 20
