@@ -76,6 +76,7 @@ do
         # by the model code, while the proposal-side fast paths stay explicit
         # here so an inherited environment cannot silently disable them.
         export SGLANG_DSPARK_FAST_KERNEL=1
+        export SGLANG_DSPARK_FUSED_LOCAL_TOP1=1
         export SGLANG_DSPARK_FAST_SAMPLING=1
         export SGLANG_DSPARK_FOLDED_PROPOSAL=1
         export SGLANG_DSPARK_FOLDED_SAMPLING=1
