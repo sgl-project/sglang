@@ -250,7 +250,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
         backend="none",
         reasoning_parser=None,
         enable_strict_thinking=False,
-        **fields
+        **fields,
     ):
         published = {
             "grammar_backend": backend,
