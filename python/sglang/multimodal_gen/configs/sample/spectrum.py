@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from sglang.multimodal_gen.configs.sample.sampling_params import CacheParams
@@ -66,6 +67,45 @@ class SpectrumParams(CacheParams):
     history_size: int = 100
     tau_num_steps: int = 50
     taylor_order: int = 1
+
+    def __post_init__(self) -> None:
+        finite_numbers = {
+            "window_size": self.window_size,
+            "flex_window": self.flex_window,
+            "w": self.w,
+            "lam": self.lam,
+        }
+        for name, value in finite_numbers.items():
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ValueError(f"Spectrum {name} must be a finite number.")
+
+        if self.window_size <= 0:
+            raise ValueError("Spectrum window_size must be greater than zero.")
+        if self.flex_window < 0:
+            raise ValueError("Spectrum flex_window must be non-negative.")
+        if not 0 <= self.w <= 1:
+            raise ValueError("Spectrum w must be between zero and one.")
+        if self.lam < 0:
+            raise ValueError("Spectrum lam must be non-negative.")
+
+        non_negative_ints = {"warmup_steps": self.warmup_steps}
+        positive_ints = {
+            "m": self.m,
+            "history_size": self.history_size,
+            "tau_num_steps": self.tau_num_steps,
+        }
+        for name, value in non_negative_ints.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"Spectrum {name} must be a non-negative integer.")
+        for name, value in positive_ints.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"Spectrum {name} must be a positive integer.")
+        if self.taylor_order not in (1, 2, 3):
+            raise ValueError("Spectrum taylor_order must be one of 1, 2, or 3.")
 
     def get_total_forward_steps(
         self, num_inference_steps: int, do_cfg: bool, separate_cfg_branches: bool

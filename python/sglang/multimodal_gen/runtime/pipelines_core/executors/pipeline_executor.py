@@ -58,10 +58,6 @@ class PipelineExecutor(ABC):
         batch: Any,
         server_args: ServerArgs,
     ) -> None:
-        if isinstance(batch, list):
-            if not batch:
-                return
-            batch = batch[0]
         self.component_residency_manager.begin_request(stages, batch, server_args)
 
     def before_stage(
@@ -205,32 +201,9 @@ class PipelineExecutor(ABC):
         if server_args.use_fsdp_inference:
             return True
 
-        for use in stage.component_uses(server_args):
-            component_name = use.component_name
-            if server_args.dit_cpu_offload and component_name in (
-                "transformer",
-                "transformer_2",
-                "video_dit",
-                "audio_dit",
-            ):
-                return True
-            if server_args.text_encoder_cpu_offload and component_name.startswith(
-                "text_encoder"
-            ):
-                return True
-            if server_args.image_encoder_cpu_offload and component_name in (
-                "image_encoder",
-                "condition_image_encoder",
-            ):
-                return True
-            if server_args.vae_cpu_offload and component_name in (
-                "vae",
-                "video_vae",
-                "audio_vae",
-                "vocoder",
-                "spatial_upsampler",
-                "condition_image_encoder",
-            ):
+        stage_name = stage._active_component_stage_name()
+        for use in stage.component_uses(server_args, stage_name):
+            if server_args.should_cpu_offload_component(use.component_name):
                 return True
         return False
 
@@ -242,7 +215,11 @@ class PipelineExecutor(ABC):
         run_stage,
     ):
         with self._stage_execution_context(stage, server_args):
-            return run_stage(stage, payload)
+            self.component_residency_manager.begin_stage()
+            try:
+                return run_stage(stage, payload)
+            finally:
+                self.component_residency_manager.end_stage()
 
     @abstractmethod
     def execute(

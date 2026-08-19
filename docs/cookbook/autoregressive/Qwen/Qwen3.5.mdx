@@ -42,7 +42,7 @@ Qwen3.5 features a Gated Delta Networks combined with sparse Mixture-of-Experts 
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-397B-A17B</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen3.5-397B-A17B](https://huggingface.co/Qwen/Qwen3.5-397B-A17B)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[Qwen/Qwen3.5-397B-A17B-FP8](https://huggingface.co/Qwen/Qwen3.5-397B-A17B-FP8)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>NVIDIA NVFP4: [nvidia/Qwen3.5-397B-A17B-NVFP4](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4)<br/>AMD MXFP4: [amd/Qwen3.5-397B-A17B-MXFP4](https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>NVIDIA NVFP4: [nvidia/Qwen3.5-397B-A17B-NVFP4-V2](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4-V2)<br/>AMD MXFP4: [amd/Qwen3.5-397B-A17B-MXFP4](https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.5-122B-A10B</td>
@@ -156,8 +156,8 @@ This section provides deployment configurations optimized for different hardware
         - **MI300X (192GB)** runs with tp=4.
         - **MI325X (256GB)** runs with tp=2.
         - **MI355X (288GB)** runs with tp=2.
-    - **FP4**: The FP4 quantized model requires ~250GB for weights, cutting memory by almost 4x. NVFP4 ([nvidia/Qwen3.5-397B-A17B-NVFP4](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4)) requires B200/B300 (Blackwell architecture); AMD provides an MXFP4 checkpoint ([amd/Qwen3.5-397B-A17B-MXFP4](https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4)) for MI355X.
-        - **B200 (183GB)** runs with tp=4. (NVFP4)
+    - **FP4**: The FP4 quantized model requires ~250GB for weights, cutting memory by almost 4x. NVFP4 ([nvidia/Qwen3.5-397B-A17B-NVFP4-V2](https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4-V2)) requires B200/B300 (Blackwell architecture); AMD provides an MXFP4 checkpoint ([amd/Qwen3.5-397B-A17B-MXFP4](https://huggingface.co/amd/Qwen3.5-397B-A17B-MXFP4)) for MI355X.
+        - **B200 (183GB)** runs with tp=4 (tp=2 with expert parallelism 2 when MTP is enabled). (NVFP4)
         - **B300 (275GB)** runs with tp=2. (NVFP4)
         - **MI355X (288GB)** runs with tp=2 (use tp=4 for low concurrency). (MXFP4)
 
@@ -191,7 +191,7 @@ This section provides deployment configurations optimized for different hardware
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>183GB</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4 / 2 + EP2 (MTP)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>B300</td>
@@ -987,6 +987,45 @@ P95 ITL (ms):                            72.10
 P99 ITL (ms):                            149.57
 Max ITL (ms):                            1220.68
 ==================================================
+```
+
+#### 5.2.3 Agentic Long-Context with HiCache DRAM Offload (H200 FP8, MTP)
+
+For agentic workloads, here is how to enable HiCache and MTP.
+
+Container image (pinned for reproducibility):
+`lmsysorg/sglang:nightly-dev-cu13-20260815-a5ba081f`.
+
+Server Launch Command:
+```bash Command
+SGLANG_ENABLE_SPEC_V2=1 \
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-397B-A17B-FP8 \
+  --served-model-name Qwen/Qwen3.5-397B-A17B-FP8 \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --data-parallel-size 1 \
+  --expert-parallel-size 1 \
+  --quantization fp8 \
+  --kv-cache-dtype fp8_e4m3 \
+  --mamba-ssm-dtype bfloat16 \
+  --attention-backend flashinfer \
+  --enable-flashinfer-allreduce-fusion \
+  --mem-fraction-static 0.8 \
+  --stream-interval 50 \
+  --scheduler-recv-interval 10 \
+  --tokenizer-worker-num 6 \
+  --enable-metrics \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --page-size 64 \
+  --enable-hierarchical-cache \
+  --hicache-size 77 \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first \
+  --hicache-write-policy write_through_selective
 ```
 
 ### 5.3 Vision Speed Benchmark

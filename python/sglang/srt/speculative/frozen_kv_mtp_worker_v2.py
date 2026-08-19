@@ -30,6 +30,7 @@ import torch
 
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.moe.utils import (
+    draft_model_build_scope,
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
@@ -43,6 +44,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_utils import (
@@ -107,7 +114,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.gpu_id = gpu_id
         self.device = server_args.device
         self.target_worker = target_worker
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -127,7 +134,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         with (
             empty_context()
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
             # Both base classes own initialization, so initialize TpModelWorker
             # explicitly after EagleDraftWorkerBase above.
             TpModelWorker.__init__(
@@ -138,6 +145,8 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
                 ps=replace(ps, pp_rank=0),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
+                # The draft runs at absolute target positions.
+                context_length=self.target_worker.model_runner.model_config.context_len,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -153,7 +162,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self.kv_context: Optional[FrozenKVMTPContext] = None
 
         self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
+            draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
 
         self.draft_attn_backend = None
@@ -225,11 +234,15 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         pass
 
     def _resolve_draft_backend_type(self) -> str:
-        return (
-            self.server_args.speculative_draft_attention_backend
-            or self.server_args.decode_attention_backend
-            or self.server_args.attention_backend
-        )
+        # The same chain as before, off the bags: the speculative override if
+        # the operator set one, else the configured decode backend (which falls
+        # back to the base one). Deliberately NOT the runner's stamp: this
+        # worker does not hand its runner a draft backend, so the stamp is the
+        # ordinary pair and reading it would drop the speculative setting --
+        # and forcing the runner onto one backend would collapse a hybrid
+        # prefill/decode config for the topk==1 path, which uses the runner's
+        # own backend.
+        return get_spec().speculative_draft_attention_backend or attention_backends()[1]
 
     def _init_draft_attn_backend(self):
         if self.topk == 1:
@@ -689,7 +702,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
