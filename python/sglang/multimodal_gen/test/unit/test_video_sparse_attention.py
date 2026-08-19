@@ -115,6 +115,7 @@ def test_cake_stage2_uses_direct_topk_metadata(monkeypatch):
         device=torch.device("cpu"),
     )
     num_blocks = metadata.variable_block_sizes.numel()
+    expected_topk = _compute_cur_topk(metadata)
     sequence = num_blocks * math.prod(VSA_TILE_SIZE)
     query = torch.randn(1, sequence, 1, 128, dtype=torch.bfloat16)
     gate = torch.zeros_like(query)
@@ -146,8 +147,11 @@ def test_cake_stage2_uses_direct_topk_metadata(monkeypatch):
     q2k_num = captured["plan_kwargs"]["q2k_num"]
     assert q2k_indices.dtype == torch.int32
     assert q2k_indices.is_contiguous()
-    assert q2k_indices.shape == (1, num_blocks, 1)
-    assert torch.equal(q2k_num, torch.ones((1, num_blocks), dtype=torch.int32))
+    assert q2k_indices.shape == (1, num_blocks, expected_topk)
+    assert torch.equal(
+        q2k_num,
+        torch.full((1, num_blocks), expected_topk, dtype=torch.int32),
+    )
     assert captured["plan_kwargs"]["kv_block_lens"] is metadata.variable_block_sizes
     assert captured["run_shapes"] == (
         torch.Size((sequence, 1, 128)),
