@@ -23,8 +23,8 @@ class TestMxfp4FlashinferActivationPrep(CustomTestCase):
         with patch(
             "sglang.srt.layers.moe.route_quant_handoff.take", return_value=None
         ) as take, patch(
-            "sglang.srt.layers.quantization.mxfp4.get_device_capability",
-            return_value=(10, 7),
+            "sglang.srt.layers.quantization.mxfp4._is_sm107_supported",
+            return_value=True,
         ), patch(
             "sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_quantize",
             return_value=(x_quant, x_scale),
@@ -49,8 +49,8 @@ class TestMxfp4FlashinferActivationPrep(CustomTestCase):
         with patch(
             "sglang.srt.layers.moe.route_quant_handoff.take", return_value=None
         ), patch(
-            "sglang.srt.layers.quantization.mxfp4.get_device_capability",
-            return_value=(10, 0),
+            "sglang.srt.layers.quantization.mxfp4._is_sm107_supported",
+            return_value=False,
         ), patch(
             "sglang.kernels.ops.quantization.per_token_group_quant."
             "per_token_group_quant",
@@ -76,15 +76,10 @@ class TestMxfp4FlashinferActivationPrep(CustomTestCase):
         x_scale = torch.arange(6, dtype=torch.uint8)
 
         with patch(
-            "sglang.srt.layers.quantization.mxfp4.get_device_capability",
-            return_value=(10, 0),
-        ), patch(
             "sglang.srt.layers.quantization.fp8_utils.flashinfer_mxfp8_quantize",
             return_value=(x_quant, x_scale),
             create=True,
-        ) as quantize, patch(
-            "sglang.srt.layers.moe.route_quant_handoff.take"
-        ) as take:
+        ) as quantize, patch("sglang.srt.layers.moe.route_quant_handoff.take") as take:
             actual_x, packed_topk, actual_quant, actual_scale = (
                 _prepare_flashinfer_mxfp8_activations(x, 64)
             )

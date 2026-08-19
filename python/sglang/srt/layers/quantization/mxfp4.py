@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import replace
+from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -75,6 +76,11 @@ has_triton_kernels = is_triton_kernels_available()
 _UE8M0_ONE = 127
 
 
+@lru_cache(maxsize=1)
+def _is_sm107_supported() -> bool:
+    return get_device_capability() == (10, 7)
+
+
 def _prepare_flashinfer_mxfp8_activations(
     x: torch.Tensor, hidden_size: int
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
@@ -92,7 +98,7 @@ def _prepare_flashinfer_mxfp8_activations(
     if prepared is not None:
         prepared_packed_topk, x_quant, x_scale = prepared
         x_scale = x_scale.view(torch.float8_e4m3fn)
-    elif x.shape[-1] != hidden_size or get_device_capability() == (10, 7):
+    elif x.shape[-1] != hidden_size or _is_sm107_supported():
         from sglang.srt.layers.quantization.fp8_utils import (
             flashinfer_mxfp8_quantize,
         )
