@@ -474,9 +474,7 @@ class CakeSSUBackend(FlashInferSSDCombinedSSUBackend):
     def chunk_scan_combined(self, *args, **kwargs):
         if "chunk_size" not in kwargs:
             raise ValueError("Cake Mamba prefill requires an explicit chunk_size")
-        kwargs["chunk_size"] = self.prefill_metadata_chunk_size(
-            int(kwargs["chunk_size"])
-        )
+        kwargs["chunk_size"] = self.prefill_metadata_chunk_size(int(kwargs["chunk_size"]))
         return super().chunk_scan_combined(*args, **kwargs)
 
 
