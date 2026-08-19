@@ -1166,6 +1166,22 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = False
+    enable_tp_lm_head_all_to_all: A[
+        Optional[bool],
+        Arg(
+            help="Use all-to-all instead of TP all-gather followed by DP scatter "
+            "for the TP-sharded LM head under DP attention. By default this is "
+            "enabled only on decode-only PD nodes with pure DP attention "
+            "(tp_size == dp_size > 1 and attn_cp_size == 1), and disabled on "
+            "prefill-only and colocated nodes. Pass "
+            "--no-enable-tp-lm-head-all-to-all to opt out. The path is "
+            "incompatible with --enable-dp-lm-head; batches without an equal "
+            "padded row count fall back to the existing all-gather path.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+        NS("parallel"),
+    ] = None
     enable_attn_tp_input_scattered: A[
         bool,
         "Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
@@ -2653,10 +2669,10 @@ class ServerArgs:
         False
     )
     hicache_ratio: A[
-        float,
-        "The ratio of the size of host KV cache memory pool to the size of device pool.",
+        Optional[float],
+        "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0, or 1.0 for host-pool decode retraction.",
         NS("memory"),
-    ] = 2.0
+    ] = None
     hicache_size: A[
         int,
         "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
@@ -3115,6 +3131,19 @@ class ServerArgs:
         "Enable async KV cache offloading on decode server (PD mode).",
         NS("disagg"),
     ] = False
+    disaggregation_decode_retraction_backup: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Storage backend for KV preserved across PD decode retraction. "
+                "'cpu_tensor' uses per-request CPU tensors. 'host_pool' uses "
+                "a reserved HiCache pool and does not fall back on exhaustion. "
+                "If omitted, the backend is inferred from the decode KV pool."
+            ),
+            choices=["cpu_tensor", "host_pool"],
+        ),
+        NS("disagg"),
+    ] = None
     num_reserved_decode_tokens: A[
         int,
         "Number of decode tokens that will have memory reserved when adding new request to the running batch.",
@@ -3327,9 +3356,9 @@ class ServerArgs:
         (
             "Opt-in to the adaptive queue-based delay trigger (independent of the "
             "slot-based one). Delays prefill until the waiting queue reaches "
-            "min(running_req * ratio, max_prefill_bs) so small fragments batch "
-            "into a larger prefill. Unset (default) keeps the original slot-only "
-            "behavior. Typical: 0.1 ~ 0.5."
+            "min(running_req * ratio, prefill_max_requests), falling back to the "
+            "observed max_prefill_bs when no request limit is set. Unset (default) "
+            "keeps the original slot-only behavior. Typical: 0.1 ~ 0.5."
         ),
         NS("schedule"),
     ] = None
@@ -3589,6 +3618,7 @@ class ServerArgs:
         self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
+        self._handle_hicache_ratio_default()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -5496,7 +5526,6 @@ class ServerArgs:
                 envs.SGLANG_OPT_USE_TILELANG_INDEXER.set(True)
             elif is_hip():
                 envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-                envs.SGLANG_OPT_USE_FUSED_COMPRESS.set(True)
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
                 envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.set(False)
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
@@ -5984,15 +6013,44 @@ class ServerArgs:
 
         prefill_backend, decode_backend = self._resolved_attention_backends()
         if "trtllm_mha" in (prefill_backend, decode_backend):
-            if prefill_backend == "trtllm_mha" and not is_sm100_supported():
+            if prefill_backend == "trtllm_mha" and not (
+                is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
+            ):
                 raise ValueError(
-                    "TRTLLM MHA backend for prefill is only supported on Blackwell GPUs (SM100). Please use a different prefill backend."
+                    "TRTLLM MHA backend for prefill requires Hopper (SM90), Blackwell (SM100), or SM120 GPUs. "
+                    "Please use a different prefill backend."
+                )
+            if (
+                prefill_backend == "trtllm_mha"
+                and is_sm120_supported()
+                and (
+                    self.kv_cache_dtype == "fp8_e4m3"
+                    or (
+                        envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get()
+                        or 0.0
+                    )
+                    > 0
+                )
+            ):
+                raise ValueError(
+                    "TRTLLM FMHAv2 prefill on SM120 does not support "
+                    "fp8_e4m3 KV cache or skip-softmax."
                 )
             if decode_backend == "trtllm_mha" and not (
                 is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
             ):
                 raise ValueError(
                     "TRTLLM MHA backend for decode is only supported on Hopper (SM90), Blackwell (SM100) and (SM120) GPUs. Please use a different decode backend."
+                )
+            if (
+                prefill_backend == "trtllm_mha"
+                and not is_sm100_supported()
+                and (self.enable_prefill_context_parallel or self.attn_cp_size > 1)
+            ):
+                raise ValueError(
+                    "Prefill context parallelism with the TRTLLM MHA prefill backend "
+                    "requires SM100 (trtllm-gen context kernel): the SM90/SM120 "
+                    "fmha_v2 prefill path does not implement CP shard masking."
                 )
 
         run_post_process_pass(self, _attention_backend_fa3_fp8_fallback)
@@ -6679,11 +6737,14 @@ class ServerArgs:
                         prefill_cfg.max_bs
                     )
 
-        # The dp-lm-head validation moved to the resolution pipeline
-        # (arg_groups/overrides.py: _dp_lm_head_validation), invoked here at
-        # its legacy slot.
-        from sglang.srt.arg_groups.overrides import _dp_lm_head_validation
+        # Resolve the phase-aware TP LM-head default before validating the
+        # resulting DP/TP LM-head configuration.
+        from sglang.srt.arg_groups.overrides import (
+            _dp_lm_head_validation,
+            _tp_lm_head_all_to_all_default,
+        )
 
+        run_post_process_pass(self, _tp_lm_head_all_to_all_default)
         run_post_process_pass(self, _dp_lm_head_validation)
 
     def _handle_moe_kernel_config(self):
@@ -6871,10 +6932,6 @@ class ServerArgs:
         if self.enable_waterfill:
             self.enforce_shared_experts_fusion = True
             logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
-
-        if a2a_backend == "megamoe":
-            if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
-                envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
 
         if a2a_backend == "deepep":
             if self.moe_runner_backend == "flashinfer_cutedsl":
@@ -7335,6 +7392,10 @@ class ServerArgs:
                 "workloads and backends may be supported in a future change."
             )
 
+    def _handle_hicache_ratio_default(self):
+        if self.hicache_ratio is None and self.disaggregation_mode != "decode":
+            self.hicache_ratio = 2.0
+
     def _handle_hicache(self):
         """Normalize hicache-related knobs into a valid runtime configuration.
 
@@ -7346,6 +7407,10 @@ class ServerArgs:
         if not (
             self.enable_hierarchical_cache
             or self.disaggregation_decode_enable_offload_kvcache
+            or (
+                self.disaggregation_mode == "decode"
+                and self.disaggregation_decode_retraction_backup in (None, "host_pool")
+            )
         ):
             return
 
@@ -7990,41 +8055,6 @@ class ServerArgs:
             "1" if requested_transport == "cuda_ipc" else "0"
         )
 
-    def _handle_custom_all_reduce_v2_multinode(self):
-        # Custom all-reduce v2's graph zero-copy path uses IPC handles and is
-        # intra-node only. On MNNVL-fabric devices (GB200/GB300) the eager pull
-        # path works across nodes via the symm-mem workspace, so opt into the
-        # multinode mode automatically (a failed fabric rendezvous falls back
-        # to the legacy path at init). Elsewhere force-disable v2 on
-        # multi-node so the dispatch falls back to the legacy CustomAllreduce
-        # path, unless the MNNVL opt-in is set explicitly.
-        if self.nnodes <= 1 or not envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
-            return
-        if (
-            not envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.is_set()
-            and is_mnnvl_fabric_device()
-            # CustomAllReduceV2 supports world sizes 2..8 only
-            # (can_use_custom_all_reduce_v2 rejects larger groups); don't
-            # auto-opt-in a TP16+ launch just to fall back downstream.
-            and self.tp_size <= 8
-        ):
-            logger.info(
-                "MNNVL fabric device detected with nnodes=%d: enabling "
-                "custom all-reduce v2 multinode mode "
-                "(SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE=1; set it "
-                "to 0 to opt out).",
-                self.nnodes,
-            )
-            envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.set("1")
-        if not envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get():
-            if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set():
-                logger.warning(
-                    "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 because nnodes=%d "
-                    "(custom all-reduce v2 is intra-node only).",
-                    self.nnodes,
-                )
-            envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
-
     def _handle_environment_variables(self):
         self._handle_multimodal_feature_transport()
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
@@ -8036,7 +8066,6 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
-        self._handle_custom_all_reduce_v2_multinode()
         if self.enable_deterministic_inference:
             envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
         if self.debug_cuda_graph:
@@ -8084,6 +8113,32 @@ class ServerArgs:
                 envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
     def _handle_cache_compatibility(self):
+        if (
+            self.disaggregation_decode_retraction_backup == "host_pool"
+            and self.disaggregation_mode != "decode"
+        ):
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=host_pool is only "
+                "supported on a PD decode server."
+            )
+        if (
+            self.disaggregation_decode_retraction_backup == "host_pool"
+            and self.dcp_size > 1
+        ):
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=host_pool does not "
+                "support --dcp-size > 1."
+            )
+        if (
+            self.disaggregation_decode_retraction_backup == "host_pool"
+            and self.enable_priority_scheduling
+            and not self.disable_priority_preemption
+        ):
+            raise ValueError(
+                "--disaggregation-decode-retraction-backup=host_pool requires "
+                "--disable-priority-preemption when priority scheduling is enabled."
+            )
+
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(
                 "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
@@ -8098,6 +8153,12 @@ class ServerArgs:
             if self.hicache_storage_backend is None:
                 raise ValueError(
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported when hicache-storage-backend is provided."
+                )
+            if self.disaggregation_decode_retraction_backup == "host_pool":
+                raise ValueError(
+                    "The arguments disaggregation-decode-enable-offload-kvcache and "
+                    "disaggregation-decode-retraction-backup=host_pool are mutually exclusive: "
+                    "both build a decode host pool."
                 )
 
         # Validate the effective ratio: model branches may declare a reset

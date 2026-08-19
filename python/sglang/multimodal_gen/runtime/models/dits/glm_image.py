@@ -18,23 +18,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.diffusion.bitexact_gate import (
+from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
-    tensors_equal,
-)
-from sglang.kernels.ops.diffusion.fused_linear_gelu import (
-    can_fuse_linear_gelu,
-    fused_gelu_active,
-    fused_linear_gelu_tanh,
-    mark_fused_gelu_site,
-)
-from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
-from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
     can_use_fused_layernorm_modulate,
     can_use_fused_qk_head_layernorm,
+    can_use_linear_gelu,
+    fused_gelu_active,
     fused_layernorm_modulate,
+    fused_linear_gelu_tanh,
     fused_qk_head_layernorm,
     is_plain_layer_norm,
+    mark_fused_gelu_site,
+    residual_gate_add,
+    tensors_equal,
 )
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -456,7 +452,7 @@ class GlmImageGELU(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
+        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )

@@ -2,11 +2,18 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
 import transformers
+from torch import nn
 
+from sglang.multimodal_gen.runtime.layers.linear import LinearBase
+from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
     TextEncoderLoader,
+    _configure_text_encoder_quantization,
+    _process_quantized_text_encoder_weights,
 )
+from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
 )
@@ -100,6 +107,128 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
             {name: should_load(name) for name in expected},
             expected,
         )
+
+
+class TestTextEncoderQuantization(unittest.TestCase):
+    def setUp(self):
+        serialized = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+        )
+        self.quant_config_patcher = mock.patch(
+            "sglang.multimodal_gen.runtime.loader.component_loaders."
+            "text_encoder_loader.get_quant_config",
+            return_value=serialized,
+        )
+        self.get_quant_config = self.quant_config_patcher.start()
+        self.addCleanup(self.quant_config_patcher.stop)
+        self.serialized = serialized
+
+    def test_serialized_fp8_checkpoint_configures_h3_encoder(self):
+        model_config = SimpleNamespace(quant_config=None)
+        _configure_text_encoder_quantization(
+            model_config,
+            MiniMaxH3Qwen3VLEncoder,
+            {},
+            "/model/text_encoder",
+        )
+        self.assertIs(model_config.quant_config, self.serialized)
+
+    def test_encoder_class_must_opt_in(self):
+        model_config = SimpleNamespace(quant_config=None)
+        with self.assertRaisesRegex(ValueError, "does not support"):
+            _configure_text_encoder_quantization(
+                model_config,
+                TextEncoder,
+                {},
+                "/model/text_encoder",
+            )
+
+    def test_model_managed_quantization_bypasses_generic_lifecycle(self):
+        model_config = SimpleNamespace(quant_config=None)
+        with mock.patch.object(
+            TextEncoder,
+            "manages_checkpoint_quantization",
+            True,
+        ):
+            _configure_text_encoder_quantization(
+                model_config,
+                TextEncoder,
+                {},
+                "/model/text_encoder",
+            )
+
+        self.assertIsNone(model_config.quant_config)
+        self.get_quant_config.assert_not_called()
+
+
+class _RecordingQuantMethod:
+    def __init__(self, *, error: Exception | None = None):
+        self.error = error
+        self.devices = []
+
+    def process_weights_after_loading(self, layer):
+        self.devices.append(layer.weight.device)
+        if self.error is not None:
+            raise self.error
+
+
+class _QuantizedLinear(LinearBase):
+    def __init__(self, quant_method):
+        nn.Module.__init__(self)
+        self.weight = nn.Parameter(torch.empty(2, 2), requires_grad=False)
+        self.quant_method = quant_method
+
+
+class _QuantizedEncoder(nn.Module):
+    def __init__(self, quant_method):
+        super().__init__()
+        self.quantized = _QuantizedLinear(quant_method)
+        self.unquantized = nn.Linear(2, 2, bias=False)
+
+
+class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
+    def test_processes_quantized_layers_without_moving_the_model(self):
+        quant_method = _RecordingQuantMethod()
+        model = _QuantizedEncoder(quant_method)
+
+        processed = _process_quantized_text_encoder_weights(
+            model,
+            torch.device("cpu"),
+        )
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(quant_method.devices, [torch.device("cpu")])
+        self.assertEqual(model.unquantized.weight.device, torch.device("cpu"))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_stages_only_the_quantized_layer_and_restores_it(self):
+        quant_method = _RecordingQuantMethod()
+        model = _QuantizedEncoder(quant_method)
+
+        processed = _process_quantized_text_encoder_weights(
+            model,
+            torch.device("cuda", torch.cuda.current_device()),
+        )
+
+        self.assertEqual(processed, 1)
+        self.assertEqual(quant_method.devices[0].type, "cuda")
+        self.assertEqual(model.quantized.weight.device, torch.device("cpu"))
+        self.assertEqual(model.unquantized.weight.device, torch.device("cpu"))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_restores_staged_layer_when_postprocess_fails(self):
+        model = _QuantizedEncoder(_RecordingQuantMethod(error=RuntimeError("boom")))
+
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            _process_quantized_text_encoder_weights(
+                model,
+                torch.device("cuda", torch.cuda.current_device()),
+            )
+
+        self.assertEqual(model.quantized.weight.device, torch.device("cpu"))
+        self.assertEqual(model.unquantized.weight.device, torch.device("cpu"))
 
 
 if __name__ == "__main__":
