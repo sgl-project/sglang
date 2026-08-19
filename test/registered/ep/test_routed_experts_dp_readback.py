@@ -95,6 +95,10 @@ class _ReadbackMixin:
             "--disable-radix-cache",
             "--mem-fraction-static",
             "0.5",
+            # dp2 halves this to a per-rank 256 to match the dispatch-token
+            # caps below; DeepEP v2 rejects a larger per-rank prefill budget.
+            "--chunked-prefill-size",
+            "512",
             *cls.backend_args,
         ]
         cls.process = popen_launch_server(
