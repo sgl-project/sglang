@@ -22,9 +22,12 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestShouldMixDllmBatches(CustomTestCase):
-    def _gate(self, prefill: int, decode: int, capacity: int) -> bool:
+    def _gate(self, prefill: int, decode: int, capacity: int, preempt: bool = False):
         return SchedulerDllmMixin._should_mix_dllm_batches(
-            num_prefill_reqs=prefill, num_decode_reqs=decode, round_capacity=capacity
+            num_prefill_reqs=prefill,
+            num_decode_reqs=decode,
+            round_capacity=capacity,
+            priority_preemption_enabled=preempt,
         )
 
     def test_mixes_when_prefill_leaves_room_for_decode(self):
@@ -46,6 +49,14 @@ class TestShouldMixDllmBatches(CustomTestCase):
     def test_declines_when_the_round_has_no_capacity(self):
         # running_batch already holds max_running_reqs rows.
         self.assertFalse(self._gate(prefill=2, decode=5, capacity=0))
+
+    def test_declines_when_priority_preemption_is_enabled(self):
+        # The mixed path does not attempt preemption when the round fills, so
+        # taking it under --enable-priority-scheduling would silently drop a
+        # feature the either/or path provides. Same inputs as the mixing case
+        # above, so only the preemption flag decides.
+        self.assertTrue(self._gate(prefill=2, decode=5, capacity=8, preempt=False))
+        self.assertFalse(self._gate(prefill=2, decode=5, capacity=8, preempt=True))
 
 
 if __name__ == "__main__":
