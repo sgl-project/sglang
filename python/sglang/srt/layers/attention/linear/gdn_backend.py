@@ -901,6 +901,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # index (valid slots start at 0), so the kernel's "null block"
             # sentinel is -1, not the vLLM default of 0.
             null_block_id=-1,
+            # Capacity folds are committed once across every GDN layer after
+            # acceptance; the active path is therefore a single launch/layer.
+            launch_mode="verify",
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)
