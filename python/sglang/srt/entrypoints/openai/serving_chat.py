@@ -1877,7 +1877,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
                 hidden_states=hidden_states,
                 prompt_token_ids=choice_prompt_token_ids,
-                token_ids=choice_token_ids,
+                response_token_ids=choice_token_ids,
                 meta_info=choice_meta_info,
             )
             choices.append(choice_data)
@@ -2007,15 +2007,25 @@ class OpenAIServingChat(OpenAIServingBase):
             parser = FunctionCallParser(
                 tools, self.tool_call_parser, tokenizer=self.tokenizer_manager.tokenizer
             )
-            should_try_parser = (
-                not is_required
-                or parser.detector.supports_structural_tag()
+            detector_owns_format = (
+                parser.detector.supports_structural_tag()
                 or parser.detector.parses_required_natively()
             )
+            should_try_parser = not is_required or detector_owns_format
             if should_try_parser and parser.has_tool_call(text):
                 try:
                     text, call_info_list = parser.parse_non_stream(text)
                     if not call_info_list:
+                        logger.warning(
+                            "Tool call marker present but no complete call parsed "
+                            "from %s output; dropping the incomplete call",
+                            self.tool_call_parser,
+                        )
+                        logger.debug(
+                            "Unparsed tool call output (%d chars): %r",
+                            len(text),
+                            text[:2000],
+                        )
                         return ToolCallProcessingResult(None, text, finish_reason)
 
                     tool_calls = []
@@ -2041,6 +2051,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     logger.error(f"Tool call parsing error: {e}")
                     return ToolCallProcessingResult(None, text, finish_reason)
 
+            if is_required and detector_owns_format:
+                logger.warning(
+                    "Required tool call missing from %s output (%d chars)",
+                    self.tool_call_parser,
+                    len(text),
+                )
+                logger.debug("Unparsed required tool call output: %r", text[:2000])
+                return ToolCallProcessingResult(None, text, finish_reason)
+
         # json_schema constraint → JSON array output for required/named
         if is_required:
             original_finish_type = finish_reason["type"]
@@ -2049,12 +2068,28 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason["matched"] = None
             try:
                 tool_call_data = orjson.loads(text)
+                if isinstance(tool_call_data, dict):
+                    tool_call_data = [tool_call_data]
+                if not isinstance(tool_call_data, list):
+                    raise ValueError(
+                        "expected a JSON array of tool calls, got "
+                        f"{type(tool_call_data).__name__}"
+                    )
+                if not all(
+                    isinstance(tool, dict) and "name" in tool for tool in tool_call_data
+                ):
+                    raise ValueError(
+                        "every tool call must be a JSON object with a 'name'"
+                    )
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
+                    parameters = json.dumps(
+                        tool.get("parameters", {}), ensure_ascii=False
+                    )
                     call_info = ToolCallItem(
                         tool_index=i,
                         name=tool["name"],
-                        parameters=json.dumps(tool["parameters"], ensure_ascii=False),
+                        parameters=parameters,
                     )
                     tool_id = self._process_tool_call_id(
                         call_info, history_tool_calls_cnt
@@ -2065,15 +2100,14 @@ class OpenAIServingChat(OpenAIServingBase):
                             index=i,
                             function=FunctionResponse(
                                 name=tool["name"],
-                                arguments=json.dumps(
-                                    tool["parameters"], ensure_ascii=False
-                                ),
+                                arguments=parameters,
                             ),
                         )
                     )
                 return ToolCallProcessingResult(tool_calls, "", finish_reason)
             except Exception as e:
                 logger.error(f"Tool call parsing error: {e}")
+                logger.debug("Unparsed required tool call output: %r", text[:2000])
                 finish_reason["type"] = original_finish_type
                 return ToolCallProcessingResult(None, text, finish_reason)
 
