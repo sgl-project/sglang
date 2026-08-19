@@ -134,11 +134,7 @@ jobs:
   # of publish failed; legs without an artifact will fail at download and be
   # the only ones marked red.
   push_local_registry:
-    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' }}
-    # Best-effort, for the same reason as the ROCm 7.0 nightly workflow: AMD CI
-    # falls back to Docker Hub for any tag the mirror is missing, so this must
-    # never turn image publication red.
-    continue-on-error: true
+    if: ${{ false }}
     runs-on: linux-mi300-1gpu-sglang
     environment: 'prod'
     needs: publish
@@ -169,11 +165,9 @@ jobs:
           password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
       - name: Mirror rocm/sgl-dev to local registry
-        env:
-          MIRROR_REGISTRY: ${{ vars.AMD_CI_DOCKER_REGISTRY_MIRROR || '10.44.14.109:5000' }}
         run: |
-          src="rocm/sgl-dev:${IMAGE_TAG}"
-          dst="${MIRROR_REGISTRY}/rocm/sgl-dev:${IMAGE_TAG}"
+          src="rocm/sgl-dev:${{ env.IMAGE_TAG }}"
+          dst="10.44.14.109:5000/rocm/sgl-dev:${{ env.IMAGE_TAG }}"
           docker pull "${src}"
           docker tag "${src}" "${dst}"
           docker push "${dst}"
