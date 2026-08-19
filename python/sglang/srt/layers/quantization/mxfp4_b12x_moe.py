@@ -25,8 +25,8 @@ MoE surface matches the released wheel::
 
 (``--no-deps``: b12x's metadata pulls a newer torch and breaks the rest of the
 image.) Later b12x generations changed the W4A16 kernels (0.20.0) and then the
-API (1.2.x); they are rejected at startup rather than silently producing
-different numerics -- see :func:`_require_015_generation`.
+API (1.2.x); anything but 0.15.3 is rejected at startup rather than silently
+producing different numerics -- see :func:`_check_b12x_version`.
 """
 
 from __future__ import annotations
@@ -95,35 +95,28 @@ def is_b12x_available() -> bool:
         return False
 
 
-def _require_015_generation() -> None:
-    """Reject b12x generations other than 0.15.x, loudly and at load time.
+def _check_b12x_version() -> None:
+    """This backend is validated against b12x 0.15.3, and only 0.15.3.
 
-    0.20.0 rewrote the W4A16 kernels behind the same ``b12x.integration``
-    API (different numerics), and the 1.2.x line replaced the API as well
-    (``b12x.moe.fused_moe``). This backend is validated against 0.15.3 only.
-    A raw source tree without dist-info cannot be version-checked; the
-    ``fused_moe`` probe still rejects the 1.2.x line there.
+    Later generations rewrote the W4A16 kernels behind the same
+    ``b12x.integration`` API (0.20.0) and then replaced the API (1.2.x), so a
+    version mismatch must fail here rather than surface as different numerics.
+    A source tree without dist-info cannot be checked and is trusted to be the
+    pinned 0.15.3.
     """
     import importlib.metadata
 
-    import b12x
-
-    try:
-        import b12x.moe.fused_moe  # noqa: F401  # the 1.2.x-generation API
-
-        has_fused_moe = True
-    except ImportError:
-        has_fused_moe = False
-    version = None
     try:
         version = importlib.metadata.version("b12x")
     except importlib.metadata.PackageNotFoundError:
-        pass
-    if has_fused_moe or (version is not None and not version.startswith("0.15.")):
+        return
+    if version != "0.15.3":
+        import b12x
+
         raise RuntimeError(
-            f"b12x at {b12x.__file__} (version {version or 'unknown'}) is not "
-            "the 0.15.x generation this backend is validated against. "
-            f"Install the pinned source commit: {_B12X_INSTALL_HINT}"
+            f"b12x at {b12x.__file__} is version {version}; this backend is "
+            "validated against 0.15.3 only. Install the pinned source commit: "
+            f"{_B12X_INSTALL_HINT}"
         )
 
 
@@ -292,7 +285,7 @@ class Mxfp4B12xMoEMethod:
                 "The b12x MoE backend needs the 0.15.3-generation b12x "
                 f"package: {_B12X_INSTALL_HINT}"
             )
-        _require_015_generation()
+        _check_b12x_version()
         if not is_sm120_supported():
             raise RuntimeError("Mxfp4B12xMoEMethod requires SM120 or SM121.")
         self._fp8 = fp8_method
