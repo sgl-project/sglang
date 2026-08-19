@@ -55,6 +55,7 @@ from sglang.srt.configs.qwen3_5 import (
 )
 from sglang.srt.configs.qwen3_asr import Qwen3ASRConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
+from sglang.srt.configs.spark3 import Spark3Config
 from sglang.srt.configs.step3_vl import (
     Step3TextConfig,
     Step3VisionEncoderConfig,
@@ -114,6 +115,7 @@ __all__ = [
     "Step3p5Config",
     "MiniMaxM3VLConfig",
     "Step3p7Config",
+    "Spark3Config",
     "Qwen3ASRConfig",
     "InklingAudioConfig",
     "InklingMMConfig",
