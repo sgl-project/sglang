@@ -530,7 +530,7 @@ class TextEncoderLoader(ComponentLoader):
             )
             component_starts_on_cpu = False
 
-        if component_starts_on_cpu and not current_platform.is_mps():
+        if component_starts_on_cpu:
             model_device = torch.device("cpu")
         else:
             model_device = local_torch_device
@@ -559,6 +559,12 @@ class TextEncoderLoader(ComponentLoader):
                 )
             model.bind_encoder_tp_group(encoder_tp_group)
 
+            if current_platform.is_mps() and component_starts_on_cpu:
+                # the h3 encoder is layered immediately after this loader returns
+                # compatible CPU safetensors stay mapped instead of copying the
+                # full Qwen checkpoint into unified memory
+                model._mps_zero_copy_weight_loading = True
+
             weights_to_load = {name for name, _ in model.named_parameters()}
             loaded_weights = model.load_weights(
                 self._get_all_weights(
@@ -581,7 +587,10 @@ class TextEncoderLoader(ComponentLoader):
 
             if component_starts_on_cpu:
                 if current_platform.is_mps():
-                    model = model.to(local_torch_device)
+                    logger.info(
+                        "Keeping %s on CPU for MPS layerwise offload",
+                        model.__class__.__name__,
+                    )
                 else:
                     model = model.to("cpu")
             else:

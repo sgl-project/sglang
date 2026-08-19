@@ -525,11 +525,9 @@ class MoEGate(nn.Module):
                 return linear_bf16_fp32(hidden_states, self.weight)
             return F.linear(hidden_states, self.weight, None)
         else:
-            # NOTE(b8zhong): this threshold has been empirically verified
-            max_router_gemm_tokens = 4 if _device_sm in (100, 103) else 16
             if (
                 _is_cuda
-                and hidden_states.shape[0] <= max_router_gemm_tokens
+                and hidden_states.shape[0] <= 16
                 and hidden_states.shape[1] % 1024 == 0
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
@@ -1230,7 +1228,9 @@ class DeepseekV2MoE(nn.Module):
             ),  # block_size
             True,  # is_vnni
         )
-        if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 

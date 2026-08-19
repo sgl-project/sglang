@@ -73,6 +73,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     build_nvfp4_config_from_safetensors_list,
     get_quant_config,
@@ -499,6 +500,37 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertTrue(config.load_in_4bit)
         self.assertEqual(config.bnb_4bit_quant_type, "nf4")
 
+    def test_fp8_quant_config_resolves_from_text_config(self):
+        config = get_quant_config(
+            {
+                "text_config": {
+                    "quantization_config": {
+                        "quant_method": "fp8",
+                        "activation_scheme": "dynamic",
+                    }
+                }
+            },
+            "/unused/component/path",
+        )
+
+        self.assertIsInstance(config, Fp8Config)
+        self.assertTrue(config.is_checkpoint_fp8_serialized)
+
+    def test_bitsandbytes_quant_config_resolves_from_compression_config(self):
+        config = get_quant_config(
+            {
+                "compression_config": {
+                    "quant_method": "bitsandbytes",
+                    "load_in_4bit": True,
+                    "bnb_4bit_quant_storage": "uint8",
+                }
+            },
+            "/unused/component/path",
+        )
+
+        self.assertEqual(config.get_name(), "bitsandbytes")
+        self.assertTrue(config.load_in_4bit)
+
     def test_nvfp4_safetensors_inference_ignores_fp8_fallback_scales(self):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
             save_file(
@@ -661,14 +693,18 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             ],
         )
 
-        block = FluxSingleTransformerBlock(
-            dim=64,
-            num_attention_heads=4,
-            attention_head_dim=16,
-            mlp_ratio=2.0,
-            quant_config=quant_config,
-            prefix="single_transformer_blocks.0",
-        )
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant.current_platform.get_device_capability",
+            return_value=DeviceCapability(10, 0),
+        ):
+            block = FluxSingleTransformerBlock(
+                dim=64,
+                num_attention_heads=4,
+                attention_head_dim=16,
+                mlp_ratio=2.0,
+                quant_config=quant_config,
+                prefix="single_transformer_blocks.0",
+            )
 
         self.assertEqual(block.proj_mlp.prefix, "single_transformer_blocks.0.proj_mlp")
         self.assertEqual(block.proj_out.prefix, "single_transformer_blocks.0.proj_out")

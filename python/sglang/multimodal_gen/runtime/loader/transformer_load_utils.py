@@ -17,6 +17,7 @@ import torch
 from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME
 from torch import nn
 
+from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
     _patch_nunchaku_scales,
@@ -47,7 +48,6 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
 )
-from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.utils.hf_transformers import (
     check_gguf_file,
     resolve_hf_gguf_reference,
