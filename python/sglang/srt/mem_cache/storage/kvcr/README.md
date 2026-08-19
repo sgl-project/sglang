@@ -78,6 +78,44 @@ Three settings are load-bearing and easy to get wrong:
 - **Keep the host pool at least as large as the device pool.** See "Known
   issues" below; this one stops offload permanently.
 
+### Sizing the two tiers together
+
+`--hicache-size` and `--mem-fraction-static` must be chosen as a pair. They are
+squeezed from both sides by the two independent limits below, and both failure
+modes are quiet:
+
+- Too *small* a host tier relative to the device tier trips known issue 1 —
+  offload stops for the life of the process.
+- Too *large* a `local_dram_bytes` trips known issue 3 — the worker refuses to
+  start with `KVCR progress thread did not start`.
+
+The trap is that backing away from one walks into the other. Shrinking
+`--hicache-size` to dodge the startup failure shrinks the *host* pool while the
+device pool stays where `--mem-fraction-static` put it, and the host pool
+silently becomes the smaller of the two. That reads as "P2P is broken on this
+branch": the stack is healthy, both workers register, hints are advertised, and
+every fetch returns nothing because nothing was ever deposited. Lower
+`--mem-fraction-static` in the same step.
+
+Read the two pool sizes back out of the worker log rather than computing them —
+the device pool depends on model and dtype, and the warning only fires for the
+inequality, not for a margin too thin to be useful:
+
+```
+KV Cache is allocated. ... #tokens: 46848        <- device pool
+Allocating kv hierarchical KV host pool: 54272 tokens, 8.00 GB host memory.
+```
+
+Two configurations verified end to end on Qwen3-8B / 80 GB cards:
+
+| `--mem-fraction-static` | `--hicache-size` | `local_dram_bytes` | device / host tokens |
+|---|---|---|---|
+| 0.20 | 16 | 8 GiB | fits, original run |
+| 0.16 | 8 | 4 GiB | 46848 / 54272 |
+
+A `WARN ... host pool (N tokens) is smaller than the device pool (M tokens)` at
+startup means offload will never fire. It is worth treating as fatal.
+
 To confirm P2P actually happened, send the same long prompt to worker A then to
 worker B and read `usage.prompt_tokens_details.cached_tokens` on B's response.
 Non-zero means B served tokens it never computed. The backend also logs
@@ -93,12 +131,27 @@ optimistic by design (it marks a page available whenever the hint covers it,
 because the destination cannot verify the source still holds it), so
 `exists_with_hint` alone proves nothing.
 
+**That line lags, and reading it too early will mislead you.** Counters are
+flushed at most once per `_STATS_LOG_INTERVAL_S` (30 s), and only from inside
+`_note` — so the last line in the log is not "the state now", it is the state as
+of the last counted event that happened to fall after an interval boundary. A
+single test run typically ends *before* its own counters are flushed, leaving a
+stale snapshot from the previous run as the newest line. That is easy to read as
+a failure that already happened.
+
+Either run the test twice, or sleep 35 s and trigger one more request before
+reading. Counters are cumulative per process, so a second run's line is a
+superset — no state is lost by waiting, only by not waiting.
+
 ## What has been verified
 
 **Functional**
 
 - Two instances, dynamo-routed, hint-driven remote fetch: 4/4 runs, with the
   full causal chain in the logs (31 blocks × 64 = 1984 `cached_tokens`).
+  Re-verified against `nvidia-kvcr` `873391c` after the rename, 2/2, counters
+  showing no shortfall anywhere in the chain: source `deposit_pages_stored=64`,
+  destination `hinted_pages_requested=62 hinted_pages_loaded=62`.
 - TP=2. Found and fixed two silent per-rank bugs on the way (a bind collision,
   and both ranks dialing the same source port) — the symptom was correct-looking
   output built from the wrong shard, so the test compares generated text, not
@@ -119,7 +172,7 @@ distinct prefixes each. Established that the collapse we saw is the HiCache
 sizing issue below, and *not* `local_dram_bytes`.
 
 **Unit** — `test/registered/mem_cache/test_kvcr_*.py` and
-`test_hicache_offload_stall.py`, 62 passing in-container.
+`test_hicache_offload_stall.py`, 78 passing in-container against `873391c`.
 
 ## Known issues
 
@@ -133,7 +186,11 @@ sizing issue below, and *not* `local_dram_bytes`.
    This is upstream HiRadixCache behaviour, not backend-specific — but it is
    silent, so this branch adds a warning (`HiCache host pool is full and nothing
    is evictable`). Diagnostic signature: `deposit_pages_offered` frozen while
-   `exists_calls` keeps climbing.
+   `exists_calls` keeps climbing — or, if offload never started at all,
+   `deposit_pages_offered` absent from the counter line entirely. Note this
+   presents as a *remote-hint* failure even though nothing about the hint path
+   is wrong; see "Sizing the two tiers together" above, and mind that backing
+   away from issue 3 is the usual way to arrive here.
 
 2. **A peer restart costs ~34 s of degraded P2P** (KVCR-side; reported
    separately). Transient and self-healing, no wrong answers, no operator
@@ -142,7 +199,11 @@ sizing issue below, and *not* `local_dram_bytes`.
 
 3. **`local_dram_bytes` ≥ 32 GiB fails to start** — NIXL registration exceeds
    KVCR's 10 s progress-thread join timeout (`RuntimeError: KVCR progress thread
-   did not start`). 14.9 GiB is fine; the threshold is somewhere between.
+   did not start`). 14.9 GiB is fine; the threshold is somewhere between. The
+   timeout (`_JOIN_TIMEOUT_SECONDS` in `kvcr/progress.py`) has been 10 s since
+   at least kvcc `e3a816e`, so hitting this after a core bump is not evidence of
+   a regression. When shrinking to get past it, shrink
+   `--mem-fraction-static` too — otherwise you land on issue 1.
 
 4. **The source offers no framework memory as a NIXL source.** `pin_adapter.py`
    declines every pin request: pinning a HiCache host page safely needs a
@@ -151,8 +212,10 @@ sizing issue below, and *not* `local_dram_bytes`.
    KVCR's own tier, where its refcount holds the slot for the duration of the
    write. Cost is a miss, never a wrong result.
 
-5. **Not benchmarked.** Every run above is a correctness run. No throughput or
-   accuracy numbers against a real dataset yet.
+5. **Benchmarked only on two models.** Dense Qwen3-8B showed +53–59% qps and
+   −50% TTFT, but only once the distinct working set exceeded the device pool;
+   an FP8 MoE model showed +20% on the same harness. Do not extrapolate the
+   dense number — and note both were taken before the KVCR rename.
 
 ## Where to look in the code
 
