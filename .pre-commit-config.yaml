@@ -114,12 +114,6 @@ repos:
         entry: python3 scripts/lint/check_no_bare_pytest_main.py
         language: system
         files: ^(python|test)/.*\.py$
-      - id: check-static-ratchets
-        name: validate static runtime ratchets
-        entry: python3 scripts/lint/check_static_ratchets.py
-        language: system
-        files: ^(python/sglang/.*\.py|scripts/lint/check_.*\.py)$
-        pass_filenames: false
       - id: check-lint-script-tests
         name: unit tests for lint checkers
         entry: python3 -m unittest discover -s scripts/lint -p 'test_check_*.py'

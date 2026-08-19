@@ -383,6 +383,7 @@ def fused_moe_kernel(
     FUSE_SUM_ALL_REDUCE: tl.constexpr,
     LORA_PRESERVE_BASE: tl.constexpr,
     ROUTER_TOPK: tl.constexpr,
+    FUSE_SWIGLU: tl.constexpr = False,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -442,6 +443,12 @@ def fused_moe_kernel(
     off_experts = off_experts_i32.to(tl.int64)
 
     if filter_expert and off_experts == -1:
+        if FUSE_SWIGLU:
+            # C is the half-width post-activation buffer here. Rows owned by a
+            # filtered expert are never read (the down-GEMM CTA for this block
+            # early-exits before loading A), and an N-wide zero store would run
+            # past the row end into a neighboring token's data.
+            return
         if not FUSE_ADD_TO_OUTPUT and not (FUSE_SUM_ALL_REDUCE and LORA_PRESERVE_BASE):
             # Write zeros only when this kernel owns the full output; the experimental LoRA
             # add path (LORA_PRESERVE_BASE) keeps the base output from the prior MoE kernel.
@@ -608,7 +615,57 @@ def fused_moe_kernel(
     # Write back the block of the output
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 
-    if FUSE_ADD_TO_OUTPUT:
+    if FUSE_SWIGLU:
+        # W13 rows were interleaved at load time, so gate/up of the same
+        # intermediate channel sit in adjacent (even, odd) columns of this
+        # tile; silu(gate) * up is applied in-register and only the
+        # half-width activation is stored, eliminating intermediate_cache1
+        # and the standalone activation launch.
+        #
+        # The asm below is the bit-parity contract with the `silu_and_mul` this
+        # replaces, not an optimization: that kernel uses the fast-math
+        # intrinsics `__fdividef(x, 1 + __expf(-x))`, while Triton's operators
+        # lower to accurate expf and IEEE `div.rn`. The 1-2 ULP gap is enough to
+        # flip the stored bf16 (8 mantissa bits) on many inputs. The final
+        # multiply needs no asm -- plain fp32 multiply matches `mul.ftz.f32`
+        # except on denormals. Silu stays fp32 until the store, as in the
+        # reference; rounding it to bf16 first double-rounds and diverges.
+        acc_pairs = tl.reshape(accumulator, (BLOCK_SIZE_M, BLOCK_SIZE_N // 2, 2))
+        gate_b, up_b = tl.split(acc_pairs)
+        gate_f = gate_b.to(tl.float32)
+        # __expf(-x) == ex2.approx(x * -log2(e)); folding the negation into
+        # the constant (0fBFB8AA3B == -log2(e)) flips the sign exactly.
+        exp_neg = tl.inline_asm_elementwise(
+            "{ mul.ftz.f32 $0, $1, 0fBFB8AA3B; ex2.approx.ftz.f32 $0, $0; }",
+            "=f,f",
+            [gate_f],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        silu_f = tl.inline_asm_elementwise(
+            "div.approx.ftz.f32 $0, $1, $2;",
+            "=f,f,f",
+            [gate_f, 1.0 + exp_neg],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        out_act = (silu_f * up_b.to(tl.float32)).to(compute_type)
+        offs_half = pid_n * (BLOCK_SIZE_N // 2) + tl.arange(0, BLOCK_SIZE_N // 2)
+        if c_sorted:
+            c_ptrs = (
+                c_ptr
+                + stride_cm * offs_token_id[:, None]
+                + stride_cn * offs_half[None, :]
+            )
+        else:
+            c_ptrs = (
+                c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_half[None, :]
+            )
+        c_mask = token_mask[:, None] & (offs_half[None, :] < N // 2)
+        tl.store(c_ptrs, out_act, mask=c_mask)
+    elif FUSE_ADD_TO_OUTPUT:
         # Accumulate into existing output with per-token mask.
         offs_token_out = offs_token // ROUTER_TOPK
         add_mask = tl.load(add_mask_ptr + offs_token_out, mask=token_mask, other=False)
@@ -745,9 +802,22 @@ def invoke_fused_moe_kernel(
     add_output_mask: Optional[torch.Tensor] = None,
     mask_output: bool = False,
     lora_preserve_base: bool = False,
+    fuse_swiglu: bool = False,
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+
+    if fuse_swiglu:
+        # The epilogue assumes an interleaved-gate/up bf16 up-GEMM writing a
+        # plain half-width output; every other output flavor is out of scope.
+        # In particular the LoRA output paths (fuse_add_to_output / mask_output)
+        # address C at full width N and would corrupt the half-width buffer.
+        assert not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        assert bias is None
+        assert not mul_routed_weight
+        assert not (fuse_add_to_output or mask_output or fuse_sum_all_reduce)
+        assert not lora_preserve_base
+        assert compute_type == tl.bfloat16
 
     if use_fp8_w8a8:
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
@@ -958,6 +1028,7 @@ def invoke_fused_moe_kernel(
             FUSE_ADD_TO_OUTPUT=fuse_add_to_output,
             MASK_OUTPUT=mask_output,
             LORA_PRESERVE_BASE=lora_preserve_base,
+            FUSE_SWIGLU=fuse_swiglu,
             FUSE_SUM_ALL_REDUCE=fuse_sum_all_reduce,
             ROUTER_TOPK=router_topk,
             **config,
@@ -1258,8 +1329,11 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     shared_id_base,  # runtime scalar: ep_rank * num_local_experts + num_local_routed
     num_local_routed,  # runtime scalar: routed experts per rank (for gap-insertion)
     scale_factor,  # runtime scalar: shared-expert weight
+    num_token_non_padded_ptr,  # 1-elem int tensor; only read when HAS_PADDING
+    pad_fill_id,  # runtime scalar: routed-id fill for padded rows
     K: tl.constexpr,
     S: tl.constexpr,
+    HAS_PADDING: tl.constexpr,
 ):
     """Append shared experts AND apply the DeepEP interleaved remap in one pass.
 
@@ -1285,6 +1359,14 @@ def _fused_append_remap_shared_experts_deepep_kernel(
     # precede it. Matches `routed + routed // num_local_routed` exactly.
     ids = ids + ids // num_local_routed
 
+    if HAS_PADDING:
+        # Fold the padded-topk_ids fill (previously a separate _fill_padded_rows
+        # launch): rows >= num_token_non_padded get pad_fill_id in every routed
+        # slot. Matches the old fill(topk_ids=0) -> remap(0)=0 when pad_fill_id==0.
+        n_valid = tl.load(num_token_non_padded_ptr)
+        if pid >= n_valid:
+            ids = tl.full((K,), pad_fill_id, dtype=ids.dtype)
+
     tl.store(out_ids_ptr + out_ids_row_ptr + offs_k, ids)
     tl.store(out_weights_ptr + out_ids_row_ptr + offs_k, ws)
 
@@ -1303,6 +1385,8 @@ def fused_append_remap_shared_experts_deepep(
     scale_factor,
     shared_id_base,
     num_local_routed,
+    num_token_non_padded=None,
+    pad_fill_id=0,
 ):
     """Fused append + DeepEP remap (see kernel docstring).
 
@@ -1320,6 +1404,9 @@ def fused_append_remap_shared_experts_deepep(
         (m, k + s), dtype=topk_weights.dtype, device=topk_weights.device
     )
 
+    has_padding = num_token_non_padded is not None
+    # Placeholder pointer when no padding (never dereferenced: HAS_PADDING False).
+    ntnp_ptr = num_token_non_padded if has_padding else topk_ids
     _fused_append_remap_shared_experts_deepep_kernel[(m,)](
         topk_ids,
         topk_weights,
@@ -1328,8 +1415,11 @@ def fused_append_remap_shared_experts_deepep(
         shared_id_base,
         num_local_routed,
         scale_factor,
+        ntnp_ptr,
+        pad_fill_id,
         K=k,
         S=s,
+        HAS_PADDING=has_padding,
         num_warps=1,
     )
     return out_ids, out_weights
