@@ -1770,8 +1770,9 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         if rope_double_precision and _is_npu:
             logger.warning(
-                f"Double precision is not supported by NPU. Use float32 for RoPE."
+                f"Ascend backend does not support float64 for RoPE until now. Falling back to float32."
             )
+            rope_double_precision = False
 
         self.quantize_video_rope_coords_to_hidden_dtype = bool(
             hf_config.get("quantize_video_rope_coords_to_hidden_dtype", False)
