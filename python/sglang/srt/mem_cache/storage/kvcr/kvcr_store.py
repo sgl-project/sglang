@@ -52,13 +52,14 @@ hashes and will need to reconcile page-hash <-> segment identity.
 
 from __future__ import annotations
 
+import functools
 import logging
 import socket
 import threading
 import time
 import uuid
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import msgspec
 import torch
@@ -81,7 +82,15 @@ from kvcr.config import (
     RemoteFWDramOptions,
 )
 from kvcr.peer_control_channel import ZmqPeerControlChannel
-from kvcr.types import BlockKey, MemDescriptor, QueryStatus
+from kvcr.policy import (
+    FIFOPolicy,
+    G3FIFOPolicy,
+    G3LRUPolicy,
+    KVCachePolicy,
+    LRUPolicy,
+)
+from kvcr.types import BlockKey, MemDescriptor, OpEntryStatus, QueryStatus
+from sglang.srt.utils import dynamic_import
 from sglang.srt.mem_cache.storage.kvcr.kvcr_config import KVCRBackendConfig
 from sglang.srt.mem_cache.storage.kvcr.pin_adapter import NoFrameworkPinning
 from sglang.srt.mem_cache.storage.kvcr.router_hint import (
@@ -148,6 +157,103 @@ def _require_kvcr_api() -> None:
             "backend tracks the kvcr core's current API; upgrade nvidia-kvcr "
             "or use a SGLang revision matching your kvcr."
         )
+
+
+# Placement/eviction policies selectable by name from extra_config. Mirrors the
+# same table on the vLLM side so a name means the same thing in both engines'
+# configs and an A/B is comparable across them.
+_BUILTIN_POLICIES: Dict[str, type] = {
+    "fifo": FIFOPolicy,
+    "lru": LRUPolicy,
+    "g3_fifo": G3FIFOPolicy,
+    "g3_lru": G3LRUPolicy,
+}
+
+
+def _resolve_policy(name: str) -> KVCachePolicy:
+    """Build the policy named in extra_config.
+
+    The core picks its own default when handed ``None``, and that default is not
+    a stable interface -- it moved from FIFO to LRU in kvcc e3a816e. So this
+    backend always names one, and the name is what gets logged and recorded
+    alongside a benchmark number.
+    """
+    policy_type = _BUILTIN_POLICIES.get(name)
+    if policy_type is None:
+        if "." not in name:
+            raise ValueError(
+                f"KVCRStore: unknown policy {name!r}. Supported: "
+                f"{sorted(_BUILTIN_POLICIES)}; an external policy must be given "
+                "as a fully qualified module.Class path."
+            )
+        policy_type = dynamic_import(name)
+        if not isinstance(policy_type, type) or not issubclass(
+            policy_type, KVCachePolicy
+        ):
+            raise TypeError(f"KVCRStore: {name} is not a KVCachePolicy subclass")
+    return policy_type()
+
+
+# How often a fault escaping into the HiCacheStorage surface is logged with its
+# traceback. The guard exists for repeatable faults (a peer that stays down, a
+# core in a bad state), so one traceback per prefetch would be the loudest thing
+# in the log while saying nothing new after the first.
+_FAULT_LOG_INTERVAL_S = 30.0
+
+
+def _fail_closed(on_error):
+    """Never let an exception out of a ``HiCacheStorage`` entry point.
+
+    HiCache's three storage threads (``prefetch_thread_func``,
+    ``prefetch_io_aux_func``, ``backup_thread_func``) each catch only ``Empty``.
+    Anything else ends the thread, and they are unsupervised daemons, so one
+    exception disables L2 and L3 for the life of the process -- and does it
+    silently, since every later request just reports a cache miss.
+
+    It is not only a lost cache. Those loops are the only ones that give back
+    what they reserved: ``prefetch_io_aux_func`` calls
+    ``append_host_mem_release`` (without it ``prefetch_tokens_occupied`` climbs
+    until the rate limiter blocks all prefetching, permanently), and
+    ``backup_thread_func`` is the sole producer for ``ack_backup_queue`` (without
+    it ``HiRadixCache`` never calls ``entry.release_host()`` and backed-up nodes
+    pin host pages forever). ``test_hicache_storage_thread_survival.py`` drives
+    the real loops to pin all three down.
+
+    So a fault degrades to "this batch missed": HiCache recomputes, which is
+    always correct -- KV that was never delivered cannot be wrong KV. ``on_error``
+    builds that miss from the same arguments the method received, because a
+    caller reads the shape of the result, not just its truthiness.
+
+    Deliberately not applied to ``close()`` or ``register_mem_pool_host()``:
+    those run on the scheduler thread during setup and teardown, where an
+    exception is visible and worth surfacing rather than swallowing.
+    """
+
+    def decorate(method):
+        @functools.wraps(method)
+        def guarded(self, *args, **kwargs):
+            try:
+                return method(self, *args, **kwargs)
+            except Exception:
+                self._note_fault(method.__name__)
+                return on_error(self, *args, **kwargs)
+
+        return guarded
+
+    return decorate
+
+
+def _miss_per_transfer(self, transfers, *_args, **_kwargs) -> Dict[str, List[bool]]:
+    """Every page of every transfer failed, keyed as the v2 callers expect."""
+    return {str(t.name): [False] * len(t.keys or []) for t in transfers}
+
+
+def _miss_per_key(self, keys, *_args, **_kwargs) -> List[bool]:
+    return [False] * len(keys)
+
+
+def _no_prefix(self, *_args, **_kwargs) -> "PoolTransferResult":
+    return PoolTransferResult.empty()
 
 
 def _offset_endpoint_port(endpoint: str, offset: int) -> Optional[str]:
@@ -261,13 +367,21 @@ class KVCRStore(HiCacheStorage):
         # without this stash. Guarded by _poll_lock -- the source pump drains
         # the same queue, so it can be the one to observe a get's completion.
         self._completed_ops: Dict[int, Dict] = {}
-        # Handles whose waiter gave up (_drain_until hit its deadline). KVCR's
-        # abort() is a no-op stub, so a timed-out op stays in flight and still
-        # reports later -- with nobody left to pop it out of _completed_ops.
-        # Recording the handle lets _poll_once drop that late result instead of
-        # stashing it forever; without this the dict grows once per timeout and
-        # is never pruned, since a store lives as long as the scheduler.
-        self._abandoned_ops: set[int] = set()
+        # Handles a _drain_until is currently blocked on. A completion for
+        # anything else is dropped rather than stashed.
+        #
+        # Tracking live waiters is what bounds this: the obvious alternative --
+        # a set of *abandoned* handles, pruned when the late result shows up --
+        # assumes every op eventually reports, and one class of them never does.
+        # kvcr.abort() is a no-op stub (core.py returns False with a TODO), so a
+        # timed-out op stays in flight; a remote deliver whose source went silent
+        # parks in KVCR's WAITING_TERMINAL state, which is only left by a
+        # write_done notification that a dead peer never sends. Measured against
+        # the real core: 6/6 hinted delivers at a dead source never reported.
+        # Keyed on abandoned handles, each of those leaves an entry behind for
+        # the life of the scheduler; keyed on live waiters, the set is bounded by
+        # concurrency and a never-reporting op costs nothing here.
+        self._waiting_ops: Set[int] = set()
         # Serializes poll_completed() between the prefetch thread (_drain_until)
         # and the source pump. poll_completed() both drains a queue and advances
         # core state machines, so two callers must not interleave.
@@ -289,6 +403,10 @@ class KVCRStore(HiCacheStorage):
         self._stats_lock = threading.Lock()
         self._stats: Dict[str, int] = defaultdict(int)
         self._next_stats_log_at = 0.0
+        # Separate clock from the stats line: a fault is rarer and carries a
+        # traceback, so throttling the two together would let a chatty stats
+        # interval swallow the first report of a fault.
+        self._next_fault_log_at = 0.0
 
         if mem_pool is not None:
             self.register_mem_pool_host(mem_pool)
@@ -319,7 +437,10 @@ class KVCRStore(HiCacheStorage):
 
         Port 0 means "ask the OS", which already guarantees distinctness -- and
         offsetting an OS-assigned port would land on an arbitrary port belonging
-        to someone else, so the offset applies only to configured ports.
+        to someone else, so the offset applies only to configured ports. It is
+        reachable only local-only: ``KVCRBackendConfig`` refuses port 0 together
+        with ``enable_remote_hint``, because an OS-assigned port is known only
+        inside this process and so cannot be registered for peers to dial.
         """
         configured = int(self._config.control_port)
         if configured <= 0:
@@ -380,6 +501,7 @@ class KVCRStore(HiCacheStorage):
             cancel_pin_request=self._pinning.cancel_pin_request,
             framework_control=self._control,
             key_hint_adapter=self._key_hint_adapter,
+            policy=_resolve_policy(self._config.policy),
         )
         # eager_ctrl_connect / opportunistic_query / metadata_retry moved out of
         # KVCRConfig into the remote-forward-DRAM options in the wheel core.
@@ -395,10 +517,12 @@ class KVCRStore(HiCacheStorage):
         self._kvcr = KVCR(config, bindings, backend_configs)
         self._start_source_pump()
         logger.info(
-            "KVCRStore initialized (agent=%s, slot_size=%s, remote_hint=%s)",
+            "KVCRStore initialized (agent=%s, slot_size=%s, remote_hint=%s, "
+            "policy=%s)",
             self._agent_name,
             self._slot_size,
             self._config.enable_remote_hint,
+            self._config.policy,
         )
 
     # ------------------------------------------------------------------
@@ -448,13 +572,13 @@ class KVCRStore(HiCacheStorage):
 
         Both the pump and ``_drain_until`` call this. Whoever gets there first
         drains the queue, so every result must be stashed rather than assumed to
-        belong to the current caller -- except results for ops whose waiter has
-        already timed out, which are dropped (see ``_abandoned_ops``).
+        belong to the current caller -- except results for ops nobody is waiting
+        on any more, which are dropped (see ``_waiting_ops``).
         """
         with self._poll_lock:
             for done_handle, entries in kvcr.poll_completed():
-                if done_handle in self._abandoned_ops:
-                    self._abandoned_ops.discard(done_handle)
+                if done_handle not in self._waiting_ops:
+                    self._note("late_completions_dropped")
                     continue
                 self._completed_ops[done_handle] = entries
 
@@ -629,6 +753,7 @@ class KVCRStore(HiCacheStorage):
     # v2 interface (the real HiCache path)
     # ------------------------------------------------------------------
 
+    @_fail_closed(_miss_per_transfer)
     def batch_set_v2(
         self,
         transfers: List[PoolTransfer],
@@ -677,8 +802,9 @@ class KVCRStore(HiCacheStorage):
             )
             return [False] * len(keys)
 
-        op_handle = self._kvcr.deposit(descriptors)
-        result_map = self._drain_until(op_handle)
+        op_handle, result_map = self._submit_and_wait(
+            lambda: self._kvcr.deposit(descriptors)
+        )
         missing = len(descriptors) - len(result_map)
         failed = sum(1 for ok in result_map.values() if not ok)
         if failed or missing:
@@ -767,6 +893,7 @@ class KVCRStore(HiCacheStorage):
                 )
         return descriptors
 
+    @_fail_closed(_miss_per_transfer)
     def batch_get_v2(
         self,
         transfers: List[PoolTransfer],
@@ -799,9 +926,29 @@ class KVCRStore(HiCacheStorage):
                     transfer, request_id
                 )
         finally:
-            if request_id is not None:
-                self._kvcr.discard_hint(request_id)
+            self._discard_hint(request_id)
         return results
+
+    def _discard_hint(self, request_id: Optional[str]) -> None:
+        """Unregister the request's hint, without letting that fail the batch.
+
+        Two reasons this is not a bare call in the ``finally``. It runs on the
+        exception path too, where raising would replace the original fault with
+        a less informative one; and on the success path a raise would discard a
+        result set whose pages are already in host memory, turning a completed
+        fetch into a recompute.
+
+        The leak it cannot prevent is the core's: a hint we failed to discard
+        stays in KVCR's request-scoped table. That is bounded per request and
+        harmless to correctness (a stale entry only ever names a source we would
+        have consulted anyway), so it is counted rather than retried.
+        """
+        if request_id is None:
+            return
+        try:
+            self._kvcr.discard_hint(request_id)
+        except Exception:
+            self._note_fault("discard_hint")
 
     def _register_hint(
         self, extra_info: Optional[HiCacheStorageExtraInfo]
@@ -877,6 +1024,36 @@ class KVCRStore(HiCacheStorage):
             return None
         return msgspec.structs.replace(hint, source_control_endpoint=endpoint)
 
+    def _note_entry_statuses(self, entries: Dict) -> None:
+        """Count how KVCR classified each block key, not just pass/fail.
+
+        ``OpEntryResult.success`` is ``status is SUCCESS``, so a block the
+        *policy* declined (``DROPPED``, returned when ``decide_ingest`` answers
+        DROP) and a block that genuinely broke (``FAILED``) collapse into the
+        same falsy value everywhere downstream. Both are correct to treat as
+        "not stored" -- but they are not the same event to a reader: a rising
+        DROPPED count means the local tier is under capacity pressure and the
+        policy is doing its job, while a rising FAILED count means something is
+        wrong. Keeping them apart is what makes the counters usable as evidence
+        when a policy is being tuned, which the fault-injection run relies on.
+
+        Statuses are read by name so an entry type without a ``status`` (the
+        older core, or a test double built on ``success`` alone) still counts.
+        """
+        dropped = failed = 0
+        for entry in entries.values():
+            status = getattr(entry, "status", None)
+            if status is OpEntryStatus.DROPPED:
+                dropped += 1
+            elif status is OpEntryStatus.FAILED or (
+                status is None and not entry.success
+            ):
+                failed += 1
+        if dropped:
+            self._note("entries_dropped_by_policy", dropped)
+        if failed:
+            self._note("entries_failed", failed)
+
     def _note(self, event: str, count: int = 1) -> None:
         """Count a remote-path event, and summarize periodically at INFO.
 
@@ -897,6 +1074,30 @@ class KVCRStore(HiCacheStorage):
         logger.info(
             "KVCRStore remote path (cumulative): %s",
             " ".join(f"{name}={value}" for name, value in sorted(snapshot.items())),
+        )
+
+    def _note_fault(self, method_name: str) -> None:
+        """Record a fault the ``_fail_closed`` guard caught, and log it sparsely.
+
+        Counted per entry point, not in aggregate: a fault in ``batch_set_v2``
+        means offload is failing while reads may be fine, and the two are
+        repaired in different places. The traceback goes out at most once per
+        ``_FAULT_LOG_INTERVAL_S`` because the faults this guard is for repeat
+        every prefetch -- but the *first* one is logged immediately, since a
+        counter alone would not say what broke.
+        """
+        self._note(f"faults_{method_name}")
+        with self._stats_lock:
+            now = time.monotonic()
+            if now < self._next_fault_log_at:
+                return
+            self._next_fault_log_at = now + _FAULT_LOG_INTERVAL_S
+        logger.warning(
+            "KVCRStore: %s failed; reporting a miss so HiCache recomputes. "
+            "Repeated faults are counted in stats() as faults_%s.",
+            method_name,
+            method_name,
+            exc_info=True,
         )
 
     def stats(self) -> Dict[str, int]:
@@ -939,8 +1140,9 @@ class KVCRStore(HiCacheStorage):
         if destinations is None:
             return [False] * len(keys)
 
-        op_handle = self._kvcr.deliver(destinations, request_id=request_id)
-        result_map = self._drain_until(op_handle)
+        _, result_map = self._submit_and_wait(
+            lambda: self._kvcr.deliver(destinations, request_id=request_id)
+        )
 
         results: List[bool] = []
         for key in keys:
@@ -959,6 +1161,7 @@ class KVCRStore(HiCacheStorage):
             self._note("hinted_pages_loaded", loaded)
         return results
 
+    @_fail_closed(_no_prefix)
     def batch_exists_v2(
         self,
         keys: List[str],
@@ -1005,6 +1208,34 @@ class KVCRStore(HiCacheStorage):
     # Progress pump
     # ------------------------------------------------------------------
 
+    def _submit_and_wait(self, submit: Callable[[], int]) -> Tuple[int, Dict]:
+        """Issue one KVCR op and block for its result, as ``(handle, results)``.
+
+        ``submit`` runs under ``_poll_lock`` so the op is registered as awaited
+        before anyone can drain its completion. Registering afterwards would
+        race: a local-tier deposit can finish in microseconds while the source
+        pump polls every 5 ms, so the pump would see a completion with no waiter,
+        drop it as late, and the caller would sit out the full ``get_timeout_s``
+        before reporting a miss on an op that actually succeeded.
+
+        The handle comes back because it is the only join between our logs and
+        KVCR's -- a failure here is usually diagnosed from the core's side.
+        """
+        with self._poll_lock:
+            op_handle = submit()
+            self._waiting_ops.add(op_handle)
+        return op_handle, self._drain_until(op_handle)
+
+    def _register_waiter(self, op_handle: int) -> None:
+        """Claim ``op_handle``'s completion, so ``_poll_once`` stashes it.
+
+        Idempotent: ``_submit_and_wait`` already did this under the lock it held
+        across the submit, and ``_drain_until`` repeats it to cover a direct
+        call.
+        """
+        with self._poll_lock:
+            self._waiting_ops.add(op_handle)
+
     def _drain_until(self, op_handle: int, timeout_s: Optional[float] = None) -> Dict:
         """Pump kvcr.poll_completed() until op_handle reports, or the deadline passes.
 
@@ -1023,33 +1254,42 @@ class KVCRStore(HiCacheStorage):
         which otherwise burns a core and starves the progress thread that we are
         waiting on. Completions for other in-flight ops are stashed, never
         dropped.
+
+        Leaving deregisters this handle, whether the result arrived or the
+        deadline did. After that the op is on its own: ``kvcr.abort()`` is a
+        no-op stub, so we cannot cancel it, only agree to ignore whatever it
+        reports -- or never reports.
         """
-        deadline = time.monotonic() + (
-            self._config.get_timeout_s if timeout_s is None else timeout_s
-        )
+        timeout = self._config.get_timeout_s if timeout_s is None else timeout_s
+        deadline = time.monotonic() + timeout
         sleep_s = _DRAIN_POLL_MIN_S
-        while True:
-            # Always go through the stash: the source pump drains the same
-            # queue, so our own completion may well be observed by it rather
-            # than by the poll below.
-            self._poll_once(self._kvcr)
-            with self._poll_lock:
-                stashed = self._completed_ops.pop(op_handle, None)
-            if stashed is not None:
-                return {k: v.success for k, v in stashed.items()}
-            if time.monotonic() >= deadline:
-                logger.warning(
-                    "KVCRStore: op %s did not complete within %.1fs",
-                    op_handle,
-                    self._config.get_timeout_s if timeout_s is None else timeout_s,
-                )
-                # The op is still in flight -- kvcr.abort() is a no-op stub, so
-                # we cannot cancel it, only agree to ignore whatever it reports.
+        try:
+            self._register_waiter(op_handle)
+            while True:
+                # Always go through the stash: the source pump drains the same
+                # queue, so our own completion may well be observed by it rather
+                # than by the poll below.
+                self._poll_once(self._kvcr)
                 with self._poll_lock:
-                    self._abandoned_ops.add(op_handle)
-                return {}
-            time.sleep(sleep_s)
-            sleep_s = min(sleep_s * 2, _DRAIN_POLL_MAX_S)
+                    stashed = self._completed_ops.pop(op_handle, None)
+                if stashed is not None:
+                    self._note_entry_statuses(stashed)
+                    return {k: v.success for k, v in stashed.items()}
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "KVCRStore: op %s did not complete within %.1fs",
+                        op_handle,
+                        timeout,
+                    )
+                    return {}
+                time.sleep(sleep_s)
+                sleep_s = min(sleep_s * 2, _DRAIN_POLL_MAX_S)
+        finally:
+            with self._poll_lock:
+                self._waiting_ops.discard(op_handle)
+                # A completion can land between the last poll and here; drop it
+                # now rather than leave it for a pop that will never come.
+                self._completed_ops.pop(op_handle, None)
 
     # ------------------------------------------------------------------
     # v1 zero-copy interface (HiRadixCache path)
@@ -1065,6 +1305,9 @@ class KVCRStore(HiCacheStorage):
             name=PoolName.KV, host_indices=host_indices, keys=list(keys)
         )
 
+    # v1 delegates to an already-guarded v2, so the guard here only covers what
+    # v1 itself does -- building the PoolTransfer and reading the result out.
+    @_fail_closed(_miss_per_key)
     def batch_set_v1(
         self,
         keys: List[str],
@@ -1076,6 +1319,7 @@ class KVCRStore(HiCacheStorage):
         )
         return results.get(str(PoolName.KV), [False] * len(keys))
 
+    @_fail_closed(_miss_per_key)
     def batch_get_v1(
         self,
         keys: List[str],
@@ -1087,6 +1331,7 @@ class KVCRStore(HiCacheStorage):
         )
         return results.get(str(PoolName.KV), [False] * len(keys))
 
+    @_fail_closed(lambda self, *a, **kw: 0)
     def batch_exists(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
@@ -1108,6 +1353,7 @@ class KVCRStore(HiCacheStorage):
     def batch_set(self, keys, values=None, target_locations=None, target_sizes=None) -> bool:
         return False  # DRAFT-STUB
 
+    @_fail_closed(lambda self, *a, **kw: False)
     def exists(self, key: str) -> bool:
         if self._kvcr is None or self._segments_per_page is None:
             return False
