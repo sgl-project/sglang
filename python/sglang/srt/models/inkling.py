@@ -72,7 +72,16 @@ from sglang.srt.models.inkling_common.util import (
     trtllm_bf16_weight_prep_enabled,
     use_inkling_shared_fused_moe,
 )
-from sglang.srt.runtime_context import get_model, get_parallel, get_server_args
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_memory,
+    get_mm,
+    get_model,
+    get_parallel,
+    get_schedule,
+    mamba_extra_buffer_enabled,
+)
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
 
 logger = logging.getLogger(__name__)
@@ -218,7 +227,7 @@ class InklingDecoderLayer(nn.Module):
         # cache (configs/inkling.py stream_dim) shard with them. The layer
         # all-gathers back to [T, H] after each sconv, before the residual add.
         self.attn_tp_group = get_parallel().attn_tp_group
-        self.scattered_sconv = get_server_args().enable_scattered_sconv
+        self.scattered_sconv = get_exec().comm.enable_scattered_sconv
         sconv_hidden = config.hidden_size
         if self.scattered_sconv:
             assert config.use_sconv, "--enable-scattered-sconv requires use_sconv"
@@ -1008,12 +1017,11 @@ class InklingForConditionalGeneration(nn.Module):
         self.config = config
         self.text_config = config.text_config
 
-        server_args = get_server_args()
         assert envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get()
-        if server_args.disaggregation_mode != "decode":
-            assert not server_args.disable_radix_cache
-            assert not server_args.disable_hybrid_swa_memory
-            assert server_args.enable_mamba_extra_buffer()
+        if get_disagg().disaggregation_mode != "decode":
+            assert not get_memory().disable_radix_cache
+            assert not get_schedule().disable_hybrid_swa_memory
+            assert mamba_extra_buffer_enabled()
 
         from types import SimpleNamespace
 
@@ -1022,7 +1030,7 @@ class InklingForConditionalGeneration(nn.Module):
         )
 
         inkling_quant_config = get_quantization_config(
-            SimpleNamespace(hf_config=self.config, model_path=server_args.model_path)
+            SimpleNamespace(hf_config=self.config, model_path=get_model().model_path)
         )
         if inkling_quant_config is not None:
             quant_config = inkling_quant_config
@@ -1039,7 +1047,7 @@ class InklingForConditionalGeneration(nn.Module):
         # checkpoint served text-only must not allocate/load the towers (wasted
         # GPU memory / avoidable startup OOM). The mm dispatch (forward) and the
         # weight loader already skip audio./visual. when these are None.
-        build_multimodal = bool(server_args.enable_multimodal)
+        build_multimodal = bool(get_mm().enable_multimodal)
         self.audio = (
             InklingAudio(self.config.audio_config)
             if build_multimodal and self.config.audio_config.decoder_dmodel is not None
@@ -1196,38 +1204,6 @@ class InklingForConditionalGeneration(nn.Module):
             hidden_states_before_norm=(
                 None if aux_hidden_states is not None else hidden_states
             ),
-        )
-
-    def update_conv_state_after_mtp_verify(
-        self,
-        req_to_token_pool,
-        req_pool_indices: torch.Tensor,
-        last_correct_step_indices: torch.Tensor,
-        mamba_track_indices: Optional[torch.Tensor],
-        mamba_steps_to_track: Optional[torch.Tensor],
-    ) -> None:
-        """Commit the per-step sconv windows saved during TARGET_VERIFY into the
-        persistent conv caches at each request's last accepted step.
-
-        Inkling bypasses the HybridLinearAttnBackend wrapper (ShortConvolution reads
-        the mamba pool directly), so the model owns this commit instead of an
-        attention-backend hook. The pool is passed in because this runs from the
-        spec worker after the forward context has exited.
-        """
-        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
-            scatter_mamba_states_after_mtp_verify,
-        )
-
-        pool = req_to_token_pool
-        mamba_indices = pool.translate_mamba_indices(
-            pool.get_mamba_indices(req_pool_indices)
-        )
-        scatter_mamba_states_after_mtp_verify(
-            pool.get_speculative_mamba2_params_all_layers(),
-            mamba_indices,
-            last_correct_step_indices,
-            mamba_track_indices,
-            mamba_steps_to_track,
         )
 
     def _load_regular_param(

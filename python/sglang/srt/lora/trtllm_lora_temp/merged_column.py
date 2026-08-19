@@ -31,7 +31,7 @@ from sglang.srt.lora.trtllm_lora_temp import (
 def merged_column_lora_forward(self, input_: torch.Tensor):
     """O9 — side-stream LoRA-A shrink ‖ base merged-column GEMM."""
     if (
-        not self.set_lora
+        not self.lora_active
         or not is_two_stream_active(input_)
         or not supports_two_stream_dense_lora(self.A_buffer, self.B_buffer)
     ):
