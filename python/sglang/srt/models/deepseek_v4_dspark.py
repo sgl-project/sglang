@@ -486,13 +486,15 @@ class DSparkV4MarkovHead(nn.Module):
         first_prev_tokens: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_corrected_logits: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         return run_markov_block(
             self,
             base_logits,
             first_prev_tokens=first_prev_tokens,
             hidden_states=hidden_states,
             sampler=sampler,
+            return_corrected_logits=return_corrected_logits,
         )
 
 

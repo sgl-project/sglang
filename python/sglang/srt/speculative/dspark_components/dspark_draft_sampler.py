@@ -57,14 +57,23 @@ class DsparkDraftSampler:
         self.folded_sampling = folded_sampling
         self.temperatures = None
         self.greedy_mask = None
+        self.kernel_greedy_mask = None
         self.exp_noise = None
         self.corrected_out = None
+        self.write_corrected_logits = None
+        self._staged_all_greedy = True
         if folded_sampling:
             vocab = int(model.lm_head.org_vocab_size)
             self.temperatures = torch.ones(
                 (max_bs,), dtype=torch.float32, device=device
             )
             self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
+            # Keep the dtype consumed by the Triton kernel resident. Converting
+            # the bool request mask inside the captured Markov loop would add
+            # one graph op for every proposal step.
+            self.kernel_greedy_mask = torch.ones(
+                (max_bs,), dtype=torch.int32, device=device
+            )
             self.exp_noise = torch.empty(
                 (max_bs, vocab), dtype=torch.float32, device=device
             )
@@ -73,22 +82,47 @@ class DsparkDraftSampler:
                 dtype=model.lm_head.weight.dtype,
                 device=device,
             )
+            self.write_corrected_logits = torch.zeros(
+                (), dtype=torch.int32, device=device
+            )
 
     def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
         """Host-side refresh of the static sampling params; must run before
         the draft graph replay that consumes them."""
         if not self.folded_sampling:
             return
-        if sampling_info is None:
-            self.temperatures[:bs].fill_(1.0)
-            self.greedy_mask[:bs].fill_(True)
+        all_greedy = sampling_info is None or sampling_info.is_all_greedy
+        if all_greedy:
+            # These buffers are initialized to the greedy state and remain
+            # valid across graph replays. Only restore them once after a
+            # stochastic batch instead of launching three tiny device ops on
+            # every greedy decode iteration.
+            if not self._staged_all_greedy:
+                self.greedy_mask.fill_(True)
+                self.kernel_greedy_mask.fill_(1)
+                self.write_corrected_logits.zero_()
+                self._staged_all_greedy = True
             return
+
         torch.clamp(
             sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
             min=1e-5,
             out=self.temperatures[:bs],
         )
-        self.greedy_mask[:bs].copy_((sampling_info.top_ks <= 1).view(-1)[:bs])
+        live_greedy_mask = (sampling_info.top_ks <= 1).view(-1)[:bs]
+        self.greedy_mask[:bs].copy_(live_greedy_mask)
+        self.kernel_greedy_mask[:bs].copy_(live_greedy_mask)
+        # CUDA-graph buckets can be larger than the live batch. Reset their
+        # tail rows so a smaller request cannot inherit stochastic flags from
+        # a previous larger replay and pay full-vocabulary noise/log work.
+        self.greedy_mask[bs:].fill_(True)
+        self.kernel_greedy_mask[bs:].fill_(1)
+        if self._staged_all_greedy:
+            self.write_corrected_logits.fill_(1)
+        self._staged_all_greedy = False
+        # Refresh stochastic noise immediately before replay instead of baking
+        # RNG into every captured proposal.
+        self.exp_noise[:bs].exponential_(1)
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.gamma
@@ -99,31 +133,37 @@ class DsparkDraftSampler:
         if self.folded_sampling:
 
             def sampler(step_logits: torch.Tensor, step_idx: int) -> torch.Tensor:
-                del step_idx
-                # In-graph philox noise: each replay advances the generator
-                # and redraws.
-                noise = self.exp_noise[:bs].exponential_()
                 return SampleStepTokens.execute(
                     step_logits=step_logits,
                     temperatures=self.temperatures[:bs],
-                    greedy_mask=self.greedy_mask[:bs],
-                    exp_noise=noise,
+                    greedy_mask=self.kernel_greedy_mask[:bs],
+                    exp_noise=self.exp_noise[:bs],
+                    corrected_logits_out=self.corrected_out.view(
+                        -1, self.gamma, step_logits.shape[-1]
+                    )[:bs, step_idx, :],
+                    write_corrected_logits=self.write_corrected_logits,
                 )
 
         else:
             sampler = greedy_step_sampler
 
-        draft_tokens, corrected_logits = self.markov_head.sample_block(
-            base_logits,
-            first_prev_tokens=anchor,
-            hidden_states=hidden_states.view(bs, self.gamma, -1),
-            sampler=sampler,
-        )
-        self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
-        if self.folded_sampling:
-            self.corrected_out[: bs * self.gamma].copy_(
-                corrected_logits.reshape(bs * self.gamma, -1)
+        if not self.folded_sampling and getattr(
+            self.markov_head, "keeps_base_logits_tp_sharded", False
+        ):
+            draft_tokens = self.markov_head.sample_greedy_block_sharded(
+                base_logits, first_prev_tokens=anchor
             )
+            corrected_logits = None
+        else:
+            draft_tokens, corrected_logits = self.markov_head.sample_block(
+                base_logits,
+                first_prev_tokens=anchor,
+                hidden_states=hidden_states.view(bs, self.gamma, -1),
+                sampler=sampler,
+                return_corrected_logits=False,
+            )
+        self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
+        assert corrected_logits is None
         if self.confidence_out is not None:
             confidence = self.confidence_fn(
                 draft_hidden=hidden_states.view(bs, self.gamma, -1),
@@ -142,6 +182,16 @@ def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
         return False
     if mode == DsparkFoldedSampling.FORCE:
         return True
+    if getattr(model.markov_head, "keeps_base_logits_tp_sharded", False):
+        # AUTO favors the greedy-only distributed top-1 graph when the dense
+        # Markov head follows lm_head's vocab shard. Sampling requests still
+        # use the exact eager fallback; FORCE retains the mixed in-graph path.
+        if tp_rank == 0:
+            logger.info(
+                "DSpark folded sampling AUTO selected greedy-only TP-sharded "
+                "proposal; stochastic requests use the eager proposal path."
+            )
+        return False
     vocab = int(model.lm_head.org_vocab_size)
     noise_bytes = max_bs * vocab * 4
     logits_bytes = max_bs * gamma * vocab * model.lm_head.weight.dtype.itemsize

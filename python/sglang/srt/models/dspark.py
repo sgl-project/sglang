@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Callable, Iterable, Optional, Tuple
 
 import torch
@@ -8,9 +9,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
-from sglang.srt.environ import envs
+from sglang.srt.environ import DsparkFoldedSampling, envs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
     parse_dspark_draft_config,
@@ -19,10 +21,24 @@ from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
     read_ragged_verify_mode,
 )
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
+_is_npu = is_npu()
+
+if _is_npu:
+    from sgl_kernel_npu.dspark.top1 import select_global_top1_npu
 
 StepSampler = Callable[[torch.Tensor, int], torch.Tensor]
+
+
+@dataclass(frozen=True)
+class _DenseMarkovW2ShardGeometry:
+    tp_size: int
+    org_vocab_start: int
+    org_vocab_end: int
+    num_embeddings_per_partition: int
+    num_embeddings_padded: int
 
 
 def gather_and_crop_vocab(
@@ -39,11 +55,12 @@ def run_markov_block(
     first_prev_tokens: torch.Tensor,
     hidden_states: Optional[torch.Tensor],
     sampler: StepSampler,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_corrected_logits: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     batch_size, proposal_len = base_logits.shape[:2]
     if proposal_len == 0:
         empty = torch.empty(batch_size, 0, dtype=torch.long, device=base_logits.device)
-        return empty, base_logits
+        return empty, base_logits if return_corrected_logits else None
 
     sampled_tokens = []
     corrected_logits = []
@@ -57,11 +74,12 @@ def run_markov_block(
         )
         next_tokens = sampler(step_logits, step_idx)
         sampled_tokens.append(next_tokens)
-        corrected_logits.append(step_logits.unsqueeze(1))
+        if return_corrected_logits:
+            corrected_logits.append(step_logits.unsqueeze(1))
         prev_tokens = next_tokens
     return (
         torch.stack(sampled_tokens, dim=1),
-        torch.cat(corrected_logits, dim=1),
+        torch.cat(corrected_logits, dim=1) if return_corrected_logits else None,
     )
 
 
@@ -79,6 +97,95 @@ class VanillaMarkov(nn.Module):
             )
         self.markov_w1 = nn.Embedding(self.vocab_size, self.markov_rank)
         self.markov_w2 = nn.Linear(self.markov_rank, self.vocab_size, bias=False)
+        self._tp_shard: Optional[_DenseMarkovW2ShardGeometry] = None
+        self._shard_group = None
+
+    @property
+    def keeps_base_logits_tp_sharded(self) -> bool:
+        return self._tp_shard is not None
+
+    def configure_tp_shard(self, *, lm_head: nn.Module) -> None:
+        """Align vanilla Markov W2 with the vocab-parallel target lm_head.
+
+        A dense DSpark proposal applies the rank-256 W2 projection once per
+        proposal token. Keeping that projection replicated makes every TP rank
+        read and compute the full vocabulary seven times for Kimi-K3. The base
+        lm_head is already vocab-parallel, so compute the matching W2 slice
+        locally and all-gather only the corrected step logits.
+
+        Limit this optimization to the exact vanilla head on NPU and the folded
+        proposal path. Gated/RNN heads need a separate latent-state adaptation,
+        while the eager fallback remains the conservative parity path.
+        """
+        if (
+            type(self) is not VanillaMarkov
+            or not _is_npu
+            or not envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
+            or (envs.SGLANG_DSPARK_FOLDED_SAMPLING.get() == DsparkFoldedSampling.FORCE)
+            or not envs.SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD.get()
+        ):
+            return
+        required = (
+            "org_vocab_size",
+            "tp_size",
+            "num_embeddings_per_partition",
+            "num_embeddings_padded",
+            "shard_indices",
+        )
+        if any(not hasattr(lm_head, name) for name in required):
+            logger.warning(
+                "DSpark dense Markov W2 TP shard disabled: lm_head lacks vocab "
+                "partition metadata."
+            )
+            return
+        if int(lm_head.org_vocab_size) != self.vocab_size:
+            logger.warning(
+                "DSpark dense Markov W2 TP shard disabled: lm_head vocab %d != "
+                "markov vocab %d.",
+                int(lm_head.org_vocab_size),
+                self.vocab_size,
+            )
+            return
+        tp_size = int(lm_head.tp_size)
+        per_partition = int(lm_head.num_embeddings_per_partition)
+        num_padded = int(lm_head.num_embeddings_padded)
+        if (
+            tp_size <= 1
+            or per_partition * tp_size != num_padded
+            or num_padded != self.vocab_size
+            or self.vocab_size >= 1 << 24
+        ):
+            return
+        parallel = get_parallel()
+        shard_group = (
+            parallel.attn_tp_group
+            if getattr(lm_head, "use_attn_tp_group", False)
+            else parallel.tp_group
+        )
+        if int(shard_group.world_size) != tp_size:
+            logger.warning(
+                "DSpark dense Markov W2 TP shard disabled: group size %d != "
+                "lm_head tp_size %d.",
+                int(shard_group.world_size),
+                tp_size,
+            )
+            return
+        shard = lm_head.shard_indices
+        self._shard_group = shard_group
+        self._tp_shard = _DenseMarkovW2ShardGeometry(
+            tp_size=tp_size,
+            org_vocab_start=int(shard.org_vocab_start_index),
+            org_vocab_end=int(shard.org_vocab_end_index),
+            num_embeddings_per_partition=per_partition,
+            num_embeddings_padded=num_padded,
+        )
+        if getattr(parallel, "attn_tp_rank", 0) == 0:
+            logger.info(
+                "DSpark dense Markov W2 follows the lm_head TP%d vocab shard "
+                "(%d rows per rank).",
+                tp_size,
+                per_partition,
+            )
 
     def get_prev_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.markov_w1(token_ids.long())
@@ -101,7 +208,100 @@ class VanillaMarkov(nn.Module):
         token_ids: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        if self._tp_shard is not None:
+            return self._apply_step_logits_sharded(
+                base_local=logits, token_ids=token_ids
+            )
         return logits + self.compute_step_bias(token_ids, hidden_states)
+
+    def _apply_step_logits_sharded(
+        self, *, base_local: torch.Tensor, token_ids: torch.Tensor
+    ) -> torch.Tensor:
+        step_local = self._build_step_logits_local(
+            base_local=base_local, token_ids=token_ids
+        )
+        shard = self._tp_shard
+        assert shard is not None and self._shard_group is not None
+        full = self._shard_group.all_gather(step_local, dim=-1)
+        return full[..., : self.vocab_size]
+
+    def _build_step_logits_local(
+        self, *, base_local: torch.Tensor, token_ids: torch.Tensor
+    ) -> torch.Tensor:
+        shard = self._tp_shard
+        assert shard is not None
+        latent = self.get_prev_embeddings(token_ids)
+        weight_local = self.markov_w2.weight[
+            shard.org_vocab_start : shard.org_vocab_end
+        ]
+        bias_local = F.linear(latent.to(weight_local.dtype), weight_local)
+        pad = shard.num_embeddings_per_partition - bias_local.shape[-1]
+        if pad < 0:
+            raise RuntimeError(
+                "DSpark dense Markov W2 shard is wider than the lm_head partition."
+            )
+        if pad:
+            bias_local = F.pad(bias_local, (0, pad))
+        # Preserve the eager path's dtype promotion/rounding before the
+        # collective. This is important for exact greedy proposal parity.
+        return base_local + bias_local
+
+    def sample_greedy_block_sharded(
+        self,
+        base_logits: torch.Tensor,
+        *,
+        first_prev_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Greedily sample a TP-sharded Markov block without vocab gathers.
+
+        Each rank reduces its local vocab slice to one `(value, token_id)` pair
+        per row, then all-gathers only those pairs.  The tie break deliberately
+        selects the smallest global token id, matching `argmax` on a fully
+        gathered vocabulary.
+        """
+        shard = self._tp_shard
+        assert shard is not None and self._shard_group is not None
+        batch_size, proposal_len = base_logits.shape[:2]
+        if proposal_len == 0:
+            return torch.empty(
+                batch_size, 0, dtype=torch.long, device=base_logits.device
+            )
+
+        sampled_tokens = []
+        prev_tokens = first_prev_tokens.long()
+        for step_idx in range(proposal_len):
+            step_local = self._build_step_logits_local(
+                base_local=base_logits[:, step_idx, :], token_ids=prev_tokens
+            )
+            org_width = shard.org_vocab_end - shard.org_vocab_start
+            local_value, local_idx = step_local[:, :org_width].max(dim=-1)
+            global_idx = local_idx + shard.org_vocab_start
+            # Token ids below 2**24 are represented exactly in float32;
+            # DSpark vocabularies are also bounded by the int32 sampler
+            # contract.
+            candidates_local = torch.stack(
+                (local_value.float(), global_idx.float()), dim=-1
+            )
+            candidates = self._shard_group.all_gather(candidates_local, dim=1).view(
+                batch_size, shard.tp_size, 2
+            )
+            if _is_npu:
+                next_tokens = select_global_top1_npu(
+                    candidates, vocab_size=self.vocab_size
+                )
+            else:
+                values = candidates[:, :, 0]
+                indices = candidates[:, :, 1].to(torch.long)
+                best_value = values.max(dim=1).values
+                sentinel = torch.full_like(indices, self.vocab_size)
+                next_tokens = (
+                    torch.where(values == best_value[:, None], indices, sentinel)
+                    .min(dim=1)
+                    .values
+                )
+            sampled_tokens.append(next_tokens)
+            prev_tokens = next_tokens
+        return torch.stack(sampled_tokens, dim=1)
 
     def apply_block_logits(
         self,
@@ -121,13 +321,15 @@ class VanillaMarkov(nn.Module):
         first_prev_tokens: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_corrected_logits: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         return run_markov_block(
             self,
             base_logits,
             first_prev_tokens=first_prev_tokens,
             hidden_states=hidden_states,
             sampler=sampler,
+            return_corrected_logits=return_corrected_logits,
         )
 
 
@@ -231,7 +433,8 @@ class RNNHead(VanillaMarkov):
         first_prev_tokens: torch.Tensor,
         hidden_states: Optional[torch.Tensor],
         sampler: StepSampler,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_corrected_logits: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if hidden_states is None:
             raise ValueError("RNNHead requires hidden_states.")
         batch_size, proposal_len = base_logits.shape[:2]
@@ -239,7 +442,7 @@ class RNNHead(VanillaMarkov):
             empty = torch.empty(
                 batch_size, 0, dtype=torch.long, device=base_logits.device
             )
-            return empty, base_logits
+            return empty, base_logits if return_corrected_logits else None
 
         state = torch.zeros(
             batch_size,
@@ -256,11 +459,12 @@ class RNNHead(VanillaMarkov):
             step_logits = base_logits[:, step_idx, :] + bias
             next_tokens = sampler(step_logits, step_idx)
             sampled_tokens.append(next_tokens)
-            corrected_logits.append(step_logits.unsqueeze(1))
+            if return_corrected_logits:
+                corrected_logits.append(step_logits.unsqueeze(1))
             prev_tokens = next_tokens
         return (
             torch.stack(sampled_tokens, dim=1),
-            torch.cat(corrected_logits, dim=1),
+            torch.cat(corrected_logits, dim=1) if return_corrected_logits else None,
         )
 
 
@@ -383,6 +587,7 @@ class DSparkDraftMixin:
     ) -> None:
         self.embed_tokens = embed_tokens
         self.lm_head = lm_head
+        self.markov_head.configure_tp_shard(lm_head=lm_head)
 
     def forward_embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         # Embeds with the shared target embedding INSIDE the draft graph
@@ -413,7 +618,11 @@ class DSparkDraftMixin:
         if hidden.dtype != weight.dtype:
             hidden = hidden.to(weight.dtype)
         local_logits = torch.matmul(hidden, weight.T)
-        base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
+        base_logits = (
+            local_logits
+            if self.markov_head.keeps_base_logits_tp_sharded
+            else gather_and_crop_vocab(local_logits, self.lm_head)
+        )
         return base_logits, None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -695,8 +904,14 @@ class DSparkDraftMixin:
         k_all = k32.to(ctx_hidden.dtype)
         # One RoPE over all layers' heads (shared rotary params + positions).
         k_flat = k_all.reshape(tokens, num_layers * kv_size)
-        dummy_q = k_flat.new_empty(k_flat.shape)
-        _, k_flat = attn0.rotary_emb(positions, dummy_q, k_flat)
+        if _is_npu:
+            k_for_rope = k_flat.view(tokens, num_layers * num_kv_heads, head_dim)
+            dummy_q = k_for_rope.new_empty(k_for_rope.shape)
+            _, k_for_rope = attn0.rotary_emb(positions, dummy_q, k_for_rope)
+            k_flat = k_for_rope.reshape(tokens, num_layers * kv_size)
+        else:
+            dummy_q = k_flat.new_empty(k_flat.shape)
+            _, k_flat = attn0.rotary_emb(positions, dummy_q, k_flat)
         # [layers, tokens, heads, dim]: per-layer slices are contiguous views.
         k_all = (
             k_flat.view(tokens, num_layers, num_kv_heads, head_dim)

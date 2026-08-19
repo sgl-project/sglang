@@ -437,6 +437,18 @@ def _case_sample_step_tokens(tc):
         exp_noise=torch.ones(1, 2050, device=DEVICE),
     )
     tc.assertEqual(tokens.item(), 1000)
+    # Greedy rows must compare logits directly. A softmax can round these two
+    # distinct values to the same probability and incorrectly pick token 0.
+    near_tie = torch.tensor([[0.0, 1.0e-8, -1.0]], device=DEVICE)
+    near_tie_kw = dict(
+        step_logits=near_tie,
+        temperatures=torch.ones(1, device=DEVICE),
+        greedy_mask=torch.ones(1, dtype=torch.bool, device=DEVICE),
+        exp_noise=torch.ones_like(near_tie),
+    )
+    expected = near_tie.argmax(dim=-1)
+    tc._eq(cls.torch(**near_tie_kw), expected)
+    tc._eq(cls.triton(**near_tie_kw), expected)
     # Non-contiguous strided cropped view must match its contiguous copy.
     view = (torch.randn(2, 129536, device=DEVICE) * 4.0)[:, :VOCAB]
     tc.assertFalse(view.is_contiguous())
@@ -449,6 +461,29 @@ def _case_sample_step_tokens(tc):
         cls.triton(step_logits=view, **kw),
         cls.triton(step_logits=view.contiguous(), **kw),
     )
+    # Corrected logits are written directly into a gamma-strided graph buffer.
+    bs, gamma, vocab, step = 2, 3, 5003, 1
+    logits = torch.randn(bs, vocab, dtype=torch.bfloat16, device=DEVICE)
+    corrected = torch.full(
+        (bs, gamma, vocab), 17.0, dtype=torch.bfloat16, device=DEVICE
+    )
+    corrected_step = corrected[:, step, :]
+    write_flag = torch.zeros((), dtype=torch.int32, device=DEVICE)
+    direct_kw = dict(
+        step_logits=logits,
+        temperatures=torch.ones(bs, device=DEVICE),
+        greedy_mask=torch.ones(bs, dtype=torch.bool, device=DEVICE),
+        exp_noise=torch.ones(bs, vocab, device=DEVICE),
+        corrected_logits_out=corrected_step,
+        write_corrected_logits=write_flag,
+    )
+    cls.triton(**direct_kw)
+    tc.assertTrue(bool((corrected == 17.0).all()))
+    write_flag.fill_(1)
+    cls.triton(**direct_kw)
+    tc._eq(corrected_step, logits)
+    tc.assertTrue(bool((corrected[:, 0, :] == 17.0).all()))
+    tc.assertTrue(bool((corrected[:, 2, :] == 17.0).all()))
 
 
 def _case_scatter_compact_to_strided(tc):
