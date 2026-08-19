@@ -63,6 +63,10 @@ def get_arch_constraints(compute_capability):
         return 4, 2
     elif major == 9 and minor >= 0:
         return 8, 8
+    elif major == 10 and minor >= 0:
+        return 8, 8
+    elif major == 12 and minor >= 0:
+        return 8, 8
     else:
         raise ValueError(f"Unsupported compute capability: {major}.{minor}")
 
