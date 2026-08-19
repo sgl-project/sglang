@@ -64,10 +64,10 @@ import triton
 import triton.language as tl
 
 from sglang.srt.lora.moe.routing import (
-    FusedAlignScratch,
     validate_shared_outer,
     virtual_expert_ids_inline,
 )
+from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
 # Launch tiles, selected by a 64-point sweep over 4 representative cells on
 # GB300 (tune_fused_align.py, 2026-07-25: best 83.45us vs 88-100us untuned).
@@ -268,31 +268,6 @@ def _expand_and_scatter_kernel(
     tl.store(sorted_pair_ids_ptr + slots, pair_ids, mask=pair_mask)
 
 
-def _validate_scratch(
-    scratch: FusedAlignScratch,
-    *,
-    num_buckets: int,
-    device: torch.device,
-) -> None:
-    contracts = (
-        ("counts", scratch.counts, (num_buckets,)),
-        ("block_cumulative", scratch.block_cumulative, (num_buckets + 1,)),
-        ("cursor", scratch.cursor, (num_buckets,)),
-        ("bucket_end", scratch.bucket_end, (num_buckets,)),
-    )
-    for name, tensor, shape in contracts:
-        if (
-            tensor.shape != shape
-            or tensor.dtype is not torch.int32
-            or tensor.device != device
-            or not tensor.is_contiguous()
-        ):
-            raise ValueError(
-                f"fused align scratch {name} must be a contiguous int32 "
-                f"{list(shape)} tensor on {device}"
-            )
-
-
 def fused_align_block_size(
     topk_ids: torch.Tensor,
     token_lora_mapping: torch.Tensor,
@@ -303,16 +278,21 @@ def fused_align_block_size(
     capacity: int,
     lora_expert_map: torch.Tensor | None = None,
     shared_outer_local_expert_count: int | None = None,
-    num_pairs_post_padded_out: torch.Tensor,
-    scratch: FusedAlignScratch,
+    workspace: MoeLoraWorkspace,
+    scratch_prefix: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return ``(sorted_pair_ids, block_virtual_expert_ids, num_pairs_post_padded)``.
 
     Same plan contract as the incumbent align, computed from the SOURCE
-    tensors: no ``virtual_topk_ids`` is written or read anywhere. Scratch and
-    the padded-pair scalar are caller-owned: every route needs its own, and a
-    process-global cache keyed by bucket count -- which is what this used to
-    fall back to -- silently shares them between routes at the same count.
+    tensors: no ``virtual_topk_ids`` is written or read anywhere.
+
+    The chain's metadata is workspace-owned and named, one set per route:
+    graph capture bakes the addresses, so they must survive replay, and
+    ``counts`` is zero on entry because the scan re-zeroes it after its final
+    read -- an invariant that only holds while the same buffer persists, and
+    which is why this is not fresh-allocated per call. Distinct
+    ``scratch_prefix`` per route is what keeps two routes at the same bucket
+    count from sharing a scalar.
     """
     device = topk_ids.device
     num_pairs = topk_ids.numel()
@@ -331,16 +311,6 @@ def fused_align_block_size(
         lora_expert_map=lora_expert_map,
         lora_experts_per_adapter=lora_experts_per_adapter,
     )
-    if (
-        num_pairs_post_padded_out.shape != (1,)
-        or num_pairs_post_padded_out.dtype is not torch.int32
-        or num_pairs_post_padded_out.device != device
-        or not num_pairs_post_padded_out.is_contiguous()
-    ):
-        raise ValueError(
-            "num_pairs_post_padded_out must be a contiguous int32 [1] "
-            f"tensor on {device}"
-        )
     shared_outer = shared_outer_local_expert_count is not None
     use_map = lora_expert_map is not None
     # Own name, not a reassignment of the parameter (see routing.py).
@@ -354,7 +324,20 @@ def fused_align_block_size(
 
     # Every host-fallible operation happens BEFORE the first launch, so an
     # exception cannot leave this entry's counts dirty between K1 and K2.
-    _validate_scratch(scratch, num_buckets=num_buckets, device=device)
+    def counter(name: str, size: int, *, zero_first: bool = False) -> torch.Tensor:
+        return workspace.tensor(
+            f"{scratch_prefix}:{name}",
+            (size,),
+            dtype=torch.int32,
+            device=device,
+            **({"zero_on_first_allocation": True} if zero_first else {}),
+        )
+
+    counts = counter("counts", num_buckets, zero_first=True)
+    block_cumulative = counter("block_cumulative", num_buckets + 1)
+    cursor = counter("cursor", num_buckets)
+    bucket_end = counter("bucket_end", num_buckets)
+    num_pairs_post_padded_out = counter("padded_pairs", 1)
     sorted_pair_ids = torch.empty(capacity, dtype=torch.int32, device=device)
     block_virtual_expert_ids = torch.empty(num_blocks, dtype=torch.int32, device=device)
     # PDL is always on where the architecture supports it: measured
@@ -370,7 +353,7 @@ def fused_align_block_size(
         topk_ids,
         token_lora_mapping,
         map_arg,
-        scratch.counts,
+        counts,
         num_pairs,
         routed_expert_id_bound,
         NUM_BUCKETS=num_buckets,
@@ -384,10 +367,10 @@ def fused_align_block_size(
         num_warps=HIST_WARPS,
     )
     _padded_scan_kernel[(1,)](
-        scratch.counts,
-        scratch.block_cumulative,
-        scratch.cursor,
-        scratch.bucket_end,
+        counts,
+        block_cumulative,
+        cursor,
+        bucket_end,
         num_pairs_post_padded_out,
         num_buckets,
         BLOCK_SIZE_M=block_size,
@@ -402,9 +385,9 @@ def fused_align_block_size(
         topk_ids,
         token_lora_mapping,
         map_arg,
-        scratch.cursor,
-        scratch.bucket_end,
-        scratch.block_cumulative,
+        cursor,
+        bucket_end,
+        block_cumulative,
         sorted_pair_ids,
         block_virtual_expert_ids,
         num_pairs,

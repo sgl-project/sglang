@@ -167,7 +167,6 @@ def _load_route_factory():
     routing = types.ModuleType("sglang.srt.lora.moe.routing")
     routing.RouteViewKind = _RouteViewKind
     routing.RouteView = _HostRouteView
-    routing.FusedAlignScratch = types.SimpleNamespace
     routing.build_virtual_expert_routing = lambda *args, **kwargs: None
     routing.uses_fused_align = lambda *_args, **_kwargs: True
 
