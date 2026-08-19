@@ -15,6 +15,9 @@ import torch
 
 from sglang.srt.layers.attention.dsv4.mxfp4_k_cache import (
     MXFP4_BYTES_PER_TOKEN,
+    MXFP4_GROUP_SIZE,
+    MXFP4_NOPE_DIM,
+    MXFP4_NUM_GROUPS,
     MXFP4_TOTAL_DIM,
     dequantize_dsv4_mxfp4_k_cache_paged,
     quantize_dsv4_mxfp4_k_cache_into,
@@ -114,6 +117,53 @@ def test_e8m0_byte_zero_decodes_as_2_pow_minus_127():
     out = dequantize_dsv4_mxfp4_k_cache_paged(pool, loc, page_size)[:, 0, :].float()
     expected = torch.full((32,), 3.0 * 2.0**-127, device=dev)
     assert torch.equal(out[0, :32], expected)
+
+
+def test_all_zero_block_quantizes_to_zero_codes():
+    """An all-zero block must quantize to E2M1 code 0 with scale byte 0 and
+    round-trip to exactly zero (regression: the quantizer derived the RNE
+    denominator from tl.math.exp2, which flushes the subnormal 2^-127 to
+    zero; the `magnitude >= denominator * midpoint` rungs then all held at
+    magnitude 0 and zero inputs were encoded as code 3 — nonzero packed
+    nibbles that also diverged from the PyTorch reference).  All-zero rows
+    occur in production: idle dummy stores write them into the pool."""
+    dev = torch.device("cuda")
+    page_size, num_tokens = 128, 4
+    k = torch.zeros(num_tokens, MXFP4_TOTAL_DIM, dtype=torch.bfloat16, device=dev)
+    pool = _pool(page_size)
+    loc = torch.arange(num_tokens, dtype=torch.int32, device=dev)
+
+    quantize_dsv4_mxfp4_k_cache_into(k, pool, loc, page_size)
+
+    rows = pool.view(-1, MXFP4_BYTES_PER_TOKEN)[:num_tokens]
+    packed = rows[:, : MXFP4_NOPE_DIM // 2]
+    scales = rows[:, MXFP4_NOPE_DIM // 2 : MXFP4_NOPE_DIM // 2 + MXFP4_NUM_GROUPS]
+    assert torch.equal(packed, torch.zeros_like(packed))
+    assert torch.equal(scales, torch.zeros_like(scales))
+
+    out = dequantize_dsv4_mxfp4_k_cache_paged(pool, loc, page_size)
+    nope = out[:, 0, :MXFP4_NOPE_DIM].float()
+    assert torch.equal(nope, torch.zeros_like(nope))
+
+    # The same must hold for a zero group inside an otherwise healthy row:
+    # its packed bytes and its scale byte stay zero while the row's other
+    # groups encode normally.
+    torch.manual_seed(3)
+    k = torch.randn(1, MXFP4_TOTAL_DIM, dtype=torch.bfloat16, device=dev)
+    k[0, :MXFP4_GROUP_SIZE] = 0
+    pool = _pool(page_size)
+    loc = torch.zeros(1, dtype=torch.int32, device=dev)
+    quantize_dsv4_mxfp4_k_cache_into(k, pool, loc, page_size)
+    row = pool.view(-1, MXFP4_BYTES_PER_TOKEN)[0]
+    group_bytes = MXFP4_GROUP_SIZE // 2
+    assert torch.equal(
+        row[:group_bytes], torch.zeros(group_bytes, dtype=torch.uint8, device=dev)
+    )
+    assert row[MXFP4_NOPE_DIM // 2] == 0
+    assert not torch.equal(
+        row[group_bytes : MXFP4_NOPE_DIM // 2],
+        torch.zeros(MXFP4_NOPE_DIM // 2 - group_bytes, dtype=torch.uint8, device=dev),
+    )
 
 
 def test_roundtrip_quality():

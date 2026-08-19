@@ -279,8 +279,15 @@ def _quantize_mxfp4_k_cache_into_kernel(
     # below it anyway so a stray byte can never decode as NaN.
     scale_byte = tl.minimum(tl.maximum(scale_byte_raw, 0), 254).to(tl.uint8)
 
-    # E2M1 RNE: compare original values against scaled midpoints (no division)
-    scale_float = tl.math.exp2((scale_byte.to(tl.float32) - 127.0))
+    # E2M1 RNE: compare original values against scaled midpoints (no division).
+    # Build 2^(byte-127) from the FP32 exponent bits instead of exp2, for the
+    # same reason as the dequant kernel below: byte 0 is 2^-127, a subnormal,
+    # and ex2.approx flushes it to zero.  A zero denominator flips the RNE
+    # ladder's `magnitude >= denominator * midpoint` rungs at magnitude 0 and
+    # encodes an all-zero block as E2M1 code 3 instead of code 0.
+    sb = scale_byte.to(tl.int32)
+    scale_normal = (tl.where(sb == 0, 1, sb) << 23).to(tl.float32, bitcast=True)
+    scale_float = tl.where(sb == 0, scale_normal * 0.5, scale_normal)
     denominator = tl.expand_dims(scale_float, 1)
     codes = _e2m1_rne_scaled_triton(x, denominator)  # [GROUPS_PER_PROGRAM, 32] uint8
 
