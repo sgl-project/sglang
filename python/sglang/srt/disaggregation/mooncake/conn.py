@@ -2018,8 +2018,10 @@ class MooncakeKVManager(CommonKVManager):
                                 f"Received abort notification for room {room_to_be_aborted}, "
                                 f"marked as Failed; ACK deferred until transfer drains"
                             )
-                        else:
-                            # Already completed/unknown: no in-flight write, ack now.
+                        elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
+                            # Concluded/unknown AND quiescent: ack now. A cleared
+                            # room is not automatically quiescent -- clear() can
+                            # drop a room whose chunk is still transferring.
                             self._send_abort_ack(
                                 decode_ip, decode_port, room_to_be_aborted
                             )

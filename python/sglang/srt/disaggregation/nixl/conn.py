@@ -2678,14 +2678,17 @@ class NixlKVManager(CommonKVManager):
 
         # Deferred KV release: register only after the status flip above (see
         # register_deferred_ack_target), then try once -- the room may already be
-        # quiescent and never revisited by the worker.
+        # quiescent and never revisited by the worker. A concluded/unknown room is
+        # acked only when nothing is still counted for it: the ERR path abandons
+        # sibling handles that may still be writing and clear() then drops the
+        # room, so "unknown" alone does not imply quiescent.
         if self.enable_deferred_decode_kv_release and decode_port is not None:
             if room_active:
                 self.register_deferred_ack_target(
                     room_to_be_aborted, decode_ip, decode_port
                 )
                 self._maybe_ack_drained_abort(room_to_be_aborted)
-            else:
+            elif self._staging_outstanding.get(room_to_be_aborted, 0) == 0:
                 self._send_abort_ack(decode_ip, decode_port, room_to_be_aborted)
 
         return True

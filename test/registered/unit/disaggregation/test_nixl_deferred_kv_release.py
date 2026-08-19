@@ -129,12 +129,23 @@ class TestNixlAbortNotification(CustomTestCase):
         self.assertEqual(mgr._deferred_ack_targets, {})
 
     def test_concluded_room_acks_immediately(self):
-        # Concluded room: nothing in flight, so ack straight away.
+        # Concluded and quiescent: ack straight away.
         mgr = self._mgr(status=None)
         mgr.check_status = lambda r: KVPoll.Success
         self.assertTrue(mgr._handle_abort_notification(self._abort_msg()))
 
         self.assertEqual(mgr._sent, [("10.0.0.3", 6000, 11)])
+        self.assertEqual(mgr._deferred_ack_targets, {})
+
+    def test_cleared_room_with_outstanding_chunk_does_not_ack(self):
+        # The ERR path abandons sibling handles that may still be writing and
+        # leaves the chunk counted; clear() then drops the room. Acking on
+        # "unknown room" alone would release decode pages under those writes.
+        mgr = self._mgr(status=None)  # room absent == cleared/unknown
+        mgr._staging_outstanding[11] = 1
+        self.assertTrue(mgr._handle_abort_notification(self._abort_msg()))
+
+        self.assertEqual(mgr._sent, [])
         self.assertEqual(mgr._deferred_ack_targets, {})
 
     def test_feature_off_registers_nothing_and_acks_nothing(self):
