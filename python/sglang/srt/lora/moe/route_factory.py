@@ -1,5 +1,3 @@
-"""Build exactly the route products consumed by one MoE-LoRA plan."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -22,7 +20,7 @@ from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
 @dataclass(frozen=True, slots=True)
 class MoeLoraRoutes:
-    """The distinct row-domain views materialized for one forward."""
+    """Every route the plan asked for; the rest stay None."""
 
     raw_per_expert: RouteView | None = None
     raw_shared_outer: RouteView | None = None
@@ -42,7 +40,6 @@ class MoeLoraRoutes:
 
     @staticmethod
     def _require(route: RouteView | None, field: str) -> RouteView:
-        """Name the FIELD, so the message is greppable straight to the slot."""
         if route is None:
             raise ValueError(f"the execution plan did not request {field}")
         return route
@@ -58,13 +55,6 @@ def build_routes(
     block_size: int,
     workspace: MoeLoraWorkspace,
 ) -> MoeLoraRoutes:
-    """Construct the exact route bundle declared by ``plan``.
-
-    Raw views are descriptor-only and therefore both ownership forms are
-    cheap.  Aligned views launch their builders.  The shared token plan uses a
-    synthetic top-k-one expert column because gate/up-A is adapter-owned; the
-    original pair route remains authoritative for every B consumer.
-    """
     requirements = plan.route_requirements()
     values: dict[str, object] = {}
     if RouteRequirement.RAW_PER_EXPERT in requirements:
@@ -77,8 +67,6 @@ def build_routes(
             view=RouteViewKind.RAW,
         )
     if RouteRequirement.RAW_SHARED_OUTER in requirements:
-        # One LoRA expert per adapter, with the local expert count restoring
-        # the ownership bound (see the shared-outer note below).
         values["raw_shared_outer"] = build_virtual_expert_routing(
             topk_ids,
             token_lora_mapping,
@@ -113,10 +101,6 @@ def build_routes(
                 scratch_prefix="route:aligned_per_expert",
             )
         if RouteRequirement.ALIGNED_SHARED_OUTER in requirements:
-            # A shared adapter has exactly ONE LoRA expert, so the generic
-            # validity test would end in ``lora_expert_id < 1`` -- always true.
-            # The local expert count restores the bound, without which a routed
-            # expert this rank does not own would pass as a valid pair.
             values["aligned_shared_outer"] = build_virtual_expert_routing(
                 topk_ids,
                 token_lora_mapping,
@@ -130,12 +114,6 @@ def build_routes(
             )
 
     if RouteRequirement.SHARED_TOKEN_PLAN in requirements:
-        # A token may have its first local top-k entry masked while another is
-        # valid, so deriving this route from topk_ids[:, :1] would incorrectly
-        # drop it.  Conversely, a token with no local pair must not schedule
-        # shared-A work: the repeated-pair control has no work for that token,
-        # and no downstream B reads its bridge.  This is the same sparse-EP
-        # contract qualified by Step 3's token-dedup candidate.
         has_local_pair = ((topk_ids >= 0) & (topk_ids < num_local_experts)).any(dim=1)
         shared_token_lora_mapping = workspace.tensor(
             "route:shared_token_lora_mapping",
@@ -149,8 +127,6 @@ def build_routes(
             torch.full_like(token_lora_mapping, -1),
             out=shared_token_lora_mapping,
         )
-        # The shared A factor is adapter-owned, so the expert column itself is
-        # synthetic once local participation has been encoded in the slots.
         token_experts = workspace.tensor(
             "route:shared_token_experts",
             (topk_ids.shape[0], 1),
@@ -158,7 +134,6 @@ def build_routes(
             device=topk_ids.device,
             zero_on_first_allocation=True,
         )
-        # Shared-outer, so the same expert-range bound as above applies.
         values["shared_token"] = build_virtual_expert_routing(
             token_experts,
             shared_token_lora_mapping,
