@@ -764,6 +764,8 @@ class RustServer:
             served_model_name=sa.served_model_name,
             tokenizer_path=sa.tokenizer_path,
             revision=sa.revision,
+            load_format=sa.load_format,
+            weight_version=sa.weight_version,
             host=sa.host,
             port=sa.port,
             log_level=sa.log_level,
@@ -801,7 +803,7 @@ class RustServer:
             enable_return_hidden_states=sa.enable_return_hidden_states,
             # Not a `server_args` field: `TokenizerManager` derives it, and the
             # rust ingress needs the same number for its total-token check.
-            num_reserved_tokens=compute_num_reserved_tokens(sa),
+            num_reserved_tokens=compute_num_reserved_tokens(),
             # Launch-time facts Python's /server_info reports from
             # scheduler_info / the package — stamped here so the rust endpoint
             # can serve them statically (no scheduler round-trip).
