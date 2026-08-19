@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Configuration for the KVCC HiCacheStorage backend.
+"""Configuration for the KVCR HiCacheStorage backend.
 
 Parsed from ``HiCacheStorageConfig.extra_config`` (the ``--hicache-storage-backend
 -extra-config`` JSON blob), mirroring how Mooncake/UMBP read their own settings.
@@ -12,14 +12,14 @@ from typing import Optional
 import msgspec
 
 
-class KVCCBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
-    """Draft config surface for KVCC-as-HiCacheStorage.
+class KVCRBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
+    """Draft config surface for KVCR-as-HiCacheStorage.
 
-    Only the fields the draft actually consumes are here; the KVCC core exposes
-    many more knobs (``KVCCConfig``) that we pass through with defaults for now.
+    Only the fields the draft actually consumes are here; the KVCR core exposes
+    many more knobs (``KVCRConfig``) that we pass through with defaults for now.
     """
 
-    # Size of KVCC's own local DRAM tier (the "buffer-only L3" pool), in bytes.
+    # Size of KVCR's own local DRAM tier (the "buffer-only L3" pool), in bytes.
     # deposit() copies engine host KV into slots carved from this region.
     local_dram_bytes: int = 1 << 30  # 1 GiB placeholder
 
@@ -33,11 +33,11 @@ class KVCCBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
     control_port: int = 0  # 0 => ephemeral
     control_advertise_host: Optional[str] = None
 
-    # KVCC core knobs. enable_telemetry / operation_timeout_ms feed KVCCConfig;
+    # KVCR core knobs. enable_telemetry / operation_timeout_ms feed KVCRConfig;
     # eager_ctrl_connect / opportunistic_query / metadata_retry_interval_ms feed
-    # KVCCBackendConfigs.remote_fw_dram (RemoteFWDramOptions) in the wheel core.
+    # KVCRBackendConfigs.remote_fw_dram (RemoteFWDramOptions) in the wheel core.
     enable_telemetry: bool = False
-    # Budget for one KVCC operation end to end. The core's own default is 1000ms,
+    # Budget for one KVCR operation end to end. The core's own default is 1000ms,
     # which is too tight here: the *source* clamps its pin deadline to this
     # value, and a single prefetch fans a 64-token page out into many block keys
     # (192 for a 96-page request), all of which must be pinned and written
@@ -52,7 +52,7 @@ class KVCCBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
     # When True, the backend expects per-request router hints (source control
     # endpoint + block hashes) to arrive via HiCacheStorageExtraInfo.extra_info
     # and drives remote P2P fetches. When False, the backend is local-only
-    # (deposit/local-get against KVCC's own DRAM), which is all the pinned KVCC
+    # (deposit/local-get against KVCR's own DRAM), which is all the pinned KVCR
     # commit can serve today.
     enable_remote_hint: bool = False
 
@@ -63,7 +63,7 @@ class KVCCBackendConfig(msgspec.Struct, frozen=True, kw_only=True):
     get_timeout_s: float = 30.0
 
     @classmethod
-    def from_extra_config(cls, extra_config: Optional[dict]) -> "KVCCBackendConfig":
+    def from_extra_config(cls, extra_config: Optional[dict]) -> "KVCRBackendConfig":
         if not extra_config:
             return cls()
         known = {f for f in cls.__struct_fields__}

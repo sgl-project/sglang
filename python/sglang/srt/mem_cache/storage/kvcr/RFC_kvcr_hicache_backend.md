@@ -1,17 +1,17 @@
-# RFC: Integrating KVCC as a HiCache Storage Backend
+# RFC: Integrating KVCR as a HiCache Storage Backend
 
-**Status:** Draft · **Author:** Lin Hu · **Scope:** SGLang HiCache ↔ KVCC (worker↔worker G2 KV reuse)
+**Status:** Draft · **Author:** Lin Hu · **Scope:** SGLang HiCache ↔ KVCR (worker↔worker G2 KV reuse)
 
 ## Summary
 
 SGLang's HiCache already supports pluggable L3 storage backends (mooncake, hf3fs,
-eic, …) behind a stable `HiCacheStorage` interface. This RFC adds KVCC as one more
+eic, …) behind a stable `HiCacheStorage` interface. This RFC adds KVCR as one more
 such backend. The integration is deliberately small: no changes to HiRadixCache or
-the scheduler's cache path — we register a `"kvcc"` backend and implement the same
+the scheduler's cache path — we register a `"kvcr"` backend and implement the same
 `batch_set_v2 / batch_get_v2 / batch_exists_v2` contract the other backends already
 implement.
 
-What makes KVCC different from mooncake et al. is that it is not a symmetric
+What makes KVCR different from mooncake et al. is that it is not a symmetric
 external pool — it is **asymmetric peer-to-peer**: a prefix that another worker
 already holds is fetched directly from that worker. To know *which* peer to fetch
 from, the backend needs one piece of per-request routing metadata that a
@@ -19,7 +19,7 @@ content-addressed `get(hash)` interface does not normally carry: a **router hint
 
 This RFC has two parts:
 1. **Router hint** — how a dynamo-router hint reaches the storage backend.
-2. **Architecture** — how KVCC plugs into HiCache, with the get-path sequence.
+2. **Architecture** — how KVCR plugs into HiCache, with the get-path sequence.
 
 ---
 
@@ -42,7 +42,7 @@ free-form `HiCacheStorageExtraInfo.extra_info` dict from the controller into the
 backend. The router hint rides in that dict under a single key:
 
 ```
-extra_info.extra_info["kvcc_router_hint"] = {
+extra_info.extra_info["kvcr_router_hint"] = {
     "source_control_endpoint": "host:port",   # ZMQ control endpoint of the peer holding the prefix
     "block_hashes": [...],                     # root-aligned block hashes for the shared prefix
 }
@@ -63,9 +63,9 @@ interface — it rides the `extra_info` dict every layer already passes through:
 2. **scheduler → controller.** `HiCacheController.prefetch(...)` carries it into the
    daemon `prefetch_io_aux_func` thread (`managers/cache_controller.py`).
 3. **controller → backend.** `_page_transfer → page_get_func(op, hashes, host_idx,
-   extra_info)` hands it to `KVCCStore.batch_get_v2(...)` (`storage/kvcc/kvcc_store.py`).
+   extra_info)` hands it to `KVCRStore.batch_get_v2(...)` (`storage/kvcr/kvcr_store.py`).
 4. **backend → decision.** `RouterHint.maybe_from_extra_info(extra_info)`
-   (`storage/kvcc/router_hint.py`) parses it:
+   (`storage/kvcr/router_hint.py`) parses it:
    - hint **absent/malformed** → fall back to local-only (deposit/local-get), never raises;
    - hint **present** → drive a directed P2P fetch from `source_control_endpoint`.
 
@@ -74,8 +74,8 @@ flowchart TD
     R[dynamo router<br/>attaches hint to request extra_info] --> S[SGLang scheduler<br/>stashes hint into prefetch request]
     S --> C["HiCacheController.prefetch()<br/>→ prefetch_io_aux_func (daemon)<br/>managers/cache_controller.py"]
     C --> P["_page_transfer → page_get_func<br/>(op, hashes, host_idx, extra_info)"]
-    P --> B["KVCCStore.batch_get_v2(...)<br/>storage/kvcc/kvcc_store.py"]
-    B --> H{"RouterHint.maybe_from_extra_info()<br/>storage/kvcc/router_hint.py"}
+    P --> B["KVCRStore.batch_get_v2(...)<br/>storage/kvcr/kvcr_store.py"]
+    B --> H{"RouterHint.maybe_from_extra_info()<br/>storage/kvcr/router_hint.py"}
     H -->|absent / malformed| L[local-only fallback<br/>deposit / local-get · never raises]
     H -->|present| D[directed P2P fetch<br/>from source_control_endpoint]
 ```
@@ -87,15 +87,15 @@ the dynamo side lands.
 
 ---
 
-## Part 2 — KVCC Integration Architecture
+## Part 2 — KVCR Integration Architecture
 
 ### Where it sits
 
 ```mermaid
 flowchart LR
     SCH[Scheduler] --- HRC[HiRadixCache] --- HCC[HiCacheController]
-    HCC -->|HiCacheStorage iface| KS[KVCCStore<br/>thin adapter]
-    subgraph core[KVCC core · vendored]
+    HCC -->|HiCacheStorage iface| KS[KVCRStore<br/>thin adapter]
+    subgraph core[KVCR core · vendored]
         LD[local DRAM tier<br/>deposit / get]
         CC[control channel<br/>ZMQ peer]
         PT[progress thread<br/>owns NIXL agent]
@@ -103,19 +103,19 @@ flowchart LR
     KS --> core
 ```
 
-`KVCCStore` is a thin adapter. It owns no transfer threads of its own — KVCC's core
-runs **one** daemon "kvcc-progress" thread that exclusively holds the NIXL agent and
+`KVCRStore` is a thin adapter. It owns no transfer threads of its own — KVCR's core
+runs **one** daemon "kvcr-progress" thread that exclusively holds the NIXL agent and
 control socket. The store advances state only by calling `poll_completed()` from the
 HiCache controller's existing prefetch thread. No new threading model is introduced
 into SGLang.
 
 ### Segment sub-blocking (set path, already working)
 
-KVCC's `deposit()` takes one contiguous `MemDescriptor` per key. A HiCache page is
+KVCR's `deposit()` takes one contiguous `MemDescriptor` per key. A HiCache page is
 not always one contiguous run: MHA packs K and V in separate halves of the buffer,
 and layer-first pools split per layer. We handle this generically by probing
 `get_page_buffer_meta` once at registration to learn `segments_per_page`, then
-fanning each page-key into `hash#0, hash#1, …` KVCC block-keys. A page counts as
+fanning each page-key into `hash#0, hash#1, …` KVCR block-keys. A page counts as
 resident iff **all** its segments landed — the same "page = all components present"
 rule Mooncake uses (`nbuf = len(ptr_list) // len(keys)`); we use a positional
 `#seg` index instead of semantic suffixes. This path is implemented and offline-verified
@@ -126,8 +126,8 @@ for both MHA and MLA.
 ```mermaid
 sequenceDiagram
     participant AUX as prefetch aux thread
-    participant KS as KVCCStore
-    participant PT as KVCC progress thread
+    participant KS as KVCRStore
+    participant PT as KVCR progress thread
     participant SRC as source worker
     participant SCH as scheduler
 
@@ -183,7 +183,7 @@ Measured on the 2-worker POC (Qwen3-8B, `page-size 64`, ~1216-token prompts):
 | 16 GB | 108,544 tokens | > 50 | 50/50, zero misses |
 
 Two things this rules out, both of which were tried first and moved nothing:
-the KVCC local DRAM tier (8→16 GB: no change) and the router index size
+the KVCR local DRAM tier (8→16 GB: no change) and the router index size
 (`mem-fraction-static` 0.15→0.45 grew it 633→5392 blocks, 8.5×: no change).
 
 #### The cliff is permanent, and `--hicache-size` alone does not lift it
@@ -205,13 +205,13 @@ first, GPU eviction never fires, `evict_host` finds nothing evictable,
 Three configurations, one variable at a time (`page-size 64`, ~1216-token
 prefixes ≈ 19 pages each):
 
-| KVCC tier | host pool | device pool | collapse | `deposit_pages_offered` froze at |
+| KVCR tier | host pool | device pool | collapse | `deposit_pages_offered` froze at |
 |---|---|---|---|---|
 | 1696 pages | 1696 pages | 5387 pages | prefix 90 | 1680 |
 | 1696 pages | **848** pages | 5387 pages | prefix **46** | **844** |
 | 1696 pages | 1696 pages | **< host** | none in 130 | still climbing at 2354 |
 
-Halving the host pool halves the collapse point while the KVCC tier is held
+Halving the host pool halves the collapse point while the KVCR tier is held
 fixed, so the tier is not the constraint. Making the device pool smaller than
 the host pool removes the collapse entirely, and offload then runs *past* the
 host pool size (2354 > 1696 pages) — pages are being recycled, which is exactly
@@ -237,8 +237,8 @@ counted on the source: a frozen deposit counter next to a climbing
 
 The remote path fails silently by construction: a hint that never arrives and a
 fetch that returns nothing are both indistinguishable from a cache miss at every
-layer above. `KVCCStore` therefore keeps counters and summarizes them at INFO
-every 30 s (`KVCCStore remote path (cumulative): ...`). The split that matters:
+layer above. `KVCRStore` therefore keeps counters and summarizes them at INFO
+every 30 s (`KVCRStore remote path (cumulative): ...`). The split that matters:
 
 - `get_without_hint` high → the **router** is not naming a source (index miss,
   upstream); nothing here is broken.

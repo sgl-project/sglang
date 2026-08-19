@@ -285,7 +285,7 @@ class GenerateReqInput:
     data_parallel_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
-    # For KVCC P2P G2 reuse — opaque router hint from the dynamo router telling
+    # For KVCR P2P G2 reuse — opaque router hint from the dynamo router telling
     # this worker which peer holds a reusable prefix. Passed through untouched to
     # the HiCache storage backend via HiCacheStorageExtraInfo.extra_info. Shape:
     # {"source_control_endpoint": str, "block_hashes": list[str]}.
@@ -1031,7 +1031,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
-    # For KVCC P2P G2 reuse — opaque router hint, passed through to the HiCache
+    # For KVCR P2P G2 reuse — opaque router hint, passed through to the HiCache
     # storage backend. See GenerateReqInput.kv_router_hint.
     kv_router_hint: Optional[dict] = None
 

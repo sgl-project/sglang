@@ -1,10 +1,10 @@
-"""KVCCStore under TP>1 colocation and under concurrent in-flight operations.
+"""KVCRStore under TP>1 colocation and under concurrent in-flight operations.
 
 Everything shipped so far was validated at TP=1 with one request at a time, so
 the two assumptions most likely to be wrong in production are untested:
 
   1. **Rank colocation (TP, and DP on top of it).** Every
-     ``(dp, attn_cp, attn_tp)`` rank of one engine builds its own KVCCStore in
+     ``(dp, attn_cp, attn_tp)`` rank of one engine builds its own KVCRStore in
      its own process on the same host, and each rank holds a *different* slice
      of every attention head. Two things therefore have to follow the rank
      rather than the config: the port this rank *binds* (a collision is silent
@@ -22,11 +22,11 @@ the two assumptions most likely to be wrong in production are untested:
      being dropped; these tests drive that path directly with several waiters in
      flight rather than trusting it by inspection.
 
-CPU-only, no torch pool, no real NIXL, no kvcc wheel: KVCCStore is built without
-a mem_pool so ``_build_kvcc`` never runs, and the core is a fake. That keeps this
+CPU-only, no torch pool, no real NIXL, no kvcr wheel: KVCRStore is built without
+a mem_pool so ``_build_kvcr`` never runs, and the core is a fake. That keeps this
 on the cheapest CI tier alongside the schema tests.
 
-    python -m pytest test/registered/mem_cache/test_kvcc_tp_and_concurrency.py -v
+    python -m pytest test/registered/mem_cache/test_kvcr_tp_and_concurrency.py -v
 """
 
 from __future__ import annotations
@@ -44,9 +44,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
-from sglang.srt.mem_cache.storage.kvcc import kvcc_store
-from sglang.srt.mem_cache.storage.kvcc.kvcc_store import KVCCStore
-from sglang.srt.mem_cache.storage.kvcc.router_hint import ROUTER_HINT_KEY
+from sglang.srt.mem_cache.storage.kvcr import kvcr_store
+from sglang.srt.mem_cache.storage.kvcr.kvcr_store import KVCRStore
+from sglang.srt.mem_cache.storage.kvcr.router_hint import ROUTER_HINT_KEY
 
 try:
     from sglang.test.ci.ci_register import register_cpu_ci
@@ -108,13 +108,13 @@ def _store(
     attn_cp_rank: int = 0,
     attn_cp_size: int = 1,
     **extra,
-) -> KVCCStore:
-    """A KVCCStore with no mem_pool, so the core is never constructed.
+) -> KVCRStore:
+    """A KVCRStore with no mem_pool, so the core is never constructed.
 
     Everything these tests assert on -- agent name, control endpoint, listen
     port -- is decided from config and rank before any pool is registered.
     """
-    return KVCCStore(
+    return KVCRStore(
         _storage_config(
             tp_rank,
             tp_size,
@@ -147,7 +147,7 @@ class FakeEntry:
         self.success = success
 
 
-class FakeKVCC:
+class FakeKVCR:
     """Records deliver() calls and reports completions only when told to.
 
     Nothing completes on its own: a test calls ``finish(op_handle, keys)`` to
@@ -495,8 +495,8 @@ class ConcurrentDrainTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.store = _store(0, 1)
-        self.core = FakeKVCC()
-        self.store._kvcc = self.core
+        self.core = FakeKVCR()
+        self.store._kvcr = self.core
 
     def test_completion_drained_by_the_pump_still_reaches_its_waiter(self):
         """The exact case _completed_ops exists for.
@@ -563,7 +563,7 @@ class ConcurrentDrainTest(unittest.TestCase):
     def test_a_completion_arriving_after_its_waiter_gave_up_is_dropped(self):
         """A timed-out op's late result must not sit in the stash forever.
 
-        Timing out does not cancel anything -- ``kvcc.abort()`` is a no-op stub
+        Timing out does not cancel anything -- ``kvcr.abort()`` is a no-op stub
         -- so the op stays in flight and still reports, but its waiter is gone
         and nothing will ever pop it again. Every entry stashed this way is
         permanent, and the store lives as long as the scheduler, so a server
@@ -584,14 +584,14 @@ class ConcurrentDrainTest(unittest.TestCase):
 
 
 class CloseTest(unittest.TestCase):
-    """Shutdown ordering between our pump thread and the KVCC core."""
+    """Shutdown ordering between our pump thread and the KVCR core."""
 
     def test_the_core_is_not_closed_under_a_pump_stuck_in_a_poll(self):
         """A pump inside poll_completed() is walking state close() frees.
 
-        ``kvcc.close()`` tears down the progress thread and the local tier, so a
+        ``kvcr.close()`` tears down the progress thread and the local tier, so a
         pump that is mid-``poll_completed()`` when that happens is reading freed
-        KVCC state -- a use-after-free reachable through NIXL, not a benign late
+        KVCR state -- a use-after-free reachable through NIXL, not a benign late
         tick. The pump only ever misses its stop flag while it is inside a poll,
         so a join that times out is precisely the dangerous case, and the old
         code's fire-and-forget ``join(timeout=...)`` closed anyway.
@@ -602,19 +602,19 @@ class CloseTest(unittest.TestCase):
         store = _store(0, 1)
         core = SimpleNamespace(closed=False)
         core.close = lambda: setattr(core, "closed", True)
-        store._kvcc = core
+        store._kvcr = core
         wedged = threading.Event()
         store._pump_thread = threading.Thread(target=wedged.wait, daemon=True)
         store._pump_thread.start()
         self.addCleanup(wedged.set)
 
-        with mock.patch.object(kvcc_store, "_PUMP_JOIN_TIMEOUT_S", 0.05):
+        with mock.patch.object(kvcr_store, "_PUMP_JOIN_TIMEOUT_S", 0.05):
             store.close()
 
         self.assertFalse(core.closed)
         # And the store still holds the core, so nothing later mistakes it for
         # an already-released handle.
-        self.assertIs(store._kvcc, core)
+        self.assertIs(store._kvcr, core)
 
     def test_a_pump_that_stops_lets_the_core_close(self):
         """The refusal must be conditional, or close() never closes anything.
@@ -624,7 +624,7 @@ class CloseTest(unittest.TestCase):
         store = _store(0, 1)
         core = SimpleNamespace(closed=False)
         core.close = lambda: setattr(core, "closed", True)
-        store._kvcc = core
+        store._kvcr = core
         store._pump_thread = threading.Thread(
             target=store._pump_stop.wait, daemon=True
         )
@@ -633,7 +633,7 @@ class CloseTest(unittest.TestCase):
         store.close()
 
         self.assertTrue(core.closed)
-        self.assertIsNone(store._kvcc)
+        self.assertIsNone(store._kvcr)
 
 
 class HintRequestIdTest(unittest.TestCase):
@@ -656,7 +656,7 @@ class HintRequestIdTest(unittest.TestCase):
         """
         store = _store(0, 1)
         extra_info = _hint_extra_info("tcp://10.0.0.7:25000")
-        store._kvcc = SimpleNamespace(submit_hint=lambda *a, **k: None)
+        store._kvcr = SimpleNamespace(submit_hint=lambda *a, **k: None)
 
         first = store._register_hint(extra_info)
         second = store._register_hint(extra_info)
@@ -690,12 +690,12 @@ class RemoteFailureTest(unittest.TestCase):
         """The deliver completes for nobody, and the deadline must end it.
 
         This is the dead-source case: the router named a peer that has since
-        been killed, so no completion ever arrives. ``kvcc.abort()`` is a stub
+        been killed, so no completion ever arrives. ``kvcr.abort()`` is a stub
         that cancels nothing, so the deadline in ``_drain_until`` is the only
         thing standing between a dead peer and a permanently wedged prefetch
         thread.
         """
-        self.store._kvcc = FakeKVCC()  # finish() is never called
+        self.store._kvcr = FakeKVCR()  # finish() is never called
         self.store._host_descriptors = lambda transfer: {"seg-a": object()}
 
         started = time.monotonic()
@@ -711,15 +711,15 @@ class RemoteFailureTest(unittest.TestCase):
     def test_a_partially_delivered_page_counts_as_not_loaded(self):
         """A page is all-or-nothing: its segments are not independently usable.
 
-        One host page fans out into ``segments_per_page`` KVCC block keys, and
+        One host page fans out into ``segments_per_page`` KVCR block keys, and
         attention reads the whole page. Reporting True when only some segments
         arrived would tell HiCache the page is cached, and the model would then
         attend over whatever was in the un-filled half of that page -- silent
         wrong output rather than a slow correct one.
         """
         self.store._segments_per_page = 2
-        core = FakeKVCC()
-        self.store._kvcc = core
+        core = FakeKVCR()
+        self.store._kvcr = core
         self.store._host_descriptors = lambda transfer: {"s0": object(), "s1": object()}
         self.store._page_segment_keys = lambda key: ["s0", "s1"]
 
@@ -759,7 +759,7 @@ class RemoteFailureTest(unittest.TestCase):
         that then miss -- the memory is released again only after a full
         deliver round trip against a source that never had them.
         """
-        self.store._kvcc = FakeKVCC()
+        self.store._kvcr = FakeKVCR()
         self.store._locally_resident = lambda segment_keys: False
         extra_info = _hint_extra_info("tcp://10.0.0.7:25000")
 
@@ -785,7 +785,7 @@ class StatsTest(unittest.TestCase):
         remote path is an unattributable throughput regression.
         """
         store = _store(0, 1)
-        store._kvcc = SimpleNamespace(submit_hint=lambda *a, **k: None)
+        store._kvcr = SimpleNamespace(submit_hint=lambda *a, **k: None)
 
         store._register_hint(_hint_extra_info("tcp://10.0.0.7:25000"))
         store._register_hint(None)

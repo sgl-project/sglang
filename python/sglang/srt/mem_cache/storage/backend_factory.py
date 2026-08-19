@@ -189,7 +189,7 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "shm":
             return backend_class(storage_config, mem_pool_host)
-        elif backend_name == "kvcc":
+        elif backend_name == "kvcr":
             return backend_class(storage_config, mem_pool_host)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
@@ -252,11 +252,11 @@ StorageBackendFactory.register_backend(
     "HiCacheShm",
 )
 
-# KVCC peer-to-peer G2 KV coordinator. Unlike the external-pool backends above
-# (mooncake/umbp/...), KVCC is asymmetric P2P: worker<->worker KV transfer
-# driven by dynamo-router hints. See storage/kvcc/README.
+# KVCR peer-to-peer G2 KV coordinator. Unlike the external-pool backends above
+# (mooncake/umbp/...), KVCR is asymmetric P2P: worker<->worker KV transfer
+# driven by dynamo-router hints. See storage/kvcr/README.
 StorageBackendFactory.register_backend(
-    "kvcc",
-    "sglang.srt.mem_cache.storage.kvcc.kvcc_store",
-    "KVCCStore",
+    "kvcr",
+    "sglang.srt.mem_cache.storage.kvcr.kvcr_store",
+    "KVCRStore",
 )

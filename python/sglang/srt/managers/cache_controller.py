@@ -220,10 +220,10 @@ class PrefetchAck:
 
 
 # Free-form key under HiCacheStorageExtraInfo.extra_info that carries the per-request
-# KV router hint down to storage backends (currently consumed by the KVCC backend to
+# KV router hint down to storage backends (currently consumed by the KVCR backend to
 # locate the source of a remote prefix). Kept as a literal here so this generic
-# controller stays backend-agnostic; the KVCC backend owns the matching constant.
-_ROUTER_HINT_EXTRA_INFO_KEY = "kvcc_router_hint"
+# controller stays backend-agnostic; the KVCR backend owns the matching constant.
+_ROUTER_HINT_EXTRA_INFO_KEY = "kvcr_router_hint"
 
 
 def _router_hint_extra_info(operation: "StorageOperation") -> Optional[dict]:
@@ -623,7 +623,7 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori", "kvcc"]
+                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori", "kvcr"]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))

@@ -2849,7 +2849,7 @@ class ServerArgs:
                 "simm",
                 "mori",
                 "shm",
-                "kvcc",
+                "kvcr",
             ],
         ),
         NS("memory"),

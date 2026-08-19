@@ -1,33 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The framework-pinning half of the KVCC bindings, deliberately empty.
+"""The framework-pinning half of the KVCR bindings, deliberately empty.
 
-``request_pin`` / ``poll_pin_results`` / ``release_pin`` are KVCC-to-framework
+``request_pin`` / ``poll_pin_results`` / ``release_pin`` are KVCR-to-framework
 callbacks, not the other way round: when a peer asks this worker to serve a
-prefix, KVCC first claims what its *own* local DRAM tier holds
+prefix, KVCR first claims what its *own* local DRAM tier holds
 (``_claim_local_dram_sources``) and only then asks the framework "do you hold
 the rest, and if so pin it and give me addresses". Answering that question
 means offering SGLang's ``HostKVCache`` pages as NIXL source memory.
 
 We answer "we hold nothing", because SGLang gives us no way to answer it
-safely. A host page is owned by HiCache's own allocator, and a KVCC source
+safely. A host page is owned by HiCache's own allocator, and a KVCR source
 write is asynchronous: between handing over the address and the peer's transfer
 completing, HiRadixCache is free to evict that page and refill it for a
-different sequence. Nothing on that path errors -- KVCC block keys are token
+different sequence. Nothing on that path errors -- KVCR block keys are token
 hashes with no content check, so the peer would accept and decode from whatever
 happened to land there. Pinning a host page properly means holding its owning
 ``TreeNode`` via ``protect_host`` / ``unprotect_host``, which needs a residency
 index inside HiRadixCache that this backend does not have (that is the
 Shared-HiCache adapter -- separate work).
 
-The cost of the empty answer is a miss, not a wrong result: a key KVCC's local
+The cost of the empty answer is a miss, not a wrong result: a key KVCR's local
 tier has already evicted is simply not served, and the peer recomputes that
 page. Everything this backend deposits lands in that tier, so the common case
-is served from there, with KVCC's own claim/refcount holding the slot for the
+is served from there, with KVCR's own claim/refcount holding the slot for the
 duration of the write.
 
 The request still has to round-trip -- ``_pin_framework_keys`` has no
 synchronous "nothing to pin" return -- so we hand back an id immediately and a
-``None`` result on the next poll, which KVCC reads as "the framework holds none
+``None`` result on the next poll, which KVCR reads as "the framework holds none
 of these" and submits the source write with the local-tier sources alone.
 """
 
@@ -37,7 +37,7 @@ import logging
 import threading
 from typing import Collection, List, Tuple
 
-from kvcc.types import BlockKey, PinHandle, PinRequestId, PinResult
+from kvcr.types import BlockKey, PinHandle, PinRequestId, PinResult
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +70,7 @@ class NoFrameworkPinning:
         return declined
 
     def cancel_pin_request(self, request: PinRequestId) -> None:
-        """Drop a request KVCC gave up on before we reported it.
+        """Drop a request KVCR gave up on before we reported it.
 
         Only reachable when the source op's deadline expires inside the single
         poll interval between ``request_pin`` and ``poll_pin_results``.
@@ -81,14 +81,14 @@ class NoFrameworkPinning:
             ]
 
     def release_pin(self, pin_handle: PinHandle) -> bool:
-        """Unreachable: KVCC only releases handles a non-``None`` result gave it.
+        """Unreachable: KVCR only releases handles a non-``None`` result gave it.
 
-        Reaching this means KVCC installed a pin we never issued, so the
+        Reaching this means KVCR installed a pin we never issued, so the
         contract in the module docstring no longer holds. Say so instead of
         returning a reassuring True.
         """
         logger.error(
-            "KVCCStore: asked to release framework pin %r, but this backend "
+            "KVCRStore: asked to release framework pin %r, but this backend "
             "never offers framework memory as a source.",
             pin_handle,
         )

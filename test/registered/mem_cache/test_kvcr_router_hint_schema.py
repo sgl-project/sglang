@@ -12,10 +12,10 @@ back in the hint as a bare JSON number. So the round trip
 ``page hash -> event int64 -> u64 -> hint -> page key`` must land back on the
 same 16 hex chars the store compares against.
 
-Unlike ``test_kvcc_router_hint_e2e.py``, this needs no ``kvcc`` wheel: it is the
+Unlike ``test_kvcr_router_hint_e2e.py``, this needs no ``kvcr`` wheel: it is the
 pure parse/normalize layer.
 
-    python -m pytest test/registered/mem_cache/test_kvcc_router_hint_schema.py -v
+    python -m pytest test/registered/mem_cache/test_kvcr_router_hint_schema.py -v
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.mem_cache.storage.kvcc.router_hint import (
+from sglang.srt.mem_cache.storage.kvcr.router_hint import (
     ROUTER_HINT_KEY,
     RouterHint,
     normalize_block_hash,

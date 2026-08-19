@@ -1,23 +1,24 @@
-# KVCC as a HiCache L3 backend — reviewer's guide
+# KVCR as a HiCache L3 backend — reviewer's guide
 
 Cross-instance KV reuse for SGLang: worker B serves a prefix that worker A
 computed, over NIXL, steered by a dynamo router hint. This is a POC — it works
 end to end, and the known gaps are listed at the bottom.
 
-For the design rationale see `RFC_kvcc_hicache_backend.md` next to this file.
+For the design rationale see `RFC_kvcr_hicache_backend.md` next to this file.
 This document is only how to run it and what has been verified.
 
 ## What it is
 
-KVCC (`nvidia-kvcc`) is a framework-neutral KV cache controller with its own
-DRAM tier and a NIXL data path. This directory plugs it into SGLang as a
-`HiCacheStorage` backend (`--hicache-storage-backend kvcc`), so:
+KVCR (`nvidia-kvcr`, formerly `nvidia-kvcc` / "KV Cache Controller") is a
+framework-neutral KV cache runner with its own DRAM tier and a NIXL data path.
+This directory plugs it into SGLang as a
+`HiCacheStorage` backend (`--hicache-storage-backend kvcr`), so:
 
-- **offload** — SGLang's HiCache host tier writes pages into KVCC's DRAM tier
+- **offload** — SGLang's HiCache host tier writes pages into KVCR's DRAM tier
   (`batch_set_v2` → `deposit()`).
 - **local fetch** — pages come back from that tier (`batch_get_v2` → `get()`).
 - **remote fetch** — when the request carries a dynamo router hint naming
-  another instance, KVCC pulls those pages from *that* instance's tier instead
+  another instance, KVCR pulls those pages from *that* instance's tier instead
   of recomputing them.
 
 The router hint is the only thing that makes the remote case possible: SGLang
@@ -28,14 +29,16 @@ a peer's residency.
 
 | component | pin |
 |---|---|
-| KVCC | `nvidia-kvcc` 0.1.0, repo base `e31766fcc7851117a1da7ba2c37d448aed05e057` (extracted from vLLM `b2df38fa2ce0487d380e668c02468812f17c7574`, see its `PROVENANCE.md`) |
-| NIXL | 1.3.1 (KVCC's own pin) |
+| KVCR | `nvidia-kvcr` 0.1.0, repo commit `873391ce97609c1caf8c785eebb78f7dfa58367d` |
+| NIXL | 1.3.1 (KVCR's own pin) |
 | dynamo | branch `linhu/kvcc-sglang-router-hint`, on top of router-hint PR #11695 |
 | model used in every run below | Qwen3-8B, `--page-size 64` |
 
-KVCC's Python API is not stable yet. A version skew shows up as an
-`AttributeError` or `TypeError` at store construction, not as a silent
-misbehaviour.
+KVCR's Python API is not stable yet, and its version number does not track it:
+the distribution has sat at `0.1.0` across every breaking change so far,
+including the `kvcc` → `kvcr` package rename itself. Pin the repo commit, not
+the version. A version skew shows up as an `AttributeError` or `TypeError` at
+store construction, not as a silent misbehaviour.
 
 ## Running it
 
@@ -50,7 +53,7 @@ python3 -m dynamo.sglang \
   --page-size 64 \
   --enable-hierarchical-cache \
   --hicache-size 16 \
-  --hicache-storage-backend kvcc \
+  --hicache-storage-backend kvcr \
   --hicache-storage-backend-extra-config '{
       "local_dram_bytes": 8589934592,
       "control_host": "127.0.0.1",
@@ -81,7 +84,7 @@ Non-zero means B served tokens it never computed. The backend also logs
 cumulative counters:
 
 ```
-KVCCStore remote path (cumulative): exists_with_hint=148 get_with_hint=148
+KVCRStore remote path (cumulative): exists_with_hint=148 get_with_hint=148
   hinted_pages_requested=2608 hinted_pages_loaded=1680 deposit_pages_offered=...
 ```
 
@@ -115,7 +118,7 @@ recompute, never admit wrong KV:
 distinct prefixes each. Established that the collapse we saw is the HiCache
 sizing issue below, and *not* `local_dram_bytes`.
 
-**Unit** — `test/registered/mem_cache/test_kvcc_*.py` and
+**Unit** — `test/registered/mem_cache/test_kvcr_*.py` and
 `test_hicache_offload_stall.py`, 62 passing in-container.
 
 ## Known issues
@@ -132,20 +135,20 @@ sizing issue below, and *not* `local_dram_bytes`.
    is evictable`). Diagnostic signature: `deposit_pages_offered` frozen while
    `exists_calls` keeps climbing.
 
-2. **A peer restart costs ~34 s of degraded P2P** (KVCC-side; reported
+2. **A peer restart costs ~34 s of degraded P2P** (KVCR-side; reported
    separately). Transient and self-healing, no wrong answers, no operator
    action. The restarted worker is only affected as a *source*; as a destination
    it works immediately.
 
 3. **`local_dram_bytes` ≥ 32 GiB fails to start** — NIXL registration exceeds
-   KVCC's 10 s progress-thread join timeout (`RuntimeError: KVCC progress thread
+   KVCR's 10 s progress-thread join timeout (`RuntimeError: KVCR progress thread
    did not start`). 14.9 GiB is fine; the threshold is somewhere between.
 
 4. **The source offers no framework memory as a NIXL source.** `pin_adapter.py`
    declines every pin request: pinning a HiCache host page safely needs a
    residency index inside HiRadixCache that this backend does not have (that is
    the Shared-HiCache adapter — separate work). Everything served comes from
-   KVCC's own tier, where its refcount holds the slot for the duration of the
+   KVCR's own tier, where its refcount holds the slot for the duration of the
    write. Cost is a miss, never a wrong result.
 
 5. **Not benchmarked.** Every run above is a correctness run. No throughput or
@@ -155,10 +158,10 @@ sizing issue below, and *not* `local_dram_bytes`.
 
 | file | what it holds |
 |---|---|
-| `kvcc_store.py` | the whole backend: the `HiCacheStorage` surface, deposit/get, the remote-hint path, counters |
+| `kvcr_store.py` | the whole backend: the `HiCacheStorage` surface, deposit/get, the remote-hint path, counters |
 | `router_hint.py` | parsing the dynamo hint and normalizing block hashes (the wire seam — a mismatch here silently makes every hint cover zero pages) |
-| `pin_adapter.py` | the KVCC→framework pin callbacks, deliberately declining (see issue 4) |
-| `kvcc_config.py` | `--hicache-storage-backend-extra-config` schema and timeouts |
+| `pin_adapter.py` | the KVCR→framework pin callbacks, deliberately declining (see issue 4) |
+| `kvcr_config.py` | `--hicache-storage-backend-extra-config` schema and timeouts |
 
 Outside this directory the change is small — 13 files, ~190 lines, mostly
 threading `kv_router_hint` from the request through the scheduler down to

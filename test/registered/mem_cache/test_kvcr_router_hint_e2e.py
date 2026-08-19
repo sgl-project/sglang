@@ -1,9 +1,9 @@
-"""Two-instance KVCC e2e over the SGLang router-hint contract.
+"""Two-instance KVCR e2e over the SGLang router-hint contract.
 
 This exercises the ONE integration seam that Workstream B owns: a dynamo router
 hint, parsed by our :class:`RouterHint` and matched by our
-:class:`StrKeyHintAdapter`, must drive the real ``nvidia-kvcc`` core to fetch a
-remote prefix from a peer instance. We stand up two real ``KVCC`` instances
+:class:`StrKeyHintAdapter`, must drive the real ``nvidia-kvcr`` core to fetch a
+remote prefix from a peer instance. We stand up two real ``KVCR`` instances
 (target + source) wired to in-process fakes for NIXL, the ZMQ control channel,
 and primary pinning -- the same fake seams the core's own unit tests use -- and
 assert that:
@@ -14,11 +14,11 @@ assert that:
      covered blocks and both sides converge to a SUCCESS op result.
 
 It is CPU-only and needs no torch / GPU / real NIXL, so it runs on the cheapest
-CI tier. It is skipped if the ``kvcc`` wheel is not installed. This does NOT
-cover the ``KVCCStore`` host-pool wiring (that needs a real HostKVCache); it
-covers the hint -> core contract that the store's ``_build_kvcc`` depends on.
+CI tier. It is skipped if the ``kvcr`` wheel is not installed. This does NOT
+cover the ``KVCRStore`` host-pool wiring (that needs a real HostKVCache); it
+covers the hint -> core contract that the store's ``_build_kvcr`` depends on.
 
-    python -m pytest test/registered/mem_cache/test_kvcc_router_hint_e2e.py -v
+    python -m pytest test/registered/mem_cache/test_kvcr_router_hint_e2e.py -v
 """
 
 from __future__ import annotations
@@ -34,15 +34,15 @@ from typing import Any, Collection, Mapping
 from unittest.mock import patch
 
 try:
-    from kvcc import KVCC, KVCCBindings
-    from kvcc import progress as kvcc_progress
-    from kvcc.config import (
-        KVCCBackendConfigs,
-        KVCCConfig,
+    from kvcr import KVCR, KVCRBindings
+    from kvcr import progress as kvcr_progress
+    from kvcr.config import (
+        KVCRBackendConfigs,
+        KVCRConfig,
         LocalDramInput,
         RemoteFWDramOptions,
     )
-    from kvcc.types import (
+    from kvcr.types import (
         BlockKey,
         CacheTier,
         MemDescriptor,
@@ -53,13 +53,13 @@ try:
         QueryStatus,
     )
 
-    _HAS_KVCC = True
+    _HAS_KVCR = True
 except ImportError:  # pragma: no cover - wheel not installed on this tier
-    _HAS_KVCC = False
+    _HAS_KVCR = False
 
-if _HAS_KVCC:
-    from sglang.srt.mem_cache.storage.kvcc.pin_adapter import NoFrameworkPinning
-    from sglang.srt.mem_cache.storage.kvcc.router_hint import (
+if _HAS_KVCR:
+    from sglang.srt.mem_cache.storage.kvcr.pin_adapter import NoFrameworkPinning
+    from sglang.srt.mem_cache.storage.kvcr.router_hint import (
         RouterHint,
         StrKeyHintAdapter,
     )
@@ -73,7 +73,7 @@ except Exception:  # pragma: no cover - registration is CI-only
 
 
 # ---------------------------------------------------------------------------
-# Minimal in-process fakes, mirroring nvidia-kvcc's own tests/unit/test_kvcc.py.
+# Minimal in-process fakes, mirroring nvidia-kvcr's own tests/unit/test_kvcr.py.
 # Vendored (not imported) because the core's test module ships inside the wheel's
 # source tree, not as an importable package.
 # ---------------------------------------------------------------------------
@@ -91,7 +91,7 @@ def _mem_descriptor(addr: int = 128, size: int = 16) -> "MemDescriptor":
 
 
 class FakePrimaryPinning:
-    """The KVCC-to-framework pin triple over an in-memory descriptor table.
+    """The KVCR-to-framework pin triple over an in-memory descriptor table.
 
     ``request_pin`` is asynchronous by contract -- it returns an id and the
     result is handed back on a later ``poll_pin_results`` -- so this fake
@@ -247,31 +247,31 @@ def _use_nixl_agent(agent):
         return agent
 
     with patch.multiple(
-        kvcc_progress,
+        kvcr_progress,
         nixl_agent=create_agent,
         nixl_agent_config=lambda **kwargs: kwargs,
     ):
         yield
 
 
-def _poll_until(kvcc, predicate, *, timeout: float = 2):
+def _poll_until(kvcr, predicate, *, timeout: float = 2):
     completed: list = []
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        completed.extend(kvcc.poll_completed())
+        completed.extend(kvcr.poll_completed())
         if predicate(completed):
             return completed
         time.sleep(0.001)
-    raise AssertionError("KVCC progress condition was not reached")
+    raise AssertionError("KVCR progress condition was not reached")
 
 
-def _has_outstanding_operations(kvcc) -> bool:
+def _has_outstanding_operations(kvcr) -> bool:
     """Whether the core still owns an in-flight op.
 
     Replaces the ``has_pending_work()`` the facade used to expose; the count is
     now core-internal, and the core's own tests read it the same way.
     """
-    return kvcc._core._outstanding_operations > 0
+    return kvcr._core._outstanding_operations > 0
 
 
 def _wait_until(predicate, *, timeout: float = 2) -> None:
@@ -280,7 +280,7 @@ def _wait_until(predicate, *, timeout: float = 2) -> None:
         if predicate():
             return
         time.sleep(0.001)
-    raise AssertionError("KVCC control condition was not reached")
+    raise AssertionError("KVCR control condition was not reached")
 
 
 def _op_entries(entries: Mapping[BlockKey, bool]) -> dict:
@@ -290,7 +290,7 @@ def _op_entries(entries: Mapping[BlockKey, bool]) -> dict:
     }
 
 
-def _new_kvcc(
+def _new_kvcr(
     agent,
     pinning,
     control,
@@ -301,33 +301,33 @@ def _new_kvcc(
     local_dram=None,
 ):
     config = replace(
-        KVCCConfig(nixl_agent_name=name, inventory_report_interval_ms=0),
+        KVCRConfig(nixl_agent_name=name, inventory_report_interval_ms=0),
         nixl_agent_name=name,
         nixl_listen_port=1,
     )
     with _use_nixl_agent(agent):
-        return KVCC(
+        return KVCR(
             config,
-            KVCCBindings(
+            KVCRBindings(
                 request_pin=pinning.request_pin,
                 poll_pin_results=pinning.poll_pin_results,
                 release_pin=pinning.release_pin,
                 framework_control=control,
                 key_hint_adapter=key_hint_adapter,
             ),
-            KVCCBackendConfigs(
+            KVCRBackendConfigs(
                 remote_fw_dram=remote_options or RemoteFWDramOptions(),
                 local_dram=local_dram,
             ),
         )
 
 
-@unittest.skipUnless(_HAS_KVCC, "nvidia-kvcc wheel not installed")
-class TestKVCCRouterHintE2E(unittest.TestCase):
-    """Our RouterHint + StrKeyHintAdapter drive a real two-instance KVCC fetch."""
+@unittest.skipUnless(_HAS_KVCR, "nvidia-kvcr wheel not installed")
+class TestKVCRRouterHintE2E(unittest.TestCase):
+    """Our RouterHint + StrKeyHintAdapter drive a real two-instance KVCR fetch."""
 
     def setUp(self):
-        self._open: list[KVCC] = []
+        self._open: list[KVCR] = []
 
     def tearDown(self):
         while self._open:
@@ -345,7 +345,7 @@ class TestKVCCRouterHintE2E(unittest.TestCase):
         source_agent = FakeNixlAgent(metadata=b"source-md")
         target_control = FakeBytesControl("tcp://target:1")
         source_control = FakeBytesControl("tcp://source:1")
-        target = _new_kvcc(
+        target = _new_kvcr(
             target_agent,
             FakePrimaryPinning(),
             target_control,
@@ -355,7 +355,7 @@ class TestKVCCRouterHintE2E(unittest.TestCase):
             # RouterHint via our real StrKeyHintAdapter.
             key_hint_adapter=StrKeyHintAdapter(),
         )
-        source = _new_kvcc(
+        source = _new_kvcr(
             source_agent,
             source_pinning or FakePrimaryPinning(missing_indices=missing_indices),
             source_control,
@@ -463,8 +463,8 @@ class TestKVCCRouterHintE2E(unittest.TestCase):
 
         Regression guard. The backend used to answer ``request_pin`` out of a
         dict of the ``HostKVCache`` descriptors it had handed to ``deposit``,
-        and that dict outlived KVCC's own residency: once the local tier
-        evicted a key, KVCC fell through to the framework callback and got the
+        and that dict outlived KVCR's own residency: once the local tier
+        evicted a key, KVCR fell through to the framework callback and got the
         *host page* back. Nothing on that path errors -- block keys are token
         hashes with no content check -- so a peer would read whatever HiCache
         had since refilled that page into and decode from it.
@@ -476,7 +476,7 @@ class TestKVCCRouterHintE2E(unittest.TestCase):
 
         One slot, two deposits: k1 evicts k0. The delivery then asks for
         (k1, k0), so the correct answer is a single-descriptor write covering
-        k1 alone, addressed inside KVCC's slot region.
+        k1 alone, addressed inside KVCR's slot region.
         """
         block_size = 16
         source_slots = ctypes.create_string_buffer(block_size)
@@ -537,7 +537,7 @@ class TestKVCCRouterHintE2E(unittest.TestCase):
         served_address = source_descriptors[0][0]
         self.assertTrue(
             slots_address <= served_address < slots_end,
-            f"source served {served_address:#x}, outside KVCC's slot region "
+            f"source served {served_address:#x}, outside KVCR's slot region "
             f"[{slots_address:#x}, {slots_end:#x})",
         )
 

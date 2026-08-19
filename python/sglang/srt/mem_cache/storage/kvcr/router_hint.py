@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Router-hint seam (Workstream B placeholder).
 
-This module isolates the ONE thing that is genuinely undecided in the KVCC ->
+This module isolates the ONE thing that is genuinely undecided in the KVCR ->
 SGLang integration: how a dynamo-router hint (which peer to fetch a prefix from)
 travels from the scheduler, through the HiCache controller, into this storage
 backend so the source-side P2P fetch can be issued.
@@ -15,7 +15,7 @@ It mirrors the wire shape from dynamo (`oandreeva/router_hints`, PR #11695 --
 "Add compact router hints for remote KV reuse", still open at head
 `b4c9823b81`) and a parser that tolerates its absence, so the store has a stable
 seam to code against. The schema is now the compact 2-field form on that PR; if
-the PR shifts before merge, this struct and `RFC_kvcc_hicache_backend.md` are
+the PR shifts before merge, this struct and `RFC_kvcr_hicache_backend.md` are
 the two places to update in lockstep.
 """
 
@@ -25,11 +25,11 @@ from functools import lru_cache
 from typing import List, Optional, Tuple, Union
 
 import msgspec
-from kvcc.types import BlockKey
+from kvcr.types import BlockKey
 
 # Key under which the controller is expected to stash the hint inside
 # HiCacheStorageExtraInfo.extra_info. Placeholder name.
-ROUTER_HINT_KEY = "kvcc_router_hint"
+ROUTER_HINT_KEY = "kvcr_router_hint"
 
 # Width of the canonical block-hash key, in hex chars. See page_hash_key().
 _BLOCK_HASH_HEX_WIDTH = 16
@@ -37,7 +37,7 @@ _U64_MASK = (1 << 64) - 1
 
 
 def encode_key(key: str) -> BlockKey:
-    """SGLang hicache keys are hex/hash strings; KVCC BlockKey is bytes."""
+    """SGLang hicache keys are hex/hash strings; KVCR BlockKey is bytes."""
     return BlockKey(key.encode("utf-8"))
 
 
@@ -87,7 +87,7 @@ class RouterHint(msgspec.Struct, frozen=True, kw_only=True):
     KV reuse") so this parser stays a thin adapter:
 
     - source_control_endpoint: ZMQ control endpoint of the peer that holds the
-      prefix (host:port). This is what KVCC's control channel connects to.
+      prefix (host:port). This is what KVCR's control channel connects to.
     - block_hashes: root-aligned block hashes (``block_hashes[i]`` is request
       block ``i``); the target decides which suffix to fetch.
 
@@ -138,7 +138,7 @@ class RouterHint(msgspec.Struct, frozen=True, kw_only=True):
         Returns None whenever no well-formed hint is present -- the backend then
         falls back to local-only behavior. This must never raise on malformed
         input: a bad hint should degrade to "no remote fetch", not crash a
-        prefetch. (Fail-closed, matching the vLLM KVCC manager's hint handling.)
+        prefetch. (Fail-closed, matching the vLLM KVCR manager's hint handling.)
         """
         if extra_info is None:
             return None
@@ -151,8 +151,8 @@ class RouterHint(msgspec.Struct, frozen=True, kw_only=True):
         """Is this SGLang page key (or one of its segment keys) in the hint?
 
         Accepts a segment key (``<page hash>#<seg>``) as well as a bare page
-        key, because the KVCC core runs its membership test on the per-segment
-        block identity that :meth:`KVCCStore._segment_key` produced, while the
+        key, because the KVCR core runs its membership test on the per-segment
+        block identity that :meth:`KVCRStore._segment_key` produced, while the
         hint only ever names whole pages.
         """
         return page_hash_key(key.split("#", 1)[0]) in _covered_pages(
@@ -164,7 +164,7 @@ class RouterHint(msgspec.Struct, frozen=True, kw_only=True):
 def _covered_pages(block_hashes: Tuple[str, ...]) -> frozenset:
     """Memoized page set for :meth:`RouterHint.covers`.
 
-    The KVCC core runs the membership test once per block key, and one prefetch
+    The KVCR core runs the membership test once per block key, and one prefetch
     fans a page out into every segment, so rebuilding the set per call is the
     hot path. Keyed on the hashes rather than the hint, so a hint built directly
     with a list (rather than through ``maybe_from_payload``) still memoizes.
@@ -173,17 +173,17 @@ def _covered_pages(block_hashes: Tuple[str, ...]) -> frozenset:
 
 
 class StrKeyHintAdapter:
-    """KVCC ``KeyHintAdapter`` over SGLang string keys + our :class:`RouterHint`.
+    """KVCR ``KeyHintAdapter`` over SGLang string keys + our :class:`RouterHint`.
 
     The core calls ``matches(key, hint)`` to decide whether a queried block is
     covered by the current request's router hint. The key it passes is a
     *segment* key, so membership goes through :meth:`RouterHint.covers`, which
     strips the segment suffix and compares in canonical page-hash form.
-    ``encode`` maps a framework key (str or bytes) to a KVCC :class:`BlockKey`.
+    ``encode`` maps a framework key (str or bytes) to a KVCR :class:`BlockKey`.
 
-    Kept torch-free here (alongside :class:`RouterHint`) so the KVCC<->SGLang
+    Kept torch-free here (alongside :class:`RouterHint`) so the KVCR<->SGLang
     hint contract can be exercised against the real core without importing the
-    GPU/host-pool stack. ``KVCCStore`` imports this class directly.
+    GPU/host-pool stack. ``KVCRStore`` imports this class directly.
     """
 
     def encode(self, framework_key: object) -> BlockKey:
@@ -191,7 +191,7 @@ class StrKeyHintAdapter:
             return BlockKey(framework_key)
         if isinstance(framework_key, str):
             return encode_key(framework_key)
-        raise TypeError(f"unsupported KVCC framework key: {type(framework_key)!r}")
+        raise TypeError(f"unsupported KVCR framework key: {type(framework_key)!r}")
 
     def matches(self, key: BlockKey, hint: object) -> bool:
         if not isinstance(hint, RouterHint):

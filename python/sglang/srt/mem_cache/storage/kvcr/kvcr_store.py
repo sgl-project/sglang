@@ -1,30 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KVCC as a SGLang HiCacheStorage backend (DRAFT / WIP).
+"""KVCR as a SGLang HiCacheStorage backend (DRAFT / WIP).
 
-KVCC is an asymmetric peer-to-peer G2 KV coordinator (the ``nvidia-kvcc`` wheel,
-package ``kvcc``).
+KVCR is an asymmetric peer-to-peer G2 KV coordinator (the ``nvidia-kvcr`` wheel,
+package ``kvcr``).
 This module adapts it to SGLang's content-addressed ``HiCacheStorage`` contract.
 
 Mapping (see the module docstring sections below for the honest status of each):
 
-    HiCacheStorage                     KVCC core
+    HiCacheStorage                     KVCR core
     ------------------------------     --------------------------------------
-    batch_set_v2  (host -> storage)    deposit()  -> KVCC-owned local DRAM slots
+    batch_set_v2  (host -> storage)    deposit()  -> KVCR-owned local DRAM slots
     batch_get_v2  local hit            deliver() -> local get-back (slot->host)
     batch_get_v2  remote hit           submit_hint() + deliver() (NIXL pull)
     batch_exists_v2                    local-DRAM residency + router-hint cover
 
-Threading: KVCC owns a single daemon "progress thread" (``kvcc/progress.py``)
+Threading: KVCR owns a single daemon "progress thread" (``kvcr/progress.py``)
 that solely holds the NIXL agent + ZMQ control socket and advances every
 in-flight op. This backend never touches NIXL directly. Main-thread state
-(residency, pins) is advanced by calling ``kvcc.poll_completed()``, which two
+(residency, pins) is advanced by calling ``kvcr.poll_completed()``, which two
 threads here do: the HiCache controller's prefetch thread (inside
-``_drain_until``) and one daemon of our own, ``kvcc-source-pump``. The pump
+``_drain_until``) and one daemon of our own, ``kvcr-source-pump``. The pump
 exists because a *source*-side serve makes no progress unless somebody polls,
 and an idle worker has no traffic of its own to poll for -- see
 ``_start_source_pump``. ``_poll_lock`` serializes the two.
 
-Both directions of the KV path are now wired to real KVCC operations: set via
+Both directions of the KV path are now wired to real KVCR operations: set via
 ``deposit``, get via the unified ``deliver`` (which the core routes per key to
 either its local DRAM tier or a source-peer NIXL pull, the latter gated on a
 router hint registered for the request via ``submit_hint``). ``_drain_until``
@@ -41,9 +41,9 @@ over v2. The remaining DRAFT edges are the byte-copy legacy methods
 Segment sub-blocking: a host KV page is not one contiguous run. MHA stores K
 and V in separate halves of the pool tensor (and per-layer sub-runs in
 ``layer_first`` layout), so ``get_page_buffer_meta`` returns several
-non-contiguous segments per page. KVCC's local tier copies exactly one
+non-contiguous segments per page. KVCR's local tier copies exactly one
 ``MemDescriptor`` of ``slot_size`` bytes into each slot, so each page deposits
-as ``segments_per_page`` KVCC block-keys (page key + ``#<seg>`` suffix). The
+as ``segments_per_page`` KVCR block-keys (page key + ``#<seg>`` suffix). The
 segment size and count are discovered by probing the pool once at
 registration. This ``page -> segment-keys`` fan-out is a LOCAL-tier identity
 detail only; the remote/source path (Workstream B) matches on router-hint page
@@ -72,19 +72,19 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
-from kvcc import KVCC, KVCCBindings
-from kvcc.config import (
+from kvcr import KVCR, KVCRBindings
+from kvcr.config import (
     FrameworkDramInput,
-    KVCCBackendConfigs,
-    KVCCConfig,
+    KVCRBackendConfigs,
+    KVCRConfig,
     LocalDramInput,
     RemoteFWDramOptions,
 )
-from kvcc.peer_control_channel import ZmqPeerControlChannel
-from kvcc.types import BlockKey, MemDescriptor, QueryStatus
-from sglang.srt.mem_cache.storage.kvcc.kvcc_config import KVCCBackendConfig
-from sglang.srt.mem_cache.storage.kvcc.pin_adapter import NoFrameworkPinning
-from sglang.srt.mem_cache.storage.kvcc.router_hint import (
+from kvcr.peer_control_channel import ZmqPeerControlChannel
+from kvcr.types import BlockKey, MemDescriptor, QueryStatus
+from sglang.srt.mem_cache.storage.kvcr.kvcr_config import KVCRBackendConfig
+from sglang.srt.mem_cache.storage.kvcr.pin_adapter import NoFrameworkPinning
+from sglang.srt.mem_cache.storage.kvcr.router_hint import (
     RouterHint,
     StrKeyHintAdapter,
     encode_key as _encode_key,
@@ -94,7 +94,7 @@ logger = logging.getLogger(__name__)
 
 # Backoff bounds for _drain_until's completion poll. Start tight so a local-tier
 # hit (already resident, microseconds away) is not needlessly delayed, then back
-# off so a remote NIXL fetch does not spin a core while the KVCC progress thread
+# off so a remote NIXL fetch does not spin a core while the KVCR progress thread
 # does the actual work.
 _DRAIN_POLL_MIN_S = 50e-6
 _DRAIN_POLL_MAX_S = 2e-3
@@ -102,7 +102,7 @@ _DRAIN_POLL_MAX_S = 2e-3
 # How often the source-side pump calls poll_completed() when this worker has no
 # get/set traffic of its own. See _source_pump_func: a peer's fetch cannot make
 # progress until we pump, so this bounds how long a P2P source keeps a peer
-# waiting. Well under KVCC's operation_timeout_ms so a pin still has room to
+# waiting. Well under KVCR's operation_timeout_ms so a pin still has room to
 # complete before the source-side deadline expires.
 _SOURCE_PUMP_INTERVAL_S = 5e-3
 
@@ -120,14 +120,15 @@ _PUMP_JOIN_TIMEOUT_S = 1.0
 _STATS_LOG_INTERVAL_S = 30.0
 
 
-# KVCC core methods this backend calls. Checked once at startup because
-# ``nvidia-kvcc`` is pre-1.0 and pinning its version would not help: the
+# KVCR core methods this backend calls. Checked once at startup because
+# ``nvidia-kvcr`` is pre-1.0 and pinning its version would not help: the
 # distribution has sat at 0.1.0 across renames that moved ``kvcc.kvcc`` to
-# ``kvcc.api``, deleted ``nixl.py``, dropped ``has_pending_work``, and changed
-# ``query`` from returning statuses to ``(status, tier)`` pairs. A missing name
-# surfaces here as one legible error naming what is absent, rather than as an
-# AttributeError from inside a prefetch on the first cache miss.
-_REQUIRED_KVCC_METHODS = (
+# ``kvcc.api``, deleted ``nixl.py``, dropped ``has_pending_work``, changed
+# ``query`` from returning statuses to ``(status, tier)`` pairs, and finally
+# renamed the whole package from ``kvcc`` to ``kvcr`` -- still 0.1.0. A missing
+# name surfaces here as one legible error naming what is absent, rather than as
+# an AttributeError from inside a prefetch on the first cache miss.
+_REQUIRED_KVCR_METHODS = (
     "deposit",
     "deliver",
     "discard_hint",
@@ -137,15 +138,15 @@ _REQUIRED_KVCC_METHODS = (
 )
 
 
-def _require_kvcc_api() -> None:
+def _require_kvcr_api() -> None:
     missing = [
-        name for name in _REQUIRED_KVCC_METHODS if not hasattr(KVCC, name)
+        name for name in _REQUIRED_KVCR_METHODS if not hasattr(KVCR, name)
     ]
     if missing:
         raise RuntimeError(
-            f"KVCCStore: the installed nvidia-kvcc is missing {missing}. This "
-            "backend tracks the kvcc core's current API; upgrade nvidia-kvcc "
-            "or use a SGLang revision matching your kvcc."
+            f"KVCRStore: the installed nvidia-kvcr is missing {missing}. This "
+            "backend tracks the kvcr core's current API; upgrade nvidia-kvcr "
+            "or use a SGLang revision matching your kvcr."
         )
 
 
@@ -186,7 +187,7 @@ def _within_dp_offset(storage_config: HiCacheStorageConfig) -> int:
 def _rank_port_offset(storage_config: HiCacheStorageConfig) -> int:
     """This scheduler's port offset from the configured base port.
 
-    Every ``(dp, attn_cp, attn_tp)`` rank of one engine runs its own KVCCStore in
+    Every ``(dp, attn_cp, attn_tp)`` rank of one engine runs its own KVCRStore in
     its own process on the same host, all reading the same ``extra_config``, so
     the offset has to be the full rank coordinate: ``tp_rank`` alone repeats once
     per DP group, and two ranks that pick the same port is invisible from the
@@ -212,7 +213,7 @@ def _rank_port_offset(storage_config: HiCacheStorageConfig) -> int:
 def _ephemeral_port() -> int:
     """Reserve an OS-assigned free TCP port and return it.
 
-    There is an inherent bind-then-rebind race, but KVCC's control channel and
+    There is an inherent bind-then-rebind race, but KVCR's control channel and
     NIXL listener are the only consumers and both bind immediately afterwards.
     """
     with socket.socket() as sock:
@@ -220,8 +221,8 @@ def _ephemeral_port() -> int:
         return sock.getsockname()[1]
 
 
-class KVCCStore(HiCacheStorage):
-    """HiCacheStorage backend backed by the KVCC P2P coordinator (draft)."""
+class KVCRStore(HiCacheStorage):
+    """HiCacheStorage backend backed by the KVCR P2P coordinator (draft)."""
 
     def __init__(
         self,
@@ -229,7 +230,7 @@ class KVCCStore(HiCacheStorage):
         mem_pool: Optional[HostKVCache] = None,
     ) -> None:
         self._storage_config = storage_config
-        self._config = KVCCBackendConfig.from_extra_config(
+        self._config = KVCRBackendConfig.from_extra_config(
             storage_config.extra_config
         )
         self.mem_pool_host = mem_pool
@@ -239,19 +240,19 @@ class KVCCStore(HiCacheStorage):
         # uuid also keeps a restarted rank from reusing a name its peers still
         # have in their remote-agent tables.
         self._agent_name = (
-            f"kvcc-sgl-dp{storage_config.dp_rank}"
+            f"kvcr-sgl-dp{storage_config.dp_rank}"
             f"-tp{storage_config.tp_rank}-{uuid.uuid4().hex[:8]}"
         )
         self._pinning = NoFrameworkPinning()
         self._key_hint_adapter = StrKeyHintAdapter()
 
-        # KVCC is constructed lazily in register_mem_pool_host(), once we know
+        # KVCR is constructed lazily in register_mem_pool_host(), once we know
         # the engine host KV region to register with NIXL as framework_dram.
-        self._kvcc: Optional[KVCC] = None
+        self._kvcr: Optional[KVCR] = None
         self._control: Optional[ZmqPeerControlChannel] = None
         # Local DRAM slot geometry, learned by probing the host pool at
         # registration. slot_size == one page segment; segments_per_page ==
-        # how many KVCC block-keys a single host page fans out into.
+        # how many KVCR block-keys a single host page fans out into.
         self._slot_size: Optional[int] = None
         self._segments_per_page: Optional[int] = None
         # Completions drained from poll_completed() that belong to an op other
@@ -260,7 +261,7 @@ class KVCCStore(HiCacheStorage):
         # without this stash. Guarded by _poll_lock -- the source pump drains
         # the same queue, so it can be the one to observe a get's completion.
         self._completed_ops: Dict[int, Dict] = {}
-        # Handles whose waiter gave up (_drain_until hit its deadline). KVCC's
+        # Handles whose waiter gave up (_drain_until hit its deadline). KVCR's
         # abort() is a no-op stub, so a timed-out op stays in flight and still
         # reports later -- with nobody left to pop it out of _completed_ops.
         # Recording the handle lets _poll_once drop that late result instead of
@@ -298,14 +299,14 @@ class KVCCStore(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache) -> None:
         super().register_mem_pool_host(mem_pool_host)
-        if self._kvcc is not None:
+        if self._kvcr is not None:
             return
-        self._build_kvcc(mem_pool_host)
+        self._build_kvcr(mem_pool_host)
 
     def _control_port(self) -> int:
-        """Bind port for this rank's KVCC control channel.
+        """Bind port for this rank's KVCR control channel.
 
-        Every scheduler of one engine runs its own KVCCStore in its own process
+        Every scheduler of one engine runs its own KVCRStore in its own process
         on the same host, all reading the same ``extra_config``. A configured
         port is therefore a *base* port that must be offset by rank -- without
         the offset, rank 1 binds the port rank 0 already holds. That failure is
@@ -325,8 +326,8 @@ class KVCCStore(HiCacheStorage):
             return _ephemeral_port()
         return configured + _rank_port_offset(self._storage_config)
 
-    def _build_kvcc(self, mem_pool_host: HostKVCache) -> None:
-        _require_kvcc_api()
+    def _build_kvcr(self, mem_pool_host: HostKVCache) -> None:
+        _require_kvcr_api()
         framework_dram = self._framework_dram_region(mem_pool_host)
         local_dram = self._local_dram_region(mem_pool_host)
         if framework_dram is None:
@@ -337,7 +338,7 @@ class KVCCStore(HiCacheStorage):
             # descriptors inside a registered region. Starting without this
             # registration means every transfer names unregistered memory.
             raise RuntimeError(
-                "KVCCStore: the host KV pool is not a single contiguous "
+                "KVCRStore: the host KV pool is not a single contiguous "
                 "kv_buffer tensor, so it cannot be registered with NIXL as one "
                 "region. Both directions of the KV path address that pool, so "
                 "the backend cannot run against this pool layout (per-layer "
@@ -346,12 +347,12 @@ class KVCCStore(HiCacheStorage):
         if local_dram is None:
             # The local DRAM tier is the backend's only storage: deposit writes
             # into it and every source-side serve reads out of it (this backend
-            # offers no framework memory -- see pin_adapter). Without it KVCC
+            # offers no framework memory -- see pin_adapter). Without it KVCR
             # fails every deposit entry individually, which reads downstream as
             # "the cache never hits" rather than "the backend is unusable", so
             # refuse to start instead.
             raise RuntimeError(
-                "KVCCStore: could not probe the host page layout, so KVCC's "
+                "KVCRStore: could not probe the host page layout, so KVCR's "
                 "local DRAM tier cannot be sized. The backend has no storage "
                 "without it."
             )
@@ -366,13 +367,13 @@ class KVCCStore(HiCacheStorage):
         # Give the NIXL listen socket a distinct ephemeral port per worker.
         nixl_listen_port = _ephemeral_port()
 
-        config = KVCCConfig(
+        config = KVCRConfig(
             nixl_agent_name=self._agent_name,
             enable_telemetry=self._config.enable_telemetry,
             operation_timeout_ms=self._config.operation_timeout_ms,
             nixl_listen_port=nixl_listen_port,
         )
-        bindings = KVCCBindings(
+        bindings = KVCRBindings(
             request_pin=self._pinning.request_pin,
             poll_pin_results=self._pinning.poll_pin_results,
             release_pin=self._pinning.release_pin,
@@ -381,8 +382,8 @@ class KVCCStore(HiCacheStorage):
             key_hint_adapter=self._key_hint_adapter,
         )
         # eager_ctrl_connect / opportunistic_query / metadata_retry moved out of
-        # KVCCConfig into the remote-forward-DRAM options in the wheel core.
-        backend_configs = KVCCBackendConfigs(
+        # KVCRConfig into the remote-forward-DRAM options in the wheel core.
+        backend_configs = KVCRBackendConfigs(
             framework_dram=framework_dram,
             local_dram=local_dram,
             remote_fw_dram=RemoteFWDramOptions(
@@ -391,10 +392,10 @@ class KVCCStore(HiCacheStorage):
                 metadata_retry_interval_ms=self._config.metadata_retry_interval_ms,
             ),
         )
-        self._kvcc = KVCC(config, bindings, backend_configs)
+        self._kvcr = KVCR(config, bindings, backend_configs)
         self._start_source_pump()
         logger.info(
-            "KVCCStore initialized (agent=%s, slot_size=%s, remote_hint=%s)",
+            "KVCRStore initialized (agent=%s, slot_size=%s, remote_hint=%s)",
             self._agent_name,
             self._slot_size,
             self._config.enable_remote_hint,
@@ -405,7 +406,7 @@ class KVCCStore(HiCacheStorage):
     # ------------------------------------------------------------------
 
     def _start_source_pump(self) -> None:
-        """Advance KVCC state even when this worker issues no traffic of its own.
+        """Advance KVCR state even when this worker issues no traffic of its own.
 
         ``poll_completed()`` is what moves the core's state machines forward, and
         the only other caller is ``_drain_until`` -- which runs solely while
@@ -426,23 +427,23 @@ class KVCCStore(HiCacheStorage):
             return
         self._pump_thread = threading.Thread(
             target=self._source_pump_func,
-            name="kvcc-source-pump",
+            name="kvcr-source-pump",
             daemon=True,
         )
         self._pump_thread.start()
 
     def _source_pump_func(self) -> None:
         while not self._pump_stop.wait(_SOURCE_PUMP_INTERVAL_S):
-            kvcc = self._kvcc
-            if kvcc is None:
+            kvcr = self._kvcr
+            if kvcr is None:
                 return
             try:
-                self._poll_once(kvcc)
+                self._poll_once(kvcr)
             except Exception:
-                logger.warning("KVCCStore source pump failed", exc_info=True)
+                logger.warning("KVCRStore source pump failed", exc_info=True)
                 return
 
-    def _poll_once(self, kvcc: KVCC) -> None:
+    def _poll_once(self, kvcr: KVCR) -> None:
         """Drain one round of completions, stashing them for their waiters.
 
         Both the pump and ``_drain_until`` call this. Whoever gets there first
@@ -451,7 +452,7 @@ class KVCCStore(HiCacheStorage):
         already timed out, which are dropped (see ``_abandoned_ops``).
         """
         with self._poll_lock:
-            for done_handle, entries in kvcc.poll_completed():
+            for done_handle, entries in kvcr.poll_completed():
                 if done_handle in self._abandoned_ops:
                     self._abandoned_ops.discard(done_handle)
                     continue
@@ -467,7 +468,7 @@ class KVCCStore(HiCacheStorage):
         outside a registered region. Both directions need it, including the
         ones that never leave this machine: ``deposit`` hands the core host
         pages as transfer *sources*, ``deliver`` hands it host pages as
-        *destinations*, and KVCC's local tier moves both by submitting a
+        *destinations*, and KVCR's local tier moves both by submitting a
         transfer addressed to its own agent rather than by memcpy.
 
         None means "no single region covers the pool", which the caller turns
@@ -479,7 +480,7 @@ class KVCCStore(HiCacheStorage):
         that keep ``kv_buffer`` as a per-layer *list* (e.g. DeepSeek V4
         paged/layer_first) are the genuine multi-tensor case: supporting them
         means registering each tensor separately, the way Mooncake's
-        ``_iter_host_pool_buffers`` iterates them, which KVCC's single
+        ``_iter_host_pool_buffers`` iterates them, which KVCR's single
         ``FrameworkDramInput`` has no shape for yet.
         """
         kv_buffer = mem_pool_host.kv_buffer
@@ -492,7 +493,7 @@ class KVCCStore(HiCacheStorage):
     def _local_dram_region(
         self, mem_pool_host: HostKVCache
     ) -> Optional[LocalDramInput]:
-        """Allocate KVCC's own local DRAM tier (the buffer-only L3 pool).
+        """Allocate KVCR's own local DRAM tier (the buffer-only L3 pool).
 
         One slot holds one page *segment* (a K or V run of a page), so slot_size
         and the per-page segment count come from probing the pool's zero-copy
@@ -502,7 +503,7 @@ class KVCCStore(HiCacheStorage):
         layout = self._probe_page_layout(mem_pool_host)
         if layout is None:
             logger.warning(
-                "KVCCStore: could not probe host page layout; local DRAM tier "
+                "KVCRStore: could not probe host page layout; local DRAM tier "
                 "disabled (DRAFT-STUB)."
             )
             return None
@@ -539,7 +540,7 @@ class KVCCStore(HiCacheStorage):
         try:
             meta = mem_pool_host.get_page_buffer_meta(probe_indices)
         except Exception:
-            logger.warning("KVCCStore: page-layout probe failed", exc_info=True)
+            logger.warning("KVCRStore: page-layout probe failed", exc_info=True)
             return None
         # Pools with no zero-copy support return None rather than a pair.
         if meta is None:
@@ -550,7 +551,7 @@ class KVCCStore(HiCacheStorage):
         segment_bytes = int(size_list[0])
         if segment_bytes <= 0 or any(int(s) != segment_bytes for s in size_list):
             logger.warning(
-                "KVCCStore: non-uniform host segment sizes %s; local tier "
+                "KVCRStore: non-uniform host segment sizes %s; local tier "
                 "disabled.",
                 size_list,
             )
@@ -558,9 +559,9 @@ class KVCCStore(HiCacheStorage):
         return segment_bytes, len(ptr_list)
 
     def _locally_resident(self, segment_keys: List[BlockKey]) -> bool:
-        """True iff KVCC's local DRAM tier holds every segment of a page.
+        """True iff KVCR's local DRAM tier holds every segment of a page.
 
-        ``query`` is KVCC's own residency table, which is the only copy of that
+        ``query`` is KVCR's own residency table, which is the only copy of that
         state: it moves keys to FILLING on deposit, to HIT on fill completion,
         and drops them on eviction, all inside the core. Mirroring it into a
         dict here would be a second copy that eviction can silently desync --
@@ -573,7 +574,7 @@ class KVCCStore(HiCacheStorage):
         """
         return all(
             status is QueryStatus.HIT
-            for status, _tier in self._kvcc.query(segment_keys)
+            for status, _tier in self._kvcr.query(segment_keys)
         )
 
     def close(self) -> None:
@@ -582,13 +583,20 @@ class KVCCStore(HiCacheStorage):
         The pump calls ``poll_completed()``, which walks core state the core's
         own ``close()`` tears down (it closes the progress thread and the local
         tier). So a pump still inside a poll when the core goes away is a
-        use-after-free on the KVCC side, not a benign late tick.
+        use-after-free on the KVCR side, not a benign late tick.
 
         The join therefore has to be honoured rather than merely attempted: if
         it times out, the pump is inside a poll that is taking longer than its
         entire interval, and closing under it is exactly the race. Leaving the
         core open leaks it for the remaining life of a process that is shutting
         down anyway, which is the strictly safer of the two outcomes.
+
+        The core's own ``close()`` makes the same trade one level down: when its
+        progress loop does not go quiescent it keeps the backend resources and
+        raises, precisely so nothing unmaps memory a native transfer still
+        references. We hold the reference in that case for the same reason, and
+        report rather than propagate -- ``close()`` is a teardown path, and the
+        rule for this backend is that it never raises at a HiCache seam.
         """
         self._pump_stop.set()
         pump = self._pump_thread
@@ -597,16 +605,25 @@ class KVCCStore(HiCacheStorage):
             pump.join(timeout=_PUMP_JOIN_TIMEOUT_S)
             if pump.is_alive():
                 logger.error(
-                    "KVCCStore: source pump still running after %.1fs; leaving "
-                    "the KVCC core open rather than closing it underneath a "
+                    "KVCRStore: source pump still running after %.1fs; leaving "
+                    "the KVCR core open rather than closing it underneath a "
                     "live poll.",
                     _PUMP_JOIN_TIMEOUT_S,
                 )
                 return
             self._pump_thread = None
-        if self._kvcc is not None:
-            self._kvcc.close()
-            self._kvcc = None
+        if self._kvcr is not None:
+            try:
+                self._kvcr.close()
+            except BaseException:
+                # Core-side close is idempotent, so keeping the reference costs
+                # nothing and leaves a later attempt possible.
+                logger.exception(
+                    "KVCRStore: KVCR core did not close cleanly; keeping the "
+                    "core so its still-registered memory is not unmapped."
+                )
+                return
+            self._kvcr = None
 
     # ------------------------------------------------------------------
     # v2 interface (the real HiCache path)
@@ -617,9 +634,9 @@ class KVCCStore(HiCacheStorage):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> Dict[str, List[bool]]:
-        """Offload host KV into KVCC's local DRAM tier via deposit()."""
+        """Offload host KV into KVCR's local DRAM tier via deposit()."""
         results: Dict[str, List[bool]] = {}
-        if self._kvcc is None:
+        if self._kvcr is None:
             return {
                 str(t.name): [False] * len(t.keys or []) for t in transfers
             }
@@ -628,9 +645,9 @@ class KVCCStore(HiCacheStorage):
         return results
 
     def _segment_key(self, page_key: str, seg: int) -> BlockKey:
-        """KVCC block identity for one segment of a host page.
+        """KVCR block identity for one segment of a host page.
 
-        A page fans out into ``segments_per_page`` KVCC blocks; the ``#<seg>``
+        A page fans out into ``segments_per_page`` KVCR blocks; the ``#<seg>``
         suffix keeps them distinct in the local tier. This identity is
         local-tier-only -- the remote/source path (Workstream B) matches on
         router-hint page hashes and will reconcile page-hash <-> segment.
@@ -645,7 +662,7 @@ class KVCCStore(HiCacheStorage):
         keys = transfer.keys or []
         if not keys or self._slot_size is None or self._segments_per_page is None:
             logger.warning(
-                "KVCCStore deposit skipped: keys=%d slot_size=%s segments=%s",
+                "KVCRStore deposit skipped: keys=%d slot_size=%s segments=%s",
                 len(keys),
                 self._slot_size,
                 self._segments_per_page,
@@ -655,20 +672,20 @@ class KVCCStore(HiCacheStorage):
         descriptors = self._host_descriptors(transfer)
         if descriptors is None:
             logger.warning(
-                "KVCCStore deposit skipped: no host descriptors for %d pages",
+                "KVCRStore deposit skipped: no host descriptors for %d pages",
                 len(keys),
             )
             return [False] * len(keys)
 
-        op_handle = self._kvcc.deposit(descriptors)
+        op_handle = self._kvcr.deposit(descriptors)
         result_map = self._drain_until(op_handle)
         missing = len(descriptors) - len(result_map)
         failed = sum(1 for ok in result_map.values() if not ok)
         if failed or missing:
             # HiCache only reports "N pages failed", which cannot distinguish a
-            # rejected deposit from a segment KVCC never reported on at all.
+            # rejected deposit from a segment KVCR never reported on at all.
             logger.warning(
-                "KVCCStore deposit op=%s: %d/%d segments failed, %d unreported "
+                "KVCRStore deposit op=%s: %d/%d segments failed, %d unreported "
                 "(pages=%d)",
                 op_handle,
                 failed,
@@ -678,7 +695,7 @@ class KVCCStore(HiCacheStorage):
             )
 
         # A page is stored iff every one of its segments landed. Nothing is
-        # recorded on our side: the copy is now in KVCC's own slots, and its
+        # recorded on our side: the copy is now in KVCR's own slots, and its
         # residency table is what ``_locally_resident`` and the source path both
         # read. ``descriptors`` names the *host* pages we copied out of, which
         # HiCache is free to reuse the moment this call returns.
@@ -704,7 +721,7 @@ class KVCCStore(HiCacheStorage):
         Returns a flat ``{segment_key: MemDescriptor}`` mapping with
         ``segments_per_page`` entries per page key, or None if the pool meta
         can't be lined up with the requested keys. Each descriptor is exactly
-        ``slot_size`` bytes so it lands in one KVCC slot.
+        ``slot_size`` bytes so it lands in one KVCR slot.
         """
         host_indices = transfer.host_indices
         keys = transfer.keys or []
@@ -715,12 +732,12 @@ class KVCCStore(HiCacheStorage):
                 host_indices
             )
         except Exception:
-            logger.warning("KVCCStore: get_page_buffer_meta failed", exc_info=True)
+            logger.warning("KVCRStore: get_page_buffer_meta failed", exc_info=True)
             return None
         segments = self._segments_per_page
         if len(ptr_list) != len(keys) * segments:
             logger.warning(
-                "KVCCStore: page meta count %d != keys %d * segments %d; "
+                "KVCRStore: page meta count %d != keys %d * segments %d; "
                 "layout changed since registration?",
                 len(ptr_list),
                 len(keys),
@@ -735,7 +752,7 @@ class KVCCStore(HiCacheStorage):
                 size = int(size_list[base + seg])
                 if size != self._slot_size:
                     logger.warning(
-                        "KVCCStore: segment size %d != slot_size %d",
+                        "KVCRStore: segment size %d != slot_size %d",
                         size,
                         self._slot_size,
                     )
@@ -755,11 +772,11 @@ class KVCCStore(HiCacheStorage):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> Dict[str, List[bool]]:
-        """Load KV into host memory via KVCC ``deliver()``.
+        """Load KV into host memory via KVCR ``deliver()``.
 
         ``deliver`` is a single unified entry: the core auto-routes each block
-        key by residency (see ``KVCC.deliver``). A key that ``deposit`` made
-        locally resident is served from KVCC's own DRAM tier; a key that is only
+        key by residency (see ``KVCR.deliver``). A key that ``deposit`` made
+        locally resident is served from KVCR's own DRAM tier; a key that is only
         covered by this request's router hint is pulled from the source peer
         over NIXL. We hand ``deliver`` the *host page* segment descriptors as
         write destinations, so both paths land straight in the engine KV pool.
@@ -770,7 +787,7 @@ class KVCCStore(HiCacheStorage):
         letting HiCache fall back to recompute.
         """
         results: Dict[str, List[bool]] = {}
-        if self._kvcc is None:
+        if self._kvcr is None:
             return {
                 str(t.name): [False] * len(t.keys or []) for t in transfers
             }
@@ -783,7 +800,7 @@ class KVCCStore(HiCacheStorage):
                 )
         finally:
             if request_id is not None:
-                self._kvcc.discard_hint(request_id)
+                self._kvcr.discard_hint(request_id)
         return results
 
     def _register_hint(
@@ -796,7 +813,7 @@ class KVCCStore(HiCacheStorage):
         submitted with an empty key set so the facade only records the
         advisory routing entry (and, if eager, warms the control connection) --
         the actual pull is driven by ``deliver`` in ``_deliver_transfer``, which
-        lets us target engine host pages rather than KVCC-owned slots.
+        lets us target engine host pages rather than KVCR-owned slots.
         """
         hint = self._parse_hint(extra_info)
         if hint is None:
@@ -804,17 +821,17 @@ class KVCCStore(HiCacheStorage):
             return None
         self._note("get_with_hint")
         self._note("hinted_blocks", len(hint.block_hashes))
-        # KVCC keys the request-scoped hint table on request_id; the controller
+        # KVCR keys the request-scoped hint table on request_id; the controller
         # does not thread one through extra_info, so we mint our own.
         request_id = self._hint_request_id()
-        self._kvcc.submit_hint(
+        self._kvcr.submit_hint(
             (),
             src=hint.source_control_endpoint,
             hints=hint,
             request_id=request_id,
         )
         logger.debug(
-            "KVCCStore: registered router hint (source=%s, %d blocks, req=%s)",
+            "KVCRStore: registered router hint (source=%s, %d blocks, req=%s)",
             hint.source_control_endpoint,
             len(hint.block_hashes),
             request_id,
@@ -837,7 +854,7 @@ class KVCCStore(HiCacheStorage):
         with only the within-DP part of the offset since the DP part is the
         router's to apply.
 
-        Getting this wrong does not fail -- KVCC block keys are token hashes and
+        Getting this wrong does not fail -- KVCR block keys are token hashes and
         carry no rank identity, so a rank that dials the wrong peer receives a
         shard it will happily accept and decode from. Correctness therefore rests
         entirely on this offset, which is why an endpoint we cannot realign drops
@@ -852,7 +869,7 @@ class KVCCStore(HiCacheStorage):
         endpoint = _offset_endpoint_port(hint.source_control_endpoint, offset)
         if endpoint is None:
             logger.warning(
-                "KVCCStore: dropping router hint, cannot align source endpoint "
+                "KVCRStore: dropping router hint, cannot align source endpoint "
                 "%s to within-DP rank offset %d",
                 hint.source_control_endpoint,
                 offset,
@@ -878,7 +895,7 @@ class KVCCStore(HiCacheStorage):
             self._next_stats_log_at = now + _STATS_LOG_INTERVAL_S
             snapshot = dict(self._stats)
         logger.info(
-            "KVCCStore remote path (cumulative): %s",
+            "KVCRStore remote path (cumulative): %s",
             " ".join(f"{name}={value}" for name, value in sorted(snapshot.items())),
         )
 
@@ -904,7 +921,7 @@ class KVCCStore(HiCacheStorage):
         """
         with self._hint_id_lock:
             self._next_hint_id += 1
-            return f"kvcc-get-{self._next_hint_id}"
+            return f"kvcr-get-{self._next_hint_id}"
 
     def _deliver_transfer(
         self, transfer: PoolTransfer, request_id: Optional[str]
@@ -922,7 +939,7 @@ class KVCCStore(HiCacheStorage):
         if destinations is None:
             return [False] * len(keys)
 
-        op_handle = self._kvcc.deliver(destinations, request_id=request_id)
+        op_handle = self._kvcr.deliver(destinations, request_id=request_id)
         result_map = self._drain_until(op_handle)
 
         results: List[bool] = []
@@ -951,14 +968,14 @@ class KVCCStore(HiCacheStorage):
         """Longest available prefix: locally resident, else remote via hint.
 
         A page is available when either (a) all its segments are resident in
-        KVCC's local DRAM tier, or (b) it is covered by this request's router
+        KVCR's local DRAM tier, or (b) it is covered by this request's router
         hint (a peer holds it and ``batch_get_v2`` can pull it). The prefix is
         root-aligned and contiguous, so it stops at the first page that is
         neither. This gate is what makes the remote branch of ``batch_get_v2``
         reachable -- the controller only issues gets for the prefix reported
         here.
         """
-        if self._kvcc is None or self._segments_per_page is None:
+        if self._kvcr is None or self._segments_per_page is None:
             return PoolTransferResult.empty()
         # Same parse as batch_get_v2, so a hint this rank cannot align is
         # reported unavailable here rather than promised and then missed.
@@ -989,7 +1006,7 @@ class KVCCStore(HiCacheStorage):
     # ------------------------------------------------------------------
 
     def _drain_until(self, op_handle: int, timeout_s: Optional[float] = None) -> Dict:
-        """Pump kvcc.poll_completed() until op_handle reports, or the deadline passes.
+        """Pump kvcr.poll_completed() until op_handle reports, or the deadline passes.
 
         Blocking here is the contract, not a compromise: this runs on the HiCache
         controller's dedicated ``prefetch_io_aux_func`` daemon thread, and
@@ -998,7 +1015,7 @@ class KVCCStore(HiCacheStorage):
         The scheduler thread is never involved; it only observes the resulting
         ``completed_tokens`` via the existing ``check_prefetch_progress`` tick.
 
-        KVCC's transfer progress is owned by its own "kvcc-progress" daemon
+        KVCR's transfer progress is owned by its own "kvcr-progress" daemon
         thread, which appends finished ops to a completion queue;
         ``poll_completed`` is a non-blocking drain of that queue with no
         condition variable to wait on. So we poll -- but yield between attempts
@@ -1015,18 +1032,18 @@ class KVCCStore(HiCacheStorage):
             # Always go through the stash: the source pump drains the same
             # queue, so our own completion may well be observed by it rather
             # than by the poll below.
-            self._poll_once(self._kvcc)
+            self._poll_once(self._kvcr)
             with self._poll_lock:
                 stashed = self._completed_ops.pop(op_handle, None)
             if stashed is not None:
                 return {k: v.success for k, v in stashed.items()}
             if time.monotonic() >= deadline:
                 logger.warning(
-                    "KVCCStore: op %s did not complete within %.1fs",
+                    "KVCRStore: op %s did not complete within %.1fs",
                     op_handle,
                     self._config.get_timeout_s if timeout_s is None else timeout_s,
                 )
-                # The op is still in flight -- kvcc.abort() is a no-op stub, so
+                # The op is still in flight -- kvcr.abort() is a no-op stub, so
                 # we cannot cancel it, only agree to ignore whatever it reports.
                 with self._poll_lock:
                     self._abandoned_ops.add(op_handle)
@@ -1092,6 +1109,6 @@ class KVCCStore(HiCacheStorage):
         return False  # DRAFT-STUB
 
     def exists(self, key: str) -> bool:
-        if self._kvcc is None or self._segments_per_page is None:
+        if self._kvcr is None or self._segments_per_page is None:
             return False
         return self._locally_resident(self._page_segment_keys(key))

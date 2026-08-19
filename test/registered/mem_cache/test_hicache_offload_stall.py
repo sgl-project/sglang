@@ -8,7 +8,7 @@ already dropped: ``_update_host_leaf_status`` admits a node to
 larger than the host pool, the host pool fills first, GPU eviction never fires,
 nothing is ever evictable, and offload stops for the life of the process.
 
-Measured on the 2-worker KVCC POC (Qwen3-8B, page-size 64, ~19-page prefixes):
+Measured on the 2-worker KVCR POC (Qwen3-8B, page-size 64, ~19-page prefixes):
 offload froze at 1680 of 1696 host pages after 90 prefixes and never resumed;
 halving the host pool to 848 pages moved the freeze to 844 pages after 46
 prefixes; making the device pool smaller than the host pool removed it entirely
