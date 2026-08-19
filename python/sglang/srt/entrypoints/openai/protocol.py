@@ -670,18 +670,6 @@ class FunctionResponse(BaseModel):
     name: Optional[str] = None
     arguments: Optional[str | Dict[str, Any]] = None
 
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        data = handler(self)
-        # Streaming argument-delta chunks must omit name instead of emitting
-        # null, otherwise delta mergers that treat null as an explicit value
-        # overwrite the function name streamed in the first chunk.
-        if self.name is None:
-            data.pop("name", None)
-        if self.arguments is None:
-            data.pop("arguments", None)
-        return data
-
 
 class ToolCall(BaseModel):
     """Tool call response."""
@@ -690,15 +678,6 @@ class ToolCall(BaseModel):
     index: Optional[int] = None
     type: Literal["function"] = "function"
     function: FunctionResponse
-
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler):
-        data = handler(self)
-        # Streaming argument-delta chunks must omit id instead of emitting
-        # null; the id is only present in the first chunk of a tool call.
-        if self.id is None:
-            data.pop("id", None)
-        return data
 
 
 _GenericMessageRole = Literal[

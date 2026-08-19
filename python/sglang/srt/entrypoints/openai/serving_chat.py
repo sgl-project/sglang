@@ -2528,6 +2528,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             chunk = ChatCompletionStreamResponse(
                 id=content["meta_info"]["id"],
+                object="chat.completion.chunk",
                 created=int(time.time()),
                 choices=[choice_data],
                 model=request.model,
@@ -2545,7 +2546,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
 
         # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
@@ -2555,24 +2556,24 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Tool call ID should be generated only once per tool call
             if call_item.name:
-                # First chunk: include ID and function name
-                tool_call_id = self._process_tool_call_id(
-                    call_item, history_tool_calls_cnt
+                # First chunk: include ID, type and function name
+                tool_call = ToolCall(
+                    id=self._process_tool_call_id(
+                        call_item, history_tool_calls_cnt
+                    ),
+                    index=call_item.tool_index,
+                    type="function",
+                    function=FunctionResponse(
+                        name=call_item.name,
+                        arguments=call_item.parameters,
+                    ),
                 )
-                function_name = call_item.name
             else:
-                # Subsequent chunks: null ID and name for argument deltas
-                tool_call_id = None
-                function_name = None
-
-            tool_call = ToolCall(
-                id=tool_call_id,
-                index=call_item.tool_index,
-                function=FunctionResponse(
-                    name=function_name,
-                    arguments=call_item.parameters,
-                ),
-            )
+                # Subsequent chunks: only index and argument deltas
+                tool_call = ToolCall(
+                    index=call_item.tool_index,
+                    function=FunctionResponse(arguments=call_item.parameters),
+                )
 
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
@@ -2581,6 +2582,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             chunk = ChatCompletionStreamResponse(
                 id=content["meta_info"]["id"],
+                object="chat.completion.chunk",
                 created=int(time.time()),
                 choices=[choice_data],
                 model=request.model,
@@ -2598,7 +2600,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
 
     def _check_for_unstreamed_tool_args(
         self,
@@ -2651,10 +2653,8 @@ class OpenAIServingChat(OpenAIServingBase):
         if remaining_call:
             # Create tool call chunk with remaining arguments
             tool_call = ToolCall(
-                id=None,  # No ID for argument deltas
                 index=tool_index,
                 function=FunctionResponse(
-                    name=None,  # No name for argument deltas
                     arguments=remaining_call,
                 ),
             )
@@ -2667,11 +2667,12 @@ class OpenAIServingChat(OpenAIServingBase):
 
             chunk = ChatCompletionStreamResponse(
                 id=content["meta_info"]["id"],
+                object="chat.completion.chunk",
                 created=int(time.time()),
                 choices=[choice_data],
                 model=request.model,
             )
 
-            return f"data: {chunk.model_dump_json()}\n\n"
+            return f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
 
         return None

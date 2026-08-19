@@ -783,30 +783,32 @@ class TestParsedResponseFieldsProtocol(unittest.TestCase):
 
 
 class TestToolCallStreamingSerialization(unittest.TestCase):
-    """Tool call deltas must omit absent id/name instead of emitting null."""
+    """Tool call deltas omit absent id/name via exclude_unset (vLLM-style)."""
 
     def test_argument_delta_omits_null_id_and_name(self):
         """Continuation chunks only carry index and function.arguments."""
         chunk = ToolCall(
-            id=None,
             index=0,
-            function=FunctionResponse(name=None, arguments='{"city":'),
+            function=FunctionResponse(arguments='{"city":'),
         )
-        data = json.loads(chunk.model_dump_json())
+        data = json.loads(chunk.model_dump_json(exclude_unset=True))
         self.assertNotIn("id", data)
+        self.assertNotIn("type", data)
         self.assertNotIn("name", data["function"])
         self.assertEqual(data["index"], 0)
         self.assertEqual(data["function"]["arguments"], '{"city":')
 
     def test_first_chunk_keeps_id_and_name(self):
-        """The first chunk of a tool call still carries id and function name."""
+        """The first chunk of a tool call still carries id, type and name."""
         chunk = ToolCall(
             id="call_abc",
             index=0,
+            type="function",
             function=FunctionResponse(name="get_weather", arguments=""),
         )
-        data = json.loads(chunk.model_dump_json())
+        data = json.loads(chunk.model_dump_json(exclude_unset=True))
         self.assertEqual(data["id"], "call_abc")
+        self.assertEqual(data["type"], "function")
         self.assertEqual(data["function"]["name"], "get_weather")
         self.assertEqual(data["function"]["arguments"], "")
 
