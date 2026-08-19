@@ -90,7 +90,7 @@ def _routing_case(num_tokens: int, top_k: int, num_experts: int, seed: int):
 
 def _views(topk_ids, token_lora_mapping, num_experts, device):
     kwargs = dict(
-        lora_experts_per_adapter=num_experts,
+        num_local_experts=num_experts,
         max_loras=_SLOTS,
         block_size=16,
     )
@@ -101,7 +101,10 @@ def _views(topk_ids, token_lora_mapping, num_experts, device):
         **kwargs,
     )
     raw = build_virtual_expert_routing(
-        topk_ids.to(device), token_lora_mapping.to(device), view=RouteViewKind.RAW, **kwargs
+        topk_ids.to(device),
+        token_lora_mapping.to(device),
+        view=RouteViewKind.RAW,
+        **kwargs,
     )
     return aligned, raw
 
@@ -174,7 +177,9 @@ def test_indexed_pairs_matches_one_launch_on_identical_inputs(
 
     # Invalid pairs (base tokens, unrouted -1 experts) must be ZERO-stored,
     # not left at the poison: B owns every consumed destination cell.
-    pair_valid = (topk_ids.view(-1) >= 0) & (token_lora_mapping.repeat_interleave(top_k) >= 0)
+    pair_valid = (topk_ids.view(-1) >= 0) & (
+        token_lora_mapping.repeat_interleave(top_k) >= 0
+    )
     invalid_rows = indexed[~pair_valid.to(device)]
     assert invalid_rows.numel() > 0
     assert torch.count_nonzero(invalid_rows) == 0
@@ -187,11 +192,11 @@ def test_zero_pair_batches_return_without_launching() -> None:
     topk_ids, token_lora_mapping = _routing_case(4, 2, 8, 0x1DB2)
     empty = RouteView(
         view=RouteViewKind.RAW,
-        num_virtual_experts=_SLOTS * 8,
         block_size=16,
         topk_ids=topk_ids[:0].to(device),
         token_lora_mapping=token_lora_mapping[:0].to(device),
-        lora_experts_per_adapter=8,
+        num_local_experts=8,
+        is_shared_outer=False,
         max_loras=_SLOTS,
     )
     bridge, weight, offsets, num_slices, width = _site_tensors(

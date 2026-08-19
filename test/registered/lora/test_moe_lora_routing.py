@@ -67,7 +67,7 @@ class TestMoeLoraRouting(CustomTestCase):
         topk_ids,
         adapters,
         *,
-        lora_experts_per_adapter,
+        num_local_experts,
         max_loras=2,
         block_size=16,
         dtype=torch.int32,
@@ -77,7 +77,7 @@ class TestMoeLoraRouting(CustomTestCase):
         return build_virtual_expert_routing(
             torch.tensor(topk_ids, dtype=dtype, device=self.device),
             torch.tensor(adapters, dtype=dtype, device=self.device),
-            lora_experts_per_adapter=lora_experts_per_adapter,
+            num_local_experts=num_local_experts,
             max_loras=max_loras,
             block_size=block_size,
             view=view,
@@ -95,14 +95,12 @@ class TestMoeLoraRouting(CustomTestCase):
         """
         ids, adapters = [[0, 1]], [0]
         aligned = self._build(
-            ids, adapters, lora_experts_per_adapter=2, view=RouteViewKind.ALIGNED
+            ids, adapters, num_local_experts=2, view=RouteViewKind.ALIGNED
         )
         self.assertGreater(aligned.sorted_pair_ids.numel(), 0)
         self.assertGreater(aligned.block_virtual_expert_ids.numel(), 0)
 
-        raw = self._build(
-            ids, adapters, lora_experts_per_adapter=2, view=RouteViewKind.RAW
-        )
+        raw = self._build(ids, adapters, num_local_experts=2, view=RouteViewKind.RAW)
         for field in ("sorted_pair_ids", "block_virtual_expert_ids"):
             with self.assertRaisesRegex(ValueError, RouteViewKind.ALIGNED):
                 getattr(raw, field)
@@ -113,13 +111,13 @@ class TestMoeLoraRouting(CustomTestCase):
 
     def test_unknown_view_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "unknown route view"):
-            self._build([[0, 1]], [0], lora_experts_per_adapter=2, view="grouped")
+            self._build([[0, 1]], [0], num_local_experts=2, view="grouped")
 
     def test_invalid_adapter_and_expert_ids_become_one_sentinel(self):
         route = self._build(
             [[-2], [-1], [3], [4], [99], [0], [0]],
             [0, 0, 0, 0, 0, 2, 3],
-            lora_experts_per_adapter=4,
+            num_local_experts=4,
         )
         # Only pair 2 is valid (adapter 0, expert 3 -> key 3); every other
         # pair is invalid for a different reason -- negative expert, expert
@@ -148,7 +146,7 @@ class TestMoeLoraRouting(CustomTestCase):
         route = self._build(
             [[0, 3], [4, -2]],
             [0, 1],
-            lora_experts_per_adapter=4,
+            num_local_experts=4,
             dtype=torch.int64,
         )
         # Adapter 0 owns experts 0 and 3 (keys 0 and 3); adapter 1's pairs are
@@ -163,7 +161,7 @@ class TestMoeLoraRouting(CustomTestCase):
         route = self._build(
             [[0], [1], [2], [3], [0], [1], [2], [3], [-1]],
             [0, 0, 0, 0, 1, 1, 1, 1, 0],
-            lora_experts_per_adapter=4,
+            num_local_experts=4,
             block_size=4,
         )
         self.assertEqual(route.num_pairs_post_padded.item(), 9 * 4)
@@ -211,11 +209,11 @@ class TestMoeLoraRouting(CustomTestCase):
         )
         original = fused_align.fused_align_block_size
         for num_virtual, num_tokens, expects_fused in cases:
-            lora_experts_per_adapter = num_virtual // 32
+            num_local_experts = num_virtual // 32
             with self.subTest(V=num_virtual, P=num_tokens * 8):
                 ids = torch.randint(
                     0,
-                    lora_experts_per_adapter,
+                    num_local_experts,
                     (num_tokens, 8),
                     dtype=torch.int32,
                     device=self.device,
@@ -234,7 +232,7 @@ class TestMoeLoraRouting(CustomTestCase):
                     route = build_virtual_expert_routing(
                         ids,
                         slots,
-                        lora_experts_per_adapter=lora_experts_per_adapter,
+                        num_local_experts=num_local_experts,
                         max_loras=32,
                         block_size=16,
                         view=RouteViewKind.ALIGNED,
@@ -268,14 +266,14 @@ class TestMoeLoraRouting(CustomTestCase):
         policy paths — V=256 (ID pass + JIT) and V=12288 (fused) — since the
         two implement the contract independently.
         """
-        for lora_experts_per_adapter, max_loras in ((8, 32), (384, 32)):
-            num_virtual = lora_experts_per_adapter * max_loras
+        for num_local_experts, max_loras in ((8, 32), (384, 32)):
+            num_virtual = num_local_experts * max_loras
             with self.subTest(V=num_virtual):
                 generator = torch.Generator(device="cpu").manual_seed(23)
                 num_tokens, top_k = 96, 8
                 topk_ids = torch.randint(
                     -1,
-                    lora_experts_per_adapter,
+                    num_local_experts,
                     (num_tokens, top_k),
                     generator=generator,
                     dtype=torch.int32,
@@ -290,7 +288,7 @@ class TestMoeLoraRouting(CustomTestCase):
                 route = build_virtual_expert_routing(
                     topk_ids,
                     token_lora_mapping,
-                    lora_experts_per_adapter=lora_experts_per_adapter,
+                    num_local_experts=num_local_experts,
                     max_loras=max_loras,
                     block_size=16,
                     view=RouteViewKind.ALIGNED,
@@ -301,8 +299,7 @@ class TestMoeLoraRouting(CustomTestCase):
                 keys = (
                     torch.where(
                         (token_lora_mapping[:, None] >= 0) & (topk_ids >= 0),
-                        token_lora_mapping[:, None].to(torch.int64)
-                        * lora_experts_per_adapter
+                        token_lora_mapping[:, None].to(torch.int64) * num_local_experts
                         + topk_ids.to(torch.int64),
                         torch.tensor(-1, dtype=torch.int64, device=self.device),
                     )

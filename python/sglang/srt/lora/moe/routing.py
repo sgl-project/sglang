@@ -7,22 +7,25 @@ does a given (token, expert) pair multiply by?)
     One expert-specific copy of an adapter's LoRA weight. A normal adapter
     carries one copy per local expert; a SHARED-OUTER adapter carries a
     single copy used by every expert.
-``lora_experts_per_adapter``
-    How many such copies each adapter has: ``num_local_experts`` normally,
-    ``1`` when shared. It sets the bucket count ``V = per_adapter *
-    max_loras`` and appears in the key formula below, so it is the one
-    number this module cannot derive on its own.
+``num_local_experts`` + ``is_shared_outer``
+    The two facts a caller states. Everything else about the key domain
+    follows: the key STRIDE is ``1`` when shared and ``num_local_experts``
+    otherwise (``RouteView.lora_experts_per_adapter``), the bucket count is
+    ``stride * max_loras``, and the routed id is range-checked against
+    ``num_local_experts``. That last check is not decoration in the shared
+    form: validity ends in ``lora_expert_id < stride``, which at stride 1 is
+    ``0 < 1`` -- always true -- so the count is what stops a routed id this
+    rank does not own from passing as valid.
+
+    Do NOT infer the form from the stride instead. A per-expert rank owning
+    exactly one expert has stride 1 too, and reading that as shared-outer
+    silently builds the wrong keys -- the same bucket-count collision the
+    route-factory clobber test drives at ``num_local_experts=1``.
 ``virtual expert id``
     The bucket key a grouped GEMM sorts by, fusing both halves of the
     question into one integer:
     ``adapter_slot * lora_experts_per_adapter + lora_expert_id``,
     or ``-1`` for a pair that must contribute nothing.
-``shared_outer_local_expert_count``
-    Shared-outer only, and NOT decoration: the validity test ends in
-    ``lora_expert_id < lora_experts_per_adapter``, which for a shared
-    adapter is ``0 < 1`` — always true. Passing the local expert count
-    restores the bound the per-expert path gets for free, so a routed id
-    this rank does not own cannot be accepted as a valid pair.
 
 A schedule requests only the route representation it consumes (execution plan
 sections 7.1 and 29 R1).  Three views exist:
@@ -130,20 +133,30 @@ class RouteView(msgspec.Struct, frozen=True, kw_only=True):
     """
 
     view: RouteViewKind
-    num_virtual_experts: int
     block_size: int
     topk_ids: torch.Tensor
     token_lora_mapping: torch.Tensor
-    lora_experts_per_adapter: int
+    # How many experts THIS RANK owns, and whether the adapter carries one
+    # factor for all of them (shared-outer) or one per expert. Everything else
+    # about the key domain follows from these two, so they are stored and the
+    # rest derived -- passing the same count in one of two differently-named
+    # slots, with 1 as a magic width, is what this replaces.
+    num_local_experts: int
+    is_shared_outer: bool
     max_loras: int
-    # Section 60.5 shared-outer form: routed ids in [0, range) map to factor
-    # slot 0 with NO map tensor; None everywhere else. Mutually exclusive
-    # with the LoRA expert map.
-    shared_outer_local_expert_count: int | None = None
     # Present only for `aligned`.
     maybe_sorted_pair_ids: torch.Tensor | None = None
     maybe_block_virtual_expert_ids: torch.Tensor | None = None
     maybe_num_pairs_post_padded: torch.Tensor | None = None
+
+    @property
+    def lora_experts_per_adapter(self) -> int:
+        """Key stride: a shared-outer adapter contributes exactly one bucket."""
+        return 1 if self.is_shared_outer else self.num_local_experts
+
+    @property
+    def num_virtual_experts(self) -> int:
+        return self.lora_experts_per_adapter * self.max_loras
 
     def _require(self, value, field: str, needed: RouteViewKind):
         if value is None:
@@ -273,9 +286,9 @@ def _build_virtual_topk_ids_kernel(
 def _build_virtual_topk_ids(
     topk_ids: torch.Tensor,
     token_lora_mapping: torch.Tensor,
-    lora_experts_per_adapter: int,
+    num_local_experts: int,
     max_loras: int,
-    shared_outer_local_expert_count: int | None = None,
+    is_shared_outer: bool = False,
 ) -> torch.Tensor:
     # The sole caller validated these same objects before branching.
     virtual_topk_ids = torch.empty_like(topk_ids)
@@ -293,11 +306,11 @@ def _build_virtual_topk_ids(
         token_lora_mapping,
         virtual_topk_ids,
         topk_ids.numel(),
-        shared_outer_local_expert_count or 0,
-        LORA_EXPERTS_PER_ADAPTER=lora_experts_per_adapter,
+        num_local_experts,
+        LORA_EXPERTS_PER_ADAPTER=1 if is_shared_outer else num_local_experts,
         MAX_LORAS=max_loras,
         TOP_K=topk_ids.shape[1],
-        SHARED_OUTER=shared_outer_local_expert_count is not None,
+        SHARED_OUTER=is_shared_outer,
         BLOCK_SIZE=block_size,
     )
     return virtual_topk_ids
@@ -319,21 +332,21 @@ def build_virtual_expert_routing(
     topk_ids: torch.Tensor,
     token_lora_mapping: torch.Tensor,
     *,
-    lora_experts_per_adapter: int,
+    num_local_experts: int,
     max_loras: int,
     block_size: int,
-    shared_outer_local_expert_count: int | None = None,
+    is_shared_outer: bool = False,
     view: RouteViewKind = RouteViewKind.ALIGNED,
     workspace: MoeLoraWorkspace | None = None,
     scratch_prefix: str | None = None,
 ) -> RouteView:
     """Build exactly the requested route representation and nothing more.
 
-    ``shared_outer_local_expert_count`` requests the section 60.5 shared-outer
-    form: every routed id inside ``[0, range)`` maps to LoRA expert 0 with
-    NO map tensor (the gather was degenerate on the shipping path).
-    Requires ``lora_experts_per_adapter == 1`` and local-domain ids — global
-    callers localize first, production's convention.
+    ``is_shared_outer`` selects the form where the adapter carries ONE factor
+    for every expert this rank owns, so the key stride is 1 and the routed id
+    is range-checked against ``num_local_experts`` instead. Ids arrive
+    EP-local either way; ``MoeLoraRunner._admit`` refuses any dispatcher that
+    keeps global ones.
 
     ``workspace`` plus ``scratch_prefix`` name this route's metadata. The
     fused aligned builder REQUIRES them; every other path ignores them, which
@@ -348,25 +361,25 @@ def build_virtual_expert_routing(
     view = RouteViewKind(view)
     if topk_ids.ndim != 2 or token_lora_mapping.shape != (topk_ids.shape[0],):
         raise ValueError("expected topk_ids [T,K] and token_lora_mapping [T]")
-    if min(lora_experts_per_adapter, max_loras, block_size) <= 0:
+    if min(num_local_experts, max_loras, block_size) <= 0:
         raise ValueError(
-            "LoRA experts per adapter, adapter capacity, and block size "
-            "must all be positive"
+            "local expert count, adapter capacity, and block size must all "
+            "be positive"
         )
     common = {
         "view": view,
-        "num_virtual_experts": lora_experts_per_adapter * max_loras,
         "block_size": block_size,
         "topk_ids": topk_ids,
         "token_lora_mapping": token_lora_mapping,
-        "lora_experts_per_adapter": lora_experts_per_adapter,
+        "num_local_experts": num_local_experts,
+        "is_shared_outer": is_shared_outer,
         "max_loras": max_loras,
-        "shared_outer_local_expert_count": shared_outer_local_expert_count,
     }
+    lora_experts_per_adapter = 1 if is_shared_outer else num_local_experts
     if view is RouteViewKind.RAW:
         return RouteView(**common)
 
-    num_virtual = common["num_virtual_experts"]
+    num_virtual = lora_experts_per_adapter * max_loras
     use_fused = uses_fused_align(
         topk_ids,
         num_virtual_experts=num_virtual,
@@ -395,11 +408,11 @@ def build_virtual_expert_routing(
             fused_align_block_size(
                 topk_ids,
                 token_lora_mapping,
-                lora_experts_per_adapter=lora_experts_per_adapter,
+                num_local_experts=num_local_experts,
+                is_shared_outer=is_shared_outer,
                 max_loras=max_loras,
                 block_size=block_size,
                 capacity=_routing_capacity(topk_ids.numel(), block_size, num_virtual),
-                shared_outer_local_expert_count=shared_outer_local_expert_count,
                 workspace=workspace,
                 scratch_prefix=scratch_prefix,
             )
@@ -414,9 +427,9 @@ def build_virtual_expert_routing(
     virtual_topk_ids = _build_virtual_topk_ids(
         topk_ids,
         token_lora_mapping,
-        lora_experts_per_adapter,
+        num_local_experts,
         max_loras,
-        shared_outer_local_expert_count=shared_outer_local_expert_count,
+        is_shared_outer=is_shared_outer,
     )
     # Reaching here means the aligned view did NOT dispatch to the fused
     # builder, i.e. V < FUSED_ALIGN_MIN_VIRTUAL_EXPERTS, which is identically

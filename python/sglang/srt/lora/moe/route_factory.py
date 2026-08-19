@@ -71,7 +71,7 @@ def build_routes(
         values["raw_per_expert"] = build_virtual_expert_routing(
             topk_ids,
             token_lora_mapping,
-            lora_experts_per_adapter=num_local_experts,
+            num_local_experts=num_local_experts,
             max_loras=max_loras,
             block_size=block_size,
             view=RouteViewKind.RAW,
@@ -82,8 +82,8 @@ def build_routes(
         values["raw_shared_outer"] = build_virtual_expert_routing(
             topk_ids,
             token_lora_mapping,
-            lora_experts_per_adapter=1,
-            shared_outer_local_expert_count=num_local_experts,
+            num_local_experts=num_local_experts,
+            is_shared_outer=True,
             max_loras=max_loras,
             block_size=block_size,
             view=RouteViewKind.RAW,
@@ -105,7 +105,7 @@ def build_routes(
             values["aligned_per_expert"] = build_virtual_expert_routing(
                 topk_ids,
                 token_lora_mapping,
-                lora_experts_per_adapter=num_local_experts,
+                num_local_experts=num_local_experts,
                 max_loras=max_loras,
                 block_size=block_size,
                 view=RouteViewKind.ALIGNED,
@@ -120,8 +120,8 @@ def build_routes(
             values["aligned_shared_outer"] = build_virtual_expert_routing(
                 topk_ids,
                 token_lora_mapping,
-                lora_experts_per_adapter=1,
-                shared_outer_local_expert_count=num_local_experts,
+                num_local_experts=num_local_experts,
+                is_shared_outer=True,
                 max_loras=max_loras,
                 block_size=block_size,
                 view=RouteViewKind.ALIGNED,
@@ -162,8 +162,8 @@ def build_routes(
         values["shared_token"] = build_virtual_expert_routing(
             token_experts,
             shared_token_lora_mapping,
-            lora_experts_per_adapter=1,
-            shared_outer_local_expert_count=num_local_experts,
+            num_local_experts=num_local_experts,
+            is_shared_outer=True,
             max_loras=max_loras,
             block_size=block_size,
             view=RouteViewKind.ALIGNED,

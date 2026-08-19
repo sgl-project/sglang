@@ -441,8 +441,8 @@ def indexed_pairs_lora_b(
     if num_pairs == 0:
         return
     offsets = tuple(int(offset) for offset in destination_offsets)
-    shared_outer = routing.shared_outer_local_expert_count is not None
-    routed_bound = routing.shared_outer_local_expert_count or 0
+    shared_outer = routing.is_shared_outer
+    routed_bound = routing.num_local_experts
     block_size_n = int(config["BLOCK_SIZE_N"])
     _indexed_pairs_lora_b_kernel[
         (num_pairs, num_slices * triton.cdiv(slice_width, block_size_n))

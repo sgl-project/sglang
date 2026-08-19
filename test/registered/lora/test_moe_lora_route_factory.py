@@ -137,13 +137,12 @@ class _RouteViewKind(str, Enum):
 
 class _HostRouteView(msgspec.Struct, frozen=True, kw_only=True):
     view: str
-    num_virtual_experts: int
     block_size: int
     topk_ids: torch.Tensor
     token_lora_mapping: torch.Tensor
-    lora_experts_per_adapter: int
+    num_local_experts: int
     max_loras: int
-    shared_outer_local_expert_count: int | None = None
+    is_shared_outer: bool = False
     maybe_sorted_pair_ids: torch.Tensor | None = None
     maybe_block_virtual_expert_ids: torch.Tensor | None = None
     maybe_num_pairs_post_padded: torch.Tensor | None = None
@@ -278,7 +277,12 @@ def _load_routing():
 
     virtual_experts = types.ModuleType("sglang.kernels.ops.moe.virtual_experts")
     virtual_experts._align_block_size_jit = lambda *_args, **_kwargs: None
-    virtual_experts._align_block_size_torch = lambda *_args, **_kwargs: None
+
+    # routing.py imports this for the fused builder's metadata; stub it so the
+    # loader does not depend on another test module having imported the real
+    # one first.
+    workspace = types.ModuleType("sglang.srt.lora.moe.workspace")
+    workspace.MoeLoraWorkspace = object
 
     module_name = "_host_routing"
     spec = importlib.util.spec_from_file_location(module_name, LORA_MOE / "routing.py")
@@ -291,6 +295,7 @@ def _load_routing():
             "triton": fake_triton,
             "triton.language": fake_tl,
             virtual_experts.__name__: virtual_experts,
+            workspace.__name__: workspace,
             module_name: module,
         },
     ):
@@ -331,19 +336,18 @@ def _route(
     *,
     block_size: int,
     padded_count: torch.Tensor,
-    lora_experts_per_adapter: int = 2,
+    num_local_experts: int = 2,
     max_loras: int = 2,
-    shared_outer_local_expert_count: int | None = None,
+    is_shared_outer: bool = False,
 ) -> _HostRouteView:
     return _HostRouteView(
         view="aligned",
-        num_virtual_experts=lora_experts_per_adapter * max_loras,
         block_size=block_size,
         topk_ids=topk_ids,
         token_lora_mapping=token_lora_mapping,
-        lora_experts_per_adapter=lora_experts_per_adapter,
+        num_local_experts=num_local_experts,
         max_loras=max_loras,
-        shared_outer_local_expert_count=shared_outer_local_expert_count,
+        is_shared_outer=is_shared_outer,
         maybe_sorted_pair_ids=torch.arange(2, dtype=torch.int32),
         maybe_block_virtual_expert_ids=torch.arange(1, dtype=torch.int32),
         maybe_num_pairs_post_padded=padded_count,
@@ -377,21 +381,18 @@ class TestRoutePdlWiring(unittest.TestCase):
             topk_ids,
             token_lora_mapping,
             *,
-            lora_experts_per_adapter,
+            num_local_experts,
             max_loras,
             block_size,
             view,
-            shared_outer_local_expert_count=None,
+            is_shared_outer=False,
             workspace=None,
             scratch_prefix=None,
         ):
-            # Shared-outer routes key on one LoRA expert and carry the local
-            # expert count as the range bound; per-expert routes do neither.
-            self.assertEqual(
-                lora_experts_per_adapter == 1,
-                shared_outer_local_expert_count is not None,
-            )
-            calls.append(scratch_prefix)
+            # Every route gets the SAME local expert count; only the flag
+            # differs, and it has to match the route being built.
+            self.assertEqual(num_local_experts, 2)
+            calls.append((scratch_prefix, is_shared_outer))
             return _route(
                 topk_ids,
                 token_lora_mapping,
@@ -416,9 +417,9 @@ class TestRoutePdlWiring(unittest.TestCase):
         self.assertEqual(
             set(calls),
             {
-                "route:aligned_per_expert",
-                "route:aligned_shared_outer",
-                "route:shared_token",
+                ("route:aligned_per_expert", False),
+                ("route:aligned_shared_outer", True),
+                ("route:shared_token", True),
             },
         )
 
@@ -464,11 +465,11 @@ class TestRoutePdlWiring(unittest.TestCase):
             topk_ids,
             token_lora_mapping,
             *,
-            lora_experts_per_adapter,
+            num_local_experts,
             max_loras,
             block_size,
             view,
-            shared_outer_local_expert_count=None,
+            is_shared_outer=False,
             workspace=None,
             scratch_prefix=None,
         ):
@@ -600,17 +601,17 @@ class TestSharedTokenRoute(unittest.TestCase):
             route_topk_ids,
             route_token_lora_mapping,
             *,
-            lora_experts_per_adapter,
+            num_local_experts,
             max_loras,
             block_size,
             view,
-            shared_outer_local_expert_count=None,
+            is_shared_outer=False,
             workspace=None,
             scratch_prefix=None,
         ):
             calls.append(
                 (
-                    shared_outer_local_expert_count is not None,
+                    scratch_prefix,
                     route_topk_ids.clone(),
                     route_token_lora_mapping.clone(),
                 )
@@ -640,7 +641,7 @@ class TestSharedTokenRoute(unittest.TestCase):
                 workspace=workspace,
             )
 
-        shared_call = next(call for call in calls if call[0] is True)
+        shared_call = next(call for call in calls if call[0] == "route:shared_token")
         torch.testing.assert_close(
             shared_call[1], torch.zeros((3, 1), dtype=torch.int32)
         )
@@ -694,11 +695,11 @@ class TestSharedTokenRoute(unittest.TestCase):
                     route_topk_ids,
                     route_token_lora_mapping,
                     *,
-                    lora_experts_per_adapter,
+                    num_local_experts,
                     max_loras,
                     block_size,
                     view,
-                    shared_outer_local_expert_count=None,
+                    is_shared_outer=False,
                     workspace=None,
                     scratch_prefix=None,
                 ):
@@ -718,9 +719,9 @@ class TestSharedTokenRoute(unittest.TestCase):
                         route_token_lora_mapping,
                         block_size=block_size,
                         padded_count=padded,
-                        lora_experts_per_adapter=lora_experts_per_adapter,
+                        num_local_experts=num_local_experts,
                         max_loras=max_loras,
-                        shared_outer_local_expert_count=shared_outer_local_expert_count,
+                        is_shared_outer=is_shared_outer,
                     )
 
                 with mock.patch.object(

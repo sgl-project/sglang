@@ -377,7 +377,14 @@ def _src2dst_rows(topk_ids: torch.Tensor, num_experts: int, style: str, seed: in
 
 
 def _fp32_finalize_oracle(
-    down_rows, src2dst, bridge, b_down, topk_ids, token_lora_mapping, topk_weights, num_experts
+    down_rows,
+    src2dst,
+    bridge,
+    b_down,
+    topk_ids,
+    token_lora_mapping,
+    topk_weights,
+    num_experts,
 ):
     num_tokens, top_k = topk_ids.shape
     out = torch.zeros((num_tokens, _HIDDEN), dtype=torch.float32)
@@ -475,7 +482,7 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
     aligned = build_virtual_expert_routing(
         gpu["topk_ids"],
         gpu["token_lora_mapping"],
-        lora_experts_per_adapter=num_experts,
+        num_local_experts=num_experts,
         max_loras=_SLOTS,
         block_size=16,
         view=RouteViewKind.ALIGNED,
@@ -524,7 +531,9 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
     # Rows no LoRA-active pair targets are BITWISE untouched: base-only and
     # sentinel pairs contribute no add and their (poisoned or unwritten)
     # src2dst entries are never dereferenced.
-    lora_active = (topk_ids.view(-1) >= 0) & (token_lora_mapping.repeat_interleave(top_k) >= 0)
+    lora_active = (topk_ids.view(-1) >= 0) & (
+        token_lora_mapping.repeat_interleave(top_k) >= 0
+    )
     touched = src2dst[lora_active].long()
     untouched = torch.ones(down_rows.shape[0], dtype=torch.bool)
     untouched[touched] = False
@@ -551,7 +560,7 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
     aligned_base = build_virtual_expert_routing(
         gpu["topk_ids"],
         base_slots,
-        lora_experts_per_adapter=num_experts,
+        num_local_experts=num_experts,
         max_loras=_SLOTS,
         block_size=16,
         view=RouteViewKind.ALIGNED,
@@ -586,7 +595,7 @@ def test_scatter_rejects_a_mismatched_route_block() -> None:
     aligned = build_virtual_expert_routing(
         topk_ids.to(device),
         token_lora_mapping.to(device),
-        lora_experts_per_adapter=4,
+        num_local_experts=4,
         max_loras=_SLOTS,
         block_size=32,
         view=RouteViewKind.ALIGNED,
@@ -810,7 +819,9 @@ def test_scatter_pipeline_replays_correctly_in_a_real_cuda_graph(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = _run_once(scatter_runner, gpu, token_lora_mapping, use_cuda_graph=True)
+        captured = _run_once(
+            scatter_runner, gpu, token_lora_mapping, use_cuda_graph=True
+        )
     output = captured.hidden_states
     output_ptr = output.data_ptr()
 

@@ -142,7 +142,7 @@ def _validate_config(
 
 
 def _validate_shared_route(routing: RouteView) -> None:
-    if routing.shared_outer_local_expert_count is None:
+    if not routing.is_shared_outer:
         raise ValueError(
             "shared_rank_reduce requires a shared-outer route; applying one "
             "B after rank reduction is invalid for per-expert weights"
@@ -373,7 +373,7 @@ def invoke_shared_rank_reduce(
         rank=rank,
         top_k=top_k,
         max_loras=routing.max_loras,
-        local_expert_count=routing.shared_outer_local_expert_count,
+        local_expert_count=routing.num_local_experts,
         block_t=block_t,
         block_r=block_r,
         num_warps=reduce_warps,

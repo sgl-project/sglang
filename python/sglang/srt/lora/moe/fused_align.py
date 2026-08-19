@@ -261,11 +261,11 @@ def fused_align_block_size(
     topk_ids: torch.Tensor,
     token_lora_mapping: torch.Tensor,
     *,
-    lora_experts_per_adapter: int,
+    num_local_experts: int,
+    is_shared_outer: bool,
     max_loras: int,
     block_size: int,
     capacity: int,
-    shared_outer_local_expert_count: int | None = None,
     workspace: MoeLoraWorkspace,
     scratch_prefix: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -285,6 +285,7 @@ def fused_align_block_size(
     device = topk_ids.device
     num_pairs = topk_ids.numel()
     top_k = topk_ids.shape[1]
+    lora_experts_per_adapter = 1 if is_shared_outer else num_local_experts
     num_virtual = lora_experts_per_adapter * max_loras
     num_buckets = num_virtual + 1
     # int32 key math holds only below 2**31; nothing upstream enforces it, and
@@ -294,8 +295,7 @@ def fused_align_block_size(
             f"fused align uses int32 plan math: num_buckets={num_buckets} and "
             f"capacity={capacity} must both be < 2**31"
         )
-    shared_outer = shared_outer_local_expert_count is not None
-    routed_expert_id_bound = shared_outer_local_expert_count or 0
+    routed_expert_id_bound = num_local_experts
     num_blocks = capacity // block_size
 
     # Every host-fallible operation happens BEFORE the first launch, so an
@@ -335,7 +335,7 @@ def fused_align_block_size(
         LORA_EXPERTS_PER_ADAPTER=lora_experts_per_adapter,
         MAX_LORAS=max_loras,
         TOP_K=top_k,
-        SHARED_OUTER=shared_outer,
+        SHARED_OUTER=is_shared_outer,
         BLOCK=HIST_BLOCK,
         USE_PDL=use_pdl,
         num_warps=HIST_WARPS,
@@ -372,7 +372,7 @@ def fused_align_block_size(
         LORA_EXPERTS_PER_ADAPTER=lora_experts_per_adapter,
         MAX_LORAS=max_loras,
         TOP_K=top_k,
-        SHARED_OUTER=shared_outer,
+        SHARED_OUTER=is_shared_outer,
         BLOCK=EXPAND_BLOCK,
         BLOCK_SIZE_M=block_size,
         # The search interval is [0, NUM_BUCKETS], not [0, NUM_BUCKETS).

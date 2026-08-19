@@ -176,8 +176,8 @@ def indexed_lora_a(
     if num_pairs == 0:
         return
     _validate_pair_gemm(input, weight, output, routing, pair_input=pair_input)
-    shared_outer = routing.shared_outer_local_expert_count is not None
-    routed_bound = routing.shared_outer_local_expert_count or 0
+    shared_outer = routing.is_shared_outer
+    routed_bound = routing.num_local_experts
     block_size_n = int(config["BLOCK_SIZE_N"])
     _indexed_lora_a_kernel[(num_pairs, triton.cdiv(weight.shape[1], block_size_n))](
         input,

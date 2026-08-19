@@ -539,36 +539,23 @@ def build_joint_shared_routes(
 
     def route(
         *,
-        num_virtual_experts: int,
-        lora_experts_per_adapter: int,
-        shared_outer_local_expert_count: int | None,
+        is_shared_outer: bool,
         scratch: dict[str, torch.Tensor],
     ) -> RouteView:
         return RouteView(
             view=RouteViewKind.ALIGNED,
-            num_virtual_experts=num_virtual_experts,
             block_size=block_size,
             topk_ids=topk_ids,
             token_lora_mapping=token_lora_mapping,
-            lora_experts_per_adapter=lora_experts_per_adapter,
+            num_local_experts=num_local_experts,
+            is_shared_outer=is_shared_outer,
             max_loras=max_loras,
-            shared_outer_local_expert_count=shared_outer_local_expert_count,
             maybe_sorted_pair_ids=scratch["sorted"],
             maybe_block_virtual_expert_ids=scratch["block_ids"],
             maybe_num_pairs_post_padded=scratch["padded_pairs"],
         )
 
     return (
-        route(
-            num_virtual_experts=num_per_expert_virtual,
-            lora_experts_per_adapter=num_local_experts,
-            shared_outer_local_expert_count=None,
-            scratch=per_expert,
-        ),
-        route(
-            num_virtual_experts=num_shared_virtual,
-            lora_experts_per_adapter=1,
-            shared_outer_local_expert_count=num_local_experts,
-            scratch=shared,
-        ),
+        route(is_shared_outer=False, scratch=per_expert),
+        route(is_shared_outer=True, scratch=shared),
     )

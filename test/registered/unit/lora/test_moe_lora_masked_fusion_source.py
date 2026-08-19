@@ -358,7 +358,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         provider = _source("masked_row_domain.py")
         wrapper = _function(provider, "run_shared_rank_finalize")
         validator = _function(source, "_validate_shared_route")
-        self.assertIn("shared_outer_local_expert_count is None", validator)
+        self.assertIn("not routing.is_shared_outer", validator)
         self.assertIn("lora_experts_per_adapter != 1", validator)
         self.assertIn("self.run_shared_rank_reduce(", wrapper)
         self.assertIn("self.finish_shared_rank_finalize(", wrapper)
