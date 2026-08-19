@@ -41,22 +41,12 @@ if TYPE_CHECKING:
 class B12xMoeQuantInfo(MoeQuantInfo):
     """Payload for the b12x W4A16 fused MoE.
 
-    ``experts`` owns the only copy of the expert weights: the checkpoint tensors
-    are released once it is built, so this dataclass carries none of its own.
+    The quant method binds everything at load time (weights, scratch plan,
+    scratch arena); ``launch`` is the prepared bind-and-run closure, so this
+    dataclass carries no tensors of its own.
     """
 
-    # b12x expert-weight package, built at load time.
-    experts: Any
-    # b12x scratch plan, planned at load time.
-    plan: Any
-    # Caller-owned scratch, allocated at load time so it never lands in a CUDA
-    # graph's private memory pool. None on the 0.15.3 path, where everything
-    # lives in ``launch``.
-    scratch: torch.Tensor | None = None
-    # Set when the quant method already bound everything it needs; the two b12x
-    # generations take different arguments, so the version-specific call lives
-    # there rather than here.
-    launch: Any = None
+    launch: Any
     # True only when expert parallelism is on: that is the only case where the
     # dispatcher rewrites non-local experts (and padded rows) to -1, which b12x
     # would otherwise run as garbage. At EP=1 the guard would cost five tiny
@@ -109,20 +99,6 @@ def fused_experts_none_to_b12x(
         topk_ids = topk_ids.clamp_min(0)
         topk_weights = topk_weights.masked_fill(invalid, 0.0)
 
-    if quant_info.launch is not None:
-        quant_info.launch(x, topk_ids, topk_weights, out)
-    else:
-        from b12x.moe import fused_moe
-
-        binding = fused_moe.bind(
-            quant_info.plan,
-            scratch=quant_info.scratch,
-            a=x,
-            experts=quant_info.experts,
-            topk_ids=topk_ids,
-            topk_weights=topk_weights,
-            output=out,
-        )
-        fused_moe.run(binding=binding)
+    quant_info.launch(x, topk_ids, topk_weights, out)
 
     return StandardCombineInput(hidden_states=out)

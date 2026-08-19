@@ -1,11 +1,11 @@
-"""DeepSeek-V4 MXFP4 expert backend backed by the b12x W4A16 fused MoE.
+"""DeepSeek-V4 MXFP4 expert backend backed by the b12x 0.15.3 W4A16 fused MoE.
 
 Same checkpoint as :mod:`mxfp4_flashinfer_cutlass_moe`, different runtime: one
 fused kernel per expert layer instead of seven, and bf16 activations instead of
 MXFP8.
 
-This uses the standalone ``b12x`` package rather than the copy vendored inside
-FlashInfer. Three things depend on that choice:
+This targets exactly one generation of the standalone ``b12x`` package: the
+0.15.3 API (``b12x.integration.tp_moe``). Three things depend on that choice:
 
 * ``source_format="fp4_e8m0_k32"`` consumes the checkpoint's E8M0 K/32 block
   scales byte for byte, so there is no scale relayout to get wrong.
@@ -13,27 +13,20 @@ FlashInfer. Three things depend on that choice:
   it binds on real data (gate magnitudes reach 10.1, and half the layers sit
   within 7% of the limit), so dropping it is a correctness change, not a
   rounding one.
-* Kernels are warmed before CUDA graph capture. b12x specializes on token
-  count only as ``size_m == 1`` vs everything else (``_m_specialization_key``
-  in its w4a16 kernel), so this is two compiles, not one per prompt length --
-  but it refuses to compile at all while a graph is being captured, which is
-  what the warm-up exists for.
+* Kernels are warmed before CUDA graph capture: b12x refuses to compile while
+  a graph is being captured and falls back to a pinned tile config that does
+  not fit every block size, so every token count a captured graph can present
+  is compiled eagerly first (see :func:`_core_token_counts`).
 
-Two b12x API generations are supported, auto-detected by import shape
-(:func:`_b12x_is_legacy`); "legacy" throughout this file names the API
-generation, not a recommendation:
+0.15.3 was never published to PyPI. Install it from the source commit whose
+MoE surface matches the released wheel::
 
-* **1.2.2** (``b12x.moe.fused_moe``) is the current PyPI release and the
-  default. Install with ``pip install --no-deps b12x==1.2.2``; without
-  ``--no-deps`` pip pulls a newer torch and breaks the rest of the image.
-* **0.15.3** (``b12x.integration``, the legacy API) was never published to
-  PyPI -- it ships only inside the dspark reference image, and 0.15.2 (the
-  last published 0.15.x) predates the ``fp4_e8m0_k32`` / ``w13_layout``
-  API this file needs -- so it can only come from a checkout
-  (``SGLANG_B12X_PATH``). At the decode working point (M=6) it is ~19%
-  *faster* per call -- see :func:`_select_b12x_distribution` -- while at
-  prefill-sized M the two generations are within noise; that decode delta
-  is why a deployment would bother.
+    pip install --no-deps "b12x @ https://github.com/local-inference-lab/b12x/archive/7dc6fb8fcc6446ea093537d1657df81985fa5f43.tar.gz"
+
+(``--no-deps``: b12x's metadata pulls a newer torch and breaks the rest of the
+image.) Later b12x generations changed the W4A16 kernels (0.20.0) and then the
+API (1.2.x); they are rejected at startup rather than silently producing
+different numerics -- see :func:`_require_015_generation`.
 """
 
 from __future__ import annotations
@@ -45,7 +38,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.nn import Module
-from torch.nn.parameter import Parameter
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import log_info_on_rank0
@@ -59,18 +51,18 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
+_B12X_INSTALL_HINT = (
+    "pip install --no-deps 'b12x @ https://github.com/local-inference-lab/"
+    "b12x/archive/7dc6fb8fcc6446ea093537d1657df81985fa5f43.tar.gz'"
+)
+
 
 def _select_b12x_distribution() -> None:
-    """Put the pinned b12x on sys.path ahead of whatever pip installed.
+    """Put a local b12x tree on sys.path ahead of whatever pip installed.
 
-    b12x 1.2.2 generalized its W4A16 kernel to also serve trellis rotation,
-    extra gating modes, expert maps and activation-amax collection. The
-    weights and scales
-    went from ``cute.Tensor`` (compile-time-static strides) to raw
-    ``cute.Pointer`` with layouts rebuilt at runtime, which costs 14 registers
-    and ~19% on this shape -- measured at 875.6 us/call against 707.9 for
-    0.15.3, same GPU, same weights, same inputs, bit-identical outputs.
-    DSv4-Flash uses none of the features that bought.
+    For deployments that carry the 0.15.3 tree as a directory (e.g. extracted
+    from the dspark reference image) instead of pip-installing the pinned
+    source commit. Unset (the default) is a no-op.
     """
     path = envs.SGLANG_B12X_PATH.get()
     if not path:
@@ -80,7 +72,7 @@ def _select_b12x_distribution() -> None:
     loaded = sys.modules.get("b12x")
     if loaded is not None:
         # Idempotent: this runs once per expert layer. Only a b12x already
-        # imported from somewhere else is a problem, and it is fatal -- the two
+        # imported from somewhere else is a problem, and it is fatal -- the
         # generations share a module name but not an API.
         want = os.path.realpath(path)
         got = os.path.realpath(os.path.dirname(os.path.dirname(loaded.__file__)))
@@ -96,23 +88,43 @@ def _select_b12x_distribution() -> None:
 def is_b12x_available() -> bool:
     try:
         _select_b12x_distribution()
-        import b12x  # noqa: F401
+        import b12x.integration.tp_moe  # noqa: F401
 
         return True
     except ImportError:
         return False
 
 
-def _b12x_is_legacy() -> bool:
-    """True for the 0.15.3-era API (``b12x.integration.tp_moe``)."""
-    import b12x  # noqa: F401
+def _require_015_generation() -> None:
+    """Reject b12x generations other than 0.15.x, loudly and at load time.
+
+    0.20.0 rewrote the W4A16 kernels behind the same ``b12x.integration``
+    API (different numerics), and the 1.2.x line replaced the API as well
+    (``b12x.moe.fused_moe``). This backend is validated against 0.15.3 only.
+    A raw source tree without dist-info cannot be version-checked; the
+    ``fused_moe`` probe still rejects the 1.2.x line there.
+    """
+    import importlib.metadata
+
+    import b12x
 
     try:
-        import b12x.moe.fused_moe  # noqa: F401
+        import b12x.moe.fused_moe  # noqa: F401  # the 1.2.x-generation API
 
-        return False
+        has_fused_moe = True
     except ImportError:
-        return True
+        has_fused_moe = False
+    version = None
+    try:
+        version = importlib.metadata.version("b12x")
+    except importlib.metadata.PackageNotFoundError:
+        pass
+    if has_fused_moe or (version is not None and not version.startswith("0.15.")):
+        raise RuntimeError(
+            f"b12x at {b12x.__file__} (version {version or 'unknown'}) is not "
+            "the 0.15.x generation this backend is validated against. "
+            f"Install the pinned source commit: {_B12X_INSTALL_HINT}"
+        )
 
 
 def _b12x_max_tokens() -> int:
@@ -130,8 +142,8 @@ def _core_token_counts(max_tokens: int, tokens_per_seq: int) -> tuple[int, ...]:
     already. Decode graphs are captured at the configured batch sizes times the
     speculative window; prefill is chunked, so a power-of-two ladder covers it.
 
-    Kernel compilation dedupes down to two variants (see ``_warmup``); the rest
-    of this ladder is what sizes the scratch arena.
+    Each count compiles its own kernel (the startup log line counts them), and
+    the same ladder sizes the scratch arena.
     """
     counts = set()
     batch_sizes = list(range(1, 33))
@@ -155,83 +167,14 @@ def _core_token_counts(max_tokens: int, tokens_per_seq: int) -> tuple[int, ...]:
     return tuple(sorted(c for c in counts if 0 < c <= max_tokens))
 
 
-def _relax_blocks_per_sm() -> None:
-    """Undo b12x's one-CTA-per-SM pin for moe_block_size==8.
-
-    b12x pins ``blocks_per_sm = 1`` whenever the routed block size is 8, to keep
-    the fused kernel's grid-barrier atomic from serializing across a wide grid.
-    Every decode token count lands on block size 8 here -- the routed fill test
-    is ``m * top_k / num_experts < 0.9 * 8``, so any m below ~308 takes it -- and
-    GB10 has 48 SMs, so the pin runs the machine at grid 48 where the unpinned
-    heuristic would pick 144.
-
-    Must run before the kernels are compiled: ``blocks_per_sm`` is part of the
-    launch bounds and therefore of b12x's kernel cache key, and b12x refuses to
-    compile during CUDA graph capture.
-    """
-    from b12x.moe._shared.kernels.w4a16 import kernel as b12x_kernel
-
-    original = b12x_kernel._determine_blocks_per_sm
-    # Latched on the patched function itself: the patch is process-global state
-    # inside the b12x module, which reset_context() cannot (and must not) undo.
-    if getattr(original, "_sglang_unpinned", False):
-        return
-
-    def _unpinned(*args, **kwargs):
-        # Route to the cta_m_blocks==1 branch, which caps at 4 rather than 1.
-        # This also picks the uses_m_block_8=False register count (143 vs 120),
-        # the more conservative of the two, so occupancy stays achievable.
-        kwargs["uses_m_block_8"] = False
-        return original(*args, **kwargs)
-
-    _unpinned._sglang_unpinned = True
-    b12x_kernel._determine_blocks_per_sm = _unpinned
-    log_info_on_rank0(
-        logger, "b12x: dropped the one-CTA-per-SM pin for moe_block_size==8."
-    )
-
-
-def _warmup(*, plan, scratch, experts, top_k, num_experts, hidden_size, device, counts):
-    """Compile one kernel per token count, outside CUDA graph capture.
-
-    b12x refuses to compile while a graph is being captured, and falls back to
-    the plan's pinned tile config -- which does not fit every block size, so the
-    launch fails outright rather than running slowly. ``core_token_counts``
-    only declares the counts; it does not compile them. So every count a
-    captured graph can present has to be run once here, eagerly, first.
-    """
-    from b12x.moe import fused_moe
-
-    for tokens in counts:
-        a = torch.zeros(tokens, hidden_size, dtype=torch.bfloat16, device=device)
-        topk_ids = torch.arange(tokens * top_k, dtype=torch.int32, device=device)
-        topk_ids = (topk_ids % num_experts).view(tokens, top_k)
-        topk_weights = torch.full(
-            (tokens, top_k), 1.0 / top_k, dtype=torch.float32, device=device
-        )
-        out = torch.empty(tokens, hidden_size, dtype=torch.bfloat16, device=device)
-        fused_moe.run(
-            binding=fused_moe.bind(
-                plan,
-                scratch=scratch,
-                a=a,
-                experts=experts,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-                output=out,
-            )
-        )
-    torch.cuda.synchronize()
-
-
 # Module-level on purpose: this latch mirrors b12x's own process-global
 # compiled-kernel cache, which reset_context() cannot reset -- re-warming after
 # a context reset would be wasted work, not a correctness need.
 _B12X_WARMED = False
 
 
-def _warmup_legacy(*, launch, top_k, num_experts, hidden_size, device, counts):
-    """Compile the 0.15.3 kernels before any CUDA graph capture."""
+def _warmup(*, launch, top_k, num_experts, hidden_size, device, counts):
+    """Compile the kernels for every count before any CUDA graph capture."""
     global _B12X_WARMED
     for tokens in counts:
         a = torch.zeros(tokens, hidden_size, dtype=torch.bfloat16, device=device)
@@ -244,8 +187,8 @@ def _warmup_legacy(*, launch, top_k, num_experts, hidden_size, device, counts):
     _B12X_WARMED = True
 
 
-def _legacy_prepare(*, w13, s13, w2, s2, ones):
-    """0.15.3 weight prep. Repacks in place, so the caller's tensors stay live."""
+def _prepare_weights(*, w13, s13, w2, s2, ones):
+    """Weight prep. Repacks in place, so the caller's tensors stay live."""
     from b12x.integration import prepare_b12x_fp4_moe_weights
 
     return prepare_b12x_fp4_moe_weights(
@@ -267,10 +210,10 @@ def _legacy_prepare(*, w13, s13, w2, s2, ones):
     )
 
 
-def _legacy_plan(
+def _plan_scratch(
     *, num_experts, hidden_size, intermediate, top_k, device, swiglu_limit, counts
 ):
-    """0.15.3 scratch plan. Returns (plan, scratch)."""
+    """Frozen scratch plan. Returns (plan, scratch)."""
     from b12x.integration.tp_moe import TPMoEScratchCaps, plan_tp_moe_scratch
 
     caps = TPMoEScratchCaps(
@@ -300,8 +243,8 @@ def _legacy_plan(
     return plan, scratch
 
 
-def _legacy_launcher(*, plan, scratch, prepared, w13, s13, w2, s2, ones, swiglu_limit):
-    """Bind-and-run closure for 0.15.3, matching vLLM's call sequence."""
+def _make_launcher(*, plan, scratch, prepared, w13, s13, w2, s2, ones, swiglu_limit):
+    """Bind-and-run closure, matching vLLM's call sequence."""
     from b12x.integration.tp_moe import b12x_moe_fp4
 
     packed = prepared.w4a16
@@ -340,119 +283,24 @@ def _legacy_launcher(*, plan, scratch, prepared, w13, s13, w2, s2, ones, swiglu_
     return launch
 
 
-def _get_weight_plan(*, num_experts: int, hidden_size: int, intermediate: int):
-    """One weight plan per shape, shared by every expert layer.
-
-    Not just a memory saving: b12x's compiled-kernel cache is keyed per plan,
-    so sharing means the warm-up compiles each token count once for the whole
-    model instead of once per layer. Stored on ``get_resources().buffers`` so
-    unit-test teardown (``reset_context``) drops it with everything else.
-    """
-    from b12x.moe import fused_moe
-
-    from sglang.srt.runtime_context import get_resources
-
-    buffers = get_resources().buffers
-    key = f"b12x:weight_plan:{num_experts}:{hidden_size}:{intermediate}"
-    plan = buffers.get(key)
-    if plan is None:
-        plan = fused_moe.plan_weights(
-            quant_modes="w4a16",
-            source_format="fp4_e8m0_k32",
-            activation="silu",
-            params_dtype=torch.bfloat16,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate,
-            w13_layout="up_gate",
-        )
-        buffers[key] = plan
-    return plan
-
-
-def _get_scratch(
-    *,
-    weight_plan,
-    top_k: int,
-    device,
-    swiglu_limit,
-    tokens_per_seq,
-    experts,
-    num_experts: int,
-    hidden_size: int,
-):
-    """Plan and allocate the shared scratch buffer, once per shape."""
-    from b12x.moe import fused_moe
-
-    from sglang.srt.runtime_context import get_resources
-
-    max_tokens = _b12x_max_tokens()
-    # One scratch arena per shape, shared by every layer: they run sequentially
-    # and it is pure scratch. Allocated at load time so it can never land in a
-    # CUDA graph's private memory pool -- a buffer first allocated during
-    # capture is only valid inside that graph, and reusing it from an
-    # un-captured forward faults.
-    buffers = get_resources().buffers
-    key = f"b12x:scratch:{id(weight_plan)}:{top_k}:{device}:{swiglu_limit}"
-    entry = buffers.get(key)
-    if entry is None:
-        if envs.SGLANG_B12X_RELAX_BLOCKS_PER_SM.get():
-            _relax_blocks_per_sm()
-        counts = _core_token_counts(max_tokens, tokens_per_seq)
-        caps = fused_moe.Caps(
-            max_tokens=max_tokens,
-            num_topk=top_k,
-            device=device,
-            weight_plan=weight_plan,
-            quant_mode="w4a16",
-            swiglu_limit=swiglu_limit,
-            core_token_counts=counts,
-            frozen=True,
-        )
-        plan = fused_moe.plan(caps)
-        scratch = torch.empty(
-            fused_moe.required_nbytes(caps), dtype=torch.uint8, device=device
-        )
-        log_info_on_rank0(
-            logger,
-            f"Compiling {len(counts)} b12x W4A16 kernels "
-            f"(token counts {counts[0]}..{counts[-1]})...",
-        )
-        _warmup(
-            plan=plan,
-            scratch=scratch,
-            experts=experts,
-            top_k=top_k,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
-            device=device,
-            counts=counts,
-        )
-        entry = (plan, scratch)
-        buffers[key] = entry
-    return entry
-
-
 class Mxfp4B12xMoEMethod:
     """b12x MXFP4 MoE: one fused W4A16 kernel per expert layer."""
 
     def __init__(self, fp8_method, prefix: str):
         if not is_b12x_available():
             raise RuntimeError(
-                "The b12x MoE backend needs the b12x package: "
-                "pip install --no-deps b12x==1.2.2"
+                "The b12x MoE backend needs the 0.15.3-generation b12x "
+                f"package: {_B12X_INSTALL_HINT}"
             )
+        _require_015_generation()
         if not is_sm120_supported():
             raise RuntimeError("Mxfp4B12xMoEMethod requires SM120 or SM121.")
         self._fp8 = fp8_method
         self.prefix = prefix
-        self._experts: Any = None
-        self._plan: Any = None
-        self._scratch: torch.Tensor | None = None
         self._swiglu_limit: float | None = None
-        # Set on the 0.15.3 path, where the whole call is a prepared closure.
+        # The whole call is a prepared closure; see _make_launcher.
         self._launch: Any = None
-        self._legacy_keepalive: Any = None
+        self._keepalive: Any = None
         self._ep_guard = False
 
     @property
@@ -538,105 +386,54 @@ class Mxfp4B12xMoEMethod:
         except Exception:
             spec_tokens = 1
 
-        if _b12x_is_legacy():
-            # 0.15.3: one call prepares the weights in place, and the scratch
-            # plan is built straight from the shapes -- there is no separate
-            # weight plan to share between layers.
-            w13 = layer.w13_weight.data.view(torch.uint8)
-            s13 = layer.w13_weight_scale_inv.data.view(torch.uint8)
-            w2 = layer.w2_weight.data.view(torch.uint8)
-            s2 = layer.w2_weight_scale_inv.data.view(torch.uint8)
-            prepared = _legacy_prepare(w13=w13, s13=s13, w2=w2, s2=s2, ones=ones)
-            counts = _core_token_counts(_b12x_max_tokens(), spec_tokens)
-            plan, scratch = _legacy_plan(
-                num_experts=num_experts,
-                hidden_size=hidden_size,
-                intermediate=intermediate,
-                top_k=int(layer.top_k),
-                device=device,
-                swiglu_limit=self._swiglu_limit,
-                counts=counts,
-            )
-            self._launch = _legacy_launcher(
-                plan=plan,
-                scratch=scratch,
-                prepared=prepared,
-                w13=w13,
-                s13=s13,
-                w2=w2,
-                s2=s2,
-                ones=ones,
-                swiglu_limit=self._swiglu_limit,
-            )
-            # reuse_input_storage=True: the prepared package aliases these
-            # tensors, so they must stay reachable. Keep the Parameters as they
-            # are and hold our own references.
-            self._legacy_keepalive = (prepared, w13, s13, w2, s2, ones, plan, scratch)
-            # Same reason as the 1.2.2 path: b12x will not compile while a CUDA
-            # graph is being captured, so every shape a graph can present has to
-            # have run once already.
-            if not _B12X_WARMED:
-                log_info_on_rank0(
-                    logger,
-                    f"Compiling b12x 0.15.3 W4A16 kernels for {len(counts)} "
-                    f"token counts ({counts[0]}..{counts[-1]})...",
-                )
-                _warmup_legacy(
-                    launch=self._launch,
-                    top_k=int(layer.top_k),
-                    num_experts=num_experts,
-                    hidden_size=hidden_size,
-                    device=device,
-                    counts=counts,
-                )
-            layer._dsv4_mxfp4_backend = "b12x_sm12x_015"
-            return
-
-        from b12x.moe import fused_moe
-
-        weight_plan = _get_weight_plan(
+        # One call prepares the weights in place, and the scratch plan is
+        # built straight from the shapes.
+        w13 = layer.w13_weight.data.view(torch.uint8)
+        s13 = layer.w13_weight_scale_inv.data.view(torch.uint8)
+        w2 = layer.w2_weight.data.view(torch.uint8)
+        s2 = layer.w2_weight_scale_inv.data.view(torch.uint8)
+        prepared = _prepare_weights(w13=w13, s13=s13, w2=w2, s2=s2, ones=ones)
+        counts = _core_token_counts(_b12x_max_tokens(), spec_tokens)
+        plan, scratch = _plan_scratch(
             num_experts=num_experts,
             hidden_size=hidden_size,
             intermediate=intermediate,
-        )
-        self._experts = fused_moe.prepare_weights(
-            plan=weight_plan,
-            params_dtype=torch.bfloat16,
-            w1_fp4=layer.w13_weight.data.view(torch.uint8),
-            w1_blockscale=layer.w13_weight_scale_inv.data.view(torch.uint8),
-            w1_global_scale=ones,
-            w2_fp4=layer.w2_weight.data.view(torch.uint8),
-            w2_blockscale=layer.w2_weight_scale_inv.data.view(torch.uint8),
-            w2_global_scale=ones,
-            a1_gscale=ones,
-            a2_gscale=ones,
-        )
-        self._plan, self._scratch = _get_scratch(
-            weight_plan=weight_plan,
             top_k=int(layer.top_k),
             device=device,
             swiglu_limit=self._swiglu_limit,
-            tokens_per_seq=spec_tokens,
-            experts=self._experts,
-            num_experts=num_experts,
-            hidden_size=hidden_size,
+            counts=counts,
         )
-
-        # b12x owns the runtime weights from here on. Whether it aliased the
-        # checkpoint storage or copied it is its choice; either way nothing else
-        # reads these Parameters again.
-        def _release(param: torch.Tensor) -> Parameter:
-            return Parameter(
-                torch.empty(0, dtype=param.dtype, device=param.device),
-                requires_grad=False,
+        self._launch = _make_launcher(
+            plan=plan,
+            scratch=scratch,
+            prepared=prepared,
+            w13=w13,
+            s13=s13,
+            w2=w2,
+            s2=s2,
+            ones=ones,
+            swiglu_limit=self._swiglu_limit,
+        )
+        # reuse_input_storage=True: the prepared package aliases these
+        # tensors, so they must stay reachable. Keep the Parameters as they
+        # are and hold our own references.
+        self._keepalive = (prepared, w13, s13, w2, s2, ones, plan, scratch)
+        # b12x will not compile while a CUDA graph is being captured, so every
+        # shape a graph can present has to have run once already.
+        if not _B12X_WARMED:
+            log_info_on_rank0(
+                logger,
+                f"Compiling b12x W4A16 kernels for {len(counts)} "
+                f"token counts ({counts[0]}..{counts[-1]})...",
             )
-
-        layer.w13_weight = _release(layer.w13_weight)
-        layer.w2_weight = _release(layer.w2_weight)
-        layer.w13_weight_scale_inv = _release(layer.w13_weight_scale_inv)
-        layer.w2_weight_scale_inv = _release(layer.w2_weight_scale_inv)
-        torch.cuda.empty_cache()
-
+            _warmup(
+                launch=self._launch,
+                top_k=int(layer.top_k),
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                device=device,
+                counts=counts,
+            )
         layer._dsv4_mxfp4_backend = "b12x_sm12x"
 
     def apply(
@@ -647,9 +444,6 @@ class Mxfp4B12xMoEMethod:
         from sglang.srt.layers.moe.moe_runner.b12x import B12xMoeQuantInfo
 
         quant_info = B12xMoeQuantInfo(
-            experts=self._experts,
-            plan=self._plan,
-            scratch=self._scratch,
             launch=self._launch,
             ep_guard=self._ep_guard,
         )
