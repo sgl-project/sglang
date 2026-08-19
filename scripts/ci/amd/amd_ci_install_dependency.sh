@@ -298,17 +298,7 @@ DOCKERFILE="docker/rocm.Dockerfile"
 GPU_ARCH="${GPU_ARCH:-mi30x}"
 echo "[CI-AITER-CHECK] Runner GPU_ARCH=${GPU_ARCH}"
 
-# ROCm 7.0 keeps the Triton its base image ships; later ROCm images run on the
-# Triton AITER pins, so a rebuilt AITER has to bring its own along.
-case "${IMAGE_HIP_VERSION}" in
-    7.0*) INSTALL_AITER_TRITON="false" ;;
-    7.*)  INSTALL_AITER_TRITON="true" ;;
-    *)
-        echo "[CI-AITER-CHECK] ERROR: Unsupported or empty HIP version: '${IMAGE_HIP_VERSION}'"
-        exit 1
-        ;;
-esac
-echo "[CI-AITER-CHECK] Container HIP=${IMAGE_HIP_VERSION}, install AITER's Triton on rebuild=${INSTALL_AITER_TRITON}"
+# Image owns Triton (pinned in docker/rocm.Dockerfile). Rebuild AITER against it.
 
 #############################################
 # 1. Extract AITER_COMMIT from the Dockerfile stage that built this image, as
@@ -392,16 +382,28 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
         pip install -r requirements.txt
     "
 
-    # The re-clone above discards the image's patched torch_utils.py, and this
-    # rebuild path is exactly when it is needed most (validating a new AITER
-    # commit), so re-apply the same patch the Dockerfile applies.
-    #
-    # 7.2* mirrors the Dockerfile's *-rocm720|*-rocm724 guard. The patch is
-    # required on the torch 2.11 of 7.2.4 and is a no-op on the torch 2.9.1 of
-    # 7.2.0, where torch.Stream already exists.
-    if [[ "${IMAGE_HIP_VERSION}" == 7.2* ]]; then
-        docker exec ci_sglang python3 \
-            /sglang-checkout/scripts/ci/amd/patch_aiter_torch_stream.py
+    # Re-apply the Dockerfile torch.Stream patch after re-clone (ROCm/aiter#4817).
+    if [[ "${IMAGE_STAGE_SUFFIX}" == "-rocm724" ]]; then
+        docker exec -i ci_sglang python3 - <<'PY'
+from pathlib import Path
+p = Path("/sgl-workspace/aiter/csrc/cpp_itfs/torch_utils.py")
+s = p.read_text()
+old = """        elif isinstance(arg, torch.cuda.Stream):
+            c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
+"""
+new = """        elif isinstance(arg, torch.Stream):
+            handle = getattr(arg, "cuda_stream", None)
+            if handle is None:
+                handle = torch.cuda.Stream(
+                    stream_id=arg.stream_id,
+                    device_index=arg.device_index,
+                    device_type=arg.device_type,
+                ).cuda_stream
+            c_args.append(ctypes.cast(handle, ctypes.c_void_p))
+"""
+if old in s:
+    p.write_text(s.replace(old, new))
+PY
     fi
 
     if [[ "${GPU_ARCH}" == "mi35x" ]]; then
@@ -411,52 +413,11 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     fi
     echo "[CI-AITER-CHECK] GPU_ARCH_LIST=${GPU_ARCH_LIST}"
 
-    # Run the installer here rather than letting setup.py do it: setup.py
-    # swallows its errors, and the AITER_USE_SYSTEM_TRITON=1 below then keeps
-    # whatever Triton is already installed. Doing it up front fails closed.
-    if [[ "${INSTALL_AITER_TRITON}" == "true" ]]; then
-        docker exec ci_sglang bash -c "
-            set -euo pipefail
-            cd /sgl-workspace/aiter
-            test -f .github/scripts/install_triton.sh
-            bash .github/scripts/install_triton.sh
-        "
-    fi
-    # build AITER against the Triton already in the image, whether that is the
-    # base image's or the one install_triton.sh just put there.
+    # The image already has the Dockerfile-pinned Triton; compile against it.
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
         AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
     "
-
-    if [[ "${INSTALL_AITER_TRITON}" == "true" ]]; then
-        # The installer above moved Triton out from under the image's copy, so
-        # re-point torch's recorded requirement the same way the Dockerfile does.
-        docker exec ci_sglang python3 \
-            /sglang-checkout/scripts/ci/amd/patch_torch_triton_requirement.py
-
-        docker exec -i ci_sglang python3 - <<'PY'
-import importlib.metadata as metadata
-import pathlib
-import re
-
-import triton
-
-triton_version = metadata.version("triton")
-
-installer = pathlib.Path(
-    "/sgl-workspace/aiter/.github/scripts/install_triton.sh"
-).read_text()
-expected = re.search(r'"triton==([^"]+)"', installer).group(1)
-assert triton_version.startswith(expected), (expected, triton_version)
-assert triton.__version__.startswith(expected), (expected, triton.__version__)
-assert "triton-custom" not in triton.__file__, triton.__file__
-print(
-    f"[CI-AITER-CHECK] Validated AITER Triton {triton_version} "
-    f"from {triton.__file__}"
-)
-PY
-    fi
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
 fi

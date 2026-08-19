@@ -8,7 +8,7 @@
 #
 # Flavor notes:
 #   GPU_ARCH=*-rocm724 is built on a Python 3.12 base and upgrades the stack to
-#   torch 2.11 (+torchvision 0.26 / torchaudio 2.11) and AITER-managed Triton.
+#   torch 2.11 (+torchvision 0.26 / torchaudio 2.11) and Triton 3.7.
 #   The ROCm 7.2.0 flavors remain on Python 3.10 and torch 2.9.1.
 
 # Usage (to build SGLang ROCm + Mori docker image):
@@ -62,7 +62,6 @@ ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # Base image 942 with rocm724 and args (Python 3.12 + torch 2.11)
 FROM $BASE_IMAGE_942_ROCM724 AS gfx942-rocm724
 ENV BUILD_VLLM="0"
-# Install AITER's pinned Triton after all other Python dependencies.
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
@@ -107,7 +106,6 @@ ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 # Base image 950 with rocm724 and args (Python 3.12 + torch 2.11)
 FROM $BASE_IMAGE_950_ROCM724 AS gfx950-rocm724
 ENV BUILD_VLLM="0"
-# See gfx942-rocm724: install AITER's pinned Triton last.
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
@@ -154,6 +152,14 @@ ARG BRANCH_TYPE=remote
 
 # Version override for setuptools_scm (used in nightly builds)
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
+
+# ROCm 7.2 Triton (BUILD_TRITON=1 stages only). Both wheels are the same
+# upstream revision, triton-lang/triton@89002410. AITER only requires
+# triton>=3.6.0 and treats the base image as the owner of the version, so the
+# choice is ours; bump these together after checking the index.
+ARG TRITON_INDEX_URL="https://pypi.amd.com/triton/release/rocm-7.2.0/simple/"
+ARG TRITON_VERSION="3.7.0+amd.rocm7.2.0.git89002410"
+ARG TRITON_KERNELS_VERSION="1.0.0+amd.rocm7.2.0.git89002410"
 
 # ROCm 7.2.4 torch upgrade pins (Python 3.12). Torch 2.11 for ROCm 7.2 is only
 # published on the PyTorch Foundation index; AMD's repo.radeon.com wheels top
@@ -307,10 +313,7 @@ RUN case "${GPU_ARCH}" in \
 
 # Populate the PIP_CONSTRAINT file, which only the rocm724 stages define, so that
 # resolving AITER and SGLang dependencies cannot replace the torch stack above.
-# Triton is deliberately left out, under every spelling: AITER installs its own
-# pinned wheel after all other Python dependencies, and pinning the triton-rocm
-# that step uninstalls would leave the shipped image constraining pip to a
-# distribution that is neither installed nor on PyPI.
+# Triton is left out: the BUILD_TRITON step installs it later.
 RUN case "${GPU_ARCH}" in \
       *-rocm724) \
         python3 -m pip freeze \
@@ -343,7 +346,7 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 # Compile AITER against the base image's Triton; the Triton step at the end of
-# this file swaps in AITER's own pin afterwards.
+# this file installs the pinned one afterwards.
 ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
 # Use `checkout -f` so the smudge-filter-induced "dirty" working tree from
@@ -370,6 +373,28 @@ RUN cd aiter \
           sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
         fi \
       && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc
+
+# torch 2.11 Dynamo may pass a base torch.Stream; drop after ROCm/aiter#4817.
+RUN python3 <<'PY'
+from pathlib import Path
+p = Path("/sgl-workspace/aiter/csrc/cpp_itfs/torch_utils.py")
+s = p.read_text()
+old = """        elif isinstance(arg, torch.cuda.Stream):
+            c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
+"""
+new = """        elif isinstance(arg, torch.Stream):
+            handle = getattr(arg, "cuda_stream", None)
+            if handle is None:
+                handle = torch.cuda.Stream(
+                    stream_id=arg.stream_id,
+                    device_index=arg.device_index,
+                    device_type=arg.device_type,
+                ).cuda_stream
+            c_args.append(ctypes.cast(handle, ctypes.c_void_p))
+"""
+if old in s:
+    p.write_text(s.replace(old, new))
+PY
 
 # -----------------------
 # Build Mooncake
@@ -454,18 +479,6 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
        else \
          export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[${all_extras}]"; \
        fi
-
-# AITER stream handling for torch.Stream (required on torch 2.11 / rocm724;
-# also applied to rocm720, where it is a no-op on torch 2.9.1). Runs here rather
-# than next to the AITER clone because it shares its logic with the CI installer
-# via a script from the sglang checkout, which only exists from this point on.
-# AITER is installed editable, so patching its source after the install still
-# takes effect.
-RUN case "${GPU_ARCH}" in \
-      *-rocm720|*-rocm724) \
-        python3 /sgl-workspace/sglang/scripts/ci/amd/patch_aiter_torch_stream.py \
-        ;; \
-    esac
 
 RUN python -m pip cache purge
 
@@ -782,38 +795,29 @@ RUN cd /tmp/whl \
         ;; \
     esac
 
-# -----------------------
-# Hot patch the transformers dynamic_module_utils symlink bug (v5.12.1); see the
-# script for the mechanism. In a script rather than a heredoc because a legacy
-# (non-BuildKit) builder drops heredoc bodies and still exits 0, silently
-# shipping an image whose patch never ran.
-RUN python3 /sgl-workspace/sglang/scripts/ci/amd/patch_transformers_dynamic_module.py
+# transformers 5.12.1: don't follow HF-cache symlinks when hashing custom modules
+# (transformers#46618, not yet released).
+RUN python3 -c "from pathlib import Path; import transformers.dynamic_module_utils as m; p=Path(m.__file__); t=p.read_text(); p.write_text(t.replace('Path(resolved_module_file).resolve()','Path(resolved_module_file)').replace('Path(source_file).resolve()','Path(source_file)'))"
 
 # -----------------------
-# Install the Triton AITER pins, replacing the base image's. No version check
-# on purpose: the pin is AITER's to move, and its installer enforces a floor.
+# Install AMD's ROCm Triton, replacing the base image's. The local version is
+# part of the pin: `==3.7.0` alone would accept any revision the index later
+# publishes under that number, and pip would choose between them by lexical
+# order of the git hash rather than by date.
 #
 # Keep this last. Base ROCm Torch pins triton==3.5.1 and the torch patch above
 # is what drops that pin, so installing Triton any earlier lets the next pip
 # install pull CUDA torch instead. The hip check below is the tripwire.
+# torch 2.11 names this `triton-rocm`; uninstall it so the pin is the only Triton.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
-        cd /sgl-workspace/aiter \
-     && test -f .github/scripts/install_triton.sh \
-     && PIP_NO_CACHE_DIR=1 bash .github/scripts/install_triton.sh \
+        pip uninstall -y triton-rocm || true \
+     && PIP_NO_CACHE_DIR=1 pip install --extra-index-url ${TRITON_INDEX_URL} \
+            "triton==${TRITON_VERSION}" "triton-kernels==${TRITON_KERNELS_VERSION}" \
      && python3 -c "import torch; from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); assert torch.version.hip is not None, torch.__version__; print(f'[Triton] ROCm Torch {torch.__version__}, Triton {v}, triton-kernels {k}')"; \
     fi
 
-# The installer above uninstalls the triton-rocm that torch 2.11 hard-requires,
-# so torch is left naming a distribution nothing provides. See the script for
-# why neither leaving triton-rocm installed nor leaving the metadata stale works.
-# Guarded because only rocm724's torch pins triton-rocm; the other flavors have
-# nothing here to repair, and their metadata is not this flavor's to rewrite.
-RUN case "${GPU_ARCH}" in *-rocm724) python3 /sgl-workspace/sglang/scripts/ci/amd/patch_torch_triton_requirement.py ;; esac
-
-# Validate the stack that actually ships, after the Triton swap above. See the
-# script for why it checks torch's own requirements instead of enforcing a
-# whole-environment `pip check` here.
-RUN case "${GPU_ARCH}" in *-rocm724) python3 /sgl-workspace/sglang/scripts/ci/amd/check_torch_rocm_stack.py ;; esac
+# torch 2.11 still Requires-Dist: triton-rocm after the swap above.
+RUN case "${GPU_ARCH}" in *-rocm724) python3 -c "import pathlib,re,importlib.metadata as m; p=pathlib.Path(m.distribution('torch')._path)/'METADATA'; v=m.version('triton'); t,n=re.subn(r'^Requires-Dist: (?:triton|triton-rocm)==[^ ;]+', 'Requires-Dist: triton=='+v, p.read_text(), count=1, flags=re.M); assert n==1, n; p.write_text(t)" ;; esac
 
 # -----------------------
 # Performance environment variable.
