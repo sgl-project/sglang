@@ -13,10 +13,9 @@ from sglang.srt.lora.moe.execution_plan import (
 )
 from sglang.srt.lora.moe.joint_routing import build_joint_shared_routes
 from sglang.srt.lora.moe.routing import (
-    ROUTE_ALIGNED,
-    ROUTE_RAW,
     FusedAlignScratch,
     RouteView,
+    RouteViewKind,
     build_virtual_expert_routing,
     uses_fused_align,
 )
@@ -106,7 +105,7 @@ def _aligned_pair_route(
         shared_outer_local_expert_count=num_local_experts if is_shared_outer else None,
         max_loras=max_loras,
         block_size=block_size,
-        view=ROUTE_ALIGNED,
+        view=RouteViewKind.ALIGNED,
         num_pairs_post_padded_out=padded_count,
         fused_align_scratch=scratch,
     )
@@ -138,7 +137,7 @@ def build_routes(
             lora_experts_per_adapter=num_local_experts,
             max_loras=max_loras,
             block_size=block_size,
-            view=ROUTE_RAW,
+            view=RouteViewKind.RAW,
         )
     if RouteRequirement.RAW_SHARED_OUTER in requirements:
         # One LoRA expert per adapter, with the local expert count restoring
@@ -150,11 +149,9 @@ def build_routes(
             shared_outer_local_expert_count=num_local_experts,
             max_loras=max_loras,
             block_size=block_size,
-            view=ROUTE_RAW,
+            view=RouteViewKind.RAW,
         )
 
-    need_per_expert = RouteRequirement.ALIGNED_PER_EXPERT in requirements
-    need_shared = RouteRequirement.ALIGNED_SHARED_OUTER in requirements
     if plan.route_builder is RouteBuilderFamily.JOINT_SHARED_OUTER:
         per_expert, shared = build_joint_shared_routes(
             topk_ids,
@@ -167,7 +164,7 @@ def build_routes(
         values["aligned_per_expert"] = per_expert
         values["aligned_shared_outer"] = shared
     else:
-        if need_per_expert:
+        if RouteRequirement.ALIGNED_PER_EXPERT in requirements:
             values["aligned_per_expert"] = _aligned_pair_route(
                 topk_ids,
                 token_slots,
@@ -178,7 +175,7 @@ def build_routes(
                 workspace=workspace,
                 scratch_prefix="route:aligned_per_expert",
             )
-        if need_shared:
+        if RouteRequirement.ALIGNED_SHARED_OUTER in requirements:
             values["aligned_shared_outer"] = _aligned_pair_route(
                 topk_ids,
                 token_slots,
