@@ -147,6 +147,7 @@ if _is_hip:
         from aiter.mla import mla_decode_fwd, mla_prefill_fwd  # noqa: F401
 
         from sglang.kernels.ops.attention.dsa.aiter_sparse_mla import (
+            PREFILL_NUM_KV_SPLITS,
             AiterSparseMLADecodeMetadata,
             aiter_sparse_mla_out_dtype,
             alloc_sparse_mla_decode_metadata,
@@ -830,6 +831,9 @@ class DeepseekSparseAttnBackend(
                 q_dtype=q_dtype,
                 kv_dtype=fp8_dtype,
                 device=self.device,
+                # A prefill chunk already has one row per token, so split-K
+                # only multiplies the planner's work; see the constant.
+                num_kv_splits=PREFILL_NUM_KV_SPLITS,
             )
             self.aiter_sparse_mla_extend_metadata = metadata
             self.aiter_sparse_mla_extend_plan_serial = -1

@@ -49,6 +49,8 @@ from aiter.mla import mla_decode_fwd
 from aiter.ops.attention import get_mla_metadata_info_v1, get_mla_metadata_v1
 
 __all__ = [
+    "DECODE_NUM_KV_SPLITS",
+    "PREFILL_NUM_KV_SPLITS",
     "AiterSparseMLADecodeMetadata",
     "aiter_sparse_mla_out_dtype",
     "alloc_sparse_mla_decode_metadata",
@@ -73,14 +75,31 @@ __all__ = [
 _FAST_MODE = True
 _IS_CAUSAL = True
 _KV_GRANULARITY = 16
-_MAX_SPLIT_PER_BATCH = 16
 _NHEAD_KV = 1
 # KV is packed one token per page for sparse decode.
 _PAGE_SIZE = 1
-# Passing an explicit num_kv_splits also pins aiter to persistent mode: its
-# non-persistent fallback cannot honor a top-k split scheme and would return
-# wrong results, so it never downgrades a caller that sets this.
-_NUM_KV_SPLITS = 16
+
+# Split-K factor. One number feeds both the planner
+# (``max_split_per_batch``) and the kernel (``num_kv_splits``); they are the
+# same quantity seen from two sides and must not drift apart, which is why it
+# is carried on the metadata object rather than passed at each call site.
+#
+# Never pass ``None``: an explicit value also pins aiter to persistent mode,
+# and its non-persistent fallback cannot honor a top-k split scheme -- it
+# would return wrong results rather than merely being slower.
+#
+# Decode: ATOM's tuned value. A decode batch is one row per request (order 64),
+# far short of the 256 CUs on MI355X, so splitting each request's KV range 16
+# ways is what fills the device.
+DECODE_NUM_KV_SPLITS = 16
+# Prefill: the opposite regime. Sparse prefill presents every query token as
+# its own length-1 sequence, so the planner's batch is the chunk's token count
+# (16384), which already oversubscribes the device by 64x. Splitting again
+# turns that into 262144 work items and costs far more in planning
+# (``kn_get_mla_metadata_v1_2``, measured 5.6 ms per call) and in the extra
+# reduce pass (``kn_mla_reduce_v1_ps``, 78 launches per step) than the split
+# can possibly win back.
+PREFILL_NUM_KV_SPLITS = 1
 
 
 def aiter_sparse_mla_out_dtype(q_dtype: torch.dtype) -> torch.dtype:
@@ -113,6 +132,9 @@ class AiterSparseMLADecodeMetadata:
     num_heads_padded: int
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
+    # Split-K factor these buffers were planned with; see the constants above.
+    # The kernel must be launched with the same value the planner used.
+    num_kv_splits: int = DECODE_NUM_KV_SPLITS
 
     def matches(
         self,
@@ -148,12 +170,20 @@ def alloc_sparse_mla_decode_metadata(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     device: torch.device,
+    num_kv_splits: int = DECODE_NUM_KV_SPLITS,
 ) -> AiterSparseMLADecodeMetadata:
     """Allocate the persistent work buffers for up to ``batch_size`` sequences.
 
     Call this once per backend (and again only if the batch capacity or a dtype
     changes), never inside CUDA graph capture: an allocation there would be
     baked into the graph.
+
+    ``num_kv_splits`` is recorded on the returned object and reused by both
+    :func:`build_sparse_mla_decode_metadata` and :func:`sparse_mla_decode`, so
+    the planner and the kernel cannot disagree. Prefill callers should pass
+    :data:`PREFILL_NUM_KV_SPLITS`. The buffer sizes below do not depend on it --
+    ``get_mla_metadata_info_v1`` returns a worst-case capacity -- so a smaller
+    split simply leaves part of the allocation unused.
     """
     sizes = get_mla_metadata_info_v1(
         batch_size,
@@ -186,6 +216,7 @@ def alloc_sparse_mla_decode_metadata(
         num_heads_padded=num_heads_padded,
         q_dtype=q_dtype,
         kv_dtype=kv_dtype,
+        num_kv_splits=num_kv_splits,
     )
 
 
@@ -220,7 +251,7 @@ def build_sparse_mla_decode_metadata(
         max_seqlen_qo=max_seqlen_q,
         uni_seqlen_qo=max_seqlen_q,
         fast_mode=_FAST_MODE,
-        max_split_per_batch=_MAX_SPLIT_PER_BATCH,
+        max_split_per_batch=metadata.num_kv_splits,
         dtype_q=metadata.q_dtype,
         dtype_kv=metadata.kv_dtype,
     )
@@ -269,7 +300,7 @@ def sparse_mla_decode(
         page_size=_PAGE_SIZE,
         nhead_kv=_NHEAD_KV,
         sm_scale=sm_scale,
-        num_kv_splits=_NUM_KV_SPLITS,
+        num_kv_splits=metadata.num_kv_splits,
         q_scale=q_scale,
         kv_scale=kv_scale,
         **metadata.kernel_kwargs(),
