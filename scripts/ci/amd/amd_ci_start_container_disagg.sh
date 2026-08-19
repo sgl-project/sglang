@@ -226,35 +226,6 @@ find_latest_image() {
   esac
 }
 
-# Pull and run the latest image
-IMAGE=$(find_latest_image "${GPU_ARCH}")
-pulled_from_mirror=0
-if [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
-  # Try the in-network mirror first: it avoids Docker Hub rate limits and is
-  # faster on the LAN. Capture stderr so the real failure reason (TLS handshake,
-  # 404, connection refused, etc.) is visible in the job log instead of being
-  # silently swallowed.
-  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
-    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
-    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
-    pulled_from_mirror=1
-  else
-    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
-    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
-  fi
-fi
-if (( pulled_from_mirror == 0 )); then
-  IMAGE_SOURCE="docker-hub"
-  retry_with_backoff 6 docker pull "${IMAGE}"
-else
-  IMAGE_SOURCE="registry-mirror"
-fi
-
-# One greppable line per job; see amd_ci_start_container.sh.
-echo "[amd-ci-setup] image=${IMAGE} source=${IMAGE_SOURCE}" \
-     "version_resolve=${VERSION_RESOLVE_SECONDS}s" \
-     "image_acquire=$(( SECONDS - VERSION_RESOLVE_SECONDS ))s"
-
 CACHE_HOST=/home/runner/sglang-data
 if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
   RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
@@ -285,6 +256,50 @@ case "${ENABLE_CACHE_HOST,,}" in
     exit 1
     ;;
 esac
+
+# shellcheck source=scripts/ci/amd/amd_ci_image_cache.sh
+source "$(dirname "${BASH_SOURCE[0]}")/amd_ci_image_cache.sh"
+if [[ -n "${CACHE_VOLUME}" ]]; then
+  image_cache_init "${CACHE_HOST}"
+else
+  image_cache_init ""
+fi
+
+# Pull and run the latest image
+IMAGE=$(find_latest_image "${GPU_ARCH}")
+pulled_from_mirror=0
+loaded_from_cache=0
+if image_cache_load "${IMAGE}"; then
+  loaded_from_cache=1
+  IMAGE_SOURCE="local-tarball"
+elif [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
+  # Try the in-network mirror first: it avoids Docker Hub rate limits and is
+  # faster on the LAN. Capture stderr so the real failure reason (TLS handshake,
+  # 404, connection refused, etc.) is visible in the job log instead of being
+  # silently swallowed.
+  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
+    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
+    pulled_from_mirror=1
+  else
+    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
+    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
+  fi
+fi
+if (( loaded_from_cache == 0 )); then
+  if (( pulled_from_mirror == 0 )); then
+    IMAGE_SOURCE="docker-hub"
+    retry_with_backoff 6 docker pull "${IMAGE}"
+  else
+    IMAGE_SOURCE="registry-mirror"
+  fi
+  image_cache_save "${IMAGE}"
+fi
+
+# One greppable line per job; see amd_ci_start_container.sh.
+echo "[amd-ci-setup] image=${IMAGE} source=${IMAGE_SOURCE}" \
+     "version_resolve=${VERSION_RESOLVE_SECONDS}s" \
+     "image_acquire=$(( SECONDS - VERSION_RESOLVE_SECONDS ))s"
 
 # Detect libionic library for RDMA support
 LIBIONIC_MOUNT=""

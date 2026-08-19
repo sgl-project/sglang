@@ -258,6 +258,47 @@ find_latest_image() {
   esac
 }
 
+CACHE_HOST=/home/runner/sglang-data
+if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
+  RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
+  RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"
+  if [[ "${RUNNER_NAME_LOWER}" == *300* || "${RUNNER_NAME_LOWER}" == *35x* ]]; then
+    ENABLE_CACHE_HOST="1"
+  else
+    ENABLE_CACHE_HOST="0"
+  fi
+fi
+case "${ENABLE_CACHE_HOST,,}" in
+  1|true|yes|on|pvc|persistent)
+    if [[ -d "$CACHE_HOST" ]]; then
+      CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
+      echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
+    else
+      CACHE_VOLUME=""
+      echo "Warning: ${CACHE_HOST} does not exist; using container-local /sgl-data." >&2
+    fi
+    ;;
+  0|false|no|off|"")
+    CACHE_VOLUME=""
+    echo "Not mounting ${CACHE_HOST}; /sgl-data will be container-local."
+    ;;
+  *)
+    echo "Error: unsupported ENABLE_CACHE_HOST='${ENABLE_CACHE_HOST}'" >&2
+    echo "Use 1/true/pvc/persistent or 0/false/off." >&2
+    exit 1
+    ;;
+esac
+
+# The image tarball cache lives on that same volume, so it has to be resolved
+# before the image is acquired rather than just before `docker run`.
+# shellcheck source=scripts/ci/amd/amd_ci_image_cache.sh
+source "$(dirname "${BASH_SOURCE[0]}")/amd_ci_image_cache.sh"
+if [[ -n "${CACHE_VOLUME}" ]]; then
+  image_cache_init "${CACHE_HOST}"
+else
+  image_cache_init ""
+fi
+
 # Determine which image to use
 IMAGE_SOURCE="unknown"
 if [[ -n "${CUSTOM_IMAGE}" ]]; then
@@ -301,7 +342,13 @@ else
   # Find the latest pre-built image
   IMAGE=$(find_latest_image "${GPU_ARCH}")
   pulled_from_mirror=0
-  if [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
+  loaded_from_cache=0
+  # Cheapest source first: a tarball on the persistent volume, seeded by
+  # whichever job missed before this one.
+  if image_cache_load "${IMAGE}"; then
+    loaded_from_cache=1
+    IMAGE_SOURCE="local-tarball"
+  elif [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
     # Try the in-network mirror first: it avoids Docker Hub rate limits and is
     # faster on the LAN. Capture stderr so the real failure reason (TLS
     # handshake, 404, connection refused, etc.) is visible in the job log
@@ -315,50 +362,23 @@ else
       printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
     fi
   fi
-  if (( pulled_from_mirror == 0 )); then
-    IMAGE_SOURCE="docker-hub"
-    retry_with_backoff 6 docker pull "${IMAGE}"
-  else
-    IMAGE_SOURCE="registry-mirror"
+  if (( loaded_from_cache == 0 )); then
+    if (( pulled_from_mirror == 0 )); then
+      IMAGE_SOURCE="docker-hub"
+      retry_with_backoff 6 docker pull "${IMAGE}"
+    else
+      IMAGE_SOURCE="registry-mirror"
+    fi
+    # Whatever this job had to fetch, the next one on this volume should not.
+    image_cache_save "${IMAGE}"
   fi
 fi
 
 # One greppable line per job so the nightly dashboard can track where setup time
-# goes and how often the mirror is actually serving the image.
+# goes and which source is actually serving the image.
 echo "[amd-ci-setup] image=${IMAGE} source=${IMAGE_SOURCE}" \
      "version_resolve=${VERSION_RESOLVE_SECONDS}s" \
      "image_acquire=$(( SECONDS - VERSION_RESOLVE_SECONDS ))s"
-
-CACHE_HOST=/home/runner/sglang-data
-if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
-  RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
-  RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"
-  if [[ "${RUNNER_NAME_LOWER}" == *300* || "${RUNNER_NAME_LOWER}" == *35x* ]]; then
-    ENABLE_CACHE_HOST="1"
-  else
-    ENABLE_CACHE_HOST="0"
-  fi
-fi
-case "${ENABLE_CACHE_HOST,,}" in
-  1|true|yes|on|pvc|persistent)
-    if [[ -d "$CACHE_HOST" ]]; then
-      CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
-      echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
-    else
-      CACHE_VOLUME=""
-      echo "Warning: ${CACHE_HOST} does not exist; using container-local /sgl-data." >&2
-    fi
-    ;;
-  0|false|no|off|"")
-    CACHE_VOLUME=""
-    echo "Not mounting ${CACHE_HOST}; /sgl-data will be container-local."
-    ;;
-  *)
-    echo "Error: unsupported ENABLE_CACHE_HOST='${ENABLE_CACHE_HOST}'" >&2
-    echo "Use 1/true/pvc/persistent or 0/false/off." >&2
-    exit 1
-    ;;
-esac
 
 echo "Launching container: ci_sglang"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
