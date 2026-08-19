@@ -26,16 +26,17 @@ from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.runtime_context import get_parallel
 
 try:
-    import nixl_ep
     from nixl_ep import Buffer
 
     use_nixl = True
 except ImportError:
     use_nixl = False
 
-NIXL_EP_TOPK_INDICES_DTYPE = (
-    getattr(nixl_ep, "topk_idx_t", torch.int64) if use_nixl else torch.int64
-)
+try:
+    from nixl_ep import topk_idx_t as NIXL_EP_TOPK_INDICES_DTYPE
+except ImportError:
+    NIXL_EP_TOPK_INDICES_DTYPE = torch.int64
+
 assert isinstance(NIXL_EP_TOPK_INDICES_DTYPE, torch.dtype)
 
 logger = logging.getLogger(__name__)
