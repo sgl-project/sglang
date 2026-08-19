@@ -17,7 +17,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _simulate_transpose_scale_emit(values: torch.Tensor) -> torch.Tensor:
-    """Model the tensor a quant kernel returns when called with
+    """Model the scale a quant kernel returns when called with
     ``transpose_scale=True``: the per-group scale is written directly in
     column-major (``[num_groups, tokens]``) byte order, exposed as a ``[M, G]``
     tensor. We reproduce that by laying the column-major bytes into contiguous
@@ -117,25 +117,29 @@ class TestBpreshuffleScaleMaterialization(CustomTestCase):
         self.assertEqual(scale_out.stride(), (1, scale.shape[0]))
 
 
-class TestBpreshuffleScaleNoCopy(CustomTestCase):
-    """The producer sites emit the scale with ``transpose_scale=True`` and then
-    reinterpret its strides instead of relaying it out with a copy. These pin the
-    contract that the zero-copy reinterpret is bit-identical to the materialize
-    (``.t().contiguous().t()``) path while sharing the producer's storage."""
+class TestBpreshuffleScaleFreshQuantNoCopy(CustomTestCase):
+    """The dense w8a8 fresh-quant path asks the quant kernel for the scale in
+    bpreshuffle byte-order (``transpose_scale=True``) and reinterprets its strides
+    via ``view_aiter_fused_rms_transposed_fp8_scale`` (the shared #31727 helper)
+    instead of relaying it out with ``materialize_bpreshuffle_fp8_scale`` (a
+    ``.t().contiguous().t()`` copy). These pin the PR's core claim: the reinterpret
+    is bit-identical to the copy path for M>=2, and allocates nothing. The real
+    quant/GEMM equivalence is validated on gfx95 in
+    ``test_fp8_bpreshuffle_dense_linear_mi35x.py``."""
 
-    def test_nocopy_matches_materialized_layout(self):
+    def test_nocopy_matches_materialize(self):
         for m, g in ((3, 4), (2, 2), (8, 5), (16, 128)):
             with self.subTest(m=m, g=g):
                 values = torch.arange(m * g, dtype=torch.float32).reshape(m, g)
                 emitted = _simulate_transpose_scale_emit(values)
 
                 nocopy = view_aiter_fused_rms_transposed_fp8_scale(emitted)
-                # Row-major producer path (transpose_scale=False + materialize).
                 materialized = materialize_bpreshuffle_fp8_scale(values)
 
                 self.assertTrue(torch.equal(nocopy, materialized))
                 self.assertEqual(nocopy.shape, values.shape)
                 self.assertEqual(nocopy.stride(), (1, m))
+                self.assertEqual(nocopy.stride(), materialized.stride())
                 self.assertTrue(nocopy.t().is_contiguous())
 
     def test_nocopy_shares_storage_no_allocation(self):
@@ -144,11 +148,41 @@ class TestBpreshuffleScaleNoCopy(CustomTestCase):
 
         nocopy = view_aiter_fused_rms_transposed_fp8_scale(emitted)
 
-        # The whole point of the optimization: reinterpret, do not copy.
+        # The reinterpret is a view over the producer's buffer -- no new storage.
         self.assertEqual(nocopy.data_ptr(), emitted.data_ptr())
-        # ...whereas the materialize path it replaces does allocate.
+        # ...unlike the materialize path it replaces.
         materialized = materialize_bpreshuffle_fp8_scale(values)
         self.assertNotEqual(materialized.data_ptr(), values.data_ptr())
+
+    def test_m1_uses_materialize_path_values_and_layout(self):
+        """Production gates the no-copy emit on ``input_2d.shape[0] >= 2``
+        (`emit_bpreshuffle_scale`), so a single row (M == 1) keeps the materialize
+        path. At M == 1 the ``[1, G]`` row-major and ``[G, 1]`` column-major byte
+        orders coincide, so ``materialize_bpreshuffle_fp8_scale`` is a no-op: the
+        ``[G, 1]`` transpose is already contiguous for the singleton dim, so
+        ``.contiguous()`` copies nothing and the result keeps the natural
+        ``(G, 1)`` stride (NOT the ``(1, M)`` column-major stride it produces for
+        M >= 2) while sharing the input's storage. Values must survive intact; the
+        downstream bpreshuffle GEMM consumes the same bytes either way. The actual
+        M==1 gating through aiter_w8a8_block_fp8_linear is exercised on gfx95 in
+        test_fp8_bpreshuffle_dense_linear_mi35x.py."""
+        scale = torch.arange(4, dtype=torch.float32).reshape(1, 4)  # [M=1, G=4]
+
+        materialized = materialize_bpreshuffle_fp8_scale(scale)
+
+        self.assertTrue(torch.equal(materialized, scale))
+        self.assertEqual(materialized.shape, (1, 4))
+        self.assertEqual(materialized.stride(), (scale.shape[1], 1))  # (G, 1)
+        self.assertEqual(materialized.data_ptr(), scale.data_ptr())  # no-op share
+        self.assertTrue(materialized.t().is_contiguous())
+
+
+class TestBpreshuffleScaleProducerNoCopy(CustomTestCase):
+    """Producer-site (MoE down, MLA o_proj bmm) coverage for the shared no-copy
+    reinterpret that isn't exercised by the dense fresh-quant class above: the
+    guard that leaves non-2D scales untouched, and the tuple wrapper the producers
+    emit through (``view_aiter_fused_rms_transposed_fp8_scale_tuple``), which must
+    reinterpret only the scale slot and pass the rest through by identity."""
 
     def test_nocopy_passthrough_for_non_2d_scale(self):
         for scale in (
@@ -201,26 +235,6 @@ class TestEmitTransposedBpreshuffleScaleGate(CustomTestCase):
                 self.assertTrue(
                     emit_transposed_bpreshuffle_scale(m, on_bpreshuffle_gfx95=True)
                 )
-
-    def test_m1_materialize_path_produces_correct_values_and_layout(self):
-        # The path M == 1 actually takes: transpose_scale=False output relaid out
-        # by materialize. At M == 1 the [1, G] row-major and [G, 1] column-major
-        # byte orders coincide, so materialize (scale.t().contiguous().t()) is a
-        # no-op: the [G, 1] transpose is already contiguous for the singleton
-        # dimension, so the result keeps the natural (G, 1) stride -- NOT the
-        # (1, M) column-major stride materialize produces for M >= 2 -- and shares
-        # the input's storage. Values must survive; the downstream bpreshuffle GEMM
-        # consumes the same bytes either way.
-        self.assertFalse(
-            emit_transposed_bpreshuffle_scale(1, on_bpreshuffle_gfx95=True)
-        )
-        scale = torch.arange(4, dtype=torch.float32).reshape(1, 4)  # [M=1, G=4]
-        materialized = materialize_bpreshuffle_fp8_scale(scale)
-        self.assertTrue(torch.equal(materialized, scale))
-        self.assertEqual(materialized.shape, (1, 4))
-        self.assertEqual(materialized.stride(), (scale.shape[1], 1))  # (G, 1)
-        self.assertEqual(materialized.data_ptr(), scale.data_ptr())  # no-op share
-        self.assertTrue(materialized.t().is_contiguous())
 
 
 if __name__ == "__main__":

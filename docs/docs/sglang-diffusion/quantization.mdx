@@ -80,6 +80,14 @@ backend.
       <td>MXFP4 requires ROCm and MI350+ (gfx95x). Weights quantized at load time, activations quantized to <code>fp8</code> / <code>mxfp4</code> dynamically.</td>
     </tr>
     <tr>
+      <td><code>kitchen_int8</code> (online quantization)</td>
+      <td>Unquantized BF16/FP16 checkpoint</td>
+      <td><code>--quantization kitchen_int8</code></td>
+      <td>MiniMax-H3 (validated on 1× RTX 4090 24 GB)</td>
+      <td><code>comfy-kitchen</code></td>
+      <td>Data-free INT8 ConvRot at load time via <code>comfy_kitchen.int8_linear</code>. Layers whose input dim is not divisible by the group size stay in BF16. Requires Turing+ (SM75).</td>
+    </tr>
+    <tr>
       <td><code>fp8</code> (offline quantization)</td>
       <td>Quantized transformer component folder, or safetensors with <code>quantization_config</code> metadata</td>
       <td><code>--transformer-path</code> or <code>--transformer-weights-path</code></td>
@@ -259,6 +267,50 @@ sglang generate \
   --save-output
 ```
 **Note:** Requires `aiter` package with MXFP4 kernel support
+
+### Kitchen INT8 Online Quantization
+
+`kitchen_int8` quantizes DiT linear weights online from the stock BF16
+checkpoint. Forward uses the fused `comfy_kitchen.int8_linear` op (rotation,
+dynamic per-row activation quantization, INT8 GEMM, dequant, and bias).
+Install the optional dependency first:
+
+```bash
+pip install comfy-kitchen
+```
+
+```bash
+sglang generate \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --quantization kitchen_int8 \
+  --attention-backend fa \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder \
+  --dit-offload-prefetch-size 1 \
+  --dit-layerwise-resident-layers 0 \
+  --enable-torch-compile false \
+  --prompt "A cat walking on a sunny beach, gentle waves." \
+  --save-output
+```
+
+Quantization runs after the model's weight loaders, so MiniMax-H3's grouped
+`qkv` reorder is already applied. Layers whose input dim is not divisible by
+the group size (256) stay in BF16 instead of failing the load; H3's AdaLN
+projections take that path.
+
+<Warning>
+`kitchen_int8` is approximate and is not a consistency ground-truth mode.
+The BF16 path is unchanged when `comfy-kitchen` is not installed. See the
+[MiniMax-H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#7-runtime-feature-recipes)
+for the 24 GB offload recipe, including why `vae` must stay out of
+`--layerwise-offload-components`.
+</Warning>
+
+Large-M GEMMs (`rows > 8192` and `out_features >= 8192`) are split by rows so
+the fused kernel stays on the data-parallel CUTLASS config. Override the
+thresholds with `SGLANG_KITCHEN_INT8_MAX_ROWS` and
+`SGLANG_KITCHEN_INT8_MIN_SPLIT_N`.
 
 ### Skipping Layers
 
