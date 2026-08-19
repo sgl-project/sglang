@@ -94,13 +94,6 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
-                # NPU: Barrier to prevent TP rank desync. NPU's isend is
-                # effectively blocking, so different TP ranks spend different
-                # time in P2P ops. Without this barrier, fast ranks advance to
-                # the next mb_id's collective ops while slow ranks are still in
-                # the current mb_id's P2P, causing collective op mismatch.
-                if is_npu():
-                    torch.distributed.barrier(self.tp_cpu_group)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -109,10 +102,7 @@ class SchedulerPPMixin:
                     recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
                 if not self.pp_group.is_last_rank:
-                    if not is_npu():
-                        self._pp_commit_comm_work(self.send_req_work)
-                    else:
-                        self.pending_send_req_work = self.send_req_work
+                    self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
                             recv_reqs,
@@ -156,13 +146,6 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                # NPU: commit pending send_reqs AFTER output recv to avoid
-                # circular dependency: PP1 output_send blocks waiting for
-                # PP0 output_recv, but PP0 can't reach output_recv because
-                # commit send_reqs blocks waiting for PP1 recv_reqs.
-                if not self.pp_group.is_last_rank and is_npu():
-                    self._pp_commit_comm_work(self.pending_send_req_work)
-                    self.pending_send_req_work = []
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
@@ -184,16 +167,6 @@ class SchedulerPPMixin:
                                 async_send=True,
                                 msg_type="proxy",
                             )
-
-                # NPU last rank: deferred output send (after proxy send to
-                # avoid blocking the proxy channel with output isend).
-                if is_npu() and self.pp_group.is_last_rank:
-                    self.send_output_work = self._pp_send_output_to_next_stage(
-                        next_first_rank_mb_id,
-                        self.mbs,
-                        self.last_rank_comm_queue,
-                        self.pp_outputs,
-                    )
 
                 self.pp_outputs = next_pp_outputs
 
@@ -255,8 +228,6 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
-                if is_npu():
-                    torch.distributed.barrier(self.tp_cpu_group)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -410,8 +381,6 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
-                if is_npu():
-                    torch.distributed.barrier(self.tp_cpu_group)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -606,7 +575,6 @@ class SchedulerPPMixin:
         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
 
         self.send_req_work = []
-        self.pending_send_req_work = []
         self.send_proxy_work = []
         self.send_output_work = []
         self.launch_event = None
@@ -1259,6 +1227,20 @@ class SchedulerPPMixin:
         batch_result = None
         send_output_work = []
 
+        # On NPU (HCCL), isend/irecv may block until a matching peer op is
+        # posted, so the parity-based send-first/recv-first ordering used
+        # for XPU is replaced by batch_isend_irecv which submits all
+        # send/recv operations atomically.
+        if is_npu():
+            return self._pp_send_recv_output_tensors_npu(
+                next_first_rank_mb_id,
+                next_mb_id,
+                mbs,
+                mb_metadata,
+                last_rank_comm_queue,
+                pp_outputs,
+            )
+
         # On CUDA, isend is async: it enqueues to the stream and returns,
         # so every rank can send first safely. On some backends isend is
         # effectively blocking and does not return until the peer posts a
@@ -1269,17 +1251,8 @@ class SchedulerPPMixin:
         # same time.
 
         # CUDA: send first
-        # XPU/NPU: even ranks send first, odd ranks recv first.
-        send_first = (not (is_xpu() or is_npu())) or ((self.ps.pp_rank % 2) == 0)
-
-        # NPU last rank: defer the output send to after proxy send.
-        # NPU's isend blocks until a matching recv is posted. If the last
-        # rank sends output (to rank 0) before sending proxy (to next stage),
-        # the blocking isend stalls the pipeline: rank 0 is waiting for
-        # proxy from the last rank, but the last rank is blocked in output
-        # send waiting for rank 0 to post a recv. Deferring the output send
-        # to after proxy send breaks this circular dependency.
-        defer_output_send = is_npu() and self.pp_group.is_last_rank
+        # XPU: even ranks send first, odd ranks recv first.
+        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
@@ -1309,15 +1282,123 @@ class SchedulerPPMixin:
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
 
-        if defer_output_send:
-            # NPU last rank: only recv here, send is deferred
-            _do_recv()
-        elif send_first:
+        if send_first:
             send_output_work = _do_send()
             _do_recv()
         else:
             _do_recv()
             send_output_work = _do_send()
+
+        return next_pp_outputs, batch_result, d2h_event, send_output_work
+
+    def _pp_send_recv_output_tensors_npu(
+        self: Scheduler,
+        next_first_rank_mb_id: int,
+        next_mb_id: int,
+        mbs: List[ScheduleBatch],
+        mb_metadata: List[PPBatchMetadata],
+        last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]],
+        pp_outputs: PPProxyTensors | None,
+    ) -> Tuple[
+        Optional[PPProxyTensors],
+        Optional[GenerationBatchResult],
+        Optional[torch.Event],
+        List[P2PWork],
+    ]:
+        """NPU-specific output tensor send/recv using batch_isend_irecv.
+
+        Pairs the send of output tensors to the next stage with the recv
+        of output tensors from the previous stage in a single
+        ``batch_isend_irecv`` call, avoiding the deadlock that can occur
+        on HCCL when separate isend/irecv calls block waiting for each
+        other.
+        """
+        next_pp_outputs = None
+        d2h_event = None
+        batch_result = None
+        send_output_work = []
+
+        all_gather_group = (
+            self.attn_tp_group if self.require_attn_tp_allgather else None
+        )
+
+        # ---- Prepare send dict ----
+        send_dict: Optional[Dict[str, torch.Tensor]] = None
+        if self.pp_group.is_last_rank:
+            target_send = mbs[next_first_rank_mb_id]
+            if target_send is not None:
+                q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
+                if (
+                    not target_send.forward_mode.is_prebuilt()
+                    and not _pp_can_skip_output_comm(target_send)
+                ):
+                    self.device_module.current_stream().wait_event(q_event)
+                    send_dict = dict(pp_outputs_to_send.tensors)
+                    send_dict["__msg_type__"] = "output"
+        elif pp_outputs:
+            send_dict = dict(pp_outputs.tensors)
+            send_dict["__msg_type__"] = "output"
+
+        # ---- Determine recv conditions ----
+        target_recv = mbs[next_mb_id]
+        should_recv = (
+            target_recv is not None
+            and not target_recv.forward_mode.is_prebuilt()
+        )
+        skip_recv = should_recv and _pp_can_skip_output_comm(target_recv)
+
+        # ---- Execute communication ----
+        if send_dict is not None and should_recv and not skip_recv:
+            # Paired send + recv via batch_isend_irecv
+            with torch.profiler.record_function("send_recv_res_dict"):
+                recv_dict = self.pp_group.send_recv_tensor_dict(
+                    send_tensor_dict=send_dict,
+                    send_all_gather_group=all_gather_group,
+                    recv_all_gather_group=all_gather_group,
+                )
+            next_pp_outputs = PPProxyTensors(recv_dict)
+            with self.copy_stream_ctx:
+                self.copy_stream.wait_stream(self.schedule_stream)
+                batch_result = self._pp_prep_batch_result(
+                    target_recv, mb_metadata[next_mb_id], next_pp_outputs
+                )
+                d2h_event = self.device_module.Event()
+                d2h_event.record(self.device_module.current_stream())
+        elif send_dict is not None:
+            # Send only (recv is skipped or not needed)
+            send_output_work = self._pp_send_dict_to_next_stage(
+                send_dict, async_send=True, msg_type="output"
+            )
+            if skip_recv:
+                next_pp_outputs, batch_result, d2h_event = (
+                    self._pp_make_skip_output_result(
+                        target_recv, mb_metadata[next_mb_id]
+                    )
+                )
+        elif should_recv:
+            # Recv only (no send needed)
+            if skip_recv:
+                next_pp_outputs, batch_result, d2h_event = (
+                    self._pp_make_skip_output_result(
+                        target_recv, mb_metadata[next_mb_id]
+                    )
+                )
+            else:
+                with torch.profiler.record_function(
+                    "recv_res_dict_from_prev_stage"
+                ):
+                    next_pp_outputs = PPProxyTensors(
+                        self._pp_recv_dict_from_prev_stage()
+                    )
+                with self.copy_stream_ctx:
+                    self.copy_stream.wait_stream(self.schedule_stream)
+                    batch_result = self._pp_prep_batch_result(
+                        target_recv,
+                        mb_metadata[next_mb_id],
+                        next_pp_outputs,
+                    )
+                    d2h_event = self.device_module.Event()
+                    d2h_event.record(self.device_module.current_stream())
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 

@@ -254,8 +254,6 @@ _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
 )
 
-SHARED_EXPERTS = None
-ALT_STREAM = None
 
 def _get_shared_expert_fp8_block_size(
     gate_up_quant_method: Any, down_quant_method: Any
@@ -1280,23 +1278,18 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
             if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
                 if self.alt_stream is not None:
-                    global SHARED_EXPERTS
-                    global ALT_STREAM
-                    if SHARED_EXPERTS is None:
-                        SHARED_EXPERTS = self.shared_experts
-                        ALT_STREAM = self.alt_stream
-                    # self.alt_stream.wait_stream(torch.cuda.current_stream())
-                    # with torch.cuda.stream(self.alt_stream):
-                    #     shared_output = self._forward_shared_experts(hidden_states)
-                    #     shared_output.record_stream(self.alt_stream)
-                    #     shared_event = self.alt_stream.record_event()
-                    # if is_in_breakable_cuda_graph():
-                    #     # The MoE call below is an eager break, so record
-                    #     # and wait must share one capture; joining here means
-                    #     # the shared experts overlap nothing. The alt stream
-                    #     # is kept for record_stream: without that marking the
-                    #     # allocator recycles shared_output across the break.
-                    #     torch.cuda.current_stream().wait_event(shared_event)
+                    self.alt_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self.alt_stream):
+                        shared_output = self._forward_shared_experts(hidden_states)
+                        shared_output.record_stream(self.alt_stream)
+                        shared_event = self.alt_stream.record_event()
+                    if is_in_breakable_cuda_graph():
+                        # The MoE call below is an eager break, so record
+                        # and wait must share one capture; joining here means
+                        # the shared experts overlap nothing. The alt stream
+                        # is kept for record_stream: without that marking the
+                        # allocator recycles shared_output across the break.
+                        torch.cuda.current_stream().wait_event(shared_event)
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
             topk_kwargs = (
@@ -1475,14 +1468,14 @@ class DeepseekV2MoE(nn.Module):
             topk_output=topk_output,
         )
 
-        # if (
-        #     hidden_states.shape[0] > 0
-        #     and not sbo_enabled_flag
-        #     and self.num_fused_shared_experts == 0
-        #     and self.alt_stream is not None
-        #     and not is_in_breakable_cuda_graph()
-        # ):
-        #     torch.cuda.current_stream().wait_event(shared_event)
+        if (
+            hidden_states.shape[0] > 0
+            and not sbo_enabled_flag
+            and self.num_fused_shared_experts == 0
+            and self.alt_stream is not None
+            and not is_in_breakable_cuda_graph()
+        ):
+            torch.cuda.current_stream().wait_event(shared_event)
 
         if shared_output is not None:
             x = shared_output
