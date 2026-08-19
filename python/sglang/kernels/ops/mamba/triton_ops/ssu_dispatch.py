@@ -625,9 +625,7 @@ class FlashInferSSUBackend(MambaSSUBackend):
                 else None
             ),
             checkpoint_state_slots=(
-                checkpoint_state_slots
-                if direct_checkpoint_states is not None
-                else None
+                checkpoint_state_slots if direct_checkpoint_states is not None else None
             ),
             checkpoint_states=direct_checkpoint_states,
             out=None,

@@ -41,6 +41,7 @@ def test_insert_compact_checkpoint_inside_physical_chunk():
         offsets, torch.tensor([0, 72, 0, 72, 0], dtype=torch.int32)
     )
 
+
 if is_hip():
     os.environ["AMDGCN_USE_BUFFER_OPS"] = "0"
 
