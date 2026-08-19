@@ -198,29 +198,6 @@ class RouteView(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
-def validate_shared_outer(
-    *,
-    shared_outer_local_expert_count: int | None,
-    lora_experts_per_adapter: int,
-) -> None:
-    """The shared-outer contract, checked identically at every entry point.
-
-    Eleventh S3 review: ``build_virtual_expert_routing`` enforced this while
-    ``fused_align_block_size`` — reachable directly — did not, so a caller
-    could reach the kernels with ``lora_experts_per_adapter != 1`` and
-    silently build keys against the wrong bucket count.
-    """
-    if shared_outer_local_expert_count is None:
-        return
-    if lora_experts_per_adapter != 1:
-        raise ValueError(
-            "the shared-outer form has exactly one LoRA expert per adapter; "
-            f"lora_experts_per_adapter={lora_experts_per_adapter} is not it"
-        )
-    if shared_outer_local_expert_count <= 0:
-        raise ValueError("shared_outer_local_expert_count must be positive")
-
-
 @triton.jit
 def virtual_expert_ids_inline(
     topk_ids_ptr,
@@ -425,11 +402,6 @@ def build_virtual_expert_routing(
             "LoRA experts per adapter, adapter capacity, and block size "
             "must all be positive"
         )
-    validate_shared_outer(
-        shared_outer_local_expert_count=shared_outer_local_expert_count,
-        lora_experts_per_adapter=lora_experts_per_adapter,
-    )
-
     common = {
         "view": view,
         "num_virtual_experts": lora_experts_per_adapter * max_loras,

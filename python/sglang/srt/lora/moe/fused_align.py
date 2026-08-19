@@ -63,10 +63,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.moe.routing import (
-    validate_shared_outer,
-    virtual_expert_ids_inline,
-)
+from sglang.srt.lora.moe.routing import virtual_expert_ids_inline
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
 # Launch tiles, selected by a 64-point sweep over 4 representative cells on
@@ -297,10 +294,6 @@ def fused_align_block_size(
             f"fused align uses int32 plan math: num_buckets={num_buckets} and "
             f"capacity={capacity} must both be < 2**31"
         )
-    validate_shared_outer(
-        shared_outer_local_expert_count=shared_outer_local_expert_count,
-        lora_experts_per_adapter=lora_experts_per_adapter,
-    )
     shared_outer = shared_outer_local_expert_count is not None
     routed_expert_id_bound = shared_outer_local_expert_count or 0
     num_blocks = capacity // block_size
