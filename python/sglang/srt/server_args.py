@@ -4154,19 +4154,25 @@ class ServerArgs:
             )
             self.flashinfer_allreduce_fusion_backend = "auto"
         self.enable_flashinfer_allreduce_fusion = False
-        # Deprecated attention-backend alias: "compressed" -> "dsv4".
+        # Deprecated attention-backend aliases: "compressed" -> "dsv4",
+        # "nsa" -> "dsa".
+        deprecated_attention_backends = {"compressed": "dsv4", "nsa": "dsa"}
         for attr in (
             "attention_backend",
             "decode_attention_backend",
             "prefill_attention_backend",
             "speculative_draft_attention_backend",
         ):
-            if getattr(self, attr, None) == "compressed":
+            alias = getattr(self, attr, None)
+            canonical = deprecated_attention_backends.get(alias)
+            if canonical is not None:
                 logger.warning(
-                    "--%s=compressed is deprecated; use 'dsv4' instead.",
+                    "--%s=%s is deprecated; use '%s' instead.",
                     attr.replace("_", "-"),
+                    alias,
+                    canonical,
                 )
-                setattr(self, attr, "dsv4")
+                setattr(self, attr, canonical)
 
         # --grpc-mode is a deprecated alias for --smg-grpc-mode.
         if self.grpc_mode and not self.smg_grpc_mode:

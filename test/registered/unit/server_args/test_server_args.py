@@ -885,6 +885,23 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
         self.assertEqual(server_args.prefill_cp_mode, "round-robin-split")
 
+    def test_nsa_attention_backend_alias_normalizes_to_dsa(self):
+        args = ServerArgs(model_path="dummy", attention_backend="nsa")
+
+        args._handle_deprecated_args()
+
+        self.assertEqual(args.attention_backend, "dsa")
+
+        server_args = self._new_cp_args(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            attention_backend=args.attention_backend,
+        )
+        server_args._handle_legacy_cp_arguments()
+
+        self.assertTrue(server_args.enable_dsa_prefill_context_parallel)
+        self.assertFalse(server_args.enable_prefill_context_parallel)
+
     def test_context_parallel_handler_initializes_cp_strategy(self):
         server_args = self._new_cp_args(
             enable_prefill_cp=True,
