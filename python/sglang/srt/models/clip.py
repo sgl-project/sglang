@@ -2,7 +2,7 @@
 # https://github.com/huggingface/transformers/blob/af9b2eaa54c150741f298d6db939af6328e1dc38/src/transformers/models/clip/modeling_clip.py
 
 from functools import partial
-from typing import Iterable, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -19,10 +19,12 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MultimodalInputs
-from sglang.srt.model_executor.model_runner import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, flatten_nested_list
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.model_runner import ForwardBatch
 
 
 def prepare_clip_attention_mask(
@@ -556,7 +558,7 @@ class CLIPModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        forward_batch: ForwardBatch,
+        forward_batch: "ForwardBatch",
         get_embedding: bool = True,
     ):
         assert get_embedding, "CLIPEmbeddingModel is only used for embedding"
