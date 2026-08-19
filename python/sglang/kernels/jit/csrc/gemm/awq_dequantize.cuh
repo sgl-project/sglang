@@ -6,6 +6,8 @@
 
 #include <sgl_kernel/utils.cuh>
 
+namespace sglang {
+
 namespace device::awq {
 
 template <int lut>
@@ -225,3 +227,5 @@ void awq_dequantize(
       static_cast<int>(qweight_cols),
       static_cast<int>(qweight_rows));
 }
+
+}  // namespace sglang

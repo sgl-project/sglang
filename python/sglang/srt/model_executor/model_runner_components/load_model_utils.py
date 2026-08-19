@@ -59,6 +59,7 @@ class LoadedModel(msgspec.Struct, frozen=True, kw_only=True):
     loader: Any
     model: Any
     remote_instance_weight_info: Optional[Any]
+    startup_weight_load: Optional[Any] = None
 
 
 def maybe_downgrade_dtype_for_legacy_gpu(
@@ -68,21 +69,24 @@ def maybe_downgrade_dtype_for_legacy_gpu(
         logger.info(
             "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
         )
-        from sglang.srt.arg_groups.overrides import declare_load_time_override
+        from sglang.srt.runtime_context import get_context
 
-        declare_load_time_override(
-            "ModelRunner._sm80_dtype_fallback", {"dtype": "float16"}
-        )
+        # Device-driven, so every runner in the process resolves the same way;
+        # the per-runner truth is model_config.dtype, this is the record.
+        get_context().override("ModelRunner._sm80_dtype_fallback", dtype="float16")
         model_config.dtype = torch.float16
         if torch.cuda.get_device_capability()[1] < 5:
             raise RuntimeError("SGLang only supports sm75 and above.")
 
 
 def maybe_trigger_remote_instance_nccl_send_group(
-    *, server_args: ServerArgs, tp_rank: int
+    *, server_args: ServerArgs, tp_rank: int, load_format: Optional[str] = None
 ) -> None:
+    """``load_format`` is this runner's effective format: a draft loading under
+    ``--speculative-draft-draft-load-format`` needs its own send group, and the
+    target's format cannot answer for it."""
     if (
-        server_args.load_format == LoadFormat.REMOTE_INSTANCE
+        (load_format or server_args.load_format) == LoadFormat.REMOTE_INSTANCE
         and server_args.remote_instance_weight_loader_backend
         == RemoteInstanceWeightLoaderBackend.NCCL
     ):
@@ -100,8 +104,13 @@ def maybe_trigger_remote_instance_nccl_send_group(
             t.start()
 
 
-def load_kv_cache_scales(*, model, server_args: ServerArgs) -> None:
-    if server_args.kv_cache_dtype == "fp8_e4m3":
+def load_kv_cache_scales(
+    *, model, server_args: ServerArgs, kv_cache_dtype: str
+) -> None:
+    """``kv_cache_dtype`` is the caller's resolved value. Required rather than
+    defaulted: a fallback to ``server_args`` would be a hidden global read for
+    any future caller that forgets to pass one."""
+    if kv_cache_dtype == "fp8_e4m3":
         if server_args.quantization_param_path is not None:
             if callable(getattr(model, "load_kv_cache_scales", None)):
                 model.load_kv_cache_scales(server_args.quantization_param_path)
@@ -184,6 +193,7 @@ def build_load_config(
     *,
     server_args: ServerArgs,
     tp_rank: int,
+    load_format: Optional[str] = None,
     remote_instance_weight_transporter_engine: Any,
     remote_instance_weight_transporter_session_id: str,
     draft_model_idx: Optional[int],
@@ -201,7 +211,7 @@ def build_load_config(
     )
 
     return LoadConfig(
-        load_format=server_args.load_format,
+        load_format=load_format or server_args.load_format,
         download_dir=server_args.download_dir,
         model_loader_extra_config=server_args.model_loader_extra_config,
         tp_rank=tp_rank,
@@ -283,6 +293,7 @@ def load_model_with_memory_saver(
         enable_cpu_backup = False
 
     remote_instance_weight_info = None
+    startup_weight_load = None
     with memory_saver_adapter.region(
         GPU_MEMORY_TYPE_WEIGHTS,
         enable_cpu_backup=enable_cpu_backup,
@@ -291,10 +302,26 @@ def load_model_with_memory_saver(
             load_config=load_config,
             model_config=model_config,
         )
-        model = loader.load_model(
-            model_config=model_config,
-            device_config=DeviceConfig(device, gpu_id),
-        )
+        device_config = DeviceConfig(device, gpu_id)
+        if server_args.is_startup_weight_load_overlap:
+            from sglang.srt.model_executor.model_runner_components.startup_weight_load import (
+                StartupWeightLoadManager,
+            )
+
+            startup_weight_load = StartupWeightLoadManager.create_from_server_args(
+                loader=loader,
+                model_config=model_config,
+                load_config=load_config,
+                device_config=device_config,
+                server_args=server_args,
+                is_draft_worker=is_draft_worker,
+            )
+            model = startup_weight_load.prepare()
+        else:
+            model = loader.load_model(
+                model_config=model_config,
+                device_config=device_config,
+            )
         if hasattr(loader, "remote_instance_transfer_engine_weight_info"):
             remote_instance_weight_info = (
                 loader.remote_instance_transfer_engine_weight_info
@@ -309,6 +336,7 @@ def load_model_with_memory_saver(
         loader=loader,
         model=model,
         remote_instance_weight_info=remote_instance_weight_info,
+        startup_weight_load=startup_weight_load,
     )
 
 

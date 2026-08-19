@@ -27,12 +27,15 @@ from sglang.srt.entrypoints.openai.chat_encoding import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     MessageProcessingResult,
+    ToolChoice,
+    ToolChoiceFuncName,
 )
 from sglang.srt.entrypoints.openai.serving_chat import (
     OpenAIServingChat,
     normalize_tool_content,
 )
-from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE
+from sglang.srt.environ import envs
+from sglang.srt.function_call.kimik3_format import TOOLS_CLOSE, TOOLS_OPEN
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
@@ -74,6 +77,9 @@ class _MockTokenizerManager:
         self.model_path = self.server_args.model_path
         # The manager tracks the served name itself; a weight update rewrites it.
         self.served_model_name = "test-model"
+        # Stands in for the context's resolved leaves: an override replaces the
+        # field's one live value, the seed stays on server_args.
+        self._config_overrides = {}
 
         # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
@@ -99,6 +105,7 @@ class _MockTokenizerManager:
                     "prompt_tokens": 10,
                     "completion_tokens": 5,
                     "cached_tokens": 0,
+                    "weight_version": "test-version",
                     "finish_reason": {"type": "stop", "matched": None},
                     "output_token_logprobs": [(0.1, 1, "Test"), (0.2, 2, "response")],
                     "output_top_logprobs": None,
@@ -108,6 +115,13 @@ class _MockTokenizerManager:
 
         self.generate_request = Mock(return_value=_mock_generate())
         self.create_abort_task = Mock()
+        self.request_logger = Mock(log_requests=False, log_requests_level=0)
+
+    def config_value(self, name: str):
+        """The value in effect for one config field."""
+        if name in self._config_overrides:
+            return self._config_overrides[name]
+        return getattr(self.server_args, name)
 
 
 class _MockTemplateManager:
@@ -147,6 +161,30 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
+
+    def test_parsers_follow_the_control_plane_overlay(self):
+        """Template detection records the parsers through `override`, so they
+        answer from the bags; `ServerArgs` keeps the launcher's seed."""
+        self.tm.server_args.tool_call_parser = "auto"
+        self.tm.server_args.reasoning_parser = "auto"
+        self.tm._config_overrides.update(
+            {"tool_call_parser": "qwen25", "reasoning_parser": None}
+        )
+
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+
+        self.assertEqual(chat.tool_call_parser, "qwen25")
+        self.assertIsNone(chat.reasoning_parser)
+        self.assertEqual(self.tm.server_args.tool_call_parser, "auto")
+
+    def test_the_xgrammar_gate_follows_the_overlay(self):
+        """A detected `reasoning_parser` must gate xgrammar, not the seed's "auto"."""
+        self.tm.server_args.reasoning_parser = "auto"
+        self.tm._config_overrides["reasoning_parser"] = "qwen3"
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.assertEqual(chat.reasoning_parser, "qwen3")
+        # the gate reads the same value the parser was built from
+        self.assertIsNotNone(chat.reasoning_parser)
 
     def test_text_only_model_rejects_media_before_generation(self):
         media_parts = {
@@ -241,11 +279,61 @@ class ServingChatTestCase(unittest.TestCase):
                 None,
             )
 
+            self.basic_req.return_sampling_mask = True
+            self.basic_req.return_meta_info = True
             adapted, processed = self.chat._convert_to_internal_request(self.basic_req)
             self.assertIsInstance(adapted, GenerateReqInput)
             self.assertFalse(adapted.stream)
+            self.assertTrue(adapted.return_sampling_mask)
             self.assertEqual(adapted.session_id, "session-1")
             self.assertEqual(processed, self.basic_req)
+
+    def test_chat_applies_pd_header_overrides(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            rid="body-rid",
+            routed_dp_rank=3,
+            disagg_prefill_dp_rank=4,
+            priority=5,
+        )
+        self.fastapi_request.headers = {
+            "x-override-rid": "header-rid",
+            "x-override-bootstrap-host": "header-host",
+            "x-override-bootstrap-port": "8998",
+            "x-override-bootstrap-room": "456",
+            "x-override-conversation-id": "conversation-1",
+            "x-override-routed-dp-rank": "6",
+            "x-override-disagg-prefill-dp-rank": "7",
+            "x-override-priority": "8",
+        }
+        body = request.model_dump()
+
+        processed_messages = MessageProcessingResult(
+            "Test prompt", [1, 2, 3], None, None, [], [], None
+        )
+        with (
+            envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.override(True),
+            patch.object(
+                self.chat, "_process_messages", return_value=processed_messages
+            ),
+        ):
+            response = get_or_create_event_loop().run_until_complete(
+                self.chat.handle_request(request, self.fastapi_request)
+            )
+
+        self.assertEqual(response.choices[0].message.content, "Test response")
+        adapted_request = self.tm.generate_request.call_args.args[0]
+        self.assertEqual(adapted_request.bootstrap_room, 456)
+        self.assertEqual(adapted_request.bootstrap_host, "header-host")
+        self.assertEqual(adapted_request.bootstrap_port, 8998)
+        self.assertEqual(adapted_request.rid, "header-rid")
+        self.assertEqual(adapted_request.conversation_id, "conversation-1")
+        self.assertEqual(adapted_request.routed_dp_rank, 6)
+        self.assertEqual(adapted_request.disagg_prefill_dp_rank, 7)
+        self.assertEqual(adapted_request.priority, 8)
+        self.assertEqual(request.model_dump(), body)
+        self.assertFalse(hasattr(request, "conversation_id"))
 
     def test_convert_to_internal_request_rejects_stream_token_ids(self):
         for field in ("return_prompt_token_ids", "return_token_ids"):
@@ -257,6 +345,18 @@ class ServingChatTestCase(unittest.TestCase):
             )
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
                 self.chat._convert_to_internal_request(req, self.fastapi_request)
+
+    def test_validate_request_rejects_sampling_mask_without_meta_info(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            return_sampling_mask=True,
+        )
+
+        self.assertEqual(
+            self.chat._validate_request(req),
+            "return_sampling_mask requires return_meta_info=true.",
+        )
 
     def test_convert_to_internal_request_rejects_stream_return_meta_info(self):
         req = ChatCompletionRequest(
@@ -279,6 +379,8 @@ class ServingChatTestCase(unittest.TestCase):
             input_ids=[101, 102, 103],
             stop=["STOP"],
             return_prompt_token_ids=True,
+            cache_salt="tenant-a",
+            extra_key="classification",
         )
 
         with patch(
@@ -292,6 +394,8 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(adapted.input_ids, [101, 102, 103])
         self.assertTrue(adapted.return_prompt_token_ids)
         self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
+        self.assertEqual(adapted.cache_salt, "tenant-a")
+        self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
 
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
@@ -1467,6 +1571,191 @@ class ServingChatTestCase(unittest.TestCase):
             self.assertEqual(tool_calls[1].id, "functions.get_weather:2")
             self.assertEqual(tool_calls[1].function.name, "get_weather")
 
+    def test_required_tool_choice_skips_json_fallback_for_native_parser(self):
+        """A structural-tag parser owns the output format, so a missing tool
+        call must not be pushed through the json_schema array fallback."""
+        self.chat.tool_call_parser = "kimi_k3"
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        texts = {
+            "prose": "<|open|>response<|sep|>I'll check that.<|close|>response<|sep|>",
+            "empty": "",
+            "json_object": '{"name": "get_weather", "parameters": {"city": "Paris"}}',
+        }
+        for choice in (
+            "required",
+            ToolChoice(function=ToolChoiceFuncName(name="get_weather")),
+        ):
+            for label, text in texts.items():
+                with self.subTest(tool_choice=choice, payload=label):
+                    finish_reason = {"type": "stop", "matched": None}
+                    with self.assertLogs(
+                        "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+                    ) as logs:
+                        tool_calls, remaining, finish_reason = (
+                            self.chat._process_tool_calls(
+                                text=text,
+                                tools=tools,
+                                finish_reason=finish_reason,
+                                tool_choice=choice,
+                            )
+                        )
+                    self.assertIsNone(tool_calls)
+                    self.assertEqual(remaining, text)
+                    self.assertEqual(finish_reason["type"], "stop")
+                    self.assertNotIn("Tool call parsing error", "\n".join(logs.output))
+
+    def test_truncated_native_tool_call_logs_and_drops(self):
+        """A tools section cut off before its closing tag parses to zero calls
+        without raising; the sync path used to drop it with no log at all."""
+        self.chat.tool_call_parser = "kimi_k3"
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        truncated = TOOLS_OPEN + '<|open|>call tool="get_weather" index="1"<|sep|>'
+        for choice in ("auto", "required"):
+            with self.subTest(tool_choice=choice):
+                finish_reason = {"type": "stop", "matched": None}
+                with self.assertLogs(
+                    "sglang.srt.entrypoints.openai.serving_chat", level="WARNING"
+                ) as logs:
+                    tool_calls, remaining, finish_reason = (
+                        self.chat._process_tool_calls(
+                            text=truncated,
+                            tools=tools,
+                            finish_reason=finish_reason,
+                            tool_choice=choice,
+                        )
+                    )
+                self.assertIsNone(tool_calls)
+                self.assertEqual(remaining, "")
+                self.assertEqual(finish_reason["type"], "stop")
+                self.assertIn("no complete call", "\n".join(logs.output))
+
+    def test_required_tool_choice_json_fallback_tolerates_odd_shapes(self):
+        """Parsers without a structural tag keep the JSON array fallback, but a
+        non-array payload degrades instead of raising an opaque TypeError."""
+        self.chat.tool_call_parser = "glm45"
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        cases = [
+            (
+                '[{"name": "get_weather", "parameters": {"city": "Paris"}}]',
+                '{"city": "Paris"}',
+            ),
+            (
+                '{"name": "get_weather", "parameters": {"city": "Paris"}}',
+                '{"city": "Paris"}',
+            ),
+            ('{"name": "get_weather"}', "{}"),
+        ]
+        for text, expected_args in cases:
+            with self.subTest(text=text):
+                tool_calls, _, finish_reason = self.chat._process_tool_calls(
+                    text=text,
+                    tools=tools,
+                    finish_reason={"type": "stop", "matched": None},
+                    tool_choice="required",
+                )
+                self.assertEqual(len(tool_calls), 1)
+                self.assertEqual(tool_calls[0].function.name, "get_weather")
+                self.assertEqual(tool_calls[0].function.arguments, expected_args)
+                self.assertEqual(finish_reason["type"], "tool_calls")
+
+        finish_reason = {"type": "stop", "matched": None}
+        with self.assertLogs(
+            "sglang.srt.entrypoints.openai.serving_chat", level="ERROR"
+        ):
+            tool_calls, remaining, finish_reason = self.chat._process_tool_calls(
+                text='["get_weather"]',
+                tools=tools,
+                finish_reason=finish_reason,
+                tool_choice="required",
+            )
+        self.assertIsNone(tool_calls)
+        self.assertEqual(remaining, '["get_weather"]')
+        self.assertEqual(finish_reason["type"], "stop")
+
+    def test_required_tool_choice_rejects_conflicting_output_constraint(self):
+        """response_format and a forced tool call cannot both be honored: the
+        tool-call constraint was dropped with only a warning, so the model was
+        constrained to a shape that can never contain a tool call."""
+        tools = [{"type": "function", "function": {"name": "get_weather"}}]
+        constraint = ("structural_tag", None)
+        conflicting = [
+            {"type": "json_object"},
+            {
+                "type": "json_schema",
+                "json_schema": {"name": "a", "schema": {"type": "object"}},
+            },
+        ]
+        for tool_choice in (
+            "required",
+            ToolChoice(function=ToolChoiceFuncName(name="get_weather")),
+        ):
+            for response_format in conflicting:
+                with self.subTest(tool_choice=tool_choice, rf=response_format["type"]):
+                    request = ChatCompletionRequest(
+                        model="x",
+                        messages=[{"role": "user", "content": "hi"}],
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        response_format=response_format,
+                    )
+                    with self.assertRaises(ValueError) as ctx:
+                        request.to_sampling_params(
+                            stop=[],
+                            model_generation_config={},
+                            tool_call_constraint=constraint,
+                        )
+                    self.assertIn("cannot be combined", str(ctx.exception))
+
+    def test_auto_tool_choice_keeps_response_format_without_raising(self):
+        """ "auto" means the model need not call a tool, so dropping the
+        tool-call constraint still leaves a satisfiable request."""
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            tool_choice="auto",
+            response_format={"type": "json_object"},
+        )
+        sampling_params = request.to_sampling_params(
+            stop=[],
+            model_generation_config={},
+            tool_call_constraint=("structural_tag", None),
+        )
+        self.assertEqual(sampling_params["json_schema"], '{"type": "object"}')
+
     def test_kimi_k2_streaming_tool_call_id_with_history(self):
         """Ensure streaming first chunk tool_call.id increase with tool calls history for kimi_k2 parser."""
 
@@ -2235,11 +2524,11 @@ class ServingChatTestCase(unittest.TestCase):
         choice = response.choices[0]
 
         self.assertEqual(choice.prompt_token_ids, [11, 12, 13])
-        self.assertEqual(choice.token_ids, [21, 22])
+        self.assertEqual(choice.response_token_ids, [21, 22])
         self.assertEqual(choice.meta_info, ret[0]["meta_info"])
         dumped_choice = response.model_dump()["choices"][0]
         self.assertEqual(dumped_choice["prompt_token_ids"], [11, 12, 13])
-        self.assertEqual(dumped_choice["token_ids"], [21, 22])
+        self.assertEqual(dumped_choice["response_token_ids"], [21, 22])
         self.assertEqual(dumped_choice["meta_info"], ret[0]["meta_info"])
 
     def test_streaming_cached_tokens_details_emits_sglext(self):
@@ -3016,6 +3305,26 @@ class InklingReasoningEffortTest(unittest.TestCase):
                     get()
         finally:
             env.clear()
+
+    def test_thinking_disabled_maps_to_no_thinking_effort(self):
+        """Bug regression: Inkling is an always-on parser, so Anthropic
+        thinking={"type": "disabled"} was rejected outright even though effort
+        "none" (0.0) expresses exactly that."""
+        serving = object.__new__(OpenAIServingChat)
+        serving.reasoning_parser = "inkling"
+        serving.template_manager = Mock(reasoning_config=None)
+        serving._reasoning_detector = Mock(reasoning_default="always")
+        request = ChatCompletionRequest(
+            model="test-model", messages=[{"role": "user", "content": "hi"}]
+        )
+
+        serving.apply_reasoning_enabled(request, False)
+        self.assertEqual(request.reasoning_effort, "none")
+
+        # Enabling leaves an effort set via output_config.effort alone.
+        request.reasoning_effort = "low"
+        serving.apply_reasoning_enabled(request, True)
+        self.assertEqual(request.reasoning_effort, "low")
 
     def test_serving_does_not_prefill_model_message(self):
         from sglang.srt.parser.inkling_tokenizer import INKLING_SPECIAL_TOKEN_IDS

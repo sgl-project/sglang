@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.multimodal_gen.runtime.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
@@ -25,6 +26,7 @@ from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
+    normalize_e4m3fn_to_e4m3fnuz,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
     pad_nvfp4_activation_for_cutlass,
@@ -411,8 +413,25 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # ROCm gfx942 (MI300X/MI325X) uses e4m3fnuz as its native fp8 dtype, so
+        # scaled_fp8_quant() produces e4m3fnuz activations. ModelOpt checkpoints
+        # ship e4m3fn weights. hipBLASLt rejects the resulting e4m3fn x e4m3fnuz
+        # torch._scaled_mm with HIPBLAS_STATUS_NOT_SUPPORTED. Reinterpreting the
+        # weights as e4m3fnuz and doubling the static scales is numerically
+        # identical and keeps the GEMM on the native fp8 path.
+        weight = layer.weight
+        if is_fp8_fnuz():
+            weight, weight_scale, input_scale = normalize_e4m3fn_to_e4m3fnuz(
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=layer.input_scale,
+            )
+            copy_or_rebind_param(layer, "weight_scale", weight_scale)
+            if input_scale is not None:
+                copy_or_rebind_param(layer, "input_scale", input_scale)
+
         max_w_scale, quantized_weight = requantize_with_max_scale(
-            layer.weight, layer.weight_scale, layer.logical_widths
+            weight, layer.weight_scale, layer.logical_widths
         )
         # Preserve the parameter subclass metadata while rebinding to the
         # transposed FP8 view expected by the runtime.

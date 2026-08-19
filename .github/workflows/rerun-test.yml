@@ -31,11 +31,6 @@ on:
         required: false
         type: string
         default: "20"
-      grace_blackwell:
-        description: "Set GRACE_BLACKWELL for the install step (cuda only)"
-        required: false
-        type: string
-        default: "0"
       rdma_devices:
         description: "SGLANG_CI_RDMA_ALL_DEVICES csv (cuda only; empty = unset)"
         required: false
@@ -56,14 +51,26 @@ on:
         required: false
         type: string
         default: ""
+      full_jit_kernel_tests:
+        description: "Sweep jit_kernel tests over their full parameter grids, the way scheduled suites do. Off matches the per-commit stages, which is what a rerun resolves to when a file is registered on both."
+        required: false
+        type: boolean
+        default: false
 
+# Mirrors _pr-test-stage.yml's env, so a rerun validates what CI actually ran.
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_ENABLE_ASYNC_ASSERT: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
-  FORCE_REBUILD_DEEPEP: '1'
+  NCCL_NVLS_ENABLE: "0"
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 300
+  SGLANG_JIT_KERNEL_RUN_FULL_TESTS: ${{ inputs.full_jit_kernel_tests && '1' || '0' }}
+  IS_H200: ${{ inputs.runs_on == '8-gpu-h200' && '1' || '0' }}
+  # SGLANG_PRECISION_* stays out: that test pushes to the shared baseline on
+  # every run, so a rerun holding the write token could become everyone's next
+  # comparison baseline. Without the repo var it fails fast instead.
 
 permissions:
   actions: write
@@ -109,8 +116,6 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
-        env:
-          GRACE_BLACKWELL: ${{ inputs.grace_blackwell }}
         run: |
           if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
@@ -120,7 +125,7 @@ jobs:
           # then dies with `ModuleNotFoundError: No module named 'sglang'`.
           # /rerun-test resolves install_script from runner_configs.yml; a manual
           # workflow_dispatch must pass it explicitly (it can't be derived from
-          # runs_on, which is shared across configs, e.g. default vs deepep).
+          # runs_on, which can be shared across runner configs).
           if [ -z "${{ inputs.install_script }}" ]; then
             echo "::error::install_script is required for cuda mode (empty would silently skip installing sglang). Pass e.g. scripts/ci/cuda/ci_install_dependency.sh"
             exit 1

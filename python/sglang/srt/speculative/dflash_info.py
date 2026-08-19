@@ -13,10 +13,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+_is_npu = is_npu()
 
 
 @dataclass
@@ -43,6 +46,9 @@ class DFlashVerifyInput(SpecInput):
     num_tokens_per_req: int = -1
 
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+    # Committed/live lengths before the verify caller temporarily expands
+    # batch.seq_lens_cpu to the target-attention KV lengths.
+    live_seq_lens_cpu: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -58,17 +64,36 @@ class DFlashVerifyInput(SpecInput):
         """Prepare a DFLASH verify forward batch for overlap scheduling.
 
         The caller computes and stores `batch.out_cache_loc` before this
-        method is called. This helper only packages the verify forward and pre-initializes either CUDA-graph replay
-        metadata or eager attention metadata so the actual forward can run with
-        `skip_attn_backend_init=True`.
+        method is called. GPU keeps the original pre-planning path. NPU leaves
+        attention/graph metadata initialization to ModelRunner because DP/EP
+        padding can still change the compressor's runtime shapes.
         """
+        from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
+
         batch.input_ids = self.draft_token
         batch.spec_info = self
+        if _is_npu and not batch.forward_mode.is_idle():
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                maybe_build_dsv4_verify_bundle,
+            )
+
+            batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
+                batch,
+                self.draft_token_num,
+                live_seq_lens_cpu=self.live_seq_lens_cpu,
+            )
+
         batch.forward_mode = (
             ForwardMode.IDLE
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
+        if not batch.forward_mode.is_idle():
+            # Rebuild mamba track indices (lazy: gather the positions planned
+            # by mamba_lazy_spec_prepare) and clear the stale extend-time mask
+            # before init_new snapshots them into the verify ForwardBatch.
+            # Same hook eagle/ngram/dspark run before TARGET_VERIFY.
+            prepare_mamba_track_for_verify(batch)
         verify_forward_batch = ForwardBatch.init_new(
             batch,
             target_worker.model_runner,
@@ -82,7 +107,13 @@ class DFlashVerifyInput(SpecInput):
                 verify_forward_batch
             )
         )
-        if can_run_cuda_graph:
+        if _is_npu:
+            # Do not pre-plan target verify on NPU. DP/EP padding can change
+            # the compressor's logical batch without changing ForwardBatch's
+            # stale-plan shape fields. Let ModelRunner select graph/eager and
+            # initialize metadata after final batch preparation.
+            return verify_forward_batch, can_run_cuda_graph
+        elif can_run_cuda_graph:
             target_worker.model_runner.decode_cuda_graph_runner.load_batch(
                 verify_forward_batch
             )

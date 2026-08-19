@@ -121,8 +121,7 @@ class DeepEPMoE(FusedMoE):
         elif (
             get_moe_runner_backend().is_flashinfer_cutedsl()
             and quant_config is not None
-            and quant_config.get_name()
-            in ("modelopt_fp4", "modelopt_mixed", "nvfp4_online")
+            and quant_config.get_name() in ("modelopt_fp4", "modelopt_mixed")
         ):
             self.deprecate_flag = True
         elif (

@@ -21,8 +21,6 @@ class IndexerTopkCapturer(BaseTopkCapturer):
         max_running_requests: int,
         device: str,
     ):
-        from sglang.srt.runtime_context import get_server_args
-
         self.num_indexer_layers = num_indexer_layers
         self.index_topk = index_topk
 
@@ -31,7 +29,6 @@ class IndexerTopkCapturer(BaseTopkCapturer):
 
         # DP-attention capture is per-rank-local: each rank writes [:local_batch, ...]
         # to its own device_cache, so the buffer only needs to fit one rank's batch.
-        server_args = get_server_args()
         max_batch_size = max(get_schedule().chunked_prefill_size, max_running_requests)
 
         super().__init__(

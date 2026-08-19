@@ -104,15 +104,23 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         set_global_server_args(server_args=server_args)
 
-        # Inter-process Communication
+        # Each DP replica is a contiguous rank block (dp is the outermost
+        # layout axis); its first rank binds the replica's ingress, and the
+        # sp/cfg/tp broadcast relay in recv_reqs -- replica-internal by
+        # construction -- fans requests out within the replica only.
+        gpus_per_replica = max(1, server_args.num_gpus // server_args.dp_size)
+        self.dp_replica = gpu_id // gpus_per_replica
         self.context = zmq.Context(io_threads=2)
-        endpoint = server_args.scheduler_endpoint
-        if gpu_id == 0:
+        if gpu_id % gpus_per_replica == 0:
+            endpoint = server_args.scheduler_endpoint_for(self.dp_replica)
             # router allocates identify (envelope) for each connection
             self.receiver, actual_endpoint = get_zmq_socket(
                 self.context, zmq.ROUTER, endpoint, True
             )
-            logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
+            logger.info(
+                f"Scheduler (dp replica {self.dp_replica}) bind at endpoint: "
+                f"{actual_endpoint}"
+            )
         else:
             self.receiver = None
         from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -203,6 +211,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             req.target,
             req.strength,
             req.merge_mode,
+            req.lora_alpha,
         )
 
     def _handle_merge_lora(self, reqs: List[Any]):
@@ -1172,9 +1181,8 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             self._disagg_event_loop()
             return
 
-        logger.debug(
-            f"Rank 0 scheduler listening on tcp://*:{self.server_args.scheduler_port}"
-        )
+        if self.receiver is not None:
+            logger.debug("Driver scheduler of dp replica %d listening", self.dp_replica)
 
         while self._running:
             # Update queue depth for metrics
