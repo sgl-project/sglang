@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 
+# `python3` is whatever the contributor's PATH resolves to -- 3.9 on a stock
+# macOS -- so annotations must not be evaluated at definition time.
+from __future__ import annotations
+
 import ast
 import pathlib
 import re
