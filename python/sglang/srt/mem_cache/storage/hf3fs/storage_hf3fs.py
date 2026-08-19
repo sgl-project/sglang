@@ -434,9 +434,11 @@ class HiCacheHF3FS(HiCacheStorage):
         keys: List[str],
         values: Optional[Any] = None,
     ) -> List[bool]:
-        # In MLA backend, only one rank needs to backup the KV cache
+        # In MLA backend, only one rank needs to backup the KV cache.
+        # Return one entry per key so callers can consume the result uniformly
+        # (e.g. `all(...)` in HiCacheController._page_set_zero_copy).
         if self.skip_backup:
-            return True
+            return [True] * len(keys)
 
         # Todo: Add prefix block's hash key
         key_with_prefix = [(key, "") for key in keys]
