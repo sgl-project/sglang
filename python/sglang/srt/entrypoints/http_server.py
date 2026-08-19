@@ -18,14 +18,17 @@ This file implements HTTP APIs for the inference engine via fastapi.
 """
 
 import asyncio
+import base64
 import dataclasses
 import logging
 import os
 import ssl
+import struct
 import tempfile
 import threading
 import time
 import uuid
+import zlib
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
@@ -2096,6 +2099,34 @@ def _admin_api_key_missing_response(
     )
 
 
+def _solid_png_base64(width: int, height: int) -> str:
+    """A single-colour RGB PNG of the given size, base64-encoded.
+
+    Only the size matters for a warmup request: it decides the vision tower's
+    patch count, and so which one-time setup the warmup pays for instead of the
+    first real request. Built here rather than checked in as a literal so a new
+    size costs one call.
+    """
+
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    row = b"\x00" + b"\x80\x80\x80" * width
+    raw = row * height
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw, 9))
+        + chunk(b"IEND", b"")
+    )
+    return base64.b64encode(png).decode("ascii")
+
+
 # Minimal 32x32 black PNG (base64, GLM4v requires at least 32x32 sized image)
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
@@ -2116,8 +2147,10 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
 
     A 512x512 image triggers Kimi K2.5/K2.7's representative compiled
     position-interpolation path during startup. Kimi K3 uses a 448x448 image
-    matching its native vision patch grid. This keeps one-time vision setup
-    work out of the first external image request.
+    matching its native vision patch grid. PaddleOCR-VL uses a page-sized image,
+    since the minimal one is 4 patches against a real page's ~5200 and so leaves
+    every shape-dependent setup to the first real page. This keeps one-time
+    vision setup work out of the first external image request.
     Other VLMs retain the minimal image to avoid changing their startup cost.
     """
 
@@ -2131,6 +2164,15 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
             "its native 32x32 vision patch grid."
         )
         return KIMI_K3_VLM_WARMUP_PNG_PICTURE_BASE64
+    if (
+        "PaddleOCRVLForConditionalGeneration" in architectures
+        or model_info.get("model_type") == "paddleocr_vl"
+    ):
+        logger.info(
+            "Using a 1008x1008 image for PaddleOCR-VL startup warmup to exercise "
+            "a full page's patch count (1296 image tokens) rather than one patch."
+        )
+        return _solid_png_base64(1008, 1008)
     if "KimiK25ForConditionalGeneration" in architectures:
         logger.info(
             "Using a 512x512 image for Kimi VLM startup warmup to compile "
