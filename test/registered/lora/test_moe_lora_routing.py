@@ -69,7 +69,6 @@ class TestMoeLoraRouting(CustomTestCase):
         *,
         lora_experts_per_adapter,
         max_loras=2,
-        lora_expert_map=None,
         block_size=16,
         dtype=torch.int32,
         view=RouteViewKind.ALIGNED,
@@ -81,11 +80,6 @@ class TestMoeLoraRouting(CustomTestCase):
             lora_experts_per_adapter=lora_experts_per_adapter,
             max_loras=max_loras,
             block_size=block_size,
-            lora_expert_map=(
-                None
-                if lora_expert_map is None
-                else torch.tensor(lora_expert_map, dtype=dtype, device=self.device)
-            ),
             view=view,
             workspace=MoeLoraWorkspace(),
             scratch_prefix="test:route",
@@ -152,48 +146,7 @@ class TestMoeLoraRouting(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "unknown route view"):
             self._build([[0, 1]], [0], lora_experts_per_adapter=2, view="grouped")
 
-    def test_identity_and_explicit_lora_expert_maps(self):
-        cases = (
-            ("local_identity", [[0, 1], [2, 3]], None, 4, [[0, 1], [6, 7]]),
-            (
-                "global_owned",
-                [[0, 1], [2, 3]],
-                [0, -1, 2, 3],
-                4,
-                [[0, -1], [6, 7]],
-            ),
-            (
-                "global_to_local",
-                [[4, 5], [6, 7]],
-                [-1, -1, -1, -1, 0, 1, 2, 3],
-                4,
-                [[0, 1], [6, 7]],
-            ),
-            (
-                "local_to_offset_factor",
-                [[0, 1], [2, 3]],
-                [4, 5, 6, 7],
-                8,
-                [[4, 5], [14, 15]],
-            ),
-        )
-        for (
-            name,
-            topk_ids,
-            lora_expert_map,
-            lora_experts_per_adapter,
-            expected,
-        ) in cases:
-            with self.subTest(name=name):
-                route = self._build(
-                    topk_ids,
-                    [0, 1],
-                    lora_experts_per_adapter=lora_experts_per_adapter,
-                    lora_expert_map=lora_expert_map,
-                )
-                self.assertEqual(route.virtual_topk_ids.cpu().tolist(), expected)
-
-    def test_invalid_adapter_expert_and_map_ids_become_one_sentinel(self):
+    def test_invalid_adapter_and_expert_ids_become_one_sentinel(self):
         route = self._build(
             [[-2], [-1], [3], [4], [99], [0], [0]],
             [0, 0, 0, 0, 0, 2, 3],
@@ -203,14 +156,6 @@ class TestMoeLoraRouting(CustomTestCase):
             route.virtual_topk_ids.flatten().cpu().tolist(),
             [-1, -1, 3, -1, -1, -1, -1],
         )
-
-        mapped = self._build(
-            [[0, 1, 2, 3]],
-            [0],
-            lora_experts_per_adapter=3,
-            lora_expert_map=[0, -1, 3, 99],
-        )
-        self.assertEqual(mapped.virtual_topk_ids.cpu().tolist(), [[0, -1, -1, -1]])
 
         live_blocks = route.num_pairs_post_padded.item() // route.block_size
         live_ids = route.block_virtual_expert_ids[:live_blocks]
@@ -230,7 +175,6 @@ class TestMoeLoraRouting(CustomTestCase):
             [[0, 3], [4, -2]],
             [0, 1],
             lora_experts_per_adapter=4,
-            lora_expert_map=[0, 1, 2, 3, -1],
             dtype=torch.int64,
         )
         self.assertEqual(route.virtual_topk_ids.cpu().tolist(), [[0, 3], [-1, -1]])

@@ -52,27 +52,23 @@ def _joint_hist_kernel(
     per_expert_ids = virtual_expert_ids_inline(
         topk_ids_ptr,
         token_lora_mapping_ptr,
-        topk_ids_ptr,
         pair_ids,
         pair_mask,
         0,
         LORA_EXPERTS_PER_ADAPTER=E_LOCAL,
         MAX_LORAS=MAX_LORAS,
         TOP_K=TOP_K,
-        USE_LORA_EXPERT_MAP=False,
         SHARED_OUTER=False,
     )
     shared_ids = virtual_expert_ids_inline(
         topk_ids_ptr,
         token_lora_mapping_ptr,
-        topk_ids_ptr,
         pair_ids,
         pair_mask,
         num_local_experts,
         LORA_EXPERTS_PER_ADAPTER=1,
         MAX_LORAS=MAX_LORAS,
         TOP_K=TOP_K,
-        USE_LORA_EXPERT_MAP=False,
         SHARED_OUTER=True,
     )
     tl.atomic_add(
@@ -299,27 +295,23 @@ def _joint_expand_scatter_kernel(
     per_expert_ids = virtual_expert_ids_inline(
         topk_ids_ptr,
         token_lora_mapping_ptr,
-        topk_ids_ptr,
         pair_ids,
         pair_mask,
         0,
         LORA_EXPERTS_PER_ADAPTER=E_LOCAL,
         MAX_LORAS=MAX_LORAS,
         TOP_K=TOP_K,
-        USE_LORA_EXPERT_MAP=False,
         SHARED_OUTER=False,
     )
     shared_ids = virtual_expert_ids_inline(
         topk_ids_ptr,
         token_lora_mapping_ptr,
-        topk_ids_ptr,
         pair_ids,
         pair_mask,
         num_local_experts,
         LORA_EXPERTS_PER_ADAPTER=1,
         MAX_LORAS=MAX_LORAS,
         TOP_K=TOP_K,
-        USE_LORA_EXPERT_MAP=False,
         SHARED_OUTER=True,
     )
     per_expert_buckets = tl.where(

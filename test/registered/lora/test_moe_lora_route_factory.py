@@ -386,7 +386,6 @@ class TestRoutePdlWiring(unittest.TestCase):
             block_size,
             view,
             shared_outer_local_expert_count=None,
-            lora_expert_map=None,
             workspace=None,
             scratch_prefix=None,
         ):
@@ -474,7 +473,6 @@ class TestRoutePdlWiring(unittest.TestCase):
             block_size,
             view,
             shared_outer_local_expert_count=None,
-            lora_expert_map=None,
             workspace=None,
             scratch_prefix=None,
         ):
@@ -611,7 +609,6 @@ class TestSharedTokenRoute(unittest.TestCase):
             block_size,
             view,
             shared_outer_local_expert_count=None,
-            lora_expert_map=None,
             workspace=None,
             scratch_prefix=None,
         ):
@@ -706,7 +703,6 @@ class TestSharedTokenRoute(unittest.TestCase):
                     block_size,
                     view,
                     shared_outer_local_expert_count=None,
-                    lora_expert_map=None,
                     workspace=None,
                     scratch_prefix=None,
                 ):

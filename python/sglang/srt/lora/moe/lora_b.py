@@ -299,7 +299,6 @@ def _indexed_pairs_lora_b_kernel(
     destination_ptr,
     topk_ids_ptr,
     token_lora_mapping_ptr,
-    lora_expert_map_ptr,
     num_pairs,
     routed_expert_id_bound,
     dest_offset_0,
@@ -318,7 +317,6 @@ def _indexed_pairs_lora_b_kernel(
     LORA_EXPERTS_PER_ADAPTER: tl.constexpr,
     MAX_LORAS: tl.constexpr,
     TOP_K: tl.constexpr,
-    USE_LORA_EXPERT_MAP: tl.constexpr,
     SHARED_OUTER: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -348,14 +346,12 @@ def _indexed_pairs_lora_b_kernel(
     key = virtual_expert_ids_inline(
         topk_ids_ptr,
         token_lora_mapping_ptr,
-        lora_expert_map_ptr,
         pair_id,
         pair_id < num_pairs,
         routed_expert_id_bound,
         LORA_EXPERTS_PER_ADAPTER=LORA_EXPERTS_PER_ADAPTER,
         MAX_LORAS=MAX_LORAS,
         TOP_K=TOP_K,
-        USE_LORA_EXPERT_MAP=USE_LORA_EXPERT_MAP,
         SHARED_OUTER=SHARED_OUTER,
     )
     pair64 = pair_id.to(tl.int64)
@@ -445,14 +441,8 @@ def indexed_pairs_lora_b(
     if num_pairs == 0:
         return
     offsets = tuple(int(offset) for offset in destination_offsets)
-    use_map = routing.lora_expert_map is not None
     shared_outer = routing.shared_outer_local_expert_count is not None
-    routed_bound = (
-        routing.shared_outer_local_expert_count
-        if shared_outer
-        else (routing.lora_expert_map.numel() if use_map else 0)
-    )
-    map_arg = routing.lora_expert_map if use_map else routing.topk_ids
+    routed_bound = routing.shared_outer_local_expert_count or 0
     block_size_n = int(config["BLOCK_SIZE_N"])
     _indexed_pairs_lora_b_kernel[
         (num_pairs, num_slices * triton.cdiv(slice_width, block_size_n))
@@ -462,7 +452,6 @@ def indexed_pairs_lora_b(
         destination,
         routing.topk_ids,
         routing.token_lora_mapping,
-        map_arg,
         num_pairs,
         routed_bound,
         offsets[0],
@@ -481,7 +470,6 @@ def indexed_pairs_lora_b(
         LORA_EXPERTS_PER_ADAPTER=routing.lora_experts_per_adapter,
         MAX_LORAS=routing.max_loras,
         TOP_K=routing.topk_ids.shape[1],
-        USE_LORA_EXPERT_MAP=use_map,
         SHARED_OUTER=shared_outer,
         BLOCK_SIZE_N=block_size_n,
         BLOCK_SIZE_K=int(config["BLOCK_SIZE_K"]),

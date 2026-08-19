@@ -85,7 +85,6 @@ SCAN_WARPS = 4
 def _fused_hist_kernel(
     topk_ids_ptr,
     token_lora_mapping_ptr,
-    lora_expert_map_ptr,
     counts_ptr,
     num_pairs,
     routed_expert_id_bound,
@@ -93,7 +92,6 @@ def _fused_hist_kernel(
     LORA_EXPERTS_PER_ADAPTER: tl.constexpr,
     MAX_LORAS: tl.constexpr,
     TOP_K: tl.constexpr,
-    USE_LORA_EXPERT_MAP: tl.constexpr,
     SHARED_OUTER: tl.constexpr,
     BLOCK: tl.constexpr,
     USE_PDL: tl.constexpr,
@@ -108,14 +106,12 @@ def _fused_hist_kernel(
     virtual_ids = virtual_expert_ids_inline(
         topk_ids_ptr,
         token_lora_mapping_ptr,
-        lora_expert_map_ptr,
         pair_ids,
         pair_mask,
         routed_expert_id_bound,
         LORA_EXPERTS_PER_ADAPTER=LORA_EXPERTS_PER_ADAPTER,
         MAX_LORAS=MAX_LORAS,
         TOP_K=TOP_K,
-        USE_LORA_EXPERT_MAP=USE_LORA_EXPERT_MAP,
         SHARED_OUTER=SHARED_OUTER,
     )
     # Invalid pairs land in the sentinel bucket at NUM_BUCKETS - 1; its blocks
@@ -171,7 +167,6 @@ def _padded_scan_kernel(
 def _expand_and_scatter_kernel(
     topk_ids_ptr,
     token_lora_mapping_ptr,
-    lora_expert_map_ptr,
     cursor_ptr,
     bucket_end_ptr,
     block_cum_ptr,
@@ -186,7 +181,6 @@ def _expand_and_scatter_kernel(
     LORA_EXPERTS_PER_ADAPTER: tl.constexpr,
     MAX_LORAS: tl.constexpr,
     TOP_K: tl.constexpr,
-    USE_LORA_EXPERT_MAP: tl.constexpr,
     SHARED_OUTER: tl.constexpr,
     BLOCK: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -250,14 +244,12 @@ def _expand_and_scatter_kernel(
     virtual_ids = virtual_expert_ids_inline(
         topk_ids_ptr,
         token_lora_mapping_ptr,
-        lora_expert_map_ptr,
         pair_ids,
         pair_mask,
         routed_expert_id_bound,
         LORA_EXPERTS_PER_ADAPTER=LORA_EXPERTS_PER_ADAPTER,
         MAX_LORAS=MAX_LORAS,
         TOP_K=TOP_K,
-        USE_LORA_EXPERT_MAP=USE_LORA_EXPERT_MAP,
         SHARED_OUTER=SHARED_OUTER,
     )
     buckets = tl.where(virtual_ids < 0, NUM_BUCKETS - 1, virtual_ids)
@@ -276,7 +268,6 @@ def fused_align_block_size(
     max_loras: int,
     block_size: int,
     capacity: int,
-    lora_expert_map: torch.Tensor | None = None,
     shared_outer_local_expert_count: int | None = None,
     workspace: MoeLoraWorkspace,
     scratch_prefix: str,
@@ -308,18 +299,10 @@ def fused_align_block_size(
         )
     validate_shared_outer(
         shared_outer_local_expert_count=shared_outer_local_expert_count,
-        lora_expert_map=lora_expert_map,
         lora_experts_per_adapter=lora_experts_per_adapter,
     )
     shared_outer = shared_outer_local_expert_count is not None
-    use_map = lora_expert_map is not None
-    # Own name, not a reassignment of the parameter (see routing.py).
-    map_arg = lora_expert_map if use_map else topk_ids
-    routed_expert_id_bound = (
-        shared_outer_local_expert_count
-        if shared_outer
-        else (map_arg.numel() if use_map else 0)
-    )
+    routed_expert_id_bound = shared_outer_local_expert_count or 0
     num_blocks = capacity // block_size
 
     # Every host-fallible operation happens BEFORE the first launch, so an
@@ -352,7 +335,6 @@ def fused_align_block_size(
     _fused_hist_kernel[(triton.cdiv(max(num_pairs, 1), HIST_BLOCK),)](
         topk_ids,
         token_lora_mapping,
-        map_arg,
         counts,
         num_pairs,
         routed_expert_id_bound,
@@ -360,7 +342,6 @@ def fused_align_block_size(
         LORA_EXPERTS_PER_ADAPTER=lora_experts_per_adapter,
         MAX_LORAS=max_loras,
         TOP_K=top_k,
-        USE_LORA_EXPERT_MAP=use_map,
         SHARED_OUTER=shared_outer,
         BLOCK=HIST_BLOCK,
         USE_PDL=use_pdl,
@@ -384,7 +365,6 @@ def fused_align_block_size(
     _expand_and_scatter_kernel[(num_block_programs + num_pair_programs,)](
         topk_ids,
         token_lora_mapping,
-        map_arg,
         cursor,
         bucket_end,
         block_cumulative,
@@ -399,7 +379,6 @@ def fused_align_block_size(
         LORA_EXPERTS_PER_ADAPTER=lora_experts_per_adapter,
         MAX_LORAS=max_loras,
         TOP_K=top_k,
-        USE_LORA_EXPERT_MAP=use_map,
         SHARED_OUTER=shared_outer,
         BLOCK=EXPAND_BLOCK,
         BLOCK_SIZE_M=block_size,
