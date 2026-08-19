@@ -9,7 +9,7 @@ import torch.nn as nn
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 
-from sglang.srt.hardware_backend.npu.moe.activation import NPUSwiglu
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
@@ -64,6 +64,12 @@ class FeedForward(nn.Module):
         else:
             raise ValueError(f"Unsupported activation function: {activation_fn}")
 
+        self.silu_and_mul = (
+            SiluAndMul()
+            if use_gated and activation_fn == "silu" and current_platform.is_npu()
+            else None
+        )    
+
         self.w2 = nn.Linear(inner_dim, dim_out, bias=bias)
         self._compile_forward_enabled = _env_flag(
             "MINIMAX_H3_VAE_DECODER_VIT_FF_TORCH_COMPILE", "0"
@@ -75,29 +81,24 @@ class FeedForward(nn.Module):
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.w1(hidden_states)
-
+    
         if self.use_gated:
             if (
                 isinstance(self.act_fn, nn.SiLU)
-                and (
-                    current_platform.is_cuda()
-                    or current_platform.is_rocm()
-                    or current_platform.is_npu()
-                )
+                and (current_platform.is_cuda() or current_platform.is_rocm())
                 and hidden_states.dtype in (torch.float16, torch.bfloat16)
                 and hidden_states.is_contiguous()
                 and hidden_states.shape[-1] % 32 == 0
             ):
-                if current_platform.is_npu():
-                    hidden_states, _ = NPUSwiglu()._apply_activation(hidden_states)
-                else:
-                    hidden_states = silu_and_mul_with_activation_rounding(hidden_states)
+                hidden_states = silu_and_mul_with_activation_rounding(hidden_states)
+            elif self.silu_and_mul is not None:
+                hidden_states = self.silu_and_mul(hidden_states)
             else:
                 gate, hidden_states = hidden_states.chunk(2, dim=-1)
                 hidden_states = self.act_fn(gate).mul_(hidden_states)
         else:
             hidden_states = self.act_fn(hidden_states)
-
+    
         hidden_states = self.w2(hidden_states)
         return hidden_states
 
