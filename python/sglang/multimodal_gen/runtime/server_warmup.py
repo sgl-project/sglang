@@ -176,7 +176,9 @@ async def maybe_apply_auto_residency(
     continues on the original strategy; only a failed rollback raises, which
     aborts startup.
     """
-    from sglang.multimodal_gen.runtime.entrypoints.utils import AutoResidencyReq
+    from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
+        AutoResidencyReq,
+    )
     from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
         PROMOTION_STATUS_PROMOTED,
         PROMOTION_STATUS_ROLLBACK_FAILED,
