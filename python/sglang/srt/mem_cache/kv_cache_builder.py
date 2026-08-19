@@ -117,7 +117,7 @@ def _register_legacy_hicache_draft(
     # so that host indices stay 1-to-1 between target and draft KV caches.
     primary_host_pool = tree_cache.cache_controller.mem_pool_host
     host_pool_kwargs = dict(
-        host_to_device_ratio=primary_host_pool.size / pool.size,
+        host_to_device_ratio=primary_host_pool.logical_size / pool.size,
         host_size=0,
         page_size=page_size,
         layout=server_args.hicache_mem_layout,

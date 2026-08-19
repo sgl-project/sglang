@@ -280,6 +280,7 @@ MOE_A2A_BACKEND_CHOICES = [
     "ascend_fuseep",
     "flashinfer",
     "megamoe",
+    "deepep_v2",
     "pplx",
     "ascend_tp",
 ]
@@ -312,7 +313,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "torch"]
+BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "gemv", "torch"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
@@ -2354,6 +2355,8 @@ class ServerArgs:
             "ascend_fuseep",
             "flashinfer",
             "megamoe",
+            "deepep_v2",
+            "ascend_tp",
             "pplx",
         ],
         Arg(
@@ -2363,6 +2366,15 @@ class ServerArgs:
         ),
         NS("exec.moe"),
     ] = "none"
+    deepep_v2_mode: A[
+        Literal["direct", "hybrid"],
+        "DeepEP v2 ElasticBuffer communication topology, fixed at server init: "
+        "`direct` (single-node NVLink) or `hybrid` (multi-node scale-out). "
+        "Layout/grouped-GEMM and the decode CUDA graph are chosen per batch by "
+        "inference phase, independent of this knob; not equivalent to DeepEP v1 "
+        "normal/low_latency.",
+        NS("exec.moe"),
+    ] = "direct"
     moe_runner_backend: A[
         str,
         Arg(
@@ -6964,6 +6976,95 @@ class ServerArgs:
                 self.cuda_graph_config.decode.backend = Backend.DISABLED
                 self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
+        if a2a_backend == "deepep_v2":
+            if self.moe_runner_backend == "auto":
+                # The generic auto -> runner resolution above only fires for
+                # moe_a2a_backend "none", so deepep_v2 would otherwise reach the
+                # check below still holding "auto" and fail. deepep_v2 dispatches
+                # FP8 activations plus scales, which only deep_gemm consumes.
+                self.moe_runner_backend = "deep_gemm"
+                logger.warning(
+                    "DeepEP v2 MoE: resolved --moe-runner-backend auto -> deep_gemm."
+                )
+            # Validate the FINAL resolved runner, not the raw field. A model
+            # declaration (e.g. mxfp8 + auto -> flashinfer_trtllm) is
+            # materialized after this handler, so self.moe_runner_backend set
+            # above is not necessarily what the runtime will use. resolved_view
+            # reflects those pending declarations: validate and drive the graph
+            # decision off it, so an unsupported resolved runner fails fast here
+            # instead of being silently restored at materialize time.
+            resolved_runner = resolved_view(self).moe_runner_backend
+            if resolved_runner != "deep_gemm":
+                raise ValueError(
+                    "DeepEP v2 MoE currently supports only "
+                    f"--moe-runner-backend deep_gemm. Got {resolved_runner!r}. "
+                    "Add a runner adapter before enabling DeepEP v2 with other "
+                    "MoE runners."
+                )
+            if self.enable_two_batch_overlap or self.enable_single_batch_overlap:
+                raise ValueError(
+                    "DeepEP v2 MoE has not implemented the TBO/SBO overlap hooks yet. "
+                    "Disable --enable-two-batch-overlap and "
+                    "--enable-single-batch-overlap when using --moe-a2a-backend deepep_v2."
+                )
+            if self.enforce_shared_experts_fusion:
+                raise ValueError(
+                    "DeepEP v2 MoE has not validated fused shared experts yet. "
+                    "Remove --enforce-shared-experts-fusion when using "
+                    "--moe-a2a-backend deepep_v2."
+                )
+            # Prefill capacity pre-check: the ElasticBuffer per-rank capacity
+            # must cover the largest extend forward, which is bounded by the
+            # chunked prefill budget. self.chunked_prefill_size is already the
+            # per-rank value here (_handle_data_parallelism divides the CLI
+            # value by dp_size under DP attention and runs before this
+            # handler). Without this check the server boots and only fails at
+            # the first full prefill chunk (the dispatcher's runtime capacity
+            # guard), which small smoke traffic may never trigger. Decode does
+            # not need a boot check: with CUDA graphs the padded capture batch
+            # goes through the same runtime guard during startup, and without
+            # graphs the guard still fails fast at runtime. Mirrors the MoRI and
+            # pplx chunk checks later in this handler, and the CuteDSL
+            # token-budget check in its own __post_init__ slot.
+            if (
+                self.chunked_prefill_size
+                and self.chunked_prefill_size > 0
+                and (self.disaggregation_mode != "decode")
+            ):
+                deepep_v2_cap = (
+                    envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+                )
+                if self.chunked_prefill_size > deepep_v2_cap:
+                    raise ValueError(
+                        "DeepEP v2 MoE: the per-rank chunked prefill budget "
+                        f"({self.chunked_prefill_size} tokens; the CLI "
+                        "--chunked-prefill-size is divided by dp_size under DP "
+                        "attention) exceeds the per-rank dispatch buffer "
+                        "capacity SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_"
+                        f"RANK={deepep_v2_cap}. Raise the env (it sizes the "
+                        "communication buffer) or lower --chunked-prefill-size."
+                    )
+            # The decode graph stays enabled under ANY comm mode (direct or
+            # hybrid): the masked layout is chosen per batch by inference phase
+            # (decode), not by the comm mode, giving static shapes with no host
+            # readback. The prefill/extend contiguous path reads exact per-expert
+            # counts back on the host, so it is never capturable.
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            logger.warning(
+                f"DeepEP v2 MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+            logger.warning(
+                "DeepEP v2 MoE is using deepep_v2_mode=%s. This controls "
+                "ElasticBuffer direct/hybrid mode and is independent from "
+                "--deepep-mode normal/low_latency. DeepEP v2 MoE enables the "
+                "decode CUDA graph on the masked decode path (any comm mode) "
+                "and disables shared expert fusion. "
+                "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK is a "
+                "per-rank communication buffer capacity, not a model limit; "
+                "increase it for large prefill/chunked-prefill workloads.",
+                self.deepep_v2_mode,
+            )
+
         if (
             self.moe_a2a_backend == "none" and is_npu()
         ) or self.moe_a2a_backend == "ascend_tp":
@@ -7502,11 +7603,11 @@ class ServerArgs:
                 "backup and the storage keys must become dcp_rank-aware "
                 "first. Run HiCache+DCP with L1/L2 only."
             )
-        if self.speculative_algorithm is not None:
+        if self.speculative_algorithm not in (None, "DSPARK"):
             raise NotImplementedError(
-                "HiCache with --dcp-size > 1 does not support speculative "
-                "decoding yet (the draft-model host pool has no DCP index "
-                "translation)."
+                "HiCache with --dcp-size > 1 only supports DSPARK speculative "
+                "decoding; other draft-model host pools have no DCP index "
+                "translation."
             )
         if self.enable_lmcache:
             raise NotImplementedError(
@@ -9669,6 +9770,13 @@ class ServerArgs:
         ``--speculative-draft-load-format`` needs its own transfer engine."""
         return remote_instance_transfer_engine_of(self, load_format)
 
+    @property
+    def kv_event_block_size(self) -> int:
+        """Width KV events are emitted at: under DCP the radix tree pages at
+        ``page_size * dcp_size`` (``mem_cache/kv_cache_builder.py``).
+        """
+        return self.page_size * self.dcp_size
+
     def describe_kv_events_publisher(self) -> Optional[dict]:
         """Return a structured description of this server's KV-event
         publisher, or `None` if publishing is disabled / misconfigured.
@@ -9694,10 +9802,13 @@ class ServerArgs:
                 "topic": "",                      # ZMQ topic prefix on the
                                                   # SUB filter (empty =
                                                   # subscribe-all)
-                "block_size": <page_size>,        # subscribers MUST hash
-                                                  # prompts at this size
-                "dp_size": <dp_size>,             # number of SUB sockets
-                                                  # to open
+                "block_size": <kv_event_block_size>,  # subscribers MUST
+                                                  # hash prompts at this size
+                "dp_size": <dp_size>,             # number of SUB sockets to
+                                                  # open; not DCP-scaled, as
+                                                  # DCP shards within a rank
+                                                  # rather than adding
+                                                  # publishers
             }
 
         Returns None (i.e. "no publisher to describe") when any of:
@@ -9752,7 +9863,7 @@ class ServerArgs:
             "endpoint_host": host,
             "endpoint_port_base": port,
             "topic": cfg.topic,
-            "block_size": page_size,
+            "block_size": self.kv_event_block_size,
             "dp_size": self.dp_size,
         }
 
