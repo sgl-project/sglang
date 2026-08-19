@@ -685,64 +685,6 @@ MINIMAX_H3_FOUR_GPU_H100_CASES = [
         run_models_api_check=False,
         run_t2v_input_reference_check=False,
     ),
-    DiffusionTestCase(
-        "minimax_h3_ref2va_video_audio_4gpu_h100",
-        DiffusionServerArgs(
-            model_path="MiniMaxAI/MiniMax-H3",
-            modality="video",
-            num_gpus=4,
-            tp_size=2,
-            ulysses_degree=2,
-            extras=[
-                "--model-variant",
-                "ref2va",
-                "--performance-mode",
-                "speed",
-                "--enable-torch-compile",
-                "false",
-            ],
-        ),
-        DiffusionSamplingParams(
-            prompt=(
-                "Follow the motion and appearance of <Video 1> while moving the "
-                "scene to a quiet moonlit room, and use <Audio 1> as the sound "
-                "reference with coherent timing."
-            ),
-            output_size="1344x768",
-            seconds=4,
-            output_format="mp4",
-            expect_audio_output=True,
-            num_outputs_per_prompt=1,
-            extras={
-                "task": "ref2va",
-                "conditions": [
-                    {
-                        "type": "video_audio",
-                        "uri": (
-                            "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/"
-                            "42ed227ee7df40d41602854ae760620d6eb651fe/assets/"
-                            "ref2va.mp4"
-                        ),
-                        "role": "reference",
-                    }
-                ],
-                "target": {
-                    "short_edge": 768,
-                    "aspect_ratio": "16:9",
-                    "duration_seconds": 4.0,
-                },
-                "num_inference_steps": 2,
-                "flow_shift": 12.0,
-                "audio_flow_shift": 3.0,
-                "seed": 42,
-            },
-        ),
-        run_perf_check=False,
-        run_consistency_check=True,
-        run_component_accuracy_check=False,
-        run_models_api_check=False,
-        run_t2v_input_reference_check=False,
-    ),
 ]
 
 TWO_GPU_CASES = [
@@ -799,6 +741,71 @@ TWO_GPU_CASES = [
             },
         ),
         run_perf_check=True,
+        run_consistency_check=True,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
+        "minimax_h3_ref2va_video_audio_2gpu_h100",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3",
+            modality="video",
+            tp_size=2,
+            ulysses_degree=1,
+            extras=[
+                "--model-variant",
+                "ref2va",
+                "--performance-mode",
+                "memory",
+                "--layerwise-offload-components",
+                "dit,text_encoder",
+                "--component-residency",
+                "vae=resident",
+                "--dit-offload-prefetch-size",
+                "1",
+                "--dit-layerwise-resident-layers",
+                "20",
+                "--enable-torch-compile",
+                "false",
+            ],
+        ),
+        DiffusionSamplingParams(
+            prompt=(
+                "Follow the motion and appearance of <Video 1> while moving the "
+                "scene to a quiet moonlit room, and use <Audio 1> as the sound "
+                "reference with coherent timing."
+            ),
+            output_size="1344x768",
+            seconds=4,
+            output_format="mp4",
+            expect_audio_output=True,
+            num_outputs_per_prompt=1,
+            extras={
+                "task": "ref2va",
+                "conditions": [
+                    {
+                        "type": "video_audio",
+                        "uri": (
+                            "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/"
+                            "42ed227ee7df40d41602854ae760620d6eb651fe/assets/"
+                            "ref2va.mp4"
+                        ),
+                        "role": "reference",
+                    }
+                ],
+                "target": {
+                    "short_edge": 768,
+                    "aspect_ratio": "16:9",
+                    "duration_seconds": 4.0,
+                },
+                "num_inference_steps": 2,
+                "flow_shift": 12.0,
+                "audio_flow_shift": 3.0,
+                "seed": 42,
+            },
+        ),
+        run_perf_check=False,
         run_consistency_check=True,
         run_component_accuracy_check=False,
         run_models_api_check=False,
