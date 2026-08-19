@@ -549,9 +549,7 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         num_rope_elems = num_pos_dims * 2
         # LTX-2.3 HQ is sensitive to RoPE rounding; keep frequency generation on
         # the target device instead of caching a CPU/NumPy tensor.
-        freqs_dtype = (
-            torch.float64 if self.double_precision and not _is_npu else torch.float32
-        )
+        freqs_dtype = torch.float64 if self.double_precision else torch.float32
         pow_indices = torch.pow(
             self.theta,
             torch.linspace(
