@@ -155,6 +155,28 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
     torch.testing.assert_close(unary_logits, expected_logits)
 
 
+def test_selector_rejects_top_k_wider_than_the_org_vocab(monkeypatch):
+    """With top_k > num_org the masked padded tail would win the top-k and
+    emit silent out-of-vocab candidate ids; the screen must fail loudly."""
+    quant_method = _FakeQuantMethod(torch.randn(2, 4), num_padded=6)
+    lm_head = SimpleNamespace(
+        weight=torch.empty(8, 2, dtype=torch.int8),
+        quant_method=quant_method,
+        org_vocab_size=2,
+    )
+    model = SimpleNamespace(
+        lm_head=lm_head,
+        candidate_selector=SimpleNamespace(top_k=4),
+        _transform_unary_logits=lambda logits: logits.float(),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.get_parallel",
+        lambda: SimpleNamespace(tp_size=1),
+    )
+    with pytest.raises(AssertionError, match="top_k"):
+        DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
+
+
 def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
     """Pins the TP gather contract on the quantized path: the per-shard
     org-vocab restriction, the global id offset, and the fp32 cast before the

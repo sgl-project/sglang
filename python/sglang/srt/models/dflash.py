@@ -63,9 +63,17 @@ def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tenso
 
 
 def _project_candidate_logits(
-    hidden: torch.Tensor, lm_head: nn.Module, *, num_org: int, use_quant_head: bool
+    hidden: torch.Tensor,
+    lm_head: nn.Module,
+    *,
+    num_org: int,
+    use_quant_head: bool,
+    top_k: int,
 ) -> torch.Tensor:
     """Project draft hiddens through the target head, restricted to the org vocab."""
+    # k > num_org would top-k into the masked padded tail and emit silent
+    # out-of-vocab candidates; the dense slice would error on its own.
+    assert num_org >= top_k, f"selector top_k ({top_k}) > org vocab width ({num_org})"
     if not use_quant_head:
         weight = lm_head.weight
         return torch.matmul(hidden.to(weight.dtype), weight[:num_org].T)
@@ -995,7 +1003,11 @@ class DFlash2DraftModel(DFlashDraftModel):
             org = int(self.lm_head.org_vocab_size)
             vals, ids = _radix_topk(
                 _project_candidate_logits(
-                    hidden, self.lm_head, num_org=org, use_quant_head=use_quant_head
+                    hidden,
+                    self.lm_head,
+                    num_org=org,
+                    use_quant_head=use_quant_head,
+                    top_k=k,
                 ),
                 k,
             )
@@ -1007,6 +1019,7 @@ class DFlash2DraftModel(DFlashDraftModel):
                 self.lm_head,
                 num_org=int(shard.num_org_elements),
                 use_quant_head=use_quant_head,
+                top_k=k,
             ),
             k,
         )
