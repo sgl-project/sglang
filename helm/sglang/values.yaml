@@ -1,0 +1,185 @@
+# Number of replicas (nodes)
+# Default values for sglang.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1
+image:
+  repository: lmsysorg/sglang
+  tag: latest
+  pullPolicy: Always
+  pullSecrets: []
+
+hostNetwork: false
+
+# Model and distributed configuration
+# model:
+#   # HuggingFace model path (required, e.g. meta-llama/Llama-3.1-8B-Instruct)
+#   path: mistralai/Mistral-7B-Instruct-v0.2
+#   # Enable metrics endpoint
+#   enableMetrics: true
+#   # Trust remote code in model
+#   trustRemoteCode: false
+#
+#   # Distributed settings (nnodes is automatically set to replicaCount)
+#   # Tensor parallel size (GPUs per node)
+#   tensorParallelSize: 1
+#   # Pipeline parallel size (optional)
+#   pipelineParallelSize: null
+#   # Expert parallel size for MoE models (e.g., DeepSeek-R1)
+#   expertParallelSize: null
+#   # Port for distributed initialization
+#   distInitPort: 5000
+#   # NCCL settings
+#   nccl:
+#     debug: INFO
+#     # Additional NCCL environment variables
+#     extraEnv: {}
+model: {}
+
+# Additional server arguments
+extraArgs: []
+  # - --chunked-prefill-size
+  # - "8192"
+
+# HuggingFace token configuration
+# Logic: If existingSecret is provided, use it. Otherwise, use externalSecret.
+# If both are empty, token must be provided inline (not recommended).
+hfSecret:
+  # Direct token value (not recommended for production)
+  token: ""
+  # Name of existing secret
+  existingSecret: ""
+  existingSecretKey: "HF_TOKEN"
+  # ExternalSecret configuration (used when existingSecret is empty)
+  externalSecret:
+    # Set secretStoreRef.name to empty to disable ExternalSecret
+    secretStoreRef:
+      name: ""
+      kind: SecretStore
+    remoteRef:
+      key: ""
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 30000
+  annotations: {}
+  # Metrics service
+  metrics:
+    enabled: true
+    port: 8080
+
+# Ingress configuration
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+  hosts:
+    - host: sglang.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# HuggingFace cache storage (HF_HOME)
+persistence:
+  enabled: true
+  # Mount path; also used as HF_HOME for all pods
+  mountPath: /root/.cache/huggingface
+  storageClass: ""
+  # ReadWriteMany so all replicas can mount the same PVC
+  accessMode: ReadWriteMany
+  size: 30Gi
+  # Use an existing PVC instead of creating one
+  existingClaim: ""
+  hostPath:
+    enabled: false
+    path: /mnt/hf-cache
+
+# Volume configuration for shm
+shm:
+  enabled: true
+  sizeLimit: 10Gi
+
+# Monitoring
+monitoring:
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+
+# Resources (example configuration, adjust based on your model)
+resources: {}
+  # limits:
+  #   nvidia.com/gpu: 1
+  #   cpu: 8
+  #   memory: 40Gi
+  # requests:
+  #   nvidia.com/gpu: 1
+  #   cpu: 2
+  #   memory: 16Gi
+
+# Probes (enabled by default with sensible defaults)
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 120
+  periodSeconds: 15
+  timeoutSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health_generate
+    port: http
+  initialDelaySeconds: 120
+  periodSeconds: 15
+  timeoutSeconds: 10
+  failureThreshold: 3
+
+# Security contexts (sensible defaults applied)
+podSecurityContext: {}
+  # fsGroup: 1000
+
+securityContext: {}
+  # privileged: false
+  # capabilities:
+  #   drop:
+  #     - ALL
+  # readOnlyRootFilesystem: false
+  # runAsNonRoot: false
+  # runAsUser: 0
+
+# ServiceAccount
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# RuntimeClass for GPU (set to "nvidia" or empty string to disable)
+runtimeClass: ""
+
+# Pod scheduling
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# PodDisruptionBudget
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+# Additional labels and annotations
+podLabels: {}
+podAnnotations: {}
+
+# Additional volumes and mounts
+extraVolumes: []
+extraVolumeMounts: []
+
+# Additional environment variables
+extraEnv: []
