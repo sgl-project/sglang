@@ -42,6 +42,7 @@ from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import has_replicated_shared_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -495,10 +496,16 @@ class LagunaDecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        # See LagunaMoE.forward: a replicated (TP1) shared expert is added after
+        # the post-experts all-reduce precisely so it is not summed once per TP
+        # rank. Fusing defers that all-reduce to the next layer's residual+LN,
+        # by which point the shared output is already inside the tensor -- so
+        # the guard no longer holds. Decline the fusion instead.
         fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
+            and not has_replicated_shared_expert(self.mlp)
         )
         mlp_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch

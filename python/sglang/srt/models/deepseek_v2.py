@@ -117,6 +117,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
     has_per_rank_fused_shared_slots,
+    has_replicated_shared_expert,
     is_deepep_class_backend,
     is_sbo_enabled,
     is_shared_experts_fusion_disabled,
@@ -2521,10 +2522,18 @@ class DeepseekV2DecoderLayer(nn.Module):
             if _cp_local_rows.shape[0] > 0:
                 _cp_shared_local = self.mlp._forward_shared_experts(_cp_local_rows)
 
+        # Fusing defers this layer's post-experts all-reduce to the NEXT layer's
+        # residual+layernorm. The MoE's own guard ("add the TP1 shared output
+        # after the all-reduce") then no longer protects anything: the shared
+        # output is already inside the returned tensor when the deferred
+        # all-reduce runs, so a replicated shared expert would be summed once
+        # per TP rank. Decline the fusion rather than emit wrong numbers -- a
+        # perf downgrade confined to configs that would otherwise be incorrect.
         fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
+            and not has_replicated_shared_expert(self.mlp)
         )
 
         # For DP with padding, reduce scatter can be used instead of all-reduce.

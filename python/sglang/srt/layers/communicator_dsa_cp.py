@@ -36,6 +36,7 @@ from sglang.srt.layers.dp_attention import (
     attn_cp_reduce_scatter_tensor,
     get_local_dp_buffer,
 )
+from sglang.srt.layers.moe.utils import has_replicated_shared_expert
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
@@ -112,15 +113,11 @@ def cp_requires_shared_expert_hoist(mlp) -> bool:
     result back after the reduce-scatter. Because this is a correctness
     requirement it is deliberately independent of ``SGLANG_DP_SHARED_EXPERT_LOCAL``,
     which only selects a perf variant of the same hoist on the DP path.
+
+    The CP combine is one of several reductions that can swallow a replicated
+    shared expert; ``has_replicated_shared_expert`` states the shared invariant.
     """
-    # getattr, not plain access: a dense (non-MoE) layer's mlp has no
-    # shared_experts attribute at all, and DeepseekV2MoE only assigns it when
-    # shared experts are neither fused nor per-rank-slotted. Three sites in
-    # deepseek_v2.py branch on hasattr(self, "shared_experts"), so it cannot be
-    # pre-initialized to None without changing their behaviour.
-    return getattr(mlp, "shared_experts", None) is not None and getattr(
-        mlp, "_shared_expert_tp1", False
-    )
+    return has_replicated_shared_expert(mlp)
 
 
 class DSACPLayerCommunicator(LayerCommunicator):
