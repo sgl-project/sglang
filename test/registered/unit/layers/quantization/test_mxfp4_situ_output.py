@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 def test_situ_routed_moe_returns_published_output_buffer():
     from sglang.srt.layers.moe import route_quant_handoff
+    from sglang.srt.layers.quantization import mxfp4 as mxfp4_module
     from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
     tokens, hidden, top_k = 3, 128, 2
@@ -80,12 +82,21 @@ def test_situ_routed_moe_returns_published_output_buffer():
             return_value=(packed_topk, x_quant, x_scale),
         ),
         patch(
-            "sglang.kernels.ops.moe.trtllm_gen_moe.available",
-            return_value=True,
-        ),
-        patch(
-            "sglang.kernels.ops.moe.trtllm_gen_moe.trtllm_fp4_block_scale_routed_moe",
+            "sglang.srt.layers.quantization.mxfp4.trtllm_fp4_block_scale_routed_moe",
             side_effect=fake_routed_moe,
+            create=True,
+        ),
+        patch.object(
+            mxfp4_module,
+            "RoutingMethodType",
+            SimpleNamespace(TopK=SimpleNamespace(value=0)),
+            create=True,
+        ),
+        patch.object(
+            mxfp4_module,
+            "ActivationType",
+            SimpleNamespace(Situ=SimpleNamespace(value=0)),
+            create=True,
         ),
         zero_copy_context.set_moe_output(latent),
     ):
@@ -95,3 +106,7 @@ def test_situ_routed_moe_returns_published_output_buffer():
     assert returned_ptr != latent.data_ptr()
     assert combine_input.hidden_states.data_ptr() == latent.data_ptr()
     torch.testing.assert_close(combine_input.hidden_states, expected, rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

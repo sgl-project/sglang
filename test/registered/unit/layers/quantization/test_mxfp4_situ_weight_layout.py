@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 
 from sglang.test.ci.ci_register import register_amd_ci
@@ -29,3 +31,7 @@ def test_aiter_situ_weight_layout_matches_activation_mode_precedence(
         monkeypatch.setenv("AITER_SITUV2_A4W4", a4w4)
 
     assert _aiter_situ_uses_gu_interleaved_weights() is expected
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
