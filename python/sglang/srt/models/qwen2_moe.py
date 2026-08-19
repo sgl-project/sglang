@@ -216,7 +216,7 @@ class Qwen2MoeMLP(nn.Module):
         # Lazily derived after weight load (input_scale_inv does not exist yet
         # at construction time); the fused kernel requires a 1-D global scale.
         self._down_input_scale_inv_1d = None
-        
+
         # When down_proj runs as online w8a8 FP8 (--enable-dense-fp8), fuse SiluAndMul +
         # per-token quant into one aiter kernel feeding the (fp8, scale) tuple to
         # down_proj. Aiter-only; default off.
