@@ -87,23 +87,32 @@ def grouped_gemm_nt_f8f8bf16_masked(
         flashinfer_backend = (
             "deepgemm" if DEEPGEMM_MASKED_FP8_BACKEND == "flashinfer" else "cake"
         )
-        lhs_scale = (
-            _unpack_packed_ue8m0_scale(lhs[1], collapse_mn=False)
-            if lhs[1].dtype == torch.int32
-            else lhs[1].contiguous()
-        )
-        if lhs_scale.dtype != torch.float32:
-            raise ValueError(
-                "batch DeepGEMM FP8 activation scales must be packed int32 "
-                f"UE8M0 or row-major float32, got dtype={lhs[1].dtype}"
+        if DEEPGEMM_MASKED_FP8_BACKEND == "cake":
+            if lhs[1].dtype != torch.int32 or rhs[1].dtype != torch.int32:
+                raise ValueError(
+                    "Cake masked FP8 requires native packed int32 UE8M0 scales, "
+                    f"got lhs={lhs[1].dtype}, rhs={rhs[1].dtype}"
+                )
+            lhs_scale = lhs[1]
+            rhs_scale = rhs[1]
+        else:
+            lhs_scale = (
+                _unpack_packed_ue8m0_scale(lhs[1], collapse_mn=False)
+                if lhs[1].dtype == torch.int32
+                else lhs[1].contiguous()
             )
-        rhs_scale = getattr(rhs[1], "_batch_deepgemm_fp8_scale", None)
-        if rhs_scale is None:
-            rhs_scale = _unpack_packed_ue8m0_scale(rhs[1], collapse_mn=True)
-            # Expert weights are immutable after model loading. Cache their
-            # expanded scale once instead of allocating/converting it for
-            # every MoE invocation.
-            rhs[1]._batch_deepgemm_fp8_scale = rhs_scale
+            if lhs_scale.dtype != torch.float32:
+                raise ValueError(
+                    "batch DeepGEMM FP8 activation scales must be packed int32 "
+                    f"UE8M0 or row-major float32, got dtype={lhs[1].dtype}"
+                )
+            rhs_scale = getattr(rhs[1], "_batch_deepgemm_fp8_scale", None)
+            if rhs_scale is None:
+                rhs_scale = _unpack_packed_ue8m0_scale(rhs[1], collapse_mn=True)
+                # Expert weights are immutable after model loading. Cache their
+                # expanded scale once instead of allocating/converting it for
+                # every MoE invocation.
+                rhs[1]._batch_deepgemm_fp8_scale = rhs_scale
         logger.info_once(
             "Using FlashInfer batch DeepGEMM API backend=%s for masked FP8 MoE "
             "(B=%d, M=%d, N=%d, K=%d, expected_m=%d, "
