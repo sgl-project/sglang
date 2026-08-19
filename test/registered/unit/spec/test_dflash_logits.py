@@ -72,15 +72,47 @@ def test_selector_greedy_row_walk_is_deterministic_in_a_mixed_batch():
         torch.testing.assert_close(mixed_q[row], q_rows[0])
 
 
-def test_selector_rejects_a_quantized_target_lm_head():
-    """The candidate matmuls read the lm_head weight directly, so a packed or
-    absent weight would be read as if it were dense."""
-    model = SimpleNamespace(
-        lm_head=SimpleNamespace(weight=torch.empty(8, 4, dtype=torch.int8)),
-        candidate_selector=SimpleNamespace(top_k=4),
+def test_selector_uses_quant_method_for_a_quantized_target_lm_head(monkeypatch):
+    """Packed head weights must be projected through their quantization method."""
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 4)
+    dense_weight = torch.randn(8, 4)
+
+    class FakeQuantMethod:
+        def __init__(self):
+            self.called = False
+
+        def apply(self, layer, x, bias):
+            self.called = True
+            assert layer.weight.dtype == torch.int8
+            assert bias is None
+            return torch.matmul(x, dense_weight.T)
+
+    quant_method = FakeQuantMethod()
+    lm_head = SimpleNamespace(
+        # Mimic a 2:1 packed head and two padded vocabulary rows.
+        weight=torch.empty(8, 2, dtype=torch.int8),
+        quant_method=quant_method,
+        org_vocab_size=6,
     )
-    with pytest.raises(RuntimeError, match="requires a dense"):
-        DFlash2DraftModel.compute_candidates(model, torch.randn(2, 4))
+    model = SimpleNamespace(
+        lm_head=lm_head,
+        candidate_selector=SimpleNamespace(top_k=4),
+        _transform_unary_logits=lambda logits: logits.float(),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.get_parallel",
+        lambda: SimpleNamespace(tp_size=1),
+    )
+    monkeypatch.setattr("sglang.srt.models.dflash._flashinfer_top_k", None)
+
+    candidate_ids, unary_logits = DFlash2DraftModel.compute_candidates(model, hidden)
+    expected_logits, expected_ids = torch.topk(
+        torch.matmul(hidden, dense_weight[:6].T), 4, dim=-1
+    )
+    assert quant_method.called
+    torch.testing.assert_close(candidate_ids, expected_ids)
+    torch.testing.assert_close(unary_logits, expected_logits.float())
 
 
 def test_grouped_conv_supports_runtime_block_sizes():

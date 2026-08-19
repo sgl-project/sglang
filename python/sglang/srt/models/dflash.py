@@ -23,7 +23,10 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    should_apply_lm_head_quant_method,
+)
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -961,24 +964,33 @@ class DFlash2DraftModel(DFlashDraftModel):
         per shard, all-gather K logits/ids (not the full vocab), then a global top-k --
         identical candidates at O(tp*K) instead of O(vocab) gather bandwidth."""
         assert self.lm_head is not None, "draft_model.lm_head unset before capture"
+        lm_head = self.lm_head
         k = self.candidate_selector.top_k
-        # The worker screens the head before capture, but its eager fallback
-        # (_propose_selector_block) attaches whatever the target has.
-        weight = getattr(self.lm_head, "weight", None)
-        if not is_dense_head_weight(weight):
+        parallel = get_parallel()
+        if parallel.tp_size == 1:
+            num_org = int(lm_head.org_vocab_size)
+            org_vocab_start = 0
+        else:
+            shard = lm_head.shard_indices
+            num_org = int(shard.num_org_elements)
+            org_vocab_start = int(shard.org_vocab_start_index)
+
+        weight = getattr(lm_head, "weight", None)
+        quant_method = getattr(lm_head, "quant_method", None)
+        if should_apply_lm_head_quant_method(lm_head, quant_method):
+            local_logits = quant_method.apply(lm_head, hidden, None)[:, :num_org]
+        elif is_dense_head_weight(weight):
+            local_logits = torch.matmul(hidden.to(weight.dtype), weight[:num_org].T)
+        else:
             raise RuntimeError(
-                "DFlash2 selector requires a dense FP16/BF16/FP32 target lm_head."
+                "DFlash2 selector requires a dense target lm_head or a supported "
+                "lm_head.quant_method."
             )
-        hidden = hidden.to(weight.dtype)
-        if get_parallel().tp_size == 1:
-            org = int(self.lm_head.org_vocab_size)
-            vals, ids = _radix_topk(torch.matmul(hidden, weight[:org].T), k)
+
+        vals, ids = _radix_topk(local_logits, k)
+        if parallel.tp_size == 1:
             return ids.long(), self._transform_unary_logits(vals)
-        shard = self.lm_head.shard_indices
-        vals, ids = _radix_topk(
-            torch.matmul(hidden, weight[: int(shard.num_org_elements)].T), k
-        )
-        global_ids = ids.long() + int(shard.org_vocab_start_index)
+        global_ids = ids.long() + org_vocab_start
         gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
         gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
         top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
