@@ -415,15 +415,12 @@ def fused_sigmoid_gating_delta_rule_update(
     split_n_hv_grid = q.device.type == "cuda"
     grid = (NV, N, HV) if split_n_hv_grid else (NK, NV, N * HV)
 
-    # Per-req stride must match the originally-allocated step dim. Prefer the
-    # caller-supplied ``cache_steps`` (forward_draft_decode passes a sliced
-    # view ``intermediate_ssm[:, step:]`` whose ``shape[1]`` no longer equals
-    # the allocated stride); fall back to ``shape[1]`` when callers pass the
-    # full buffer.
-    if cache_steps is not None and cache_steps > 0:
+    # Adaptive spec changes the runtime draft count without changing the
+    # allocated per-request pitch, which is preserved in stride(0).
+    if intermediate_states_buffer is not None:
+        cache_stride_steps = intermediate_states_buffer.stride(0) // (HV * K * V)
+    elif cache_steps is not None and cache_steps > 0:
         cache_stride_steps = cache_steps
-    elif intermediate_states_buffer is not None:
-        cache_stride_steps = intermediate_states_buffer.shape[1]
     else:
         cache_stride_steps = 0
 
