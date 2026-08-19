@@ -9,7 +9,7 @@ import torch.nn as nn
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 
-from sglang.kernels.ops.activation import silu_and_mul
+from sglang.srt.hardware_backend.npu.moe.activation import NPUSwiglu
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
@@ -89,7 +89,7 @@ class FeedForward(nn.Module):
                 and hidden_states.shape[-1] % 32 == 0
             ):
                 if current_platform.is_npu():
-                    hidden_states = silu_and_mul(hidden_states)
+                    hidden_states, _ = NPUSwiglu()._apply_activation(hidden_states)
                 else:
                     hidden_states = silu_and_mul_with_activation_rounding(hidden_states)
             else:
