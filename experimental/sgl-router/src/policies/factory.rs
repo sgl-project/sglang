@@ -152,8 +152,8 @@ pub fn build_registry_with_defaults(cfg: &Config) -> Result<PolicyRegistry> {
 mod tests {
     use super::*;
     use crate::config::{
-        ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ProxyConfig, ServerConfig,
-        StaticUrlsDiscoveryConfig,
+        ActiveLoadConfig, BucketConfig, Config, DiscoveryBackend, ModelConfig, ProxyConfig,
+        ServerConfig, StaticUrlsDiscoveryConfig,
     };
 
     use crate::config::PolicyKind;
@@ -178,6 +178,7 @@ mod tests {
             }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
+            buckets: BucketConfig::default(),
         }
     }
 

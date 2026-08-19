@@ -11,9 +11,10 @@ use std::num::NonZeroU32;
 
 use crate::config::{
     default_cb_cool_down, default_proxy_request_timeout_secs, default_stale_request_timeout_secs,
-    resolve_mode, ActiveLoadConfig, CacheAwareConfig, CircuitBreakerConfig, Config,
-    DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig, StickyConfig,
+    resolve_mode, ActiveLoadConfig, BucketConfig, BucketRange, CacheAwareConfig,
+    CircuitBreakerConfig, Config, DiscoveryBackend, K8sDiscoveryConfig, LogFormat, ModelConfig,
+    ObservabilityConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    StickyConfig,
 };
 
 /// `sgl-router` — slim KV-aware OpenAI-compatible router for SGLang workers.
@@ -132,6 +133,18 @@ pub struct Cli {
     /// Log output format.
     #[arg(long, value_enum, default_value = "text")]
     pub log_format: LogFormat,
+
+    // ---- bucket dispatch ----
+    /// Prefill bucket ranges, e.g. `short:0-2048` (space-separated or
+    /// repeated). Selected by uncached prefill token count. Omit the max
+    /// for an open-ended range: `long:2049-`. Ranges must not overlap.
+    #[arg(long, num_args = 1.., value_name = "NAME:MIN-MAX")]
+    pub prefill_bucket: Vec<BucketRange>,
+    /// Decode bucket ranges, e.g. `long:4097-` (space-separated or
+    /// repeated). Selected by estimated sequence length. Independent of
+    /// `--prefill-bucket`: the same name may appear in both.
+    #[arg(long, num_args = 1.., value_name = "NAME:MIN-MAX")]
+    pub decode_bucket: Vec<BucketRange>,
 }
 
 impl Cli {
@@ -274,6 +287,10 @@ impl Cli {
             },
             active_load: ActiveLoadConfig {
                 stale_request_timeout_secs: self.stale_request_timeout_secs,
+            },
+            buckets: BucketConfig {
+                prefill: self.prefill_bucket,
+                decode: self.decode_bucket,
             },
         };
         config.validate()?;
@@ -958,5 +975,107 @@ mod tests {
             err.contains("--sticky-idle-secs must be greater than 0"),
             "got: {err}"
         );
+    }
+
+    /// Bucket dispatch is opt-in: with no `--*-bucket` flags both range
+    /// lists are empty and the config is still valid.
+    #[test]
+    fn bucket_ranges_default_to_empty() {
+        let c = into_config_owned(with_model(&["--worker-urls", "http://x:30000"])).unwrap();
+        assert!(c.buckets.prefill.is_empty());
+        assert!(c.buckets.decode.is_empty());
+    }
+
+    #[test]
+    fn parses_repeated_and_space_separated_bucket_flags() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            // repeated flag
+            "--prefill-bucket",
+            "short:0-2048",
+            "--prefill-bucket",
+            "long:2049-",
+            // space-separated values under one flag
+            "--decode-bucket",
+            "short:0-4096",
+            "long:4097-",
+        ]))
+        .unwrap();
+
+        let prefill: Vec<&str> = c.buckets.prefill.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(prefill, ["short", "long"]);
+        assert_eq!(c.buckets.prefill[0].max_tokens, Some(2048));
+        // Omitting the max parses as an open-ended range.
+        assert_eq!(c.buckets.prefill[1].min_tokens, 2049);
+        assert_eq!(c.buckets.prefill[1].max_tokens, None);
+
+        let decode: Vec<&str> = c.buckets.decode.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(decode, ["short", "long"]);
+        assert_eq!(c.buckets.decode[0].max_tokens, Some(4096));
+    }
+
+    /// The two roles bucket on different quantities, so they are validated
+    /// independently — reusing a name across roles is not a conflict.
+    #[test]
+    fn prefill_and_decode_buckets_are_independent() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--prefill-bucket",
+            "short:0-2048",
+            "--decode-bucket",
+            "short:0-4096",
+        ]))
+        .unwrap();
+        assert_eq!(c.buckets.prefill[0].max_tokens, Some(2048));
+        assert_eq!(c.buckets.decode[0].max_tokens, Some(4096));
+    }
+
+    /// A malformed spec fails at `clap` parse time via `FromStr`, before
+    /// `into_config` runs.
+    #[test]
+    fn rejects_malformed_bucket_spec() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--prefill-bucket",
+            "short:2048",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("missing '-'"), "got: {err}");
+    }
+
+    /// Overlaps are a cross-bucket invariant, so they surface from
+    /// `Config::validate` — prefixed with the flag that has to change.
+    #[test]
+    fn rejects_overlapping_prefill_buckets() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--prefill-bucket",
+            "a:0-2048",
+            "b:1024-4096",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--prefill-bucket"), "got: {err}");
+        assert!(err.contains("overlap"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_decode_bucket_names() {
+        let err = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://x:30000",
+            "--decode-bucket",
+            "short:0-2048",
+            "short:2049-",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--decode-bucket"), "got: {err}");
+        assert!(err.contains("duplicate"), "got: {err}");
     }
 }

@@ -454,8 +454,8 @@ async fn register_one(
 mod tests {
     use super::*;
     use crate::config::{
-        ActiveLoadConfig, CircuitBreakerConfig as RawCbConfig, DiscoveryBackend, ModelConfig,
-        PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+        ActiveLoadConfig, BucketConfig, CircuitBreakerConfig as RawCbConfig, DiscoveryBackend,
+        ModelConfig, PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
     };
     use crate::discovery::{WorkerId, WorkerMode};
     use axum::{routing::get, Json, Router};
@@ -487,6 +487,7 @@ mod tests {
             }),
             proxy: ProxyConfig::default(),
             active_load: ActiveLoadConfig::default(),
+            buckets: BucketConfig::default(),
         }
     }
 

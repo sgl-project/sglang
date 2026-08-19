@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use sgl_router::config::{
-    ActiveLoadConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig, PolicyKind,
-    ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
+    ActiveLoadConfig, BucketConfig, Config, DiscoveryBackend, ModelConfig, ObservabilityConfig,
+    PolicyKind, ProxyConfig, ServerConfig, StaticUrlsDiscoveryConfig,
 };
 use sgl_router::discovery::{ModelId, WorkerId, WorkerMode, WorkerSpec};
 use sgl_router::policies::factory::build_registry_with_defaults as build_policy_registry;
@@ -43,6 +43,7 @@ fn config_for(_worker_url: &str) -> Config {
         }),
         proxy: ProxyConfig::default(),
         active_load: ActiveLoadConfig::default(),
+        buckets: BucketConfig::default(),
     }
 }
 
