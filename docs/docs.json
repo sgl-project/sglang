@@ -1336,6 +1336,7 @@
                   {
                     "group": "Baidu",
                     "pages": [
+                      "cookbook/autoregressive/Baidu/PaddleOCR-VL",
                       "cookbook/autoregressive/Baidu/Unlimited-OCR"
                     ]
                   },
