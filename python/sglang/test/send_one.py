@@ -20,6 +20,8 @@ import tabulate
 from sglang.profiler import run_profile
 from sglang.srt.utils.network import resolve_base_url
 
+JSON_OBJECT_SCHEMA = json.dumps({"type": "object"})
+
 
 @dataclasses.dataclass
 class BenchArgs:
@@ -176,7 +178,7 @@ def send_one_prompt(
             "Give me 3 trivial information about that city. "
             "Write in a format of json.\nAssistant:"
         )
-        json_schema = "$$ANY$$"
+        json_schema = JSON_OBJECT_SCHEMA
     else:
         json_schema = None
 

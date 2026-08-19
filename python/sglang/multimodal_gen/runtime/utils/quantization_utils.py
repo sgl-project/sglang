@@ -13,6 +13,9 @@ from sglang.multimodal_gen.runtime.layers.quantization import (
     get_quantization_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_loader.checkpoint_quantization import (
+    resolve_checkpoint_quant_spec,
+)
 
 logger = init_logger(__name__)
 
@@ -169,27 +172,17 @@ def get_quant_config(
         quant_cls = _load_quant_cls(quant_cfg)
         return quant_cls.from_config(quant_cfg, reverse_param_names_mapping)
 
-    if "quantization_config" not in model_config:
+    checkpoint_quant_spec = resolve_checkpoint_quant_spec(model_config)
+    if checkpoint_quant_spec is None:
         return None
 
-    hf_quant_config = normalize_flat_modelopt_quant_config(
-        model_config["quantization_config"]
-    )
-    if hf_quant_config is not None and not isinstance(hf_quant_config, dict):
-        hf_quant_config = hf_quant_config.to_dict()
+    hf_quant_config = normalize_flat_modelopt_quant_config(checkpoint_quant_spec.config)
     quant_cls = _load_quant_cls(hf_quant_config)
 
     # GGUF doesn't have config file
     if hf_quant_config["quant_method"] == "gguf":
         return quant_cls.from_config({})
 
-    # some vision model may keep quantization_config in their text_config
-    hf_text_config = getattr(model_config, "text_config", None)
-    if hf_quant_config is None and hf_text_config is not None:
-        hf_quant_config = getattr(hf_text_config, "quantization_config", None)
-    if hf_quant_config is None:
-        # compressed-tensors uses a compressions_config
-        hf_quant_config = getattr(model_config, "compression_config", None)
     if hf_quant_config is not None:
         hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
         is_modelopt_fp8 = (

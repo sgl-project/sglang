@@ -7,6 +7,10 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    is_fp8_fnuz,
+    per_token_group_quant_fp8,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
@@ -31,10 +35,6 @@ from sglang.multimodal_gen.runtime.utils.common import (
     use_intel_amx_backend,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.quantization.fp8_kernel import (
-    is_fp8_fnuz,
-    per_token_group_quant_fp8,
-)
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
@@ -455,6 +455,13 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # The activation quantization kernels assert on row-major input, and
+        # diffusion backbones routinely pass a permuted view. Normalising at the
+        # producer instead would also move the unquantized path's output, by
+        # changing which GEMM kernel it picks. No-op when already contiguous.
+        if not x.is_contiguous():
+            x = x.contiguous()
+
         if self.use_marlin:
             return apply_fp8_marlin_linear(
                 input=x,

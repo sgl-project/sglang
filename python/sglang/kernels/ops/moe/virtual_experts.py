@@ -9,7 +9,9 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.moe_align import moe_align_block_size as jit_moe_align_block_size
+from sglang.kernels.ops.moe.moe_align import (
+    moe_align_block_size as jit_moe_align_block_size,
+)
 
 
 @triton.jit
@@ -637,7 +639,7 @@ def _merged_experts_fused_moe_lora_add_impl(
 
         return result
 
-    from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+    from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
         invoke_fused_moe_kernel,
     )
 

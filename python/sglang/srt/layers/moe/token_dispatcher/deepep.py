@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -22,7 +23,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
-    DeepEPOutputDtype,
+    DispatcherOutputDtype,
     get_deepep_config,
     get_deepep_output_dtype,
     is_tbo_enabled,
@@ -38,19 +39,20 @@ from sglang.srt.utils import (
 )
 
 _is_npu = is_npu()
+_use_zbal = _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
 
 try:
-    if _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
+    if _use_zbal:
         from zbal.zbal.deepep_adaptor import Config
         from zbal.zbal_buffer import Buffer
     else:
         from deep_ep import Buffer, Config
 
     if not _is_npu:
-        from sglang.srt.layers.quantization.fp8_kernel import (
+        from sglang.kernels.ops.quantization.fp8_kernel import (
             sglang_per_token_group_quant_fp8,
         )
 
@@ -66,6 +68,18 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+
+_NVSHMEM_QP_DEPTH_DEFAULT = 1024
+
+
+def _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank: int) -> None:
+    min_qp_depth = 2 * (num_max_dispatch_tokens_per_rank + 1)
+    current_qp_depth = int(
+        os.environ.get("NVSHMEM_QP_DEPTH", _NVSHMEM_QP_DEPTH_DEFAULT)
+    )
+    os.environ["NVSHMEM_QP_DEPTH"] = str(
+        max(current_qp_depth, _NVSHMEM_QP_DEPTH_DEFAULT, min_qp_depth)
+    )
 
 
 def _is_mnnvl_fabric_supported() -> bool:
@@ -219,6 +233,8 @@ class DeepEPBuffer:
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
             assert num_experts != -1 and num_experts % group.size() == 0
+            if not _is_npu:
+                _set_nvshmem_qp_depth(num_max_dispatch_tokens_per_rank)
             num_rdma_bytes = max(
                 Buffer.get_low_latency_rdma_size_hint(
                     num_max_dispatch_tokens_per_rank,
@@ -422,22 +438,22 @@ class _DeepEPDispatcherImplBase:
 
         # Configuration mapping for each dtype
         config_map = {
-            DeepEPOutputDtype.BF16: {
+            DispatcherOutputDtype.BF16: {
                 "use_fp8": False,
                 "use_nvfp4": False,
             },
-            DeepEPOutputDtype.FP8: {
+            DispatcherOutputDtype.FP8: {
                 "use_fp8": True,
                 "use_nvfp4": False,
             },
             # Needed for Ascend A2/A3 NPU case,
             # despite the use_fp8 flag,
             # quantization will be performed in int8
-            DeepEPOutputDtype.INT8: {
+            DispatcherOutputDtype.INT8: {
                 "use_fp8": True,
                 "use_nvfp4": False,
             },
-            DeepEPOutputDtype.NVFP4: {
+            DispatcherOutputDtype.NVFP4: {
                 "use_fp8": False,
                 "use_nvfp4": True,
             },
@@ -458,23 +474,23 @@ class _DeepEPDispatcherImplBase:
     def _validate_and_adjust_dtype(self) -> None:
         """Validate dtype against hardware and adjust if necessary."""
         if _is_npu:
-            if self.deepep_output_dtype == DeepEPOutputDtype.FP8:
+            if self.deepep_output_dtype == DispatcherOutputDtype.FP8:
                 logger.warning_once(
                     "Ascend A2/A3 NPU does not support fp8 "
                     "deepep_dispatcher_output_dtype, switching to int8..."
                 )
-                self.deepep_output_dtype = DeepEPOutputDtype.INT8
-            elif self.deepep_output_dtype == DeepEPOutputDtype.NVFP4:
+                self.deepep_output_dtype = DispatcherOutputDtype.INT8
+            elif self.deepep_output_dtype == DispatcherOutputDtype.NVFP4:
                 raise RuntimeError(
                     "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
                 )
         else:
-            if self.deepep_output_dtype == DeepEPOutputDtype.INT8:
+            if self.deepep_output_dtype == DispatcherOutputDtype.INT8:
                 logger.warning_once(
                     "GPU does not support int8 "
                     "deepep_dispatcher_output_dtype, switching to fp8..."
                 )
-                self.deepep_output_dtype = DeepEPOutputDtype.FP8
+                self.deepep_output_dtype = DispatcherOutputDtype.FP8
             # NVFP4 is supported on GPU, no adjustment needed
 
     def _update_int8_quant_env(self) -> None:
@@ -493,6 +509,8 @@ class _DeepEPDispatcherImplBase:
 
 
 class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
+    dispatch_mode = DeepEPMode.NORMAL
+
     def __init__(self, async_finish: bool, **kwargs):
         super().__init__(**kwargs)
 
@@ -653,6 +671,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
 
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
+    dispatch_mode = DeepEPMode.LOW_LATENCY
+
     def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
 
@@ -753,7 +773,11 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=self.use_fp8,
-                **(dict(topk_weights=topk_weights) if _is_npu else dict()),
+                **(
+                    dict(topk_weights=topk_weights)
+                    if _is_npu and not _use_zbal
+                    else dict()
+                ),
                 **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
                 **(
                     dict(x_global_scale=input_global_scale)

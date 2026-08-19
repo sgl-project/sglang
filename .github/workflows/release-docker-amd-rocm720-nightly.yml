@@ -50,7 +50,7 @@ jobs:
         id: version
         run: |
           # Use the shared helper so stable/post releases sort above rc tags.
-          VERSION=$(python3 python/tools/get_version_tag.py --tag-only | sed 's/^v//')
+          VERSION=$(python3 scripts/release/get_version_tag.py --tag-only | sed 's/^v//')
 
           if [ -z "$VERSION" ]; then
             echo "::error::Could not determine version from git tags"
@@ -134,7 +134,7 @@ jobs:
   # of publish failed; legs without an artifact will fail at download and be
   # the only ones marked red.
   push_local_registry:
-    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish') }}
+    if: ${{ false }}
     runs-on: linux-mi300-1gpu-sglang
     environment: 'prod'
     needs: publish

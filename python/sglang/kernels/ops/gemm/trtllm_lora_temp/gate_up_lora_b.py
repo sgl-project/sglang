@@ -147,7 +147,7 @@ def _gate_up_lora_b_kernel(
 
     # Store result to output matrix
     partial_sum *= scaling
-    partial_sum = partial_sum.to(x.dtype.element_ty)
+    partial_sum = partial_sum.to(output.dtype.element_ty)
     output_ptr = (
         output
         + n_start * output_stride_1
@@ -214,6 +214,7 @@ def gate_up_lora_b_fwd(
         )
         and s * r >= _CUBLAS_MIN_S_RANK
         and gate_up_lora_b.shape[0] == 1
+        and x.dtype == gate_up_lora_b.dtype
     ):  # single-adapter fast path: only valid with one resident slot
         return _gate_up_lora_b_cublas(
             x, gate_up_lora_b, batch_info, output_dim, base_output

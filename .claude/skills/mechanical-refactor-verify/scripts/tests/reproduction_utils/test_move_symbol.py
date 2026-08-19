@@ -321,6 +321,76 @@ def test_move_symbol_rejects_ambiguous_duplicate_names(tmp_path: Path) -> None:
         _apply(r, tmp_path)
 
 
+def test_move_symbol_after_inserts_below_named_function(tmp_path: Path) -> None:
+    """With after=, the relocated def lands immediately below that sibling def."""
+    (tmp_path / "src.py").write_text("def moved():\n    return 1\n")
+    (tmp_path / "dst.py").write_text(
+        "def first():\n    return 0\n\n\ndef last():\n    return 2\n"
+    )
+    r = Repro("b", "t").move_symbol(
+        "moved", src="src.py", dst="dst.py", into_class=None, after="first"
+    )
+    _apply(r, tmp_path)
+    dst_out = (tmp_path / "dst.py").read_text()
+    assert (
+        dst_out.index("def first")
+        < dst_out.index("def moved")
+        < dst_out.index("def last")
+    )
+
+
+def test_move_symbol_after_assign_lands_before_typechecking_guard(
+    tmp_path: Path,
+) -> None:
+    """after= anchors on a module-level assignment target, landing the def just below it and
+    above a following ``if TYPE_CHECKING:`` guard (which is not a nameable anchor)."""
+    (tmp_path / "src.py").write_text("def helper(x):\n    return x + 1\n")
+    (tmp_path / "dst.py").write_text(
+        "from u import is_hip\n"
+        "\n"
+        "_is_hip = is_hip()\n"
+        "\n"
+        "if TYPE_CHECKING:\n"
+        "    from m import Thing\n"
+    )
+    r = Repro("b", "t").move_symbol(
+        "helper", src="src.py", dst="dst.py", into_class=None, after="_is_hip"
+    )
+    _apply(r, tmp_path)
+    dst_out = (tmp_path / "dst.py").read_text()
+    assert (
+        dst_out.index("_is_hip = is_hip()")
+        < dst_out.index("def helper")
+        < dst_out.index("if TYPE_CHECKING:")
+    )
+
+
+def test_move_symbol_before_and_after_are_mutually_exclusive(tmp_path: Path) -> None:
+    """Passing both before= and after= is rejected up front."""
+    (tmp_path / "src.py").write_text("def moved():\n    return 1\n")
+    (tmp_path / "dst.py").write_text("def z():\n    return 0\n")
+    with pytest.raises(AssertionError):
+        Repro("b", "t").move_symbol(
+            "moved",
+            src="src.py",
+            dst="dst.py",
+            into_class=None,
+            before="z",
+            after="z",
+        )
+
+
+def test_move_symbol_asserts_when_after_symbol_missing(tmp_path: Path) -> None:
+    """An after= anchor absent from the destination must raise, not fall back to append."""
+    (tmp_path / "src.py").write_text("def moved():\n    return 1\n")
+    (tmp_path / "dst.py").write_text("def z():\n    return 0\n")
+    r = Repro("b", "t").move_symbol(
+        "moved", src="src.py", dst="dst.py", into_class=None, after="NO_SUCH_SYMBOL"
+    )
+    with pytest.raises(AssertionError):
+        _apply(r, tmp_path)
+
+
 def test_move_symbol_asserts_when_before_sibling_missing(tmp_path: Path) -> None:
     """A before= anchor absent from the destination must raise, not fall back to append."""
     (tmp_path / "src.py").write_text("def moved():\n    return 1\n")
@@ -355,6 +425,23 @@ def test_move_symbol_negative_dedent_indents_into_the_class(tmp_path: Path) -> N
     )
     _apply(r, tmp_path)
     assert "    def helper(x):\n        return x\n" in (tmp_path / "dst.py").read_text()
+
+
+def test_move_symbol_relocates_a_top_level_class(tmp_path: Path) -> None:
+    """move_symbol relocates a whole top-level class (with its methods) verbatim."""
+    (tmp_path / "src.py").write_text(
+        "x = 1\n\n\nclass Widget:\n    def get(self, rank):\n        return rank\n"
+    )
+    (tmp_path / "dst.py").write_text("y = 2\n")
+    r = Repro("b", "t").move_symbol(
+        "Widget", src="src.py", dst="dst.py", into_class=None
+    )
+    _apply(r, tmp_path)
+    assert "class Widget:" not in (tmp_path / "src.py").read_text()
+    assert (
+        "class Widget:\n    def get(self, rank):\n        return rank\n"
+        in (tmp_path / "dst.py").read_text()
+    )
 
 
 # --- adversarial audit: leave_delegate stubs -------------------------------------

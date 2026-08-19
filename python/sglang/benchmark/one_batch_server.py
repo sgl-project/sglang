@@ -785,9 +785,15 @@ def run_one_case(
         response.raise_for_status()
         server_info = response.json()
         internal_states = server_info.get("internal_states", [])
-        internal_state = internal_states[0] if internal_states else {}
-        last_gen_throughput = internal_state.get("last_gen_throughput", None) or -1
-        acc_length = internal_state.get("avg_spec_accept_length", None) or -1
+        acc_length = -1
+        last_gen_throughput = -1
+        for internal_state in internal_states:
+            val_acc = internal_state.get("avg_spec_accept_length")
+            if val_acc is not None:
+                acc_length = val_acc
+            val_thr = internal_state.get("last_gen_throughput")
+            if val_thr is not None:
+                last_gen_throughput = val_thr
 
     # Calculate cache hit rate from before/after metrics delta
     metrics_after = get_cache_tokens_from_metrics(url)
@@ -996,10 +1002,21 @@ def run_benchmark_internal(
                 "token_capacity", 1000000000
             )
 
-        assert (
-            max_running_requests_per_dp > 0
-        ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
-        skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
+        # Router /get_server_info responses carry "router_manager"; worker
+        # responses never do, so its presence confirms a router by design.
+        if not internal_states and server_info.get("router_manager"):
+            print(
+                "WARNING: base_url points at a PD router; worker internal "
+                "states are unavailable, so the max-running-requests and "
+                "token-capacity skip guards are disabled."
+            )
+            skip_max_running_requests_threshold = float("inf")
+            skip_token_capacity_threshold = float("inf")
+        else:
+            assert (
+                max_running_requests_per_dp > 0
+            ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
+            skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
 
         print(f"{max_running_requests_per_dp=}")
         print(f"{dp_size=}")

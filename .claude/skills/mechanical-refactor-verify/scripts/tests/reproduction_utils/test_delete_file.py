@@ -46,4 +46,23 @@ def test_delete_file_on_a_missing_path_is_a_no_op(tmp_path: Path) -> None:
     assert not (tmp_path / "nope.py").exists()
 
 
+def test_delete_file_allows_a_bare_module_logger(tmp_path: Path) -> None:
+    """A leftover module holding only imports and a `logger` is deletable scaffolding."""
+    (tmp_path / "gone.py").write_text(
+        "import logging\n\nlogger = logging.getLogger(__name__)\n"
+    )
+    r = Repro("b", "t").delete_file("gone.py")
+    _apply(r, tmp_path)
+    assert not (tmp_path / "gone.py").exists()
+
+
+def test_delete_file_still_refuses_a_non_logger_assignment(tmp_path: Path) -> None:
+    """A leftover module-level assignment other than a logger blocks deletion."""
+    (tmp_path / "live.py").write_text("CONFIG = {'a': 1}\n")
+    r = Repro("b", "t").delete_file("live.py")
+    with pytest.raises(AssertionError):
+        _apply(r, tmp_path)
+    assert (tmp_path / "live.py").exists()
+
+
 # --- adversarial audit: extract_function -----------------------------------------

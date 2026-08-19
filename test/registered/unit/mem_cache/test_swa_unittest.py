@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from types import SimpleNamespace
 
 import torch
 
@@ -35,9 +36,7 @@ class _DummyReq:
     def __init__(self):
         self._kv_committed_len = 0
         self.swa_prefix_lock_released = False
-
-    def pop_committed_kv_cache(self):
-        return self._kv_committed_len
+        self.kv = SimpleNamespace(swa_evicted_seqlen=0)
 
 
 def _build_swa_tree(
@@ -151,18 +150,20 @@ class TestSWA(unittest.TestCase):
         first_insert_events = [
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
-        self.assertEqual(len(first_insert_events), 4)
-        self.assertEqual([e.token_ids[0] for e in first_insert_events], [1, 2, 3, 4])
+        self.assertEqual(len(first_insert_events), 1)
+        self.assertEqual(list(first_insert_events[0].token_ids), [1, 2, 3, 4])
 
         _insert(tree, allocator, [1, 2, 3, 4, 5, 6])
         second_insert_events = [
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
-        self.assertEqual(len(second_insert_events), 2)
-        self.assertEqual([e.token_ids[0] for e in second_insert_events], [5, 6])
+        self.assertEqual(len(second_insert_events), 1)
+        self.assertEqual(list(second_insert_events[0].token_ids), [5, 6])
 
         stored_hashes = [
-            e.block_hashes[0] for e in first_insert_events + second_insert_events
+            block_hash
+            for event in first_insert_events + second_insert_events
+            for block_hash in event.block_hashes
         ]
 
         # Evicting only SWA tokens tombstones nodes but keeps full KV blocks.
@@ -190,15 +191,15 @@ class TestSWA(unittest.TestCase):
         first_insert_events = [
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
-        self.assertEqual(len(first_insert_events), 4)
-        split_parent_hash = first_insert_events[1].block_hashes[0]
+        self.assertEqual(len(first_insert_events), 1)
+        split_parent_hash = first_insert_events[0].block_hashes[1]
 
         _insert(tree, allocator, [1, 2, 5, 6])
         second_insert_events = [
             e for e in tree.take_events() if isinstance(e, BlockStored)
         ]
-        self.assertEqual(len(second_insert_events), 2)
-        self.assertEqual(list(second_insert_events[0].token_ids), [5])
+        self.assertEqual(len(second_insert_events), 1)
+        self.assertEqual(list(second_insert_events[0].token_ids), [5, 6])
         self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
 
     def test_swa_memory_pool_paged_free_clears_full_page_mapping(self):
@@ -224,6 +225,41 @@ class TestSWA(unittest.TestCase):
 
         allocator.free_swa(full_indices[1:2])
         self.assertEqual(allocator.swa_available_size(), 16)
+
+    def test_free_swa_group_owns_deferred_indices(self):
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            kv_size=32,
+            kv_size_swa=32,
+        )
+        index_batches = []
+        for size in (2, 3, 1, 4):
+            indices = _swa_alloc(allocator, size)
+            assert indices is not None
+            index_batches.append(indices)
+        original_indices = torch.cat([indices.clone() for indices in index_batches])
+
+        available_before_free = allocator.swa_available_size()
+        allocator.free_group_begin()
+        for indices in index_batches:
+            allocator.free_swa(indices)
+
+        self.assertEqual(len(allocator.swa_free_group), len(index_batches))
+        self.assertEqual(allocator.swa_available_size(), available_before_free)
+        for indices in index_batches:
+            indices.zero_()
+        allocator.free_group_end()
+
+        self.assertTrue(
+            torch.equal(
+                allocator.full_to_swa_index_mapping[original_indices.to(torch.int64)],
+                torch.zeros_like(original_indices),
+            )
+        )
+        self.assertEqual(
+            allocator.swa_available_size(),
+            available_before_free + original_indices.numel(),
+        )
 
     def test_swa_radix_cache_1(self):
         # args
@@ -573,9 +609,10 @@ class TestSWA(unittest.TestCase):
             (req.req_pool_idx, slice(0, req._kv_committed_len)), kv_indices
         )
         req.extra_key = None
+        req.cache_salt = None
         req.last_node = tree.root_node
         req.swa_uuid_for_lock = None
-        req.swa_evicted_seqlen = 0
+        req.kv.swa_evicted_seqlen = 0
         req.cache_protected_len = 1
         # Intentionally mismatch to ensure code does not use len(prefix_indices).
         req.prefix_indices = torch.tensor([7, 8, 9, 10, 11], device=tree.device)
@@ -590,7 +627,9 @@ class TestSWA(unittest.TestCase):
             return original_insert(params)
 
         tree.insert = wrapped_insert
-        tree.cache_finished_req(req, is_insert=True)
+        tree.cache_finished_req(
+            req, is_insert=True, kv_len_to_handle=req._kv_committed_len
+        )
 
         self.assertEqual(captured["prev_prefix_len"], req.cache_protected_len)
         self.assertTrue(captured["is_bigram"])
@@ -608,9 +647,10 @@ class TestSWA(unittest.TestCase):
             (req2.req_pool_idx, slice(0, req2._kv_committed_len)), kv_indices2
         )
         req2.extra_key = None
+        req2.cache_salt = None
         req2.last_node = tree.root_node
         req2.swa_uuid_for_lock = None
-        req2.swa_evicted_seqlen = 0
+        req2.kv.swa_evicted_seqlen = 0
         req2.cache_protected_len = 1
         req2.prefix_indices = torch.tensor([21, 22, 23, 24, 25], device=tree.device)
 
@@ -622,7 +662,9 @@ class TestSWA(unittest.TestCase):
             return original_free(indices)
 
         allocator.free = wrapped_free
-        tree.cache_finished_req(req2, is_insert=False)
+        tree.cache_finished_req(
+            req2, is_insert=False, kv_len_to_handle=req2._kv_committed_len
+        )
 
         # EAGLE + page_size=1 => page_aligned_len = committed_len - 1 = 5
         # Expected frees:

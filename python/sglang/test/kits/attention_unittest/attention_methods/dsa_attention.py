@@ -5,6 +5,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, ReqToTokenPool
@@ -258,7 +259,12 @@ class TinyDSAModelConfig:
             index_topk=index_topk,
             num_hidden_layers=1,
         )
+        self.hf_config.get_text_config = lambda: self.hf_config
         self.hf_text_config = self.hf_config
+        self.linear_attn_registry_result = None
+
+    def get_max_num_attention_heads(self) -> int:
+        return self.num_attention_heads
 
 
 class DSAMockModelRunner(ModelRunner):
@@ -286,6 +292,12 @@ class DSAMockModelRunner(ModelRunner):
         # 656 bytes/token while the model still projects K/V in BF16;
         # `set_mla_kv_buffer` does the quantize on the way in.
         self.kv_cache_dtype = torch.float8_e4m3fn if fp8_kv_cache else dtype
+        self.kv_cache_dtype_str = "auto"
+        # This runner's own resolved backends (production stamps these in
+        # ModelRunner.initialize); a draft runner would carry its own.
+        self.prefill_attention_backend_str = case.backend
+        self.decode_attention_backend_str = case.backend
+        self.draft_attention_backend = None
         # For TARGET_VERIFY / DRAFT_EXTEND, the DSA backend uses
         # `self.speculative_num_draft_tokens` to size `seqlens_expanded`
         # (`dsa_backend.py:482-486,510-515`). When zero, deep_gemm's
@@ -308,6 +320,7 @@ class DSAMockModelRunner(ModelRunner):
         self._kernel_warmed_up = True
         self.dp_size = 1
         self.pp_size = 1
+        self.ps = ParallelState.trivial()
         self._server_args_override = get_context().override_server_args(
             attention_backend=case.backend,
             chunked_prefill_size=-1,
@@ -350,6 +363,7 @@ class DSAMockModelRunner(ModelRunner):
             triton_attention_split_tile_size=None,
         )
         self.server_args = self._server_args_override.install()
+        self.max_running_requests = pool_batch_size
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
             max_context_len=max_context_len,
@@ -1128,11 +1142,14 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
 
     if impl == "fa3":
         try:
-            from sglang.jit_kernel.flash_attention import (  # noqa: F401
+            from sglang.kernels.ops.attention.flash_attention import (  # noqa: F401
                 flash_attn_with_kvcache,
             )
         except ImportError as exc:
-            return False, f"sglang.jit_kernel.flash_attention unavailable: {exc}"
+            return (
+                False,
+                f"sglang.kernels.ops.attention.flash_attention unavailable: {exc}",
+            )
         # sgl-kernel flash_attn is compiled for SM9.x (Hopper) only;
         # it raises NotImplementedError on Blackwell (SM10.x+).
         if major < 9 or major >= 10:
@@ -1141,7 +1158,7 @@ def dsa_impl_capability(impl: str) -> tuple[bool, str]:
 
     if impl == "tilelang":
         try:
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import (  # noqa: F401
+            from sglang.kernels.ops.attention.dsa.tilelang_kernel import (  # noqa: F401
                 tilelang_sparse_fwd,
             )
         except ImportError as exc:

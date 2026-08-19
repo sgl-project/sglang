@@ -315,7 +315,13 @@ class DiffusionTestCase:
             )
 
 
-LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
+_REALTIME_MODEL_COMMON_EXTRAS = {
+    "seed": 42,
+    "num_inference_steps": 4,
+    "guidance_scale": 1.0,
+}
+
+REALTIME_MODEL_sampling_params = DiffusionSamplingParams(
     prompt=(
         "A slow aerial orbit around a pastel floating island hotel in the open "
         "ocean, hazy sunlight, turquoise water, toy-like architectural detail, "
@@ -336,9 +342,7 @@ LINGBOT_WORLD_REALTIME_sampling_params = DiffusionSamplingParams(
     },
     realtime_perf_ignore_initial_chunks=2,
     extras={
-        "seed": 42,
-        "num_inference_steps": 4,
-        "guidance_scale": 1.0,
+        **_REALTIME_MODEL_COMMON_EXTRAS,
         "realtime_causal_sink_size": 9,
         "realtime_causal_kv_cache_num_frames": 18,
         "condition_inputs": {
@@ -366,7 +370,7 @@ PI05_ACTION_CI_sampling_params = DiffusionSamplingParams(
     extras={
         "action_horizon": 50,
         "action_dim": 32,
-        "state_dim": 32,
+        "state_dim": 14,
         "image_size": 64,
         "num_inference_steps": 2,
         "seed": 0,
@@ -573,6 +577,14 @@ T2V_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
 )
 
+SANA_VIDEO_T2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt="A curious raccoon walks through a sunlit forest. motion score: 30.",
+    output_size="832x480",
+    num_frames=17,
+    fps=16,
+    extras={"num_inference_steps": 8, "guidance_scale": 6.0, "seed": 42},
+)
+
 JOY_ECHO_T2V_CI_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
     output_size="640x384",
@@ -592,6 +604,65 @@ MODELOPT_T2V_CI_sampling_params = DiffusionSamplingParams(
     extras={"num_inference_steps": 12, "seed": 0},
 )
 
+LINGBOT_VIDEO_T2V_CI_PROMPT = json.dumps(
+    {
+        "comprehensive_description": {
+            "scene_content_description": (
+                "A small silver robot arm on a white table slowly reaches "
+                "toward a red cube. The background is a plain, softly lit "
+                "laboratory wall."
+            ),
+            "camera_movement_description": (
+                "The camera is static at eye level, medium shot, with the "
+                "robot arm centered and in sharp focus."
+            ),
+        },
+        "camera_info": {
+            "color": "Neutral",
+            "frame_size": "Medium",
+            "shot_type_angle": "Eye level",
+            "lens_size": "Medium",
+            "composition": "Center",
+            "lighting": "Soft light",
+            "lighting_type": "Artificial light",
+        },
+        "world_knowledge": [],
+        "prominent_elements": [
+            {
+                "name": "robot arm",
+                "description": "A small silver robot arm with a two-finger gripper.",
+                "actions": [
+                    {
+                        "timestamp": "[0.0s - 1.0s]",
+                        "action": "reaches toward the red cube",
+                    }
+                ],
+                "location": "center of the frame",
+                "relative_size": "dominant",
+                "shape_and_color": "articulated silver metal arm",
+                "texture": "brushed metal",
+                "appearance_details": "two-finger gripper, visible joints",
+                "relationship": "reaching toward the red cube on the table",
+                "orientation": "upright, base on the table",
+                "pose": "reaching",
+                "expression": "",
+                "clothing": "",
+                "gender": "",
+                "skin_tone_and_texture": "",
+            }
+        ],
+    },
+    separators=(",", ":"),
+)
+
+LINGBOT_VIDEO_T2V_CI_sampling_params = DiffusionSamplingParams(
+    prompt=LINGBOT_VIDEO_T2V_CI_PROMPT,
+    output_size="384x640",
+    num_frames=17,
+    fps=16,
+    extras={"num_inference_steps": 12, "seed": 0},
+)
+
 TI2V_sampling_params = DiffusionSamplingParams(
     prompt="The man in the picture slowly turns his head, his expression enigmatic and otherworldly. The camera performs a slow, cinematic dolly out, focusing on his face. Moody lighting, neon signs glowing in the background, shallow depth of field.",
     image_path="https://is1-ssl.mzstatic.com/image/thumb/Music114/v4/5f/fa/56/5ffa56c2-ea1f-7a17-6bad-192ff9b6476d/825646124206.jpg/600x600bb.jpg",
@@ -605,6 +676,28 @@ SANA_WM_TI2V_CI_sampling_params = DiffusionSamplingParams(
     output_size="384x640",
     num_frames=17,
     extras={"num_inference_steps": 12, "seed": 0, "guidance_scale": 4.5},
+)
+
+LONGLIVE2_T2V_CI_sampling_params = replace(
+    REALTIME_MODEL_sampling_params,
+    image_path=None,
+    num_frames=61,
+    realtime_num_chunks=None,
+    realtime_events=[],
+    realtime_perf_thresholds={},
+    realtime_perf_ignore_initial_chunks=0,
+    extras=dict(_REALTIME_MODEL_COMMON_EXTRAS),
+)
+
+LONGLIVE2_I2V_CI_sampling_params = replace(
+    REALTIME_MODEL_sampling_params,
+    output_size="960x928",
+    num_frames=61,
+    realtime_num_chunks=None,
+    realtime_events=[],
+    realtime_perf_thresholds={},
+    realtime_perf_ignore_initial_chunks=0,
+    extras=dict(_REALTIME_MODEL_COMMON_EXTRAS),
 )
 
 TURBOWAN_I2V_sampling_params = DiffusionSamplingParams(
