@@ -307,6 +307,7 @@ def build_kv_only_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=server_args.hicache_host_memory_mode,
     )
     if params.mtp_draft_device_pools:
         cache_controller.set_mtp_draft_pools(params.mtp_draft_device_pools)
@@ -377,6 +378,7 @@ def build_hybrid_swa_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=server_args.hicache_host_memory_mode,
     )
     if mtp_swa_device_pools:
         cache_controller.set_mtp_draft_pools(mtp_swa_device_pools)
@@ -664,6 +666,7 @@ def build_deepseek_v4_hicache_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=server_args.hicache_host_memory_mode,
     )
     if mtp_swa_device_buffers:
         cache_controller.set_mtp_draft_pools(mtp_swa_device_buffers)
@@ -759,6 +762,7 @@ def build_hybrid_mamba_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=server_args.hicache_host_memory_mode,
     )
     if mtp_draft_device_pools:
         cache_controller.set_mtp_draft_pools(mtp_draft_device_pools)
@@ -874,6 +878,7 @@ def build_hybrid_mamba_swa_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=server_args.hicache_host_memory_mode,
     )
     return host_pool_group, cache_controller
 
@@ -951,6 +956,7 @@ def build_anchor_sidecar_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         transfer_layer_num=transfer_layer_num,
         enable_storage_metrics=enable_storage_metrics,
+        host_memory_mode=server_args.hicache_host_memory_mode,
     )
     if mtp_draft_device_pools:
         cache_controller.set_mtp_draft_pools(mtp_draft_device_pools)
@@ -1007,9 +1013,11 @@ def build_full_draft_pools(
     controller = tree_cache.cache_controller
     host_pool_group = controller.mem_pool_host
 
+    # Note(kpham-sgl): DCP x DSpark draft KV is replicated and spans the virtual
+    # loc space, so match the target host's logical_size instead of physical size.
     draft_host_pool = _build_mha_mla_host_pool(
         pool=pool,
-        host_to_device_ratio=host_pool_group.size / pool.size,
+        host_to_device_ratio=host_pool_group.logical_size / pool.size,
         page_size=controller.page_size,
         layout=server_args.hicache_mem_layout,
         allocator_type=_get_allocator_type(server_args),
