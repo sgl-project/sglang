@@ -137,9 +137,13 @@ class BaseKVSender(ABC):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
+        wait_event: Optional[object] = None,
     ):
         """
         Send the kv cache at the given kv indices and the extra cache/state at the given indices to the decoder server.
+
+        If wait_event is provided, an asynchronous sender must wait for it before
+        reading the source buffers.
         """
         ...
 

@@ -26,6 +26,7 @@ class TransferKVChunk:
     state_indices: Optional[List]
     chunk_id: Optional[int] = None
     num_kv_tokens: Optional[int] = None
+    wait_event: Optional[object] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )
