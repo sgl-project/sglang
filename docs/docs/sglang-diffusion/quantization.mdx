@@ -139,9 +139,9 @@ backend.
       <td><code>gguf</code></td>
       <td>A single community <code>.gguf</code> holding the transformer</td>
       <td><code>--transformer-weights-path</code></td>
-      <td>MiniMax-H3 (validated, non-pruned <code>fl2va</code>)</td>
+      <td>MiniMax-H3 <code>fl2va</code> (original and pruned AdaLN curve)</td>
       <td>None</td>
-      <td>CUDA only, <code>--tp-size 1</code>, no FSDP. Shrinks the download and the host memory offload pins (17.5 vs 61.7 GiB for H3) rather than peak VRAM, which offload already bounds. Dequantized per use, so it is not faster. See <a href="#gguf">GGUF</a>.</td>
+      <td>CUDA only, no FSDP. TP requires GGML-aligned shard boundaries. Shrinks the download and the host memory offload pins (17.5 vs 61.7 GiB for H3) rather than peak VRAM, which offload already bounds. Dequantized per use, so it is not faster. See <a href="#gguf">GGUF</a>.</td>
     </tr>
   </tbody>
 </table>
@@ -751,6 +751,10 @@ sglang serve \
   --port 30010
 ```
 
+The pruned architecture keeps its sampled curve and reduced AdaLN projections
+in FP32, matching the published checkpoint implementation. This precision
+island deliberately bypasses the BF16-only fused modulation kernels.
+
 #### Whether to offload the VAE
 
 Adding `vae` to `--layerwise-offload-components` trades a lot of latency for
@@ -791,13 +795,15 @@ startup rejects a degree that cuts a row-parallel matrix inside a GGML block.
 | MiniMax-H3 `fl2va` | [`leejet/MiniMax-H3-GGUF`](https://huggingface.co/leejet/MiniMax-H3-GGUF) `minimax_h3_fl2va-Q4_K_M.gguf` (17.5 GiB) | 1x RTX 5090 (32 GiB) | t2va 1344x768, 107 frames, video + audio; 19.6-26.3 GiB peak depending on VAE offload |
 | MiniMax-H3 `fl2va` | `minimax_h3_fl2va-Q4_K_M.gguf` (17.5 GiB) | 1x H200 (141 GiB) | 2-step t2va 1344x768, 107 frames, H.264 + AAC; 10.13 s and 17.17 GiB peak |
 | MiniMax-H3 `fl2va`, pruned AdaLN curve | [`unsloth/MiniMax-H3-GGUF`](https://huggingface.co/unsloth/MiniMax-H3-GGUF) `minimax_h3_fl2va_pruned-Q4_K.gguf` (10.7 GiB loaded DiT) | 1x H200 (141 GiB) | 2-step t2va 1344x768, 107 frames, H.264 + AAC |
+| MiniMax-H3 `fl2va`, pruned AdaLN curve | `minimax_h3_fl2va_pruned-Q4_K.gguf` | 1x GB300 (CUDA 13, PyTorch 2.13) | 50-step t2va 1344x768, 107 frames, H.264 + AAC; 105.38 s and 80.88 GB peak |
+| MiniMax-H3 `fl2va`, pruned AdaLN curve | `minimax_h3_fl2va_pruned-Q4_K.gguf` | 2x GB300, TP2 (CUDA 13, PyTorch 2.13) | 2-step t2va 1344x768, 107 frames, H.264 + AAC; 7.55 s and 51.90 GB peak per rank |
 
 The DiT loads at 17.5 GiB against 61.7 GiB for the BF16 checkpoint. Weight
 fidelity was checked tensor-by-tensor against the BF16 reference: cosine
 1.00000 for the F32/BF16 tensors and 0.9973 for Q4_K/Q4_0.
 
 Not validated in the measurements above: any other quantization type, the
-`ref2va` partition, multi-GPU, and a BF16-vs-GGUF output comparison.
+`ref2va` partition, and a BF16-vs-GGUF output comparison.
 
 ## Nunchaku (SVDQuant)
 
