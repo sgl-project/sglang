@@ -11,6 +11,10 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.kernels.ops.quantization.per_token_group_quant import (
+    _allocate_outputs,
+    _infer_scale_layout,
+)
 from sglang.srt.layers.deep_gemm_wrapper import entrypoint
 from sglang.srt.layers.moe.moe_runner import deep_gemm as deep_gemm_runner
 
@@ -210,6 +214,28 @@ class TestDeepGemmMaskedFp8Backend(unittest.TestCase):
         torch.testing.assert_close(unpacked, expected, rtol=0, atol=0)
         self.assertEqual(unpacked.shape, (1, 2, 4))
         self.assertTrue(unpacked.is_contiguous())
+
+    def test_unpacked_ue8m0_scale_layout_is_row_major_float32(self):
+        scale = torch.empty((2, 3, 4), dtype=torch.float32)
+        self.assertEqual(
+            _infer_scale_layout(scale, scale_ue8m0=True, num_groups=4),
+            (True, True, True),
+        )
+
+        source = torch.empty((2, 256), dtype=torch.bfloat16)
+        output_q, output_s = _allocate_outputs(
+            source,
+            group_size=128,
+            out_dtype=torch.float8_e4m3fn,
+            scale_ue8m0=True,
+            column_major_scales=False,
+            fuse_silu_and_mul=False,
+            unpacked_ue8m0_scales=True,
+        )
+        self.assertEqual(output_q.shape, (2, 256))
+        self.assertEqual(output_s.shape, (2, 2))
+        self.assertEqual(output_s.dtype, torch.float32)
+        self.assertTrue(output_s.is_contiguous())
 
     def test_batch_backend_forces_masked_layout(self):
         with (
