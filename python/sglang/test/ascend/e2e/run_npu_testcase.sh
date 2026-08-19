@@ -143,9 +143,9 @@ fi
 source_plog_path="/root/ascend/log/debug/plog"
 if [ -d "$source_plog_path" ];then
     echo "Plog files found. Begin to backup them."
-    target_plog_path="/root/sglang/debug/logs/plog/${tc_name}/${HOSTNAME}"
+    target_plog_path="/root/sglang/debug/logs/plog/${run_label}/${tc_name}/${HOSTNAME}"
     if [ "${SGLANG_IS_IN_CI}" = "true" ] || [ "${SGLANG_IS_IN_CI}" = "True" ];then
-        target_plog_path="/root/.cache/tests/logs/plog/${tc_name}/${HOSTNAME}"
+        target_plog_path="/root/.cache/tests/logs/plog/${run_label}/${tc_name}/${HOSTNAME}"
     fi
     rm -rf "${target_plog_path}"
     mkdir -p "${target_plog_path}"
