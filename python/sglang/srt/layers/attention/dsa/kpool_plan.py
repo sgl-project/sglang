@@ -498,9 +498,7 @@ def init_kpool_extend_metadata(
     local_req_pool_indices: Optional[torch.Tensor] = None,
 ) -> DSAMetadata:
     mode = forward_batch.forward_mode
-    is_extend_like = mode.is_extend_without_speculative() or mode.is_draft_extend(
-        include_v2=True
-    )
+    is_extend_like = mode.is_extend_without_speculative() or mode.is_draft_extend_v2()
     if (
         not _is_kpool_layout_enabled(pool_size, real_page_size)
         or not is_extend_like
