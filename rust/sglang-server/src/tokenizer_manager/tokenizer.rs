@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::message::request::{Request, RequestKind};
+use crate::message::request::{GenerateRequest, Request, RequestKind};
 use crate::message::types::TokenIds;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::wiring::TmEvent;
@@ -152,6 +152,37 @@ fn strip_auto_specials(mut ids: Vec<i32>, auto_specials: &[i32]) -> Vec<i32> {
     ids
 }
 
+/// Apply the text-tokenization stage to one generate request. Both the normal
+/// tokenizer worker and the standalone renderer call this function so stop
+/// sizing and special-token handling cannot drift between the two paths.
+pub(crate) fn tokenize_generate_request(
+    request: &mut GenerateRequest,
+    tokenizer: &dyn TextTokenizer,
+    auto_specials: &[i32],
+) -> Result<(), Error> {
+    // Size the scheduler's stop-match window in TOKENS, as Python's
+    // `normalize(tokenizer)` does.
+    if let Some(stop_tokens) = request
+        .sampling_params
+        .stop_strs
+        .iter()
+        // A stop that won't encode falls back to its byte length rather
+        // than failing the request: still an over-estimate, never an
+        // under-estimate, so the scheduler cannot miss that stop.
+        .map(|stop| tokenizer.encode(stop).map_or(stop.len(), |ids| ids.len()))
+        .max()
+    {
+        request.sampling_params.stop_str_max_len = stop_tokens;
+    }
+    let ids = tokenizer.encode(request.text.as_deref().unwrap_or(""))?;
+    request.input_ids = Some(if request.skip_special_tokens {
+        strip_auto_specials(ids, auto_specials)
+    } else {
+        ids
+    });
+    Ok(())
+}
+
 /// One tokenizer worker: pulls a `Request` off the shared inbox, fills
 /// `input_ids`, returns it to the TokenizerManager. Pinned; backend shared.
 ///
@@ -192,29 +223,8 @@ impl Runnable for TokenizerWorker {
                     tracing::error!("tokenizer pool received a non-generate request");
                     continue;
                 };
-                // Size the scheduler's stop-match window in TOKENS, as Python's
-                // `normalize(tokenizer)` does.
-                let stop_tokens = g
-                    .sampling_params
-                    .stop_strs
-                    .iter()
-                    // A stop that won't encode falls back to its byte length rather
-                    // than failing the request: still an over-estimate, never an
-                    // under-estimate, so the scheduler cannot miss that stop.
-                    .map(|s| self.tokenizer.encode(s).map_or(s.len(), |ids| ids.len()))
-                    .max();
-                if let Some(n) = stop_tokens {
-                    g.sampling_params.stop_str_max_len = n;
-                }
-                match self.tokenizer.encode(g.text.as_deref().unwrap_or("")) {
-                    Ok(ids) => {
-                        g.input_ids = Some(if g.skip_special_tokens {
-                            strip_auto_specials(ids, &self.auto_specials)
-                        } else {
-                            ids
-                        });
-                        Event::TokenizeDone
-                    }
+                match tokenize_generate_request(g, self.tokenizer.as_ref(), &self.auto_specials) {
+                    Ok(()) => Event::TokenizeDone,
                     Err(err) => Event::Error(err),
                 }
             };

@@ -543,11 +543,32 @@ impl Intake {
 /// generate request must already carry token ids (no tokenizer to byte-encode
 /// text); control requests carry none and are exempt.
 fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
-    let (skip_tokenizer_init, vocab_size) = (limits.skip_tokenizer_init, limits.vocab_size);
     let _ = req
         .state
         .apply(Event::Validated(ValidationOutcome::NeedsTokenize));
 
+    match &req.kind {
+        RequestKind::Generate(request) => {
+            validate_generate_request(&req.rid, request, limits)?;
+        }
+        RequestKind::Control(_) => validate_rid(&req.rid)?,
+        RequestKind::Detokenize { token_ids } => {
+            validate_rid(&req.rid)?;
+            // Detokenize ids must fit the shard's `&[u32]` decode domain. No vocab
+            // bound — parity with the retired direct decode service: an unknown id is
+            // the tokenizer's error to report, and nothing here reaches the scheduler's
+            // embedding lookup.
+            for &id in token_ids {
+                if u32::try_from(id).is_err() {
+                    return Err(Error::Validation(format!("Token ID {id} is out of range")));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_rid(rid: &Rid) -> Result<(), Error> {
     // The rid is the request's identity everywhere downstream: it keys the detok
     // table, and it rides on EVERY chunk of EVERY decode step. An unbounded
     // client-supplied rid is therefore a per-step cost, not a one-off. Python's is
@@ -555,15 +576,26 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
     // Measured on the CLIENT-facing form: the uniquifier `Rid::from_client` appends
     // is this server's own overhead, and charging the client for bytes it did not
     // send would reject a rid exactly at the documented limit.
-    let client_rid_len = req.rid.client_facing().len();
+    let client_rid_len = rid.client_facing().len();
     if client_rid_len > MAX_RID_LEN {
         return Err(Error::Validation(format!(
             "rid is {client_rid_len} bytes, over the {MAX_RID_LEN}-byte limit"
         )));
     }
-    if skip_tokenizer_init
-        && matches!(&req.kind, RequestKind::Generate(g) if !g.already_tokenized())
-    {
+    Ok(())
+}
+
+/// Validate the generate-specific fields checked when normal ingress receives
+/// a request. The standalone renderer calls the same function before it runs
+/// normalization and tokenization.
+pub(crate) fn validate_generate_request(
+    rid: &Rid,
+    request: &GenerateRequest,
+    limits: &Limits,
+) -> Result<(), Error> {
+    validate_rid(rid)?;
+    let vocab_size = limits.vocab_size;
+    if limits.skip_tokenizer_init && !request.already_tokenized() {
         // `Validation` (400), not `Tokenize` (500): the client sent a request this
         // server cannot serve, which is their error to fix — Python 400s it too.
         return Err(Error::Validation(
@@ -574,37 +606,23 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
     // Client-supplied token ids must be in-vocabulary: an out-of-range id
     // reaches the embedding lookup and kills the scheduler process, so 400
     // here instead — mirroring the Python `TokenizerManager` validation.
-    if let RequestKind::Generate(g) = &req.kind {
-        if let Some(ids) = &g.input_ids {
-            for &id in ids {
-                if id < 0 || id as u64 >= vocab_size {
-                    return Err(Error::Validation(format!(
-                        "input_ids contains out-of-vocabulary token id {id}; \
-                         valid range is [0, {vocab_size})"
-                    )));
-                }
-            }
-        }
-        if let Some(ids) = &g.token_ids_logprob {
-            for &id in ids {
-                if id < 0 || id as u64 >= vocab_size {
-                    return Err(Error::Validation(format!(
-                        "token_ids_logprob contains out-of-vocabulary token id \
-                         {id}; valid range is [0, {vocab_size})"
-                    )));
-                }
+    if let Some(ids) = &request.input_ids {
+        for &id in ids {
+            if id < 0 || id as u64 >= vocab_size {
+                return Err(Error::Validation(format!(
+                    "input_ids contains out-of-vocabulary token id {id}; \
+                     valid range is [0, {vocab_size})"
+                )));
             }
         }
     }
-
-    // Detokenize ids must fit the shard's `&[u32]` decode domain. No vocab
-    // bound — parity with the retired direct decode service: an unknown id is
-    // the tokenizer's error to report, and nothing here reaches the scheduler's
-    // embedding lookup.
-    if let RequestKind::Detokenize { token_ids } = &req.kind {
-        for &id in token_ids {
-            if u32::try_from(id).is_err() {
-                return Err(Error::Validation(format!("Token ID {id} is out of range")));
+    if let Some(ids) = &request.token_ids_logprob {
+        for &id in ids {
+            if id < 0 || id as u64 >= vocab_size {
+                return Err(Error::Validation(format!(
+                    "token_ids_logprob contains out-of-vocabulary token id \
+                     {id}; valid range is [0, {vocab_size})"
+                )));
             }
         }
     }
@@ -612,9 +630,7 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
     // The scheduler only computes hidden states when launched for it, so without
     // this the request would 200 with `meta_info.hidden_states` silently absent
     // (Python `TokenizerManager._validate_one_request`).
-    if !limits.enable_return_hidden_states
-        && matches!(&req.kind, RequestKind::Generate(g) if g.return_hidden_states)
-    {
+    if request.return_hidden_states && !limits.enable_return_hidden_states {
         return Err(Error::Validation(
             "The server is not configured to return the hidden states. \
              Please set `--enable-return-hidden-states` to enable this feature."
@@ -633,7 +649,7 @@ fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> {
 ///
 /// Under `allow_auto_truncate` both clamp instead of rejecting — the launch flag
 /// opted into that.
-fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
+pub(crate) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Result<(), Error> {
     let max_req_len = limits.context_len;
     // Python counts the reserved slots as part of the input, so a request can be
     // rejected for them even when the prompt alone fits.
