@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Allocation-free microbenchmark for the Kimi-K3 fused f_b + KDA decode."""
 
 import argparse
@@ -7,6 +6,11 @@ import statistics
 from pathlib import Path
 
 import torch
+
+from sglang.test.ci.ci_register import register_amd_ci
+from sglang.utils import is_in_ci
+
+register_amd_ci(est_time=120, stage="jit-kernel-benchmark", runner_config="amd")
 
 
 def main() -> None:
@@ -18,13 +22,9 @@ def main() -> None:
     parser.add_argument("--mode", choices=("eager", "graph"), default="graph")
     args = parser.parse_args()
 
-    test = runpy.run_path(
-        str(Path(__file__).with_name("test_kimi_k3_kda_decode.py"))
-    )
+    test = runpy.run_path(str(Path(__file__).with_name("test_kimi_k3_kda_decode.py")))
     f_a, f_b_weight, inputs = test["_make_fb_inputs"](args.batch)
-    out = torch.empty(
-        (1, args.batch, 12, 128), dtype=torch.bfloat16, device="cuda"
-    )
+    out = torch.empty((1, args.batch, 12, 128), dtype=torch.bfloat16, device="cuda")
     kwargs = dict(
         f_a=f_a,
         f_b_weight=f_b_weight,
@@ -80,4 +80,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if is_in_ci():
+        print("Skipping bench_kimi_k3_kda_decode.py in CI")
+        raise SystemExit(0)
     main()

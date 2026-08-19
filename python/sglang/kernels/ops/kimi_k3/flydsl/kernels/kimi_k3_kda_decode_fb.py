@@ -8,23 +8,20 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import gpu as mlir_gpu
-from flydsl._mlir.dialects import llvm
-from flydsl._mlir.dialects import scf
-from flydsl._mlir.dialects import vector as mlir_vector
-from flydsl.expr import arith, const_expr, range_constexpr
-from flydsl.expr.arith import ArithValue
-from flydsl.expr.typing import T
-
 from aiter.ops.flydsl.kernels import vector
-
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
     GTensor,
     _to_raw,
 )
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import gpu as mlir_gpu
+from flydsl._mlir.dialects import llvm, scf
+from flydsl._mlir.dialects import vector as mlir_vector
+from flydsl.expr import arith, const_expr, range_constexpr
+from flydsl.expr.arith import ArithValue
+from flydsl.expr.typing import T
 
 _HEADS = 12
 _DIM = 128
@@ -205,9 +202,7 @@ def create_kimi_k3_kda_decode_fb_kernel(
                 f_a_base = batch * stride_f_a_token
                 f_b_base = head * stride_f_b_head + tid * stride_f_b_output
                 for projection_iter in range_constexpr(_PROJECTION_ITERS):
-                    projection_offset = fx.Int32(
-                        projection_iter * _PROJECTION_VECTOR
-                    )
+                    projection_offset = fx.Int32(projection_iter * _PROJECTION_VECTOR)
                     if const_expr(cooperative_f_a):
                         f_a_values = fx.ptr_load(
                             f_a_lds + projection_offset,
@@ -598,9 +593,7 @@ def create_kimi_k3_kda_decode_fb_kernel(
                 global_v = global_v_start + fx.Int32(vi * _V_GROUP_TILE)
                 for ki in range_constexpr(_K_ITERS):
                     k_base = k_vec_start + fx.Int32(ki * _WARP_TILE_K)
-                    state_off = (
-                        state_head_base + global_v * fx.Int32(_DIM) + k_base
-                    )
+                    state_off = state_head_base + global_v * fx.Int32(_DIM) + k_base
                     state_vecs.append(state.vec_load((state_off,), 4))
             for vi in range_constexpr(_V_ITERS):
                 norm_accum = norm_accum + process_state_row(

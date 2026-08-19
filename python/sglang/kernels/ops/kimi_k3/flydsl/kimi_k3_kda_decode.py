@@ -9,6 +9,7 @@ import functools
 from collections.abc import Iterable
 
 import torch
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from .kernels.kimi_k3_kda_decode import (
     create_kimi_k3_kda_decode_kernel,
@@ -16,7 +17,6 @@ from .kernels.kimi_k3_kda_decode import (
 from .kernels.kimi_k3_kda_decode_fb import (
     create_kimi_k3_kda_decode_fb_kernel,
 )
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 _HEADS = 12
 _DIM = 128

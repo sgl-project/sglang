@@ -13,13 +13,17 @@ import torch.nn.functional as F
 
 pytest.importorskip("flydsl")
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.utils import is_flydsl_available
+
 from sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_kda_decode import (
     _fb_build_options,
     flydsl_kimi_k3_kda_decode,
     flydsl_kimi_k3_kda_decode_with_f_b,
     is_flydsl_kimi_k3_kda_decode_supported,
 )
-from aiter.ops.flydsl.utils import is_flydsl_available
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=120, stage="jit-kernel-unit", runner_config="amd")
 
 
 def _gfx950_flydsl_available() -> bool:
@@ -510,3 +514,9 @@ def test_decode_api_rejects_invalid_input_rank() -> None:
 
     with pytest.raises(ValueError, match="`x` must have rank 2"):
         _run(inputs)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
