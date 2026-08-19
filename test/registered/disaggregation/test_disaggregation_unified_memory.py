@@ -1,8 +1,11 @@
 import unittest
 
-from test_disaggregation_kimi_linear import KimiLinearPDParityBase
+from test_disaggregation_kimi_linear import KimiLinearPDParityMixin
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    PDDisaggregationServerBase,
+)
 
 register_cuda_ci(est_time=900, stage="base-b", runner_config="2-gpu-large")
 
@@ -29,7 +32,9 @@ UNIFIED_MEMORY_ARGS = [
 ]
 
 
-class TestUnifiedMemoryDisaggregation(KimiLinearPDParityBase):
+class TestUnifiedMemoryDisaggregation(
+    KimiLinearPDParityMixin, PDDisaggregationServerBase
+):
     """1 prefill + 1 decode, both with --enable-unified-memory, vs a non-PD
     unified-memory reference server."""
 

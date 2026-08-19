@@ -35,7 +35,7 @@ DETERMINISTIC_ARGS = [
 ]
 
 
-class KimiLinearPDParityBase(PDDisaggregationServerBase):
+class KimiLinearPDParityMixin:
     reference_parallel_args = []
     baseline_args = []
     extra_prefill_env = SERVER_ENV
@@ -101,7 +101,9 @@ class KimiLinearPDParityBase(PDDisaggregationServerBase):
         assert_process_healthy(self, "decode", self.process_decode, self.decode_url)
 
 
-class TestKimiLinearHeterogeneousTPDisaggregation(KimiLinearPDParityBase):
+class TestKimiLinearHeterogeneousTPDisaggregation(
+    KimiLinearPDParityMixin, PDDisaggregationServerBase
+):
     prefill_tp_size = 2
     decode_tp_size = 1
     decode_base_gpu_id = 2
