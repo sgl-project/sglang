@@ -13,19 +13,21 @@
 /// waves; transposing the bin totals onto lanes turns the 16-step walk over
 /// them into a 4-step DPP prefix sum plus a ballot.
 ///
-/// Selection contract: experts rank by sigmoid(score) + bias and a NaN ranking
-/// value keys below every number, so it can never displace one. Experts whose
-/// whole key is identical are separated by kAiterTieLaneRank below, which is
-/// where aiter's wave64 walk reaches them; the CUDA router in route_radix.cuh
-/// gives that tie to the lowest id instead, the one point the two contracts part.
+/// Selection contract: experts rank by sigmoid(score) + bias, and a NaN ranking
+/// value always ranks below every number, so it can never displace one. The
+/// sigmoid itself uses aiter's approximate exp2f + rcpf combination, because
+/// expf plus a divide would still disagree with aiter's result at the ULP
+/// level. Experts whose key is exactly identical (a strict tie) are separated
+/// by kAiterTieLaneRank below, which is exactly the order aiter's wave64
+/// traversal reaches them;
 ///
-/// Winners are emitted highest key first, equal keys in that same tie order. So
-/// a row is what aiter would have produced, expert for expert and column for
-/// column, on every input rather than only on the ones that do not tie -- this
-/// kernel and aiter both serve K3 depending on the batch size, and a routing
-/// that changed with the batch size would be the cost of them disagreeing.
-/// Nothing the compaction races over reaches the output: it fills the staged row
-/// in whatever order it wins, and the epilogue ranks that row afterwards.
+/// Winners are emitted highest key first, equal keys in the same tie order. So
+/// regardless of whether the input ties, this row matches what aiter would
+/// produce, expert for expert and column for column -- this kernel and aiter
+/// both serve K3, just split by batch size, and a routing that changed with
+/// batch size would be the cost of the two disagreeing. The write race during
+/// compaction does not affect the final output: it fills the staged row in
+/// whatever order wins the race, and the epilogue re-ranks that row afterward.
 
 #pragma once
 
@@ -51,6 +53,10 @@ inline constexpr uint32_t kRadix4TopK = 16;
 inline constexpr uint32_t kRadix4Block = 256;
 inline constexpr uint32_t kRadix4Wave = 64;
 
+/// log2(e): aiter computes exp(-x) as exp2f(-kAiterSigmoidLog2E * x) rather than
+/// expf(-x). Matched bit for bit with topk_softmax_kernels_group.cu's C_LOG2E.
+inline constexpr float kAiterSigmoidLog2E = 1.44269504088896340736f;
+
 struct RouteRadix4Params {
   const void* __restrict__ scores;
   const void* __restrict__ bias;
@@ -64,26 +70,32 @@ struct RouteRadix4Params {
 
 namespace radix4 {
 
-/// Rank of a wave64 lane in the order aiter's router walks them. Its tie
-/// positions come out of a cumsum over that walk, so two experts whose ranking
-/// value is equal bit for bit are separated by where they sit in it, and this is
-/// the one piece of the walk that is not implied by the expert id. Read off aiter
-/// by comparison, and test_moe_route_radix4 pins it back against aiter so a
-/// change on their side surfaces as a failure rather than as a silent divergence.
+/// Rank of a wave64 lane in aiter router's traversal order. Its tie positions
+/// come from a cumulative sum over that traversal order, so two experts whose
+/// ranking value is bit-for-bit equal are separated by their position in it.
+/// This table was obtained by comparing item-by-item against aiter, and
+/// test_moe_route_radix4 pins it back against aiter, so a change on their side
+/// surfaces as a test failure rather than a silent divergence.
 static __device__ __constant__ uint8_t kAiterTieLaneRank[64] = {
     56, 57, 58, 59, 63, 62, 61, 60, 52, 53, 54, 55, 51, 50, 49, 48, 40, 41, 42, 43, 47, 46,
     45, 44, 36, 37, 38, 39, 35, 34, 33, 32, 24, 25, 26, 27, 31, 30, 29, 28, 20, 21, 22, 23,
     19, 18, 17, 16, 8,  9,  10, 11, 15, 14, 13, 12, 4,  5,  6,  7,  3,  2,  1,  0,
 };
 
-/// Where an expert falls in that walk: a bijection onto [0, EXPERTS). Experts
-/// travel in groups of four, a group sits in one lane, and the lanes that hold
-/// four groups rather than three come first in each rank band.
+/// Where an expert falls in that traversal order: a bijection onto [0, EXPERTS).
+/// Experts come in groups of four, and a group lands on one lane; 224 groups
+/// are cyclically assigned across 64 lanes, with lanes 0-31 each getting 4
+/// groups (banks 0-3) and lanes 32-63 each getting 3 groups (banks 0-2). The
+/// rank < 32 branch below takes *3 (for the 3-bank lanes), otherwise *4 (for
+/// the 4-bank lanes) -- this relies on the structural fact that
+/// kAiterTieLaneRank happens to map lanes 0-31 to rank>=32 and lanes 32-63 to
+/// rank<32, rather than branching on the bank count directly.
 SGL_DEVICE uint32_t tie_priority(int expert) {
   const int group = expert >> 2;
   const int lane = group & 63;
   const int bank = group >> 6;
   const int rank = static_cast<int>(kAiterTieLaneRank[lane]);
+  assert((rank < 32) == (lane >= 32));
   const int group_rank = (rank < 32) ? (rank * 3 + bank) : (96 + (rank - 32) * 4 + bank);
   return static_cast<uint32_t>((group_rank << 2) + (expert & 3));
 }
@@ -208,7 +220,8 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   for (int i = 0; i < VPT; ++i) {
     const int e = tid + i * BLOCK;
     if (e < EXPERTS) {
-      const float g = 1.0f / (1.0f + __expf(-radix4::load_score(srow, e)));
+      const float x = radix4::load_score(srow, e);
+      const float g = __builtin_amdgcn_rcpf(1.0f + exp2f(-kAiterSigmoidLog2E * x));
       sig[i] = g;
       key[i] = radix4::rank_key(g + radix4::load_score(sbias, e));
       or_all |= key[i];
@@ -375,9 +388,10 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   } else {
     // Every pivot bit is fixed and the survivors still outnumber the quota, so
     // what is left are keys equal bit for bit and only the tie rule separates
-    // them: `need` of them get in, the ones aiter's walk reaches first. Marking
-    // the survivors in a bitmap indexed by that walk turns "how many come before
-    // me" into a popcount, which costs the block no divergence and no scan.
+    // them: `need` of them get in, the ones aiter's traversal reaches first.
+    // Marking the survivors in a bitmap indexed by that traversal turns "how
+    // many come before me" into a popcount, which costs the block no
+    // divergence and no scan.
     for (int j = tid; j < TIE_WORDS; j += BLOCK)
       s_tie[j] = 0ull;
     if (tid == 0) s_cnt = 0;
@@ -436,7 +450,6 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
       rank += (kq > k || (kq == k && pq < p)) ? 1 : 0;
     }
 
-    // The weight is the plain sigmoid; the bias only ever ranked the experts.
     float scale = params.routed_scaling_factor;
     if (params.renormalize) {
       float sum = 0.0f;

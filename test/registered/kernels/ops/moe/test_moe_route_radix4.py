@@ -103,7 +103,8 @@ def _assert_matches_oracle(scores, bias, renormalize=True, scaling=2.5):
     w, ids = moe_route_radix4.route_radix4(scores, bias, TOPK, renormalize, scaling)
     # Column by column: the position a winner lands in is part of the contract.
     assert torch.equal(ids, ref_ids)
-    # The kernel's sigmoid uses __expf, whose last bits differ from torch's.
+    # The kernel's sigmoid is an approximate hardware sequence (matched to
+    # aiter's), whose last bits differ from torch's exact sigmoid.
     torch.testing.assert_close(w, ref_w, rtol=1e-5, atol=1e-6)
 
 
