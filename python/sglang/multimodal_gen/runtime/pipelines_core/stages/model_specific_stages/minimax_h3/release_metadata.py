@@ -7,11 +7,9 @@ import math
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from sglang.multimodal_gen.configs.sample.sampling_params import QUALITY_LEVELS
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
-    MINIMAX_H3_QUALITY_PROFILES,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
     minimax_h3_plan_from_batch,
 )
@@ -150,25 +148,17 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
             raise ValueError("MiniMax H3 request task must be a non-empty string")
         self.metadata.canonical_task(task)
         quality = getattr(batch.sampling_params, "quality", "lossless")
-        if quality not in MINIMAX_H3_QUALITY_PROFILES:
+        if quality not in QUALITY_LEVELS:
             raise ValueError(
-                f"unsupported MiniMax-H3 quality profile {quality!r}; supported: "
-                f"{list(MINIMAX_H3_QUALITY_PROFILES)}"
+                f"quality must be one of {list(QUALITY_LEVELS)}, got {quality!r}"
             )
-        approximate = quality != "lossless"
-        attention_backend = str(server_args.attention_backend or "").strip().lower()
-        if attention_backend == "sage_attn" and not batch.is_warmup:
-            raise ValueError(
-                "MiniMax-H3 does not support SageAttention: the current packed "
-                "varlen path does not preserve model output"
-            )
-        if approximate and not batch.is_warmup:
+        high_quality = quality == "high"
+        if high_quality and not batch.is_warmup:
             server_args.pipeline_config.validate_quality_deployment(server_args)
             plan = minimax_h3_plan_from_batch(batch)
             if plan is None:
                 raise ValueError(
-                    "MiniMax-H3 approximate quality profiles require a resolved "
-                    "request plan"
+                    'MiniMax-H3 quality="high" requires a resolved request plan'
                 )
             shape = plan.shape
             actual = {
@@ -212,7 +202,7 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
             )
             if not exact or not shifts:
                 raise ValueError(
-                    "MiniMax-H3 approximate quality profiles are validated only for "
+                    'MiniMax-H3 quality="high" is validated only for '
                     f"{_MINIMAX_H3_QUALITY_WORKLOAD}; got {actual}"
                 )
         return batch

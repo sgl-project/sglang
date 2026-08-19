@@ -4,8 +4,8 @@ Loaded on demand by the `cookbook-add-model` skill. This is the field-by-field
 contract for when the clone needs more than a rename. The two engine files are
 the canonical specs — read their headers first:
 
-- [`_deployment.jsx`](../../../../docs_new/src/snippets/_deployment.jsx) — the matrix widget; its header lists every config field. Dimensions are the legacy fixed five by default, or config-declared via `matchDims` / `overlayDims` (§2.1b).
-- [`_playground.jsx`](../../../../docs_new/src/snippets/_playground.jsx) — the diff-based override widget; lists the `playgroundFeatures` axes + the `AXIS_HANDLERS` interface.
+- [`_deployment.jsx`](../../../../docs/src/snippets/_deployment.jsx) — the matrix widget; its header lists every config field. Dimensions are the legacy fixed five by default, or config-declared via `matchDims` / `overlayDims` (§2.1b).
+- [`_playground.jsx`](../../../../docs/src/snippets/_playground.jsx) — the diff-based override widget; lists the `playgroundFeatures` axes + the `AXIS_HANDLERS` interface.
 
 Engine extension (adding a new playground axis) lives in [engine-axis.md](engine-axis.md).
 
@@ -13,7 +13,7 @@ Engine extension (adding a new playground axis) lives in [engine-axis.md](engine
 
 ## 2.1 Create the config file
 
-**Path**: `docs_new/src/snippets/configs/<vendor>/<model>.jsx`. The vendor folder is
+**Path**: `docs/src/snippets/configs/<vendor>/<model>.jsx`. The vendor folder is
 the HuggingFace org (`deepseek-ai`, `Qwen`, `moonshotai`, ...); the file
 name is a short hyphenated model id (`deepseek-v4`, `qwen3.5`, ...).
 
@@ -164,7 +164,7 @@ schemas (full reference in the `_playground.jsx` header):
 | `moe` | Backend select (incl. MegaMoE) + EP knob; picking the MegaMoE backend reveals a Quantization sub-select (W4A8/W4A4) | Model is MoE and supports multiple `--moe-*-backend` choices. For Blackwell MoE kernel-fusion, give the `megamoe` backend option a `requiresHw` (and optional `excludesStrategy`) gate, then add a sibling `megamoeQuant` block (`{stripEnv, options}`): W4A8 = `NUM_MAX` only, W4A4 adds the FP4-activations env vars; both strip the DeepEP dispatch env. |
 | `parsers` | Multi-toggle | Model has reasoning / tool-call parsers. |
 | `speculative` | Single-select chip group | Model has spec-decoding presets you want to expose. |
-| `pdDisagg` | Mode + transfer backend (+ optional per-backend env via `envWhen` hw-gate) + IB device + optional `router{port, command}` | Model supports prefill/decode disaggregation. When a PD role is active and `router` is set, the playground shows the router (SGLang Model Gateway) launch command as a separate companion block and retargets the cURL modal to `router.port` (clients hit the router, not the role servers). |
+| `pdDisagg` | Mode + transfer backend (+ optional per-backend env via `envWhen` hw-gate) + IB device + optional `router{port, command}` | Model supports prefill/decode disaggregation. A `modes[]` entry may carry `flags` / `env` that only that role needs (`prefill`'s `--load-balance-method`, `decode`'s `--disaggregation-decode-polling-interval`, ...); they are emitted only while that role is selected, and a flag whose head the base cell already sets is replaced rather than duplicated. Put role-specific settings here, NOT in the cells — a cell carries one recipe, and the role is a Playground overlay. In `router.command` the ports MUST be `{{PREFILL_PORT}}` / `{{DECODE_PORT}}` / `{{ROUTER_PORT}}`: the engine substitutes them from its own `PD_PORTS` (prefill 30000, decode **30100**), so a literal port silently points the router at something the generated decode command never binds. When a PD role is active and `router` is set, the playground shows the router (SGLang Model Gateway) launch command as a companion block and retargets the cURL modal to `router.port`. |
 | `hicache` | Enable + storage + write policy | Model is large enough that hierarchical KV cache matters. |
 | `hisparse` | Enable + host-ratio select; whole card gated on the live PD-Disagg mode being `decode` | DSA-style model (DeepSeek-V3.2 / V4, GLM-5) that supports decode-side hierarchical sparse attention. |
 | `flagSelects` | A config-declared **list** of single-selects, each `{ id, title, stripPrefixes, options }` (option = `{ id, label, flags?, hide?, disable?, disableReason? }`); a flagless option is the "none"/accuracy-safe choice | A titled single-select that picks one value of a flag family the other axes don't model — e.g. KV-cache dtype (`--kv-cache-dtype`), mamba scheduler strategy (`--mamba-scheduler-strategy`). Generic: no engine change to add another. |
@@ -217,7 +217,7 @@ schemas (full reference in the `_playground.jsx` header):
 
 ## 2.4 Create the MDX page
 
-Path: `docs_new/cookbook/<category>/<Vendor>/<Model>.mdx`. Import both widgets and
+Path: `docs/cookbook/<category>/<Vendor>/<Model>.mdx`. Import both widgets and
 the per-model config, render them inside the relevant sections:
 
 ```mdx

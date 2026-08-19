@@ -1,21 +1,33 @@
 import copy
 import logging
+from collections.abc import Callable
+from contextlib import nullcontext
 from typing import Any
 
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    component_attn_backend_context_manager,
+    get_component_forced_attn_backend,
+    get_global_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+    TransformerQuantLoadSpec,
     resolve_transformer_quant_load_spec,
     resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _normalize_component_type
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
@@ -26,6 +38,36 @@ from sglang.srt.utils import is_npu
 _is_npu = is_npu()
 
 logger = init_logger(__name__)
+
+
+def _resolve_checkpoint_load_device(
+    runtime_device: torch.device,
+    *,
+    component_starts_on_cpu: bool,
+    runtime_quant_config: object | None,
+) -> torch.device:
+    if component_starts_on_cpu and runtime_quant_config is None:
+        return torch.device("cpu")
+    return runtime_device
+
+
+def _minimax_h3_adaln_cache_key_filter(name: str) -> bool:
+    return ".adaln_proj.linear." not in name
+
+
+def _default_quantized_attention_backend(
+    quant_spec: TransformerQuantLoadSpec, server_args: ServerArgs
+) -> AttentionBackendEnum | None:
+    """Preserve stable NVFP4 numerics unless the user selected a backend."""
+    if not current_platform.is_blackwell() or not quant_spec.is_modelopt_fp4:
+        return None
+    if (
+        get_global_forced_attn_backend() is not None
+        or get_component_forced_attn_backend() is not None
+        or server_args.attention_backend is not None
+    ):
+        return None
+    return AttentionBackendEnum.FA
 
 
 def _warn_if_expected_param_dtype_missing(
@@ -125,11 +167,15 @@ class TransformerLoader(ComponentLoader):
 
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
-        component_name = _normalize_component_type(component_name)
+        component_type = _normalize_component_type(component_name)
         server_args.model_paths[component_name] = component_model_path
-        if component_name in ("transformer", "unconditional_transformer", "video_dit"):
+        if component_type in (
+            "transformer",
+            "unconditional_transformer",
+            "video_dit",
+        ):
             pipeline_dit_config_attr = "dit_config"
-        elif component_name in ("audio_dit",):
+        elif component_type == "audio_dit":
             pipeline_dit_config_attr = "audio_dit_config"
         else:
             raise ValueError(f"Invalid module name: {component_name}")
@@ -146,7 +192,14 @@ class TransformerLoader(ComponentLoader):
             component_model_path=component_model_path,
             model_cls=model_cls,
             cls_name=cls_name,
+            component_name=component_name,
         )
+        # Quantization adapters may require resident weights, so placement must
+        # be resolved after they have validated the component configuration.
+        component_starts_on_cpu = server_args.should_start_component_on_cpu(
+            component_name
+        )
+        use_fsdp = server_args.should_use_fsdp_for_component(component_name)
 
         logger.info(
             "Loading %s from %s safetensors file(s) %s, param_dtype: %s",
@@ -161,6 +214,40 @@ class TransformerLoader(ComponentLoader):
             "hf_config": config,
             "quant_config": quant_spec.runtime_quant_config,
         }
+        checkpoint_key_filter: Callable[[str], bool] | None = None
+        adaln_cache_path = component_server_args.minimax_h3_adaln_cache_path
+        if adaln_cache_path is not None:
+            if cls_name != "MiniMaxH3DiTModel":
+                raise ValueError(
+                    "--minimax-h3-adaln-cache-path is only supported by MiniMax H3"
+                )
+            if component_server_args.model_variant not in ("fl2va", "ref2va"):
+                raise ValueError(
+                    "MiniMax H3 AdaLN cache requires --model-variant fl2va or ref2va"
+                )
+            init_params["adaln_cache_path"] = adaln_cache_path
+            init_params["adaln_cache_model_variant"] = (
+                component_server_args.model_variant
+            )
+            checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
+        if component_server_args.minimax_h3_adaln_online:
+            if cls_name != "MiniMaxH3DiTModel":
+                raise ValueError(
+                    "--minimax-h3-adaln-online is only supported by MiniMax H3"
+                )
+            if adaln_cache_path is not None:
+                raise ValueError(
+                    "--minimax-h3-adaln-online and --minimax-h3-adaln-cache-path "
+                    "are mutually exclusive"
+                )
+            # Keep the weights off-device; the model rebuilds the AdaLN
+            # outputs from the checkpoint for each request's timestep plan.
+            init_params["adaln_weight_files"] = safetensors_list
+            init_params["adaln_plan_width"] = (
+                component_server_args.minimax_h3_adaln_plan_width
+            )
+            checkpoint_key_filter = _minimax_h3_adaln_cache_key_filter
+
         if (
             init_params["quant_config"] is None
             and component_server_args.transformer_weights_path is not None
@@ -172,29 +259,67 @@ class TransformerLoader(ComponentLoader):
             logger.debug("quantization config: %s", init_params["quant_config"])
 
         local_torch_device = get_local_torch_device()
+        checkpoint_load_device = _resolve_checkpoint_load_device(
+            local_torch_device,
+            component_starts_on_cpu=component_starts_on_cpu,
+            runtime_quant_config=quant_spec.runtime_quant_config,
+        )
+        direct_gpu_weight_loading = bool(
+            component_server_args.direct_gpu_weight_loading
+        )
+        if direct_gpu_weight_loading and quant_spec.runtime_quant_config is not None:
+            raise ValueError(
+                "--direct-gpu-weight-loading supports only unquantized DiT checkpoints"
+            )
         weight_load_plan = WeightLoadPlan.for_component(
-            checkpoint_load_device=local_torch_device,
+            checkpoint_load_device=checkpoint_load_device,
             needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
-            component_cpu_offload=bool(component_server_args.dit_cpu_offload),
+            component_starts_on_cpu=component_starts_on_cpu,
+            load_full_state_dict_on_device=direct_gpu_weight_loading,
+        )
+        if direct_gpu_weight_loading:
+            logger.warning(
+                "Direct GPU weight loading is enabled for %s; the complete checkpoint "
+                "state dict and materialized model weights may coexist on GPU during startup",
+                component_name,
+            )
+
+        quantized_attn_backend = _default_quantized_attention_backend(
+            quant_spec, component_server_args
+        )
+        if quantized_attn_backend is not None:
+            logger.info(
+                "Using %s attention for ModelOpt NVFP4 to preserve output precision",
+                quantized_attn_backend.name.lower(),
+            )
+        attn_backend_context = (
+            component_attn_backend_context_manager(
+                quantized_attn_backend, component_name=component_name
+            )
+            if quantized_attn_backend is not None
+            else nullcontext()
         )
 
-        # Load the model using FSDP loader
-        model = maybe_load_fsdp_model(
-            model_cls=model_cls,
-            init_params=init_params,
-            weight_dir_list=safetensors_list,
-            device=local_torch_device,
-            hsdp_replicate_dim=server_args.hsdp_replicate_dim,
-            hsdp_shard_dim=server_args.hsdp_shard_dim,
-            cpu_offload=component_server_args.dit_cpu_offload,
-            pin_cpu_memory=component_server_args.pin_cpu_memory,
-            fsdp_inference=component_server_args.use_fsdp_inference,
-            param_dtype=quant_spec.param_dtype,
-            reduce_dtype=torch.float32,
-            output_dtype=None,
-            strict=False,
-            weight_load_plan=weight_load_plan,
-        )
+        # Model construction resolves attention implementations, so apply the
+        # quantization-specific default around FSDP initialization and loading.
+        with attn_backend_context:
+            model = maybe_load_fsdp_model(
+                model_cls=model_cls,
+                init_params=init_params,
+                weight_dir_list=safetensors_list,
+                device=local_torch_device,
+                hsdp_replicate_dim=server_args.hsdp_replicate_dim,
+                hsdp_shard_dim=server_args.hsdp_shard_dim,
+                component_starts_on_cpu=component_starts_on_cpu,
+                pin_cpu_memory=component_server_args.pin_cpu_memory,
+                fsdp_inference=use_fsdp,
+                param_dtype=quant_spec.param_dtype,
+                reduce_dtype=torch.float32,
+                output_dtype=None,
+                strict=False,
+                weight_load_plan=weight_load_plan,
+                checkpoint_key_filter=checkpoint_key_filter,
+            )
 
         # post-hooks (e.g., patch scales (nunchaku))
         for post_load_hook in quant_spec.post_load_hooks:

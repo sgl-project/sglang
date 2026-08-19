@@ -8,7 +8,6 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import logging
 
 from .base_module import RotaryEmbeddingND, TransformerBlock
-from .flash import make_block_causal_mask_mod
 from .vit_utils import create_token_ids, prepare_rotary_pos_emb
 
 logger = logging.get_logger(__name__)
@@ -106,12 +105,6 @@ class ViTBase(ModelMixin, ConfigMixin):
             self.max_mask_ratio = mask_config.get("max_mask_ratio", 0.75)
         self.aspect_ratio_range = mask_config.get("aspect_ratio_range", (0.75, 1.5))
         self.max_retries = mask_config.get("max_retries", 100)
-        if (
-            self.mask_enabled
-            and self.mask_style == "drop"
-            and getattr(self, "t_causal", False)
-        ):
-            logger.warning("mask_style='drop' with t_causal may cause issues")
         if self.mask_enabled and "mask_token" in self._buffers:
             del self._buffers["mask_token"]
             self.mask_token = nn.Parameter(torch.randn(1, 1, self._mask_dim) * 0.02)
@@ -134,11 +127,9 @@ class ViTBase(ModelMixin, ConfigMixin):
             )
         return hidden_states, img_ids
 
-    def forward_transformer_blocks(self, hidden_states, rotary_pos_emb, pack_info=None):
-        if pack_info is None:
-            pack_info = {}
+    def forward_transformer_blocks(self, hidden_states, rotary_pos_emb):
         for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, rotary_pos_emb, pack_info)
+            hidden_states = block(hidden_states, rotary_pos_emb)
         return hidden_states
 
     def apply_mask_postprocess(self, hidden_states, num_patches):
@@ -179,6 +170,9 @@ class ViT3DDecoder(ViTBase):
     ):
         super().__init__()
 
+        if t_causal:
+            raise ValueError("MiniMax H3's released ViT decoder is non-causal")
+
         dim = heads * dim_head
         rope_apply_dim = int(dim_head * rope_dim_ratio)
 
@@ -189,8 +183,6 @@ class ViT3DDecoder(ViTBase):
         self.x_embedder = nn.Linear(in_channels, dim)
 
         self.init_suffix_tokens(dim, num_register_tokens, has_cls_token=False)
-
-        self.t_causal = t_causal
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -326,16 +318,6 @@ class ViT3DDecoder(ViTBase):
         )
         cache_img_ids = img_ids
 
-        pack_info = {}
-        if self.t_causal:
-            spatial_size = latent_H * latent_W
-            mask_mod = make_block_causal_mask_mod(
-                num_tokens=num_patches,
-                block_size=spatial_size,
-                suffix=True,
-            )
-            pack_info["mask_mod"] = mask_mod
-
         if cache_hit:
             rotary_pos_emb = cache_record[2]
         else:
@@ -351,7 +333,7 @@ class ViT3DDecoder(ViTBase):
                 )
 
         for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, rotary_pos_emb, pack_info)
+            hidden_states = block(hidden_states, rotary_pos_emb)
 
         hidden_states = self.norm_out(hidden_states)
 

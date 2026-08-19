@@ -147,7 +147,7 @@ class GrammarManager:
                     key = ("regex", req.sampling_params.regex)
                 elif req.sampling_params.ebnf is not None:
                     key = ("ebnf", req.sampling_params.ebnf)
-                elif req.sampling_params.structural_tag:
+                elif req.sampling_params.structural_tag is not None:
                     key = ("structural_tag", req.sampling_params.structural_tag)
 
                 value, cache_hit = self.grammar_backend.get_cached_or_future_value(
