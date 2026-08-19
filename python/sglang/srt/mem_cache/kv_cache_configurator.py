@@ -15,6 +15,7 @@ from sglang.srt.configs.hybrid_arch import (
 )
 from sglang.srt.configs.model_config import (
     ModelConfig,
+    dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -88,6 +89,17 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
+    memory_config = get_memory()
+    return (
+        not memory_config.enable_hisparse
+        and not is_draft_worker
+        and not memory_config.enable_hierarchical_cache
+        and get_disagg().disaggregation_mode == "null"
+    )
+
 
 _is_hip = is_hip()
 
@@ -747,13 +759,7 @@ class KVCacheConfigurator:
             )
 
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
-        # The same bag-derived bound the pools below receive, so the row
-        # headroom and the speculative buffers cannot disagree after a
-        # post-publish override.
-        extra_max_context_len = get_req_to_token_extra_context_len(
-            self.server_args,
-            max_draft_tokens=max_speculative_num_draft_tokens(),
-        )
+        extra_max_context_len = get_req_to_token_extra_context_len()
 
         if get_disagg().disaggregation_mode == "decode":
             # Extra slots for pre-allocated requests
@@ -1324,6 +1330,13 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = DSATokenToKVPool
+        if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
+            pool_kwargs["skip_topk_layers"] = [
+                dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                for layer_id in range(
+                    self.layer_info.start_layer, self.layer_info.end_layer
+                )
+            ]
         token_to_kv_pool = PoolCls(
             max_total_num_tokens,
             page_size=self.pool_page_size,

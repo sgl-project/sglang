@@ -10,6 +10,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=3600, suite="base-c-test-perf-16-npu-a3")
+register_npu_ci(est_time=3600, suite="nightly-perf-16-npu-a3", nightly=True)
 
 QWEN3_235B_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -26,7 +27,6 @@ QWEN3_235B_ENVS = {
     "SGLANG_NPU_PROFILING": "0",
     "SGLANG_NPU_PROFILING_BS": "27",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "188416",
-    "SGLANG_NPU_FUSED_MOE_MODE": "2",
 }
 
 QWEN3_235B_OTHER_ARGS = [
@@ -60,6 +60,8 @@ QWEN3_235B_OTHER_ARGS = [
     "--disable-radix-cache",
     "--moe-a2a-backend",
     "ascend_fuseep",
+    "--fuseep-mode",
+    2,
     "--speculative-algorithm",
     "EAGLE3",
     "--speculative-draft-model-path",

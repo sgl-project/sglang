@@ -24,6 +24,7 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
@@ -292,6 +293,7 @@ class LogitsProcessor(nn.Module):
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
+        self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
@@ -666,15 +668,22 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
+        used_tp_lm_head_all_to_all = False
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
+            elif self._can_use_tp_lm_head_all_to_all(
+                logits, local_hidden_states, lm_head, logits_metadata
+            ):
+                logits = self._tp_lm_head_all_to_all(logits)
+                used_tp_lm_head_all_to_all = True
             else:
                 logits = self._logits_gatherer(logits)
 
-        logits = self._scatter_dp_attn_logits(
-            logits, local_hidden_states, logits_metadata
-        )
+        if not used_tp_lm_head_all_to_all:
+            logits = self._scatter_dp_attn_logits(
+                logits, local_hidden_states, logits_metadata
+            )
 
         logits = self._copy_logits_to_buffer(
             logits, logits_metadata, use_buffer=use_logits_buffer
@@ -792,6 +801,54 @@ class LogitsProcessor(nn.Module):
                 logits,
             )
         return global_logits
+
+    def _can_use_tp_lm_head_all_to_all(
+        self,
+        logits: torch.Tensor,
+        local_hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> bool:
+        if not self.use_tp_lm_head_all_to_all:
+            return False
+
+        tp_size = get_parallel().tp_size
+        base_lm_head = getattr(lm_head, "base_layer", lm_head)
+        if getattr(base_lm_head, "tp_size", None) != tp_size:
+            # Tied embeddings may be replicated across DP ranks (tp_size=1),
+            # even though the logits processor runs in a larger global TP
+            # group. Such logits are full-vocabulary rather than TP shards and
+            # therefore do not satisfy the all-to-all layout contract.
+            return False
+
+        # Every participant must make the same collective choice. Decode CUDA
+        # graphs omit CPU counts and fill every GPU count with the same padded
+        # bucket size. Eager batches carry the same global CPU count list on
+        # every rank, so they are also safe when all entries are equal.
+        global_counts_cpu = logits_metadata.global_num_tokens_for_logprob_cpu
+        is_equal_padded_graph_layout = global_counts_cpu is None and (
+            logits_metadata.global_num_tokens_for_logprob_gpu is not None
+        )
+        is_equal_eager_layout = (
+            global_counts_cpu is not None
+            and len(global_counts_cpu) == tp_size
+            and len(global_counts_cpu) > 0
+            and all(count == global_counts_cpu[0] for count in global_counts_cpu)
+        )
+        if not (is_equal_padded_graph_layout or is_equal_eager_layout):
+            return False
+
+        local_rows = local_hidden_states.shape[0]
+        return local_rows > 0 and logits.shape[0] == local_rows * tp_size
+
+    def _tp_lm_head_all_to_all(self, logits: torch.Tensor) -> torch.Tensor:
+        """Exchange only the row block owned by each destination DP rank."""
+        logits = logits.contiguous()
+        all_to_all_output = torch.empty_like(logits)
+        get_tp_group().all_to_all_single(all_to_all_output.view(-1), logits.view(-1))
+        return _reassemble_tp_lm_head_all_to_all_output(
+            all_to_all_output, get_parallel().tp_size
+        )
 
     def _scatter_dp_attn_logits(
         self,
@@ -949,6 +1006,26 @@ class LogitsProcessor(nn.Module):
             input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
+
+
+def _reassemble_tp_lm_head_all_to_all_output(
+    all_to_all_output: torch.Tensor, tp_size: int
+) -> torch.Tensor:
+    """Convert source-major all-to-all output to row-major full-vocab logits.
+
+    Each source TP rank contributes ``[local_rows, vocab_shard]`` for this
+    destination DP rank. ``all_to_all_single`` concatenates those contributions
+    along dim 0, while the sampler expects the vocab shards concatenated along
+    dim 1.
+    """
+    assert all_to_all_output.shape[0] % tp_size == 0
+    local_rows = all_to_all_output.shape[0] // tp_size
+    vocab_shard = all_to_all_output.shape[1]
+    return (
+        all_to_all_output.view(tp_size, local_rows, vocab_shard)
+        .permute(1, 0, 2)
+        .reshape(local_rows, tp_size * vocab_shard)
+    )
 
 
 def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
