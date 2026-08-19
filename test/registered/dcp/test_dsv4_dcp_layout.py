@@ -42,6 +42,17 @@ class TestDSV4DCPLayout(CustomTestCase):
                 attn_dp_size=2,
             )
 
+    def test_topology_rejects_disaggregation(self):
+        with self.assertRaisesRegex(NotImplementedError, "disaggregated serving"):
+            validate_dsv4_dcp_topology(
+                dcp_size=8,
+                dcp_rank=0,
+                attn_tp_size=8,
+                attn_tp_rank=0,
+                attn_dp_size=1,
+                disaggregation_mode="decode",
+            )
+
     def test_topology_rejects_inconsistent_rank_mapping(self):
         with self.assertRaisesRegex(RuntimeError, "rank mapping"):
             validate_dsv4_dcp_topology(

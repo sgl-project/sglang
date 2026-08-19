@@ -9282,9 +9282,10 @@ class ServerArgs:
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).
         # Skip validation if disaggregation mode is decode.
         if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
-            assert (
-                self.chunked_prefill_size % self.page_size == 0
-            ), "chunked_prefill_size must be divisible by page_size"
+            assert self.chunked_prefill_size % self.allocation_page_size == 0, (
+                "chunked_prefill_size must be divisible by the allocator page size "
+                "(page_size * dcp_size)"
+            )
 
         # Check pdmux
         if self.enable_pdmux:
@@ -9692,11 +9693,14 @@ class ServerArgs:
         return remote_instance_transfer_engine_of(self, load_format)
 
     @property
-    def kv_event_block_size(self) -> int:
-        """Width KV events are emitted at: under DCP the radix tree pages at
-        ``page_size * dcp_size`` (``mem_cache/kv_cache_builder.py``).
-        """
+    def allocation_page_size(self) -> int:
+        """Logical page width used by the DCP-aware token allocator."""
         return self.page_size * self.dcp_size
+
+    @property
+    def kv_event_block_size(self) -> int:
+        """Width at which KV events are emitted."""
+        return self.allocation_page_size
 
     def describe_kv_events_publisher(self) -> Optional[dict]:
         """Return a structured description of this server's KV-event

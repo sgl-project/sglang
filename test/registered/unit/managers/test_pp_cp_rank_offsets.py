@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -64,6 +64,26 @@ def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
+    def test_dynamic_chunk_uses_allocator_page_size(self):
+        scheduler = SchedulerPPMixin()
+        scheduler.enable_dynamic_chunking = True
+        scheduler.length_predictor = MagicMock(is_ready=True)
+        scheduler.length_predictor.predict_next_chunk_size.return_value = 2048
+        scheduler.chunked_prefill_size = 65536
+        scheduler.page_size = 256
+        scheduler.token_to_kv_pool_allocator = SimpleNamespace(page_size=2048)
+        scheduler.max_prefill_tokens = 16384
+        scheduler.model_config = SimpleNamespace(context_len=1 << 20)
+        scheduler.ps = SimpleNamespace(pp_rank=0)
+
+        self.assertEqual(scheduler.predict_next_chunk_size(4096), 2048)
+        self.assertEqual(
+            scheduler.length_predictor.predict_next_chunk_size.call_args.kwargs[
+                "page_size"
+            ],
+            2048,
+        )
+
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         ps = _make_ps()
         calls = []

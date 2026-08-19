@@ -25,7 +25,7 @@ from sglang.srt.layers.attention.dsv4.dcp import (
     local_compressed_lens,
     merge_c4_topk_candidates,
 )
-from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, dcp_a2a_lse_reduce
+from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mla, dcp_a2a_lse_reduce
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=120, stage="sgl-kernel-unit", runner_config="2-gpu-amd")
@@ -180,7 +180,16 @@ def _worker_test(rank: int, world_size: int, device, coordinator) -> None:
         return_lse=True,
     )
 
-    ag_rs = cp_lse_ag_out_rs_mha(partial_out.clone(), partial_lse.clone(), coordinator)
+    ag_rs = (
+        cp_lse_ag_out_rs_mla(
+            partial_out,
+            partial_lse.clone(),
+            coordinator,
+            is_lse_base_on_e=True,
+        )
+        .transpose(0, 1)
+        .contiguous()
+    )
     a2a = dcp_a2a_lse_reduce(
         partial_out.clone(),
         partial_lse.clone(),
@@ -195,6 +204,46 @@ def _worker_test(rank: int, world_size: int, device, coordinator) -> None:
         a2a.float(), reference_local.float(), atol=4e-2, rtol=4e-2
     )
     torch.testing.assert_close(a2a.float(), ag_rs.float(), atol=3e-2, rtol=3e-2)
+    assert ag_rs.is_contiguous()
+    ag_rs.view(batch, -1)
+
+    graph_partial_out = torch.empty_like(partial_out)
+    graph_partial_lse = torch.empty_like(partial_lse)
+    graph_partial_out.copy_(partial_out)
+    graph_partial_lse.copy_(partial_lse)
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with coordinator.graph_capture() as graph_context:
+        with torch.cuda.graph(graph, stream=graph_context.stream):
+            graph_ag_rs = (
+                cp_lse_ag_out_rs_mla(
+                    graph_partial_out,
+                    graph_partial_lse,
+                    coordinator,
+                    is_lse_base_on_e=True,
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
+    torch.cuda.synchronize()
+
+    replay_results = []
+    for _ in range(3):
+        graph_partial_out.copy_(partial_out)
+        graph_partial_lse.copy_(partial_lse)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        replay_results.append(graph_ag_rs.clone())
+
+    for replay_result in replay_results:
+        torch.testing.assert_close(
+            replay_result.float(), ag_rs.float(), atol=3e-2, rtol=3e-2
+        )
+        assert replay_result.is_contiguous()
+        replay_result.view(batch, -1)
+    for replay_result in replay_results[1:]:
+        torch.testing.assert_close(replay_result, replay_results[0], atol=0, rtol=0)
 
 
 def _worker_main() -> None:

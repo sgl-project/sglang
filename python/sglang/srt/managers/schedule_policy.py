@@ -766,7 +766,7 @@ class PrefillAdder:
         allocation so an admitted request cannot OOM."""
         window = self.tree_cache.sliding_window_size
         headroom = min(extend_input_len + max_new_tokens, window)
-        reserved = headroom + self.page_size
+        reserved = headroom + self.allocation_page_size
         if swa_host_hit_length > 0:
             reserved += self._ceil_swa_paged_tokens(swa_host_hit_length)
         return reserved
@@ -799,7 +799,7 @@ class PrefillAdder:
         )
         if cap <= 0:
             return 0
-        return cap // self.page_size * self.page_size
+        return cap // self.allocation_page_size * self.allocation_page_size
 
     def _swa_req_never_fits(
         self, extend_input_len: int, max_new_tokens: int, swa_host_hit_length: int = 0
@@ -841,7 +841,7 @@ class PrefillAdder:
         return -(-tokens // self.allocation_page_size) * self.allocation_page_size
 
     def _ceil_swa_paged_tokens(self, tokens: int) -> int:
-        return -(-tokens // self.page_size) * self.page_size
+        return -(-tokens // self.allocation_page_size) * self.allocation_page_size
 
     def budget_state(self):
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
@@ -1012,10 +1012,11 @@ class PrefillAdder:
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             if self.is_hybrid_swa:
-                # alloc_extend needs extend_num_tokens + page_size per request,
-                # so reserve one page here to avoid OOM
+                # alloc_extend needs extend_num_tokens plus one allocator page
+                # per request, so reserve that page here to avoid OOM.
                 _rem_tokens = min(
-                    _rem_tokens, int(self.rem_swa_tokens) - self.page_size
+                    _rem_tokens,
+                    int(self.rem_swa_tokens) - self.allocation_page_size,
                 )
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.

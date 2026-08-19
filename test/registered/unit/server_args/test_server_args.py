@@ -2265,6 +2265,7 @@ class TestDcpKvEventContract(CustomTestCase):
             page_size=64,
             kv_events_config=self.KV_EVENTS,
         )
+        self.assertEqual(args.allocation_page_size, 256)
         self.assertEqual(args.describe_kv_events_publisher()["block_size"], 256)
         args = ServerArgs(
             model_path="dummy", page_size=64, kv_events_config=self.KV_EVENTS
@@ -2276,6 +2277,31 @@ class TestDcpKvEventContract(CustomTestCase):
         # paged, at dcp_size.
         args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
         self.assertEqual(args.kv_event_block_size, 8)
+
+
+class TestDcpChunkedPrefillContract(CustomTestCase):
+    def test_rejects_chunk_smaller_than_logical_page(self):
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            dcp_size=8,
+            page_size=256,
+            chunked_prefill_size=1024,
+            served_model_name="dummy",
+        )
+        with self.assertRaisesRegex(AssertionError, "page_size \\* dcp_size"):
+            args.check_server_args()
+
+    def test_accepts_chunk_aligned_to_logical_page(self):
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=8,
+            dcp_size=8,
+            page_size=256,
+            chunked_prefill_size=2048,
+            served_model_name="dummy",
+        )
+        args.check_server_args()
 
 
 if __name__ == "__main__":

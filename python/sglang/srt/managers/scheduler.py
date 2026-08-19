@@ -1106,9 +1106,11 @@ class Scheduler(
         if not get_observability().enable_metrics:
             return
 
+        full_token_capacity, swa_token_capacity = self.get_token_pool_capacities()
+        token_capacity = full_token_capacity or swa_token_capacity
         self.metrics_collector.emit_constants(
-            max_total_num_tokens=self.max_total_num_tokens,
-            max_total_num_tokens_swa=self.swa_tokens_per_layer,
+            max_total_num_tokens=token_capacity,
+            max_total_num_tokens_swa=swa_token_capacity,
             weight_memory_usage_gb=self.tp_worker.model_runner.weight_load_mem_usage,
             kv_cache_memory_usage_gb=(
                 self.token_to_kv_pool_allocator.get_kvcache().mem_usage
@@ -1123,10 +1125,25 @@ class Scheduler(
             ),
             # TODO: max_running_requests_under_SLO has no setter — dead chain.
             max_running_requests_under_SLO=None,
-            page_size=self.page_size,
-            num_pages=self.max_total_num_tokens // self.page_size,
+            page_size=self.token_to_kv_pool_allocator.page_size,
+            num_pages=token_capacity // self.token_to_kv_pool_allocator.page_size,
             context_len=self.model_config.context_len,
             startup_available_gpu_memory_gb=self.startup_available_gpu_memory_gb,
+        )
+
+    def get_token_pool_capacities(self) -> Tuple[int, Optional[int]]:
+        if self.is_hybrid_swa:
+            return (
+                (
+                    self.token_to_kv_pool_allocator.size_full
+                    if self.full_tokens_per_layer
+                    else 0
+                ),
+                self.token_to_kv_pool_allocator.size_swa,
+            )
+        return (
+            self.max_total_num_tokens * get_parallel().attn_dcp_size,
+            self.swa_tokens_per_layer,
         )
 
     def init_hisparse_coordinator(self) -> None:
@@ -2085,6 +2102,8 @@ class Scheduler(
         )
 
     def init_pool_stats_observer(self) -> None:
+        full_token_capacity, swa_token_capacity = self.get_token_pool_capacities()
+        token_capacity = full_token_capacity or swa_token_capacity
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -2094,10 +2113,9 @@ class Scheduler(
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_ssm=self.is_hybrid_ssm,
             enable_hisparse=self.enable_hisparse,
-            full_tokens_per_layer=self.full_tokens_per_layer,
-            swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens
-            * get_parallel().attn_dcp_size,
+            full_tokens_per_layer=full_token_capacity,
+            swa_tokens_per_layer=swa_token_capacity,
+            max_total_num_tokens=token_capacity,
             get_last_batch=lambda: self.last_batch,
             get_running_batch=lambda: self.running_batch,
         )
@@ -2107,10 +2125,10 @@ class Scheduler(
             is_hybrid_swa=self.is_hybrid_swa,
             is_hybrid_ssm=self.is_hybrid_ssm,
             disaggregation_mode=self.disaggregation_mode,
-            page_size=self.page_size,
-            full_tokens_per_layer=self.full_tokens_per_layer,
-            swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens,
+            page_size=self.token_to_kv_pool_allocator.page_size,
+            full_tokens_per_layer=self.pool_stats_observer.full_tokens_per_layer,
+            swa_tokens_per_layer=self.pool_stats_observer.swa_tokens_per_layer,
+            max_total_num_tokens=self.pool_stats_observer.max_total_num_tokens,
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
@@ -2140,7 +2158,7 @@ class Scheduler(
             tree_cache=self.tree_cache,
             send_metrics_from_scheduler=self.ipc_channels.send_metrics_from_scheduler,
             max_running_requests=self.max_running_requests,
-            max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens=self.pool_stats_observer.max_total_num_tokens,
             get_stats=lambda: self.metrics_reporter.stats,
         )
 
@@ -2154,7 +2172,7 @@ class Scheduler(
             disaggregation_mode=self.disaggregation_mode,
             ps=self.ps,
             server_args=self.server_args,
-            max_total_num_tokens=self.max_total_num_tokens,
+            max_total_num_tokens=self.pool_stats_observer.max_total_num_tokens,
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,
             tp_worker=self.tp_worker,
@@ -4386,8 +4404,8 @@ class Scheduler(
             weight_gb=self.tp_worker.model_runner.weight_load_mem_usage,
             kv_cache_gb=self.token_to_kv_pool_allocator.get_kvcache().mem_usage,
             startup_available_gb=self.startup_available_gpu_memory_gb,
-            token_capacity=self.max_total_num_tokens,
-            token_capacity_swa=self.swa_tokens_per_layer,
+            token_capacity=self.pool_stats_observer.max_total_num_tokens,
+            token_capacity_swa=self.pool_stats_observer.swa_tokens_per_layer,
             target_graph_memory_usage=self.tp_worker.graph_memory_usage,
             draft_graph_memory_usage=draft_graph_memory_usage,
         )

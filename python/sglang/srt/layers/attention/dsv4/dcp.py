@@ -26,9 +26,15 @@ def validate_dsv4_dcp_topology(
     attn_tp_size: int,
     attn_tp_rank: int,
     attn_dp_size: int,
+    disaggregation_mode: str = "null",
 ) -> None:
     if dcp_size <= 1:
         return
+    if disaggregation_mode != "null":
+        raise NotImplementedError(
+            "DeepSeek V4 DCP does not support disaggregated serving yet; "
+            "the PD transfer path is not owner-local aware."
+        )
     if attn_dp_size != 1:
         raise NotImplementedError(
             "DeepSeek V4 DCP currently requires attention data parallel size 1; "
