@@ -925,6 +925,7 @@ def maybe_download_model(
         local_path = snapshot_download(
             repo_id=model_name_or_path,
             ignore_patterns=["*.onnx", "*.msgpack"],
+            allow_patterns=allow_patterns,
             local_dir=local_dir,
             local_files_only=True,
             max_workers=8,
@@ -1034,6 +1035,7 @@ def maybe_download_model(
                     local_path = snapshot_download(
                         repo_id=model_name_or_path,
                         ignore_patterns=["*.onnx", "*.msgpack"],
+                        allow_patterns=allow_patterns,
                         local_dir=local_dir,
                         max_workers=8,
                         force_download=True,
@@ -1081,6 +1083,28 @@ def maybe_download_model(
                 attempt + 1,
                 MAX_RETRIES,
                 e,
+                wait_time,
+            )
+            time.sleep(wait_time)
+        except RuntimeError as e:
+            if "client has been closed" not in str(e).lower():
+                raise ValueError(
+                    f"Could not find model at {model_name_or_path} and failed to download from {_model_hub_name()}: {e}"
+                ) from e
+            if attempt == MAX_RETRIES - 1:
+                raise ValueError(
+                    f"Could not find model at {model_name_or_path} and failed to download from {_model_hub_name()} "
+                    f"after {MAX_RETRIES} attempts due to network error: {e}"
+                ) from e
+            from huggingface_hub.utils._http import close_session
+
+            close_session()
+            wait_time = 2**attempt
+            logger.warning(
+                "Download failed (attempt %d/%d) because the Hugging Face client was closed. "
+                "Retrying in %d seconds...",
+                attempt + 1,
+                MAX_RETRIES,
                 wait_time,
             )
             time.sleep(wait_time)
