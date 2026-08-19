@@ -1771,7 +1771,12 @@ def alloc_for_decode_prealloc(
                 swa_tail_len=swa_tail_len,
                 **extra_kwargs,
             )
-            req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
+            swa_evicted_seqlen = fill_len - swa_tail_len
+            assert (
+                swa_evicted_seqlen >= 0
+                and swa_evicted_seqlen % allocator.page_size == 0
+            )
+            req.kv.swa_evicted_seqlen = swa_evicted_seqlen
         else:
             kv_loc = allocator.alloc_extend(
                 prefix_lens=torch.tensor(
