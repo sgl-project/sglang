@@ -89,6 +89,8 @@ class Mamba2Metadata(ForwardMetadata):
         checkpoint_seq_indices: tuple[int, ...]
         checkpoint_seq_starts: tuple[int, ...]
         checkpoint_lengths: tuple[int, ...]
+        checkpoint_token_indices: torch.Tensor | None
+        checkpoint_state_slots: torch.Tensor | None
 
     mixed_metadata: MixedMetadata | None = None
     """`mixed_metadata` is used for extend/mixed requests"""
@@ -176,6 +178,21 @@ class Mamba2Metadata(ForwardMetadata):
             chunk_offsets[_s] = s % chunk_size
 
         return chunk_indices, chunk_offsets
+
+    @staticmethod
+    def _insert_logical_chunk_starts(
+        chunk_indices: torch.Tensor,
+        chunk_offsets: torch.Tensor,
+        chunk_size: int,
+        starts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Insert logical boundaries without changing physical token order."""
+        logical_starts = chunk_indices * chunk_size + chunk_offsets
+        logical_starts = torch.unique(
+            torch.cat((logical_starts, starts.to(logical_starts.dtype))),
+            sorted=True,
+        )
+        return logical_starts // chunk_size, logical_starts % chunk_size
 
     @staticmethod
     def prepare_decode(
@@ -273,9 +290,11 @@ class Mamba2Metadata(ForwardMetadata):
         from sglang.kernels.ops.mamba.triton_ops.ssu_dispatch import (
             mamba_prefill_metadata_chunk_size,
             mamba_prefill_requires_chunk_metadata,
+            mamba_prefill_supports_direct_checkpoints,
         )
 
         chunk_offsets, chunk_indices = None, None
+        metadata_chunk_size = None
         if prep_initial_states or mamba_prefill_requires_chunk_metadata():
             metadata_chunk_size = mamba_prefill_metadata_chunk_size(chunk_size)
             chunk_indices, chunk_offsets = (
@@ -285,12 +304,15 @@ class Mamba2Metadata(ForwardMetadata):
             )
 
         # SSDCombined backends intentionally avoid Triton's dense intermediate
-        # ``h`` tensor.  Plan the at-most-one compact earlier checkpoint needed
+        # ``h`` tensor. Plan the at-most-one compact earlier checkpoint needed
         # by every tracked prefill whose radix boundary is not the final chunk
-        # boundary.  The selected SSD backend replays only these prefixes.
+        # boundary. Cake emits it in the main pass; other SSD backends replay
+        # only the selected prefixes.
         checkpoint_seq_indices: list[int] = []
         checkpoint_seq_starts: list[int] = []
         checkpoint_lengths: list[int] = []
+        checkpoint_token_indices_cpu = [-1] * num_prefills
+        checkpoint_state_slots_cpu = [-1] * num_prefills
         if forward_metadata.has_mamba_track_mask:
             track_mask = forward_batch.mamba_track_mask[:num_prefills].cpu()
             relative_track_lens = (
@@ -308,7 +330,7 @@ class Mamba2Metadata(ForwardMetadata):
             ):
                 if track and relative_length % chunk_size:
                     checkpoint_length = (relative_length // chunk_size) * chunk_size
-                    if checkpoint_length <= 0 or checkpoint_length > extend_length:
+                    if checkpoint_length <= 0 or checkpoint_length >= extend_length:
                         raise ValueError(
                             "invalid compact Mamba checkpoint length: "
                             f"sequence={sequence}, checkpoint={checkpoint_length}, "
@@ -317,7 +339,39 @@ class Mamba2Metadata(ForwardMetadata):
                     checkpoint_seq_indices.append(sequence)
                     checkpoint_seq_starts.append(sequence_start)
                     checkpoint_lengths.append(checkpoint_length)
+                    checkpoint_token_indices_cpu[sequence] = (
+                        sequence_start + checkpoint_length
+                    )
+                    checkpoint_state_slots_cpu[sequence] = (
+                        len(checkpoint_seq_indices) - 1
+                    )
                 sequence_start += extend_length
+
+        checkpoint_token_indices = None
+        checkpoint_state_slots = None
+        if checkpoint_seq_indices:
+            checkpoint_token_indices = torch.tensor(
+                checkpoint_token_indices_cpu,
+                dtype=torch.int32,
+                device=query_start_loc.device,
+            )
+            checkpoint_state_slots = torch.tensor(
+                checkpoint_state_slots_cpu,
+                dtype=torch.int32,
+                device=query_start_loc.device,
+            )
+            if mamba_prefill_supports_direct_checkpoints():
+                assert chunk_indices is not None and chunk_offsets is not None
+                assert metadata_chunk_size is not None
+                checkpoint_starts = checkpoint_token_indices[
+                    checkpoint_token_indices >= 0
+                ]
+                chunk_indices, chunk_offsets = cls._insert_logical_chunk_starts(
+                    chunk_indices,
+                    chunk_offsets,
+                    metadata_chunk_size,
+                    checkpoint_starts,
+                )
 
         draft_token_num = (
             getattr(forward_batch.spec_info, "draft_token_num", 1)
@@ -365,5 +419,7 @@ class Mamba2Metadata(ForwardMetadata):
                 checkpoint_seq_indices=tuple(checkpoint_seq_indices),
                 checkpoint_seq_starts=tuple(checkpoint_seq_starts),
                 checkpoint_lengths=tuple(checkpoint_lengths),
+                checkpoint_token_indices=checkpoint_token_indices,
+                checkpoint_state_slots=checkpoint_state_slots,
             ),
         )

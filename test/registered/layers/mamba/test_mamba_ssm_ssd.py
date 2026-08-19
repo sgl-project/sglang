@@ -20,6 +20,27 @@ from sglang.srt.utils import get_device
 from sglang.srt.utils.common import is_hip
 from sglang.utils import is_in_ci
 
+
+def test_insert_compact_checkpoint_inside_physical_chunk():
+    # Packed lengths [72, 312] put sequence 1's 128-token checkpoint at
+    # absolute token 200, inside physical chunk 1.
+    chunk_indices = torch.tensor([0, 0, 1, 2], dtype=torch.int32)
+    chunk_offsets = torch.tensor([0, 72, 0, 0], dtype=torch.int32)
+
+    indices, offsets = Mamba2Metadata._insert_logical_chunk_starts(
+        chunk_indices,
+        chunk_offsets,
+        128,
+        torch.tensor([200], dtype=torch.int32),
+    )
+
+    torch.testing.assert_close(
+        indices, torch.tensor([0, 0, 1, 1, 2], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        offsets, torch.tensor([0, 72, 0, 72, 0], dtype=torch.int32)
+    )
+
 if is_hip():
     os.environ["AMDGCN_USE_BUFFER_OPS"] = "0"
 
