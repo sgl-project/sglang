@@ -1445,7 +1445,6 @@ def pre_permute_deepep_v2_to_deep_gemm(
 ) -> DeepGemmRunnerInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import (
         ep_expand_init_m_indices_from_psum,
-        ep_scatter,
         ep_scatter_from_psum,
     )
 
@@ -1453,7 +1452,6 @@ def pre_permute_deepep_v2_to_deep_gemm(
     hidden_states_scale = dispatch_output.hidden_states_scale
     topk_ids = dispatch_output.topk_ids
     topk_weights = dispatch_output.topk_weights
-    num_recv_tokens_per_expert = dispatch_output.num_recv_tokens_per_expert
     psum_num_recv_tokens_per_expert = dispatch_output.psum_num_recv_tokens_per_expert
     is_expanded = dispatch_output.is_expanded
     hidden_states_scale_tma_aligned = dispatch_output.hidden_states_scale_tma_aligned
@@ -1472,7 +1470,8 @@ def pre_permute_deepep_v2_to_deep_gemm(
     if is_expanded:
         if psum_num_recv_tokens_per_expert is None:
             raise RuntimeError(
-                "DeepEP v2 expanded layout requires native expert prefix sums."
+                "DeepEP v2 requires the native expert prefix sums from the "
+                "ElasticBuffer dispatch handle."
             )
         all_tokens = hidden_states.shape[0]
         running_state["all_tokens"] = all_tokens
@@ -1525,17 +1524,9 @@ def pre_permute_deepep_v2_to_deep_gemm(
             hidden_states_scale_tma_aligned=hidden_states_scale_tma_aligned,
         )
 
-    if psum_num_recv_tokens_per_expert is not None:
-        all_tokens = int(psum_num_recv_tokens_per_expert[-1].item())
-        num_recv_tokens_per_expert_gpu = None
-    else:
-        num_recv_tokens_per_expert = [
-            ceil_div(x, 128) * 128 for x in num_recv_tokens_per_expert
-        ]
-        all_tokens = sum(num_recv_tokens_per_expert)
-        num_recv_tokens_per_expert_gpu = torch.tensor(
-            num_recv_tokens_per_expert, dtype=torch.int32, pin_memory=True, device="cpu"
-        ).cuda(non_blocking=True)
+    # ElasticBuffer always populates the handle's per-expert prefix sum, so the
+    # contiguous path never needs a host-side count list.
+    all_tokens = int(psum_num_recv_tokens_per_expert[-1].item())
     K = hidden_states.shape[1]
     running_state["all_tokens"] = all_tokens
     running_state["hidden_states_shape"] = hidden_states.shape
@@ -1567,42 +1558,27 @@ def pre_permute_deepep_v2_to_deep_gemm(
         )
     m_indices = buffer_init(all_tokens, device=hidden_states.device, dtype=torch.int32)
     output_index = torch.empty_like(topk_ids)
-    if psum_num_recv_tokens_per_expert is not None:
-        # Contiguous-path alignment contract: this psum comes from ElasticBuffer
-        # dispatch(do_expand=False, expert_alignment=capability.expert_alignment),
-        # and DeepEP documents the non-expand psum as the inclusive prefix sum of
-        # alignment-PADDED per-expert counts (deep_ep/buffers/elastic.py). The
-        # deep_gemm capability pins expert_alignment=128 ==
-        # get_m_alignment_for_contiguous_layout(), so psum[e-1] is a valid
-        # 128-aligned group start for the contiguous grouped GEMM. Do NOT re-align
-        # here: an align_up would silently mask an upstream contract break.
-        expert_start_loc = torch.empty_like(psum_num_recv_tokens_per_expert)
-        ep_scatter_from_psum(
-            hidden_states,
-            hidden_states_scale,
-            topk_ids,
-            psum_num_recv_tokens_per_expert,
-            expert_start_loc,
-            input_tensor,
-            input_tensor_scale,
-            m_indices,
-            output_index,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        )
-    else:
-        expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
-        ep_scatter(
-            hidden_states,
-            hidden_states_scale,
-            topk_ids,
-            num_recv_tokens_per_expert_gpu,
-            expert_start_loc,
-            input_tensor,
-            input_tensor_scale,
-            m_indices,
-            output_index,
-            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        )
+    # Contiguous-path alignment contract: this psum comes from ElasticBuffer
+    # dispatch(do_expand=False, expert_alignment=_EXPERT_ALIGNMENT), and DeepEP
+    # documents the non-expand psum as the inclusive prefix sum of
+    # alignment-PADDED per-expert counts (deep_ep/buffers/elastic.py). The
+    # dispatcher pins that alignment to 128 ==
+    # get_m_alignment_for_contiguous_layout(), so psum[e-1] is a valid
+    # 128-aligned group start for the contiguous grouped GEMM. Do NOT re-align
+    # here: an align_up would silently mask an upstream contract break.
+    expert_start_loc = torch.empty_like(psum_num_recv_tokens_per_expert)
+    ep_scatter_from_psum(
+        hidden_states,
+        hidden_states_scale,
+        topk_ids,
+        psum_num_recv_tokens_per_expert,
+        expert_start_loc,
+        input_tensor,
+        input_tensor_scale,
+        m_indices,
+        output_index,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
     dispose_tensor(hidden_states)
     dispose_tensor(hidden_states_scale)
     running_state["output_index"] = output_index

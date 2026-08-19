@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import List, NamedTuple, Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -55,7 +55,6 @@ class DeepEPv2DispatchOutput(NamedTuple):
     hidden_states_scale: Optional[torch.Tensor]
     topk_ids: Optional[torch.Tensor]
     topk_weights: torch.Tensor
-    num_recv_tokens_per_expert: List[int]
     psum_num_recv_tokens_per_expert: Optional[torch.Tensor] = None
     is_expanded: bool = False
     hidden_states_scale_tma_aligned: bool = False
@@ -412,7 +411,6 @@ class _DeepEPv2Impl:
             # Avoid exact-count CPU reads that are only needed by non-expanded
             # slicing/scatter paths.
             local_topk_ids = None
-            num_recv_tokens_per_expert = []
         else:
             num_recv_tokens = int(
                 handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()
@@ -427,7 +425,6 @@ class _DeepEPv2Impl:
             # expert ids and marks non-local choices as -1. Keep it on-GPU and avoid
             # an unnecessary max().item() synchronization in the decode path.
             local_topk_ids = recv_topk_idx
-            num_recv_tokens_per_expert = list(handle.num_recv_tokens_per_expert_list)
 
         expected_m = 0
         masked_max_m = 0
@@ -462,7 +459,6 @@ class _DeepEPv2Impl:
             recv_hidden_states_scale,
             local_topk_ids,
             recv_topk_weights,
-            num_recv_tokens_per_expert,
             handle.psum_num_recv_tokens_per_expert,
             use_expand_layout,
             use_tma_aligned_col_major_sf,
