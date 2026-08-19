@@ -27,10 +27,13 @@ generation, not a recommendation:
   default. Install with ``pip install --no-deps b12x==1.2.2``; without
   ``--no-deps`` pip pulls a newer torch and breaks the rest of the image.
 * **0.15.3** (``b12x.integration``, the legacy API) was never published to
-  PyPI and can only come from a checkout (``SGLANG_B12X_PATH``). On this
-  shape it is ~19% *faster* per call -- see
-  :func:`_select_b12x_distribution` for the numbers and the mechanism --
-  which is why a deployment would bother.
+  PyPI -- it ships only inside the dspark reference image, and 0.15.2 (the
+  last published 0.15.x) predates the ``fp4_e8m0_k32`` / ``w13_layout``
+  API this file needs -- so it can only come from a checkout
+  (``SGLANG_B12X_PATH``). At the decode working point (M=6) it is ~19%
+  *faster* per call -- see :func:`_select_b12x_distribution` -- while at
+  prefill-sized M the two generations are within noise; that decode delta
+  is why a deployment would bother.
 """
 
 from __future__ import annotations
