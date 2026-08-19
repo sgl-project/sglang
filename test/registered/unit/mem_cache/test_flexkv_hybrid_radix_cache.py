@@ -66,6 +66,36 @@ def test_pool_accounting_delegates_to_inner_cache():
     assert cache.swa_protected_size() == 128
 
 
+def test_evict_does_not_poll_cross_rank_store_completion():
+    inner = MagicMock()
+    result = object()
+    inner.evict.return_value = result
+    connector = MagicMock()
+    cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
+    cache._inner_cache = inner
+    cache.flexkv_connector = connector
+    params = object()
+
+    assert cache.evict(params) is result
+
+    inner.evict.assert_called_once_with(params)
+    connector.check_completed_stores.assert_not_called()
+
+
+def test_scheduler_hook_polls_cross_rank_store_completion():
+    connector = MagicMock()
+    connector.check_completed_stores.return_value = []
+    cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
+    cache.flexkv_connector = connector
+    cache._node_lock = threading.Lock()
+    cache._inflight_store_nodes = {}
+
+    cache.check_hicache_events()
+
+    connector.check_completed_stores.assert_called_once_with()
+    connector.drain_launched_loads.assert_called_once_with()
+
+
 def test_restored_swa_tail_marks_older_prefix_as_evicted_before_cache_insert():
     inner = MagicMock()
     cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)

@@ -471,7 +471,10 @@ class FlexKVHybridRadixCache(BasePrefixCache):
         del req._flexkv_swa_evicted_seqlen
 
     def evict(self, params: EvictParams) -> EvictResult:
-        self._drain_completed_stores()
+        # Local memory pressure can make eviction asymmetric across TP/CP
+        # ranks. Do not poll FlexKV here: completion uses a cross-rank scatter
+        # and belongs to the synchronized scheduler hook below. The inner
+        # cache cannot evict active store nodes because their lock refs remain.
         return self._inner_cache.evict(params)
 
     def check_hicache_events(self) -> None:

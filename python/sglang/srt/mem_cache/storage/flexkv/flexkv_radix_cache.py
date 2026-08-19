@@ -133,9 +133,9 @@ class FlexKVRadixCache(RadixCache):
         # Two-phase MP load: stash marker between ``match_prefix`` and
         # ``init_load_back``.
         self._load_markers: dict[str, _LoadBackMarker] = {}
-        # ``store_kv`` is async — we keep a lock on the source node
-        # until FlexKV signals completion, draining in ``evict`` /
-        # ``check_hicache_events``.
+        # ``store_kv`` is async — we keep a lock on the source node until
+        # FlexKV signals completion at the scheduler's synchronized
+        # ``check_hicache_events`` point.
         self._inflight_store_nodes: dict[str, TreeNode] = {}
         self._node_lock = threading.Lock()
 
@@ -471,11 +471,13 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
 
     def evict(self, params: EvictParams) -> EvictResult:  # type: ignore[override]
-        """Drain completed stores before letting the base evict touch
-        the source nodes."""
+        """Evict unlocked nodes without entering a cross-rank protocol."""
         if self.disable:
             return EvictResult()
-        self._drain_completed_stores()
+        # Eviction is conditional on local allocator pressure, so not every
+        # TP/CP rank calls it. Store completion is a scatter protocol and must
+        # only run from the synchronized scheduler hook below. In-flight store
+        # nodes remain protected by their lock refs here.
         # Make sure the store stream's GPU work is observed before any
         # eviction frees the source slots.
         self.store_stream.synchronize()

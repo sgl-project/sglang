@@ -99,7 +99,7 @@ def _flexkv_factory(ctx):
         from sglang.srt.mem_cache.storage.flexkv.flexkv_hybrid_radix_cache import (
             FlexKVHybridRadixCache,
         )
-        from sglang.srt.mem_cache.unified_cache_components import ComponentType
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         ctx.params.tree_components = (ComponentType.FULL, ComponentType.SWA)
