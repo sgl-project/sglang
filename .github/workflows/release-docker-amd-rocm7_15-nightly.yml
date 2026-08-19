@@ -34,7 +34,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gpu_arch: ['gfx942-rocm7_15', 'gfx950-rocm7_15', 'gfx1250-rocm7_15']
+        # TEST-ONLY (branch bingxche/rocm715-fullflow): gfx1250-rocm7_15 is dropped
+        # because its Dockerfile stage lives in PR #32754, not on this branch, so
+        # that matrix entry can only fail here and would burn a runner slot for two
+        # hours. Restore the three-entry matrix before merging anything from here.
+        gpu_arch: ['gfx942-rocm7_15', 'gfx950-rocm7_15']
         build_type: ['all']
     steps:
       - name: Checkout repository
