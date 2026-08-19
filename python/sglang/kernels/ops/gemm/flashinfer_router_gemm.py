@@ -22,9 +22,7 @@ class _RouterGemmSpec(NamedTuple):
 
 
 _ROUTER_GEMM_SPECS = {
-    (7168, 128): _RouterGemmSpec(
-        "mm_M1_16_K7168_N128", torch.bfloat16
-    ),
+    (7168, 128): _RouterGemmSpec("mm_M1_16_K7168_N128", torch.bfloat16),
     (7168, 256): _RouterGemmSpec("mm_M1_16_K7168_N256", torch.float32),
     (6144, 256): _RouterGemmSpec("mm_M1_16_K6144_N256", torch.float32),
 }

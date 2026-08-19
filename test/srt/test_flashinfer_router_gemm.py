@@ -75,9 +75,7 @@ def test_flashinfer_router_gemm_preserves_unsupported_fallbacks(
         "_get_flashinfer_router_gemm_ops",
         lambda: pytest.fail("unsupported inputs must not resolve FlashInfer ops"),
     )
-    assert (
-        router_gemm.try_flashinfer_router_gemm(hidden_states, router_weights) is None
-    )
+    assert router_gemm.try_flashinfer_router_gemm(hidden_states, router_weights) is None
 
 
 def test_flashinfer_router_gemm_kill_switch(monkeypatch):
@@ -146,9 +144,7 @@ def test_deepseek_gate_uses_flashinfer_router_gemm(monkeypatch):
     )
     gate = deepseek_v2.MoEGate.__new__(deepseek_v2.MoEGate)
     torch.nn.Module.__init__(gate)
-    gate.weight = torch.nn.Parameter(
-        torch.empty(256, 7168, dtype=torch.bfloat16)
-    )
+    gate.weight = torch.nn.Parameter(torch.empty(256, 7168, dtype=torch.bfloat16))
     gate.is_deepseek_v4 = False
     gate.dsa_enable_prefill_cp = False
     gate.mla_enable_prefill_cp = False
