@@ -47,8 +47,12 @@ class AutoRoundConfig(QuantizationConfig):
     """
 
     SUPPORTED_BITS = {2, 3, 4, 8}
-    SUPPORTED_DTYPES = {"int"}
-    SUPPORTED_FORMATS = {"auto_round:auto_gptq", "auto_round:auto_awq"}
+    SUPPORTED_DTYPES = {"int", "mx_fp"}
+    SUPPORTED_FORMATS = {
+        "auto_round:auto_gptq",
+        "auto_round:auto_awq",
+        "auto_round:llm_compressor",
+    }
     SUPPORTED_BACKENDS = {"auto", "gptq", "gptq:marlin", "awq", "awq:marlin", "marlin"}
 
     def __init__(
@@ -75,7 +79,8 @@ class AutoRoundConfig(QuantizationConfig):
                 f"Unsupported weight_bits: {weight_bits}, "
                 f"currently only support  {self.SUPPORTED_BITS}"
             )
-        if data_type not in self.SUPPORTED_DTYPES:
+        is_mxfp = "mx_fp" in data_type
+        if data_type not in self.SUPPORTED_DTYPES and not is_mxfp:
             raise ValueError(
                 f"Unsupported data_type: {data_type},"
                 f" currently only support  {self.SUPPORTED_DTYPES}"
@@ -113,6 +118,9 @@ class AutoRoundConfig(QuantizationConfig):
         self.gptq_defaulted_config_keys = gptq_defaulted_config_keys or ()
         self._logged_gptq_default_assumptions = False
 
+        if self.is_mxfp:
+            self._validate_mxfp_metadata()
+
     def __repr__(self) -> str:
         return (
             f"AutoRoundConfig(weight_bits={self.weight_bits}, "
@@ -122,6 +130,93 @@ class AutoRoundConfig(QuantizationConfig):
     @classmethod
     def get_name(cls):
         return "auto-round"
+
+    @property
+    def is_mxfp(self) -> bool:
+        return "mx_fp" in self.data_type
+
+    @classmethod
+    def is_mxfp_config(cls, config: dict[str, Any]) -> bool:
+        return (
+            (
+                config.get("quant_method") == "auto-round"
+                or config.get("_auto_round_quant_method") == "auto-round"
+            )
+            and "mx_fp" in str(config.get("data_type", ""))
+        )
+
+    @classmethod
+    def get_mxfp_quantization_method(cls, config: dict[str, Any]) -> Optional[str]:
+        if not cls.is_mxfp_config(config):
+            return None
+        bits = int(config.get("bits", 0))
+        if bits == 8:
+            return "mxfp8"
+        if bits == 4:
+            return "mxfp4"
+        raise ValueError(
+            "SGLang supports AutoRound MXFP checkpoints with bits=4 or bits=8, "
+            f"but got bits={bits}."
+        )
+
+    @classmethod
+    def to_native_mxfp_config(cls, config: dict[str, Any]) -> dict[str, Any]:
+        quant_method = cls.get_mxfp_quantization_method(config)
+        if quant_method is None:
+            return config
+
+        cls._validate_mxfp_config_dict(config)
+        normalized = dict(config)
+        group_size = int(normalized.get("group_size", 32))
+        normalized["_auto_round_quant_method"] = "auto-round"
+        normalized["quant_method"] = quant_method
+        if quant_method == "mxfp8":
+            normalized.setdefault("activation_scheme", "dynamic")
+            normalized["weight_block_size"] = [1, group_size]
+            normalized.setdefault("scale_fmt", "ue8m0")
+        return normalized
+
+    @classmethod
+    def override_quantization_method(
+        cls, hf_quant_cfg: dict[str, Any], user_quant: Optional[str]
+    ) -> Optional[str]:
+        return cls.get_mxfp_quantization_method(hf_quant_cfg)
+
+    def _validate_mxfp_metadata(self) -> None:
+        self._validate_mxfp_config_dict(
+            {
+                "bits": self.weight_bits,
+                "group_size": self.group_size,
+                "sym": self.sym,
+                "packing_format": self.packing_format,
+            }
+        )
+
+    @classmethod
+    def _validate_mxfp_config_dict(cls, config: dict[str, Any]) -> None:
+        bits = int(config.get("bits", 0))
+        group_size = int(config.get("group_size", 0))
+        sym = bool(config.get("sym", False))
+        packing_format = config.get("packing_format")
+
+        if bits not in (4, 8):
+            raise ValueError(
+                "SGLang supports AutoRound MXFP checkpoints with 4-bit or 8-bit "
+                f"weights, but got {bits}-bit."
+            )
+        if group_size != 32:
+            raise ValueError(
+                "AutoRound MXFP checkpoints require group_size=32, "
+                f"but got group_size={group_size}."
+            )
+        if not sym:
+            raise ValueError("AutoRound MXFP checkpoints must be symmetric.")
+        if packing_format != "auto_round:llm_compressor":
+            raise ValueError(
+                "AutoRound MXFP checkpoints require "
+                "packing_format='auto_round:llm_compressor', "
+                f"but got {packing_format!r}."
+            )
 
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:

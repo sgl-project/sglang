@@ -283,6 +283,12 @@ def get_quant_config(
     if hf_quant_config is not None:
         if not isinstance(hf_quant_config, dict):
             hf_quant_config = hf_quant_config.to_dict()
+        from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
+
+        if AutoRoundConfig.is_mxfp_config(hf_quant_config):
+            hf_quant_config.update(
+                AutoRoundConfig.to_native_mxfp_config(hf_quant_config)
+            )
         # For modelopt_mixed, config.json's quantization_config may not
         # contain all runtime metadata. Fall through to the file-based
         # hf_quant_config.json path when the per-layer map or KV-cache

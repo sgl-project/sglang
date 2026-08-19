@@ -1180,6 +1180,11 @@ class ModelConfig:
         if quant_cfg is not None and not isinstance(quant_cfg, dict):
             quant_cfg = quant_cfg.to_dict()
         if quant_cfg is not None:
+            from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
+
+            if AutoRoundConfig.is_mxfp_config(quant_cfg):
+                quant_cfg.update(AutoRoundConfig.to_native_mxfp_config(quant_cfg))
+
             # Identify modelopt quantization
             if (
                 "quant_method" not in quant_cfg
