@@ -108,6 +108,30 @@ class TestLlama32Detector(CustomTestCase):
         self.assertEqual(args["city"], "London")
         self.assertEqual(args["unit"], "celsius")
 
+    def test_trailing_text_after_tool_call_is_preserved(self):
+        # Prose after the tool call has no ";" separator; the parser used to
+        # unconditionally skip len(tool_call_separator) and drop the first
+        # character ("}}Some note" -> "ome note").
+        text = (
+            '<|python_tag|>{"name": "get_weather", "arguments": {"city": "Beijing"}}'
+            "Some trailing note."
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.normal_text, "Some trailing note.")
+
+    def test_trailing_text_after_multiple_tool_calls_is_preserved(self):
+        text = (
+            '<|python_tag|>{"name": "get_weather", "arguments": {"city": "Beijing"}}'
+            ';{"name": "search", "arguments": {"query": "food"}}'
+            "Done."
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[1].name, "search")
+        self.assertEqual(result.normal_text, "Done.")
+
     # ==================== Python dict conversion Tests ====================
 
     def test_convert_python_dict_to_json(self):
