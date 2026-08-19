@@ -72,6 +72,7 @@ from sglang.multimodal_gen.test.test_utils import (
     load_action_consistency_gt,
     load_audio_consistency_gt,
     load_consistency_gt,
+    save_audio_gt_artifact,
     save_consistency_failure_artifact,
     save_missing_consistency_gt_artifact,
     wait_for_req_perf_record,
@@ -620,6 +621,15 @@ class DiffusionServerBase:
                 logger.info(
                     "[Artifact] Saved missing consistency GT: %s", artifact_path
                 )
+            if case.sampling_params.expect_audio_output:
+                audio_path = save_audio_gt_artifact(
+                    os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR"),
+                    case.id,
+                    num_gpus,
+                    extract_audio_pcm_from_video_bytes(content),
+                )
+                if audio_path is not None:
+                    logger.info("[Artifact] Saved missing audio GT: %s", audio_path)
             if _get_consistency_gt_dir() is not None:
                 names = ", ".join(
                     get_consistency_gt_candidates(
@@ -758,13 +768,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         num_gpus = case.server_args.num_gpus
         output_audio = extract_audio_pcm_from_video_bytes(content)
         if not audio_gt_exists(case.id, num_gpus):
-            artifact_dir = os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR")
-            if artifact_dir:
-                artifact_path = Path(artifact_dir) / (
-                    f"{case.id}_{num_gpus}gpu_audio.wav"
-                )
-                artifact_path.parent.mkdir(parents=True, exist_ok=True)
-                artifact_path.write_bytes(encode_audio_gt_wav(output_audio))
+            artifact_path = save_audio_gt_artifact(
+                os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR"),
+                case.id,
+                num_gpus,
+                output_audio,
+            )
+            if artifact_path is not None:
                 logger.info("[Artifact] Saved missing audio GT: %s", artifact_path)
             names = ", ".join(get_audio_consistency_gt_candidates(case.id, num_gpus))
             pytest.fail(f"Audio GT not found for {case.id}. Expected one of: {names}")

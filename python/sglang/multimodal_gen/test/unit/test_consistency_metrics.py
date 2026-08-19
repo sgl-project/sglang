@@ -659,6 +659,15 @@ def test_audio_consistency_wav_round_trip_passes():
     assert result.duration_diff == 0.0
 
 
+def test_save_audio_gt_artifact(tmp_path):
+    path = test_utils.save_audio_gt_artifact(
+        str(tmp_path), "unit_audio", 2, _sine_wave(440.0)
+    )
+
+    assert path == tmp_path / "unit_audio_2gpu_audio.wav"
+    assert test_utils.decode_audio_gt_wav(path.read_bytes()).size > 0
+
+
 def test_audio_consistency_rejects_wrong_audio():
     result = test_utils.compare_audio_with_gt(
         _sine_wave(440.0),

@@ -854,6 +854,20 @@ def encode_audio_gt_wav(
     return output.getvalue()
 
 
+def save_audio_gt_artifact(
+    artifact_dir: str | None,
+    case_id: str,
+    num_gpus: int,
+    audio: np.ndarray,
+) -> Path | None:
+    if not artifact_dir:
+        return None
+    path = Path(artifact_dir) / f"{case_id}_{num_gpus}gpu_audio.wav"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(encode_audio_gt_wav(audio))
+    return path
+
+
 def decode_audio_gt_wav(
     content: bytes,
     expected_sample_rate: int = AUDIO_CONSISTENCY_SAMPLE_RATE,
