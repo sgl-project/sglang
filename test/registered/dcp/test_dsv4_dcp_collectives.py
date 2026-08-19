@@ -85,12 +85,12 @@ def _flat_indices(
 @torch.inference_mode()
 def _worker_test(rank: int, world_size: int, device, coordinator) -> None:
     batch = 3
-    local_heads = 2
+    local_heads = 16
     global_heads = local_heads * world_size
     head_dim = 512
-    global_width = 67
-    topk = 24
-    c4_page_size = 8
+    global_width = 1153
+    topk = 1024
+    c4_page_size = 64
 
     generator = torch.Generator(device=device).manual_seed(20260819)
     q_global = torch.randn(
@@ -117,7 +117,7 @@ def _worker_test(rank: int, world_size: int, device, coordinator) -> None:
     )
     global_scores[1, 40:] += 8.0
     global_scores[2, 4:12] = 6.0
-    global_lens = torch.tensor([17, 53, global_width], device=device)
+    global_lens = torch.tensor([257, 1025, global_width], device=device)
     sink = torch.randn(
         global_heads, dtype=torch.float32, device=device, generator=generator
     )

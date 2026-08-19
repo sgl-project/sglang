@@ -56,6 +56,38 @@ class TestDeepSeekV4DCPAllocator(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "resizing"):
             allocator.resize(object())
 
+    def test_widened_ids_cross_old_physical_range_and_localize(self):
+        physical_size = 32768
+        physical_page_size = 256
+        dcp_size = 8
+        logical_pages = 64
+        allocator = DeepSeekV4DCPTokenToKVPoolAllocator(
+            physical_size_full=physical_size,
+            physical_size_swa=physical_size,
+            physical_page_size=physical_page_size,
+            dcp_size=dcp_size,
+            dcp_rank=0,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=self._pool(True),
+            need_sort=False,
+        )
+
+        logical_ids = allocator.full_attn_allocator.alloc(
+            logical_pages * allocator.page_size
+        )
+        self.assertIsNotNone(logical_ids)
+        self.assertGreater(int(logical_ids.max()), physical_size)
+        expected_local_rows = torch.arange(
+            physical_page_size,
+            physical_page_size + logical_pages * physical_page_size,
+        )
+        for rank in range(dcp_size):
+            owned = logical_ids[logical_ids % dcp_size == rank]
+            local_rows = owned // dcp_size
+            torch.testing.assert_close(local_rows, expected_local_rows)
+            self.assertLess(int(local_rows.max()), physical_size)
+
 
 if __name__ == "__main__":
     unittest.main()
