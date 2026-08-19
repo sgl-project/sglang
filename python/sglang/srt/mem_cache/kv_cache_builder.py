@@ -139,6 +139,12 @@ def _register_legacy_hicache_draft(
     tree_cache.cache_controller.set_draft_kv_pool(pool, draft_host_pool)
 
 
+# Host slots a backup-only retraction pool gets, as a fraction of the device
+# pool. Sized well under 1.0 because a retraction burst touches a fraction of
+# the device tokens; overflow aborts the request rather than pre-reserving.
+BACKUP_ONLY_HICACHE_RATIO = 0.2
+
+
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     """Resolve the retraction backend onto the config bags and return it.
 
@@ -185,7 +191,7 @@ def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
         # request instead of crashing the scheduler. Sharing the pool with
         # HiCache keeps the standard default.
         if backend == "host_pool" and not memory.enable_hierarchical_cache:
-            fields["hicache_ratio"] = 0.2
+            fields["hicache_ratio"] = BACKUP_ONLY_HICACHE_RATIO
         else:
             fields["hicache_ratio"] = 2.0
 
