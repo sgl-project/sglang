@@ -73,14 +73,30 @@ def _logits_sequence(n: int):
     return [torch.randn(BATCH * BLOCK, VOCAB) for _ in range(n)]
 
 
-def _algorithm(steps_per_round: int, *, vectorized: bool, max_post_edit_steps: int):
+def _peaked_logits(token_id: int):
+    """A near-one-hot row: the peak's probability is ~1, so it clears both the
+    unmask threshold and any edit threshold. Scripting the winning token per
+    forward makes the T2T trajectory exact instead of sampled."""
+    logits = torch.full((BATCH * BLOCK, VOCAB), -10.0)
+    logits[:, token_id] = 10.0
+    return logits
+
+
+def _algorithm(
+    steps_per_round: int,
+    *,
+    vectorized: bool,
+    max_post_edit_steps: int,
+    edit_threshold: float = 2.0,
+):
     config = DllmConfig(
         algorithm="JointThreshold",
         algorithm_config={
             "threshold": 0.5,
-            # p is a probability, so an edit threshold above 1 disables T2T and
-            # leaves a pure mask-to-token trajectory.
-            "edit_threshold": 2.0,
+            # p is a probability, so the default edit threshold above 1 disables
+            # T2T and leaves a pure mask-to-token trajectory. The post-edit test
+            # lowers it to drive edits instead.
+            "edit_threshold": edit_threshold,
             "max_post_edit_steps": max_post_edit_steps,
             "vectorized_decoding": vectorized,
         },
@@ -94,15 +110,26 @@ def _algorithm(steps_per_round: int, *, vectorized: bool, max_post_edit_steps: i
         return JointThreshold(config)
 
 
-def _drive(steps_per_round, total_forwards, *, vectorized, max_post_edit_steps=16):
+def _drive(
+    steps_per_round,
+    total_forwards,
+    *,
+    vectorized,
+    max_post_edit_steps=16,
+    edit_threshold=2.0,
+    logits_seq=None,
+):
     algorithm = _algorithm(
         steps_per_round,
         vectorized=vectorized,
         max_post_edit_steps=max_post_edit_steps,
+        edit_threshold=edit_threshold,
     )
     input_ids = torch.full((BATCH * BLOCK,), MASK_ID, dtype=torch.int64)
     forward_batch = _forward_batch(input_ids)
-    model_runner = _ScriptedModelRunner(_logits_sequence(total_forwards))
+    model_runner = _ScriptedModelRunner(
+        logits_seq if logits_seq is not None else _logits_sequence(total_forwards)
+    )
 
     states, accept_lengths = None, None
     for _ in range(total_forwards // steps_per_round):
@@ -142,6 +169,41 @@ class TestFdfoMultiStepRound(CustomTestCase):
         self.assertTrue(torch.equal(one[0], four[0]))
         self.assertEqual(one[1], four[1])
         self.assertEqual(four[1], [0] * BATCH)
+
+    def test_t2t_edit_budget_carries_and_exhausts_across_rounds(self):
+        # The other cases disable T2T, which also pins post_edit_steps at 0:
+        # a block that still holds masks never takes the no_mask_active branch.
+        # This one drives the state that actually crosses a round boundary.
+        #
+        # Scripted trajectory (peak token per forward, edit threshold 0):
+        #   1: every position unmasks to token 0   (has_mask -> False)
+        #   2: post_edit_steps 0->1, T2T edits to token 1
+        #   3: post_edit_steps 1->2, T2T edits to token 2
+        #   4: post_edit_steps 2->3 > budget 2 -> row finishes, no edit
+        #
+        # Token 2 is the whole assertion: if the budget were re-initialised per
+        # round instead of carried, K=2 would still have headroom at forward 4
+        # and would edit on to token 3.
+        seq = [_peaked_logits(i) for i in range(4)]
+        for vectorized in (True, False):
+            with self.subTest(vectorized=vectorized):
+                runs = [
+                    _drive(
+                        k,
+                        4,
+                        vectorized=vectorized,
+                        max_post_edit_steps=2,
+                        edit_threshold=0.0,
+                        logits_seq=seq,
+                    )
+                    for k in (1, 2, 4)
+                ]
+                for ids, accept, calls in runs:
+                    self.assertEqual(calls, 4)
+                    self.assertEqual(accept, [BLOCK] * BATCH)
+                    self.assertTrue(
+                        torch.equal(ids, torch.full_like(ids, 2)), ids.tolist()
+                    )
 
     def test_round_stops_once_every_row_has_resolved(self):
         # A block with no masked position and no post-edit budget resolves on
