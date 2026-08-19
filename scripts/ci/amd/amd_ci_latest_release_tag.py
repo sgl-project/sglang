@@ -8,7 +8,7 @@ on the shallow CI checkout. Do not go back to `git fetch --tags origin`: that
 pulls every branch and tag object, and cost up to an hour per job once the
 nightlies had ~90 jobs fetching at once.
 
-Ordering is reused from python/tools/get_version_tag.py rather than
+Ordering is reused from scripts/release/get_version_tag.py rather than
 reimplemented here, so the tag this picks is the same one the nightly release
 workflow published the image under, including stable/post sorting above rc.
 """
@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-VERSION_HELPER_PATH = REPO_ROOT / "python" / "tools" / "get_version_tag.py"
+VERSION_HELPER_PATH = REPO_ROOT / "scripts" / "release" / "get_version_tag.py"
 TAG_PATTERN = "v*.*.*"
 REF_PREFIX = "refs/tags/"
 
