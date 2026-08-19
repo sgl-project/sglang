@@ -64,8 +64,8 @@ paths:
 | `transformer`, `transformer_2`, `unconditional_transformer`, `audio_dit`, `video_dit` | Uses the SGLang transformer quantization adapters documented below. |
 | `text_encoder*`, `image_encoder*` | Requires the native encoder class to declare support for the detected format. MiniMax-H3 FP8 and model-managed integrations such as Ideogram are supported; unknown combinations fail closed. |
 | `vae`, `video_vae`, `audio_vae` | A standard top-level Diffusers `quantization_config` is delegated to `AutoModel.from_pretrained`. Native-only VAEs and nested/compression metadata fail closed. |
-| Library-managed Transformers or Diffusers components | Delegates to the upstream `from_pretrained` path and inherits its format support and validation behavior. |
-| Native auxiliary components that load raw state dicts | Quantized checkpoints are rejected before model construction until that component has a quantized materialization implementation. This includes connectors, duration heads, bridges, diffusion decoders, sound tokenizers, spatial upsamplers, vocoders, and the native PE model. |
+| Library-managed Transformers or Diffusers components | Delegates to the upstream `from_pretrained` path and inherits its format support and validation behavior. The local PE model uses this path; compatible formats remain model-specific. |
+| Native auxiliary components that load raw state dicts | Quantized checkpoints are rejected before model construction until that component has a quantized materialization implementation. This includes connectors, duration heads, bridges, diffusion decoders, sound tokenizers, spatial upsamplers, and vocoders. |
 
 `--quantization` remains a transformer option. There is intentionally no
 generic per-component quantization override: a string option without a matching

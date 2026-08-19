@@ -2,7 +2,6 @@
 
 import re
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.multimodal_gen.runtime.loader.component_loaders.adapter_loader import (
@@ -18,7 +17,6 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 from sglang.multimodal_gen.runtime.loader.component_loaders.diffusion_decoder_loader import (
     DiffusionDecoderLoader,
 )
-from sglang.multimodal_gen.runtime.loader.component_loaders.pe_loader import PELoader
 from sglang.multimodal_gen.runtime.loader.component_loaders.sound_tokenizer_loader import (
     SoundTokenizerLoader,
 )
@@ -75,7 +73,6 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             AdapterLoader,
             BridgeLoader,
             DiffusionDecoderLoader,
-            PELoader,
             SoundTokenizerLoader,
             UpsamplerLoader,
             VocoderLoader,
@@ -135,30 +132,6 @@ class TestComponentQuantizationAdmission(unittest.TestCase):
             )
 
         load_weights.assert_not_called()
-
-    def test_pe_rejects_quantization_before_tokenizer_or_model_loading(self):
-        server_args = SimpleNamespace(
-            pe_server_url=None,
-            revision=None,
-            trust_remote_code=False,
-        )
-        config = SimpleNamespace(quantization_config={"quant_method": "bitsandbytes"})
-
-        with (
-            patch(
-                "sglang.multimodal_gen.runtime.loader.component_loaders."
-                "pe_loader.get_hf_config",
-                return_value=config,
-            ),
-            patch(
-                "sglang.multimodal_gen.runtime.loader.component_loaders."
-                "pe_loader.AutoTokenizer.from_pretrained"
-            ) as load_tokenizer,
-            self.assertRaises(ComponentCheckpointUnsupportedError),
-        ):
-            PELoader().load_customized("/model/pe", server_args, "pe")
-
-        load_tokenizer.assert_not_called()
 
 
 if __name__ == "__main__":
