@@ -106,6 +106,41 @@ def test_default_worker_count_stays_at_the_measured_optimum():
     assert BaseMultimodalProcessor.auto_mm_processor_worker_num == 2
 
 
+def _process_mm_data_overrides():
+    """Yield (path, node) for every subclass override of `process_mm_data`."""
+    for path in sorted(_MULTIMODAL_ROOT.rglob("*.py")):
+        if path.name in _EXEMPT:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "process_mm_data":
+                yield path, node
+
+
+def test_overrides_take_the_worker_pools_processor_clone():
+    """An override that reaches for `self._processor` puts every worker thread on
+    one shared HF processor, which is exactly what the per-thread clone exists to
+    prevent. Either accept `processor=` and resolve it, or delegate to super.
+    """
+    offenders = []
+    for path, node in _process_mm_data_overrides():
+        args = [a.arg for a in node.args.args] + [a.arg for a in node.args.kwonlyargs]
+        body = ast.dump(node)
+        reaches_for_shared = "attr='_processor'" in body
+        resolves_injected = "_resolve_processor" in body
+        if reaches_for_shared and not resolves_injected:
+            offenders.append(f"{path.relative_to(_MULTIMODAL_ROOT)}:{node.lineno}")
+        elif "processor" not in args and not (
+            "'super'" in body or not reaches_for_shared
+        ):
+            offenders.append(f"{path.relative_to(_MULTIMODAL_ROOT)}:{node.lineno}")
+    assert not offenders, (
+        "these `process_mm_data` overrides bypass the worker pool's processor "
+        "clone; accept `processor=None` and resolve it with "
+        "`self._resolve_processor(processor)`: " + ", ".join(offenders)
+    )
+
+
 def test_the_scan_actually_finds_call_sites():
     """Guard against the scan silently matching nothing after a rename."""
     assert len(list(_call_sites())) > 20
