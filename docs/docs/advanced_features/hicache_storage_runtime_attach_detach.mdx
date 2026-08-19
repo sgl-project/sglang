@@ -26,7 +26,7 @@ The control path is:
 3. **Scheduler** (`python/sglang/srt/managers/scheduler.py`)
    - Performs a **strict idle check**
    - Calls `tree_cache.attach_storage_backend(...)` / `detach_storage_backend(...)`
-4. **HiRadixCache** (`python/sglang/srt/mem_cache/hiradix_cache.py`)
+4. **Tree cache** (`HiRadixCache` in `python/sglang/srt/mem_cache/hiradix_cache.py`, `UnifiedRadixCache` in `python/sglang/srt/mem_cache/unified_radix_cache.py`)
    - Parses `hicache_storage_backend_extra_config_json` (supports both backend config and prefetch knobs)
    - Calls `cache_controller.attach_storage_backend(...)` / `detach_storage_backend(...)`
 5. **HiCacheController** (`python/sglang/srt/managers/cache_controller.py`)
@@ -130,4 +130,4 @@ Notes:
 - **Host KV layout constraints still apply**: for example, Mooncake still requires layouts like `page_first/page_first_direct/page_head`; if the server's HiCache host-memory layout does not satisfy the backend requirements, attach will fail with an error
 - **Observability**:
   - After attach, `server_args.hicache_storage_backend*` is updated on both the tokenizer and scheduler sides
-  - If metrics are enabled, attach will create a storage metrics collector in `HiRadixCache` on demand
+  - If metrics are enabled, attach will create a storage metrics collector in `HiRadixCache` / `UnifiedRadixCache` on demand
