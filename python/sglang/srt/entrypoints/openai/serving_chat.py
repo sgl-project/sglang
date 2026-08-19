@@ -2268,6 +2268,13 @@ class OpenAIServingChat(OpenAIServingBase):
         elif self.reasoning_parser == "muse":
             request.skip_special_tokens = False
 
+    def supports_native_reasoning_history(self) -> bool:
+        """Whether the chat encoder takes history as ``reasoning_content`` rather
+        than via :meth:`wrap_reasoning_history`; see
+        :func:`chat_encoding.spec_owns_reasoning_history` for why.
+        """
+        return chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec)
+
     def wrap_reasoning_history(self, reasoning_text: str) -> str:
         """Wrap prior-turn reasoning in the detector's own start/end tokens.
 
