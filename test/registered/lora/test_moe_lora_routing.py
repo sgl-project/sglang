@@ -8,6 +8,7 @@ from sglang.srt.lora.moe.routing import (
     RouteViewKind,
     build_virtual_expert_routing,
 )
+from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -73,6 +74,7 @@ class TestMoeLoraRouting(CustomTestCase):
         dtype=torch.int32,
         view=RouteViewKind.ALIGNED,
     ):
+        # A real workspace, since the fused builder requires one.
         return build_virtual_expert_routing(
             torch.tensor(topk_ids, dtype=dtype, device=self.device),
             torch.tensor(adapters, dtype=dtype, device=self.device),
@@ -85,6 +87,8 @@ class TestMoeLoraRouting(CustomTestCase):
                 else torch.tensor(lora_expert_map, dtype=dtype, device=self.device)
             ),
             view=view,
+            workspace=MoeLoraWorkspace(),
+            scratch_prefix="test:route",
         )
 
     def test_narrower_views_refuse_fields_they_did_not_build(self):
@@ -124,6 +128,25 @@ class TestMoeLoraRouting(CustomTestCase):
         # sources must survive on the view.
         self.assertEqual(raw.lora_experts_per_adapter, 2)
         self.assertEqual(raw.token_lora_mapping.numel(), 1)
+
+    def test_fused_aligned_build_without_a_workspace_is_rejected(self):
+        """The alternative is the builder's global cache, which clobbers."""
+        from sglang.srt.lora.moe.routing import FUSED_ALIGN_MIN_VIRTUAL_EXPERTS
+
+        experts = FUSED_ALIGN_MIN_VIRTUAL_EXPERTS // 32
+        ids = torch.zeros((8, 8), dtype=torch.int32, device=self.device)
+        slots = torch.zeros(8, dtype=torch.int32, device=self.device)
+        for half in ({}, {"workspace": MoeLoraWorkspace()}, {"scratch_prefix": "x"}):
+            with self.subTest(**{k: bool(v) for k, v in half.items()}):
+                with self.assertRaisesRegex(ValueError, "needs workspace"):
+                    build_virtual_expert_routing(
+                        ids,
+                        slots,
+                        lora_experts_per_adapter=experts,
+                        max_loras=32,
+                        block_size=16,
+                        **half,
+                    )
 
     def test_unknown_view_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "unknown route view"):
@@ -292,6 +315,8 @@ class TestMoeLoraRouting(CustomTestCase):
                         max_loras=32,
                         block_size=16,
                         view=RouteViewKind.ALIGNED,
+                        workspace=MoeLoraWorkspace(),
+                        scratch_prefix="test:route",
                     )
                 finally:
                     fused_align.fused_align_block_size = original
@@ -346,12 +371,15 @@ class TestMoeLoraRouting(CustomTestCase):
                     max_loras=max_loras,
                     block_size=16,
                     view=RouteViewKind.ALIGNED,
+                    workspace=MoeLoraWorkspace(),
+                    scratch_prefix="test:route",
                 )
                 num_pairs = num_tokens * top_k
                 keys = (
                     torch.where(
                         (token_lora_mapping[:, None] >= 0) & (topk_ids >= 0),
-                        token_lora_mapping[:, None].to(torch.int64) * lora_experts_per_adapter
+                        token_lora_mapping[:, None].to(torch.int64)
+                        * lora_experts_per_adapter
                         + topk_ids.to(torch.int64),
                         torch.tensor(-1, dtype=torch.int64, device=self.device),
                     )

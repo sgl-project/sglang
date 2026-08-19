@@ -479,10 +479,10 @@ def build_virtual_expert_routing(
     Requires ``lora_experts_per_adapter == 1`` and local-domain ids — global
     callers localize first, production's convention.
 
-    ``workspace`` plus ``scratch_prefix`` make the fused aligned path's
-    metadata layer-owned and graph-stable. They are meaningless on every other
-    path, which is why the fused branch allocates them itself instead of
-    making each caller predict the dispatch.
+    ``workspace`` plus ``scratch_prefix`` name this route's metadata. The
+    fused aligned builder REQUIRES them; every other path ignores them, which
+    is why the fused branch both demands and allocates them instead of making
+    each caller predict the dispatch.
     """
     if view not in RouteViewKind:
         raise ValueError(
@@ -531,31 +531,38 @@ def build_virtual_expert_routing(
         # this is also the only CUDA-speed option.
         from sglang.srt.lora.moe.fused_align import fused_align_block_size
 
-        # A caller holding the layer workspace gets graph-stable buffers keyed
-        # by its route name; the scan restores ``counts`` to zero after its
-        # final read, so that one is initialized only when storage is first
-        # allocated. Without a workspace (tests, benchmarks) the fused kernel
-        # falls back to its own process-global cache.
-        padded_count = scratch = None
-        if workspace is not None:
-            num_buckets = num_virtual + 1
-
-            def counter(name: str, size: int, *, zero_first: bool = False):
-                return workspace.tensor(
-                    f"{scratch_prefix}:{name}",
-                    (size,),
-                    dtype=torch.int32,
-                    device=topk_ids.device,
-                    **({"zero_on_first_allocation": True} if zero_first else {}),
-                )
-
-            padded_count = counter("padded_pairs", 1)
-            scratch = FusedAlignScratch(
-                counts=counter("counts", num_buckets, zero_first=True),
-                block_cumulative=counter("block_cumulative", num_buckets + 1),
-                cursor=counter("cursor", num_buckets),
-                bucket_end=counter("bucket_end", num_buckets),
+        # Only the fused builder keeps metadata across calls, so this is the
+        # one path that needs the workspace -- and it needs it unconditionally.
+        # Sharing the builder's own process-global cache instead would key the
+        # buffers by bucket count alone, so a second route at the same count
+        # would overwrite this one's padded-pair scalar and silently produce a
+        # short route rather than failing.
+        if workspace is None or scratch_prefix is None:
+            raise ValueError(
+                "the fused aligned builder needs workspace and scratch_prefix "
+                f"(view={view.value}, virtual experts={num_virtual}, "
+                f"pairs={topk_ids.numel()})"
             )
+        num_buckets = num_virtual + 1
+
+        def counter(name: str, size: int, *, zero_first: bool = False):
+            # The scan restores ``counts`` to zero after its final read, so
+            # that one is initialized only when its storage is first allocated.
+            return workspace.tensor(
+                f"{scratch_prefix}:{name}",
+                (size,),
+                dtype=torch.int32,
+                device=topk_ids.device,
+                **({"zero_on_first_allocation": True} if zero_first else {}),
+            )
+
+        padded_count = counter("padded_pairs", 1)
+        scratch = FusedAlignScratch(
+            counts=counter("counts", num_buckets, zero_first=True),
+            block_cumulative=counter("block_cumulative", num_buckets + 1),
+            cursor=counter("cursor", num_buckets),
+            bucket_end=counter("bucket_end", num_buckets),
+        )
 
         sorted_pair_ids, block_virtual_expert_ids, num_pairs_post_padded = (
             fused_align_block_size(
