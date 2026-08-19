@@ -4,8 +4,8 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.kernel_api_logging import debug_kernel_api
-from sglang.kernels.ops.diffusion.triton.rotary import apply_rotary_embedding
+from sglang.kernels.kernel_api_logging import debug_kernel_api
+from sglang.kernels.ops.diffusion import apply_rotary_embedding
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils.custom_op import register_custom_op_from_extern
@@ -63,6 +63,33 @@ def _apply_rotary_emb(
         return torch.cat((o1, o2), dim=-1)
     else:
         return apply_rotary_embedding(x, cos, sin, interleaved)
+
+
+def _apply_rotary_emb_complex(
+    x: torch.Tensor,  # [b, s, h, d]
+    freqs: torch.Tensor,  # [s, 1, d // 2]
+) -> torch.Tensor:  # [b, s, h, d]
+    """
+    Apply complex rotary positional embeddings designed for interleaved=True, neox_style=False.
+    Works by mathematically mapping the complex multiplication
+    (a + ib) * (cos + isin) to the interleaved layout.
+
+    Args:
+        x: Input activation tensor in bf16/fp16.
+            Shape: [batch, num_tokens, num_heads, head_size]
+        freqs: Complex-valued frequency tensor in complex64 format.
+            Shape: [num_tokens, 1, head_size // 2]
+
+    Returns:
+        torch.Tensor: The same shape and dtype as x.
+    """
+    b, s, h, d = x.shape
+    dtype_c = torch.float64
+
+    x_complex = torch.view_as_complex(x.to(dtype_c).reshape(b, s, h, d // 2, 2))
+    x_out = torch.view_as_real(x_complex * freqs)
+    x_out = x_out.view(b, s, h, d)
+    return x_out.to(x.dtype)
 
 
 @debug_kernel_api
