@@ -94,6 +94,7 @@ class Dots3Config(PretrainedConfig):
         audio_start_token="<|audio_comp_start|>",
         audio_token="<|audio_comp_pad|>",
         audio_end_token="<|audio_comp_end|>",
+        video_token="<|video_pad|>",
         **kwargs,
     ):
         # General model parameters
@@ -173,6 +174,9 @@ class Dots3Config(PretrainedConfig):
         self.audio_start_token = audio_start_token
         self.audio_token = audio_token
         self.audio_end_token = audio_end_token
+        # The chat template renders a video content part as this single token,
+        # which the processor replaces with the flattened frames and audio.
+        self.video_token = video_token
 
         super().__init__(
             pad_token_id=pad_token_id,

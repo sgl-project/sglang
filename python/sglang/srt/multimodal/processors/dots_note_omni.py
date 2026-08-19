@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 _VIDEO_TOKEN_RE = re.compile(r"(<image_\d+>|<audio_\d+>)")
 _VIDEO_PREPROCESS_LOCK = threading.Lock()
+_EXPANDED_VIDEO_MEDIA_RE = re.compile(
+    r"<\|sglang_dots_video_(?P<video>\d+)_(?P<modality>image|audio)_(?P<item>\d+)\|>"
+)
 
 
 def _build_video_cfg(
@@ -189,6 +192,7 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
         self.audio_start_token = hf_config.audio_start_token
         self.audio_token = hf_config.audio_token
         self.audio_end_token = hf_config.audio_end_token
+        self.video_placeholder_regex = re.compile(re.escape(hf_config.video_token))
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.image_token,
             image_token_id=self._token_id(processor, self.image_token),
@@ -247,32 +251,50 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
         return waveform.contiguous()
 
     def _render_video_content(
-        self, input_text: str, question: str, content: list[dict]
-    ) -> tuple[str, list[str], list[str]]:
-        """Convert the adapter's OpenAI content back to native model markers."""
+        self,
+        input_text: str,
+        question: str,
+        video_index: int,
+        content: list[dict],
+    ) -> tuple[str, dict[str, tuple[Modality, str]]]:
+        """Insert one expanded video while retaining its media ordering."""
         rendered = []
-        images = []
-        audios = []
+        media = {}
         for item in content:
             item_type = item.get("type")
             if item_type == "text":
                 rendered.append(item.get("text", ""))
             elif item_type == "image_url":
-                images.append(item["image_url"]["url"])
-                rendered.append(
-                    self.image_start_token + self.image_token + self.image_end_token
-                )
+                marker = f"<|sglang_dots_video_{video_index}_image_{len(media)}|>"
+                media[marker] = (Modality.IMAGE, item["image_url"]["url"])
+                rendered.append(marker)
             elif item_type == "audio_url":
-                audios.append(item["audio_url"]["url"])
-                rendered.append(
-                    self.audio_start_token + self.audio_token + self.audio_end_token
-                )
+                marker = f"<|sglang_dots_video_{video_index}_audio_{len(media)}|>"
+                media[marker] = (Modality.AUDIO, item["audio_url"]["url"])
+                rendered.append(marker)
             else:
                 raise ValueError(f"Unsupported preprocessed video item: {item_type}")
 
         expanded = "".join(rendered)
-        if question and question in input_text:
-            input_text = input_text.replace(question, expanded, 1)
+        # The adapter appends the question to every flattened video. Keep the
+        # question already rendered by the chat template so multiple videos do
+        # not duplicate it.
+        if question:
+            question_pos = expanded.rfind(question)
+            if question_pos >= 0:
+                expanded = (
+                    expanded[:question_pos] + expanded[question_pos + len(question) :]
+                )
+
+        placeholder = self.video_placeholder_regex.search(input_text)
+        if placeholder is not None:
+            input_text = (
+                input_text[: placeholder.start()]
+                + expanded
+                + input_text[placeholder.end() :]
+            )
+        elif question and question in input_text:
+            input_text = input_text.replace(question, expanded + question, 1)
         else:
             # The normal dots template starts the user turn with <|user|>.  Keep
             # system text ahead of video media if a custom template is used.
@@ -280,7 +302,76 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
             pos = input_text.rfind(user_marker)
             insert_at = pos + len(user_marker) if pos >= 0 else 0
             input_text = input_text[:insert_at] + expanded + input_text[insert_at:]
-        return input_text, images, audios
+        return input_text, media
+
+    def _merge_video_media(
+        self,
+        input_text: str,
+        image_data: list | None,
+        audio_data: list | None,
+        video_media: dict[str, tuple[Modality, str]],
+    ) -> tuple[str, list, list]:
+        """Resolve native and video-derived media in final prompt order."""
+        native_images = iter(image_data or [])
+        native_audios = iter(audio_data or [])
+        ordered_images = []
+        ordered_audios = []
+        native_pattern = self.mm_tokens.get_combined_regex()
+        pattern = re.compile(
+            f"({native_pattern.pattern}|{_EXPANDED_VIDEO_MEDIA_RE.pattern})"
+        )
+        rendered = []
+        last = 0
+
+        for match in pattern.finditer(input_text):
+            rendered.append(input_text[last : match.start()])
+            marker = match.group(0)
+            expanded_media = video_media.get(marker)
+            if expanded_media is not None:
+                modality, value = expanded_media
+            else:
+                modality = self.mm_tokens.get_modality_of_token(marker)
+                if modality == Modality.IMAGE:
+                    try:
+                        value = next(native_images)
+                    except StopIteration as exc:
+                        raise ValueError(
+                            "Image placeholder count does not match image_data"
+                        ) from exc
+                elif modality == Modality.AUDIO:
+                    try:
+                        value = next(native_audios)
+                    except StopIteration as exc:
+                        raise ValueError(
+                            "Audio placeholder count does not match audio_data"
+                        ) from exc
+                else:
+                    raise ValueError(f"Unsupported dots omni media marker: {marker}")
+
+            if modality == Modality.IMAGE:
+                ordered_images.append(value)
+                rendered.append(
+                    self.image_start_token + self.image_token + self.image_end_token
+                )
+            else:
+                ordered_audios.append(value)
+                rendered.append(
+                    self.audio_start_token + self.audio_token + self.audio_end_token
+                )
+            last = match.end()
+
+        rendered.append(input_text[last:])
+        try:
+            next(native_images)
+            raise ValueError("Image placeholder count does not match image_data")
+        except StopIteration:
+            pass
+        try:
+            next(native_audios)
+            raise ValueError("Audio placeholder count does not match audio_data")
+        except StopIteration:
+            pass
+        return "".join(rendered), ordered_images, ordered_audios
 
     async def process_mm_data_async(
         self,
@@ -296,20 +387,21 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
         video_data = request_obj.video_data or video_data
         if not image_data and not audio_data and not video_data:
             return None
-        if video_data:
-            if image_data or audio_data:
-                raise ValueError(
-                    "Dots note omni does not yet support mixing a native video "
-                    "with separate image/audio inputs"
-                )
-            if len(video_data) != 1:
-                raise ValueError(
-                    "Dots note omni currently supports one video per request"
-                )
         if not isinstance(input_text, str):
             raise ValueError(  # noqa: TRY004 - preserve the processor API contract
                 "Dots note omni requires a text prompt for multimodal requests"
             )
+
+        request_videos = len(video_data) if video_data else 0
+        request_images = len(image_data) if image_data else 0
+        request_audios = len(audio_data) if audio_data else 0
+        logger.info(
+            "[dots_mm] rid=%s request videos=%d images=%d audios=%d",
+            request_obj.rid,
+            request_videos,
+            request_images,
+            request_audios,
+        )
 
         if video_data:
             question = request_obj.video_question or ""
@@ -322,31 +414,55 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
             max_new_tokens = sampling_params.get("max_new_tokens") or 0
             loop = asyncio.get_running_loop()
             preprocess_started = time.perf_counter()
-            content = await loop.run_in_executor(
-                self.io_executor,
-                lambda: preprocess_dots_video(
-                    video_data[0],
-                    question,
-                    tokenizer=self._tokenizer,
-                    seq=request_obj.seq,
-                    audio_cap=request_obj.audio_cap,
-                    audio_sr=request_obj.audio_sr,
-                    k_mode=request_obj.k_mode,
-                    max_new_tokens=max_new_tokens,
-                ),
+            video_media = {}
+            total_content_items = 0
+            total_frames = 0
+            total_audio_segments = 0
+            for video_index, video in enumerate(video_data):
+                content = await loop.run_in_executor(
+                    self.io_executor,
+                    lambda video=video: preprocess_dots_video(
+                        video,
+                        question,
+                        tokenizer=self._tokenizer,
+                        seq=request_obj.seq,
+                        audio_cap=request_obj.audio_cap,
+                        audio_sr=request_obj.audio_sr,
+                        k_mode=request_obj.k_mode,
+                        max_new_tokens=max_new_tokens,
+                    ),
+                )
+                total_content_items += len(content)
+                total_frames += sum(item.get("type") == "image_url" for item in content)
+                total_audio_segments += sum(
+                    item.get("type") == "audio_url" for item in content
+                )
+                input_text, media = self._render_video_content(
+                    input_text, question, video_index, content
+                )
+                video_media.update(media)
+
+            leftover = self.video_placeholder_regex.search(input_text)
+            if leftover is not None:
+                raise ValueError(
+                    "Video placeholder count does not match video_data: "
+                    f"{len(video_data)} video(s) given"
+                )
+            input_text, image_data, audio_data = self._merge_video_media(
+                input_text, image_data, audio_data, video_media
             )
             preprocess_elapsed = time.perf_counter() - preprocess_started
             logger.info(
-                "[dots_video_preprocess] rid=%s elapsed=%.3fs frames=%d "
-                "audio_segments=%d content_items=%d",
+                "[dots_mm] rid=%s video_preprocess elapsed=%.3fs "
+                "expanded_frames=%d expanded_audio_segments=%d content_items=%d "
+                "after_preprocess images=%d audios=%d",
                 request_obj.rid,
                 preprocess_elapsed,
-                sum(item.get("type") == "image_url" for item in content),
-                sum(item.get("type") == "audio_url" for item in content),
-                len(content),
-            )
-            input_text, image_data, audio_data = self._render_video_content(
-                input_text, question, content
+                total_frames,
+                total_audio_segments,
+                total_content_items,
+                len(image_data),
+                len(audio_data),
             )
 
         base_output = await self.load_mm_data(
