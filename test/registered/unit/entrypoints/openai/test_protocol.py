@@ -13,6 +13,7 @@
 # ==============================================================================
 """Tests for OpenAI API protocol models"""
 
+import json
 import unittest
 from typing import List, Optional
 
@@ -28,9 +29,11 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatMessage,
     CompletionRequest,
     Function,
+    FunctionResponse,
     ModelCard,
     ModelList,
     Tool,
+    ToolCall,
     UsageInfo,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -777,6 +780,35 @@ class TestValidationEdgeCases(unittest.TestCase):
 
 class TestParsedResponseFieldsProtocol(unittest.TestCase):
     """Test ParsedResponseFields protocol."""
+
+
+class TestToolCallStreamingSerialization(unittest.TestCase):
+    """Tool call deltas must omit absent id/name instead of emitting null."""
+
+    def test_argument_delta_omits_null_id_and_name(self):
+        """Continuation chunks only carry index and function.arguments."""
+        chunk = ToolCall(
+            id=None,
+            index=0,
+            function=FunctionResponse(name=None, arguments='{"city":'),
+        )
+        data = json.loads(chunk.model_dump_json())
+        self.assertNotIn("id", data)
+        self.assertNotIn("name", data["function"])
+        self.assertEqual(data["index"], 0)
+        self.assertEqual(data["function"]["arguments"], '{"city":')
+
+    def test_first_chunk_keeps_id_and_name(self):
+        """The first chunk of a tool call still carries id and function name."""
+        chunk = ToolCall(
+            id="call_abc",
+            index=0,
+            function=FunctionResponse(name="get_weather", arguments=""),
+        )
+        data = json.loads(chunk.model_dump_json())
+        self.assertEqual(data["id"], "call_abc")
+        self.assertEqual(data["function"]["name"], "get_weather")
+        self.assertEqual(data["function"]["arguments"], "")
 
 
 if __name__ == "__main__":
