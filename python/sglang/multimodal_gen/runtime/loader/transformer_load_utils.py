@@ -22,10 +22,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     _patch_nunchaku_scales,
 )
 from sglang.multimodal_gen.runtime.loader.gguf_weights import (
-    is_gguf_file,
     names_gguf_checkpoint,
     read_gguf_tensor_meta,
-    resolve_gguf_reference,
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
@@ -50,6 +48,10 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_quant_config_from_safetensors_metadata,
 )
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.utils.hf_transformers import (
+    check_gguf_file,
+    resolve_hf_gguf_reference,
+)
 
 logger = init_logger(__name__)
 
@@ -489,13 +491,8 @@ def _validate_gguf_runtime_support(
         )
     if not current_platform.is_cuda():
         raise ValueError(
-            "GGUF diffusion checkpoints require CUDA; the GGML dequantize "
-            f"kernel has no {current_platform.device_type} implementation."
-        )
-    if server_args.tp_size > 1:
-        raise ValueError(
-            "GGUF diffusion checkpoints do not support tensor parallelism yet; "
-            f"got --tp-size {server_args.tp_size}. Run with --tp-size 1."
+            "GGUF diffusion checkpoints require CUDA; the GGML kernels have no "
+            f"{current_platform.device_type} implementation."
         )
     uses_fsdp = (
         server_args.should_use_fsdp_for_component(component_name)
@@ -504,10 +501,9 @@ def _validate_gguf_runtime_support(
     )
     if uses_fsdp:
         raise ValueError(
-            "GGUF diffusion checkpoints are incompatible with FSDP inference: "
-            "sharding packed GGML blocks is not block-aware. Run without "
-            "--use-fsdp-inference, or keep this component offloaded so FSDP "
-            "does not manage it."
+            "GGUF diffusion checkpoints are incompatible with FSDP inference. "
+            "Run without --use-fsdp-inference, or keep this component offloaded "
+            "so FSDP does not manage it."
         )
     if server_args.lora_path is not None:
         raise ValueError(
@@ -550,10 +546,14 @@ def resolve_transformer_gguf_to_load(
     # only then hit an unsupported-configuration error.
     _validate_gguf_runtime_support(server_args, component_name)
 
+    is_local_reference = os.path.isabs(override) or override.startswith(".")
     resolved = (
-        resolve_gguf_reference(override, revision=server_args.revision) or override
+        override
+        if is_local_reference
+        else resolve_hf_gguf_reference(override, revision=server_args.revision)
+        or override
     )
-    if not is_gguf_file(resolved):
+    if not check_gguf_file(resolved):
         raise ValueError(f"Resolved GGUF path is not a GGUF file: {resolved}")
     logger.info("using GGUF transformer weights from: %s", resolved)
     return resolved

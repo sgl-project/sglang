@@ -47,8 +47,11 @@ def _resolve_checkpoint_load_device(
     *,
     component_starts_on_cpu: bool,
     runtime_quant_config: object | None,
+    quantized_cpu_load_supported: bool = False,
 ) -> torch.device:
-    if component_starts_on_cpu and runtime_quant_config is None:
+    if component_starts_on_cpu and (
+        runtime_quant_config is None or quantized_cpu_load_supported
+    ):
         return torch.device("cpu")
     return runtime_device
 
@@ -205,6 +208,19 @@ class TransformerLoader(ComponentLoader):
             component_name=component_name,
             gguf_file=gguf_file,
         )
+        if quant_spec.gguf_file is not None and cls_name == "MiniMaxH3DiTModel":
+            assert quant_spec.quant_config is not None
+            curve = quant_spec.quant_config.tensor_meta.get("adaln_t_table")
+            if curve is not None:
+                if curve.is_quantized or len(curve.logical_shape) != 2:
+                    raise ValueError(
+                        "MiniMax-H3 adaln_t_table must be an unquantized 2D tensor"
+                    )
+                curve_grid, time_embed_dim = curve.logical_shape
+                if curve_grid < 2:
+                    raise ValueError("MiniMax-H3 adaln_t_table needs at least two rows")
+                dit_config.arch_config.adaln_curve_grid = curve_grid
+                dit_config.arch_config.time_embed_dim = time_embed_dim
         # Quantization adapters may require resident weights, so placement must
         # be resolved after they have validated the component configuration.
         component_starts_on_cpu = server_args.should_start_component_on_cpu(
@@ -282,6 +298,7 @@ class TransformerLoader(ComponentLoader):
             local_torch_device,
             component_starts_on_cpu=component_starts_on_cpu,
             runtime_quant_config=quant_spec.runtime_quant_config,
+            quantized_cpu_load_supported=quant_spec.gguf_file is not None,
         )
         direct_gpu_weight_loading = bool(
             component_server_args.direct_gpu_weight_loading

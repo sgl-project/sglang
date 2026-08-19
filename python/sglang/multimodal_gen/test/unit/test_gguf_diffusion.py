@@ -10,32 +10,36 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
+from gguf import GGMLQuantizationType as WeightType
 
 from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
     ReplicatedLinear,
+    RowParallelLinear,
     UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.gguf import (
     GGUFConfig,
     GGUFLinearMethod,
 )
-from sglang.multimodal_gen.runtime.loader.gguf_weights import GGML_BF16 as _BF16
-from sglang.multimodal_gen.runtime.loader.gguf_weights import GGML_F32 as _F32
 from sglang.multimodal_gen.runtime.loader.gguf_weights import (
-    GGML_UNQUANTIZED_TYPES,
     GGUFTensorMeta,
     gguf_weights_iterator,
-    is_gguf_file,
     names_gguf_checkpoint,
     read_gguf_tensor_meta,
-    resolve_gguf_reference,
 )
+from sglang.srt.layers.quantization.gguf import UNQUANTIZED_TYPES
+from sglang.srt.utils.hf_transformers import check_gguf_file
 
-# Q4_K has no module-level name; it is one of many packed types.
-_Q4_K = 12
+_F32 = WeightType.F32
+_BF16 = WeightType.BF16
+_Q4_K = WeightType.Q4_K
 
 _Q4_K_BLOCK, _Q4_K_TYPE_SIZE = 256, 144
 
@@ -126,6 +130,26 @@ class TestGGUFTensorMeta(unittest.TestCase):
         self.assertEqual(meta.stored_dtype, torch.float32)
         self.assertEqual(meta.param_name, "w.weight")
 
+    def test_pruned_adaln_curve_shape_is_available_before_model_init(self):
+        grid, width = 1025, 8
+        path = self.tmp / "pruned.gguf"
+        _write_gguf(
+            path,
+            [
+                (
+                    "adaln_t_table",
+                    [width, grid],
+                    _F32,
+                    bytes(grid * width * 4),
+                )
+            ],
+        )
+
+        metadata = read_gguf_tensor_meta(str(path))["adaln_t_table"]
+
+        self.assertEqual(metadata.logical_shape, (grid, width))
+        self.assertFalse(metadata.is_quantized)
+
     def test_non_block_aligned_inner_dim_is_rejected(self):
         """A row that is not a whole number of blocks must not load.
 
@@ -163,9 +187,8 @@ class TestGGUFTensorMeta(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "super\\s+blocks"):
             read_gguf_tensor_meta(str(path))
 
-    def test_bounds_checked_type_allows_any_32_multiple(self):
-        """Q4_0 goes through the bounds-checked kernel, so 256 must not be
-        required of it -- over-rejecting would refuse valid checkpoints."""
+    def test_standard_quant_type_does_not_require_super_block_alignment(self):
+        """Q4_0 has native MMVQ/MMQ kernels, so 256 must not be required."""
         _Q4_0, block, type_size = 2, 32, 18
         out_features, in_features = 1, 32  # numel 32: not a super block
         row_bytes = in_features // block * type_size
@@ -235,11 +258,18 @@ class TestGGUFTensorMeta(unittest.TestCase):
     def test_is_gguf_file_detects_by_magic(self):
         path = self.tmp / "no-suffix.bin"
         _write_gguf(path, [("w.weight", [4], _F32, bytes(16))])
-        self.assertTrue(is_gguf_file(str(path)))
+        self.assertTrue(check_gguf_file(str(path)))
         other = self.tmp / "other.bin"
         other.write_bytes(b"NOTGGUF")
-        self.assertFalse(is_gguf_file(str(other)))
-        self.assertFalse(is_gguf_file(str(self.tmp / "missing.gguf")))
+        self.assertFalse(check_gguf_file(str(other)))
+        self.assertFalse(check_gguf_file(str(self.tmp / "missing.gguf")))
+
+    def test_quantized_non_linear_tensor_is_rejected(self):
+        path = self.tmp / "bad-norm.gguf"
+        _write_gguf(path, [("norm.weight", [256], _Q4_K, bytes(144))])
+
+        with self.assertRaisesRegex(ValueError, "only for 2D linear"):
+            read_gguf_tensor_meta(str(path))
 
 
 class TestGGUFQuantMethodSelection(unittest.TestCase):
@@ -252,11 +282,9 @@ class TestGGUFQuantMethodSelection(unittest.TestCase):
             logical_shape=(out_features, in_features),
             stored_shape=stored_shape or (out_features, in_features),
             stored_dtype=(
-                torch.float32 if ggml_type in GGML_UNQUANTIZED_TYPES else torch.uint8
+                torch.float32 if ggml_type in UNQUANTIZED_TYPES else torch.uint8
             ),
-            param_name=(
-                "w.weight" if ggml_type in GGML_UNQUANTIZED_TYPES else "w.qweight"
-            ),
+            param_name=("w.weight" if ggml_type in UNQUANTIZED_TYPES else "w.qweight"),
         )
 
     def test_quantized_layer_gets_gguf_method(self):
@@ -265,8 +293,7 @@ class TestGGUFQuantMethodSelection(unittest.TestCase):
         self.assertIsInstance(layer.quant_method, GGUFLinearMethod)
         self.assertEqual(layer.qweight.dtype, torch.uint8)
         self.assertEqual(tuple(layer.qweight.shape), (4, 288))
-        self.assertEqual(layer.ggml_type, _Q4_K)
-        self.assertEqual(layer.logical_weight_shape, (4, 512))
+        self.assertEqual(layer.quant_method.weight_type, _Q4_K)
 
     def test_unquantized_layer_falls_back(self):
         """H3 keeps its FP32 projections unquantized inside the same file."""
@@ -281,8 +308,100 @@ class TestGGUFQuantMethodSelection(unittest.TestCase):
 
     def test_shape_mismatch_fails_fast(self):
         config = self._config(**{"w.weight": self._meta(_Q4_K, 8, 512, (8, 288))})
-        with self.assertRaisesRegex(ValueError, "has shape"):
+        with self.assertRaisesRegex(ValueError, "logical shape"):
             ReplicatedLinear(512, 4, bias=False, quant_config=config, prefix="w")
+
+    @patch(
+        "sglang.multimodal_gen.runtime.layers.quantization.gguf.dequantize_gguf_weight"
+    )
+    def test_apply_reuses_srt_dequantization(self, dequantize):
+        config = self._config(**{"w.weight": self._meta(_Q4_K, 4, 512, (4, 288))})
+        layer = ReplicatedLinear(512, 4, bias=False, quant_config=config, prefix="w")
+        dequantize.return_value = torch.ones(4, 512)
+
+        output, _ = layer(torch.ones(2, 4, 512))
+
+        dequantize.assert_called_once_with(layer.qweight, _Q4_K, torch.float32)
+        self.assertEqual(tuple(output.shape), (2, 4, 4))
+        torch.testing.assert_close(output, torch.full_like(output, 512.0))
+
+
+class TestGGUFTensorParallelLoading(unittest.TestCase):
+    def setUp(self):
+        self.group = SimpleNamespace(world_size=2, rank_in_group=1)
+        self.meta = GGUFTensorMeta(
+            ggml_type=int(_Q4_K),
+            logical_shape=(8, 512),
+            stored_shape=(8, 288),
+            stored_dtype=torch.uint8,
+            param_name="w.qweight",
+        )
+        self.config = GGUFConfig("/dev/null", {"w.weight": self.meta})
+        values = torch.arange(8 * 288, dtype=torch.int64).remainder(251)
+        self.loaded = values.to(torch.uint8).reshape(8, 288)
+
+    def test_column_parallel_slices_output_rows(self):
+        layer = ColumnParallelLinear(
+            512,
+            8,
+            bias=False,
+            quant_config=self.config,
+            prefix="w",
+            tp_group=self.group,
+        )
+
+        layer.weight_loader(layer.qweight, self.loaded)
+
+        torch.testing.assert_close(layer.qweight, self.loaded[4:])
+
+    def test_row_parallel_slices_packed_input_blocks(self):
+        layer = RowParallelLinear(
+            512,
+            8,
+            bias=False,
+            quant_config=self.config,
+            prefix="w",
+            tp_group=self.group,
+        )
+
+        layer.weight_loader(layer.qweight, self.loaded)
+
+        torch.testing.assert_close(layer.qweight, self.loaded[:, 144:])
+
+    def test_merged_column_parallel_slices_each_output_group(self):
+        layer = MergedColumnParallelLinear(
+            512,
+            [4, 4],
+            bias=False,
+            quant_config=self.config,
+            prefix="w",
+            tp_group=self.group,
+        )
+
+        layer.weight_loader(layer.qweight, self.loaded)
+
+        expected = torch.cat((self.loaded[2:4], self.loaded[6:8]))
+        torch.testing.assert_close(layer.qweight, expected)
+
+    def test_row_parallel_rejects_unaligned_partition(self):
+        metadata = GGUFTensorMeta(
+            ggml_type=int(_Q4_K),
+            logical_shape=(8, 256),
+            stored_shape=(8, 144),
+            stored_dtype=torch.uint8,
+            param_name="w.qweight",
+        )
+        config = GGUFConfig("/dev/null", {"w.weight": metadata})
+
+        with self.assertRaisesRegex(ValueError, "not aligned"):
+            RowParallelLinear(
+                256,
+                8,
+                bias=False,
+                quant_config=config,
+                prefix="w",
+                tp_group=self.group,
+            )
 
 
 class TestGGUFIncompatibleOptions(unittest.TestCase):
@@ -301,8 +420,6 @@ class TestGGUFIncompatibleOptions(unittest.TestCase):
         These are CPU-only tests; without the mock the CUDA guard fires first
         and every case would report the wrong reason.
         """
-        from unittest.mock import Mock, patch
-
         from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
             _resolve_gguf_quant_load_spec,
         )
@@ -327,8 +444,8 @@ class TestGGUFIncompatibleOptions(unittest.TestCase):
                 model_cls=Mock(packed_modules_mapping=None),
             )
 
-    def test_accepts_tp1_without_fsdp(self):
-        spec = self._resolve()
+    def test_accepts_tp_without_fsdp(self):
+        spec = self._resolve(tp_size=2)
         self.assertEqual(spec.gguf_file, str(self.gguf))
         self.assertEqual(spec.safetensors_list, [])
         # Each tensor keeps its checkpoint dtype rather than a single cast.
@@ -336,8 +453,6 @@ class TestGGUFIncompatibleOptions(unittest.TestCase):
 
     def test_rejects_non_cuda_platform(self):
         """Fail before reading a multi-GiB checkpoint, not at the first linear."""
-        from unittest.mock import Mock, patch
-
         from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
             _resolve_gguf_quant_load_spec,
         )
@@ -362,10 +477,6 @@ class TestGGUFIncompatibleOptions(unittest.TestCase):
                     model_cls=Mock(packed_modules_mapping=None),
                 )
 
-    def test_rejects_tensor_parallelism(self):
-        with self.assertRaisesRegex(ValueError, "tensor parallelism"):
-            self._resolve(tp_size=2)
-
     def test_rejects_fsdp_when_this_component_is_fsdp_managed(self):
         server_args_kwargs = {"use_fsdp_inference": True}
         with self.assertRaisesRegex(ValueError, "FSDP"):
@@ -377,8 +488,6 @@ class TestGGUFIncompatibleOptions(unittest.TestCase):
         Rejecting on the global flag would block FSDP on other resident
         components for no reason.
         """
-        from unittest.mock import Mock, patch
-
         from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
             _resolve_gguf_quant_load_spec,
         )
@@ -391,8 +500,6 @@ class TestGGUFIncompatibleOptions(unittest.TestCase):
         server_args.lora_path = None
         server_args.minimax_h3_adaln_online = False
         server_args.minimax_h3_adaln_cache_path = None
-        server_args.quantization = None
-        server_args.nunchaku_config = None
         server_args.quantization = None
         server_args.nunchaku_config = None
         with patch(
@@ -478,21 +585,33 @@ class TestGGUFPreDownloadValidation(unittest.TestCase):
         Recognition must not depend on directory depth: /a/x.gguf and
         /a/b/c/x.gguf are both local paths.
         """
-        for ref in (
-            "/models/missing.gguf",
-            "/a/b/c/deep/missing.gguf",
-            "./sub/missing.gguf",
-            "~/missing.gguf",
+        from sglang.multimodal_gen.runtime.loader import transformer_load_utils
+
+        server_args = Mock(
+            transformer_weights_path="/models/missing.gguf",
+            revision=None,
+            tp_size=1,
+            use_fsdp_inference=False,
+            lora_path=None,
+            minimax_h3_adaln_online=False,
+            minimax_h3_adaln_cache_path=None,
+            quantization=None,
+            nunchaku_config=None,
+        )
+        with (
+            patch.object(
+                transformer_load_utils, "resolve_hf_gguf_reference"
+            ) as resolve,
+            patch.object(transformer_load_utils, "current_platform") as platform,
+            self.assertRaisesRegex(ValueError, "/models/missing.gguf"),
         ):
-            # Still recognized as a GGUF intent, so the error names the file...
-            self.assertTrue(names_gguf_checkpoint(ref), ref)
-            # ...but resolution declines it instead of querying the Hub.
-            self.assertIsNone(resolve_gguf_reference(ref), ref)
+            platform.is_cuda.return_value = True
+            transformer_load_utils.resolve_transformer_gguf_to_load(server_args)
+        resolve.assert_not_called()
 
     def test_home_relative_path_is_expanded(self):
         """A `~` can arrive unexpanded from a config file or quoted argument."""
         import os
-        from unittest.mock import Mock, patch
 
         from sglang.multimodal_gen.runtime.loader import transformer_load_utils
 
@@ -515,9 +634,10 @@ class TestGGUFPreDownloadValidation(unittest.TestCase):
         server_args.quantization = None
         server_args.nunchaku_config = None
 
-        with patch.dict(os.environ, {"HOME": str(home)}), patch.object(
-            transformer_load_utils, "current_platform"
-        ) as platform:
+        with (
+            patch.dict(os.environ, {"HOME": str(home)}),
+            patch.object(transformer_load_utils, "current_platform") as platform,
+        ):
             platform.is_cuda.return_value = True
             resolved = transformer_load_utils.resolve_transformer_gguf_to_load(
                 server_args
@@ -526,8 +646,6 @@ class TestGGUFPreDownloadValidation(unittest.TestCase):
 
     def test_revision_is_forwarded_to_the_hub_resolver(self):
         """--revision must pin the GGUF download, not be silently dropped."""
-        from unittest.mock import Mock, patch
-
         from sglang.multimodal_gen.runtime.loader import transformer_load_utils
 
         server_args = Mock()
@@ -541,11 +659,12 @@ class TestGGUFPreDownloadValidation(unittest.TestCase):
         server_args.quantization = None
         server_args.nunchaku_config = None
 
-        with patch.object(
-            transformer_load_utils, "resolve_gguf_reference", return_value=None
-        ) as resolve, patch.object(
-            transformer_load_utils, "current_platform"
-        ) as platform:
+        with (
+            patch.object(
+                transformer_load_utils, "resolve_hf_gguf_reference", return_value=None
+            ) as resolve,
+            patch.object(transformer_load_utils, "current_platform") as platform,
+        ):
             platform.is_cuda.return_value = True
             # Resolution returns None, so the override itself is checked and
             # rejected as a non-file; the call arguments are what matters here.
@@ -554,28 +673,27 @@ class TestGGUFPreDownloadValidation(unittest.TestCase):
             resolve.assert_called_once_with("owner/repo:Q4_K_M", revision="abc123")
 
     def test_unsupported_config_rejected_before_download(self):
-        from unittest.mock import Mock, patch
-
         from sglang.multimodal_gen.runtime.loader import transformer_load_utils
 
         server_args = Mock()
         # A Hub reference: resolving it would download the whole checkpoint.
         server_args.transformer_weights_path = "owner/repo:Q4_K_M"
-        server_args.tp_size = 4
-        server_args.use_fsdp_inference = False
+        server_args.tp_size = 1
+        server_args.use_fsdp_inference = True
         server_args.lora_path = None
         server_args.minimax_h3_adaln_online = False
         server_args.minimax_h3_adaln_cache_path = None
         server_args.quantization = None
         server_args.nunchaku_config = None
 
-        with patch.object(
-            transformer_load_utils, "resolve_gguf_reference"
-        ) as resolve, patch.object(
-            transformer_load_utils, "current_platform"
-        ) as platform:
+        with (
+            patch.object(
+                transformer_load_utils, "resolve_hf_gguf_reference"
+            ) as resolve,
+            patch.object(transformer_load_utils, "current_platform") as platform,
+        ):
             platform.is_cuda.return_value = True
-            with self.assertRaisesRegex(ValueError, "tensor parallelism"):
+            with self.assertRaisesRegex(ValueError, "FSDP"):
                 transformer_load_utils.resolve_transformer_gguf_to_load(server_args)
             resolve.assert_not_called()
 
@@ -669,13 +787,6 @@ class TestGGUFRejectsLoraConversion(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "LoRA is not supported"):
             pipeline.set_lora("n", lora_path="p")
         entered.assert_not_called()
-
-
-class TestGGUFReferenceResolution(unittest.TestCase):
-    def test_non_gguf_reference_returns_none(self):
-        self.assertIsNone(resolve_gguf_reference("owner/repo"))
-        self.assertIsNone(resolve_gguf_reference("owner/repo/model.safetensors"))
-        self.assertIsNone(resolve_gguf_reference(""))
 
 
 if __name__ == "__main__":

@@ -686,20 +686,17 @@ GGUF loads a community-quantized transformer from a single `.gguf` file while
 the rest of the pipeline — VAE, text encoder, scheduler, tokenizer — keeps
 loading from the base model.
 
-**What it buys is the size of the checkpoint, not the peak VRAM.** Layerwise
-offload already fits a large DiT on a consumer card without any quantization —
-peak VRAM is set by the offload buffers and VAE decode rather than by the weight
-dtype, so BF16 and GGUF land in the same range. What changes is everything
-upstream of that: MiniMax-H3's transformer is 17.5 GiB as Q4_K_M against 61.7 GiB
-as BF16, so the download shrinks 3.5×, the host memory that offload pins shrinks
-with it, and each streamed layer moves a quarter of the bytes over PCIe. For a
-24 GB card the alternative is `kitchen_int8`, which quantizes online and is
-therefore faster to run but still needs the full BF16 checkpoint on disk and in
-host RAM.
+GGUF primarily reduces checkpoint, host-memory, and resident-weight size. For
+example, MiniMax-H3's transformer is 17.5 GiB as Q4_K_M versus 61.7 GiB as
+BF16. With full layerwise offload, VAE decode and offload buffers can still
+dominate peak GPU memory, but each streamed DiT layer also transfers fewer
+bytes.
 
-Weights stay in their GGML block format on device and are dequantized to the
-activation dtype each time a linear runs, so the DiT pays one dequantization per
-linear per denoise step. **This is not a speed optimization.**
+Packed linears reuse SRT's GGUF type definitions and CUDA dequantization, then
+run the native GEMM. SRT's fused MMVQ/MMQ kernels target the low-token LLM
+regime and are slower at diffusion sequence lengths. GGUF remains a
+capacity-oriented option; latency depends on the quantization type, activation
+shape, and placement policy.
 
 Layers the checkpoint stores unquantized (F32/F16/BF16) take the ordinary linear
 path rather than the packed one. Their precision is then whatever the model
@@ -715,12 +712,15 @@ No extra install: `gguf` is already a core SGLang dependency.
 
 `--model-path` stays the base model; `--transformer-weights-path` takes the
 GGUF. A local path, `owner/repo/file.gguf`, or `owner/repo:QUANT_TYPE` all work.
+The quant-type shorthand is accepted only when exactly one repository file
+matches it; otherwise SGLang lists the candidates and asks for a full path.
 
 ```bash
 sglang serve \
   --model-path MiniMaxAI/MiniMax-H3 \
   --model-variant fl2va \
-  --transformer-weights-path leejet/MiniMax-H3-GGUF:Q4_K_M \
+  --transformer-weights-path \
+    leejet/MiniMax-H3-GGUF/minimax_h3_fl2va-Q4_K_M.gguf \
   --num-gpus 1 \
   --attention-backend fa \
   --performance-mode memory \
@@ -733,6 +733,23 @@ sglang serve \
 
 Note that `--quantization gguf` is not the selector — the quantization is read
 from the file itself, so passing the file is what enables the path.
+
+MiniMax-H3 GGUF checkpoints may use either the original timestep MLP or the
+pruned AdaLN curve architecture. Repositories often contain both FL2VA and
+Ref2VA files, so use the full Hub file reference instead of an ambiguous
+`owner/repo:QUANT_TYPE` selector:
+
+```bash
+sglang serve \
+  --model-path MiniMaxAI/MiniMax-H3 \
+  --model-variant fl2va \
+  --transformer-weights-path \
+    unsloth/MiniMax-H3-GGUF/minimax_h3_fl2va_pruned-Q4_K.gguf \
+  --performance-mode memory \
+  --layerwise-offload-components dit,text_encoder \
+  --enable-torch-compile false \
+  --port 30010
+```
 
 #### Whether to offload the VAE
 
@@ -753,9 +770,9 @@ does, and the 6× slower decode is the price of fitting.
 
 | Constraint | Reason |
 | --- | --- |
-| `--tp-size 1` only | Sharding packed GGML blocks is not block-aware yet |
-| No `--use-fsdp-inference` | Same reason; rejected with an explicit error |
-| CUDA only | The GGML dequantize kernel ships for CUDA |
+| TP shard boundaries must align to GGML blocks | Column-parallel rows shard directly; row-parallel packed columns require each local input partition to contain whole quantization blocks |
+| No `--use-fsdp-inference` | FSDP does not preserve the GGUF packed-block layout |
+| CUDA only | The reused SRT GGML matmul kernels currently ship for CUDA |
 | Native byte order only | A quantized block embeds its scales, so a non-native file cannot be byte-swapped as a whole |
 | No LoRA, and none of the H3 AdaLN cache flags | An adapter cannot be merged into packed blocks, and the AdaLN paths read the transformer's safetensors |
 | No `--quantization` | The checkpoint fixes the quantization; the flag would be a second, conflicting selector |
@@ -763,9 +780,9 @@ does, and the 6× slower decode is the price of fitting.
 Every constraint above fails at startup with an explanatory error rather than
 silently producing wrong output.
 
-`--tp-size 1` does not forbid multiple GPUs: sequence parallelism
-(`--ulysses-degree` / `--ring-degree`) shards activations rather than weights, so
-it is not rejected. It is also **not validated** — the scope below is one GPU.
+Sequence parallelism (`--ulysses-degree` / `--ring-degree`) remains available
+because it shards activations rather than packed weights. TP is also available;
+startup rejects a degree that cuts a row-parallel matrix inside a GGML block.
 
 ### Validated scope
 
@@ -777,13 +794,8 @@ The DiT loads at 17.5 GiB against 61.7 GiB for the BF16 checkpoint. Weight
 fidelity was checked tensor-by-tensor against the BF16 reference: cosine
 1.00000 for the F32/BF16 tensors and 0.9973 for Q4_K/Q4_0.
 
-Not validated: any other quantization type, the `ref2va` partition, multi-GPU,
-and a BF16-vs-GGUF output comparison (the BF16 transformer was deliberately not
-downloaded, which is the point of the format).
-
-Pruned community checkpoints are a different matter: variants that fold H3's
-AdaLN branches into a low-rank table change the module structure and are not
-loadable by this path.
+Not validated in the measurement above: any other quantization type, the
+`ref2va` partition, multi-GPU, and a BF16-vs-GGUF output comparison.
 
 ## Nunchaku (SVDQuant)
 

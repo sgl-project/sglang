@@ -790,7 +790,9 @@ class MiniMaxH3AdalnProj(nn.Module):
             out_features,
             bias=True,
             gather_output=False,
-            params_dtype=_BF16_DTYPE,
+            params_dtype=(
+                _FP32_DTYPE if arch.adaln_curve_grid is not None else _BF16_DTYPE
+            ),
             quant_config=quant_config,
             prefix=f"{prefix}.linear",
         )
@@ -1466,16 +1468,23 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         adaln_plan_width: int = MINIMAX_H3_ADALN_MAX_PLAN_WIDTH,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
+        arch = self.config
         if (
             adaln_cache_path is not None or adaln_weight_files is not None
         ) and quant_config is not None:
             raise ValueError(
                 "MiniMax H3 AdaLN cache is only compatible with unquantized weights"
             )
+        if arch.adaln_curve_grid is not None and (
+            adaln_cache_path is not None or adaln_weight_files is not None
+        ):
+            raise ValueError(
+                "MiniMax H3 pruned curve checkpoints cannot use a separate "
+                "AdaLN cache"
+            )
         self._adaln_precomputed = (
             adaln_cache_path is not None or adaln_weight_files is not None
         )
-        arch = self.config
         self.arch = arch
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
@@ -1520,10 +1529,22 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             quant_config=quant_config,
             prefix="condition_proj",
         )
-        self.time_embedder = MiniMaxH3TimeEmbedder(
-            arch,
-            prefix="time_embedder",
-        )
+        if arch.adaln_curve_grid is None:
+            self.time_embedder = MiniMaxH3TimeEmbedder(
+                arch,
+                prefix="time_embedder",
+            )
+            self.register_parameter("adaln_t_table", None)
+        else:
+            self.time_embedder = None
+            self.adaln_t_table = nn.Parameter(
+                torch.empty(
+                    arch.adaln_curve_grid,
+                    arch.time_embed_dim,
+                    dtype=_FP32_DTYPE,
+                ),
+                requires_grad=False,
+            )
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(
             arch,
@@ -1596,12 +1617,26 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             param.missing_param_init = "error"
 
     def post_load_weights(self) -> None:
-        for name in _MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER:
+        fp32_param_names = list(_MINIMAX_H3_FP32_PARAM_NAMES_IN_MODEL_ORDER)
+        if self.adaln_t_table is not None:
+            fp32_param_names = [
+                name
+                for name in fp32_param_names
+                if not name.startswith("time_embedder.")
+            ]
+            fp32_param_names.append("adaln_t_table")
+        for name in fp32_param_names:
             param = self.get_parameter(name)
             if param.dtype != _FP32_DTYPE:
                 raise ValueError(
                     f"{name} must stay fp32 after load, got {param.dtype}."
                 )
+        if self.adaln_t_table is not None:
+            for name, param in self.named_parameters():
+                if ".adaln_proj.linear." in name and param.dtype != _FP32_DTYPE:
+                    raise ValueError(
+                        f"{name} must stay fp32 with curve AdaLN, got {param.dtype}."
+                    )
         # assign=True loading may re-register this persistent buffer as a parameter
         rope_inv_freq = self.rope.inv_freq
         if rope_inv_freq.dtype != _FP32_DTYPE:
@@ -1610,6 +1645,19 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             )
         if self.adaln_cache is not None:
             self.adaln_cache.load(self.video_patch_proj.weight.device)
+
+    def _time_embedding(self, timesteps: torch.Tensor) -> torch.Tensor:
+        if self.adaln_t_table is None:
+            assert self.time_embedder is not None
+            return self.time_embedder(timesteps)
+
+        grid = self.adaln_t_table.shape[0]
+        position = timesteps.to(_FP32_DTYPE).clamp(0, 1) * (grid - 1)
+        lower = position.floor().clamp(max=grid - 2).to(torch.long)
+        fraction = (position - lower).unsqueeze(-1)
+        lower_value = self.adaln_t_table.index_select(0, lower)
+        upper_value = self.adaln_t_table.index_select(0, lower + 1)
+        return torch.lerp(lower_value, upper_value, fraction)
 
     @staticmethod
     def _pos_ids(pos_info: Any, key: str) -> torch.Tensor:
@@ -1858,7 +1906,7 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
                 audio_embed.to(_BF16_DTYPE),
             )
 
-        t_emb = self.time_embedder(unique_timesteps)
+        t_emb = self._time_embedding(unique_timesteps)
         return embeddings, t_emb
 
     def forward(self, **kwargs: Any) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2014,7 +2062,11 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             local_embedding_layout=kwargs.get("local_embedding_layout"),
         )
         # request-step AdaLN input shared by all blocks
-        adaln_input = nn.functional.silu(t_emb).to(_BF16_DTYPE)
+        adaln_input = (
+            t_emb
+            if self.adaln_t_table is not None
+            else nn.functional.silu(t_emb).to(_BF16_DTYPE)
+        )
         inverse_indices = inverse_indices.to(device)
         block_inverse = inverse_indices[row_start:row_stop]
         if block_token_tags is None:

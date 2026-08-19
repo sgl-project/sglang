@@ -286,6 +286,16 @@ class TestTransformerQuantHelpers(unittest.TestCase):
 
         self.assertEqual(device, runtime_device)
 
+    def test_gguf_cpu_offload_loads_packed_checkpoint_on_cpu(self):
+        device = _resolve_checkpoint_load_device(
+            torch.device("cuda:0"),
+            component_starts_on_cpu=True,
+            runtime_quant_config=object(),
+            quantized_cpu_load_supported=True,
+        )
+
+        self.assertEqual(device, torch.device("cpu"))
+
     def test_resident_transformer_loads_checkpoint_on_runtime_device(self):
         runtime_device = torch.device("cuda:0")
         device = _resolve_checkpoint_load_device(

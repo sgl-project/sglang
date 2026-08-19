@@ -53,6 +53,7 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     normalize_flat_modelopt_quant_config,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils.hf_transformers import check_gguf_file
 from sglang.utils import is_in_ci
 
 logger = init_logger(__name__)
@@ -595,19 +596,6 @@ def attach_additional_stop_token_ids(tokenizer):
         }
     else:
         tokenizer.additional_stop_token_ids = None
-
-
-def check_gguf_file(model: str | os.PathLike) -> bool:
-    """Check if the file is a GGUF model."""
-    model = Path(model)
-    if not model.is_file():
-        return False
-    elif model.suffix == ".gguf":
-        return True
-
-    with open(model, "rb") as f:
-        header = f.read(4)
-    return header == b"GGUF"
 
 
 def maybe_download_lora(

@@ -77,6 +77,8 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     timestep_input_dim: int = 256
     time_embed_hidden_size: int = 5376
     time_embed_dim: int = 2688
+    # Pruned checkpoints replace the timestep MLP with a sampled AdaLN curve.
+    adaln_curve_grid: int | None = None
     adaln_out_features: int = 18 * 5376
     final_adaln_out_features: int = 2 * 5376
     rope_inv_freq_len: int = 16

@@ -1,69 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GGUF checkpoint reading for diffusion transformers.
-
-A GGUF file replaces only the transformer component of a diffusion pipeline;
-every other component (VAE, text encoder, scheduler) still loads from the base
-model repository.
-
-Unlike the safetensors path, tensor shapes here are not knowable from the model
-config alone: a quantized tensor is stored as packed bytes whose row length
-depends on its GGML type. ``read_gguf_tensor_meta`` is therefore called *before*
-model construction so that ``GGUFLinearMethod.create_weights`` can register
-parameters with their exact packed byte shapes. That keeps the generic weight
-loader in ``fsdp_load`` working unchanged -- it casts each loaded tensor to the
-meta parameter's dtype, which is already ``uint8`` for packed weights, making
-the cast a no-op.
-"""
+"""Diffusion-specific GGUF tensor layout and iteration."""
 
 from __future__ import annotations
 
 import math
 import os
+import warnings
 from collections.abc import Callable, Generator
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
-import msgspec
 import torch
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils.hf_transformers import check_gguf_file
 
-logger = init_logger(__name__)
+if TYPE_CHECKING:
+    import gguf
+    from gguf import GGMLQuantizationType as WeightType
 
-# GGMLQuantizationType ids this module names directly.
-GGML_F32, GGML_F16, GGML_BF16 = 0, 1, 30
-
-# GGML types that store plain, unquantized values. Everything else is packed and
-# must go through ``ggml_dequantize`` before use.
-GGML_UNQUANTIZED_TYPES = frozenset({GGML_F32, GGML_F16, GGML_BF16})
-
-# Types whose dequantize kernel walks 32-element blocks and bounds-checks each
-# thread (``dequantize_block`` in dequantize.cuh). Every other quantized type is
-# handled by a 256-element super-block kernel with no bounds check, which
-# requires the tensor's element count to be a whole number of super-blocks:
-# the truncating variants would leave the tail uninitialized, and the two
-# ceil-rounding ones (IQ4_NL, IQ4_XS) would write past the output.
-_GGML_BOUNDS_CHECKED_TYPES = frozenset({2, 3, 6, 7, 8})  # Q4_0 Q4_1 Q5_0 Q5_1 Q8_0
+_GGML_F32, _GGML_F16, _GGML_BF16 = 0, 1, 30
+_UNQUANTIZED_TYPES = {_GGML_F32, _GGML_F16, _GGML_BF16}
+# SRT has no batched MMQ kernel for I-matrix types and may dequantize them.
+_SUPER_BLOCK_DEQUANT_TYPES = {16, 17, 18, 19, 20, 21, 22, 23, 29}
 _GGML_SUPER_BLOCK = 256
 
-GGUF_MAGIC = b"GGUF"
 
-
-class GGUFTensorMeta(msgspec.Struct, frozen=True):
-    """Layout of one GGUF tensor, read from the file header.
-
-    Attributes:
-        ggml_type: The numeric ``GGMLQuantizationType``.
-        logical_shape: Shape the dequantized tensor has, in torch order --
-            ``(out_features, in_features)`` for a weight matrix. GGUF stores
-            dimensions fastest-varying first, so this is the reverse of the
-            file's ``ne`` array.
-        stored_shape: Shape the parameter is registered and loaded with. Equal
-            to ``logical_shape`` for unquantized tensors; for quantized ones it
-            is ``(out_features, row_bytes)`` of packed ``uint8``.
-        stored_dtype: dtype the parameter is registered with.
-        param_name: Model parameter this tensor loads into. A quantized weight
-            targets ``qweight`` -- the name ``GGUFLinearMethod`` registers --
-            while everything else keeps its checkpoint name.
-    """
+@dataclass(frozen=True)
+class GGUFTensorMeta:
+    """Logical and packed layouts read before constructing a DiT."""
 
     ggml_type: int
     logical_shape: tuple[int, ...]
@@ -72,76 +36,31 @@ class GGUFTensorMeta(msgspec.Struct, frozen=True):
     param_name: str
 
     @property
+    def weight_type(self) -> WeightType:
+        from gguf import GGMLQuantizationType as WeightType
+
+        return WeightType(self.ggml_type)
+
+    @property
     def is_quantized(self) -> bool:
-        return self.ggml_type not in GGML_UNQUANTIZED_TYPES
+        return self.ggml_type not in _UNQUANTIZED_TYPES
 
 
-_WEIGHT_SUFFIX = ".weight"
-
-
-def _param_name_for(gguf_name: str, is_quantized: bool) -> str:
-    """Map a GGUF tensor name to the model parameter it loads into."""
-    if is_quantized and gguf_name.endswith(_WEIGHT_SUFFIX):
-        return gguf_name[: -len(_WEIGHT_SUFFIX)] + ".qweight"
-    return gguf_name
-
-
-def is_gguf_file(path: str | os.PathLike) -> bool:
-    """Return whether ``path`` is a GGUF file, by suffix or magic bytes."""
-    if not path:
-        return False
-    path = str(path)
-    if not os.path.isfile(path):
-        return False
-    if path.endswith(".gguf"):
-        return True
-    try:
-        with open(path, "rb") as f:
-            return f.read(4) == GGUF_MAGIC
-    except OSError:
-        return False
-
-
-def _require_gguf():
+def _gguf_module() -> Any:
     try:
         import gguf
     except ImportError as exc:
         raise ImportError(
-            "Reading a GGUF checkpoint requires the `gguf` package. "
-            "Install it with `pip install gguf`."
+            "Reading a GGUF checkpoint requires the `gguf` package"
         ) from exc
     return gguf
 
 
-def _torch_dtype_for_ggml(ggml_type: int) -> torch.dtype:
-    if ggml_type == GGML_F32:
-        return torch.float32
-    if ggml_type == GGML_F16:
-        return torch.float16
-    if ggml_type == GGML_BF16:
-        return torch.bfloat16
-    # Packed types are carried as raw bytes.
-    return torch.uint8
-
-
-def _open_reader(gguf_file: str):
-    """Open a GGUF file, rejecting one whose byte order is not the host's.
-
-    gguf-py records endianness per file and reports ``"S"`` when it differs, but
-    it only hands back views with a swapped NumPy dtype. That is not something
-    this loader can fix up: ``torch.from_numpy`` refuses a non-native dtype, and
-    a quantized tensor stays ``uint8`` with its scale fields embedded inside each
-    block, so a whole-buffer swap would silently corrupt dequantization instead
-    of failing. Rejecting is the honest option until there is a reason -- and a
-    sample file -- to convert every block layout properly.
-    """
-    gguf = _require_gguf()
-
+def _open_reader(gguf_file: str) -> gguf.GGUFReader:
+    gguf = _gguf_module()
     try:
         reader = gguf.GGUFReader(gguf_file)
     except Exception as exc:
-        # gguf-py builds every tensor view up front, so an incomplete download
-        # surfaces here as a bare reshape error that reads like a layout bug.
         size = os.path.getsize(gguf_file) if os.path.isfile(gguf_file) else 0
         raise ValueError(
             f"Failed to read GGUF {gguf_file} ({size} bytes). An incomplete or "
@@ -149,72 +68,83 @@ def _open_reader(gguf_file: str):
         ) from exc
     if reader.byte_order == "S":
         raise ValueError(
-            f"GGUF file {gguf_file} is stored in the opposite byte order from "
-            "this host, which is not supported. Convert it to a native-endian "
-            "GGUF first."
+            f"GGUF file {gguf_file} uses the opposite byte order from this host"
         )
     return reader
 
 
 def read_gguf_tensor_meta(gguf_file: str) -> dict[str, GGUFTensorMeta]:
-    """Read every tensor's layout from a GGUF file header.
-
-    Only the header is parsed; tensor data is not read.
-    """
-    from gguf.constants import GGML_QUANT_SIZES
-
+    """Read the exact packed shape required by diffusion parameters."""
+    gguf = _gguf_module()
+    WeightType = gguf.GGMLQuantizationType
     reader = _open_reader(gguf_file)
-    meta: dict[str, GGUFTensorMeta] = {}
+    metadata: dict[str, GGUFTensorMeta] = {}
     for tensor in reader.tensors:
-        ggml_type = int(tensor.tensor_type)
-        is_quantized = ggml_type not in GGML_UNQUANTIZED_TYPES
-        # GGUF stores `ne` fastest-varying first; torch wants the reverse.
-        logical_shape = tuple(int(d) for d in reversed(tensor.shape))
-        if not is_quantized:
-            stored_shape = logical_shape
-        else:
-            block_size, type_size = GGML_QUANT_SIZES[tensor.tensor_type]
-            inner = logical_shape[-1]
-            if inner % block_size:
+        weight_type = WeightType(tensor.tensor_type)
+        logical_shape = tuple(int(dim) for dim in reversed(tensor.shape))
+        is_quantized = int(weight_type) not in _UNQUANTIZED_TYPES
+        if is_quantized:
+            if len(logical_shape) != 2 or not tensor.name.endswith(".weight"):
                 raise ValueError(
-                    f"GGUF tensor {tensor.name} has inner dimension {inner} that is "
-                    f"not a multiple of the block size {block_size} for type "
-                    f"{ggml_type}."
+                    f"GGUF tensor {tensor.name} is quantized, but diffusion GGUF "
+                    "currently supports packed data only for 2D linear .weight "
+                    "tensors"
                 )
-            row_bytes = inner // block_size * type_size
-            stored_shape = (*logical_shape[:-1], row_bytes)
-            if ggml_type not in _GGML_BOUNDS_CHECKED_TYPES:
-                numel = math.prod(logical_shape)
-                if numel % _GGML_SUPER_BLOCK:
-                    raise ValueError(
-                        f"GGUF tensor {tensor.name} has {numel} elements, which is "
-                        f"not a whole number of {_GGML_SUPER_BLOCK}-element super "
-                        f"blocks required by the type-{ggml_type} dequantize "
-                        "kernel. Loading it would read or write out of bounds."
-                    )
-        meta[tensor.name] = GGUFTensorMeta(
-            ggml_type=ggml_type,
+            block_size, type_size = gguf.GGML_QUANT_SIZES[weight_type]
+            inner_dim = logical_shape[-1]
+            if inner_dim % block_size:
+                raise ValueError(
+                    f"GGUF tensor {tensor.name} has inner dimension {inner_dim}, "
+                    f"which is not a multiple of block size {block_size}"
+                )
+            stored_shape = (
+                *logical_shape[:-1],
+                inner_dim // block_size * type_size,
+            )
+            if (
+                int(weight_type) in _SUPER_BLOCK_DEQUANT_TYPES
+                and math.prod(logical_shape) % _GGML_SUPER_BLOCK
+            ):
+                raise ValueError(
+                    f"GGUF tensor {tensor.name} is not aligned to "
+                    f"{_GGML_SUPER_BLOCK}-element super blocks"
+                )
+            stored_dtype = torch.uint8
+        else:
+            stored_shape = logical_shape
+            stored_dtype = {
+                _GGML_F32: torch.float32,
+                _GGML_F16: torch.float16,
+                _GGML_BF16: torch.bfloat16,
+            }[int(weight_type)]
+
+        param_name = (
+            f"{tensor.name.removesuffix('.weight')}.qweight"
+            if is_quantized
+            else tensor.name
+        )
+        metadata[tensor.name] = GGUFTensorMeta(
+            ggml_type=int(weight_type),
             logical_shape=logical_shape,
             stored_shape=stored_shape,
-            stored_dtype=_torch_dtype_for_ggml(ggml_type),
-            param_name=_param_name_for(tensor.name, is_quantized),
+            stored_dtype=stored_dtype,
+            param_name=param_name,
         )
-    return meta
+    return metadata
 
 
-def _tensor_from_reader(tensor, meta: GGUFTensorMeta) -> torch.Tensor:
-    """Materialize one GGUF tensor as a torch tensor in its stored layout."""
-    import numpy as np
-
-    data: np.ndarray = tensor.data
-    if meta.ggml_type == GGML_BF16:
-        # gguf-py hands BF16 back as raw bytes rather than a typed array, so
-        # reinterpret rather than cast (a cast would read the byte values as
-        # numbers).
-        out = torch.from_numpy(data.view(np.uint16).copy()).view(torch.bfloat16)
-    else:
-        out = torch.from_numpy(np.asarray(data).copy())
-    return out.reshape(meta.stored_shape)
+def _tensor_to_torch(tensor, metadata: GGUFTensorMeta) -> torch.Tensor:
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="The given NumPy array is not writable",
+            category=UserWarning,
+        )
+        value = torch.from_numpy(tensor.data)
+    if metadata.ggml_type == _GGML_BF16:
+        return value.view(torch.bfloat16).reshape(metadata.stored_shape).clone()
+    value = value.reshape(metadata.stored_shape)
+    return value.clone() if not metadata.is_quantized else value
 
 
 def gguf_weights_iterator(
@@ -222,119 +152,34 @@ def gguf_weights_iterator(
     tensor_meta: dict[str, GGUFTensorMeta],
     key_filter: Callable[[str], bool] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Yield ``(param_name, tensor)`` for every tensor in a GGUF file.
-
-    Quantized tensors are yielded as packed ``uint8`` in their stored layout and
-    under the ``qweight`` name the layer registered; ``GGUFLinearMethod``
-    dequantizes them at use time.
-
-    ``key_filter`` matches the same way as the safetensors iterator's: it sees
-    the checkpoint's own tensor name and keeps the ones it returns true for.
-    """
+    """Yield checkpoint tensors under their diffusion parameter names."""
     reader = _open_reader(gguf_file)
     for tensor in reader.tensors:
         if key_filter is not None and not key_filter(tensor.name):
             continue
-        meta = tensor_meta.get(tensor.name)
-        if meta is None:
-            # The header was read from this same file, so a miss means the
-            # caller passed metadata from a different checkpoint.
-            raise KeyError(
-                f"GGUF tensor {tensor.name} is missing from the supplied metadata; "
-                "the metadata and the checkpoint do not match."
-            )
-        yield meta.param_name, _tensor_from_reader(tensor, meta)
-
-
-def _is_local_path(reference: str) -> bool:
-    """Whether ``reference`` is meant as a filesystem path, not a Hub reference.
-
-    Hub references are always ``owner/repo...``, so anything absolute or
-    explicitly relative names a local file even when it does not exist.
-    """
-    return os.path.isabs(reference) or reference.startswith((".", "~"))
+        metadata = tensor_meta[tensor.name]
+        yield metadata.param_name, _tensor_to_torch(tensor, metadata)
 
 
 def names_gguf_checkpoint(reference: str) -> bool:
-    """Whether ``reference`` names a GGUF checkpoint, without any network I/O.
-
-    Lets callers validate runtime support *before* a Hub reference is downloaded,
-    so an unsupported configuration is rejected in a second rather than after a
-    multi-gigabyte fetch.
-    """
+    """Recognize an explicit local or Hub GGUF reference without downloading."""
     if not reference:
         return False
-    if is_gguf_file(reference):
+    if check_gguf_file(reference):
         return True
     if os.path.exists(reference):
-        # An existing path that is not a GGUF file is something else entirely.
         return False
-    if _is_local_path(reference):
-        # A missing local path is judged by intent alone, so the error names the
-        # file rather than depending on how many directories deep it sits.
+    if os.path.isabs(reference) or reference.startswith((".", "~")):
         return reference.endswith(".gguf")
     if ":" in reference:
         repo_id, _, quant_type = reference.rpartition(":")
         return repo_id.count("/") == 1 and bool(quant_type)
-    # Hub file reference: owner/repo/path/inside/repo.gguf
     return reference.endswith(".gguf") and len(reference.strip("/").split("/")) >= 3
 
 
-def resolve_gguf_reference(reference: str, revision: str | None = None) -> str | None:
-    """Resolve a Hub reference to a local ``.gguf`` path.
-
-    Accepts ``owner/repo/path/inside/repo.gguf`` and ``owner/repo:QUANT_TYPE``
-    (e.g. ``leejet/MiniMax-H3-GGUF:Q4_K_M``). Returns ``None`` when the
-    reference is not a Hub GGUF reference, so callers can fall through to
-    treating it as a local path.
-    """
-    if not reference or os.path.exists(reference):
-        return None
-    if _is_local_path(reference):
-        # A missing local file is a typo, not a repo named after its directories.
-        return None
-
-    from huggingface_hub import hf_hub_download
-
-    if ":" in reference:
-        repo_id, _, quant_type = reference.rpartition(":")
-        if repo_id.count("/") != 1 or not quant_type:
-            return None
-        return _download_gguf_by_quant_type(repo_id, quant_type, revision)
-
-    if not reference.endswith(".gguf"):
-        return None
-    parts = reference.strip("/").split("/")
-    if len(parts) < 3:
-        return None
-    repo_id = "/".join(parts[:2])
-    filename = "/".join(parts[2:])
-    logger.info("Downloading GGUF %s from %s", filename, repo_id)
-    return hf_hub_download(repo_id, filename, revision=revision)
-
-
-def _download_gguf_by_quant_type(
-    repo_id: str, quant_type: str, revision: str | None
-) -> str:
-    """Download the single ``.gguf`` in ``repo_id`` matching ``quant_type``."""
-    from huggingface_hub import HfApi, hf_hub_download
-
-    files = [
-        sibling.rfilename
-        for sibling in HfApi().model_info(repo_id, revision=revision).siblings
-    ]
-    suffix = f"-{quant_type}.gguf"
-    matches = [f for f in files if f.endswith(suffix)]
-    if not matches:
-        candidates = sorted(f for f in files if f.endswith(".gguf"))
-        raise ValueError(
-            f"No file matching quant type {quant_type!r} in {repo_id}. "
-            f"Available GGUF files: {candidates}"
-        )
-    if len(matches) > 1:
-        raise ValueError(
-            f"Quant type {quant_type!r} is ambiguous in {repo_id}: {sorted(matches)}. "
-            "Pass the full path instead, e.g. owner/repo/subdir/file.gguf."
-        )
-    logger.info("Downloading GGUF %s from %s", matches[0], repo_id)
-    return hf_hub_download(repo_id, matches[0], revision=revision)
+__all__ = [
+    "GGUFTensorMeta",
+    "gguf_weights_iterator",
+    "names_gguf_checkpoint",
+    "read_gguf_tensor_meta",
+]

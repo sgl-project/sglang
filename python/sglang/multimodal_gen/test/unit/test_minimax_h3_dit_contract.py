@@ -129,6 +129,25 @@ def test_native_weight_names_and_grouped_qkv_reorder():
             )
 
 
+def test_pruned_adaln_curve_interpolates_without_timestep_mlp():
+    model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
+    torch.nn.Module.__init__(model)
+    model.time_embedder = None
+    model.adaln_t_table = torch.nn.Parameter(
+        torch.tensor([[0.0, 2.0], [2.0, 4.0], [4.0, 6.0]]),
+        requires_grad=False,
+    )
+
+    result = model._time_embedding(torch.tensor([0.0, 0.25, 1.0]))
+
+    torch.testing.assert_close(
+        result,
+        torch.tensor([[0.0, 2.0], [1.0, 3.0], [4.0, 6.0]]),
+        rtol=0,
+        atol=0,
+    )
+
+
 class _KwargIdentity(torch.nn.Module):
     def forward(self, x, **_kwargs):
         return x
