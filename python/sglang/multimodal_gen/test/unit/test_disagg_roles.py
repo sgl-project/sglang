@@ -255,9 +255,11 @@ class TestPipelineStageRoleFilter(unittest.TestCase):
                     {
                         "_class_name": "FakePipeline",
                         "_diffusers_version": "0.34.0",
+                        "transformer": ["diffusers", "FakeTransformer"],
                     }
                 )
             )
+            (tmp_path / "transformer").mkdir()
 
             pipeline = object.__new__(_FakePipeline)
             pipeline.model_path = "org/repo"
