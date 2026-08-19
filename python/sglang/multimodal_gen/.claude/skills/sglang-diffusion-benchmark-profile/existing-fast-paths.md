@@ -10,33 +10,33 @@ framework-specific optimization workflow.
 - `python/sglang/multimodal_gen/runtime/layers/elementwise.py`
 - `python/sglang/multimodal_gen/runtime/layers/fused_scale_shift_gate.py`
 - `python/sglang/multimodal_gen/runtime/layers/rotary_embedding/utils.py`
-- `python/sglang/kernels/ops/diffusion/triton/scale_shift.py`
-- `python/sglang/kernels/ops/diffusion/modulate_scale_shift.py`
-- `python/sglang/kernels/ops/diffusion/fused_ln_modulate.py`
-- `python/sglang/kernels/ops/diffusion/quality_gate.py`
-- `python/sglang/kernels/ops/diffusion/bitexact_gate.py`
-- `python/sglang/kernels/ops/diffusion/group_norm_silu.py`
-- `python/sglang/kernels/ops/diffusion/triton/group_norm_silu.py`
-- `python/sglang/kernels/ops/diffusion/triton/group_norm_silu_twopass.py`
-- `python/sglang/kernels/ops/diffusion/triton/norm.py`
-- `python/sglang/kernels/ops/diffusion/triton/rmsnorm_onepass.py`
-- `python/sglang/kernels/ops/diffusion/triton/layernorm_modulate.py`
-- `python/sglang/kernels/ops/diffusion/triton/native_bf16_rmsnorm.py`
-- `python/sglang/kernels/ops/diffusion/triton/zimage_native_norm.py`
-- `python/sglang/kernels/ops/diffusion/triton/rotary.py`
-- `python/sglang/kernels/ops/diffusion/triton/ltx2_rotary.py`
-- `python/sglang/kernels/ops/diffusion/ltx2_qknorm_split_rope.py`
-- `python/sglang/kernels/ops/diffusion/ltx2_rmsnorm_modulate.py`
-- `python/sglang/kernels/ops/diffusion/triton/indexed_modulation.py`
-- `python/sglang/kernels/ops/diffusion/triton/ulysses_qkv.py`
-- `python/sglang/kernels/ops/diffusion/usp_relayout.py`
+- `python/sglang/kernels/ops/diffusion/modulate/scale_shift_triton.py`
+- `python/sglang/kernels/ops/diffusion/modulate/modulate_scale_shift_jit.py`
+- `python/sglang/kernels/ops/diffusion/sites/fused_ln_modulate_site.py`
+- `python/sglang/kernels/ops/diffusion/sites/quality_gate.py`
+- `python/sglang/kernels/ops/diffusion/sites/bitexact_gate.py`
+- `python/sglang/kernels/ops/diffusion/norm/group_norm_silu.py`
+- `python/sglang/kernels/ops/diffusion/norm/group_norm_silu_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/group_norm_silu_twopass_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/norm_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/rmsnorm_onepass_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/layernorm_modulate_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/native_bf16_rmsnorm_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/zimage_qk_rmsnorm_triton.py`
+- `python/sglang/kernels/ops/diffusion/rope/rotary_triton.py`
+- `python/sglang/kernels/ops/diffusion/rope/ltx2_rotary_triton.py`
+- `python/sglang/kernels/ops/diffusion/rope/ltx2_qknorm_split_rope_jit.py`
+- `python/sglang/kernels/ops/diffusion/sites/ltx2_rmsnorm_modulate_site.py`
+- `python/sglang/kernels/ops/diffusion/modulate/indexed_modulation_triton.py`
+- `python/sglang/kernels/ops/diffusion/layout/ulysses_qkv_triton.py`
+- `python/sglang/kernels/ops/diffusion/layout/usp_relayout_jit.py`
 - `python/sglang/multimodal_gen/runtime/layers/usp.py`
 - `python/sglang/multimodal_gen/runtime/models/dits/minimax_h3.py`
-- `python/sglang/kernels/ops/diffusion/residual_gate_add.py`
+- `python/sglang/kernels/ops/diffusion/modulate/residual_gate_add_jit.py`
 - `python/sglang/kernels/jit/csrc/diffusion/residual_gate_add.cuh`
-- `python/sglang/kernels/ops/diffusion/triton/varlen_pack_pad.py`
-- `python/sglang/kernels/ops/diffusion/triton/wan_causal_cache.py`
-- `python/sglang/kernels/ops/diffusion/cutedsl/scale_residual_norm_scale_shift.py`
+- `python/sglang/kernels/ops/diffusion/layout/varlen_pack_pad_triton.py`
+- `python/sglang/kernels/ops/diffusion/layout/wan_causal_cache_triton.py`
+- `python/sglang/kernels/ops/diffusion/norm/scale_residual_norm_cutedsl.py`
 - `python/sglang/multimodal_gen/runtime/models/vaes/fast_path_gate.py`
 - `python/sglang/multimodal_gen/runtime/models/vaes/flux2_vae_cuda_opt.py`
 - `python/sglang/multimodal_gen/runtime/models/vaes/wan_vae_cuda_opt.py`
@@ -249,7 +249,7 @@ framework-specific optimization workflow.
 **QK Norm + RoPE Optimization**
 
 - Entry point: `apply_qk_norm_rope` in `layernorm.py`.
-- Fast path: JIT fused inplace QK norm + RoPE from `python/sglang/kernels/ops/diffusion/qknorm_rope.py` via `fused_inplace_qknorm_rope`.
+- Fast path: JIT fused inplace QK norm + RoPE from `python/sglang/kernels/ops/diffusion/rope/qknorm_rope_jit.py` via `fused_inplace_qknorm_rope`.
 - Toggle: `SGLANG_ENABLE_FUSED_QKNORM_ROPE=1` keeps the fused path enabled by default.
 - Preconditions for fused path:
   - CUDA only.
@@ -310,12 +310,12 @@ framework-specific optimization workflow.
 - LTX2 split RoPE: `apply_ltx2_split_rotary_emb` in `ltx_2.py`.
 - LTX2 RMSNorm+modulate and FFN GELU epilogue under `quality="high"`:
   `mark_ltx2_rms_norm_modulate_site` / `fused_ltx2_rms_norm_modulate` in
-  `kernels/ops/diffusion/ltx2_rmsnorm_modulate.py` (mount-based
+  `kernels/ops/diffusion/sites/ltx2_rmsnorm_modulate_site.py` (mount-based
   `QualityGatedFusion`, not a first-sight `BitExactFusionGate` — the fused
   kernel is <=1 ULP off aten, so it is request-gated instead of verified),
   wired at the six `LTX2TransformerBlock` adaLN sites in `ltx_2.py`.
 - LTX2 residual-gate add: `ltx_2.py` calls `residual_gate_add` from
-  `kernels/ops/diffusion/residual_gate_add.py` directly for attention,
+  `kernels/ops/diffusion/modulate/residual_gate_add_jit.py` directly for attention,
   cross-attention, and MLP residual updates.
 - Wan causal VAE: `cat_pad_channels_last_3d` and `dup_up3d_add` in
   `wanvae.py`, backed by `triton/wan_causal_cache.py`.

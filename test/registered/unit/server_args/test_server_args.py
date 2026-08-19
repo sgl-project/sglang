@@ -1348,6 +1348,27 @@ class TestHiCacheArgs(unittest.TestCase):
         self.assertEqual(args.hicache_mem_layout, "page_first")
         self.assertIsNone(args.decode_attention_backend)
 
+    def test_decode_offload_rejects_host_pool_retraction(self):
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_offload_kvcache=True,
+            hicache_storage_backend="file",
+            disaggregation_decode_retraction_backup="host_pool",
+        )
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            args._handle_cache_compatibility()
+
+    def test_decode_offload_allows_cpu_tensor_retraction(self):
+        args = self._make_args(
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_offload_kvcache=True,
+            hicache_storage_backend="file",
+            disaggregation_decode_retraction_backup="cpu_tensor",
+        )
+
+        args._handle_cache_compatibility()
+
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def _make_dummy_ngram_args(self, **overrides):
@@ -2136,8 +2157,6 @@ class TestGrpcServerArgs(CustomTestCase):
         arg-parsing tests above never call start_server, so a stray kwarg (e.g.
         the removed max_prefill_tokens) would only surface as a TypeError at
         launch. This mocks the native extension and locks the kwarg set."""
-        import sys
-
         from sglang.srt.entrypoints import http_server
 
         fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
@@ -2145,22 +2164,25 @@ class TestGrpcServerArgs(CustomTestCase):
         server_args = SimpleNamespace(
             host="127.0.0.1", grpc_port=50051, grpc_worker_threads=4
         )
-        with patch.dict(
-            sys.modules,
-            {
-                "sglang.srt.grpc": SimpleNamespace(_core=fake_core),
-                "sglang.srt.grpc._core": fake_core,
-                "sglang.srt.entrypoints.grpc_bridge": fake_bridge,
-            },
+        with (
+            patch(
+                "sglang.srt.rust_extensions.load_rust_extension",
+                return_value=fake_core,
+            ) as load_rust_extension,
+            patch.dict(
+                "sys.modules", {"sglang.srt.entrypoints.grpc_bridge": fake_bridge}
+            ),
         ):
             handle = http_server._start_native_grpc_server_for_runtime(
                 server_args=server_args,
                 tokenizer_manager=MagicMock(),
                 template_manager=MagicMock(),
                 scheduler_info={},
+                grpc_port=server_args.grpc_port,
             )
 
         self.assertEqual(handle, "handle")
+        load_rust_extension.assert_called_once_with("sglang.srt.rust_extensions._grpc")
         _, kwargs = fake_core.start_server.call_args
         self.assertEqual(
             set(kwargs), {"host", "port", "runtime_handle", "worker_threads"}
@@ -2205,6 +2227,36 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         # require dp-attention there.
         args = self._args(moe_a2a_backend="deepep", enable_dp_attention=False)
         args._check_two_batch_overlap()
+
+
+class TestDcpKvEventContract(CustomTestCase):
+    """DCP widens the radix-tree page to page_size * dcp_size, which the
+    advertised KV-event block size must reflect."""
+
+    KV_EVENTS = '{"publisher":"zmq","topic":"kv","endpoint":"tcp://*:5557"}'
+
+    def test_kv_events_descriptor_reports_logical_block_size(self):
+        """Advertising the physical page_size made every KV-aware router hash
+        prompts at a width no emitted block can match, silently pinning its
+        hit rate to zero while stores kept applying cleanly."""
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=4,
+            dcp_size=4,
+            page_size=64,
+            kv_events_config=self.KV_EVENTS,
+        )
+        self.assertEqual(args.describe_kv_events_publisher()["block_size"], 256)
+        args = ServerArgs(
+            model_path="dummy", page_size=64, kv_events_config=self.KV_EVENTS
+        )
+        self.assertEqual(args.describe_kv_events_publisher()["block_size"], 64)
+
+    def test_kv_event_block_size_widens_a_single_token_page(self):
+        # page_size=1 + DCP is a real deployment shape: the allocator is still
+        # paged, at dcp_size.
+        args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
+        self.assertEqual(args.kv_event_block_size, 8)
 
 
 if __name__ == "__main__":

@@ -72,6 +72,18 @@ pub struct ServerArgs {
     /// HF revision, used only when `tokenizer_path` is a repo id. `None` → main.
     #[serde(default)]
     pub revision: Option<String>,
+    /// Weight format selected by `--load-format`, reported by `/get_model_info`.
+    /// The blob carries the post-`__post_init__` value (`auto` is already
+    /// narrowed to `gguf` / `mistral` / `runai_streamer` / `remote` where the
+    /// checkpoint demands it). Not consumed for loading -- the scheduler owns
+    /// that; `None` only when the blob omits the key.
+    #[serde(default)]
+    pub load_format: Option<String>,
+    /// Operator-supplied weight version, reported by `/model_info`. Defaults to
+    /// `"default"` on the Python side, so it is present in every blob; `None`
+    /// only when the blob omits the key.
+    #[serde(default)]
+    pub weight_version: Option<String>,
     /// HTTP bind address (see [`Self::bind`]).
     #[serde(default = "default_host")]
     pub host: String,
