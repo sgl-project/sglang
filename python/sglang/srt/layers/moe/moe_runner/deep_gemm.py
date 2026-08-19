@@ -1464,8 +1464,8 @@ def pre_permute_deepep_v2_to_deep_gemm(
     deepep_v2_expert_alignment = dispatch_output.expert_alignment
     if hidden_states_scale is None:
         raise RuntimeError(
-            "DeepEP v2 -> DeepGEMM requires FP8 dispatch output with activation scales. "
-            "Use --deepep-v2-dispatcher-output-dtype fp8 or select a BF16 runner such as triton."
+            "DeepEP v2 -> DeepGEMM requires FP8 dispatch output with activation "
+            "scales, but the dispatch output carried none."
         )
     assert runner_config.activation == "silu"
 

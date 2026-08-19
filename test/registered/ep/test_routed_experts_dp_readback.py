@@ -198,8 +198,6 @@ class TestRoutedExpertsReadbackDeepEPv2(_ReadbackMixin, CustomTestCase):
         "deepep_v2",
         "--deepep-v2-mode",
         "direct",
-        "--deepep-v2-dispatcher-output-dtype",
-        "fp8",
         "--moe-runner-backend",
         "deep_gemm",
     ]

@@ -1910,23 +1910,13 @@ class TestDeepEPv2Args(CustomTestCase):
             decode=PhaseConfig(backend=Backend.FULL, max_bs=512),
             prefill=PhaseConfig(backend=Backend.FULL, max_bs=512),
         )
+        valid = {f.name for f in dataclasses.fields(ServerArgs)}
         for key, value in overrides.items():
+            # ServerArgs has no __slots__, so setattr of a stale field name would
+            # silently succeed and leave the test asserting nothing.
+            assert key in valid, f"{key} is not a ServerArgs field"
             setattr(server_args, key, value)
         return server_args
-
-    def test_auto_runner_resolves_to_deep_gemm_for_fp8(self):
-        args = self._args(
-            moe_runner_backend="auto", deepep_v2_dispatcher_output_dtype="fp8"
-        )
-        args._handle_a2a_moe()
-        self.assertEqual(args.moe_runner_backend, "deep_gemm")
-
-    def test_auto_runner_resolves_to_triton_for_bf16(self):
-        args = self._args(
-            moe_runner_backend="auto", deepep_v2_dispatcher_output_dtype="bf16"
-        )
-        args._handle_a2a_moe()
-        self.assertEqual(args.moe_runner_backend, "triton")
 
     def test_runner_restored_by_declaration_fails_fast(self):
         # mxfp8 + auto: a model declaration restores an unsupported runner at
@@ -1951,9 +1941,7 @@ class TestDeepEPv2Args(CustomTestCase):
         self.assertTrue(args.disable_shared_experts_fusion)
 
     def test_auto_runner_defaults_to_deep_gemm(self):
-        args = self._args(
-            moe_runner_backend="auto", deepep_v2_dispatcher_output_dtype="auto"
-        )
+        args = self._args(moe_runner_backend="auto")
         args._handle_a2a_moe()
         self.assertEqual(args.moe_runner_backend, "deep_gemm")
 
@@ -1961,6 +1949,23 @@ class TestDeepEPv2Args(CustomTestCase):
         args = self._args(moe_runner_backend="flashinfer_trtllm")
         with self.assertRaises(ValueError):
             args._handle_a2a_moe()
+
+    def test_triton_runner_rejected(self):
+        # deepep_v2 registers permute adapters for deep_gemm only. Rejecting
+        # triton here is what keeps a user from reaching the permute registry
+        # and dying on a bare assert inside the MoE forward.
+        args = self._args(moe_runner_backend="triton")
+        with self.assertRaises(ValueError):
+            args._handle_a2a_moe()
+
+    def test_decode_graph_stays_enabled_in_both_comm_modes(self):
+        # Capturability follows the inference phase (masked decode), not the
+        # comm mode, so neither direct nor hybrid may disable the decode graph.
+        for mode in ("direct", "hybrid"):
+            args = self._args(moe_runner_backend="deep_gemm", deepep_v2_mode=mode)
+            args._handle_a2a_moe()
+            self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
+            self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
 
     def test_two_batch_overlap_rejected(self):
         args = self._args(moe_runner_backend="deep_gemm", enable_two_batch_overlap=True)

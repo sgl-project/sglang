@@ -184,33 +184,18 @@ class MoeRunnerBackend(Enum):
         return self == MoeRunnerBackend.AITER
 
 
-class DeepEPv2OutputDtype(Enum):
+class DeepEPv2Fp8ScaleFormat(NamedTuple):
     """
-    Describes the dispatch output data type for DeepEP v2.
+    Layout of the FP8 activation scales DeepEP v2 dispatches to DeepGEMM.
 
-    - BF16: dispatch hidden states in bf16, without activation scales.
-    - FP8: dispatch hidden states in fp8, with activation scales.
-    """
-
-    BF16 = "bf16"
-    FP8 = "fp8"
-
-
-class DeepEPv2RunnerCapability(NamedTuple):
-    """
-    Describes the DeepEP v2 dispatcher contract required by the active MoE runner.
-
-    This capability is resolved in one place (get_deepep_v2_runner_capability, which reads
-    runner-side flags such as DeepGEMM JIT TMA/UE8M0 settings) and then consumed
-    by the dispatcher. The dispatcher depends only on this resolved contract and
-    does not peek at runner implementation details itself.
+    Both fields come from the DeepGEMM JIT configuration and therefore vary by
+    HARDWARE, not by runner: Hopper wants row-major fp32, Blackwell wants
+    column-major packed UE8M0. Resolving them here keeps the dispatcher from
+    importing deep_gemm_wrapper and reading JIT flags itself.
     """
 
-    output_dtype: DeepEPv2OutputDtype
-    expert_alignment: int
-    fp8_scale_tma_aligned: bool = False
-    fp8_scale_ue8m0: bool = False
-    use_expanded_layout: bool = False
+    tma_aligned: bool
+    ue8m0: bool
 
 
 class DeepEPMode(Enum):
@@ -346,72 +331,21 @@ def get_ascend_dispatcher_output_dtype(dispatcher):
     return DispatcherOutputDtype.BF16
 
 
-def get_deepep_v2_output_dtype(self) -> DeepEPv2OutputDtype:
+def get_deepep_v2_fp8_scale_format() -> DeepEPv2Fp8ScaleFormat:
+    """Resolve the FP8 scale layout DeepEP v2 must pre-quantize into.
+
+    deepep_v2 dispatches FP8 activations plus scales, which only the deep_gemm
+    runner consumes; MoeRunner rejects any other runner for this backend.
     """
-    Automatically choose the dispatch output dtype for DeepEP v2.
+    from sglang.srt.layers import deep_gemm_wrapper
 
-    The decision follows several checks in priority order:
-    0. Parse server argument.
-    1. Parse quant config.
-    2. DeepGEMM expects FP8 activation + scales.
-    3. Triton consumes BF16 activation without dispatcher-provided scales.
-    """
-
-    server_args = get_server_args()
-    if server_args and server_args.deepep_v2_dispatcher_output_dtype != "auto":
-        return DeepEPv2OutputDtype(server_args.deepep_v2_dispatcher_output_dtype)
-
-    if self.quant_config is not None:
-        dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
-        if dispatcher_output_dtype is not None:
-            return DeepEPv2OutputDtype(dispatcher_output_dtype)
-
-    runner_backend = get_moe_runner_backend()
-    if runner_backend.is_deep_gemm():
-        return DeepEPv2OutputDtype.FP8
-    if runner_backend.is_triton():
-        return DeepEPv2OutputDtype.BF16
-
-    raise ValueError(
-        "DeepEP v2 auto dispatcher output dtype only supports deep_gemm and triton "
-        f"runner backends for now, got {runner_backend.value}. Set "
-        "--deepep-v2-dispatcher-output-dtype explicitly only after adding a matching "
-        "DeepEP v2 runner adapter."
+    return DeepEPv2Fp8ScaleFormat(
+        tma_aligned=(
+            deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+            or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ),
+        ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
     )
-
-
-def get_deepep_v2_runner_capability(self) -> DeepEPv2RunnerCapability:
-    output_dtype = get_deepep_v2_output_dtype(self)
-    runner_backend = get_moe_runner_backend()
-    if output_dtype == DeepEPv2OutputDtype.FP8:
-        if not runner_backend.is_deep_gemm():
-            raise ValueError(
-                "DeepEP v2 FP8 dispatch output currently requires "
-                "--moe-runner-backend deep_gemm because the adapter must consume "
-                f"activation scales. Got {runner_backend.value}."
-            )
-        from sglang.srt.layers import deep_gemm_wrapper
-
-        # DeepGEMM consumes expert-major grouped activations. Use DeepEP v2's
-        # native expanded layout so the dispatcher copy epilogue writes one
-        # row per local expert slot, avoiding an extra SGLang scatter/gather
-        # adapter round-trip on the decode path.
-        return DeepEPv2RunnerCapability(
-            output_dtype=output_dtype,
-            expert_alignment=128,
-            fp8_scale_tma_aligned=(
-                deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
-                or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-            ),
-            fp8_scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-            use_expanded_layout=True,
-        )
-    if not runner_backend.is_triton():
-        raise ValueError(
-            "DeepEP v2 BF16 dispatch output currently requires "
-            f"--moe-runner-backend triton. Got {runner_backend.value}."
-        )
-    return DeepEPv2RunnerCapability(output_dtype=output_dtype, expert_alignment=1)
 
 
 def initialize_moe_config(server_args: ServerArgs):

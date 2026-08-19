@@ -18,14 +18,17 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
-    DeepEPv2OutputDtype,
-    DeepEPv2RunnerCapability,
-    get_deepep_v2_runner_capability,
+    DeepEPv2Fp8ScaleFormat,
+    get_deepep_v2_fp8_scale_format,
 )
 
 logger = logging.getLogger(__name__)
 
 _SCALE_BLOCK_SIZE = 128
+# Per-expert row alignment requested from ElasticBuffer. Must equal DeepGEMM's
+# get_m_alignment_for_contiguous_layout() so the non-expand psum doubles as a
+# valid group-start table for the contiguous grouped GEMM.
+_EXPERT_ALIGNMENT = 128
 _deepep_v2_import_error: Optional[BaseException] = None
 _fp8_quant_import_error: Optional[BaseException] = None
 sglang_per_token_group_quant_fp8 = None
@@ -122,15 +125,15 @@ def _get_allow_hybrid_mode() -> bool:
 
 
 def _quantize_for_deepep_v2_dispatch(
-    hidden_states: torch.Tensor, capability: DeepEPv2RunnerCapability
+    hidden_states: torch.Tensor, scale_format: DeepEPv2Fp8ScaleFormat
 ):
     _ensure_fp8_quant_available()
     return sglang_per_token_group_quant_fp8(
         hidden_states,
         _SCALE_BLOCK_SIZE,
-        column_major_scales=capability.fp8_scale_tma_aligned,
-        scale_tma_aligned=capability.fp8_scale_tma_aligned,
-        scale_ue8m0=capability.fp8_scale_ue8m0,
+        column_major_scales=scale_format.tma_aligned,
+        scale_tma_aligned=scale_format.tma_aligned,
+        scale_ue8m0=scale_format.ue8m0,
     )
 
 
@@ -215,7 +218,7 @@ class _DeepEPv2Impl:
         num_experts: int,
         num_local_experts: int,
         hidden_size: int,
-        capability: DeepEPv2RunnerCapability,
+        scale_format: DeepEPv2Fp8ScaleFormat,
         num_max_dispatch_tokens_per_rank: int,
     ):
         self.group = group
@@ -223,19 +226,11 @@ class _DeepEPv2Impl:
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
         self.hidden_size = hidden_size
-        self.capability = capability
+        self.scale_format = scale_format
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         self.rank = dist.get_rank(group)
         self._handle = None
         self._pad_empty_combine = False
-
-    def set_runner_capability(self, capability: DeepEPv2RunnerCapability) -> None:
-        if self.capability != capability:
-            self._destroy_handle()
-            self.capability = capability
-
-    def _uses_fp8_dispatch_output(self) -> bool:
-        return self.capability.output_dtype == DeepEPv2OutputDtype.FP8
 
     def _destroy_handle(self) -> None:
         self._handle = None
@@ -246,7 +241,7 @@ class _DeepEPv2Impl:
             self.hidden_size,
             self.router_topk,
             self.num_max_dispatch_tokens_per_rank,
-            self._uses_fp8_dispatch_output(),
+            True,  # deepep_v2 always dispatches FP8 activations + scales
         )
 
     def _resolve_num_sms_qps(self, buffer: ElasticBuffer) -> Tuple[int, int]:
@@ -280,10 +275,7 @@ class _DeepEPv2Impl:
                 f"DeepEP v2 hidden size mismatch: expected {self.hidden_size}, "
                 f"got {hidden_states.shape[1]}"
             )
-        if (
-            self._uses_fp8_dispatch_output()
-            and self.hidden_size % _SCALE_BLOCK_SIZE != 0
-        ):
+        if self.hidden_size % _SCALE_BLOCK_SIZE != 0:
             raise ValueError(
                 "DeepEP v2 FP8 dispatch requires hidden_size multiple of "
                 f"{_SCALE_BLOCK_SIZE}, got {self.hidden_size}"
@@ -315,9 +307,7 @@ class _DeepEPv2Impl:
         # prefill/extend -> non-expanded contiguous layout. This decouples the
         # masked-GEMM + CUDA-graph decode fast path from the comm mode, so it is
         # available under multi-node `hybrid` too.
-        use_expand_layout = (
-            self.capability.use_expanded_layout and not get_is_extend_in_batch()
-        )
+        use_expand_layout = not get_is_extend_in_batch()
         # masked GEMM is built from the expanded layout (expand_to_masked_slab), so
         # masked <=> expanded. async dispatch (cpu_sync=False) gives a static
         # capturable recv shape; the masked GEMM bounds compute by masked_m, so the
@@ -345,32 +335,28 @@ class _DeepEPv2Impl:
             ).unsqueeze(0)
             topk_weights = topk_weights.new_zeros((1, topk_weights.shape[-1]))
 
-        if self._uses_fp8_dispatch_output():
-            _ensure_fp8_quant_available()
-            if use_masked:
-                # Follow the hardware scale format (DEEPGEMM_SCALE_UE8M0 via
-                # capability.fp8_scale_ue8m0). Hopper (False): plain row-major
-                # fp32 scale, and _run_masked_gemm does its own e8m0/tma-major
-                # alignment. Blackwell (True): pre-quantize the activation
-                # against a col-major UE8M0 scale so it already matches the
-                # layout the masked GEMM consumes.
-                _ue8m0 = self.capability.fp8_scale_ue8m0
-                dispatch_x = sglang_per_token_group_quant_fp8(
-                    hidden_states,
-                    _SCALE_BLOCK_SIZE,
-                    column_major_scales=_ue8m0,
-                    scale_tma_aligned=_ue8m0,
-                    scale_ue8m0=_ue8m0,
-                )
-                use_tma_aligned_col_major_sf = _ue8m0
-            else:
-                dispatch_x = _quantize_for_deepep_v2_dispatch(
-                    hidden_states, self.capability
-                )
-                use_tma_aligned_col_major_sf = self.capability.fp8_scale_tma_aligned
+        _ensure_fp8_quant_available()
+        if use_masked:
+            # Follow the hardware scale format (DEEPGEMM_SCALE_UE8M0 via
+            # scale_format.ue8m0). Hopper (False): plain row-major fp32 scale,
+            # and _run_masked_gemm does its own e8m0/tma-major alignment.
+            # Blackwell (True): pre-quantize the activation against a col-major
+            # UE8M0 scale so it already matches the layout the masked GEMM
+            # consumes.
+            _ue8m0 = self.scale_format.ue8m0
+            dispatch_x = sglang_per_token_group_quant_fp8(
+                hidden_states,
+                _SCALE_BLOCK_SIZE,
+                column_major_scales=_ue8m0,
+                scale_tma_aligned=_ue8m0,
+                scale_ue8m0=_ue8m0,
+            )
+            use_tma_aligned_col_major_sf = _ue8m0
         else:
-            dispatch_x = hidden_states
-            use_tma_aligned_col_major_sf = False
+            dispatch_x = _quantize_for_deepep_v2_dispatch(
+                hidden_states, self.scale_format
+            )
+            use_tma_aligned_col_major_sf = self.scale_format.tma_aligned
 
         # num_max_tokens_per_rank is a COLLECTIVE dispatch arg (ElasticBuffer
         # requires the same value on all ranks). Keep it at the fixed buffer cap
@@ -380,7 +366,7 @@ class _DeepEPv2Impl:
         # ragged DP load (or TP attention) the ranks would disagree on this
         # collective arg.
         num_max_tokens = self.num_max_dispatch_tokens_per_rank
-        # Non-masked (extend/prefill, or a BF16 runner) path reads exact per-expert
+        # Non-masked (extend/prefill) path reads exact per-expert
         # recv
         # counts on the CPU, so it must wait for the GPU to finish writing them
         # (matches the DeepEP elastic test which passes do_cpu_sync=1). Leaving
@@ -398,7 +384,7 @@ class _DeepEPv2Impl:
             topk_weights=topk_weights,
             num_experts=self.num_experts,
             num_max_tokens_per_rank=num_max_tokens,
-            expert_alignment=self.capability.expert_alignment,
+            expert_alignment=_EXPERT_ALIGNMENT,
             num_sms=_num_sms,
             num_qps=_num_qps,
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
@@ -484,7 +470,7 @@ class _DeepEPv2Impl:
             expected_m,
             masked_max_m,
             total_expanded,
-            self.capability.expert_alignment,
+            _EXPERT_ALIGNMENT,
         )
 
     def combine(self, combine_input: DeepEPv2CombineInput) -> torch.Tensor:
@@ -535,7 +521,7 @@ class DeepEPv2Dispatcher(BaseDispatcher):
                 "DeepEP v2 dispatch adapter currently expects BF16 model activations, "
                 f"got {params_dtype}"
             )
-        capability = get_deepep_v2_runner_capability(self)
+        scale_format = get_deepep_v2_fp8_scale_format()
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
@@ -545,14 +531,9 @@ class DeepEPv2Dispatcher(BaseDispatcher):
             num_experts=num_experts,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
-            capability=capability,
+            scale_format=scale_format,
             num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
         )
-
-    def set_quant_config(self, quant_config: dict) -> None:
-        self.quant_config = quant_config
-        capability = get_deepep_v2_runner_capability(self)
-        self._impl.set_runner_capability(capability)
 
     # This backend intentionally exposes only single-shot dispatch()/combine():
     # TBO/SBO are rejected at server start, and our overlap PoC showed the naive
