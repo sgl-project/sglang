@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -761,6 +762,14 @@ ReasoningEffortType = Optional[
 ]
 
 
+# Dynamic tools may only be declared in a system (or its developer alias)
+# message. The name shape is Moonshot's, which is stricter than OpenAI's
+# ``^[a-zA-Z0-9_-]+$``: a leading digit is rejected, and the ceiling is 256.
+_DYNAMIC_TOOL_ROLES = ("system", "developer")
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+_TOOL_NAME_MAX_LEN = 256
+
+
 def _has_message_level_tools(messages: Any) -> bool:
     if not isinstance(messages, list):
         return False
@@ -924,6 +933,70 @@ class ChatCompletionRequest(BaseModel):
             else:
                 values["tool_choice"] = "auto"
         return values
+
+    # Dynamic tools are declared in a system message that carries no content;
+    # every other placement is a client error, and the model would never see the
+    # tool. Runs "before" because pydantic drops an unknown `tools` key on a user
+    # message, leaving an "after" validator nothing to reject.
+    @model_validator(mode="before")
+    @classmethod
+    def validate_message_level_tools(cls, values):
+        messages = values.get("messages") if isinstance(values, dict) else None
+        if not isinstance(messages, list):
+            return values
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            tools = message.get("tools")
+            if not tools:
+                continue
+            role = message.get("role")
+            role = role.lower() if isinstance(role, str) else role
+            if role not in _DYNAMIC_TOOL_ROLES:
+                raise ValueError(
+                    f"messages[{index}]: message-level 'tools' are only valid on a "
+                    f"system or developer message, not {role!r}"
+                )
+            if message.get("content"):
+                raise ValueError(
+                    f"messages[{index}]: a message declaring 'tools' must not also "
+                    "carry content"
+                )
+            if not isinstance(tools, list):
+                raise ValueError(f"messages[{index}]: 'tools' must be a list")
+            for tool_index, tool in enumerate(tools):
+                cls._validate_dynamic_tool(index, tool_index, tool)
+        return values
+
+    @classmethod
+    def _validate_dynamic_tool(cls, index: int, tool_index: int, tool: Any) -> None:
+        where = f"messages[{index}].tools[{tool_index}]"
+        if not isinstance(tool, dict):
+            raise ValueError(f"{where}: must be an object")
+        # `type` has a default on the Tool model, so an omitted or bogus value
+        # would otherwise be accepted and silently treated as a function.
+        tool_type = tool.get("type")
+        if tool_type != "function":
+            raise ValueError(
+                f"{where}: 'type' must be 'function'"
+                + (" (missing)" if tool_type is None else f", got {tool_type!r}")
+            )
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            raise ValueError(f"{where}: 'function' is required")
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"{where}: 'function.name' is required")
+        if len(name) > _TOOL_NAME_MAX_LEN:
+            raise ValueError(
+                f"{where}: 'function.name' must be at most "
+                f"{_TOOL_NAME_MAX_LEN} characters, got {len(name)}"
+            )
+        if not _TOOL_NAME_RE.match(name):
+            raise ValueError(
+                f"{where}: 'function.name' must start with a letter or underscore "
+                f"and contain only letters, digits, '_' or '-'; got {name!r}"
+            )
 
     @field_validator("reasoning_effort", mode="before")
     @classmethod

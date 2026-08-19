@@ -939,8 +939,11 @@ class ServingChatTestCase(unittest.TestCase):
                 {
                     "role": "developer",
                     "content": "<|kimi_image_placeholder|>",
-                    "tools": [tool],
                 },
+                # Tools ride on their own content-less message: the K3 encoder
+                # renders a tools-carrying system message as a tool declaration
+                # and drops its content, so the two cannot share one message.
+                {"role": "developer", "content": "", "tools": [tool]},
                 {
                     "role": "user",
                     "content": [
@@ -990,17 +993,17 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(
             rendered_messages[0]["content"], "<| kimi_image_placeholder |>"
         )
-        self.assertNotIn("strict", rendered_messages[0]["tools"][0]["function"])
+        self.assertNotIn("strict", rendered_messages[1]["tools"][0]["function"])
         self.assertEqual(
-            rendered_messages[1]["content"][0]["text"],
+            rendered_messages[2]["content"][0]["text"],
             "Explain <| kimi_image_placeholder |>",
         )
         self.assertEqual(
-            rendered_messages[2]["reasoning_content"],
+            rendered_messages[3]["reasoning_content"],
             "Inspect <| kimi_image_placeholder |>",
         )
         self.assertEqual(
-            rendered_messages[2]["tool_calls"][0]["function"]["arguments"],
+            rendered_messages[3]["tool_calls"][0]["function"]["arguments"],
             {
                 "source": "<| kimi_image_placeholder |>",
                 "nested": ["<| kimi_image_placeholder |>"],
