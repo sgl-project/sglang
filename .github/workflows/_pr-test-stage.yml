@@ -92,7 +92,7 @@ env:
   # default times out on a cold cache.
   HF_HUB_DOWNLOAD_TIMEOUT: 300
   HF_HUB_ETAG_TIMEOUT: 300
-  SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ (inputs.scheduled || fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
 
