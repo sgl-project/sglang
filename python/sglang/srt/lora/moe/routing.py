@@ -112,14 +112,6 @@ ROUTE_ALIGNED = "aligned"
 ROUTE_VIEWS = (ROUTE_RAW, ROUTE_FUSED_IDS, ROUTE_ALIGNED)
 
 
-def uses_fused_align_shape(*, num_virtual_experts: int, num_pairs: int) -> bool:
-    """Whether an aligned route uses the fused builder for this shape."""
-    return (
-        num_virtual_experts >= FUSED_ALIGN_MIN_VIRTUAL_EXPERTS
-        or num_pairs >= FUSED_ALIGN_MIN_PAIRS
-    )
-
-
 def uses_fused_align(
     topk_ids: torch.Tensor,
     *,
@@ -130,9 +122,9 @@ def uses_fused_align(
     return (
         view == ROUTE_ALIGNED
         and topk_ids.is_cuda
-        and uses_fused_align_shape(
-            num_virtual_experts=num_virtual_experts,
-            num_pairs=topk_ids.numel(),
+        and (
+            num_virtual_experts >= FUSED_ALIGN_MIN_VIRTUAL_EXPERTS
+            or topk_ids.numel() >= FUSED_ALIGN_MIN_PAIRS
         )
     )
 
