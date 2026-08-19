@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     get_cp_strategy,
@@ -23,8 +24,7 @@ from sglang.srt.layers.cp.padding import (
 )
 from sglang.srt.layers.cp.utils import (
     cp_split_before_forward,
-    enable_cp_v2,
-    is_cp_v2_active,
+    is_cp_active,
     prepare_cp_forward,
 )
 from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
@@ -34,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
+from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -89,7 +90,7 @@ class TestCPStrategyUnit(CustomTestCase):
         self.assertFalse(is_interleave())
         self.assertEqual(get_cp_strategy_kind(), ContextParallelStrategyKind.ZIGZAG)
 
-    def test_get_cp_strategy_is_initialized_under_cp_v1_and_cp_v2(self):
+    def test_get_cp_strategy_is_initialized_when_cp_is_enabled(self):
         init_cp_strategy(
             SimpleNamespace(
                 enable_prefill_cp=True,
@@ -98,17 +99,9 @@ class TestCPStrategyUnit(CustomTestCase):
             )
         )
 
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=False
-        ):
-            self.assertIsNotNone(get_cp_strategy())
-            self.assertTrue(is_cp_enabled())
-            self.assertTrue(is_interleave())
-
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
-        ):
-            self.assertIsNotNone(get_cp_strategy())
+        self.assertIsNotNone(get_cp_strategy())
+        self.assertTrue(is_cp_enabled())
+        self.assertTrue(is_interleave())
 
 
 class TestPrefillCPBCGReplay(CustomTestCase):
@@ -125,7 +118,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [2048, 2304]
         runner.max_num_tokens = 2304
-        runner.enable_cp_v2_bcg_capture = True
+        runner.enable_cp_bcg_capture = True
         return runner
 
     def _make_forward_batch(self):
@@ -165,15 +158,9 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         forward_batch = self._make_forward_batch()
         self._enable_zigzag()
 
-        with (
-            patch(
-                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
-                return_value=8,
-            ),
+        with patch(
+            "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
+            return_value=8,
         ):
             selected_buckets = []
             for cp_rank in range(4):
@@ -221,10 +208,6 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         with (
             get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
             patch(
-                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
-                return_value=True,
-            ),
-            patch(
                 "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
                 return_value=8,
             ),
@@ -254,10 +237,6 @@ class TestPrefillCPBCGReplay(CustomTestCase):
 
         with (
             get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
-            patch(
-                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
-                return_value=True,
-            ),
             patch(
                 "sglang.srt.layers.cp.bcg.get_cp_padding_align_size",
                 return_value=8,
@@ -300,7 +279,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             attn_cp_metadata=metadata,
         )
 
-    def test_enable_cp_v2_and_is_cp_v2_active(self):
+    def test_is_cp_active_uses_strategy_eligibility(self):
         active_batch = SimpleNamespace(
             input_ids=torch.arange(8),
             forward_mode=_ExtendMode(),
@@ -312,18 +291,88 @@ class TestCPZigzagStrategy(CustomTestCase):
             extend_seq_lens_cpu=[7],
         )
 
-        with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=False
-        ):
-            self.assertFalse(enable_cp_v2())
-            self.assertFalse(is_cp_v2_active(active_batch))
+        self.assertTrue(is_cp_active(active_batch))
+        self.assertFalse(is_cp_active(inactive_batch))
+
+    def test_index_topk_share_materializes_global_order_before_publish(self):
+        local_topk = torch.tensor([[1, 2], [3, 4]])
+        global_topk = torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8]])
+        forward_batch = SimpleNamespace(
+            input_ids=torch.arange(8),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=[8],
+            reuse_dsa_topk_indices=True,
+            spec_info=SimpleNamespace(dsa_topk_indices=None),
+        )
+        state = IndexTopKShareState(forward_batch, None)
 
         with patch(
-            "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+            "sglang.srt.layers.attention.index_topk_share.cp_gather_after_forward",
+            return_value=global_topk,
         ):
-            self.assertTrue(enable_cp_v2())
-            self.assertTrue(is_cp_v2_active(active_batch))
-            self.assertFalse(is_cp_v2_active(inactive_batch))
+            state.update(local_topk)
+
+        self.assertTrue(torch.equal(state.topk_indices, global_topk))
+
+    def test_index_topk_share_skips_publish_without_spec_info(self):
+        local_topk = torch.tensor([[1, 2], [3, 4]])
+        forward_batch = SimpleNamespace(
+            input_ids=torch.arange(8),
+            forward_mode=_ExtendMode(),
+            extend_seq_lens_cpu=[8],
+            reuse_dsa_topk_indices=False,
+            spec_info=None,
+        )
+        state = IndexTopKShareState(forward_batch, None)
+
+        state.update(local_topk)
+
+        self.assertTrue(torch.equal(state.topk_indices, local_topk))
+
+    def test_eager_runner_passes_local_and_physical_input_ids(self):
+        init_cp_strategy(
+            SimpleNamespace(
+                enable_prefill_cp=True,
+                cp_strategy="interleave",
+                attn_cp_size=4,
+                attention_backend="dsa",
+            )
+        )
+        with get_parallel().override(attn_cp_rank=0, attn_cp_size=4):
+            metadata = InterleaveCPStrategy(cp_size=4).build_metadata(
+                num_tokens=8,
+                seqs_len=[8],
+                extend_seqs_len=[8],
+            )
+        forward_batch = self._forward_batch(metadata, [8])
+        forward_batch.positions = torch.arange(8)
+        forward_batch.spec_info = None
+        observed = {}
+
+        class Body:
+            def __call__(self, input_ids, positions, forward_batch, **kwargs):
+                observed["input_ids"] = input_ids
+                observed["input_ids_global"] = forward_batch.input_ids_global
+                return kwargs["input_embeds"]
+
+        model = SimpleNamespace(
+            model=Body(),
+            pp_group=SimpleNamespace(is_last_rank=False),
+            capture_aux_hidden_states=False,
+            get_input_embeddings=lambda: lambda input_ids: input_ids[:, None].float(),
+        )
+        runner = EagerRunner.__new__(EagerRunner)
+        runner.model_runner = SimpleNamespace(model=model)
+
+        with get_parallel().override(attn_cp_rank=0, attn_cp_size=4):
+            runner._execute_extend_cp(forward_batch, {})
+
+        self.assertTrue(torch.equal(observed["input_ids"], torch.tensor([0, 4])))
+        self.assertTrue(
+            torch.equal(
+                observed["input_ids_global"], torch.tensor([0, 4, 1, 5, 2, 6, 3, 7])
+            )
+        )
 
     def _expected_metadata(self, *, rank, cp_size, seq_lens, extend_seq_lens):
         bs = len(extend_seq_lens)
@@ -514,14 +563,11 @@ class TestCPZigzagStrategy(CustomTestCase):
 
             local_x = strategy.shard_hidden_states(x, fb)
             local_positions = strategy.shard_position_ids(positions, fb)
-            with patch(
-                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
-            ):
-                helper_x, helper_positions = cp_split_before_forward(
-                    x,
-                    positions,
-                    fb,
-                )
+            helper_x, helper_positions = cp_split_before_forward(
+                x,
+                positions,
+                fb,
+            )
 
             self.assertTrue(torch.equal(local_x, expected_x))
             self.assertTrue(torch.equal(local_positions, expected_positions))
@@ -602,17 +648,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             max_rank_len=[7, 7],
         )
 
-        with (
-            get_parallel().override(attn_cp_size=cp_size),
-            patch(
-                "sglang.srt.layers.utils.cp_utils.is_prefill_cp_in_seq_split",
-                return_value=True,
-            ),
-            patch(
-                "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_in_seq_split",
-                return_value=False,
-            ),
-        ):
+        with get_parallel().override(attn_cp_size=cp_size):
             align_size = get_cp_padding_align_size()
             pad_logical_token_to_physical(metadata)
 
@@ -851,28 +887,19 @@ class TestCPInterleaveStrategy(CustomTestCase):
     def _rank_tensors(self, x, *, cp_size, seq_lens, extend_seq_lens):
         per_rank = []
         metas = []
-        with self._patch_legacy_round_robin_mode():
-            for rank in range(cp_size):
-                metadata = self._metadata_for_rank(
-                    rank,
-                    cp_size=cp_size,
-                    seq_lens=seq_lens,
-                    extend_seq_lens=extend_seq_lens,
-                )
-                metas.append(metadata)
-                fb = self._forward_batch(metadata, extend_seq_lens)
-                strategy = InterleaveCPStrategy(cp_size=cp_size)
-                with get_parallel().override(attn_cp_rank=rank, attn_cp_size=cp_size):
-                    per_rank.append(strategy.shard_hidden_states(x, fb))
+        for rank in range(cp_size):
+            metadata = self._metadata_for_rank(
+                rank,
+                cp_size=cp_size,
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+            )
+            metas.append(metadata)
+            fb = self._forward_batch(metadata, extend_seq_lens)
+            strategy = InterleaveCPStrategy(cp_size=cp_size)
+            with get_parallel().override(attn_cp_rank=rank, attn_cp_size=cp_size):
+                per_rank.append(strategy.shard_hidden_states(x, fb))
         return metas, per_rank
-
-    @contextmanager
-    def _patch_legacy_round_robin_mode(self):
-        with patch(
-            "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_round_robin_split",
-            return_value=True,
-        ):
-            yield
 
     @contextmanager
     def _patch_interleave_all_gather(self, rank_tensors):
@@ -893,16 +920,11 @@ class TestCPInterleaveStrategy(CustomTestCase):
                 "sglang.srt.layers.cp.interleave.use_symmetric_memory",
                 return_value=torch.no_grad(),
             ),
-            patch(
-                "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_round_robin_split",
-                return_value=True,
-            ),
         )
         with (
             patchers[0],
             patchers[1],
             patchers[2],
-            patchers[3],
             get_parallel().override(attn_cp_group=object()),
         ):
             yield
@@ -940,10 +962,6 @@ class TestCPInterleaveStrategy(CustomTestCase):
         with (
             get_parallel().override(attn_cp_rank=2, attn_cp_size=4),
             patch(
-                "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
-                return_value=True,
-            ),
-            patch(
                 "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
                 return_value=4,
             ),
@@ -978,25 +996,17 @@ class TestCPInterleaveStrategy(CustomTestCase):
             expected_x = x[rank::cp_size]
             expected_positions = positions[rank::cp_size]
 
-            with (
-                get_parallel().override(
-                    attn_cp_rank=rank,
-                    attn_cp_size=cp_size,
-                ),
-                self._patch_legacy_round_robin_mode(),
+            with get_parallel().override(
+                attn_cp_rank=rank,
+                attn_cp_size=cp_size,
             ):
                 local_x = strategy.shard_hidden_states(x, fb)
                 local_positions = strategy.shard_position_ids(positions, fb)
-
-                with patch(
-                    "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get",
-                    return_value=True,
-                ):
-                    helper_x, helper_positions = cp_split_before_forward(
-                        x,
-                        positions,
-                        fb,
-                    )
+                helper_x, helper_positions = cp_split_before_forward(
+                    x,
+                    positions,
+                    fb,
+                )
 
             self.assertTrue(torch.equal(local_x, expected_x))
             self.assertTrue(torch.equal(local_positions, expected_positions))

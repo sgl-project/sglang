@@ -37,7 +37,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     make_persistent_multi_ctas_kv_counter_buffer,
 )
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
-from sglang.srt.layers.cp.utils import is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -86,7 +86,7 @@ class TRTLLMMHAMetadata:
     page_table: torch.Tensor = None
     # Page table for SWA layers (translated from full pool indices to SWA pool indices)
     swa_page_table: torch.Tensor = None
-    # CP-v2 zigzag treats prev/next halves as a synthetic 2 * batch_size batch.
+    # Zigzag CP treats prev/next halves as a synthetic 2 * batch_size batch.
     zigzag_page_table: torch.Tensor = None
     zigzag_swa_page_table: torch.Tensor = None
     # full->SWA translated out_cache_loc (SWA KV-store write target)
@@ -397,7 +397,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_batch: ForwardBatch,
     ) -> None:
         """Duplicate request rows once for the combined prev-then-next CP launch."""
-        if not is_cp_v2_active(forward_batch):
+        if not is_cp_active(forward_batch):
             return
 
         # TODO: Avoid materializing duplicated page tables to reduce zigzag CP
@@ -804,7 +804,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ) -> bool:
         """Check if we should use the fused FP8 KV cache write path."""
         return (
-            not is_cp_v2_active(forward_batch)
+            not is_cp_active(forward_batch)
             and save_kv_cache
             and k is not None
             and self.data_type == torch.float8_e4m3fn
@@ -1208,9 +1208,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
         cache_loc = forward_batch.out_cache_loc
-        cp_v2_active = is_cp_v2_active(forward_batch)
+        cp_active = is_cp_active(forward_batch)
 
-        # The fused path writes rank-local K/V directly to cache. CP-v2 needs
+        # The fused path writes rank-local K/V directly to cache. CP needs
         # the strategy to gather K/V into full logical token order first.
         use_fused_fp8_path = self._should_use_fused_fp8_path(
             save_kv_cache, k, forward_batch
@@ -1227,7 +1227,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             v = None
         else:
             if save_kv_cache and k is not None:
-                if cp_v2_active:
+                if cp_active:
                     cp_strategy = get_cp_strategy()
                     assert cp_strategy is not None
                     cp_strategy.materialize_full_kv(
@@ -1360,8 +1360,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     q_len_per_req=self.forward_metadata.max_seq_len_q,
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
-        elif self.use_fmha_v2 and not cp_v2_active:
-            # CP-v2 must go through cp_strategy.run_attention (per-shard
+        elif self.use_fmha_v2 and not cp_active:
+            # CP must go through cp_strategy.run_attention (per-shard
             # masking); the plain-causal fmha_v2 call below would be wrong.
             paged_kv = torch.stack([k_cache, v_cache], dim=1)
             o = flashinfer.prefill.trtllm_fmha_v2_prefill(
@@ -1424,7 +1424,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     out_dtype=self.q_data_type,
                 )
 
-            if cp_v2_active:
+            if cp_active:
                 cp_strategy = get_cp_strategy()
                 assert cp_strategy is not None
                 o = cp_strategy.run_attention(

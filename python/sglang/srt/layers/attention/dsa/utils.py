@@ -1,5 +1,5 @@
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Tuple, Union
+from typing import TYPE_CHECKING
 
 import torch
 import triton
@@ -19,7 +19,6 @@ from sglang.srt.runtime_context import (
     process_model_config,
 )
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip
-from sglang.srt.utils.common import ceil_align, ceil_div
 
 
 @lru_cache(maxsize=1)
@@ -104,33 +103,15 @@ def should_use_dsa_fused_topk(seed_dsa_topk_from_draft_extend: bool) -> bool:
     )
 
 
-def is_dsa_enable_prefill_cp():
-    if not envs.SGLANG_ENABLE_CP_V2.get():
-        return get_parallel().enable_dsa_prefill_context_parallel
-
-    # Derive from the runtime CP topology + model arch rather than the legacy
-    # flag under CP-v2: DSA prefill CP is active when the CP group is on for a
-    # DeepSeek Sparse Attention model.
+def is_dsa_cp_enabled() -> bool:
+    # DSA prefill CP is active when the CP group is on for a DeepSeek Sparse
+    # Attention model.
     if get_parallel().attn_cp_size <= 1:
         return False
     from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
     hf_config = process_model_config().hf_config
     return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
-
-
-def is_dsa_prefill_cp_in_seq_split():
-    return (
-        is_dsa_enable_prefill_cp()
-        and get_parallel().dsa_prefill_cp_mode == "in-seq-split"
-    )
-
-
-def is_dsa_prefill_cp_round_robin_split():
-    return (
-        is_dsa_enable_prefill_cp()
-        and get_parallel().dsa_prefill_cp_mode == "round-robin-split"
-    )
 
 
 # Structural surface where the graph DSA split-op dispatch (DSA indexer) and the
@@ -146,75 +127,18 @@ def is_graph_dsa_split_op_surface(forward_batch: "ForwardBatch") -> bool:
     )
 
 
-def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
-    if not forward_batch.forward_mode.is_context_parallel_extend():
-        return False
-    cp_size = get_parallel().attn_cp_size
-    seq_len = sum(forward_batch.extend_seq_lens_cpu)
-    return (
-        is_dsa_prefill_cp_round_robin_split()
-        and seq_len > 0
-        and seq_len >= cp_size
-        and cp_size > 1
-    )
-
-
-def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
-    """
-    # for round-robin-split, split the tokens evenly according to the rule of token_idx % cp_size.
-    |   +-----------before split------------+|
-    | token0, token1, token2, token3, token4, token5, token6, token7, ...
-    |
-    |   +--------------result-------------------+
-    | dp_atten_tp0: token0, token4, token8, token12, token16, ... |
-    | dp_atten_tp1: token1, token5, token9, token13, token17, ... |
-    | dp_atten_tp2: token2, token6, token10, token14, token18, ... |
-    | dp_atten_tp3: token3, token7, token11, token15, token19, ... |
-    |   +-------------------------+
-    """
-    cp_size = get_parallel().attn_cp_size
-    cp_rank = get_parallel().attn_cp_rank
-    if isinstance(input_, (tuple, list)):
-        indices = range(cp_rank, len(input_), cp_size)
-        return input_[indices]
-
-    tokens = len(input_)
-    if tokens % cp_size != 0:
-        cur_len = tokens // cp_size + (tokens % cp_size > cp_rank)
-        if cur_len == 0:
-            return input_.new_empty(0, *input_.shape[1:])
-        indices = torch.arange(cp_rank, tokens, cp_size, device=input_.device)
-        return input_[indices]
-
-    # for torch device tensor
-    return input_.view(-1, cp_size, *input_.shape[1:])[:, cp_rank].contiguous()
-
-
 def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # Consistent with the padding calculation logic in ForwardBatch.prepare_mlp_sync_batch,
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
-    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
-    from sglang.srt.layers.cp.utils import enable_cp_v2, is_cp_v2_active
+    from sglang.srt.layers.cp.utils import is_cp_active
 
-    # CP-v2 already pads each rank-local shard to its physical size
-    if is_cp_v2_active(forward_batch):
+    # CP already pads each rank-local shard to its physical size.
+    if is_cp_active(forward_batch):
         return forward_batch.attn_cp_metadata.per_rank_actual_token[
             get_parallel().attn_cp_rank
         ]
 
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
-    sync_group_size = len(global_num_tokens)
-    attn_cp_size = get_parallel().attn_cp_size
-    # Must mirror ForwardBatch.prepare_mlp_sync_batch, which applies cp_align_size only when
-    # CP-v2 is disabled. Under enable_cp_v2() the speculative forwards (TARGET_VERIFY /
-    # DRAFT_EXTEND_V2) reach here with is_cp_v2_active False, and q is padded to attn_tp_size only
-    # (not cp-aligned). Applying cp_align here over-pads the flashmla metadata past q, so
-    # num_splits ends up longer than q -> fwd_kvcache_mla fails "num_splits must have shape (b+1)".
-    # (attn_cp analog of the attn_tp fix in PR #30642 / issue #30296.)
-    if not enable_cp_v2():
-        cp_align_size = get_cp_padding_align_size()
-        for i in range(sync_group_size):
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], cp_align_size)
     # Reuse the mode selected when the DP buffer was prepared.
     dp_padding_mode = forward_batch.dp_padding_mode
     if dp_padding_mode is None:
@@ -227,16 +151,13 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
         tokens = global_num_tokens[get_parallel().attn_dp_rank]
     else:
         tokens = global_num_tokens[0]
-    if can_dsa_prefill_cp_round_robin_split(forward_batch):
-        tokens = ceil_div(tokens, attn_cp_size)
     return tokens
 
 
 def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
-    attn_cp_size = get_parallel().attn_cp_size
-    needs_cp_pad = attn_cp_size > 1 and can_dsa_prefill_cp_round_robin_split(
-        forward_batch
-    )
+    from sglang.srt.layers.cp.utils import is_cp_active
+
+    needs_cp_pad = is_cp_active(forward_batch)
     needs_dp_pad = forward_batch.global_num_tokens_cpu is not None
     if not needs_cp_pad and not needs_dp_pad:
         return dsa_cache_seqlens
@@ -252,89 +173,10 @@ def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
     return dsa_cache_seqlens
 
 
-def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
-    if (
-        cp_size <= 1
-        or not use_dsa
-        or not forward_batch.forward_mode.is_context_parallel_extend()
-        or not is_dsa_enable_prefill_cp()
-        or sum(forward_batch.extend_seq_lens_cpu) < cp_size
-    ):
-        return False
+def is_dsa_cp_active(forward_batch) -> bool:
+    from sglang.srt.layers.cp.utils import is_cp_active
 
-    if is_dsa_prefill_cp_round_robin_split():
-        cur_cp_seq_len = seq_len // cp_size
-        assert (
-            seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
-    else:
-        # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
-        # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
-        # the seq data needs to be divided and recombined at twice the size of cp_size.
-        cur_cp_seq_len = seq_len // (cp_size * 2)
-    return cur_cp_seq_len != 0
-
-
-from sglang.kernels.ops.attention.dsa.cp_split import (
-    dsa_cp_round_robin_split_q_seqs_kernel,
-)
-
-
-def dsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):
-    cp_size = get_parallel().attn_cp_size
-    cp_rank = get_parallel().attn_cp_rank
-    extra_seq = 0
-    q_seqs = []
-    for bs, cur_len in enumerate(extend_seqs):
-        cur_len += extra_seq
-        cur_seq = cur_len // cp_size + int(cur_len % cp_size > cp_rank)
-        q_seqs.append(cur_seq)
-        extra_seq = cur_len - cur_seq * cp_size
-    bs_idx = list([i for i, x in enumerate(q_seqs) if x > 0])
-    q_seqs = [q_len for q_len in q_seqs if q_len > 0]
-    return q_seqs, bs_idx
-
-
-def dsa_cp_round_robin_split_q_seqs(
-    extend_seqs_cpu, extend_seqs
-) -> Tuple[List, torch.Tensor, List, torch.Tensor]:
-    """
-    round-robin-split distributes tokens across ranks based on token_idx % cp_size.
-
-    Return:
-    ret_q_lens_cpu(List) and ret_q_lens(torch.Tensor): the partitioned length (excluding zeros) on the current cp rank
-        for each sequence after distribution across cp ranks.
-    bs_idx_cpu(List) and bs_idx(torch.Tensor): marks which sequences are ultimately selected,
-        i.e., those with a partitioned length greater than zero.
-    """
-    cp_size = get_parallel().attn_cp_size
-    cp_rank = get_parallel().attn_cp_rank
-    # len(ret_q_lens_cpu) == len(bs_idx_cpu)
-    ret_q_lens_cpu, bs_idx_cpu = dsa_cp_round_robin_split_q_seqs_cpu(extend_seqs_cpu)
-    ret_q_lens = torch.empty(
-        (len(bs_idx_cpu),), device=extend_seqs.device, dtype=extend_seqs.dtype
-    )
-    bs_idx = torch.empty(
-        (len(bs_idx_cpu),), device=extend_seqs.device, dtype=torch.int32
-    )
-    grid = (1,)
-    dsa_cp_round_robin_split_q_seqs_kernel[grid](
-        extend_seqs, ret_q_lens, bs_idx, len(extend_seqs), cp_size, cp_rank
-    )
-    return ret_q_lens_cpu, ret_q_lens, bs_idx_cpu, bs_idx
-
-
-def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
-    if dsa_enable_prefill_cp is None:
-        dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-    if (
-        forward_batch.attn_cp_metadata is not None
-        and dsa_enable_prefill_cp
-        and forward_batch.forward_mode.is_context_parallel_extend()
-    ):
-        return True
-    else:
-        return False
+    return is_dsa_cp_enabled() and is_cp_active(forward_batch)
 
 
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:

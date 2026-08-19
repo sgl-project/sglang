@@ -12,9 +12,6 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
-from sglang.srt.layers.attention.dsa.utils import (
-    dsa_use_prefill_cp,
-)
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
@@ -203,10 +200,8 @@ def forward_mla_prepare_npu(
                 k_nope = m.kv_a_layernorm(k_nope).unsqueeze(1)
                 k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
             else:
-                if (
-                    qkv_latent.shape[0] < 65536
-                    and not dsa_use_prefill_cp(forward_batch)
-                    and not getattr(m, "_disable_npu_fused_split_qk_norm", False)
+                if qkv_latent.shape[0] < 65536 and not getattr(
+                    m, "_disable_npu_fused_split_qk_norm", False
                 ):
                     q, k_nope, k_pe = fused_split_qk_norm(
                         qkv_latent,
@@ -252,11 +247,6 @@ def forward_mla_prepare_npu(
         if m.rotary_emb is not None:
             q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
 
-        if dsa_use_prefill_cp(forward_batch):
-            # support allgather+rerrange
-            k_nope, k_pe = m.rebuild_cp_kv_cache(
-                latent_cache, forward_batch, k_nope, k_pe
-            )
         topk_indices = None
         if q_lora is not None:
             topk_indices = m.indexer(
@@ -387,10 +377,8 @@ def forward_dsa_prepare_npu(
             if q_event is not None:
                 torch.npu.current_stream().wait_event(q_event)
         else:
-            if (
-                fused_qkv_a_proj_out.shape[0] < 65535
-                and not dsa_use_prefill_cp(forward_batch)
-                and not getattr(m, "_disable_npu_fused_split_qk_norm", False)
+            if fused_qkv_a_proj_out.shape[0] < 65535 and not getattr(
+                m, "_disable_npu_fused_split_qk_norm", False
             ):
                 q_lora, k_nope, k_pe = fused_split_qk_norm(
                     fused_qkv_a_proj_out,
@@ -429,12 +417,6 @@ def forward_dsa_prepare_npu(
             )
 
         q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
-
-        if dsa_use_prefill_cp(forward_batch):
-            # support allgather+rerrange
-            k_nope, k_pe = m.rebuild_cp_kv_cache(
-                latent_cache, forward_batch, k_nope, k_pe
-            )
 
     if not m.skip_topk or (m.is_nextn and prev_topk_indices is None):
         topk_indices = m.indexer(

@@ -17,8 +17,8 @@
 The strategy implementation is split across:
 
 * ``base.py``: base ABC, base metadata dataclass, enums, and singleton helpers.
-* ``zigzag.py``: former in-seq-split strategy and zigzag metadata.
-* ``interleave.py``: former round-robin-split strategy and interleave metadata.
+* ``zigzag.py``: zigzag strategy and metadata.
+* ``interleave.py``: interleave strategy and metadata.
 * ``utils.py``: public re-exports for import convenience.
 """
 
@@ -182,9 +182,9 @@ class ContextParallelStrategy(ABC):
         positions: Any,
         input_embeds: Optional[Any] = None,
     ) -> Optional[Any]:
-        """Shard model inputs before model.forward in CP-v2 paths."""
+        """Shard model inputs before model.forward in CP paths."""
         if input_ids is not None:
-            forward_batch.cp_v2_input_ids = self.shard_hidden_states(
+            forward_batch.cp_input_ids = self.shard_hidden_states(
                 input_ids, forward_batch
             )
         forward_batch.positions = self.shard_position_ids(positions, forward_batch)

@@ -10,18 +10,12 @@ from flash_attn_interface import get_scheduler_metadata
 
 from sglang.srt.distributed import get_pp_group, get_pp_indices
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.musa.layers.utils.cp_utils import (
-    musa_cp_attn_forward_extend as cp_attn_forward_extend,
-)
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionBackend,
     FlashAttentionMultiStepBackend,
     merge_state_v2_wrapper,
 )
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_utils import (
-    cp_allgather_and_save_kv_cache,
-)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.runtime_context import get_schedule
 
@@ -255,13 +249,7 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
         if k is not None:
             assert v is not None
 
-            is_cp_mode = (
-                forward_batch.forward_mode.is_context_parallel_extend()
-                and forward_batch.attn_cp_metadata is not None
-                and self.attn_cp_size > 1
-            )
-
-            if save_kv_cache and not is_cp_mode:
+            if save_kv_cache:
                 cache_loc = (
                     forward_batch.out_cache_loc
                     if not layer.is_cross_attention
@@ -283,19 +271,6 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                         k,
                         k_rope,
                     )
-            if is_cp_mode:
-                cp_allgather_and_save_kv_cache(
-                    forward_batch,
-                    layer,
-                    k,
-                    v,
-                    self.attn_cp_size,
-                    swa_loc=(
-                        self.forward_metadata.swa_out_cache_loc
-                        if self.use_sliding_window_kv_pool
-                        else None
-                    ),
-                )
 
         metadata = self.forward_metadata
 
@@ -390,42 +365,6 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 window_size = (-1, -1)
 
             if (
-                forward_batch.forward_mode.is_context_parallel_extend()
-                and forward_batch.attn_cp_metadata is not None
-                and self.attn_cp_size > 1
-            ):
-
-                def _fa_cp_attn(
-                    q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp
-                ):
-                    return flash_attn_with_kvcache(
-                        q=q_chunk,
-                        k_cache=key_cache,
-                        v_cache=value_cache,
-                        page_table=page_table,
-                        cache_seqlens=cache_seqlens_cp,
-                        cu_seqlens_q=cu_seqlens_q_cp,
-                        cu_seqlens_k_new=(cu_seqlens_k if not use_local_attn else None),
-                        max_seqlen_q=max_seqlen_q_cp,
-                        softmax_scale=layer.scaling,
-                        causal=False if use_cascade_attn else causal,
-                        window_size=window_size,
-                        softcap=layer.logit_cap,
-                        k_descale=k_descale,
-                        v_descale=v_descale,
-                        return_softmax_lse=use_cascade_attn,
-                        num_splits=self.num_splits,
-                        **kwargs,
-                    )
-
-                result = cp_attn_forward_extend(
-                    self,
-                    forward_batch,
-                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    self.device,
-                    _fa_cp_attn,
-                )
-            elif (
                 forward_batch.extend_prefix_lens_cpu is not None
                 and any(forward_batch.extend_prefix_lens_cpu)
             ) or forward_batch.forward_mode.is_target_verify():
