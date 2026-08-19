@@ -35,13 +35,10 @@ def _compute_enable_deep_gemm():
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
 DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_sm100_supported()
-DEEPGEMM_MASKED_FP8_BACKEND = (
-    envs.SGLANG_DEEPGEMM_MASKED_FP8_BACKEND.get().lower()
-)
+DEEPGEMM_MASKED_FP8_BACKEND = envs.SGLANG_DEEPGEMM_MASKED_FP8_BACKEND.get().lower()
 if DEEPGEMM_MASKED_FP8_BACKEND not in ("native", "flashinfer", "cake"):
     raise ValueError(
-        "SGLANG_DEEPGEMM_MASKED_FP8_BACKEND must be one of: "
-        "native, flashinfer, cake"
+        "SGLANG_DEEPGEMM_MASKED_FP8_BACKEND must be one of: " "native, flashinfer, cake"
     )
 if DEEPGEMM_MASKED_FP8_BACKEND != "native" and not DEEPGEMM_BLACKWELL:
     raise ValueError(

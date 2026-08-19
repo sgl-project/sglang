@@ -128,9 +128,7 @@ class TestDeepGemmUE8M0Requant(CustomTestCase):
             deep_gemm_wrapper,
             ENABLE_JIT_DEEPGEMM=True,
             DEEPGEMM_SCALE_UE8M0=False,
-        ), patch.object(
-            fp8_utils, "requant_weight_ue8m0_inplace"
-        ) as requant:
+        ), patch.object(fp8_utils, "requant_weight_ue8m0_inplace") as requant:
             fired = fp8_utils.requant_block_scale_ue8m0_for_deepgemm(
                 weight,
                 weight_scale,

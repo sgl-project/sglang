@@ -138,8 +138,7 @@ def _estimate_masked_standard_layout_peak_bytes(
     else:
         block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
         packed_scales = (
-            quant_info.use_mxfp8
-            or deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_PACKED_SCALES
+            quant_info.use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_PACKED_SCALES
         )
         scale_item_bytes = (
             torch.uint8.itemsize if packed_scales else torch.float32.itemsize
