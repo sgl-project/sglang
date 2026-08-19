@@ -1766,9 +1766,9 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hf_config.get("rope_double_precision", arch.double_precision_rope)
             )
         )
-        if rope_double_precision and _is_npu:
+        if rope_double_precision and not current_platform.is_float64_supported():
             logger.warning(
-                f"Ascend backend does not support float64 for RoPE until now. Falling back to float32."
+                f"Current platform does not support float64. Falling back to float32."
             )
             rope_double_precision = False
 
