@@ -126,6 +126,75 @@ The SHARED-OUTER prefill rows remain the open lead: they run the opposite
 regime (4 virtual experts, ~16k pairs each, padding 0.4% of slots) and a
 kernel-level sweep on GB300 puts a block of 128 at +19.6% (2k tokens) to
 +26.0% (8k) over the 16 they ship, with no padding tax to give it back.
+
+Route builder launch tiles (`fused_align.py`, `joint_routing.py`):
+
+These are module constants, not table entries and not autotuned, because
+graph capture wants one launch shape per call site. The route build is three
+kernels: count pairs per bucket, plan the blocks, then label blocks and place
+pairs. `HIST_BLOCK`/`HIST_WARPS` size the count, `SCAN_CHUNK`/`SCAN_WARPS`
+the plan, `EXPAND_BLOCK`/`EXPAND_WARPS` the place.
+
+Swept on GB300 2026-07-25 (64 points over 4 cells), then re-verified
+per-kernel on H200/B200/GB300 2026-08-19 (5 cells x 48 configs, profiler GPU
+time, noise <=1%). Decision: KEEP ALL SIX. No alternative wins everywhere.
+The plan and place tiles are minimax-optimal — every other value regresses
+7-18% in some cell — and the count tile has rivals with a ~4% better median
+that give back up to 1.9% elsewhere. A per-cell oracle would save 0.1-2.7us
+of an 8-60us build, so a per-geometry table buys nothing.
+
+MEASURE THESE WITH THE PROFILER, per kernel. CUDA events around the Python
+call cannot see them: 70-90% of that wall time is host-side launch work, and
+the first attempt at this sweep measured the shipped config 9.6% FASTER THAN
+ITSELF, and one arch's three stages each +13% while their combination went
+-3.9%. Per-kernel `self_device_time_total` has a <=1% floor.
+
+`joint_routing.py` inherits the same three values without its own sweep; its
+kernels write two count arrays per pass, so the shapes need not transfer.
+The JIT id-pass tile in `routing.py` (`block_size = 1024`, a flat map over
+pairs) was never swept either. Both are open, both are ~1-3us of exposure.
+
+Cost of one route build, measured on B200 2026-08-19 (16,384 pairs = 2048
+tokens at top-8, block 32, profiler GPU time per kernel):
+
+| geometry | count | plan | place | total |
+|---|---|---|---|---|
+| per-expert 128 experts x 4 adapters (513 buckets) | 4.4 | 2.3 | 4.0 | 10.7us |
+| per-expert 256 x 8 (2049 buckets) | 3.0 | 3.8 | 4.3 | 11.1us |
+| per-expert 256 x 32 (8193 buckets) | 3.0 | 8.9 | 5.1 | 16.9us |
+| shared-outer, 4 adapters (5 buckets) | 4.3 | 2.2 | 4.4 | 10.9us |
+| shared-outer, 1 adapter (2 buckets) | 12.6 | 3.1 | 12.4 | 28.1us |
+
+This is paid ONCE PER MoE LAYER per forward, not once per forward — each
+layer routes its tokens differently, so the route cannot be reused. Multiply
+by the model's MoE layer count before comparing against anything.
+
+Two open leads, both UNCHANGED pending end-to-end evidence:
+
+- The plan kernel is a single thread block, so it grows with bucket count:
+  2.3us at 513 buckets, 8.9us at 8193, where it is half the build and 149 of
+  the GPU's SMs are idle. A two-pass multi-block scan would fix it. Only
+  configs with many adapters resident reach the bad end.
+- Atomic contention is harmless until one bucket takes more than about 4,000
+  pairs, then the count and place kernels nearly triple. Shared-outer with a
+  single live adapter is exactly that case (28.1us vs 10.9us with four
+  adapters) and it is a shipping config. A per-thread-block histogram, or
+  warp-aggregated slot claims, would fix it for small bucket counts only.
+
+Not a lead, and worth recording so nobody re-derives it: the padding fill's
+2D tile is `EXPAND_BLOCK x routing_block_size`, which looks like it should
+blow up registers as the block grows. It does not. Blocks 16 through 512 all
+compile with zero spills (32 registers, 56 at block 64), and 256 and 512 run
+correctly. Whatever limits the route block, it is not this kernel.
+
+Correctness coverage for the fused builder, B200 2026-08-19: differentially
+diffed against a torch reference over 21 geometries — per-expert and
+shared-outer, blocks 16-128, 513 to 8193 buckets (four scan chunks), all four
+ways a pair can be invalid, a single hot bucket, a count landing exactly on a
+block boundary, single token, top-1, and a zero-token idle rank. Each case
+checks the padded pair count, every block label including the out-of-plan -1
+tail, each bucket's real slots as a set plus its exact padding, that the
+counters came back zeroed, and that a second call agrees with the first.
 Unverified end-to-end; a shared-outer adapter on 397B or Inkling is the
 vehicle. A block of 256 exceeds shared memory for these tiles.
 

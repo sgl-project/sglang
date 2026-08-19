@@ -157,7 +157,7 @@ def _build_virtual_topk_ids(
         # An idle DP rank arrives with zero tokens; cdiv(0, block) is no grid.
         return virtual_topk_ids
 
-    block_size = 1024  # pairs per program; never swept, flat map over pairs
+    block_size = 1024  # pairs per program
     _build_virtual_topk_ids_kernel[(triton.cdiv(topk_ids.numel(), block_size),)](
         topk_ids,
         token_lora_mapping,

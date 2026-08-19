@@ -12,6 +12,7 @@ import triton.language as tl
 from sglang.srt.lora.moe.routing import virtual_expert_ids_inline
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
+# Launch tiles; see configs/README.md before changing them.
 HIST_BLOCK = 512
 HIST_WARPS = 8
 EXPAND_BLOCK = 128

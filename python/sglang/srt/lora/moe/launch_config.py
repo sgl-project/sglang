@@ -81,9 +81,7 @@ class MoeLoraLaunchConfig:
     """Site-specific launch settings; no token/rank/device config."""
 
     # One aligned route is SHARED by every grouped LoRA stage; its block is
-    # each stage's row tile. A second gate/up-A-only granularity existed and
-    # was retired 2026-08-19: one block of 32 measured within noise of the
-    # 16+64 split on all three models (see the configs README).
+    # each stage's row tile. Values and their evidence: configs/README.md.
     routing_block_size: int = 16
     gate_up_a: dict[str, int] = field(default_factory=_a_default)
     gate_up_b: dict[str, int] = field(default_factory=_b_default)
