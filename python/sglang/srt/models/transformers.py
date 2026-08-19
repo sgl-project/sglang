@@ -625,15 +625,15 @@ class TransformersBase(nn.Module):
                 "requires custom attention support."
             )
 
-        self.vocab_size = getattr(
-            self.text_config,
-            "vocab_size",
-            self.model.get_input_embeddings().num_embeddings,
-        )
+        input_embeddings = self.model.get_input_embeddings()
+        if hasattr(self.text_config, "vocab_size"):
+            self.vocab_size = self.text_config.vocab_size
+        elif isinstance(input_embeddings, nn.Embedding):
+            self.vocab_size = input_embeddings.num_embeddings
+        else:
+            self.vocab_size = 0
         self.unpadded_vocab_size = self.vocab_size
 
-        # Embedding scale (e.g. Whisper)
-        input_embeddings = self.model.get_input_embeddings()
         self.embed_scale = getattr(input_embeddings, "embed_scale", None)
 
         self.start_layer = 0
