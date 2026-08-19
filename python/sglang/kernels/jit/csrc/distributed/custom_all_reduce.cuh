@@ -491,6 +491,7 @@ struct AllReducePullImpl {
     const auto local_vec_bias = avg_vecs * params.rank + min(params.rank, rem_vecs);
     const auto local_num_vecs = avg_vecs + (params.rank < rem_vecs ? 1 : 0);
     __shared__ uint32_t s_phase;
+    device::PDLWaitPrimary<kUsePDL>();
     if (threadIdx.x == 0) {
       const auto semaphore = &params.pull_semaphores[params.rank][blockIdx.x];
       s_phase = (semaphore->counter_ptr()->get() / kWorldSize) % 2;
