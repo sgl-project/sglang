@@ -431,9 +431,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             # is_neox=False here, so this can hit the NPU
             # _apply_rotary_emb_complex fast path in RotaryEmbedding instead
             # of the interleaved fallback (no fused NPU kernel for it).
-            complex_freqs = torch.complex(
-                cos.to(torch.float32), sin.to(torch.float32)
-            )
+            complex_freqs = torch.complex(cos.to(torch.float32), sin.to(torch.float32))
 
         if self.added_kv_proj_dim is not None:
             encoder_query = encoder_query.unflatten(-1, (self.local_heads, -1))
@@ -682,9 +680,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             # is_neox=False here, so this can hit the NPU
             # _apply_rotary_emb_complex fast path in RotaryEmbedding instead
             # of the interleaved fallback (no fused NPU kernel for it).
-            complex_freqs = torch.complex(
-                cos.to(torch.float32), sin.to(torch.float32)
-            )
+            complex_freqs = torch.complex(cos.to(torch.float32), sin.to(torch.float32))
             complex_freqs = complex_freqs[: query.shape[1]]
 
         # QK-norm (+ RoPE) via the shared helper so the fused kernel path is used

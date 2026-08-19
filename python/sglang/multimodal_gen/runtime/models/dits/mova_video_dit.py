@@ -136,7 +136,7 @@ class SelfAttention(nn.Module):
             use_precomputed_cache=False,
             is_neox_style=False,
         )
-        
+
         self.attn = USPAttention(
             # Local heads per TP rank.
             num_heads=self.num_heads_per_rank,
