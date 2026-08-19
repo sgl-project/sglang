@@ -75,7 +75,6 @@ from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
     forward_extend_vectorized_5d,
 )
-from sglang.srt.layers.attention.aiter_verify_gqa import pack_unified_verify_kv
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
@@ -270,6 +269,10 @@ class AiterAttnBackend(AttentionBackend):
             and self.topk == 1
             and get_bool_env_var("SGLANG_AITER_UNIFIED_VERIFY", "1")
         )
+        # AITER counterpart of Triton grouped-head shared-KV verify (PR #34517):
+        # keep the true TP-local KV head count so unified_attention packs Q
+        # heads against one KV load. Set False to restore the old expand.
+        self._verify_gqa_pack = envs.SGLANG_ENABLE_AITER_VERIFY_GQA_PACK.get()
 
         # aiter kernel related initialization
         self.max_num_partitions = (
@@ -2287,17 +2290,16 @@ class AiterAttnBackend(AttentionBackend):
                     v_unified = v_cache.view(
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     )
-                    # AITER counterpart of Triton grouped-head shared-KV verify
-                    # (PR #34517): do not expand the single TP-local KV head to
-                    # tp_q_head_num. unified_attention derives num_queries_per_kv
-                    # from the K/V head axis; expanding it forces fake MHA.
-                    k_unified, v_unified = pack_unified_verify_kv(
-                        k_unified,
-                        v_unified,
-                        layer.tp_k_head_num,
-                        layer.tp_q_head_num,
-                        gqa_pack=envs.SGLANG_ENABLE_AITER_VERIFY_GQA_PACK.get(),
-                    )
+                    if (
+                        layer.tp_k_head_num == 1
+                        and layer.tp_q_head_num > 1
+                        and not self._verify_gqa_pack
+                    ):
+                        # Historical A/B path: expand the local KV head to
+                        # tp_q_head_num (fake MHA). Default packing skips this
+                        # so unified_attention sees num_queries_per_kv = H_q.
+                        k_unified = k_unified.expand(-1, -1, layer.tp_q_head_num, -1)
+                        v_unified = v_unified.expand(-1, -1, layer.tp_q_head_num, -1)
 
                     # The seq_lens + draft_num add has to run INSIDE the graph
                     # region; a host-side pre-add would allocate a new tensor
