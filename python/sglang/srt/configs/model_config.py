@@ -1920,6 +1920,7 @@ multimodal_piecewise_cuda_graph_supported_model_archs = [
 # capturing cleanly.
 multimodal_breakable_cuda_graph_supported_model_archs = [
     "InternS2MobiusForConditionalGeneration",
+    "PaddleOCRVLForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
     "MuseGlimmerForConditionalGeneration",
