@@ -12,6 +12,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -31,6 +32,14 @@ class FakeReceiver:
 
 class TestDecodeQueueCleanup(CustomTestCase):
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
+        # resume_retracted_reqs reads the retraction backend off the disagg
+        # bag, so the case publishes a config instead of injecting one.
+        override = get_context().override_server_args(
+            disaggregation_decode_retraction_backup="cpu_tensor"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
         page_size = 128
         fill_len = 574
         physical_tokens_per_req = 5 * page_size
@@ -42,6 +51,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 origin_input_ids=[0] * fill_len,
                 output_ids=[],
                 is_retracted=True,
+                retraction_backup=None,
                 load_kv_cache=MagicMock(),
             )
             for i in range(4)
@@ -52,6 +62,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue.num_reserved_decode_tokens = 0
         queue.req_to_token_pool = SimpleNamespace(available_size=lambda: len(reqs))
         queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=page_size)
+        queue.tree_cache = MagicMock()
         queue.scheduler = SimpleNamespace(
             sliding_window_size=2047,
             server_args=SimpleNamespace(disable_radix_cache=True),
@@ -200,6 +211,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = [decode_req]
         queue.enable_staging = False
+        queue.enable_deferred_kv_release = False
         queue.gloo_group = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.tp_rank = 0

@@ -37,6 +37,7 @@ not the per-rank group membership logic.
 from __future__ import annotations
 
 import sys
+from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 import pytest
@@ -47,6 +48,45 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 # Import the actual parallel_state module
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
+
+
+def test_custom_allreduce_precedes_symmetric_memory_pynccl():
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.world_size = 2
+    coordinator.unique_name = "test"
+    coordinator.hpu_communicator = None
+    coordinator.xpu_communicator = None
+    coordinator.npu_communicator = None
+    coordinator.qr_comm = None
+    coordinator.pymscclpp_comm = None
+    coordinator.torch_symm_mem_comm = None
+    coordinator._fi_workspace_hint = None
+    coordinator.ca_comm = Mock(disabled=False)
+    coordinator.ca_comm.should_custom_ar.return_value = True
+    coordinator.pynccl_comm = Mock()
+    coordinator.pynccl_comm.change_state.return_value = nullcontext()
+    coordinator.is_symmetric_memory_enabled = Mock(return_value=True)
+    coordinator.debug_check_symmetric_mempool = Mock()
+    input_ = Mock(is_cpu=False)
+    custom_output = object()
+
+    with (
+        patch.object(parallel_state.torch.compiler, "is_compiling", return_value=False),
+        patch.object(
+            parallel_state, "outplace_all_reduce", return_value=custom_output
+        ) as outplace_all_reduce,
+    ):
+        output = coordinator.all_reduce(input_)
+
+    assert output is custom_output
+    outplace_all_reduce.assert_called_once_with(
+        input_,
+        group_name="test",
+        outplace_all_reduce_method="ca",
+    )
+    coordinator.pynccl_comm.all_reduce.assert_not_called()
 
 
 def test_parallel_group_construction_tp8_attn_cp2():

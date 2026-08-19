@@ -270,16 +270,15 @@ Test Environment:
     **Benchmark Command**:
     ```shell Command
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-        --backend sglang-video --dataset vbench --task t2v --num-prompts 1 --max-concurrency 1
+        --dataset vbench --task text-to-video --num-prompts 1 --max-concurrency 1
     ```
 
     **Result**:
     ```text Output
     ================= Serving Benchmark Result =================
-    Backend:                                 sglang-video
     Model:                                   Wan-AI/Wan2.2-T2V-A14B-Diffusers
     Dataset:                                 vbench
-    Task:                                    t2v
+    Task:                                    text-to-video
     --------------------------------------------------
     Benchmark duration (s):                  630.43
     Request rate:                            inf
@@ -372,17 +371,16 @@ Test Environment:
 
     ```shell Command
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-        --backend sglang-video --dataset vbench --task t2v --num-prompts 20 --max-concurrency 20
+        --dataset vbench --task text-to-video --num-prompts 20 --max-concurrency 20
     ```
 
     **Result**:
 
     ```text Output
     ================= Serving Benchmark Result =================
-    Backend:                                 sglang-video
     Model:                                   Wan-AI/Wan2.2-T2V-A14B-Diffusers
     Dataset:                                 vbench
-    Task:                                    t2v
+    Task:                                    text-to-video
     --------------------------------------------------
     Benchmark duration (s):                  5163.21
     Request rate:                            inf

@@ -4,7 +4,6 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
-import einops
 import torch
 import triton
 import triton.language as tl
@@ -31,7 +30,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import (
     ceil_div,
@@ -62,7 +61,7 @@ _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
-# Imported only for the SGLANG_OPT_FIX_MEGA_MOE_MEMORY=False fallback path.
+
 if not (_is_npu or _is_hip) and _is_cuda:
     from sglang.kernels.ops.activation.activation import (
         silu_and_mul as _legacy_silu_and_mul,
@@ -254,11 +253,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         assert self.config.activation in ("silu", "situ")
         assert self.config.is_gated
         self.swiglu_limit = self.config.swiglu_limit
-        self.use_swizzle = False
-        if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-            assert envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
-            assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-            self.use_swizzle = deep_gemm_sm120.use_swizzle()
+        # SM120's contiguous GEMM only consumes standard-layout activations, so
+        # it opts out of swizzle regardless of the a2a backend.
+        self.use_swizzle = (
+            get_moe_a2a_backend().is_megamoe() and deep_gemm_sm120.use_swizzle()
+        )
 
     def run(
         self,
@@ -396,7 +395,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     scale_ue8m0=False,
                 )
                 del down_input
-        elif envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
+        elif self.use_swizzle:
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
 
             down_input_fp8 = torch.empty(
@@ -424,9 +423,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             )
             del gateup_output
         else:
-            # Hacky byte-equal fallback that reproduces the optimize-branch
-            # code path exactly: bf16 silu_and_mul then a separate per-token
-            # group fp8 quant. Kept behind the mega-moe-memory flag.
             from sglang.kernels.ops.quantization.fp8_kernel import (
                 sglang_per_token_group_quant_fp8,
             )
@@ -638,25 +634,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         swiglu_limit_arg: Optional[float] = None
         if self.swiglu_limit is not None:
-            # DeepSeek V4: clamped swiglu requires the DSV4 JIT EP activation.
-            assert (
-                envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-            ), "DeepSeek V4 requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
-
-            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
-                swiglu_limit_arg = self.swiglu_limit
-            else:
-                gateup_output = einops.rearrange(
-                    gateup_output, "grp tok hidden -> (grp tok) hidden"
-                )
-                gateup_output = _apply_swiglu_limit(
-                    gateup_output, swiglu_limit=self.swiglu_limit
-                )
-                gateup_output = einops.rearrange(
-                    gateup_output,
-                    "(grp tok) hidden -> grp tok hidden",
-                    grp=num_groups,
-                )
+            swiglu_limit_arg = self.swiglu_limit
 
         # Act.
         if self.config.activation == "situ":
@@ -1374,9 +1352,6 @@ def _varlen_deep_gemm_silu_mul_quant(
     # DSV4-specific activations (clamped swiglu, swizzled gate|up layout) stay
     # on the DSV4 JIT kernel; it is the only implementation carrying them.
     if swiglu_limit is not None or swizzle:
-        assert (
-            envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-        ), "swiglu_limit / swizzle require SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
         assert N % 4 == 0 and G % 4 == 0 and D // 8 >= E, (
             "DSV4 JIT activation requires N % 4 == 0, G % 4 == 0 and "
             f"D // 8 >= num_experts, got N={N} G={G} D={D} E={E}"

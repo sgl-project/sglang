@@ -21,7 +21,7 @@ def align_up(value: int, alignment: int) -> int:
 def _driver_modules():
     from cuda.bindings import driver as cuda
 
-    from sglang.srt.distributed.device_communicators.vmm_utils import check_drv
+    from sglang.srt.cuda_vmm_utils import check_drv
 
     return cuda, check_drv
 
