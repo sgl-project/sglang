@@ -482,6 +482,9 @@ class DeepseekSparseAttnBackend(
             self.aiter_sparse_mla_extend_metadata = None
             self.aiter_sparse_mla_extend_kv_indices = None
             self.aiter_sparse_mla_extend_plan_serial = -1
+            # Per-destination record of which top-k table the compacted index
+            # buffer currently holds; see _aiter_topk_compaction_is_current.
+            self.aiter_topk_compaction_cache: Dict[str, tuple] = {}
             self.aiter_sparse_mla_identity_scale = None
             self.aiter_sparse_mla_descale_cache: Dict[int, torch.Tensor] = {}
 
@@ -830,6 +833,41 @@ class DeepseekSparseAttnBackend(
             )
             buffer = self.aiter_sparse_mla_extend_kv_indices
         return buffer[:needed]
+
+    def _aiter_topk_compaction_is_current(
+        self, slot: str, page_table_1: torch.Tensor, num_tokens: int
+    ) -> bool:
+        """Whether ``slot``'s compacted index buffer already describes this
+        top-k table, i.e. whether ``get_valid_kv_indices`` can be skipped.
+
+        The compaction is a pure function of the top-k table, and GLM-5.2 shares
+        one indexer result across four attention layers
+        (``index_topk_freq=4``): 21 of its 78 layers compute top-k, the other 57
+        reuse it. Compacting per layer rebuilds a byte-identical buffer for
+        three layers out of four.
+
+        ``page_table_1`` identifies the table, and object identity is the exact
+        test: a layer that computes top-k gets a freshly allocated tensor, and a
+        layer that reuses one is handed the very same object (the share path
+        returns it unchanged). Recording a reference is what keeps that sound --
+        a bare ``data_ptr`` could match a *different* table once the allocator
+        recycles a freed one. ``num_tokens`` and ``dsa_forward_serial`` cover the
+        remaining inputs, since ``sparse_kv_indptr`` is batch-scoped rather than
+        per layer; a buffer that had to grow can only do so on a batch's first
+        layer, which the serial has already invalidated.
+
+        This holds under CUDA-graph capture too, which is what makes it usable
+        on the graph-captured decode path: which layers share a table follows
+        from ``layer_id`` and the model config alone, so the launches recorded at
+        capture stay correct for every replay.
+        """
+        key = (num_tokens, self.dsa_forward_serial)
+        cached = self.aiter_topk_compaction_cache.get(slot)
+        if cached is not None and cached[0] is page_table_1 and cached[1] == key:
+            return True
+        # Holds the table so the identity check above cannot be fooled.
+        self.aiter_topk_compaction_cache[slot] = (page_table_1, key)
+        return False
 
     def _prepare_aiter_dsa_decode_metadata(
         self,
@@ -3252,9 +3290,11 @@ class DeepseekSparseAttnBackend(
         """Sparse MLA decode through aiter's persistent kernel pair.
 
         Everything batch-shaped was already planned by
-        :py:meth:`_build_aiter_sparse_mla_metadata`; the only per-layer work left
-        is gathering this layer's own top-k KV slots, since the *values* of the
-        selection differ per layer even though its per-request *lengths* do not.
+        :py:meth:`_build_aiter_sparse_mla_metadata`. What remains is gathering
+        the top-k KV slots, whose *values* differ per layer even though their
+        per-request *lengths* do not -- but only for layers that actually
+        recompute top-k, since the gather follows the table rather than the
+        layer (see :py:meth:`_aiter_topk_compaction_is_current`).
         """
         assert (
             metadata.aiter_sparse_mla is not None
@@ -3293,9 +3333,12 @@ class DeepseekSparseAttnBackend(
         # -- exactly the sparse indptr, and already up to date for this batch.
         sparse_kv_indptr = metadata.dsa_cu_seqlens_k[: num_tokens + 1]
         sparse_kv_indices = self.kv_indices
-        get_valid_kv_indices(
-            page_table_1, sparse_kv_indptr, sparse_kv_indices, num_tokens
-        )
+        if not self._aiter_topk_compaction_is_current(
+            "decode", page_table_1, num_tokens
+        ):
+            get_valid_kv_indices(
+                page_table_1, sparse_kv_indptr, sparse_kv_indices, num_tokens
+            )
 
         sparse_mla_decode(
             q_kernel,
@@ -3334,8 +3377,8 @@ class DeepseekSparseAttnBackend(
         ``mla_prefill_fwd``, which has no fp8 scale or persistent-work
         parameters at all.
 
-        Only the top-k gather is per layer; the work plan and every index
-        buffer are shared across the batch.
+        The work plan and every index buffer are shared across the batch, and the
+        top-k gather is shared across every layer that reuses one indexer result.
         """
         num_tokens = q_all.shape[0]
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
@@ -3354,9 +3397,12 @@ class DeepseekSparseAttnBackend(
         sparse_kv_indptr = metadata.dsa_cu_seqlens_k[: num_tokens + 1]
         cu_seqlens_q = metadata.dsa_cu_seqlens_q[: num_tokens + 1]
         sparse_kv_indices = self._aiter_sparse_mla_extend_kv_indices(num_tokens)
-        get_valid_kv_indices(
-            page_table_1, sparse_kv_indptr, sparse_kv_indices, num_tokens
-        )
+        if not self._aiter_topk_compaction_is_current(
+            "extend", page_table_1, num_tokens
+        ):
+            get_valid_kv_indices(
+                page_table_1, sparse_kv_indptr, sparse_kv_indices, num_tokens
+            )
 
         if kv_cache.dtype != fp8_dtype:
             # The persistent path is fp8-only; fall back to aiter's plain
