@@ -13,6 +13,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from sglang.kernels.ops.attention.fla.chunk_delta_h_cp import (
+    LinearAttnCPContext,
+    chunk_gated_delta_rule_fwd_h_cp_pre_process,
+)
 from sglang.kernels.ops.attention.fla.chunk_intra import chunk_kda_fwd_intra
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_norm_gate import layer_norm_gated_fwd
@@ -1095,6 +1099,7 @@ def chunk_kda_fwd(
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
     output_intermediate_states: bool = False,
+    cp_context: Optional["LinearAttnCPContext"] = None,
 ):
     chunk_size = 64
     # Pre-compute chunk indices once and thread through all downstream kernels.
@@ -1159,6 +1164,28 @@ def chunk_kda_fwd(
         fuse_recompute=_small_grid,
     )
 
+    if cp_context is not None and cp_context.is_active:
+        # Context parallel: inputs here are this rank's contiguous shard of
+        # each sequence (cu_seqlens is shard-local). The pre-process seeds the
+        # cross-rank affine chain from the pool slots, writes the global final
+        # state back to them, and hands the main kernel a scratch h0 so its
+        # in-place epilogue cannot clobber the pool. The pre-scan MUST receive
+        # the same tensors as chunk_gated_delta_rule_fwd_h below (kg/w/u and
+        # the log2-domain g) — see chunk_delta_h_cp.py.
+        initial_state, initial_state_indices = (
+            chunk_gated_delta_rule_fwd_h_cp_pre_process(
+                k=kg,
+                w=w,
+                u=u,
+                gk=g,
+                initial_state=initial_state,
+                initial_state_indices=initial_state_indices,
+                cu_seqlens=cu_seqlens,
+                cp_context=cp_context,
+                use_exp2=True,
+            )
+        )
+
     h, v_new = chunk_gated_delta_rule_fwd_h(
         k=kg,
         w=w,
@@ -1210,6 +1237,7 @@ def chunk_kda(
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
     output_intermediate_states: bool = False,
+    cp_context: Optional[LinearAttnCPContext] = None,
     **kwargs,
 ):
     if scale is None:
@@ -1234,4 +1262,5 @@ def chunk_kda(
         dt_bias=dt_bias,
         lower_bound=lower_bound,
         output_intermediate_states=output_intermediate_states,
+        cp_context=cp_context,
     )

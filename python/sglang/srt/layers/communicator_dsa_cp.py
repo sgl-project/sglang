@@ -18,6 +18,7 @@ from typing import Callable, Optional
 
 import torch
 
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -34,6 +35,7 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
+    attn_tp_all_reduce,
     get_local_dp_buffer,
 )
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
@@ -69,9 +71,10 @@ def maybe_prefetch_next_full_attention_kv(
 
 
 def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
-    attn_dp_size = get_parallel().attn_dp_size
-    attn_tp_size = get_parallel().attn_tp_size
-    assert attn_dp_size == 1 and attn_tp_size == 1
+    # attn_tp > 1 is fine here: the gather runs within the attn_cp group
+    # (ranks sharing this attn-TP head shard), and the caller has already
+    # completed the attn-TP reduction of the hidden states.
+    assert get_parallel().attn_dp_size == 1
     hidden_states, local_hidden_states = (
         get_local_dp_buffer(get_parallel().attn_cp_group),
         hidden_states,
@@ -118,6 +121,11 @@ class DSACPLayerCommunicator(LayerCommunicator):
             assert (
                 self._context.attn_dp_size == 1
             ), f"dp_size should be 1 when moe_runner_backend is none"
+        elif get_parallel().attn_tp_size > 1:
+            raise NotImplementedError(
+                "prefill CP with attn_tp > 1 does not support SCATTERED mlp "
+                "mode (a2a MoE dispatch) yet"
+            )
         self._communicate_simple_fn = DSACPCommunicateSimpleFn.get_fn(
             input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
@@ -194,6 +202,11 @@ class DSACPCommunicateWithAllReduceAndLayerNormFn(
         residual_input_mode,
     ):
         if hidden_states.shape[0] != 0:
+            if get_parallel().attn_tp_size > 1:
+                # Attention returned TP-partial outputs (reduce_results=False
+                # with attn-TP-sharded weights); complete the reduction over
+                # the attn-TP group before the fused add-layernorm.
+                hidden_states = attn_tp_all_reduce(hidden_states)
             hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
@@ -243,5 +256,15 @@ class DSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         # for prefill: full -> attn tp scattered
         # for decode: full -> attn tp full
         if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
-            hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
+            if get_parallel().attn_tp_size > 1:
+                # MLP output is partial over the FULL TP group (attn_tp x cp).
+                # Complete the reduction and take this rank's cp shard. A
+                # reduce-scatter over the full group + all-gather over attn_tp
+                # would halve the traffic; start with the simple exact form.
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                cp_size = get_parallel().attn_cp_size
+                cp_rank = get_parallel().attn_cp_rank
+                hidden_states = hidden_states.tensor_split(cp_size)[cp_rank]
+            else:
+                hidden_states = dsa_cp_reduce_scatter_hidden_states(hidden_states)
         return hidden_states, residual
