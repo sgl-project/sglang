@@ -312,7 +312,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "torch"]
+BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "gemv", "torch"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
@@ -7502,11 +7502,11 @@ class ServerArgs:
                 "backup and the storage keys must become dcp_rank-aware "
                 "first. Run HiCache+DCP with L1/L2 only."
             )
-        if self.speculative_algorithm is not None:
+        if self.speculative_algorithm not in (None, "DSPARK"):
             raise NotImplementedError(
-                "HiCache with --dcp-size > 1 does not support speculative "
-                "decoding yet (the draft-model host pool has no DCP index "
-                "translation)."
+                "HiCache with --dcp-size > 1 only supports DSPARK speculative "
+                "decoding; other draft-model host pools have no DCP index "
+                "translation."
             )
         if self.enable_lmcache:
             raise NotImplementedError(
@@ -9669,6 +9669,13 @@ class ServerArgs:
         ``--speculative-draft-load-format`` needs its own transfer engine."""
         return remote_instance_transfer_engine_of(self, load_format)
 
+    @property
+    def kv_event_block_size(self) -> int:
+        """Width KV events are emitted at: under DCP the radix tree pages at
+        ``page_size * dcp_size`` (``mem_cache/kv_cache_builder.py``).
+        """
+        return self.page_size * self.dcp_size
+
     def describe_kv_events_publisher(self) -> Optional[dict]:
         """Return a structured description of this server's KV-event
         publisher, or `None` if publishing is disabled / misconfigured.
@@ -9694,10 +9701,13 @@ class ServerArgs:
                 "topic": "",                      # ZMQ topic prefix on the
                                                   # SUB filter (empty =
                                                   # subscribe-all)
-                "block_size": <page_size>,        # subscribers MUST hash
-                                                  # prompts at this size
-                "dp_size": <dp_size>,             # number of SUB sockets
-                                                  # to open
+                "block_size": <kv_event_block_size>,  # subscribers MUST
+                                                  # hash prompts at this size
+                "dp_size": <dp_size>,             # number of SUB sockets to
+                                                  # open; not DCP-scaled, as
+                                                  # DCP shards within a rank
+                                                  # rather than adding
+                                                  # publishers
             }
 
         Returns None (i.e. "no publisher to describe") when any of:
@@ -9752,7 +9762,7 @@ class ServerArgs:
             "endpoint_host": host,
             "endpoint_port_base": port,
             "topic": cfg.topic,
-            "block_size": page_size,
+            "block_size": self.kv_event_block_size,
             "dp_size": self.dp_size,
         }
 
