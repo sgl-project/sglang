@@ -140,11 +140,8 @@ def _dual_scan_kernel(
     USE_PDL: tl.constexpr,
 ):
     if USE_PDL:
-        # Both scan CTAs consume histogram output immediately.
         tl.extra.cuda.gdc_wait()
-        # The expand/scatter kernel can launch now. Its pair path recomputes
-        # virtual keys without scan output, then waits immediately before the
-        # first cursor load; its label paths wait before their first access.
+        # The expand/scatter kernel can launch now
         tl.extra.cuda.gdc_launch_dependents()
     if tl.program_id(0) == 0:
         _scan_one(
@@ -253,7 +250,6 @@ def _joint_expand_scatter_kernel(
     pid = tl.program_id(0)
     if pid < per_expert_label_programs:
         if USE_PDL:
-            # The label path immediately consumes scan outputs.
             tl.extra.cuda.gdc_wait()
         _label_blocks(
             pid,
@@ -272,7 +268,6 @@ def _joint_expand_scatter_kernel(
         return
     if pid < per_expert_label_programs + shared_label_programs:
         if USE_PDL:
-            # The label path immediately consumes scan outputs.
             tl.extra.cuda.gdc_wait()
         _label_blocks(
             pid - per_expert_label_programs,
@@ -317,8 +312,6 @@ def _joint_expand_scatter_kernel(
         SHARED_OUTER=True,
     )
     if USE_PDL:
-        # Key recomputation above is independent of the scan. Cursors below
-        # are the first scan-produced values this path consumes.
         tl.extra.cuda.gdc_wait()
     per_expert_slots = claim_slots_inline(
         per_expert_cursor_ptr,
@@ -347,13 +340,7 @@ def _plan_scratch(
     block_size: int,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
-    """Return route-owned scratch with a self-restoring count invariant.
-
-    ``_dual_scan_kernel`` clears each count immediately after its final read,
-    so counts need initialization only when their workspace storage is first
-    allocated.  Re-zeroing them on every lookup would add two redundant
-    memset launches to every joint-route construction.
-    """
+    """Route-owned scratch; counts are zeroed once because the scan restores that."""
     return {
         "counts": workspace.tensor(
             f"{prefix}:counts",
@@ -410,13 +397,7 @@ def build_joint_shared_routes(
     block_size: int,
     workspace: MoeLoraWorkspace,
 ) -> tuple[RouteView, RouteView]:
-    """Return ``(per_expert, shared_outer)`` aligned views from one pair pass.
-
-    PDL is on where the architecture supports it (cached check). The three
-    kernels form a real histogram -> scan -> scatter dependency chain; the
-    consumer launches carry ``launch_pdl=True`` and wait only immediately
-    before their first predecessor-produced load.
-    """
+    """Return the per-expert view and the shared-outer view, in that order."""
     if topk_ids.ndim != 2 or token_lora_mapping.shape != (topk_ids.shape[0],):
         raise ValueError(
             "joint routing expects topk_ids [T,K] and token_lora_mapping [T]"
