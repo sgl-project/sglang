@@ -7,10 +7,16 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptNvFp4FusedMoEMethod,
+)
 from sglang.srt.models.llada2 import (
     LLaDA2MoeSparseMoeBlock,
+    _get_effective_moe_runner_backend,
     _make_block_routing_triton_output,
     _require_block_routing_ep1,
+    _require_block_routing_runner_compatibility,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -60,14 +66,79 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
         self.assertIs(result.gate_scal, gate_scal)
         self.assertEqual(result.n_expts_act, 2)
 
+    @patch("sglang.srt.layers.quantization.modelopt_quant.MoeRunner")
+    @patch(
+        "sglang.srt.layers.quantization.modelopt_quant.get_device_capability",
+        return_value=(10, 0),
+    )
+    @patch("sglang.srt.layers.quantization.modelopt_quant.is_cuda", return_value=True)
+    @patch("sglang.srt.layers.quantization.modelopt_quant.get_moe_runner_backend")
+    def test_block_routing_rejects_auto_selected_plain_flashinfer(
+        self,
+        backend,
+        _is_cuda,
+        _capability,
+        runner,
+    ):
+        backend.return_value = MoeRunnerBackend.AUTO
+        quant_method = ModelOptNvFp4FusedMoEMethod.__new__(ModelOptNvFp4FusedMoEMethod)
+        quant_method.create_moe_runner(
+            SimpleNamespace(),
+            SimpleNamespace(),
+        )
+        experts = SimpleNamespace(quant_method=quant_method)
+
+        self.assertIs(
+            _get_effective_moe_runner_backend(experts),
+            MoeRunnerBackend.FLASHINFER_TRTLLM,
+        )
+        runner.assert_called_once_with(
+            MoeRunnerBackend.FLASHINFER_TRTLLM,
+            quant_method.moe_runner_config,
+        )
+        with self.assertRaisesRegex(ValueError, r"does not support.*flashinfer_trtllm"):
+            _require_block_routing_runner_compatibility(experts)
+
     @patch("sglang.srt.models.llada2.get_moe_runner_backend")
-    def test_plain_runner_fp4_block_routing_applies_scale_once(self, backend):
+    def test_fused_scaling_contract_applies_scale_once(self, backend):
         backend.return_value.is_triton_kernels.return_value = False
+        backend.return_value.is_aiter.return_value = False
 
         block = LLaDA2MoeSparseMoeBlock.__new__(LLaDA2MoeSparseMoeBlock)
         nn.Module.__init__(block)
         block.routed_scaling_factor = 2.5
         block.experts = SimpleNamespace(should_fuse_routed_scaling_factor_in_topk=True)
+
+        router_logits = torch.zeros((1, 4), dtype=torch.float32)
+        topk_weights = torch.tensor([[0.25, 0.75]], dtype=torch.float32)
+        topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
+
+        result = block._make_block_topk_output(
+            router_logits,
+            topk_weights,
+            topk_ids,
+        )
+
+        torch.testing.assert_close(
+            result.topk_weights,
+            topk_weights * block.routed_scaling_factor,
+        )
+        torch.testing.assert_close(topk_weights, torch.tensor([[0.25, 0.75]]))
+        self.assertIs(result.topk_ids, topk_ids)
+        self.assertIs(result.router_logits, router_logits)
+
+    def test_aiter_block_routing_applies_scale_once(self):
+        selected_backend = SimpleNamespace(
+            is_triton_kernels=lambda: False,
+            is_aiter=lambda: True,
+        )
+        block = LLaDA2MoeSparseMoeBlock.__new__(LLaDA2MoeSparseMoeBlock)
+        nn.Module.__init__(block)
+        block.routed_scaling_factor = 2.5
+        block.experts = SimpleNamespace(
+            quant_method=SimpleNamespace(_moe_runner_backend=selected_backend),
+            should_fuse_routed_scaling_factor_in_topk=False,
+        )
 
         router_logits = torch.zeros((1, 4), dtype=torch.float32)
         topk_weights = torch.tensor([[0.25, 0.75]], dtype=torch.float32)

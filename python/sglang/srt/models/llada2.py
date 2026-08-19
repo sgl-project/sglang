@@ -103,6 +103,30 @@ def _require_block_routing_ep1(moe_ep_size: int) -> None:
         )
 
 
+def _get_effective_moe_runner_backend(experts):
+    """Return the runner selected by the quant method, including auto selection."""
+    quant_method = getattr(experts, "quant_method", None)
+    backend = getattr(quant_method, "_moe_runner_backend", None)
+    if backend is not None:
+        return backend
+
+    runner = getattr(experts, "runner", None)
+    backend = getattr(runner, "runner_backend", None)
+    if backend is not None:
+        return backend
+
+    return get_moe_runner_backend()
+
+
+def _require_block_routing_runner_compatibility(experts) -> None:
+    backend = _get_effective_moe_runner_backend(experts)
+    if backend.is_flashinfer_trtllm():
+        raise ValueError(
+            "LLaDA2 block routing does not support --moe-runner-backend "
+            "flashinfer_trtllm; use a compatible runner instead"
+        )
+
+
 def _make_block_routing_triton_output(
     ragged_metadata,
     combine_indx: torch.Tensor,
@@ -645,6 +669,8 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
         )
+        if self.use_block_routing:
+            _require_block_routing_runner_compatibility(self.experts)
         # shared expert
         if config.num_shared_experts is not None:
             if hasattr(config, "moe_shared_expert_intermediate_size"):
@@ -723,15 +749,16 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         topk_ids: torch.Tensor,
     ):
         """Convert block-routing results to the selected MoE runner format."""
-        if not get_moe_runner_backend().is_triton_kernels():
+        runner_backend = _get_effective_moe_runner_backend(self.experts)
+        if not runner_backend.is_triton_kernels():
             if (
-                getattr(
+                runner_backend.is_aiter()
+                or getattr(
                     self.experts,
                     "should_fuse_routed_scaling_factor_in_topk",
                     False,
                 )
-                and self.routed_scaling_factor is not None
-            ):
+            ) and self.routed_scaling_factor is not None:
                 topk_weights = topk_weights * self.routed_scaling_factor
             return StandardTopKOutput(
                 topk_weights=topk_weights,
