@@ -9,14 +9,12 @@ processes import it, and the HTTP process must not drag in torch-heavy
 worker modules through it.
 """
 
-from dataclasses import dataclass
 from typing import List, Optional, Union
 
 import msgspec
 
 
-@dataclass
-class SetLoraReq:
+class SetLoraReq(msgspec.Struct):
     lora_nickname: Union[str, List[str]]
     lora_path: Optional[Union[str, List[Optional[str]]]] = None
     target: Union[str, List[str]] = "all"
@@ -25,34 +23,28 @@ class SetLoraReq:
     lora_alpha: Optional[Union[int, List[Optional[int]]]] = None
 
 
-@dataclass
-class MergeLoraWeightsReq:
+class MergeLoraWeightsReq(msgspec.Struct):
     target: str = "all"
     strength: float = 1.0
 
 
-@dataclass
-class UnmergeLoraWeightsReq:
+class UnmergeLoraWeightsReq(msgspec.Struct):
     target: str = "all"
 
 
-@dataclass
-class ListLorasReq:
+class ListLorasReq(msgspec.Struct):
     pass
 
 
-@dataclass
-class ShutdownReq:
+class ShutdownReq(msgspec.Struct):
     pass
 
 
-@dataclass
-class ReleaseRealtimeSessionReq:
+class ReleaseRealtimeSessionReq(msgspec.Struct):
     session_id: str
 
 
-@dataclass
-class GetDisaggStatsReq:
+class GetDisaggStatsReq(msgspec.Struct):
     """Request to get disagg pipeline metrics from the scheduler."""
 
     pass
