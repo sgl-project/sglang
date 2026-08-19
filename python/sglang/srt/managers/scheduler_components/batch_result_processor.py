@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -93,6 +94,12 @@ class SchedulerBatchResultProcessor:
     logprob_result_processor: SchedulerLogprobResultProcessor
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
+    _spec_capture_batches: List = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -196,6 +203,7 @@ class SchedulerBatchResultProcessor:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
+        pending_spec_captures: List = []
         self.token_to_kv_pool_allocator.free_group_begin()
 
         if self.is_generation:
@@ -237,6 +245,17 @@ class SchedulerBatchResultProcessor:
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
                 if (
+                    req.spec_capture is not None
+                    and logits_output.hidden_states is not None
+                ):
+                    assert extend_input_len_per_req is not None
+                    hidden_state_offset = self._append_spec_capture_states(
+                        req=req,
+                        logits_output=logits_output,
+                        hidden_state_offset=hidden_state_offset,
+                        extend_input_len=extend_input_len_per_req[i],
+                    )
+                elif (
                     batch.return_hidden_states
                     and logits_output.hidden_states is not None
                 ):
@@ -276,6 +295,10 @@ class SchedulerBatchResultProcessor:
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
+                        if req.spec_capture is not None:
+                            pending = self._stage_spec_capture(req)
+                            if pending is not None:
+                                pending_spec_captures.append(pending)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:
@@ -363,9 +386,23 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
         self.token_to_kv_pool_allocator.free_group_end()
-        self.output_streamer.stream_output(
-            batch.reqs, batch.return_logprob, skip_stream_req
-        )
+        if pending_spec_captures:
+            self._queue_spec_captures(
+                pending_spec_captures,
+                return_logprob=batch.return_logprob,
+            )
+            pending_ids = {id(item[0]) for item in pending_spec_captures}
+            ready = [
+                req
+                for req in batch.reqs
+                if id(req) not in pending_ids and req is not skip_stream_req
+            ]
+            if ready:
+                self.output_streamer.stream_output(ready, batch.return_logprob)
+        else:
+            self.output_streamer.stream_output(
+                batch.reqs, batch.return_logprob, skip_stream_req
+            )
 
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
@@ -495,6 +532,112 @@ class SchedulerBatchResultProcessor:
                     f"{batch.contains_last_prefill_chunk}). "
                     f"Placeholder zeros would be appended to output_ids."
                 )
+
+    def _append_spec_capture_states(
+        self,
+        *,
+        req: Req,
+        logits_output: LogitsProcessorOutput,
+        hidden_state_offset: int,
+        extend_input_len: int,
+    ) -> int:
+        start = hidden_state_offset
+        end = start + extend_input_len
+        if self.output_streamer.ps.attn_tp_rank != 0:
+            return end
+        features = dict(req.spec_capture.get("features") or {})
+        if "aux" in features:
+            req.spec_capture_aux.append(logits_output.hidden_states[start:end])
+        if (
+            "last_hidden" in features
+            and logits_output.last_hidden_states is not None
+        ):
+            req.spec_capture_last_hidden.append(
+                logits_output.last_hidden_states[start:end]
+            )
+        return end
+
+    def _stage_spec_capture(self, req: Req):
+        from sglang.srt import spec_capture_sink
+
+        sink = spec_capture_sink.get_sink()
+        if sink is None or self.output_streamer.ps.attn_tp_rank != 0:
+            return None
+        aux = self._coalesce_spec_capture_chunks(req.spec_capture_aux)
+        last_hidden = self._coalesce_spec_capture_chunks(
+            req.spec_capture_last_hidden
+        )
+        req.spec_capture_aux = []
+        req.spec_capture_last_hidden = []
+        return req, req.spec_capture, aux, last_hidden
+
+    def _queue_spec_captures(self, pending, *, return_logprob: bool) -> None:
+        from sglang.srt import spec_capture_sink
+
+        sink = spec_capture_sink.get_sink()
+        if sink is None:
+            raise RuntimeError("spec-capture sink is not initialized")
+        samples = [
+            (spec, aux, last_hidden)
+            for _, spec, aux, last_hidden in pending
+        ]
+        self._spec_capture_batches.append(
+            (pending, sink.submit_samples(samples), return_logprob, time.perf_counter())
+        )
+        max_pending = self.server_args.spec_capture_max_pending_batches
+        if len(self._spec_capture_batches) >= max_pending:
+            self.drain_spec_captures(block=True, max_batches=1)
+
+    def has_pending_spec_captures(self) -> bool:
+        return bool(self._spec_capture_batches)
+
+    def drain_spec_captures(
+        self, *, block: bool = False, max_batches: Optional[int] = None
+    ) -> int:
+        completed = 0
+        while self._spec_capture_batches:
+            if max_batches is not None and completed >= max_batches:
+                break
+            pending, future, return_logprob, queued_at = self._spec_capture_batches[0]
+            if not block and not future.done():
+                break
+            self._spec_capture_batches.pop(0)
+            try:
+                results = future.result()
+                if len(results) != len(pending):
+                    raise RuntimeError(
+                        f"spec-capture sink returned {len(results)} results for "
+                        f"{len(pending)} requests"
+                    )
+            except Exception as exc:
+                logger.error(
+                    "GPU-direct spec-capture batch failed after %.3f ms: %s",
+                    (time.perf_counter() - queued_at) * 1000.0,
+                    exc,
+                )
+                for req, spec, _, _ in pending:
+                    req.spec_capture_result = {
+                        "sample_id": spec.get("sample_id"),
+                        "error": str(exc),
+                    }
+            else:
+                for item, result in zip(pending, results):
+                    item[0].spec_capture_result = result
+            self.output_streamer.stream_output(
+                [item[0] for item in pending], return_logprob
+            )
+            completed += 1
+        return completed
+
+    @staticmethod
+    def _coalesce_spec_capture_chunks(
+        chunks: List[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if not chunks:
+            return None
+        if len(chunks) == 1:
+            return chunks[0]
+        return torch.cat(chunks, dim=0)
 
     def _append_prefill_hidden_states(
         self,

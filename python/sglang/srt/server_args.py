@@ -3525,6 +3525,57 @@ class ServerArgs:
         ),
         NS("exec.features"),
     ] = None
+    enable_spec_capture: A[
+        bool,
+        "Enable server-side GPU-direct hidden-state capture for SpecForge.",
+        NS("exec.features"),
+    ] = False
+    spec_capture_aux_layer_ids: A[
+        Optional[List[int]],
+        "Target layer ids concatenated into the auxiliary capture tensor.",
+        NS("exec.features"),
+    ] = None
+    spec_capture_method: A[
+        str,
+        Arg(
+            help="Auxiliary hidden-state capture method.",
+            choices=["eagle3", "dflash", "dspark"],
+        ),
+        NS("exec.features"),
+    ] = "eagle3"
+    spec_capture_transfer_backend: A[
+        str,
+        Arg(
+            help="Mooncake GPU-direct transport used by spec capture.",
+            choices=["nvlink", "nvlink_intra", "rdma"],
+        ),
+        NS("exec.features"),
+    ] = "rdma"
+    spec_capture_control_host: A[
+        Optional[str],
+        "Advertised host for Mooncake handshakes and release acknowledgements.",
+        NS("exec.features"),
+    ] = None
+    spec_capture_control_port: A[
+        int,
+        "TCP control port for GPU buffer release acknowledgements; zero selects a free port.",
+        NS("exec.features"),
+    ] = 0
+    spec_capture_ib_device: A[
+        Optional[str],
+        "RDMA HCA list for the spec-capture Mooncake TransferEngine.",
+        NS("exec.features"),
+    ] = None
+    spec_capture_max_resident_bytes: A[
+        Optional[int],
+        "Maximum GPU bytes retained for unacknowledged spec captures.",
+        NS("exec.features"),
+    ] = None
+    spec_capture_max_pending_batches: A[
+        int,
+        "Maximum queued GPU-direct capture batches before scheduler backpressure.",
+        NS("exec.features"),
+    ] = 2
     enable_return_routed_experts: A[
         bool,
         "Enable returning routed experts of each layer with responses.",

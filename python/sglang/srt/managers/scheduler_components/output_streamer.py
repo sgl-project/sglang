@@ -162,6 +162,13 @@ class SchedulerOutputStreamer:
         for req in reqs:
             if req is skip_req:
                 continue
+            if (
+                self.server_args.enable_spec_capture
+                and req.spec_capture is not None
+                and req.finished()
+                and req.spec_capture_result is None
+            ):
+                continue
             if req.finished() and req.finished_output:
                 # With the overlap schedule, a request will try to output twice and hit this line twice
                 # because of the one additional delayed token. This "continue" prevented the dummy output.
@@ -302,6 +309,7 @@ class _GenerationStreamAccumulator:
     spec_cap_lens_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
+    spec_capture: list = field(default_factory=list)
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
@@ -579,6 +587,7 @@ class _GenerationStreamAccumulator:
                     self.output_hidden_states.append(hs)
             else:
                 self.output_hidden_states.append(None)
+        self.spec_capture.append(getattr(req, "spec_capture_result", None))
         if self.return_routed_experts:
             self.routed_experts.append(
                 req.routed_experts if req.return_routed_experts else None
@@ -671,6 +680,7 @@ class _GenerationStreamAccumulator:
             output_token_sampling_mask=self.output_token_sampling_mask,
             output_token_sampling_logprobs=self.output_token_sampling_logprobs,
             output_hidden_states=self.output_hidden_states,
+            spec_capture=self.spec_capture or None,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
             customized_info=(
