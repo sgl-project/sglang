@@ -1146,6 +1146,10 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
+        # CUDA-event timings per forward, keyed by forward_iter and consumed by
+        # the metrics reporter to append "step time (ms)" onto the Prefill/Decode
+        # batch log line. Populated only when enable_step_time_logging is set.
+        self._step_events: Dict[int, Tuple] = {}
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
@@ -3639,6 +3643,20 @@ class Scheduler(
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
 
+        # Time every decode/prefill forward with CUDA events for accurate
+        # per-step GPU time. Gated on the enable_step_time_logging engine flag.
+        step_timing = (
+            self.server_args.enable_step_time_logging
+            and self.is_generation
+            and (batch.forward_mode.is_decode() or batch.forward_mode.is_extend())
+            and not use_mlx()
+        )
+        _sstep_start = None
+        _sstep_stream = self.forward_stream if self.enable_overlap else None
+        if step_timing:
+            _sstep_start = self.device_module.Event(enable_timing=True)
+            _sstep_start.record(_sstep_stream)
+
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
 
@@ -3841,6 +3859,14 @@ class Scheduler(
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
                     can_run_cuda_graph=can_run_cuda_graph,
                 )
+
+        if step_timing and _sstep_start is not None:
+            _sstep_end = self.device_module.Event(enable_timing=True)
+            _sstep_end.record(_sstep_stream)
+            self._step_events[batch.forward_iter] = (_sstep_start, _sstep_end)
+            # Bound memory: only recent iters can still be logged.
+            while len(self._step_events) > 256:
+                self._step_events.pop(next(iter(self._step_events)))
 
         self._maybe_report_active_ranks()
 
@@ -4690,6 +4716,8 @@ class Scheduler(
         # idle log by resetting the rate-limit timestamp, and flush pending
         # KV events.
         self.metrics_reporter.last_gen_throughput = 0.0
+        # Drop any recorded per-step timing events on pause/idle.
+        self._step_events.clear()
         if self.metrics_reporter.current_scheduler_metrics_enabled:
             self.metrics_reporter.metrics_collector.last_log_time = 0.0
             self.metrics_reporter._maybe_log_idle_metrics()

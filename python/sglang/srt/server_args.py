@@ -968,6 +968,11 @@ class ServerArgs:
         ),
         NS("schedule"),
     ] = False
+    enable_step_time_logging: A[
+        bool,
+        "Append per-step GPU time (CUDA-event timed) to each Prefill/Decode batch log line. Generation models only.",
+        NS("schedule"),
+    ] = False
     num_continuous_decode_steps: A[
         int,
         "Run multiple continuous decoding steps to reduce scheduling overhead. This can potentially increase throughput but may also increase time-to-first-token latency. The default value is 1, meaning only run one decoding step at a time.",

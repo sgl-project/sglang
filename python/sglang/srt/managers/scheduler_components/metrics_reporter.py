@@ -570,6 +570,19 @@ class SchedulerMetricsReporter:
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
 
+    def _step_time_suffix(self, batch_iter) -> str:
+        """Return ', step time (ms): X.XXX' for the forward whose CUDA events
+        were recorded under batch_iter (see Scheduler._step_events), or '' if
+        unavailable. Consumes the stored events. The end event is already
+        complete by the time stats are reported (the forward's outputs were
+        copied to host), so reading it does not stall the scheduler."""
+        evts = self.scheduler._step_events.pop(batch_iter, None)
+        if evts is None:
+            return ""
+        start_evt, end_evt = evts
+        end_evt.synchronize()
+        return f", step time (ms): {start_evt.elapsed_time(end_evt):.3f}"
+
     def report_prefill_stats(
         self,
         batch: Optional[ScheduleBatch],
@@ -603,6 +616,7 @@ class SchedulerMetricsReporter:
 
         msg = (
             f"Prefill batch{iter_msg}, "
+            f"step_idx: {batch_iter}, "
             f"#new-seq: {prefill_stats.num_new_seqs}, "
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
@@ -648,6 +662,9 @@ class SchedulerMetricsReporter:
 
         if ENABLE_METRICS_DEVICE_TIMER:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
+
+        if self.scheduler.server_args.enable_step_time_logging:
+            msg += self._step_time_suffix(batch_iter)
 
         if self.is_stats_logging_rank:
             logger.info(msg)
@@ -808,7 +825,7 @@ class SchedulerMetricsReporter:
             else self.scheduler.forward_ct
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
-        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+        msg = f"Decode batch{iter_msg}, step_idx: {batch_iter}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
         spec_num_steps = 0
         spec_num_draft_tokens = 0
@@ -911,6 +928,9 @@ class SchedulerMetricsReporter:
 
         if ENABLE_METRICS_DEVICE_TIMER:
             msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
+
+        if self.scheduler.server_args.enable_step_time_logging:
+            msg += self._step_time_suffix(batch_iter)
 
         if self.is_stats_logging_rank:
             logger.info(msg)
