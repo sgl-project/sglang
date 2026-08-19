@@ -110,5 +110,6 @@ class TestNativeGrpcParallelResponses(CustomTestCase):
         )
         self.assertEqual([call[1] for call in callback.calls], [False, False, True])
 
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
