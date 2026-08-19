@@ -785,14 +785,17 @@ class MiniMaxH3AdalnProj(nn.Module):
         self.expand_ratio = expand_ratio
         self.modality_num = modality_num
         self.hidden_size = arch.hidden_size
+        # Curve checkpoints store both the sampled curve and their reduced
+        # AdaLN projections in FP32. Preserve that precision island to match
+        # the published pruned implementation; these outputs intentionally do
+        # not enter the BF16-only fused modulation kernels.
+        params_dtype = _FP32_DTYPE if arch.adaln_curve_grid is not None else _BF16_DTYPE
         self.linear = ColumnParallelLinear(
             arch.time_embed_dim,
             out_features,
             bias=True,
             gather_output=False,
-            params_dtype=(
-                _FP32_DTYPE if arch.adaln_curve_grid is not None else _BF16_DTYPE
-            ),
+            params_dtype=params_dtype,
             quant_config=quant_config,
             prefix=f"{prefix}.linear",
         )
@@ -807,7 +810,7 @@ class MiniMaxH3AdalnProj(nn.Module):
         return tuple(x.chunk(self.expand_ratio, dim=-1))
 
     def forward(self, adaln_input: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        """adaln_input: SiLU(t_emb) BF16 -> expand_ratio tensors of [M*modality_num, H]."""
+        """Project the post-SiLU embedding in its checkpoint-defined dtype."""
         x = self.project_local(adaln_input)
         if get_tp_world_size() > 1:
             x = tensor_model_parallel_all_gather(x)

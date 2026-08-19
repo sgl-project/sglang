@@ -313,6 +313,27 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
             assert tensor.dtype == torch.bfloat16, name
 
 
+def test_pruned_meta_model_preserves_curve_adaln_fp32_island():
+    _ensure_single_process_parallel_runtime()
+    config = MiniMaxH3DiTConfig(
+        arch_config=MiniMaxH3DiTArchConfig(
+            adaln_curve_grid=1025,
+            time_embed_dim=8,
+        )
+    )
+    with torch.device("meta"):
+        model = MiniMaxH3DiTModel(
+            config=config,
+            hf_config={},
+            quant_config=None,
+        )
+
+    assert model.time_embedder is None
+    assert model.adaln_t_table.dtype == torch.float32
+    assert model.blocks[0].adaln_proj.linear.weight.dtype == torch.float32
+    assert model.final_layer.adaln_proj.linear.weight.dtype == torch.float32
+
+
 def test_online_fp8_keeps_fp32_boundaries_and_ignored_layers_unquantized():
     _ensure_single_process_parallel_runtime()
     with torch.device("meta"):
