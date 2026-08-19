@@ -50,6 +50,7 @@ def resolve_spec_aux_hidden_state_config(
     _resolve_eagle_aux_hidden_state(
         config=config,
         server_args=server_args,
+        model_config=model_config,
         spec_algorithm=spec_algorithm,
         is_draft_worker=is_draft_worker,
     )
@@ -67,47 +68,66 @@ def _resolve_eagle_aux_hidden_state(
     *,
     config: SpecAuxHiddenStateConfig,
     server_args: ServerArgs,
+    model_config: ModelConfig,
     spec_algorithm: SpeculativeAlgorithm,
     is_draft_worker: bool,
 ) -> None:
     if (
-        (spec_algorithm.is_eagle() or spec_algorithm.is_standalone())
-        and not is_draft_worker
-        and server_args.speculative_draft_model_path
-    ):
-        # Load draft config to get layer count for KV cache sizing
-        draft_model_config = ModelConfig.from_server_args(
-            server_args,
-            model_path=server_args.speculative_draft_model_path,
-            model_revision=server_args.speculative_draft_model_revision,
-            is_draft_model=True,
-        )
-        num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
-        if num_nextn_predict_layers is not None:
-            config.eagle_draft_num_layers = int(num_nextn_predict_layers)
-        else:
-            config.eagle_draft_num_layers = int(
-                max(
-                    draft_model_config.num_hidden_layers,
-                    draft_model_config.num_attention_layers,
-                )
+        spec_algorithm.is_eagle() or spec_algorithm.is_standalone()
+    ) and not is_draft_worker:
+        if server_args.speculative_draft_model_path:
+            # External draft: load draft config to get layer count for KV cache sizing.
+            draft_model_config = ModelConfig.from_server_args(
+                server_args,
+                model_path=server_args.speculative_draft_model_path,
+                model_revision=server_args.speculative_draft_model_revision,
+                is_draft_model=True,
             )
+            num_nextn_predict_layers = draft_model_config.num_nextn_predict_layers
+            if num_nextn_predict_layers is not None:
+                config.eagle_draft_num_layers = int(num_nextn_predict_layers)
+            else:
+                config.eagle_draft_num_layers = int(
+                    max(
+                        draft_model_config.num_hidden_layers,
+                        draft_model_config.num_attention_layers,
+                    )
+                )
 
-        if spec_algorithm.is_eagle3():
-            config.eagle_use_aux_hidden_state = True
-            try:
-                eagle_config = getattr(
-                    draft_model_config.hf_config, "eagle_config", None
+            if spec_algorithm.is_eagle3():
+                config.eagle_use_aux_hidden_state = True
+                try:
+                    eagle_config = getattr(
+                        draft_model_config.hf_config, "eagle_config", None
+                    )
+                    config.eagle_use_aux_hidden_state = eagle_config.get(
+                        "use_aux_hidden_state", True
+                    )
+                    config.eagle_aux_hidden_state_layer_ids = eagle_config[
+                        "eagle_aux_hidden_state_layer_ids"
+                    ]
+                except:
+                    # if there is no aux layer, set to None
+                    config.eagle_aux_hidden_state_layer_ids = None
+        else:
+            # Native in-checkpoint MTP (e.g. Qwen3.5 / Qwen3.8): the draft model
+            # is the same checkpoint and its KV layers are not covered by an
+            # explicit --speculative-draft-model-path. The checkpoint declares the
+            # MTP layer count via ``mtp_num_hidden_layers`` on the text config;
+            # budget those draft layers in the target KV cell size so the draft
+            # KV pool allocation cannot overrun the static memory envelope.
+            # There is one native MTP hidden layer reused across every draft step,
+            # so do not multiply by speculative-num-steps.
+            mtp_num_hidden_layers = getattr(
+                model_config.hf_text_config, "mtp_num_hidden_layers", None
+            )
+            if mtp_num_hidden_layers is not None and int(mtp_num_hidden_layers) > 0:
+                config.eagle_draft_num_layers = int(mtp_num_hidden_layers)
+                logger.info(
+                    "Native MTP draft KV accounting: mtp_num_hidden_layers=%s "
+                    "from target text config (no external draft path).",
+                    mtp_num_hidden_layers,
                 )
-                config.eagle_use_aux_hidden_state = eagle_config.get(
-                    "use_aux_hidden_state", True
-                )
-                config.eagle_aux_hidden_state_layer_ids = eagle_config[
-                    "eagle_aux_hidden_state_layer_ids"
-                ]
-            except:
-                # if there is no aux layer, set to None
-                config.eagle_aux_hidden_state_layer_ids = None
 
 
 def _resolve_dflash_aux_hidden_state(
