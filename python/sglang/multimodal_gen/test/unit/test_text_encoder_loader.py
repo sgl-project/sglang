@@ -8,12 +8,18 @@ from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
+from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentCheckpointUnsupportedError,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.text_encoder_loader import (
     TextEncoderLoader,
-    _configure_text_encoder_quantization,
-    _process_quantized_text_encoder_weights,
+    _configure_encoder_quantization,
+    _process_quantized_encoder_weights,
 )
-from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    CheckpointQuantizationCapability,
+    TextEncoder,
+)
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
 )
@@ -108,6 +114,26 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
             expected,
         )
 
+    def test_vision_qkv_checkpoint_name_maps_to_native_projection(self):
+        encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
+        torch.nn.Module.__init__(encoder)
+        encoder.model = torch.nn.Module()
+        encoder.model.visual = torch.nn.Module()
+        block = torch.nn.Module()
+        block.attn = torch.nn.Module()
+        block.attn.qkv_proj = torch.nn.Linear(2, 2)
+        encoder.model.visual.blocks = torch.nn.ModuleList([block])
+
+        loaded = encoder.load_weights(
+            [("model.visual.blocks.0.attn.qkv.bias", torch.tensor([1.0, 2.0]))]
+        )
+
+        self.assertEqual(loaded, {"model.visual.blocks.0.attn.qkv_proj.bias"})
+        torch.testing.assert_close(
+            encoder.model.visual.blocks[0].attn.qkv_proj.bias,
+            torch.tensor([1.0, 2.0]),
+        )
+
 
 class TestTextEncoderQuantization(unittest.TestCase):
     def setUp(self):
@@ -127,22 +153,48 @@ class TestTextEncoderQuantization(unittest.TestCase):
 
     def test_serialized_fp8_checkpoint_configures_h3_encoder(self):
         model_config = SimpleNamespace(quant_config=None)
-        _configure_text_encoder_quantization(
+        _configure_encoder_quantization(
             model_config,
             MiniMaxH3Qwen3VLEncoder,
             {},
             "/model/text_encoder",
+            "text_encoder",
         )
         self.assertIs(model_config.quant_config, self.serialized)
 
     def test_encoder_class_must_opt_in(self):
         model_config = SimpleNamespace(quant_config=None)
-        with self.assertRaisesRegex(ValueError, "does not support"):
-            _configure_text_encoder_quantization(
+        with self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError, "does not support"
+        ):
+            _configure_encoder_quantization(
                 model_config,
                 TextEncoder,
                 {},
                 "/model/text_encoder",
+                "text_encoder",
+            )
+
+    def test_srt_backend_is_not_admitted_without_an_adapter(self):
+        model_config = SimpleNamespace(quant_config=None)
+        capability = CheckpointQuantizationCapability(
+            backend="srt",
+            methods=frozenset({"fp8"}),
+        )
+        with mock.patch.object(
+            MiniMaxH3Qwen3VLEncoder,
+            "checkpoint_quantization_capability",
+            capability,
+        ), self.assertRaisesRegex(
+            ComponentCheckpointUnsupportedError,
+            "'srt'.*only the 'diffusion' backend",
+        ):
+            _configure_encoder_quantization(
+                model_config,
+                MiniMaxH3Qwen3VLEncoder,
+                {},
+                "/model/text_encoder",
+                "text_encoder",
             )
 
     def test_model_managed_quantization_bypasses_generic_lifecycle(self):
@@ -152,11 +204,12 @@ class TestTextEncoderQuantization(unittest.TestCase):
             "manages_checkpoint_quantization",
             True,
         ):
-            _configure_text_encoder_quantization(
+            _configure_encoder_quantization(
                 model_config,
                 TextEncoder,
                 {},
                 "/model/text_encoder",
+                "text_encoder",
             )
 
         self.assertIsNone(model_config.quant_config)
@@ -193,9 +246,10 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
         quant_method = _RecordingQuantMethod()
         model = _QuantizedEncoder(quant_method)
 
-        processed = _process_quantized_text_encoder_weights(
+        processed = _process_quantized_encoder_weights(
             model,
             torch.device("cpu"),
+            "text_encoder",
         )
 
         self.assertEqual(processed, 1)
@@ -207,9 +261,10 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
         quant_method = _RecordingQuantMethod()
         model = _QuantizedEncoder(quant_method)
 
-        processed = _process_quantized_text_encoder_weights(
+        processed = _process_quantized_encoder_weights(
             model,
             torch.device("cuda", torch.cuda.current_device()),
+            "text_encoder",
         )
 
         self.assertEqual(processed, 1)
@@ -222,9 +277,10 @@ class TestQuantizedTextEncoderPostprocess(unittest.TestCase):
         model = _QuantizedEncoder(_RecordingQuantMethod(error=RuntimeError("boom")))
 
         with self.assertRaisesRegex(RuntimeError, "boom"):
-            _process_quantized_text_encoder_weights(
+            _process_quantized_encoder_weights(
                 model,
                 torch.device("cuda", torch.cuda.current_device()),
+                "text_encoder",
             )
 
         self.assertEqual(model.quantized.weight.device, torch.device("cpu"))
