@@ -173,7 +173,7 @@ def indexed_lora_a(
     """Execute raw-route indexed A.
 
     This launcher intentionally contains no ``launch_pdl`` or GDC operations.
-    A caller choosing this family should request ``ROUTE_RAW`` so no aligned
+    A caller choosing this family should request ``RouteViewKind.RAW`` so no aligned
     plan is built merely for another site.
     """
     num_pairs = routing.topk_ids.numel()

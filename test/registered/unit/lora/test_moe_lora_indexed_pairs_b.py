@@ -38,9 +38,8 @@ from sglang.srt.lora.moe.lora_b import (
     run_lora_b,
 )
 from sglang.srt.lora.moe.routing import (
-    ROUTE_ALIGNED,
-    ROUTE_RAW,
     RouteView,
+    RouteViewKind,
     build_virtual_expert_routing,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -96,10 +95,13 @@ def _views(topk_ids, token_slots, num_experts, device):
         block_size=16,
     )
     aligned = build_virtual_expert_routing(
-        topk_ids.to(device), token_slots.to(device), view=ROUTE_ALIGNED, **kwargs
+        topk_ids.to(device),
+        token_slots.to(device),
+        view=RouteViewKind.ALIGNED,
+        **kwargs,
     )
     raw = build_virtual_expert_routing(
-        topk_ids.to(device), token_slots.to(device), view=ROUTE_RAW, **kwargs
+        topk_ids.to(device), token_slots.to(device), view=RouteViewKind.RAW, **kwargs
     )
     return aligned, raw
 
@@ -184,7 +186,7 @@ def test_zero_pair_batches_return_without_launching() -> None:
     device = torch.device("cuda")
     topk_ids, token_slots = _routing_case(4, 2, 8, 0x1DB2)
     empty = RouteView(
-        view=ROUTE_RAW,
+        view=RouteViewKind.RAW,
         num_virtual_experts=_SLOTS * 8,
         block_size=16,
         topk_ids=topk_ids[:0].to(device),

@@ -19,8 +19,8 @@ import triton
 import triton.language as tl
 
 from sglang.srt.lora.moe.routing import (
-    ROUTE_ALIGNED,
     RouteView,
+    RouteViewKind,
     _routing_capacity,
     virtual_expert_ids_inline,
 )
@@ -551,7 +551,7 @@ def build_joint_shared_routes(
         scratch: dict[str, torch.Tensor],
     ) -> RouteView:
         return RouteView(
-            view=ROUTE_ALIGNED,
+            view=RouteViewKind.ALIGNED,
             num_virtual_experts=num_virtual_experts,
             block_size=block_size,
             topk_ids=topk_ids,

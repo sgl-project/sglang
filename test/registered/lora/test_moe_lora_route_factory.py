@@ -8,6 +8,7 @@ import importlib.util
 import sys
 import types
 import unittest
+from enum import Enum
 from pathlib import Path
 from unittest import mock
 
@@ -127,6 +128,14 @@ def _load_launch_config():
 LAUNCH = _load_launch_config()
 
 
+class _RouteViewKind(str, Enum):
+    """Stand-in for routing.RouteViewKind: these tests stub that module."""
+
+    RAW = "raw"
+    FUSED_IDS = "fused_ids"
+    ALIGNED = "aligned"
+
+
 class _HostRouteView(msgspec.Struct, frozen=True, kw_only=True):
     view: str
     num_virtual_experts: int
@@ -156,8 +165,7 @@ def _load_route_factory():
         packages[name] = package
 
     routing = types.ModuleType("sglang.srt.lora.moe.routing")
-    routing.ROUTE_RAW = "raw"
-    routing.ROUTE_ALIGNED = "aligned"
+    routing.RouteViewKind = _RouteViewKind
     routing.RouteView = _HostRouteView
     routing.FusedAlignScratch = types.SimpleNamespace
     routing.build_virtual_expert_routing = lambda *args, **kwargs: None
@@ -215,7 +223,7 @@ def _load_joint_routing():
     fake_triton.language = fake_tl
 
     routing = types.ModuleType("sglang.srt.lora.moe.routing")
-    routing.ROUTE_ALIGNED = "aligned"
+    routing.RouteViewKind = _RouteViewKind
     routing.RouteView = _HostRouteView
     routing._routing_capacity = lambda num_pairs, block_size, num_virtual: (
         block_size * ((num_pairs + block_size - 1) // block_size + num_virtual)

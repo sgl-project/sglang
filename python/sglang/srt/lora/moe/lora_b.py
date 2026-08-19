@@ -428,7 +428,7 @@ def indexed_pairs_lora_b(
 
     Consumes only the raw source tensors carried on every ``RouteView``
     (``topk_ids``/``token_slots``); an execution plan choosing this family
-    requests ``ROUTE_RAW`` so no aligned pair plan is built merely for this
+    requests ``RouteViewKind.RAW`` so no aligned pair plan is built merely for this
     stage.  The ``(num_pairs, n_tiles)`` grid is static per CUDA-graph
     capture bucket (``num_pairs == T * top_k``), matching the graph-captured
     indexed down-A precedent.  This launcher has no PDL operations.

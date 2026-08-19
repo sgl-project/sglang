@@ -58,7 +58,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.moe.routing import ROUTE_ALIGNED, RouteView
+from sglang.srt.lora.moe.routing import RouteView, RouteViewKind
 
 
 @triton.jit
@@ -175,9 +175,9 @@ def invoke_down_b_scatter(
     semantics (``BLOCK_SIZE_M``, when present, must equal the aligned
     route's block size, as in the standalone launcher).
     """
-    if routing.view != ROUTE_ALIGNED:
+    if routing.view is not RouteViewKind.ALIGNED:
         raise ValueError(
-            f"down-B scatter needs route view {ROUTE_ALIGNED!r}, got "
+            f"down-B scatter needs route view {RouteViewKind.ALIGNED.value!r}, got "
             f"{routing.view!r}"
         )
     num_tokens, top_k = routing.topk_ids.shape

@@ -450,7 +450,7 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
     )
     from sglang.srt.lora.moe.lora_b import one_launch_sliced_lora_b
     from sglang.srt.lora.moe.routing import (
-        ROUTE_ALIGNED,
+        RouteViewKind,
         build_virtual_expert_routing,
     )
 
@@ -478,7 +478,7 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
         lora_experts_per_adapter=num_experts,
         max_loras=_SLOTS,
         block_size=16,
-        view=ROUTE_ALIGNED,
+        view=RouteViewKind.ALIGNED,
     )
 
     # Shipped tail: one-launch down-B writes the materialized LoRA delta,
@@ -554,7 +554,7 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
         lora_experts_per_adapter=num_experts,
         max_loras=_SLOTS,
         block_size=16,
-        view=ROUTE_ALIGNED,
+        view=RouteViewKind.ALIGNED,
     )
     scattered_base = gpu["down_rows"].clone()
     invoke_down_b_scatter(
@@ -576,7 +576,7 @@ def test_scatter_rejects_a_mismatched_route_block() -> None:
         invoke_down_b_scatter,
     )
     from sglang.srt.lora.moe.routing import (
-        ROUTE_ALIGNED,
+        RouteViewKind,
         build_virtual_expert_routing,
     )
 
@@ -589,7 +589,7 @@ def test_scatter_rejects_a_mismatched_route_block() -> None:
         lora_experts_per_adapter=4,
         max_loras=_SLOTS,
         block_size=32,
-        view=ROUTE_ALIGNED,
+        view=RouteViewKind.ALIGNED,
     )
     with pytest.raises(ValueError, match="BLOCK_SIZE_M"):
         invoke_down_b_scatter(

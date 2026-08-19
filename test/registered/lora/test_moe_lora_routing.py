@@ -5,9 +5,7 @@ import unittest
 import torch
 
 from sglang.srt.lora.moe.routing import (
-    ROUTE_ALIGNED,
-    ROUTE_FUSED_IDS,
-    ROUTE_RAW,
+    RouteViewKind,
     build_virtual_expert_routing,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -73,7 +71,7 @@ class TestMoeLoraRouting(CustomTestCase):
         lora_expert_map=None,
         block_size=16,
         dtype=torch.int32,
-        view=ROUTE_ALIGNED,
+        view=RouteViewKind.ALIGNED,
     ):
         return build_virtual_expert_routing(
             torch.tensor(topk_ids, dtype=dtype, device=self.device),
@@ -99,26 +97,28 @@ class TestMoeLoraRouting(CustomTestCase):
         """
         ids, adapters = [[0, 1]], [0]
         aligned = self._build(
-            ids, adapters, lora_experts_per_adapter=2, view=ROUTE_ALIGNED
+            ids, adapters, lora_experts_per_adapter=2, view=RouteViewKind.ALIGNED
         )
         self.assertEqual(aligned.virtual_topk_ids.numel(), 2)
         self.assertGreater(aligned.sorted_pair_ids.numel(), 0)
 
         fused = self._build(
-            ids, adapters, lora_experts_per_adapter=2, view=ROUTE_FUSED_IDS
+            ids, adapters, lora_experts_per_adapter=2, view=RouteViewKind.FUSED_IDS
         )
         self.assertTrue(
             torch.equal(fused.virtual_topk_ids, aligned.virtual_topk_ids),
             "fused_ids must agree bitwise with the aligned view it is a prefix of",
         )
         for field in ("sorted_pair_ids", "block_virtual_expert_ids"):
-            with self.assertRaisesRegex(ValueError, ROUTE_ALIGNED):
+            with self.assertRaisesRegex(ValueError, RouteViewKind.ALIGNED):
                 getattr(fused, field)
 
-        raw = self._build(ids, adapters, lora_experts_per_adapter=2, view=ROUTE_RAW)
-        with self.assertRaisesRegex(ValueError, ROUTE_FUSED_IDS):
+        raw = self._build(
+            ids, adapters, lora_experts_per_adapter=2, view=RouteViewKind.RAW
+        )
+        with self.assertRaisesRegex(ValueError, RouteViewKind.FUSED_IDS):
             raw.virtual_topk_ids
-        with self.assertRaisesRegex(ValueError, ROUTE_ALIGNED):
+        with self.assertRaisesRegex(ValueError, RouteViewKind.ALIGNED):
             raw.sorted_pair_ids
         # A raw consumer fuses the key computation into its own kernel, so the
         # sources must survive on the view.
@@ -240,6 +240,7 @@ class TestMoeLoraRouting(CustomTestCase):
             _JIT_ALIGN_MAX_VIRTUAL_EXPERTS,
             FUSED_ALIGN_MIN_PAIRS,
             FUSED_ALIGN_MIN_VIRTUAL_EXPERTS,
+            RouteViewKind,
             build_virtual_expert_routing,
         )
 
@@ -290,7 +291,7 @@ class TestMoeLoraRouting(CustomTestCase):
                         lora_experts_per_adapter=lora_experts_per_adapter,
                         max_loras=32,
                         block_size=16,
-                        view=ROUTE_ALIGNED,
+                        view=RouteViewKind.ALIGNED,
                     )
                 finally:
                     fused_align.fused_align_block_size = original
@@ -344,7 +345,7 @@ class TestMoeLoraRouting(CustomTestCase):
                     lora_experts_per_adapter=lora_experts_per_adapter,
                     max_loras=slot_capacity,
                     block_size=16,
-                    view=ROUTE_ALIGNED,
+                    view=RouteViewKind.ALIGNED,
                 )
                 num_pairs = num_tokens * top_k
                 keys = (

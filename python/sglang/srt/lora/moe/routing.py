@@ -61,6 +61,8 @@ the view you would have had to request.
 
 from __future__ import annotations
 
+from enum import Enum
+
 import msgspec
 import torch
 import triton
@@ -86,6 +88,7 @@ _JIT_ALIGN_MAX_VIRTUAL_EXPERTS = 8191
 FUSED_ALIGN_MIN_VIRTUAL_EXPERTS = 8192
 FUSED_ALIGN_MIN_PAIRS = 16384
 
+
 # ALIGNED-view kernel config, sited by the section 40 redo (15 rung-edge-aware
 # V values x P in {8..16384} x 3 seeds x 2 interleaved repeats x graph AND
 # eager modes x iid+hotset routes; winner = unanimous sign + >=1.05 geo margin;
@@ -106,21 +109,34 @@ FUSED_ALIGN_MIN_PAIRS = 16384
 #   jit-or-tied at small V except one decided fused win at eager V=1024
 #   (1.07x, the config's one accepted give-away in that direction), so per
 #   section 13 rule 3 the unsampled (8192, 16384) interior stays JIT.
-ROUTE_RAW = "raw"
-ROUTE_FUSED_IDS = "fused_ids"
-ROUTE_ALIGNED = "aligned"
-ROUTE_VIEWS = (ROUTE_RAW, ROUTE_FUSED_IDS, ROUTE_ALIGNED)
+class RouteViewKind(str, Enum):
+    """Which products a :class:`RouteView` materialized.
+
+    Each value IS the string the ``view`` argument takes, and the members ARE
+    the accepted set -- ``view in RouteViewKind`` is the membership test, so no
+    parallel tuple has to be kept in step with them.
+
+    NOT interchangeable with ``RouteRequirement``: that one crosses these with
+    factor ownership (``aligned_per_expert`` vs ``aligned_shared_outer``), has
+    no member for ``FUSED_IDS`` because no plan requests it as a product, and
+    lives in the pydantic plan layer -- which the Triton modules comparing
+    views here must not import.
+    """
+
+    RAW = "raw"
+    FUSED_IDS = "fused_ids"
+    ALIGNED = "aligned"
 
 
 def uses_fused_align(
     topk_ids: torch.Tensor,
     *,
     num_virtual_experts: int,
-    view: str = ROUTE_ALIGNED,
+    view: RouteViewKind = RouteViewKind.ALIGNED,
 ) -> bool:
     """Return the aligned-route dispatch without building either arm."""
     return (
-        view == ROUTE_ALIGNED
+        view == RouteViewKind.ALIGNED
         and topk_ids.is_cuda
         and (
             num_virtual_experts >= FUSED_ALIGN_MIN_VIRTUAL_EXPERTS
@@ -151,7 +167,7 @@ class RouteView(msgspec.Struct, frozen=True, kw_only=True):
     it needs to fuse the key computation into its own kernel.
     """
 
-    view: str
+    view: RouteViewKind
     num_virtual_experts: int
     block_size: int
     topk_ids: torch.Tensor
@@ -171,24 +187,24 @@ class RouteView(msgspec.Struct, frozen=True, kw_only=True):
     maybe_block_virtual_expert_ids: torch.Tensor | None = None
     maybe_num_pairs_post_padded: torch.Tensor | None = None
 
-    def _require(self, value, field: str, needed: str):
+    def _require(self, value, field: str, needed: RouteViewKind):
         if value is None:
             raise ValueError(
-                f"route view {self.view!r} did not build {field}; the consumer "
-                f"must request view {needed!r} or derive it inline"
+                f"route view {self.view.value!r} did not build {field}; the "
+                f"consumer must request view {needed.value!r} or derive it inline"
             )
         return value
 
     @property
     def virtual_topk_ids(self) -> torch.Tensor:
         return self._require(
-            self.maybe_virtual_topk_ids, "virtual_topk_ids", ROUTE_FUSED_IDS
+            self.maybe_virtual_topk_ids, "virtual_topk_ids", RouteViewKind.FUSED_IDS
         )
 
     @property
     def sorted_pair_ids(self) -> torch.Tensor:
         return self._require(
-            self.maybe_sorted_pair_ids, "sorted_pair_ids", ROUTE_ALIGNED
+            self.maybe_sorted_pair_ids, "sorted_pair_ids", RouteViewKind.ALIGNED
         )
 
     @property
@@ -196,13 +212,15 @@ class RouteView(msgspec.Struct, frozen=True, kw_only=True):
         return self._require(
             self.maybe_block_virtual_expert_ids,
             "block_virtual_expert_ids",
-            ROUTE_ALIGNED,
+            RouteViewKind.ALIGNED,
         )
 
     @property
     def num_pairs_post_padded(self) -> torch.Tensor:
         return self._require(
-            self.maybe_num_pairs_post_padded, "num_pairs_post_padded", ROUTE_ALIGNED
+            self.maybe_num_pairs_post_padded,
+            "num_pairs_post_padded",
+            RouteViewKind.ALIGNED,
         )
 
 
@@ -448,7 +466,7 @@ def build_virtual_expert_routing(
     block_size: int,
     lora_expert_map: torch.Tensor | None = None,
     shared_outer_local_expert_count: int | None = None,
-    view: str = ROUTE_ALIGNED,
+    view: RouteViewKind = RouteViewKind.ALIGNED,
     num_pairs_post_padded_out: torch.Tensor | None = None,
     fused_align_scratch: FusedAlignScratch | None = None,
 ) -> RouteView:
@@ -465,8 +483,12 @@ def build_virtual_expert_routing(
     leaves this buffer unused. ``fused_align_scratch`` similarly replaces the
     fused path's process-global serial fallback with caller-owned metadata.
     """
-    if view not in ROUTE_VIEWS:
-        raise ValueError(f"unknown route view {view!r}; expected one of {ROUTE_VIEWS}")
+    if view not in RouteViewKind:
+        raise ValueError(
+            f"unknown route view {view!r}; expected one of "
+            f"{tuple(kind.value for kind in RouteViewKind)}"
+        )
+    view = RouteViewKind(view)
     if topk_ids.ndim != 2 or token_lora_mapping.shape != (topk_ids.shape[0],):
         raise ValueError("expected topk_ids [T,K] and token_lora_mapping [T]")
     if min(lora_experts_per_adapter, max_loras, block_size) <= 0:
@@ -491,7 +513,7 @@ def build_virtual_expert_routing(
         "lora_expert_map": lora_expert_map,
         "shared_outer_local_expert_count": shared_outer_local_expert_count,
     }
-    if view == ROUTE_RAW:
+    if view is RouteViewKind.RAW:
         return RouteView(**common)
 
     num_virtual = common["num_virtual_experts"]
@@ -537,7 +559,7 @@ def build_virtual_expert_routing(
         lora_expert_map,
         shared_outer_local_expert_count=shared_outer_local_expert_count,
     )
-    if view == ROUTE_FUSED_IDS:
+    if view is RouteViewKind.FUSED_IDS:
         return RouteView(**common, maybe_virtual_topk_ids=virtual_topk_ids)
 
     sorted_pair_ids, block_virtual_expert_ids, num_pairs_post_padded = (
