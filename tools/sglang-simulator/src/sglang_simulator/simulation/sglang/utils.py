@@ -27,6 +27,8 @@ def resolve_scheduler_config(
         ep_size=server_args.ep_size,
         dp_size=server_args.dp_size,
         pp_size=server_args.pp_size,
+        cp_size=getattr(server_args, "attn_cp_size", 1),
+        cp_style=getattr(server_args, "cp_style", "none"),
         page_size=getattr(server_args, "page_size", None),
         swa_full_tokens_ratio=getattr(server_args, "swa_full_tokens_ratio", None),
         kv_bytes_per_token_per_gpu=getattr(

@@ -100,6 +100,42 @@ def _install_meta_allocators() -> None:
             allocators[key] = allocate_meta_tensor
 
 
+_SIMULATED_AVAILABLE_HOST_MEMORY_BYTES = 1 << 60
+
+
+class _PsutilProxy:
+    def __init__(self, psutil_module):
+        self._psutil_module = psutil_module
+
+    def virtual_memory(self):
+        snapshot = self._psutil_module.virtual_memory()
+        return snapshot._replace(
+            available=max(
+                snapshot.available,
+                _SIMULATED_AVAILABLE_HOST_MEMORY_BYTES,
+            )
+        )
+
+    def __getattr__(self, name):
+        return getattr(self._psutil_module, name)
+
+
+def _call_with_meta_host_memory(original_init, self, *args, **kwargs):
+    """Bypass physical host-payload checks while meta allocation is active."""
+    init_globals = getattr(original_init, "__globals__", None)
+    psutil_module = init_globals.get("psutil") if init_globals is not None else None
+    if psutil_module is None:
+        return original_init(self, *args, **kwargs)
+
+    proxy = _PsutilProxy(psutil_module)
+    init_globals["psutil"] = proxy
+    try:
+        return original_init(self, *args, **kwargs)
+    finally:
+        if init_globals.get("psutil") is proxy:
+            init_globals["psutil"] = psutil_module
+
+
 @lru_cache(maxsize=256)
 def get_refined_cache_size_per_token(host_pool) -> float:
     internal_size = float(host_pool.get_size_per_token())
@@ -197,7 +233,14 @@ def _transfer_segment_lengths(
 
 
 def _sim_load_to_device_per_layer(
-    self, device_pool, host_indices, device_indices, layer_id, io_backend
+    self,
+    device_pool,
+    host_indices,
+    device_indices,
+    layer_id,
+    io_backend,
+    *,
+    is_draft: bool = False,
 ) -> None:
     segment_lengths = _transfer_segment_lengths(
         self, host_indices, device_indices, count_logical_tokens=True
@@ -247,7 +290,7 @@ def _install_transport_methods(target) -> None:
         _install_meta_allocators()
         if "pin_memory" in kwargs:
             kwargs["pin_memory"] = False
-        return original_init(self, *args, **kwargs)
+        return _call_with_meta_host_memory(original_init, self, *args, **kwargs)
 
     target.__init__ = wrapped_init
     target.load_to_device_per_layer = _sim_load_to_device_per_layer
@@ -282,7 +325,7 @@ class C_HostKVCacheHook(BaseHook):
             elif len(args) > 5:
                 args = list(args)
                 args[5] = False
-            return original_init(self, *args, **kwargs)
+            return _call_with_meta_host_memory(original_init, self, *args, **kwargs)
 
         target.__init__ = wrapped_init
 

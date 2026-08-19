@@ -1,0 +1,96 @@
+name: PR Test SGLang Simulator (CPU)
+
+on:
+  workflow_call:
+    inputs:
+      check_changes:
+        description: 'toJson(needs.check-changes.outputs).'
+        type: string
+        required: true
+      caller_inputs:
+        description: 'toJson(inputs) from the caller workflow.'
+        type: string
+        required: true
+      rust_ext_artifact:
+        description: 'Artifact of prebuilt Rust extension modules.'
+        type: string
+        default: ''
+
+env:
+  SGLANG_IS_IN_CI: true
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  USE_VENV: false
+
+jobs:
+  run:
+    name: simulator-test-cpu
+    if: fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).simulator == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ fromJson(inputs.caller_inputs).git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-pr-test-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - uses: ./.github/actions/download-rust-ext
+        id: rust_ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
+
+      - name: Install protoc + Rust toolchain
+        if: ${{ steps.rust_ext.outputs.hit != 'true' }}
+        timeout-minutes: 10
+        run: bash scripts/ci/utils/install_rust_protoc.sh
+
+      - name: Rust cache (rust/ workspace)
+        if: ${{ steps.rust_ext.outputs.hit != 'true' }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: "sglang-grpc-cpu"
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        env:
+          UV_SYSTEM_PYTHON: "1"
+        run: |
+          uv pip install -e "python" --index-strategy unsafe-best-match --prerelease allow
+          uv pip install pytest
+          uv pip install -e "tools/sglang-simulator[aic]"
+
+      - name: Prebuild HiCache native hash extension
+        timeout-minutes: 5
+        env:
+          MALLOC_ARENA_MAX: "2"
+          MAX_JOBS: "1"
+          TORCH_EXTENSIONS_DIR: ${{ runner.temp }}/torch-extensions
+        run: |
+          python3 -c \
+            'from sglang.srt.mem_cache.cpp_utils.native_hash import get_native_hash; get_native_hash([1], None)'
+
+      - name: Run SGLang Simulator compatibility tests
+        timeout-minutes: 10
+        env:
+          MALLOC_ARENA_MAX: "2"
+          MAX_JOBS: "1"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          TORCH_EXTENSIONS_DIR: ${{ runner.temp }}/torch-extensions
+        run: |
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_runner.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_serving.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_cache_hit_ratio.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_offline_blocking.py

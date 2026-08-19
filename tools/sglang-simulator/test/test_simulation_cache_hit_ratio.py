@@ -8,7 +8,10 @@ from test_simulation_sglang_serving import (
 )
 
 
-def test_second_replay_benchmark_hits_all_reusable_prefix_tokens(tmp_path):
+def test_second_replay_benchmark_hits_all_reusable_prefix_tokens(tmp_path, monkeypatch):
+    # This test validates cache reuse across consecutive benchmark runs.
+    monkeypatch.setenv("SGLANG_IS_IN_CI", "false")
+
     runner = SGLangServingRunner(SIM_CONFIGS["replay"], tmp_path)
     try:
         first_metrics = runner.benchmark(tmp_path / "benchmark-first.json")

@@ -36,15 +36,14 @@ class C_HiCacheController(BaseHook):
         def wrapped_init(self, *args, **kwargs):
             self.sim_prefetch_buffer = Queue()
             result = original_init(self, *args, **kwargs)
-            # v0.5.16 creates this queue inside the real IO thread. SGLang Simulator
-            # replaces that thread, so create the scheduler/IO handoff here.
+            # The real IO thread normally creates this queue. The simulator
+            # replaces that thread, so initialize the handoff queue here.
             if hasattr(self, "prefetch_hit_queue"):
                 self.prefetch_buffer = Queue()
             return result
 
         def wrapped_append_host_mem_release(self, host_indices):
-            # A terminated v0.5.16 prefetch may not have allocated host memory
-            # yet. There is nothing to release in that case.
+            # A terminated prefetch may not have allocated host memory yet.
             if host_indices is None:
                 return
             return original_append_host_mem_release(self, host_indices)
@@ -124,8 +123,7 @@ class C_HiCacheController(BaseHook):
                             : (storage_hit_count // self.page_size)
                         ]
                         if hasattr(self, "prefetch_hit_queue"):
-                            # v0.5.16 allocates exactly the storage-hit length
-                            # on the scheduler thread before simulated transfer.
+                            # Allocate only the storage-hit range on the scheduler.
                             operation.storage_hit_count = storage_hit_count
                             self.prefetch_hit_queue.put(operation)
                             continue
@@ -181,9 +179,8 @@ class C_HiCacheController(BaseHook):
                             operation.host_indices[storage_hit_count:]
                         )
 
-            # v0.5.16's scheduler-side HiRadixCache moves queried operations
-            # here after allocating host pages. Feed them into the existing
-            # virtual-time transfer loop.
+            # Feed operations whose host pages were allocated by the scheduler
+            # into the virtual-time transfer loop.
             prefetch_buffer = getattr(self, "prefetch_buffer", None)
             if prefetch_buffer is not None:
                 while not prefetch_buffer.empty():
