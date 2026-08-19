@@ -73,6 +73,19 @@ docker pull lmsysorg/sgl-model-gateway:latest
 cargo build --release
 ```
 
+### FIPS Builds
+For FedRAMP / IL4-IL5 environments, build with the `fips` feature to use the
+FIPS 140-3 validated AWS-LC cryptographic module (instead of ring) for all
+TLS, JWT signature verification, and SHA-256 hashing:
+```bash
+# Requires cmake and Go at build time (used to compile AWS-LC)
+cargo build --release --features fips
+```
+Default builds are unaffected. Non-cryptographic hashing (blake3/xxhash for
+request routing and cache-aware load balancing) is not security-relevant and
+is unchanged in both builds. For full-stack compliance, run the FIPS binary
+on a FIPS-enabled base image (e.g. Chainguard FIPS) with a FIPS kernel.
+
 ### Python Package
 ```bash
 pip install maturin

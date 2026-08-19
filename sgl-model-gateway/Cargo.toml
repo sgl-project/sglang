@@ -14,6 +14,21 @@ grpc-server = []
 
 vendored-openssl = ["openssl/vendored"]
 
+# Use the AWS-LC FIPS module for all cryptography: rustls-based TLS,
+# JWT signature verification, and SHA-256 hashing. Requires cmake and Go
+# at build time. Default (non-fips) builds are unaffected.
+# The bundled AWS-LC FIPS module version follows the latest aws-lc-fips-sys
+# release; record the module version from the built binary
+# (`strings <binary> | grep "AWS-LC FIPS"`) and re-check the CMVP certificate
+# status when it changes (see https://github.com/aws/aws-lc/blob/main/crypto/fipsmodule/FIPS.md).
+fips = [
+    "rustls/fips",
+    "jsonwebtoken/aws_lc_rs",
+    "dep:aws-lc-rs",
+    "aws-lc-rs/fips",
+    "dep:aws-lc-fips-sys",
+]
+
 [lints.rust]
 unused_qualifications = "warn"
 
@@ -83,13 +98,15 @@ reasoning-parser = "=1.0.0"
 openai-protocol = { version = "=1.0.0", features = ["axum"] }
 tool-parser = "=1.0.0"
 llm-tokenizer = "=1.3.2"
-smg-auth = "=1.0.0"
+smg-auth = "=1.2.2"
 wfaas = "=1.0.0"
 data-connector = "=1.0.0"
 smg-mcp = "=1.0.0"
 smg-wasm = "=1.0.0"
 smg-mesh = "=1.0.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+aws-lc-rs = { version = "1", optional = true }
+aws-lc-fips-sys = { version = "0.14", optional = true }
 rustls-pemfile = "2.2"
 openssl = "0.10.73"
 rmcp = { version = "0.8.3", features = ["client", "server",
@@ -102,7 +119,7 @@ rmcp = { version = "0.8.3", features = ["client", "server",
     "auth"] }
 serde_yaml = "0.9"
 subtle = "2.6"
-jsonwebtoken = { version = "9.3", default-features = false, features = ["use_pem"] }
+jsonwebtoken = { version = "10.4", default-features = false, features = ["use_pem", "rust_crypto"] }
 num-traits = "0.2"
 num-bigint = "0.4"
 base64 = "0.22"

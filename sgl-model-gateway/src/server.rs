@@ -13,7 +13,6 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use smg_mesh::{
@@ -696,6 +695,8 @@ pub fn build_app(
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
+    crate::crypto::ensure_crypto_provider_installed();
+
     if let Some(trace_config) = &config.router_config.trace_config {
         otel_trace::otel_tracing_init(
             trace_config.enable_trace,
@@ -1069,10 +1070,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         &config.router_config.server_key,
     ) {
         info!("TLS enabled");
-        ring::default_provider()
-            .install_default()
-            .map_err(|e| format!("Failed to install rustls ring provider: {e:?}"))?;
-
         let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
             .await
             .map_err(|e| format!("Failed to create TLS config: {}", e))?;

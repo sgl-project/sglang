@@ -23,7 +23,7 @@ fn ensure_crypto_provider() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        smg::crypto::ensure_crypto_provider_installed();
     });
 }
 
