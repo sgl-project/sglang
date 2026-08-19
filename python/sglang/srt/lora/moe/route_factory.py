@@ -51,43 +51,6 @@ class MoeLoraRoutes:
         return route
 
 
-def _fused_align_scratch(
-    workspace: MoeLoraWorkspace,
-    *,
-    prefix: str,
-    num_buckets: int,
-    device: torch.device,
-) -> FusedAlignScratch:
-    """Return route-owned metadata whose count-zero invariant is self-restoring."""
-    return FusedAlignScratch(
-        counts=workspace.tensor(
-            f"{prefix}:counts",
-            (num_buckets,),
-            dtype=torch.int32,
-            device=device,
-            zero_on_first_allocation=True,
-        ),
-        block_cumulative=workspace.tensor(
-            f"{prefix}:block_cumulative",
-            (num_buckets + 1,),
-            dtype=torch.int32,
-            device=device,
-        ),
-        cursor=workspace.tensor(
-            f"{prefix}:cursor",
-            (num_buckets,),
-            dtype=torch.int32,
-            device=device,
-        ),
-        bucket_end=workspace.tensor(
-            f"{prefix}:bucket_end",
-            (num_buckets,),
-            dtype=torch.int32,
-            device=device,
-        ),
-    )
-
-
 def _aligned_pair_route(
     topk_ids: torch.Tensor,
     token_slots: torch.Tensor,
@@ -108,23 +71,28 @@ def _aligned_pair_route(
     its own metadata without paying for unused fused scratch.
     """
     lora_experts_per_adapter = 1 if is_shared_outer else num_local_experts
+    num_virtual_experts = lora_experts_per_adapter * max_loras
     padded_count = None
     scratch = None
-    if uses_fused_align(
-        topk_ids,
-        num_virtual_experts=lora_experts_per_adapter * max_loras,
-    ):
-        padded_count = workspace.tensor(
-            f"{scratch_prefix}:padded_pairs",
-            (1,),
-            dtype=torch.int32,
-            device=topk_ids.device,
-        )
-        scratch = _fused_align_scratch(
-            workspace,
-            prefix=scratch_prefix,
-            num_buckets=lora_experts_per_adapter * max_loras + 1,
-            device=topk_ids.device,
+    if uses_fused_align(topk_ids, num_virtual_experts=num_virtual_experts):
+        device = topk_ids.device
+        num_buckets = num_virtual_experts + 1
+
+        def counter(name: str, size: int, *, zero_first: bool = False):
+            return workspace.tensor(
+                f"{scratch_prefix}:{name}",
+                (size,),
+                dtype=torch.int32,
+                device=device,
+                **({"zero_on_first_allocation": True} if zero_first else {}),
+            )
+
+        padded_count = counter("padded_pairs", 1)
+        scratch = FusedAlignScratch(
+            counts=counter("counts", num_buckets, zero_first=True),
+            block_cumulative=counter("block_cumulative", num_buckets + 1),
+            cursor=counter("cursor", num_buckets),
+            bucket_end=counter("bucket_end", num_buckets),
         )
     # These two move together, and validate_shared_outer enforces it: a shared
     # adapter has exactly ONE LoRA expert, so the validity test would end in
