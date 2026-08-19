@@ -213,7 +213,7 @@ class TestSamplingMask(SamplingMaskTestMixin, CustomTestCase):
         self.assertEqual(response.status_code, 200, response.text)
 
         choice = response.json()["choices"][0]
-        output_ids = choice["token_ids"]
+        output_ids = choice["response_token_ids"]
         meta_info = choice["meta_info"]
         sampling_masks = meta_info["output_token_sampling_mask"]
         sampling_logprobs = meta_info["output_token_sampling_logprobs"]
