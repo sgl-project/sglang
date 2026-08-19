@@ -1219,11 +1219,11 @@ class MQALayer(MqaAttentionBase):
             envs.SGLANG_OPT_FUSED_QK_NORM_ROPE_VERIFY.get()
             and forward_batch.forward_mode.is_target_verify()
         )
-        do_fused_store = (unified and (is_decode or fuse_verify)) or (
+        do_fused_qk_norm_rope = (unified and (is_decode or fuse_verify)) or (
             not unified and self.use_fused_qk_norm_rope
         )
 
-        if do_fused_store:
+        if do_fused_qk_norm_rope:
             if _is_gfx95_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
