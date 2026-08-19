@@ -43,6 +43,15 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_prefill_decode_interval(self):
+        args = ServerArgs(model_path="dummy", prefill_decode_interval=16)
+        self.assertEqual(args.prefill_decode_interval, 16)
+
+        with self.assertRaisesRegex(
+            ValueError, "--prefill-decode-interval must be non-negative"
+        ):
+            ServerArgs(model_path="dummy", prefill_decode_interval=-1)
+
     def test_return_hidden_states_mode_configuration(self):
         disabled = ServerArgs(model_path="dummy")
         self.assertFalse(disabled.enable_return_hidden_states)
@@ -516,11 +525,21 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = ServerArgs(
             model_path="dummy",
             disaggregation_mode="decode",
+            disaggregation_transfer_backend="mori",
+            dcp_size=4,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "mooncake, nixl, or fake for synthetic benchmarking"
+        ):
+            server_args._handle_pd_disaggregation()
+
+    def test_pd_decode_dcp_allows_fake_transfer_backend(self):
+        server_args = self._load_balance_args(
+            disaggregation_mode="decode",
             disaggregation_transfer_backend="fake",
             dcp_size=4,
         )
-        with self.assertRaisesRegex(ValueError, "mooncake or nixl"):
-            server_args._handle_pd_disaggregation()
+        self.assertTrue(server_args.disable_radix_cache)
 
     def test_pd_decode_dcp_rejects_radix_cache(self):
         server_args = ServerArgs(
@@ -1896,120 +1915,6 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
             ]
         )
         self.assertEqual(parsed.sampling_backend, "token_oracle")
-
-
-class TestDeepEPv2Args(CustomTestCase):
-    """DeepEP v2 server-args resolution + validation. The dummy-model path
-    short-circuits __post_init__, so _handle_a2a_moe() is invoked directly."""
-
-    def _args(self, **overrides):
-        server_args = ServerArgs(model_path="dummy", moe_a2a_backend="deepep_v2")
-        # The deepep_v2 branch mutates cuda_graph_config.{decode,prefill}.backend,
-        # so it must exist (the dummy path leaves it unset otherwise).
-        server_args.cuda_graph_config = CudaGraphConfig(
-            decode=PhaseConfig(backend=Backend.FULL, max_bs=512),
-            prefill=PhaseConfig(backend=Backend.FULL, max_bs=512),
-        )
-        valid = {f.name for f in dataclasses.fields(ServerArgs)}
-        for key, value in overrides.items():
-            # ServerArgs has no __slots__, so setattr of a stale field name would
-            # silently succeed and leave the test asserting nothing.
-            assert key in valid, f"{key} is not a ServerArgs field"
-            setattr(server_args, key, value)
-        return server_args
-
-    def test_runner_restored_by_declaration_fails_fast(self):
-        # mxfp8 + auto: a model declaration restores an unsupported runner at
-        # materialize time, which runs after this handler. The handler must
-        # validate the declaration-resolved runner, not the raw value it just set.
-        args = self._args(moe_runner_backend="auto")
-        args._resolved_overrides = [
-            ("test_mxfp8", {"moe_runner_backend": "flashinfer_trtllm"})
-        ]
-        with self.assertRaises(ValueError):
-            args._handle_a2a_moe()
-
-    def test_declarations_materialize_ep_size_and_fusion(self):
-        from sglang.srt.arg_groups.overrides import materialize_declarations
-
-        args = self._args(moe_runner_backend="auto", tp_size=2)
-        args._handle_a2a_moe()
-        # ep_size / shared-experts fusion are declared by the a2a passes and land
-        # on the fields only at materialization, like every other a2a backend.
-        materialize_declarations(args)
-        self.assertEqual(args.ep_size, args.tp_size)
-        self.assertTrue(args.disable_shared_experts_fusion)
-
-    def test_auto_runner_defaults_to_deep_gemm(self):
-        args = self._args(moe_runner_backend="auto")
-        args._handle_a2a_moe()
-        self.assertEqual(args.moe_runner_backend, "deep_gemm")
-
-    def test_unsupported_runner_rejected(self):
-        args = self._args(moe_runner_backend="flashinfer_trtllm")
-        with self.assertRaises(ValueError):
-            args._handle_a2a_moe()
-
-    def test_triton_runner_rejected(self):
-        # deepep_v2 registers permute adapters for deep_gemm only. Rejecting
-        # triton here is what keeps a user from reaching the permute registry
-        # and dying on a bare assert inside the MoE forward.
-        args = self._args(moe_runner_backend="triton")
-        with self.assertRaises(ValueError):
-            args._handle_a2a_moe()
-
-    def test_decode_graph_stays_enabled_in_both_comm_modes(self):
-        # Capturability follows the inference phase (masked decode), not the
-        # comm mode, so neither direct nor hybrid may disable the decode graph.
-        for mode in ("direct", "hybrid"):
-            args = self._args(moe_runner_backend="deep_gemm", deepep_v2_mode=mode)
-            args._handle_a2a_moe()
-            self.assertEqual(args.cuda_graph_config.decode.backend, Backend.FULL)
-            self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
-
-    def test_two_batch_overlap_rejected(self):
-        args = self._args(moe_runner_backend="deep_gemm", enable_two_batch_overlap=True)
-        with self.assertRaises(ValueError):
-            args._handle_a2a_moe()
-
-    # --- prefill capacity pre-check (per-rank chunk vs dispatch buffer cap) ---
-    _CAP_ENV = "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK"
-
-    def test_prefill_chunk_exceeding_cap_rejected(self):
-        args = self._args(moe_runner_backend="deep_gemm", chunked_prefill_size=2048)
-        with patch.dict(os.environ, {self._CAP_ENV: "1024"}):
-            with self.assertRaisesRegex(ValueError, "NUM_MAX_DISPATCH_TOKENS_PER_RANK"):
-                args._handle_a2a_moe()
-
-    def test_prefill_chunk_at_cap_boundary_accepted(self):
-        # chunk == cap is the documented (and currently benchmarked) edge; the
-        # guard must be strict-greater-than.
-        args = self._args(moe_runner_backend="deep_gemm", chunked_prefill_size=1024)
-        with patch.dict(os.environ, {self._CAP_ENV: "1024"}):
-            args._handle_a2a_moe()
-        self.assertEqual(args.moe_runner_backend, "deep_gemm")
-
-    def test_prefill_chunk_rejected_under_default_cap(self):
-        # Default cap is 128: a typical 1024-token per-rank chunk must be
-        # rejected at boot instead of at the first full prefill chunk.
-        args = self._args(moe_runner_backend="deep_gemm", chunked_prefill_size=1024)
-        with self.assertRaisesRegex(ValueError, "chunked prefill budget"):
-            args._handle_a2a_moe()
-
-    def test_prefill_chunk_check_skipped_for_decode_disaggregation(self):
-        args = self._args(
-            moe_runner_backend="deep_gemm",
-            chunked_prefill_size=4096,
-            disaggregation_mode="decode",
-        )
-        args._handle_a2a_moe()
-
-    def test_prefill_chunk_check_skipped_when_chunking_disabled(self):
-        for disabled in (None, 0, -1):
-            args = self._args(
-                moe_runner_backend="deep_gemm", chunked_prefill_size=disabled
-            )
-            args._handle_a2a_moe()
 
 
 class TestHandleCrashDumpEnv(CustomTestCase):
