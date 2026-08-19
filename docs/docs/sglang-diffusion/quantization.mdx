@@ -772,7 +772,7 @@ does, and the 6× slower decode is the price of fitting.
 | --- | --- |
 | TP shard boundaries must align to GGML blocks | Column-parallel rows shard directly; row-parallel packed columns require each local input partition to contain whole quantization blocks |
 | No `--use-fsdp-inference` | FSDP does not preserve the GGUF packed-block layout |
-| CUDA only | The reused SRT GGML matmul kernels currently ship for CUDA |
+| CUDA only | The reused SRT GGML dequantization kernel currently ships for CUDA |
 | Native byte order only | A quantized block embeds its scales, so a non-native file cannot be byte-swapped as a whole |
 | No LoRA, and none of the H3 AdaLN cache flags | An adapter cannot be merged into packed blocks, and the AdaLN paths read the transformer's safetensors |
 | No `--quantization` | The checkpoint fixes the quantization; the flag would be a second, conflicting selector |
@@ -789,12 +789,14 @@ startup rejects a degree that cuts a row-parallel matrix inside a GGML block.
 | Model | Checkpoint | Hardware | Result |
 | --- | --- | --- | --- |
 | MiniMax-H3 `fl2va` | [`leejet/MiniMax-H3-GGUF`](https://huggingface.co/leejet/MiniMax-H3-GGUF) `minimax_h3_fl2va-Q4_K_M.gguf` (17.5 GiB) | 1x RTX 5090 (32 GiB) | t2va 1344x768, 107 frames, video + audio; 19.6-26.3 GiB peak depending on VAE offload |
+| MiniMax-H3 `fl2va` | `minimax_h3_fl2va-Q4_K_M.gguf` (17.5 GiB) | 1x H200 (141 GiB) | 2-step t2va 1344x768, 107 frames, H.264 + AAC; 10.13 s and 17.17 GiB peak |
+| MiniMax-H3 `fl2va`, pruned AdaLN curve | [`unsloth/MiniMax-H3-GGUF`](https://huggingface.co/unsloth/MiniMax-H3-GGUF) `minimax_h3_fl2va_pruned-Q4_K.gguf` (10.7 GiB loaded DiT) | 1x H200 (141 GiB) | 2-step t2va 1344x768, 107 frames, H.264 + AAC |
 
 The DiT loads at 17.5 GiB against 61.7 GiB for the BF16 checkpoint. Weight
 fidelity was checked tensor-by-tensor against the BF16 reference: cosine
 1.00000 for the F32/BF16 tensors and 0.9973 for Q4_K/Q4_0.
 
-Not validated in the measurement above: any other quantization type, the
+Not validated in the measurements above: any other quantization type, the
 `ref2va` partition, multi-GPU, and a BF16-vs-GGUF output comparison.
 
 ## Nunchaku (SVDQuant)
