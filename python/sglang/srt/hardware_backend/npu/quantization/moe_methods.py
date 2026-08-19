@@ -197,8 +197,15 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
             process_fuseep_weights,
         )
 
-        for prefix in ("w13", "w2"):
-            process_fuseep_weights(layer, prefix)
+        # Mode 3 converts both projections atomically.  Modes 1/2 retain the
+        # per-prefix processing used by the existing FuseEP implementations.
+        from sglang.srt.runtime_context import get_exec
+
+        if get_exec().moe.fuseep_mode == 3:
+            process_fuseep_weights(layer, "w13")
+        else:
+            for prefix in ("w13", "w2"):
+                process_fuseep_weights(layer, prefix)
         layer._fuseep_weights_processed = True
         return True
 
@@ -346,7 +353,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
         # If the FuseEP weight layout is used, process weights via
-        # maybe_apply_fuseep_weights and skip the rest of this method.
+        # maybe_process_fuseep_weights and skip the rest of this method.
         if self.maybe_process_fuseep_weights(layer):
             return
 
