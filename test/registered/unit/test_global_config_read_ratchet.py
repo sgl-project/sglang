@@ -52,6 +52,23 @@ _SLOT_OWNERS = ("srt/runtime_context.py", "srt/server_args.py", "srt/arg_groups/
 # live topology cannot answer there. The test below asserts this map is exactly
 # the set of call sites, so the reasons cannot drift away from the code.
 _CONFIGURED_SIZE_CALL_SITES = {
+    ("srt/entrypoints/engine.py", "configured_pp_size"): (
+        "the launch path decides how many scheduler processes to spawn; it runs "
+        "before any of them exists, so there is no group to ask"
+    ),
+    ("srt/ray/engine.py", "configured_pp_size"): (
+        "the Ray driver sizes the actor placement group; the actors it is about "
+        "to create are the ones that will hold the process groups"
+    ),
+    ("srt/ray/data_parallel_controller.py", "configured_pp_size"): (
+        "same placement arithmetic on the DP path -- ranks per TP group, "
+        "computed in the driver before the actors start"
+    ),
+    ("srt/ray/data_parallel_controller.py", "configured_attn_cp_size"): (
+        "the attention-CP factor of that same placement arithmetic, and the one "
+        "size whose live value cannot express the configured intent when "
+        "attn_cp_size > moe_dp_size aliases the groups"
+    ),
     ("srt/layers/attention/dsa/dsa_indexer.py", "configured_pp_size"): (
         "gates `pp_size > 1 and not get_pp_group()...`; the short circuit is the "
         "point, since with PP off the group is never touched, which is what lets "
@@ -75,6 +92,31 @@ _CONFIGURED_SIZE_CALL_SITES = {
         "the configuration this predicate detects (attn_cp_size > moe_dp_size) is "
         "the one where initialize_model_parallel aliases _MOE_DP to _ATTN_CP, so "
         "the live sizes are equal there and a live comparison is always false"
+    ),
+    ("srt/managers/scheduler.py", "configured_tp_size"): (
+        "configure_scheduler_process runs before the scheduler's own process "
+        "groups exist -- configuring the process is what it is for -- so there "
+        "is nothing live to ask yet"
+    ),
+    ("srt/managers/scheduler.py", "configured_moe_dp_size"): (
+        "same pre-distributed-init arithmetic in configure_scheduler_process"
+    ),
+    ("srt/managers/scheduler.py", "configured_attn_cp_size"): (
+        "same pre-distributed-init arithmetic in configure_scheduler_process"
+    ),
+    ("srt/utils/cuda_vmm_transport_utils.py", "configured_tp_size"): (
+        "the consumer count is configured fan-out arithmetic (tp_size // "
+        "dp_size), which is what the record answered before"
+    ),
+    ("srt/disaggregation/encode_server.py", "configured_tp_size"): (
+        "the encode server's launch entry sizes its workers before it has "
+        "spawned any of them"
+    ),
+    ("srt/utils/common.py", "configured_tp_size"): (
+        "the require_*_tp_gather predicates compared the configured tp_size "
+        "when they read the record; the live property answers a different "
+        "question wherever the groups alias, so the configured accessor is the "
+        "mechanical substitution and the live one would be a semantic change"
     ),
     ("srt/model_loader/loader.py", "configured_moe_dp_size"): (
         "the same dict already carries the live moe_dp_size under 'dp'; this entry "
