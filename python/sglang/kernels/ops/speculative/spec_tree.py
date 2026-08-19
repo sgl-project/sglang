@@ -174,6 +174,191 @@ def sgl_build_tree_kernel_efficient_triton(
 
 
 @triton.jit
+def tree_speculative_sampling_target_only_kernel_triton(
+    predicts_ptr,
+    accept_index_ptr,
+    accept_token_num_ptr,
+    candidates_ptr,
+    retrieve_index_ptr,
+    retrieve_next_token_ptr,
+    retrieve_next_sibling_ptr,
+    uniform_samples_ptr,
+    uniform_samples_for_final_sampling_ptr,
+    target_probs_ptr,
+    draft_probs_ptr,
+    threshold_single,
+    threshold_acc,
+    # Strides
+    stride_cand_b,
+    stride_cand_s,
+    stride_idx_b,
+    stride_idx_s,
+    stride_acc_b,
+    stride_acc_s,
+    stride_uni_b,
+    stride_uni_s,
+    stride_tp_b,
+    stride_tp_s,
+    stride_tp_v,
+    stride_dp_b,
+    stride_dp_s,
+    stride_dp_v,
+    # Constants
+    num_speculative_tokens: tl.constexpr,
+    num_draft_tokens: tl.constexpr,
+    vocab_size: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    """Triton port of sgl-kernel's TreeSpeculativeSamplingTargetOnly.
+
+    Walks the draft tree accepting nodes against the target distribution, then
+    samples the first rejected (or bonus) token from the residual
+    ``relu(target_probs - draft_probs)``. One program per batch item.
+
+    Kept semantically identical to
+    ``sgl-kernel/csrc/speculative/speculative_sampling.cuh`` so devices without
+    that CUDA kernel (ROCm) keep the same sampling distribution. In particular
+    the rejected-token write-back into ``draft_probs`` is what makes the
+    "target only" variant exclude already-rejected tokens from the residual.
+    """
+    bx = tl.program_id(0)
+
+    cand_base = bx * stride_cand_b
+    idx_base = bx * stride_idx_b
+    uni_base = bx * stride_uni_b
+
+    # Current row of target_probs/draft_probs, as a step index within the batch item.
+    cur_prob_step = tl.cast(0, tl.int32)
+    prob_acc = tl.cast(0.0, tl.float32)
+    coin = tl.load(uniform_samples_ptr + uni_base)
+
+    last_accept_retrieve_idx = tl.load(retrieve_index_ptr + idx_base)
+    tl.store(accept_index_ptr + bx * stride_acc_b, last_accept_retrieve_idx)
+    num_accept_tokens = tl.cast(0, tl.int32)
+    cur_index = tl.cast(0, last_accept_retrieve_idx.dtype)
+
+    walking = tl.cast(1, tl.int32)
+    for _level in range(1, num_speculative_tokens):
+        if walking == 1:
+            cur_index = tl.load(
+                retrieve_next_token_ptr + idx_base + cur_index * stride_idx_s
+            )
+            accepted_level = tl.cast(0, tl.int32)
+            # Sibling scan: at most num_draft_tokens siblings on a level.
+            for _sibling in range(num_draft_tokens):
+                if accepted_level == 0:
+                    if cur_index != -1:
+                        draft_index = tl.load(
+                            retrieve_index_ptr + idx_base + cur_index * stride_idx_s
+                        )
+                        draft_token = tl.load(
+                            candidates_ptr + cand_base + cur_index * stride_cand_s
+                        )
+                        prob_offset = (
+                            bx * stride_tp_b
+                            + cur_prob_step * stride_tp_s
+                            + draft_token * stride_tp_v
+                        )
+                        target_prob_single = tl.load(target_probs_ptr + prob_offset)
+                        prob_acc += target_prob_single
+
+                        if (coin <= prob_acc / threshold_acc) | (
+                            target_prob_single >= threshold_single
+                        ):
+                            prob_acc = tl.cast(0.0, tl.float32)
+                            cur_prob_step = cur_index.to(tl.int32)
+                            coin = tl.load(
+                                uniform_samples_ptr
+                                + uni_base
+                                + cur_index * stride_uni_s
+                            )
+                            tl.store(
+                                predicts_ptr + last_accept_retrieve_idx,
+                                draft_token.to(tl.int32),
+                            )
+                            num_accept_tokens += 1
+                            tl.store(
+                                accept_index_ptr
+                                + bx * stride_acc_b
+                                + num_accept_tokens * stride_acc_s,
+                                draft_index,
+                            )
+                            last_accept_retrieve_idx = draft_index
+                            accepted_level = tl.cast(1, tl.int32)
+                        else:
+                            # Mask this token out of the residual distribution.
+                            tl.store(
+                                draft_probs_ptr
+                                + bx * stride_dp_b
+                                + cur_prob_step * stride_dp_s
+                                + draft_token * stride_dp_v,
+                                target_prob_single,
+                            )
+                            cur_index = tl.load(
+                                retrieve_next_sibling_ptr
+                                + idx_base
+                                + cur_index * stride_idx_s
+                            )
+            if accepted_level == 0:
+                walking = tl.cast(0, tl.int32)
+
+    tl.store(accept_token_num_ptr + bx, num_accept_tokens)
+
+    # Sample the first rejected (or bonus) token from relu(target - draft).
+    coin_final = tl.load(uniform_samples_for_final_sampling_ptr + bx)
+    # No draft distribution exists for the bonus token: every level was accepted.
+    all_drafts_accepted = num_accept_tokens == num_speculative_tokens - 1
+
+    tp_base_ptr = target_probs_ptr + bx * stride_tp_b + cur_prob_step * stride_tp_s
+    dp_base_ptr = draft_probs_ptr + bx * stride_dp_b + cur_prob_step * stride_dp_s
+
+    # Pass 1: normalization constant.
+    norm_sum = tl.cast(0.0, tl.float32)
+    for v_start in range(0, vocab_size, BLOCK_V):
+        v_offsets = v_start + tl.arange(0, BLOCK_V)
+        mask = v_offsets < vocab_size
+        p_val = tl.load(tp_base_ptr + v_offsets * stride_tp_v, mask=mask, other=0.0)
+        if all_drafts_accepted:
+            val = p_val
+        else:
+            q_val = tl.load(dp_base_ptr + v_offsets * stride_dp_v, mask=mask, other=0.0)
+            diff = p_val - q_val
+            val = tl.where(diff > 0.0, diff, 0.0)
+        norm_sum += tl.sum(val)
+
+    # Pass 2: inverse CDF. A degenerate residual (norm_sum == 0) leaves the
+    # cumsum at 0 <= target_u and falls back to vocab_size - 1, matching
+    # reject_sampling.py's chain kernel.
+    target_u = coin_final * norm_sum
+    cum_sum = tl.cast(0.0, tl.float32)
+    final_token = vocab_size - 1
+    found = 0
+
+    for v_start in range(0, vocab_size, BLOCK_V):
+        if found == 0:
+            v_offsets = v_start + tl.arange(0, BLOCK_V)
+            mask = v_offsets < vocab_size
+            p_val = tl.load(tp_base_ptr + v_offsets * stride_tp_v, mask=mask, other=0.0)
+            if all_drafts_accepted:
+                val = p_val
+            else:
+                q_val = tl.load(
+                    dp_base_ptr + v_offsets * stride_dp_v, mask=mask, other=0.0
+                )
+                diff = p_val - q_val
+                val = tl.where(diff > 0.0, diff, 0.0)
+
+            total_cumsum = cum_sum + tl.cumsum(val, axis=0)
+            hits = total_cumsum > target_u
+            if tl.max(hits, axis=0):
+                final_token = v_start + tl.argmax(hits.to(tl.int32), axis=0)
+                found = 1
+            cum_sum += tl.sum(val)
+
+    tl.store(predicts_ptr + last_accept_retrieve_idx, final_token)
+
+
+@triton.jit
 def verify_tree_greedy_kernel_triton(
     predicts_ptr,
     accept_index_ptr,

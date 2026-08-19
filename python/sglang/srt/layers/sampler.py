@@ -750,6 +750,58 @@ def sampling_from_probs_torch(
     return batch_next_token_ids
 
 
+def top_k_top_p_normalize_probs_torch(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+):
+    """Torch equivalent of ``top_k_renorm_prob`` followed by ``top_p_renorm_prob``.
+
+    Used where the sgl_kernel renorm ops are unavailable (e.g. ROCm, which does
+    not build them). One sort serves both filters, but the intermediate
+    renormalization is required: the CUDA path applies top-p to the already
+    top-k-renormalized distribution, so folding both masks in before
+    normalizing would cut top-p more aggressively than CUDA does.
+
+    Top-k discards everything past rank ``max(top_ks)``, so a bounded top-k lets
+    us rank only that prefix instead of the whole vocab -- a full sort over a
+    150k vocab costs several ms per call. Falls back to a full sort when top-k
+    keeps everything (top-p alone still needs the full ranking).
+
+    Top-p is applied as a probability threshold, not a rank cut: the smallest
+    nucleus member becomes the pivot and every token tied with it is kept too.
+    That is what the flashinfer kernel behind ``top_p_renorm_prob`` does, so the
+    fallback and the CUDA path agree on tied distributions.
+    """
+    vocab_size = probs.shape[-1]
+    k_max = int(top_ks.max())
+    if k_max < vocab_size:
+        probs_sort, probs_idx = probs.topk(k_max, dim=-1)  # sorted descending
+    else:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+
+    probs_sort[
+        torch.arange(0, probs_sort.shape[-1], device=probs.device).view(1, -1)
+        >= top_ks.view(-1, 1)
+    ] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    # First rank whose inclusive cumulative mass reaches top_p; its probability
+    # is the nucleus pivot. `argmax` on the bool picks the first True, and the
+    # last rank is the fallback when rounding leaves the total just under top_p.
+    reached = probs_sum >= top_ps.view(-1, 1)
+    pivot_rank = torch.where(
+        reached.any(dim=-1, keepdim=True),
+        reached.to(torch.uint8).argmax(dim=-1, keepdim=True),
+        torch.full_like(top_ps.view(-1, 1), probs_sort.shape[-1] - 1, dtype=torch.long),
+    )
+    pivots = probs_sort.gather(-1, pivot_rank)
+    probs_sort[probs_sort < pivots] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    return torch.zeros_like(probs).scatter_(-1, probs_idx, probs_sort)
+
+
 def top_p_normalize_probs_torch(
     probs: torch.Tensor,
     top_ps: torch.Tensor,

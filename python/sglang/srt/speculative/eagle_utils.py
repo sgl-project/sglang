@@ -9,6 +9,7 @@ import torch
 
 from sglang.kernels.ops.speculative.spec_tree import (
     sgl_build_tree_kernel_efficient_triton,
+    tree_speculative_sampling_target_only_kernel_triton,
     verify_tree_greedy_kernel_triton,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
@@ -375,6 +376,66 @@ def verify_tree_greedy_triton(
     )
 
 
+def tree_speculative_sampling_target_only_triton(
+    predicts: torch.Tensor,  # mutable
+    accept_index: torch.Tensor,  # mutable
+    accept_token_num: torch.Tensor,  # mutable
+    candidates: torch.Tensor,
+    # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,  # mutable
+    threshold_single: float,
+    threshold_acc: float,
+    deterministic: bool,  # not used; the Triton kernel is always deterministic
+):
+    """Triton drop-in for sgl_kernel's `tree_speculative_sampling_target_only`."""
+    bs, num_draft_tokens = candidates.shape
+    num_speculative_tokens = accept_index.shape[1]
+    vocab_size = target_probs.shape[-1]
+
+    # Matches the CUDA host-side clamp in speculative_sampling.cuh.
+    threshold_acc = max(threshold_acc, 1e-9)
+
+    tree_speculative_sampling_target_only_kernel_triton[(bs,)](
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        uniform_samples,
+        uniform_samples_for_final_sampling,
+        target_probs,
+        draft_probs,
+        threshold_single,
+        threshold_acc,
+        candidates.stride(0),
+        candidates.stride(1),
+        retrive_index.stride(0),
+        retrive_index.stride(1),
+        accept_index.stride(0),
+        accept_index.stride(1),
+        uniform_samples.stride(0),
+        uniform_samples.stride(1),
+        target_probs.stride(0),
+        target_probs.stride(1),
+        target_probs.stride(2),
+        draft_probs.stride(0),
+        draft_probs.stride(1),
+        draft_probs.stride(2),
+        num_speculative_tokens=num_speculative_tokens,
+        num_draft_tokens=num_draft_tokens,
+        vocab_size=vocab_size,
+        BLOCK_V=4096,
+    )
+
+
 def verify_tree_greedy_func(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
@@ -727,7 +788,7 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -757,11 +818,24 @@ def eagle_sample(
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
     else:
-        from sgl_kernel import (
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-            tree_speculative_sampling_target_only,
-        )
+        if _is_hip:
+            # sgl-kernel's ROCm build (setup_rocm.py) ships neither
+            # speculative_sampling.cu nor flashinfer's renorm.cu, so these three
+            # torch.ops entries do not exist there; use the Triton/torch
+            # equivalents to keep sampling distribution-preserving on HIP.
+            from sglang.srt.layers.sampler import (
+                top_k_top_p_normalize_probs_torch as _renorm_top_k_top_p,
+            )
+
+            tree_speculative_sampling_target_only = (
+                tree_speculative_sampling_target_only_triton
+            )
+        else:
+            from sgl_kernel import (
+                top_k_renorm_prob,
+                top_p_renorm_prob,
+                tree_speculative_sampling_target_only,
+            )
 
         from sglang.kernels.ops.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
@@ -787,26 +861,46 @@ def eagle_sample(
                 next_token_logits / expanded_temperature, dim=-1
             )  # (bs * num_draft_tokens, vocab_size)
             maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-            if sampling_info.need_top_k_sampling:
-                target_probs = top_k_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                    ),
-                )  # (bs * num_draft_tokens, vocab_size)
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_k_renorm"
-                )
-            if sampling_info.need_top_p_sampling:
-                target_probs = top_p_renorm_prob(
-                    target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                    ),
-                )
-                maybe_detect_nan(
-                    target_probs, "v2 verify: target_probs after top_p_renorm"
-                )
+            if _is_hip:
+                # The torch fallback ranks the vocab, so skip it entirely when
+                # neither filter is active (temperature-only batches).
+                if (
+                    sampling_info.need_top_k_sampling
+                    or sampling_info.need_top_p_sampling
+                ):
+                    target_probs = _renorm_top_k_top_p(
+                        target_probs,
+                        torch.repeat_interleave(
+                            sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                        ),
+                        torch.repeat_interleave(
+                            sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                        ),
+                    )
+                    maybe_detect_nan(
+                        target_probs, "v2 verify: target_probs after top_k_top_p_renorm"
+                    )
+            else:
+                if sampling_info.need_top_k_sampling:
+                    target_probs = top_k_renorm_prob(
+                        target_probs,
+                        torch.repeat_interleave(
+                            sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                        ),
+                    )  # (bs * num_draft_tokens, vocab_size)
+                    maybe_detect_nan(
+                        target_probs, "v2 verify: target_probs after top_k_renorm"
+                    )
+                if sampling_info.need_top_p_sampling:
+                    target_probs = top_p_renorm_prob(
+                        target_probs,
+                        torch.repeat_interleave(
+                            sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                        ),
+                    )
+                    maybe_detect_nan(
+                        target_probs, "v2 verify: target_probs after top_p_renorm"
+                    )
             target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
             draft_probs = (
                 verify_input.draft_probs
