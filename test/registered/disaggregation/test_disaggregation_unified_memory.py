@@ -1,10 +1,11 @@
 import unittest
 
-from test_disaggregation_kimi_linear import KimiLinearPDParityMixin
-
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
+)
+from sglang.test.server_fixtures.kimi_linear_pd_fixture import (
+    KimiLinearPDParityMixin,
 )
 
 register_cuda_ci(est_time=900, stage="base-b", runner_config="2-gpu-large")
