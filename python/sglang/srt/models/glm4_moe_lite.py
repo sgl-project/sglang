@@ -23,6 +23,9 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.ops.gemm.flashinfer_router_gemm import (
+    try_flashinfer_router_gemm,
+)
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
@@ -166,6 +169,9 @@ class Glm4MoeLiteGate(nn.Module):
         self.register_buffer("_weight_fp32", None, persistent=False)
 
     def forward(self, hidden_states):
+        logits = try_flashinfer_router_gemm(hidden_states, self.weight)
+        if logits is not None:
+            return logits
         if self._weight_fp32 is None:
             self._weight_fp32 = self.weight.data.to(torch.float32)
         logits = F.linear(hidden_states.to(torch.float32), self._weight_fp32, None)
