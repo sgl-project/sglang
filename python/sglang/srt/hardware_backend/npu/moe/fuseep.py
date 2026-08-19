@@ -153,7 +153,7 @@ def _scale_from_float_to_int64(scale: torch.Tensor) -> torch.nn.Parameter:
 def process_fuseep_weights(layer: torch.nn.Module, weight_prefix: str) -> None:
     """Apply the Ascend FuseEP-specific weight layout for a single weight group.
 
-    Invoked by ``maybe_process_fuseep_weights`` for both ``"w13"`` and ``"w2"``.
+    Invoked by ``maybe_apply_fuseep_weights`` for both ``"w13"`` and ``"w2"``.
     """
     fuseep_mode = get_exec().moe.fuseep_mode
     if fuseep_mode == 3:
