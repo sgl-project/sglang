@@ -15,7 +15,11 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_reserve_per_decode,
+    page_aligned_decode_alloc_lens,
+)
+from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
     is_cpu,
@@ -737,6 +741,21 @@ def eagle_sample(
             target_predict=target_predict,
             topk=verify_input.tree_topk,
         )
+
+        if _is_hip:
+            # On ROCm, the per-rank draft tokens can differ, so ranks accept a
+            # different number of drafts, desynchronize the committed seq_lens, and
+            # deadlock the next TP collective. Broadcast from rank 0 to ensure
+            # consistency, the same way the sampling branch below does.
+            tp_group = (
+                get_parallel().attn_tp_group
+                if is_dp_attention_enabled()
+                else get_tp_group()
+            )
+            if tp_group.world_size > 1:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_correct_drafts, src=0)
     else:
         from sgl_kernel import (
             top_k_renorm_prob,
@@ -750,91 +769,106 @@ def eagle_sample(
 
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
 
-        # Apply temperature and get target probs
-        expanded_temperature = torch.repeat_interleave(
-            sampling_info.temperatures, verify_input.draft_token_num, dim=0
-        )  # (bs * num_draft_tokens, 1)
-
-        target_probs = F.softmax(
-            next_token_logits / expanded_temperature, dim=-1
-        )  # (bs * num_draft_tokens, vocab_size)
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        if sampling_info.need_top_k_sampling:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, verify_input.draft_token_num, dim=0
-                ),
-            )  # (bs * num_draft_tokens, vocab_size)
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_k_renorm")
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, verify_input.draft_token_num, dim=0
-                ),
-            )
-            maybe_detect_nan(target_probs, "v2 verify: target_probs after top_p_renorm")
-        target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
-        draft_probs = (
-            verify_input.draft_probs
-            if use_rejection_sampling
-            else torch.zeros_like(target_probs)
-        )
-        # Defense-in-depth behind the spec_hook startup allowlist: validate the
-        # actual kernel inputs (catches draft_probs plumbing regressions or a
-        # startup guard bypassed by a worker subclass) before the Triton kernel.
-        if use_rejection_sampling and (
-            draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
-        ):
-            raise ValueError(
-                "Rejection sampling requires a target-vocab draft proposal "
-                "distribution; the current speculative algorithm/draft worker "
-                "does not produce one (draft_probs missing or vocab-mismatched)."
-            )
-
-        coins, coins_for_final_sampling = _verify_coins(
-            sampling_info=sampling_info,
-            seq_lens=batch.seq_lens,
-            draft_token_num=verify_input.draft_token_num,
-            candidates=candidates,
-            device=device,
-        )
-
         sampling_fn = (
             chain_speculative_sampling_triton
             if use_rejection_sampling
             else tree_speculative_sampling_target_only
         )
-        sampling_fn(
-            predicts=predict,  # mutable
-            accept_index=accept_index,  # mutable
-            accept_token_num=num_correct_drafts,  # mutable
-            candidates=candidates,
-            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-            retrive_index=verify_input.retrieve_index,
-            retrive_next_token=verify_input.retrieve_next_token,
-            retrive_next_sibling=verify_input.retrieve_next_sibling,
-            uniform_samples=coins,
-            uniform_samples_for_final_sampling=coins_for_final_sampling,
-            target_probs=target_probs,
-            draft_probs=draft_probs,
-            threshold_single=get_spec().speculative_accept_threshold_single,
-            threshold_acc=get_spec().speculative_accept_threshold_acc,
-            deterministic=True,
-        )
 
-    # Sync the verify decision across TP ranks: small per-rank differences in the
-    # tensors feeding this point can make one rank accept a different number of
-    # drafts, which desynchronizes the committed seq_lens and deadlocks the next
-    # TP collective. Broadcast from rank 0 to ensure consistency.
-    tp_group = (
-        get_parallel().attn_tp_group if is_dp_attention_enabled() else get_tp_group()
-    )
-    if tp_group.world_size > 1:
-        tp_group.broadcast(predict, src=0)
-        tp_group.broadcast(accept_index, src=0)
-        tp_group.broadcast(num_correct_drafts, src=0)
+        # These full-vocabulary matrices are consumed by the sampling kernel
+        # within this step. Returned tensors were allocated before the scope,
+        # so the next CUDA graph replay may safely reclaim these borrowed bytes.
+        with borrow_graph_pool(user="EAGLE probability borrow"):
+            expanded_temperature = torch.repeat_interleave(
+                sampling_info.temperatures, verify_input.draft_token_num, dim=0
+            )  # (bs * num_draft_tokens, 1)
+
+            target_probs = F.softmax(
+                next_token_logits / expanded_temperature, dim=-1
+            )  # (bs * num_draft_tokens, vocab_size)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+            if sampling_info.need_top_k_sampling:
+                target_probs = top_k_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ks, verify_input.draft_token_num, dim=0
+                    ),
+                )  # (bs * num_draft_tokens, vocab_size)
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_k_renorm"
+                )
+            if sampling_info.need_top_p_sampling:
+                target_probs = top_p_renorm_prob(
+                    target_probs,
+                    torch.repeat_interleave(
+                        sampling_info.top_ps, verify_input.draft_token_num, dim=0
+                    ),
+                )
+                maybe_detect_nan(
+                    target_probs, "v2 verify: target_probs after top_p_renorm"
+                )
+            target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
+            draft_probs = (
+                verify_input.draft_probs
+                if use_rejection_sampling
+                else torch.zeros_like(target_probs)
+            )
+            # Defense-in-depth behind the spec_hook startup allowlist: validate
+            # the actual kernel inputs before the Triton kernel.
+            if use_rejection_sampling and (
+                draft_probs is None or draft_probs.shape[-1] != target_probs.shape[-1]
+            ):
+                raise ValueError(
+                    "Rejection sampling requires a target-vocab draft proposal "
+                    "distribution; the current speculative algorithm/draft worker "
+                    "does not produce one (draft_probs missing or vocab-mismatched)."
+                )
+
+            coins, coins_for_final_sampling = _verify_coins(
+                sampling_info=sampling_info,
+                seq_lens=batch.seq_lens,
+                draft_token_num=verify_input.draft_token_num,
+                candidates=candidates,
+                device=device,
+            )
+            sampling_fn(
+                predicts=predict,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=num_correct_drafts,  # mutable
+                candidates=candidates,
+                # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+                retrive_index=verify_input.retrieve_index,
+                retrive_next_token=verify_input.retrieve_next_token,
+                retrive_next_sibling=verify_input.retrieve_next_sibling,
+                uniform_samples=coins,
+                uniform_samples_for_final_sampling=coins_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=get_spec().speculative_accept_threshold_single,
+                threshold_acc=get_spec().speculative_accept_threshold_acc,
+                deterministic=True,
+            )
+            del (
+                expanded_temperature,
+                target_probs,
+                draft_probs,
+                coins,
+                coins_for_final_sampling,
+            )
+
+        # Sync sampling results across TP ranks: different GPUs may
+        # produce slightly different target_probs due to floating-point
+        # non-determinism in softmax/top_k/top_p, causing different
+        # sampled tokens. Broadcast from rank 0 to ensure consistency.
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
+        )
+        if tp_group.world_size > 1:
+            tp_group.broadcast(predict, src=0)
+            tp_group.broadcast(accept_index, src=0)
+            tp_group.broadcast(num_correct_drafts, src=0)
 
     if SIMULATE_ACC_LEN > 0:
         # Do simulation. The helper builds (and returns) a replacement
@@ -890,26 +924,12 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
     page_size = batch.token_to_kv_pool_allocator.page_size
     double_alloc = get_alloc_reserve_per_decode()
 
-    cur_kv_lens = [0] * bs
-    nxt_kv_lens = [0] * bs
-    num_needed_tokens = 0
-    for i, r in enumerate(batch.reqs):
-        cur = r.kv.kv_allocated_len
-        # max(cur, ...) clamps so adaptive downswitch cannot make nxt < cur.
-        # kv_committed_len is honest (bonus committed in resolve, not here),
-        # so it lags batch.seq_lens by ~1 verify in overlap; 2*alloc absorbs.
-        # Whole-page accounting: the paged allocator hands out full pages, so
-        # round nxt up to the page boundary or the unaligned tail is allocated
-        # but never recorded — a stranded-tail leak at page_size > 1.
-        nxt = max(
-            cur,
-            (r.kv_committed_len + double_alloc + page_size - 1)
-            // page_size
-            * page_size,
-        )
-        cur_kv_lens[i] = cur
-        nxt_kv_lens[i] = nxt
-        num_needed_tokens += nxt - cur
+    cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
+        batch.reqs,
+        reserve=double_alloc,
+        page_size=page_size,
+    )
+    for r in batch.reqs:
         r.decode_batch_idx += 1
 
     cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")

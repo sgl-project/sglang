@@ -1,6 +1,7 @@
 import bisect
 import re
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from typing import Any, Dict, List, Set, Tuple
 
 import torch
@@ -84,7 +85,8 @@ class LayerwiseOffloadManager:
     """A lightweight layerwise CPU offload manager.
 
     This utility offloads per-layer parameters/buffers from GPU to CPU, and
-    supports async H2D prefetch using a dedicated CUDA stream.
+    supports async H2D prefetch using a dedicated CUDA stream. MPS uses
+    synchronous per-layer transfers from the checkpoint-backed CPU tensors.
 
     Typical usage:
     - Construct the manager with the target model and the list-like module
@@ -104,13 +106,23 @@ class LayerwiseOffloadManager:
         pin_cpu_memory: bool = True,
         prefetch_size: int = 1,
         resident_layers: int = 0,
+        initialize: bool = True,
         residency_policy: str = RESIDENCY_POLICY_LEADING,
     ) -> None:
         self.model = model
         self.layers_attr_str = layers_attr_str
         self.num_layers = num_layers
-        self.pin_cpu_memory = pin_cpu_memory
-        self.prefetch_size = min(max(1, prefetch_size), self.num_layers)
+        self._synchronous_mps = current_platform.is_mps()
+        # mps shares physical memory with the CPU and has no pinned host memory
+        # or CUDA-style copy streams
+        self.pin_cpu_memory = bool(pin_cpu_memory and not self._synchronous_mps)
+        # an explicit MPS zero avoids staging the next layer alongside the
+        # active one; MPS has no transfer overlap to recover from that cost
+        self.prefetch_size = (
+            0
+            if current_platform.is_mps() and prefetch_size == 0
+            else min(max(1, prefetch_size), self.num_layers)
+        )
         # Layers held on GPU across denoise steps, instead of being re-streamed
         # every step. `residency_policy` picks *which* layers those are; see
         # compute_streamed_layers for why the choice is not cosmetic.
@@ -134,10 +146,17 @@ class LayerwiseOffloadManager:
         self.enabled = bool(enabled and torch.get_device_module().is_available())
         if not self.enabled:
             return
-        self.device = torch.device(
-            current_platform.device_type, torch.get_device_module().current_device()
+        self.device = (
+            current_platform.get_local_torch_device()
+            if current_platform.is_mps()
+            else torch.device(
+                current_platform.device_type,
+                torch.get_device_module().current_device(),
+            )
         )
-        self.copy_stream = torch.get_device_module().Stream()
+        self.copy_stream = (
+            None if self._synchronous_mps else torch.get_device_module().Stream()
+        )
 
         # ``named_parameters()`` is relative to ``model``, just like the path in
         # ``layers_attr_str``. Anchor the match so a manager for top-level
@@ -153,6 +172,9 @@ class LayerwiseOffloadManager:
         # layer_idx -> {name: pinned_cpu_tensor_with_original_stride}
         # stores tensors whose original non-contiguous stride/layout must be preserved
         self._strided_cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
+        # mps keeps the original CPU tensor for each layer instead of building a
+        # second flattened host copy
+        self._mps_cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
         # layer_idx -> {name: {dtype, offset, numel, shape}}
         # stores the offset and numel of each weight from a same layer, of same dtype
         self._weight_metadata: Dict[int, Dict[str, Dict[str, Any]]] = {}
@@ -168,6 +190,10 @@ class LayerwiseOffloadManager:
         # Store forward hooks for removal
         self._forward_hooks: List[Any] = []
 
+        if initialize:
+            self._initialize()
+
+    def initialize(self) -> None:
         self._initialize()
 
     def _match_layer_idx(self, name: str) -> int | None:
@@ -228,6 +254,10 @@ class LayerwiseOffloadManager:
 
         self._named_parameters = dict(self.model.named_parameters())
         self._named_buffers = dict(self.model.named_buffers())
+
+        if self._synchronous_mps:
+            self._initialize_mps_cpu_weights()
+            return
 
         # 1. collect and group layer parameters by dtype. Keep buffers resident:
         # shared buffers such as RoPE caches may be referenced by many layers.
@@ -361,6 +391,33 @@ class LayerwiseOffloadManager:
             return list(range(count))
         return self._next_streamed(after=-1, count=count)
 
+    @torch.compiler.disable
+    def _initialize_mps_cpu_weights(self) -> None:
+        for name, tensor in self._named_parameters.items():
+            layer_idx = self._match_layer_idx(name)
+            if layer_idx is None or layer_idx >= self.num_layers:
+                continue
+            local_tensor = self._to_local_tensor(tensor).detach()
+            cpu_tensor = (
+                local_tensor
+                if local_tensor.device.type == "cpu"
+                else local_tensor.to("cpu")
+            )
+            self._mps_cpu_weights.setdefault(layer_idx, {})[name] = cpu_tensor
+            self._weight_metadata.setdefault(layer_idx, {})[name] = {
+                "dtype": cpu_tensor.dtype,
+            }
+            tensor.data = self._get_shared_empty_tensor_for_target(
+                tensor, cpu_tensor.dtype
+            )
+
+        torch.mps.empty_cache()
+        self.register_forward_hooks()
+        self._configured = True
+        logger.info(
+            f"Initialized synchronous MPS layerwise offload with {self.num_layers} layers"
+        )
+
     def prepare_for_next_req(self, non_blocking=True):
         """
         Prepare for the next round of denoising loop with prefetching the necessary layers
@@ -435,22 +492,41 @@ class LayerwiseOffloadManager:
         """
         idempotent
         """
-        if not self.enabled or self.device is None or self.copy_stream is None:
+        if not self.enabled or self.device is None:
             return
         if layer_idx < 0 or layer_idx >= self.num_layers:
             return
         if layer_idx in self._gpu_layers:
             return
+        if self._synchronous_mps:
+            cpu_weights = self._mps_cpu_weights.get(layer_idx)
+            if not cpu_weights:
+                return
+            with torch.inference_mode(False), torch.no_grad():
+                for name, cpu_tensor in cpu_weights.items():
+                    target = self.get_target_with_name(name)
+                    target.data = self._wrap_for_target(
+                        target,
+                        cpu_tensor.to(device=self.device, non_blocking=False),
+                    )
+            self._gpu_layers.add(layer_idx)
+            return
         if layer_idx not in self._consolidated_cpu_weights:
             return
-        self.copy_stream.wait_stream(torch.get_device_module().current_stream())
+        if self.copy_stream is not None:
+            self.copy_stream.wait_stream(torch.get_device_module().current_stream())
+            stream_context = torch.get_device_module().stream(self.copy_stream)
+        else:
+            # the device has no CUDA-like stream or pinned-memory support
+            non_blocking = False
+            stream_context = nullcontext()
 
         # create gpu buffer and load from CPU buffer
         gpu_buffers: Dict[torch.dtype, torch.Tensor] = {}
         with (
             torch.inference_mode(False),
             torch.no_grad(),
-            torch.get_device_module().stream(self.copy_stream),
+            stream_context,
         ):
             for dtype, cpu_buffer in self._consolidated_cpu_weights[layer_idx].items():
                 gpu_buffer = torch.empty(
@@ -488,10 +564,11 @@ class LayerwiseOffloadManager:
                 ].view(meta["shape"])
                 target.data = self._wrap_for_target(target, local_tensor)
 
-        # record the prefetch event of this layer after all copies are enqueued
-        event = torch.get_device_module().Event()
-        event.record(self.copy_stream)
-        self._prefetch_events[layer_idx] = event
+        if self.copy_stream is not None:
+            # record after all copies so the consumer waits for every weight copy
+            event = torch.get_device_module().Event()
+            event.record(self.copy_stream)
+            self._prefetch_events[layer_idx] = event
 
         self._gpu_layers.add(layer_idx)
 
@@ -524,6 +601,11 @@ class LayerwiseOffloadManager:
                 )
 
         self._gpu_layers.discard(layer_idx)
+        if self._synchronous_mps:
+            # mps dispatch is asynchronous, so a tensor rebinding alone leaves
+            # prior layer allocations live until the command buffer drains
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
 
     @torch.compiler.disable
     def release_all(self) -> None:
@@ -553,6 +635,10 @@ class LayerwiseOffloadManager:
     def sync_layer_to_cpu(self, layer_idx: int) -> None:
         """Sync a layer's weights from GPU back to CPU."""
         if not self.enabled or layer_idx not in self._gpu_layers:
+            return
+        if self._synchronous_mps:
+            # inference does not mutate parameters; retain the original mapped
+            # tensor instead of materializing a CPU copy after every layer
             return
         if layer_idx not in self._consolidated_cpu_weights:
             return
@@ -616,6 +702,33 @@ class LayerwiseOffloadManager:
             return None
 
         updated_names: Set[str] = set()
+        if self._synchronous_mps:
+            for name, loaded_weight in weight_dict.items():
+                layer_idx = self._match_layer_idx(name)
+                if layer_idx is None:
+                    continue
+                cpu_tensor = self._mps_cpu_weights.get(layer_idx, {}).get(name)
+                if cpu_tensor is None:
+                    continue
+                if tuple(cpu_tensor.shape) != tuple(loaded_weight.shape):
+                    raise ValueError(
+                        f"Shape mismatch for {name}: "
+                        f"expected={tuple(cpu_tensor.shape)}, "
+                        f"loaded={tuple(loaded_weight.shape)}"
+                    )
+                replacement = loaded_weight.to(
+                    device="cpu", dtype=cpu_tensor.dtype
+                ).detach()
+                self._mps_cpu_weights[layer_idx][name] = replacement
+                if layer_idx in self._gpu_layers:
+                    target = self.get_target_with_name(name)
+                    target.data = self._wrap_for_target(
+                        target,
+                        replacement.to(device=target.device, dtype=target.dtype),
+                    )
+                updated_names.add(name)
+            return updated_names
+
         for name, loaded_weight in weight_dict.items():
             layer_idx = self._match_layer_idx(name)
             if layer_idx is None:
@@ -665,6 +778,11 @@ class LayerwiseOffloadManager:
         when offload is enabled, this method returns the real weights and
         can be used for checksum computation.
         """
+        if self._synchronous_mps:
+            for layer_idx in sorted(self._mps_cpu_weights):
+                yield from self._mps_cpu_weights[layer_idx].items()
+            return
+
         for layer_idx in sorted(self._weight_metadata):
             for name, meta in self._weight_metadata[layer_idx].items():
                 if meta.get("preserve_strides", False):
@@ -696,7 +814,7 @@ class LayerwiseOffloadManager:
                 if i not in self._gpu_layers:
                     # LTX audio VAE traverses decoder.up in reverse order
                     self.prefetch_layer(i, non_blocking=False)
-                if i in self._prefetch_events:
+                if i in self._prefetch_events and self.copy_stream is not None:
                     torch.get_device_module().current_stream().wait_event(
                         self._prefetch_events[i]
                     )
@@ -716,7 +834,7 @@ class LayerwiseOffloadManager:
                     ):
                         self.prefetch_layer(layer_to_prefetch, non_blocking=True)
                 # trigger batch prefetch (i + prefetch_size ~ i + 2 * prefetch_size) if needed
-                elif i % self.prefetch_size == 0:
+                elif self.prefetch_size and i % self.prefetch_size == 0:
                     for j in range(i + self.prefetch_size, i + 2 * self.prefetch_size):
                         layer_to_prefetch = j % self.num_layers
                         self.prefetch_layer(layer_to_prefetch, non_blocking=True)
@@ -750,10 +868,105 @@ class LayerwiseOffloadableModuleMixin:
 
     # whether the current module is selected by the `dit` group
     layerwise_offload_dit_group_enabled: bool = True
+    # H3 has a large packed-sequence working set on MPS, so its non-block
+    # weights are materialized only for the subphase that consumes them
+    mps_stream_non_layer_weights: bool = False
 
     # The list of names of this module's layer/block ModuleList or Sequential attributes.
     layer_names: List[str] = []
     layerwise_offload_managers: list[LayerwiseOffloadManager] = []
+
+    def _capture_mps_cpu_non_layer_weights(self) -> None:
+        managed_names = {
+            name
+            for manager in self.layerwise_offload_managers
+            for weights in manager._mps_cpu_weights.values()
+            for name in weights
+        }
+        self._mps_cpu_non_layer_parameters = {
+            name: parameter.detach()
+            for name, parameter in self.named_parameters()
+            if name not in managed_names
+        }
+        self._mps_cpu_buffers = {
+            name: buffer.detach() for name, buffer in self.named_buffers()
+        }
+        if not self.mps_stream_non_layer_weights:
+            return
+
+        parameters = dict(self.named_parameters())
+        for name, tensor in self._mps_cpu_non_layer_parameters.items():
+            parameters[name].data = torch.empty(
+                (1,),
+                dtype=tensor.dtype,
+                device=current_platform.get_local_torch_device(),
+            )
+        buffers = dict(self.named_buffers())
+        for name, tensor in self._mps_cpu_buffers.items():
+            buffers[name].data = torch.empty(
+                (1,),
+                dtype=tensor.dtype,
+                device=current_platform.get_local_torch_device(),
+            )
+
+    @staticmethod
+    def _matches_mps_weight_prefix(name: str, prefixes: tuple[str, ...]) -> bool:
+        return any(
+            name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes
+        )
+
+    def materialize_mps_non_layer_weights(self, *prefixes: str) -> None:
+        if not current_platform.is_mps() or not self.mps_stream_non_layer_weights:
+            return
+        selected_prefixes = tuple(prefixes)
+        with torch.inference_mode(False), torch.no_grad():
+            parameters = dict(self.named_parameters())
+            for name, tensor in self._mps_cpu_non_layer_parameters.items():
+                if self._matches_mps_weight_prefix(name, selected_prefixes):
+                    parameters[name].data = tensor.to(
+                        current_platform.get_local_torch_device()
+                    )
+            buffers = dict(self.named_buffers())
+            for name, tensor in self._mps_cpu_buffers.items():
+                if self._matches_mps_weight_prefix(name, selected_prefixes):
+                    buffers[name].data = tensor.to(
+                        current_platform.get_local_torch_device()
+                    )
+
+    def release_mps_non_layer_weights(self, *prefixes: str) -> None:
+        if not current_platform.is_mps() or not self.mps_stream_non_layer_weights:
+            return
+        selected_prefixes = tuple(prefixes)
+        with torch.inference_mode(False), torch.no_grad():
+            parameters = dict(self.named_parameters())
+            for name, tensor in self._mps_cpu_non_layer_parameters.items():
+                if self._matches_mps_weight_prefix(name, selected_prefixes):
+                    parameters[name].data = torch.empty(
+                        (1,),
+                        dtype=tensor.dtype,
+                        device=current_platform.get_local_torch_device(),
+                    )
+            buffers = dict(self.named_buffers())
+            for name, tensor in self._mps_cpu_buffers.items():
+                if self._matches_mps_weight_prefix(name, selected_prefixes):
+                    buffers[name].data = torch.empty(
+                        (1,),
+                        dtype=tensor.dtype,
+                        device=current_platform.get_local_torch_device(),
+                    )
+        torch.mps.synchronize()
+        torch.mps.empty_cache()
+
+    def restore_mps_cpu_non_layer_weights(self) -> None:
+        if not current_platform.is_mps():
+            return
+        with torch.inference_mode(False), torch.no_grad():
+            parameters = dict(self.named_parameters())
+            for name, tensor in self._mps_cpu_non_layer_parameters.items():
+                parameters[name].data = tensor
+            buffers = dict(self.named_buffers())
+            for name, tensor in self._mps_cpu_buffers.items():
+                buffers[name].data = tensor
 
     def configure_layerwise_offload(self, server_args: ServerArgs):
         self.layerwise_offload_managers = []
@@ -774,7 +987,9 @@ class LayerwiseOffloadableModuleMixin:
             prefetch_value = (
                 server_args.dit_offload_prefetch_size if dit_tuning_enabled else 0.0
             )
-            if prefetch_value < 1.0:
+            if current_platform.is_mps() and prefetch_value == 0.0:
+                prefetch_size = 0
+            elif prefetch_value < 1.0:
                 prefetch_size = 1 + int(round(prefetch_value * (num_layers - 1)))
             else:
                 prefetch_size = int(prefetch_value)
@@ -797,6 +1012,7 @@ class LayerwiseOffloadableModuleMixin:
                 pin_cpu_memory=server_args.pin_cpu_memory,
                 prefetch_size=prefetch_size,
                 resident_layers=resident_layers,
+                initialize=not current_platform.is_mps(),
                 residency_policy=(
                     server_args.dit_layerwise_residency_policy
                     if dit_tuning_enabled
@@ -805,6 +1021,11 @@ class LayerwiseOffloadableModuleMixin:
             )
             self.layerwise_offload_managers.append(manager)
             configured_layer_names.append(layer_name)
+
+        if current_platform.is_mps():
+            for manager in self.layerwise_offload_managers:
+                manager.initialize()
+            self._capture_mps_cpu_non_layer_weights()
 
         if configured_layer_names:
             logger.debug(

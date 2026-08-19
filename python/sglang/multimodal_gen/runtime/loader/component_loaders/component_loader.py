@@ -43,7 +43,7 @@ logger = init_logger(__name__)
 
 
 class ComponentCheckpointUnsupportedError(ValueError):
-    """A checkpoint cannot be restored by either component loading path."""
+    """A component checkpoint is unsupported and must not use native fallback."""
 
 
 class NativeComponentLoaderRequired(RuntimeError):
@@ -199,9 +199,7 @@ class ComponentLoader(ABC):
                 component_attn_name,
             )
             source = "sgl-diffusion"
-        except ComponentResidencyError:
-            raise
-        except ComponentCheckpointUnsupportedError:
+        except (ComponentCheckpointUnsupportedError, ComponentResidencyError):
             raise
         except Exception as e:
             native_loader_required = isinstance(e, NativeComponentLoaderRequired)

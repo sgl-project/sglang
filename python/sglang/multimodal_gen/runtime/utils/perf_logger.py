@@ -134,6 +134,16 @@ def capture_memory_snapshot() -> MemorySnapshot:
             peak_reserved_mb=0.0,
         )
 
+    if current_platform.is_mps():
+        allocated = torch.mps.current_allocated_memory()
+        reserved = torch.mps.driver_allocated_memory()
+        return MemorySnapshot(
+            allocated_mb=allocated / (1024**2),
+            reserved_mb=reserved / (1024**2),
+            peak_allocated_mb=allocated / (1024**2),
+            peak_reserved_mb=reserved / (1024**2),
+        )
+
     allocated = torch.get_device_module().memory_allocated()
     reserved = torch.get_device_module().memory_reserved()
     peak_allocated = torch.get_device_module().max_memory_allocated()

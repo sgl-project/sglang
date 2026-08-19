@@ -759,13 +759,7 @@ class KVCacheConfigurator:
             )
 
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
-        # The same bag-derived bound the pools below receive, so the row
-        # headroom and the speculative buffers cannot disagree after a
-        # post-publish override.
-        extra_max_context_len = get_req_to_token_extra_context_len(
-            self.server_args,
-            max_draft_tokens=max_speculative_num_draft_tokens(),
-        )
+        extra_max_context_len = get_req_to_token_extra_context_len()
 
         if get_disagg().disaggregation_mode == "decode":
             # Extra slots for pre-allocated requests

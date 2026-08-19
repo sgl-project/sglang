@@ -2,7 +2,8 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from abc import ABC, abstractmethod
-from dataclasses import field
+from dataclasses import dataclass, field
+from typing import Literal
 
 import torch
 from torch import nn
@@ -14,6 +15,7 @@ from sglang.multimodal_gen.configs.models.encoders import (
     TextEncoderConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import (
+    get_replica_group,
     get_sp_group,
     get_tp_group,
     get_world_group,
@@ -36,6 +38,10 @@ def get_folding_tp_group(config: EncoderConfig):
     if mode == "world":
         # the whole single-replica DiT (all GPUs), regardless of tp/sp/cfg.
         return get_world_group()
+    if mode == "replica":
+        # the ranks serving this rank's pipeline replica (== world when
+        # dp_size is 1); the shape-independent choice for explicit folding
+        return get_replica_group()
     if mode is None:
         return get_tp_group()
     raise ValueError(f"Unsupported encoder folding mode: {mode!r}")
@@ -149,10 +155,22 @@ def finalize_encoder_folding(
         config.parallel_folding_mode = None
 
 
+@dataclass(frozen=True)
+class CheckpointQuantizationCapability:
+    """Quantized-checkpoint contract implemented by a native encoder."""
+
+    backend: Literal["diffusion", "srt"]
+    methods: frozenset[str]
+
+
 class EncoderTensorParallelMixin:
     """Keep an encoder on the TP group that was used to build its shards."""
 
     _encoder_tp_group: GroupCoordinator | None = None
+    checkpoint_quantization_capability: CheckpointQuantizationCapability | None = None
+    # Some encoders own checkpoint quantization end to end because their weight
+    # states or sharding contract cannot use the generic loader lifecycle.
+    manages_checkpoint_quantization = False
 
     def bind_encoder_tp_group(self, tp_group: GroupCoordinator) -> None:
         self._encoder_tp_group = tp_group
@@ -174,6 +192,12 @@ class TextEncoder(
     # Qwen2_5_VLCausalLMOutputWithPast). Off by default so a new encoder is
     # replicated rather than silently broken; flip it once dp is verified there.
     supports_dp_encode = False
+    # Quantized checkpoints are opt-in because an encoder must construct
+    # quantized linears and load the checkpoint's auxiliary scale parameters.
+    supported_checkpoint_quantization_methods: frozenset[str] = frozenset()
+    # Some encoders own checkpoint quantization end to end because their weight
+    # states or sharding contract cannot use the generic loader lifecycle.
+    manages_checkpoint_quantization = False
     layerwise_offload_dit_group_enabled = False
     layer_names = [
         "layers",
