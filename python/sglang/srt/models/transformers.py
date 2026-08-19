@@ -955,6 +955,8 @@ class TransformersBase(nn.Module):
         old_module = self.model.get_input_embeddings()
         if old_module is None or isinstance(old_module, PPMissingLayer):
             return
+        if not isinstance(old_module, nn.Embedding):
+            return
         embedding_dim = getattr(old_module, "embedding_dim", None)
         if embedding_dim is None:
             embedding_dim = _getattr_first(
