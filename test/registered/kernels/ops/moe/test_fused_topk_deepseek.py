@@ -3,11 +3,91 @@ import sys
 import pytest
 import torch
 
-from sglang.srt.layers.moe.topk import biased_grouped_topk_gpu, biased_grouped_topk_impl
+from sglang.srt.layers.moe import topk as topk_module
+from sglang.srt.layers.moe.topk import (
+    _can_use_flashinfer_fused_topk_deepseek,
+    biased_grouped_topk_gpu,
+    biased_grouped_topk_impl,
+)
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=40, stage="nightly", runner_config="1-gpu-large")
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        (128, 4, 2, 4),
+        (256, 8, 4, 8),
+        (64, 2, 2, 4),
+        (256, 1, 1, 8),
+    ],
+)
+def test_flashinfer_fused_topk_deepseek_accepts_contract_shapes(params):
+    assert _can_use_flashinfer_fused_topk_deepseek(*params)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        (256, 16, 4, 8),  # too many groups
+        (256, 8, 5, 8),  # too many selected groups
+        (8, 8, 4, 8),  # fewer than two experts per group
+        (512, 8, 4, 8),  # too many grouped experts
+        (256, 8, 4, 9),  # too many routed experts
+        (96, 3, 2, 5),  # FlashInfer route requires power-of-two expert count
+    ],
+)
+def test_flashinfer_fused_topk_deepseek_rejects_outside_contract(params):
+    assert not _can_use_flashinfer_fused_topk_deepseek(*params)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        (256, 16, 4, 8),
+        (256, 8, 5, 8),
+        (8, 8, 4, 8),
+    ],
+)
+def test_outside_contract_falls_back_without_calling_flashinfer(monkeypatch, params):
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("out-of-contract shape called FlashInfer")
+
+    monkeypatch.setattr(topk_module, "fused_topk_deepseek", fail_if_called)
+
+    num_experts, num_expert_group, topk_group, topk = params
+    device = get_device()
+    torch.manual_seed(num_experts + num_expert_group + topk_group + topk)
+    hidden_states = torch.randn(8, 128, dtype=torch.float32, device=device)
+    gating_output = torch.randn(8, num_experts, dtype=torch.float32, device=device)
+    correction_bias = torch.randn(num_experts, dtype=torch.float32, device=device)
+
+    output, indices = biased_grouped_topk_gpu(
+        hidden_states,
+        gating_output,
+        correction_bias,
+        topk=topk,
+        renormalize=True,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+    )
+    ref_output, ref_indices = biased_grouped_topk_impl(
+        hidden_states,
+        gating_output,
+        correction_bias,
+        topk=topk,
+        renormalize=True,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+    )
+
+    result = torch.zeros(8, num_experts, dtype=torch.float32, device=device)
+    reference = torch.zeros_like(result)
+    result.scatter_(1, indices.long(), output)
+    reference.scatter_(1, ref_indices.long(), ref_output)
+    torch.testing.assert_close(result, reference, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.parametrize(

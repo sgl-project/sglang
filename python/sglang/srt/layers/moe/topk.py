@@ -1373,6 +1373,42 @@ def is_power_of_two(n):
     return n > 0 and math.log2(n).is_integer()
 
 
+def _can_use_flashinfer_fused_topk_deepseek(
+    num_experts: int,
+    num_expert_group: Optional[int],
+    topk_group: Optional[int],
+    topk_routed: int,
+) -> bool:
+    """Return whether FlashInfer's native DeepSeek router supports this shape."""
+    if (
+        num_expert_group is None
+        or topk_group is None
+        or not is_power_of_two(num_experts)
+        or num_experts <= 0
+        or num_expert_group <= 0
+        or num_experts % num_expert_group != 0
+        or topk_routed <= 0
+        or topk_routed > 8
+        or topk_routed > num_experts
+        or topk_group <= 0
+        or topk_group > num_expert_group
+        or topk_group * num_expert_group < topk_routed
+    ):
+        return False
+
+    if num_expert_group == 1:
+        return num_experts <= 384
+
+    experts_per_group = num_experts // num_expert_group
+    return (
+        num_expert_group <= 8
+        and topk_group <= 4
+        and num_experts <= 256
+        and 2 <= experts_per_group <= 32
+        and experts_per_group * topk_group <= 128
+    )
+
+
 def _eplb_remap_enabled() -> bool:
     # A real logical->physical mapping only exists when EPLB is enabled, the
     # initial expert placement is non-trivial, or there are redundant physical
@@ -1487,15 +1523,11 @@ def biased_grouped_topk_gpu(
     if (
         _is_cuda
         and fused_topk_deepseek is not None
-        and is_power_of_two(num_experts)
-        # flashinfer constraints (applied to routed experts only)
-        and topk_routed <= 8
-        and topk_group <= num_expert_group
-        and topk_group * num_expert_group >= topk_routed
-        and (
-            (experts_per_group <= 32 and experts_per_group * topk_group <= 128)
-            if num_expert_group > 1
-            else num_experts <= 384
+        and _can_use_flashinfer_fused_topk_deepseek(
+            num_experts,
+            num_expert_group,
+            topk_group,
+            topk_routed,
         )
     ):
         # Pre-allocate output tensors (flashinfer mutates them in-place)
