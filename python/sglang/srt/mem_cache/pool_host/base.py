@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import abc
 import logging
-import socket
 import threading
 from functools import wraps
 from typing import Optional
@@ -16,6 +15,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
@@ -28,34 +28,24 @@ HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
-_ranks_per_host: Optional[int] = None
-
 
 def ranks_per_host() -> int:
     """Number of ranks of this job running on the same machine as this one.
 
-    Cached so the collective runs once per process: ranks may build different
-    numbers of host pools, and an uncached call would deadlock on the rank that
-    builds fewer.
+    Derived as world_size // nnodes: the launcher slices ranks uniformly
+    across nodes (resolution asserts divisibility), so no hostname collective
+    is needed — a collective here would have to be issued the same number of
+    times on every rank, and ranks build different numbers of host pools.
     """
-    global _ranks_per_host
-    if _ranks_per_host is not None:
-        return _ranks_per_host
-
-    _ranks_per_host = 1
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        try:
-            world_group = get_world_group()
-        except AssertionError:
-            return _ranks_per_host
-        if world_group.world_size > 1:
-            hostname = socket.gethostname()
-            peers = [None] * world_group.world_size
-            torch.distributed.all_gather_object(
-                peers, hostname, group=world_group.cpu_group
-            )
-            _ranks_per_host = peers.count(hostname)
-    return _ranks_per_host
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return 1
+    try:
+        world_group = get_world_group()
+    except AssertionError:
+        return 1
+    if world_group.world_size == 1:
+        return 1
+    return max(world_group.world_size // get_parallel().nnodes, 1)
 
 
 def host_memory_budget_bytes() -> int:

@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
 from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -205,13 +206,13 @@ class TestHostMemoryBudget(CustomTestCase):
     # psutil value drifts between calls and would flake the equality checks.
     _AVAILABLE = base.HICACHE_HOST_MEMORY_RESERVE_BYTES + 64 * (1024**3)
 
-    def tearDown(self):
-        base._ranks_per_host = None
-
     def _budget_with_ranks(self, ranks):
-        base._ranks_per_host = ranks
+        # Deliberate single-accessor stub: isolates the budget math from the
+        # topology derivation, which the ranks_per_host case below covers.
         fake_mem = unittest.mock.Mock(available=self._AVAILABLE)
         with unittest.mock.patch.object(
+            base, "ranks_per_host", return_value=ranks
+        ), unittest.mock.patch.object(
             base.psutil, "virtual_memory", return_value=fake_mem
         ):
             return base.host_memory_budget_bytes()
@@ -226,6 +227,15 @@ class TestHostMemoryBudget(CustomTestCase):
         self.assertLessEqual(
             budget * 8, self._AVAILABLE - base.HICACHE_HOST_MEMORY_RESERVE_BYTES
         )
+
+    def test_ranks_per_host_divides_world_size_by_nodes(self):
+        # The launcher slices ranks uniformly across nodes, so the co-located
+        # rank count is world_size // nnodes — no hostname collective.
+        fake_group = unittest.mock.Mock(world_size=16)
+        with get_context().override_server_args(nnodes=2), unittest.mock.patch.object(
+            torch.distributed, "is_initialized", return_value=True
+        ), unittest.mock.patch.object(base, "get_world_group", return_value=fake_group):
+            self.assertEqual(base.ranks_per_host(), 8)
 
 
 if __name__ == "__main__":
