@@ -11,6 +11,9 @@ from sglang.srt.layers.attention.dots_hybrid_backend import (
     _metadata_mismatches_dp_padded_batch,
 )
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
+from sglang.srt.layers.attention.swa_mla_fallback.ops import (
+    gather_page64_kv_latent,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -72,6 +75,36 @@ def test_hybrid_rebuilds_when_dp_padding_changes_batch_size():
         _batch(bs=2, num_tokens=2, original_bs=1)
     )
     hybrid.init_forward_metadata.assert_called_once()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_page64_gather_masks_out_of_range_page_table_entries():
+    kv_cache_dim = 128
+    k_cache = torch.arange(64 * kv_cache_dim, dtype=torch.float32, device="cuda").view(
+        64, 1, kv_cache_dim
+    )
+    # Row 0 has a sequence longer than its one-page table. Row 1 points past
+    # the physical KV pool. Both can occur transiently when DP padding changes
+    # the live batch after speculative metadata was planned.
+    block_table = torch.tensor([[0], [9]], dtype=torch.int32, device="cuda")
+    cache_seqlens = torch.tensor([130, 64], dtype=torch.int32, device="cuda")
+
+    gathered, valid = gather_page64_kv_latent(
+        k_cache=k_cache,
+        block_table=block_table,
+        cache_seqlens=cache_seqlens,
+        window_size=128,
+        s_q=1,
+        kv_cache_dim=kv_cache_dim,
+    )
+    torch.cuda.synchronize()
+
+    assert valid[0, :62].all()
+    assert not valid[0, 62:].any()
+    assert not valid[1].any()
+    torch.testing.assert_close(gathered[0, :62], k_cache[2:64, 0])
+    assert not gathered[0, 62:].any()
+    assert not gathered[1].any()
 
 
 if __name__ == "__main__":

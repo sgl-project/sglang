@@ -15,6 +15,8 @@ def _gather_page64_kv_latent_kernel(
     k_cache_stride_t,
     k_cache_stride_d,
     block_table_stride_b,
+    block_table_num_pages: tl.constexpr,
+    k_cache_num_tokens: tl.constexpr,
     kv_out_stride_b,
     kv_out_stride_t,
     kv_out_stride_d,
@@ -38,13 +40,16 @@ def _gather_page64_kv_latent_kernel(
 
     logical_page = logical_token // PAGE_SIZE_
     intra_page = logical_token - logical_page * PAGE_SIZE_
+    page_table_valid = logical_valid & (logical_page < block_table_num_pages)
     physical_page = tl.load(
         block_table_ptr + bid * block_table_stride_b + logical_page,
-        mask=logical_valid,
+        mask=page_table_valid,
         other=-1,
     ).to(tl.int32)
-    physical_valid = logical_valid & (physical_page >= 0)
     physical_token = physical_page * PAGE_SIZE_ + intra_page
+    physical_valid = (
+        page_table_valid & (physical_page >= 0) & (physical_token < k_cache_num_tokens)
+    )
 
     offs_d = did * BLOCK_D + tl.arange(0, BLOCK_D)
     values = tl.load(
@@ -101,6 +106,8 @@ def gather_page64_kv_latent(
         k_cache.stride(0),
         k_cache.stride(2),
         block_table.stride(0),
+        block_table.shape[1],
+        k_cache.shape[0],
         kv_latent.stride(0),
         kv_latent.stride(1),
         kv_latent.stride(2),
