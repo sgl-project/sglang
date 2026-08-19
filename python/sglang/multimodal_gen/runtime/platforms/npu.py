@@ -41,6 +41,11 @@ class NPUPlatformBase(Platform):
     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
 
     @classmethod
+    @lru_cache(maxsize=1)
+    def is_float64_supported(cls) -> bool:
+        return False
+
+    @classmethod
     def get_local_torch_device(cls) -> torch.device:
         return torch.device(f"npu:{envs.LOCAL_RANK}")
 
