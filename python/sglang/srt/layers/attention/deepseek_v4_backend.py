@@ -71,7 +71,7 @@ from sglang.srt.speculative.ragged_verify import (
     resolve_ragged_verify_layout,
 )
 from sglang.srt.utils import ceil_align, is_cuda, is_xpu
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_sm100_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 _is_sm120 = is_sm120_supported()
+_is_sm100 = is_sm100_supported()
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 
@@ -132,7 +133,10 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
         return None
     curr_size = x.shape[-1]
     target_size = ceil_align(curr_size, multiples_of)
-    return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
+    padding = target_size - curr_size
+    if padding == 0:
+        return x
+    return F.pad(x, pad=(0, padding), mode="constant", value=-1)
 
 
 def _create_flashmla_metadata():
@@ -277,7 +281,11 @@ class DSV4AttnMetadata:
         for field_name in reference_assign_fields:
             setattr(self, field_name, getattr(other, field_name))
 
-    def init_compression_metadata(self, num_tokens: Optional[int] = None) -> None:
+    def init_compression_metadata(
+        self,
+        num_tokens: Optional[int] = None,
+        live_prefix_only: bool = False,
+    ) -> None:
         assert self.page_table.dim() == 2
         # CP-v2 pads causal metadata for per-rank partitioning, while cache-write
         # locations remain one-per-logical-token. num_tokens tracks that unpadded
@@ -305,6 +313,7 @@ class DSV4AttnMetadata:
             self.page_table,
             self.page_size,
             compute_page_indices=True,
+            live_prefix_only=live_prefix_only,
         )
 
         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
@@ -448,6 +457,7 @@ class DSV4RawVerifyMetadata:
     extend_start_loc: Optional[torch.Tensor] = None
     verify_lens: Optional[torch.Tensor] = None
     total_verify_tokens: int = 0
+    live_prefix_only: bool = False
 
     def copy_(self, other: DSV4RawVerifyMetadata):
         self.req_pool_indices.copy_(other.req_pool_indices)
@@ -463,6 +473,7 @@ class DSV4RawVerifyMetadata:
         self.extend_start_loc = other.extend_start_loc
         self.verify_lens = other.verify_lens
         self.total_verify_tokens = other.total_verify_tokens
+        self.live_prefix_only = other.live_prefix_only
 
 
 @dataclass
@@ -588,7 +599,41 @@ class DeepseekV4AttnBackend(
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
+        self.live_prefix_metadata_supported = (
+            self._compute_live_prefix_metadata_supported()
+        )
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
+
+    def _compute_live_prefix_metadata_supported(self) -> bool:
+        """Whether this backend's verify consumers bound metadata reads.
+
+        The DeepGEMM indexer and top-k v1/v2 bound page-table reads by the live
+        C4 length, native FlashMLA bounds C128 addresses by ``extra_topk_length``,
+        and the nonpaged indexer is EXTEND-only; consumers that may not are
+        excluded below. All terms are frozen, so this resolves once in
+        ``__init__``.
+        """
+        return (
+            # _is_sm100 implies _is_cuda; _is_xpu is process-wide, so it doesn't.
+            _is_sm100
+            and not _is_xpu
+            and self.hisparse_coordinator is None
+            and not self.enable_deepseek_v4_fp4_indexer
+            and not envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+            and not envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+            and self.dsa_topk_backend.is_sgl_kernel()
+        )
+
+    def _can_use_live_prefix_target_verify_metadata(
+        self, *, use_prefill_cuda_graph: bool
+    ) -> bool:
+        """Whether this target-verify build may skip stale metadata tails.
+
+        Graph-only: the eager verify path leaves ``use_prefill_cuda_graph``
+        false, which restores the full capture-capacity initialization.
+        """
+        return use_prefill_cuda_graph and self.live_prefix_metadata_supported
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -850,6 +895,9 @@ class DeepseekV4AttnBackend(
             extend_start_loc=extend_start_loc,
             verify_lens=verify_lens,
             total_verify_tokens=total_verify_tokens,
+            live_prefix_only=self._can_use_live_prefix_target_verify_metadata(
+                use_prefill_cuda_graph=use_prefill_cuda_graph
+            ),
         )
 
     def init_forward_metadata_dspark_draft_block(
@@ -932,6 +980,7 @@ class DeepseekV4AttnBackend(
             max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
             out_loc=out_cache_loc,
             need_compress=True,
+            live_prefix_only=raw_metadata.live_prefix_only,
         )
         indexer_metadata = self.init_forward_metadata_indexer(core_attn_metadata)
         create = functools.partial(
@@ -1395,6 +1444,7 @@ class DeepseekV4AttnBackend(
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu,
                 out_cache_loc=forward_batch.out_cache_loc,
+                use_prefill_cuda_graph=use_prefill_cuda_graph,
                 online_c128_state_slot_offset=online_c128_state_slot_offset,
                 ragged_layout=ragged_layout,
             )
@@ -1920,6 +1970,7 @@ class DeepseekV4AttnBackend(
         need_compress: bool = True,
         is_prefill: bool = False,
         dspark_block_size: Optional[int] = None,
+        live_prefix_only: bool = False,
         num_tokens: Optional[int] = None,
     ) -> DSV4AttnMetadata:
         assert self.swa_page_size == SWA_WINDOW
@@ -1931,6 +1982,7 @@ class DeepseekV4AttnBackend(
             max_seq_len=max_seq_len,
             page_size=self.page_size,
             swa_window=SWA_WINDOW,
+            live_prefix_only=live_prefix_only,
         )
         seq_lens_casual = prep.seq_lens_casual
 
@@ -1977,7 +2029,10 @@ class DeepseekV4AttnBackend(
         )
 
         if need_compress:
-            core_attn_metadata.init_compression_metadata(num_tokens)
+            core_attn_metadata.init_compression_metadata(
+                num_tokens=num_tokens,
+                live_prefix_only=live_prefix_only,
+            )
             core_attn_metadata.init_flashmla_related(is_prefill=is_prefill)
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
