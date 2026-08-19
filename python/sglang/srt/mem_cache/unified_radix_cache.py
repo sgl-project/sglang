@@ -2568,8 +2568,18 @@ class UnifiedRadixCache(BasePrefixCache):
         self._drain_async_work()
 
         if self.pp_size != 1:
-            self.writing_check()
-            self.loading_check()
+            finish_counts = torch.zeros(2, dtype=torch.int, device="cpu")
+            if self.pp_rank == 0 and self.cache_controller is not None:
+                finish_counts[0] = self._count_ready_acks(
+                    self.cache_controller.ack_write_queue
+                )
+                finish_counts[1] = self._count_ready_acks(
+                    self.cache_controller.ack_load_queue
+                )
+            self._all_reduce(finish_counts, torch.distributed.ReduceOp.MIN)
+            write_finish_count, load_finish_count = map(int, finish_counts.tolist())
+            self.writing_check(finish_count=write_finish_count)
+            self.loading_check(finish_count=load_finish_count)
             if self.enable_storage:
                 self.drain_storage_control_queues()
         else:
