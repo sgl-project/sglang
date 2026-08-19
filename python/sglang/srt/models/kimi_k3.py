@@ -133,13 +133,15 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _is_npu = is_npu()
-_aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+_aiter_k3_opt = _is_hip and get_bool_env_var("SGLANG_AITER_K3_OPT")
 _k3_shared_experts_attn_tp = envs.SGLANG_K3_SHARED_EXPERTS_ATTN_TP.get()
 _k3_dense_mlp_attn_tp = envs.SGLANG_K3_DENSE_MLP_ATTN_TP.get()
-_aiter_mla_gate = get_bool_env_var("SGLANG_K3_AITER_MLA_GATE")
-_aiter_kda_group64 = get_bool_env_var("SGLANG_K3_AITER_KDA_GROUP64")
-_aiter_moe_preroute_fp8 = get_bool_env_var("SGLANG_K3_AITER_MOE_PREROUTE_FP8")
-_aiter_latent_tail_fp8 = get_bool_env_var("SGLANG_K3_AITER_LATENT_TAIL_FP8")
+_aiter_mla_gate = _is_hip and get_bool_env_var("SGLANG_K3_AITER_MLA_GATE")
+_aiter_kda_group64 = _is_hip and get_bool_env_var("SGLANG_K3_AITER_KDA_GROUP64")
+_aiter_moe_preroute_fp8 = _is_hip and get_bool_env_var(
+    "SGLANG_K3_AITER_MOE_PREROUTE_FP8"
+)
+_aiter_latent_tail_fp8 = _is_hip and get_bool_env_var("SGLANG_K3_AITER_LATENT_TAIL_FP8")
 
 
 def _cdiv(a: int, b: int) -> int:
