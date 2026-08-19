@@ -312,7 +312,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "torch"]
+BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "gemv", "torch"]
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
@@ -7500,11 +7500,11 @@ class ServerArgs:
                 "backup and the storage keys must become dcp_rank-aware "
                 "first. Run HiCache+DCP with L1/L2 only."
             )
-        if self.speculative_algorithm is not None:
+        if self.speculative_algorithm not in (None, "DSPARK"):
             raise NotImplementedError(
-                "HiCache with --dcp-size > 1 does not support speculative "
-                "decoding yet (the draft-model host pool has no DCP index "
-                "translation)."
+                "HiCache with --dcp-size > 1 only supports DSPARK speculative "
+                "decoding; other draft-model host pools have no DCP index "
+                "translation."
             )
         if self.enable_lmcache:
             raise NotImplementedError(

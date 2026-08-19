@@ -35,6 +35,16 @@ def gather_and_crop_vocab(
     return full_logits[..., : int(lm_head.org_vocab_size)]
 
 
+def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
+    """Project draft hidden states through the target head; a quantized head
+    stores `weight` packed, so it needs its own kernel instead of a matmul."""
+    quant_method = lm_head.quant_method
+    if should_apply_lm_head_quant_method(lm_head, quant_method):
+        return quant_method.apply(lm_head, hidden, None)
+    weight = lm_head.weight
+    return torch.matmul(hidden.to(weight.dtype), weight.T)
+
+
 def run_markov_block(
     head: nn.Module,
     base_logits: torch.Tensor,
@@ -470,14 +480,7 @@ class DSparkDraftMixin:
             )
         if self.logits_mup_width_multiplier:
             hidden = hidden / self.logits_mup_width_multiplier
-        weight = self.lm_head.weight
-        quant_method = getattr(self.lm_head, "quant_method", None)
-        if should_apply_lm_head_quant_method(self.lm_head, quant_method):
-            local_logits = quant_method.apply(self.lm_head, hidden, None)
-        else:
-            if hidden.dtype != weight.dtype:
-                hidden = hidden.to(weight.dtype)
-            local_logits = torch.matmul(hidden, weight.T)
+        local_logits = project_through_lm_head(hidden, self.lm_head)
         base_logits = gather_and_crop_vocab(local_logits, self.lm_head)
         return base_logits, None
 

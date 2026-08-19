@@ -27,6 +27,10 @@ def _resolve_corrected_logits_dtype(model) -> torch.dtype:
     method returns floating-point logits. Static folded-sampling buffers must
     follow that output dtype rather than the packed parameter dtype.
     """
+    lm_head_weight = model.lm_head.weight
+    if lm_head_weight.dtype.is_floating_point:
+        return lm_head_weight.dtype
+
     config = model.config
     for name in ("dtype", "torch_dtype"):
         dtype = getattr(config, name, None)
@@ -45,6 +49,12 @@ def _resolve_corrected_logits_dtype(model) -> torch.dtype:
         weight = getattr(module, "weight", None)
         if isinstance(weight, torch.Tensor) and weight.dtype.is_floating_point:
             return weight.dtype
+
+    parameters = getattr(model.markov_head, "parameters", None)
+    if callable(parameters):
+        for parameter in parameters():
+            if parameter.dtype.is_floating_point:
+                return parameter.dtype
     return torch.float32
 
 

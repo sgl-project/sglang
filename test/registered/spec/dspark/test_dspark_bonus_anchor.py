@@ -292,6 +292,28 @@ def test_folded_sampler_uses_logit_dtype_for_quantized_lm_head():
     assert sampler.corrected_out.dtype == torch.bfloat16
 
 
+def test_folded_sampler_falls_back_to_markov_parameter_dtype():
+    model = SimpleNamespace(
+        config=SimpleNamespace(),
+        embed_tokens=SimpleNamespace(weight=torch.empty(1, dtype=torch.uint8)),
+        lm_head=SimpleNamespace(weight=torch.empty((4, 1), dtype=torch.uint8)),
+        markov_head=torch.nn.Linear(1, 1, dtype=torch.float16),
+    )
+
+    assert _resolve_corrected_logits_dtype(model) == torch.float16
+
+
+def test_folded_sampler_uses_unquantized_lm_head_dtype():
+    model = SimpleNamespace(
+        config=SimpleNamespace(torch_dtype=torch.bfloat16),
+        embed_tokens=SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16)),
+        lm_head=SimpleNamespace(weight=torch.empty((4, 1), dtype=torch.float16)),
+        markov_head=SimpleNamespace(),
+    )
+
+    assert _resolve_corrected_logits_dtype(model) == torch.float16
+
+
 if __name__ == "__main__":
     import sys
 
