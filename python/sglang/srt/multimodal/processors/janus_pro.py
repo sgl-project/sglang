@@ -10,6 +10,8 @@ from sglang.srt.multimodal.processors.base_processor import (
 
 class JanusProImageProcessor(BaseMultimodalProcessor):
     models = [MultiModalityCausalLM]
+    # ``VLMImageProcessor`` only accepts ``PIL.Image``
+    gpu_image_decode = False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
