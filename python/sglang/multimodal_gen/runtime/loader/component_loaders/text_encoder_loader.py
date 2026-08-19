@@ -15,6 +15,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
 )
 from sglang.multimodal_gen.runtime.distributed import (
+    get_encoder_data_parallel_group,
     get_local_torch_device,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -420,17 +421,19 @@ class TextEncoderLoader(ComponentLoader):
             model_config,
             component_model_path,
         )
+        encoder_dp_group = get_encoder_data_parallel_group()
+        prefer_dp = (
+            server_args.batching_max_size > 1
+            and encoder_dp_group is not None
+            and encoder_dp_group.world_size > 1
+            and issubclass(model_cls, TextEncoder)
+            and model_cls.supports_dp_encode
+        )
         # real dims are populated now; resolve fold vs replicate
         finalize_encoder_folding(
             encoder_config,
             server_args.encoder_parallel,
-            prefer_dp=(
-                server_args.batching_max_size > 1
-                and (server_args.tp_size or 1) == 1
-                and (server_args.dp_size or 1) == 1
-                and issubclass(model_cls, TextEncoder)
-                and model_cls.supports_dp_encode
-            ),
+            prefer_dp=prefer_dp,
         )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[
             encoder_index
