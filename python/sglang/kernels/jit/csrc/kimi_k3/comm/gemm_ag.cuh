@@ -198,9 +198,6 @@ __global__ void spin_add3_kernel(const __grid_constant__ ConsumerParams params) 
 }
 
 }  // namespace gemm_ag
-}  // namespace sglang
-
-using namespace sglang;
 using host::distributed::CommunicatorRef;
 
 // Host entry point (tiny_gemm style: one GEMV instantiation per M in
@@ -301,3 +298,5 @@ struct GEMMAGKernel {
         .enable_pdl(kUsePDL)(kernel, consumer_params);
   }
 };
+
+}  // namespace sglang

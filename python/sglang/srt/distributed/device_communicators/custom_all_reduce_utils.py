@@ -19,6 +19,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from typing_extensions import ParamSpec
 
+from sglang.srt.cuda_vmm_utils import _gpu_fabric_clique
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs as sglang_envs
@@ -389,27 +390,6 @@ def is_full_nvlink(physical_device_ids: List[int], world_size: int) -> bool:
                         )
                         return False
         return True
-
-
-# NVML_GPU_FABRIC_STATE_COMPLETED: the GPU has joined its NVLink fabric clique.
-_NVML_GPU_FABRIC_STATE_COMPLETED = 3
-
-
-def _gpu_fabric_clique(device: torch.device):
-    """(cluster_uuid, clique_id) of the local GPU's NVLink fabric clique, or None if
-    the GPU has not joined a fabric (single-node box / fabric init incomplete)."""
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-    if cuda_visible_devices:
-        device_ids = list(map(int, cuda_visible_devices.split(",")))
-    else:
-        device_ids = list(range(torch.cuda.device_count()))
-    handle = pynvml.nvmlDeviceGetHandleByIndex(device_ids[device.index])
-    fabric = pynvml.c_nvmlGpuFabricInfo_v3_t()
-    fabric.version = pynvml.nvmlGpuFabricInfo_v3
-    pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(fabric))
-    if fabric.state != _NVML_GPU_FABRIC_STATE_COMPLETED:
-        return None
-    return (bytes(fabric.clusterUuid), int(fabric.cliqueId))
 
 
 @with_nvml_context

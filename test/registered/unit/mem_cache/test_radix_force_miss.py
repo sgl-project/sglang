@@ -31,6 +31,7 @@ class _StubReq:
         self.origin_input_ids = array("q", token_ids)
         self.output_ids = array("q")
         self.extra_key = None
+        self.cache_salt = None
         self.prefix_indices = None
         self.last_node = None
         self.last_host_node = None

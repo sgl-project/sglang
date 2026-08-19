@@ -51,6 +51,15 @@ class LTXVideoVAEArchConfig(VAEArchConfig):
     decoder_layers_per_block: List[int] = field(default_factory=lambda: [5, 5, 5, 5])
     decoder_causal: bool = False
     decoder_spatial_padding_mode: str = "reflect"
+    decoder_inject_noise: List[bool] = field(
+        default_factory=lambda: [False, False, False, False]
+    )
+    upsample_residual: List[bool] = field(default_factory=lambda: [True, True, True])
+    upsample_factor: List[int] = field(default_factory=lambda: [2, 2, 2])
+    # Per-decoder-stage upsampling axis: "spatial", "temporal" or
+    # "spatiotemporal". `None` keeps every stage spatiotemporal (LTX-2).
+    upsample_type: List[str] | None = None
+    timestep_conditioning: bool = False
 
     # Native LTX variant metadata.
     ltx_variant: str = "ltx_2"

@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
 )
+from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +44,13 @@ def _get_raw_quant_config(
 
     model_name_or_path = model_config.model_path
 
-    # A local path holds hf_quant_config.json directly; a remote HF repo id must
-    # first resolve its JSON configs from the hub (mirrors weight_utils.get_quant_config).
+    # A local path holds hf_quant_config.json directly; anything else resolves its
+    # JSON configs first. An object-storage URL is neither a directory nor a valid
+    # repo id, so it needs its own branch before snapshot_download.
     if os.path.isdir(model_name_or_path):
         hf_folder = model_name_or_path
+    elif is_runai_obj_uri(model_name_or_path):
+        hf_folder = ObjectStorageModel.download_and_get_path(model_name_or_path)
     else:
         hf_folder = snapshot_download(
             model_name_or_path,

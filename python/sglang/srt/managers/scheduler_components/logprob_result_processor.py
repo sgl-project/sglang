@@ -327,7 +327,13 @@ class SchedulerLogprobResultProcessor:
         else:
             self._initialize_empty_logprob_containers(req)
 
-        if req.logprob.top_logprobs_num > 0:
+        if (
+            req.logprob.top_logprobs_num > 0
+            and output.next_token_top_logprobs_val is not None
+        ):
+            # Guarded like next_token_logprobs above: a backend may leave the
+            # top-logprob fields unset even for a request that asked for them
+            # (indexing None raises TypeError).
             req.logprob.output_top_logprobs_val.append(
                 output.next_token_top_logprobs_val[i]
             )

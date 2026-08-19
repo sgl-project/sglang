@@ -1,15 +1,20 @@
 """Model introspection and attention patching."""
 
+import logging
 from typing import Any
 
 import mlx.nn as nn
 
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_contract import (
+    get_container_window_size,
+    get_layer_window_sizes,
     is_attention_module,
 )
 from sglang.srt.hardware_backend.mlx.kv_cache.attention_wrapper import (
     MLXAttentionWrapper,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _find_attention_attr(layer: Any) -> str | None:
@@ -43,6 +48,19 @@ def patch_model_attention(model: Any) -> int:
     is set, so it is always installed and never removed.
     """
     layer_list, attn_attrs = find_attention_layers(model)
+    window_sizes = get_layer_window_sizes(model)
+    if not window_sizes and get_container_window_size(model) is not None:
+        # e.g. gemma3-style containers derive per-layer windows from a
+        # pattern instead of ``layer_types``. Prefill masks (delegated to
+        # the container) honor the window, but batched decode cannot
+        # without a per-layer map, so outputs would diverge past the
+        # window. Surface it instead of silently splitting semantics.
+        logger.warning(
+            "Model %s declares a sliding window but no per-layer "
+            "layer_types map; MLX batched decode will not apply the "
+            "window and long-context output may be incorrect.",
+            type(model).__name__,
+        )
     patched = 0
     for idx, (layer, attn_attr) in enumerate(zip(layer_list, attn_attrs)):
         if attn_attr is None:
@@ -50,7 +68,11 @@ def patch_model_attention(model: Any) -> int:
         attn = getattr(layer, attn_attr)
         if isinstance(attn, MLXAttentionWrapper):
             continue
-        setattr(layer, attn_attr, MLXAttentionWrapper(attn, idx))
+        setattr(
+            layer,
+            attn_attr,
+            MLXAttentionWrapper(attn, idx, window_size=window_sizes.get(idx)),
+        )
         patched += 1
     return patched
 

@@ -280,6 +280,18 @@ def _run_all_tests() -> List[Dict]:
         )
     )
 
+    # MiniMax-H3 Turbo LoRA (native diffusers/PEFT-style keys).
+    results.append(
+        run_single_test(
+            name="MiniMax H3 Turbo LoRA",
+            repo_id="larryvrh/MiniMax-H3-Turbo-Lora",
+            filename="minimax_h3_turbo_4step.safetensors",
+            local_name="minimax_h3_turbo_4step.safetensors",
+            expected_before=LoRAFormat.STANDARD,
+            expected_after=LoRAFormat.STANDARD,
+        )
+    )
+
     return results
 
 

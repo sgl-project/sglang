@@ -41,36 +41,32 @@ def share_input_buffer(name: str, new_buffer: torch.Tensor) -> torch.Tensor:
     return canonical.as_strided(new_buffer.size(), new_buffer.stride())
 
 
-def share_input_buffers_in(obj) -> None:
-    """Pool every tensor buffer on ``obj`` (dataclass / ``SimpleNamespace``)
-    through the process-wide pool, in place. No-op on NPU; recurses into dict /
-    dataclass buffer fields (``pp_proxy_tensors`` / ``ngram_embedding_info``)."""
-    if is_npu():
-        return
-
-    for name, buffer in list(vars(obj).items()):
-        if buffer is None:
-            continue
-        if dataclasses.is_dataclass(buffer):
-            buffer = vars(buffer)
-        if isinstance(buffer, dict):
-            for sub_name, sub_buffer in buffer.items():
-                assert isinstance(
-                    sub_buffer, torch.Tensor
-                ), f"Field {name}.{sub_name} is expected to be a torch.Tensor, but got {type(sub_buffer)}."
-                buffer[sub_name] = share_input_buffer(f"{name}.{sub_name}", sub_buffer)
-        else:
-            assert isinstance(
-                buffer, torch.Tensor
-            ), f"Field {name} is expected to be a torch.Tensor, a dict of torch.Tensor, or a dataclass of torch.Tensor, but got {type(buffer)}."
-            setattr(obj, name, share_input_buffer(name, buffer))
+# Values that index the rope table, the KV pool, req_to_token, or the mamba
+# state pool, so stale content is unsafe to execute. build_decode_registry
+# asserts its ZERO-policy slots against this set.
+INDEX_SEMANTIC_BUFFERS = frozenset(
+    {
+        "positions",
+        "mrope_positions",
+        "out_cache_loc",
+        "req_pool_indices",
+        "mamba_track_indices",
+        "mamba_track_mask",
+    }
+)
 
 
 @dataclass
 class ForwardInputBuffers:
 
-    def _share_one_buffer(self, name: str, new_buffer: torch.Tensor) -> torch.Tensor:
-        return share_input_buffer(name, new_buffer)
+    def reset_index_buffers(self) -> None:
+        """Zero the index-semantic buffers this set declares."""
+        for f in fields(self):
+            if f.name not in INDEX_SEMANTIC_BUFFERS:
+                continue
+            buffer = getattr(self, f.name)
+            if buffer is not None:
+                buffer.zero_()
 
     def share_buffers(self):
         # disable share input buffer on npu due to accuracy issue
@@ -92,13 +88,11 @@ class ForwardInputBuffers:
                     assert isinstance(
                         sub_buffer, torch.Tensor
                     ), f"Field {name}.{sub_name} is expected to be a torch.Tensor, but got {type(sub_buffer)}."
-                    new_buffer = self._share_one_buffer(
+                    buffer[sub_name] = share_input_buffer(
                         f"{name}.{sub_name}", sub_buffer
                     )
-                    buffer[sub_name] = new_buffer
             else:
                 assert isinstance(
                     buffer, torch.Tensor
                 ), f"Field {name} is expected to be a torch.Tensor, a dict of torch.Tensor, or a dataclass of torch.Tensor, but got {type(buffer)}."
-                new_buffer = self._share_one_buffer(name, buffer)
-                setattr(self, name, new_buffer)
+                setattr(self, name, share_input_buffer(name, buffer))

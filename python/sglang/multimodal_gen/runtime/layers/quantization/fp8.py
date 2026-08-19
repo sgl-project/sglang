@@ -455,6 +455,13 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # The activation quantization kernels assert on row-major input, and
+        # diffusion backbones routinely pass a permuted view. Normalising at the
+        # producer instead would also move the unquantized path's output, by
+        # changing which GEMM kernel it picks. No-op when already contiguous.
+        if not x.is_contiguous():
+            x = x.contiguous()
+
         if self.use_marlin:
             return apply_fp8_marlin_linear(
                 input=x,

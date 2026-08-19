@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <type_traits>
 
+namespace sglang {
+
 namespace device::warp {
 
 /// \brief Full warp active mask.
@@ -209,3 +211,5 @@ SGL_DEVICE bool elect_one_lane() {
 }
 
 }  // namespace device::warp
+
+}  // namespace sglang

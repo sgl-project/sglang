@@ -1,0 +1,317 @@
+---
+title: LTX2.5
+description: Run LTX-2.5 video + audio generation with SGLang Diffusion.
+metatags:
+    description: "Deploy and use the LTX-2.5 video and audio generation model with SGLang Diffusion, including one-stage, two-stage, image-to-video, auto-duration, and diffusion-decoder examples."
+---
+
+import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
+import { LTX25Deployment } from '/src/snippets/diffusion/ltx25-deployment.jsx';
+
+<DiffusionModelTags tags={["video", "audio", "text-to-video", "image-to-video", "two-stage", "auto-duration", "diffusion decoder"]} />
+
+## 1. Model Introduction
+
+[LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) is an open world model from
+Lightricks, built for local execution and fine-tuning. Its established use is
+generating synchronized, high-fidelity video and audio from text, image and
+video inputs.
+
+It is a 22B DiT paired with a Gemma-4-12B text encoder, separate video and audio
+VAEs, and a vocoder that outputs 48 kHz stereo. Video and audio are denoised
+jointly in one pass rather than dubbed afterwards, so they stay in sync.
+
+Use **`Lightricks/LTX-2.5-Diffusers`** as `--model-path`.
+
+<Warning>
+**License notice:** LTX-2.5 is released under the LTX-2.x Community License
+Agreement, not Apache 2.0. The license includes commercial-use restrictions for
+some entities. Review the [official Lightricks license](https://github.com/Lightricks/LTX-2/blob/main/LICENSE.md)
+before production or commercial use; SGLang support does not grant additional
+model usage rights.
+</Warning>
+
+### 1.1 New in LTX-2.5
+
+Two capabilities have no equivalent in LTX-2 / LTX-2.3:
+
+<CardGroup cols={2}>
+  <Card title="Auto-duration" icon="clock" href="#4-3-auto-duration">
+    A duration head predicts how long the shot the caption implies should run,
+    and picks the frame count for you. Pass `--auto-duration` instead of
+    `--num-frames`.
+  </Card>
+  <Card title="Diffusion decoder" icon="wand-magic-sparkles" href="#4-6-diffusion-decoder">
+    A diffusion model replaces the convolutional VAE decoder for the
+    latent-to-pixel step. Enable with `--use-diffusion-decoder`.
+  </Card>
+</CardGroup>
+
+Both are optional and off by default.
+
+### 1.2 Components
+
+| Path | Component | Used by |
+| --- | --- | --- |
+| `transformer/` | Distilled DiT (the default) | always |
+| `transformer_full/` | Full / SFT DiT | `--model-variant dev` |
+| `vae/` | Convolutional video VAE | encode always; decode by default |
+| `diffusion_decoder/` | Diffusion video decoder, decoder-only | `--use-diffusion-decoder` |
+| `latent_upsampler/` | Spatial x2 latent upsampler | `LTX2TwoStagePipeline` |
+| `duration_head/` | Predicts clip length from the caption | `--auto-duration` |
+| `audio_vae/`, `vocoder/`, `connectors/`, `text_encoder/`, `tokenizer/`, `scheduler/` | Shared | always |
+
+Encoding always uses `vae/`, and both decoders consume the same latents, so the
+decoder choice does not change anything upstream of it.
+
+## 2. SGLang-diffusion Installation
+
+```bash
+uv pip install "sglang[diffusion]" --prerelease=allow
+```
+
+For platform-specific setup, see the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation).
+
+NATTEN is an optional extra, worth installing only if you plan to use the
+[diffusion decoder](#4-6-diffusion-decoder) — see that section for why.
+
+## 3. Model Deployment
+
+### 3.1 Basic Configuration
+
+```bash
+sglang serve \
+  --model-path Lightricks/LTX-2.5-Diffusers \
+  --pipeline-class-name LTX2Pipeline
+```
+
+On a single high-VRAM GPU no extra flags are needed.
+
+**Interactive Command Generator**: pick a target and the features you want; the
+command updates below. Server-side choices (pipeline class, weights variant,
+parallelism) go on `sglang serve`, while per-request choices (auto-duration,
+diffusion decoder, resolution) are listed separately, since they belong on the
+`sglang generate` call or the request body.
+
+<LTX25Deployment />
+
+### 3.2 Configuration Tips
+
+Choose the pipeline class based on the quality and latency target:
+
+| Use case | Pipeline class | Notes |
+| --- | --- | --- |
+| One-stage generation | `LTX2Pipeline` | Fastest path. Supports T2V and TI2V, auto-duration and the diffusion decoder. |
+| Two-stage generation | `LTX2TwoStagePipeline` | Half-resolution base stage, x2 latent upsample, then a short refinement. Pass the **final** resolution. |
+
+There is no HQ pipeline class for LTX-2.5, and no `--distilled-lora-path` for
+either weights variant: LTX-2.5 distils the weights themselves rather than
+merging a LoRA per stage, so `--ltx2-two-stage-device-mode` (which governs that
+swap) does not apply either.
+
+Every feature on this page — text-to-video, image conditioning, auto-duration,
+the diffusion decoder, and either weights variant — works with both pipeline
+classes.
+
+Selecting weights:
+
+- `--model-variant dev` serves the full / SFT DiT from `transformer_full/`; the
+  default is the distilled one. See [section 4.5](#4-5-the-dev-transformer).
+
+### 3.3 Multi-GPU presets
+
+| Target | Recommended server flags | Notes |
+| --- | --- | --- |
+| 1 high-VRAM GPU | *(no extra flags)* | 960×544 fits comfortably on an H200. |
+| 1 tight-VRAM GPU | `--quantization fp8` | Halves the DiT and cuts peak memory ~18 GB at unchanged speed. See [section 3.4](#3-4-fp8-quantization). |
+| 1 very tight GPU | `--dit-layerwise-offload` | Cuts peak memory by roughly 10 GB, at about 4x the wall clock. |
+| 2 GPUs, long sequences | `--num-gpus 2 --ulysses-degree 2` | Sequence parallel; the memory/long-sequence tool. |
+| 2 GPUs, large DiT | `--num-gpus 2 --tp-size 2` | Tensor parallel across attention heads. |
+| 2 GPUs, dev weights | `--num-gpus 2 --enable-cfg-parallel` | Splits the guided and unguided branches across GPUs. Measured 1.77x on denoising (15.1s to 8.5s, 960×544 / 57 frames / 30 steps). |
+
+<Warning>
+**CFG parallelism does not apply on the default (distilled) path.** That DiT
+runs unguided, so there is no negative branch to split across GPUs and
+`--enable-cfg-parallel` buys nothing — the CFG-parallel presets on the
+LTX-2 / LTX-2.3 page do not carry over. It *is* worth using with
+`--model-variant dev`, which runs with guidance.
+</Warning>
+
+### 3.4 fp8 quantization
+
+`--quantization fp8` quantizes the DiT's linear layers as it loads them, so it
+needs no pre-quantized checkpoint:
+
+```bash
+sglang serve \
+  --model-path Lightricks/LTX-2.5-Diffusers \
+  --pipeline-class-name LTX2Pipeline \
+  --quantization fp8
+```
+
+At 960×544 / 49 frames the transformer loads in 18.11 GB against 35.37 GB for
+bf16, and the run peaks at 53.5 GB against 71.1 GB. Denoising time is
+unchanged: the distilled 8-step path at this size is bound by memory traffic
+rather than matmul throughput, so fp8 buys headroom rather than speed.
+
+Expect a different sample for a given seed. Quantization nudges the denoising
+trajectory and diffusion amplifies that, so the result differs from bf16
+without being worse.
+
+## 4. Model Invocation
+
+### 4.1 Text-to-video with audio
+
+```bash
+sglang generate \
+  --model-path Lightricks/LTX-2.5-Diffusers \
+  --pipeline-class-name LTX2Pipeline \
+  --prompt "A cinematic shot of a red fox walking through a snowy forest at dawn, the camera tracking alongside, snow crunching underfoot." \
+  --save-output
+```
+
+Defaults: 960×544, 121 frames, 24 fps. Video and audio are generated jointly and
+muxed into one MP4.
+
+The default DiT is distilled and runs off a fixed 8-sigma schedule rather than a
+step count, so `--num-inference-steps` and `--guidance-scale` have no effect
+here. Use [`--model-variant dev`](#4-5-the-dev-transformer) when you want
+control over either.
+
+### 4.2 Image-to-video
+
+```bash
+sglang generate \
+  --model-path Lightricks/LTX-2.5-Diffusers \
+  --pipeline-class-name LTX2Pipeline \
+  --image-path ./inputs/start.png \
+  --prompt "The camera pushes forward as the subject turns toward the light." \
+  --save-output
+```
+
+The conditioning image is re-compressed to match the compression the model was
+trained against — CRF 18 for LTX-2.5, where LTX-2 / 2.3 use 33. SGLang picks the
+right one from the checkpoint, so nothing needs to be passed.
+
+### 4.3 Auto-duration
+
+<span style={{fontSize: "0.7em", verticalAlign: "middle", padding: "2px 8px", borderRadius: "9999px", background: "#16a34a", color: "#fff"}}>NEW</span>
+
+LTX-2.5 ships a duration head — a small module that reads the encoded caption
+and regresses the natural length of the shot it describes. Use it when the
+prompt implies a duration ("a quick glance" vs "a slow pan across the valley")
+and you would rather not guess a frame count:
+
+```bash
+sglang generate \
+  --model-path Lightricks/LTX-2.5-Diffusers \
+  --pipeline-class-name LTX2Pipeline \
+  --prompt "A red fox walking through a snowy forest at dawn." \
+  --auto-duration \
+  --save-output
+```
+
+The prediction is clamped to `--auto-duration-min-seconds` /
+`--auto-duration-max-seconds` (default 1–20 s) and snapped to the VAE's temporal
+grid, so the result is always a valid frame count. It overrides `--num-frames`.
+
+### 4.4 Two-stage (higher quality)
+
+Stage 1 runs at half the requested resolution, the latents are upsampled 2x, and
+a short sigma tail refines at full resolution. Pass the **final** size:
+
+```bash
+sglang generate \
+  --model-path Lightricks/LTX-2.5-Diffusers \
+  --pipeline-class-name LTX2TwoStagePipeline \
+  --prompt "A cinematic shot of a red fox walking through a snowy forest at dawn." \
+  --height 1088 --width 1920 \
+  --save-output
+```
+
+Resolution must be divisible by 64. Unlike LTX-2.3, no `--distilled-lora-path`
+is needed: the LTX-2.5 transformer is already distilled.
+
+### 4.5 The dev transformer
+
+LTX-2.5 ships two DiTs. `model_index.json` points at the distilled one; the
+full / SFT weights live in `transformer_full/` and are deliberately left out of
+the index. Select them with `--model-variant dev`:
+
+```bash
+sglang generate \
+  --model-path Lightricks/LTX-2.5-Diffusers \
+  --pipeline-class-name LTX2Pipeline \
+  --model-variant dev \
+  --prompt "A cinematic shot of a red fox walking through a snowy forest at dawn." \
+  --num-inference-steps 30 --guidance-scale 3.0 \
+  --save-output
+```
+
+The dev variant is not distilled, so SGLang automatically drops the pinned
+distilled sigma schedule and re-enables the dynamic shifting that `scheduler/`
+turns off for the distilled DiT. Unlike the distilled path it *is* driven by a
+step count and *does* want CFG, so pass `--num-inference-steps` and
+`--guidance-scale` yourself.
+
+Note that `from_pretrained` only fetches what `model_index.json` lists, so a
+partial snapshot download will not include `transformer_full/` (another 38 GB).
+
+### 4.6 Diffusion decoder
+
+<span style={{fontSize: "0.7em", verticalAlign: "middle", padding: "2px 8px", borderRadius: "9999px", background: "#16a34a", color: "#fff"}}>NEW</span>
+
+LTX-2.5 adds a diffusion-based video decoder as an alternative to the
+convolutional VAE decoder. Rather than deconvolving the latent it denoises
+pixels conditioned on a context volume built from it, which recovers detail a
+convolutional decoder tends to smooth away:
+
+```bash
+sglang generate \
+  --model-path Lightricks/LTX-2.5-Diffusers \
+  --pipeline-class-name LTX2Pipeline \
+  --prompt "A red fox walking through a snowy forest at dawn." \
+  --use-diffusion-decoder \
+  --save-output
+```
+
+It is a diffusion model in its own right and decodes more slowly than the VAE
+decoder, so it is off by default — matching upstream, where `LTX2Pipeline` also
+decodes with the VAE. The offline `generate` command loads the optional decoder
+automatically when `--use-diffusion-decoder` is present.
+
+For an online server, opt into loading the decoder at startup, then select it per
+request with `use_diffusion_decoder: true`:
+
+```bash
+sglang serve \
+  --model-path Lightricks/LTX-2.5-Diffusers \
+  --pipeline-class-name LTX2Pipeline \
+  --load-diffusion-decoder
+```
+
+This keeps the default server footprint unchanged while still allowing VAE and
+diffusion-decoder requests to share one server. When GPU memory is constrained,
+`--cpu-offload-components diffusion_decoder` keeps the optional decoder on CPU
+between uses.
+
+<Tip>
+**Install NATTEN for this decoder.** Its stages run 3D neighborhood attention,
+and SGLang uses NATTEN's fused `na3d` kernel for it when the package is present.
+NATTEN is *not* a dependency of `sglang[diffusion]`: without it the decoder
+falls back to a compiled FlexAttention block mask. The two agree to bf16
+rounding, but the fallback is roughly **5x slower** on the decoder's largest
+attention grid, and has to build the mask on top of that.
+
+NATTEN ships prebuilt wheels pinned to a specific torch and CUDA build, so
+install the one matching your environment rather than a bare version — check
+your combination at [natten.org](https://natten.org). For torch 2.11 / CUDA
+13.0, for example:
+
+```bash
+uv pip install natten==0.21.6+torch2110cu130 -f https://whl.natten.org/
+```
+
+Nothing else changes if you skip it: the decoder still produces the same video,
+just slower.
+</Tip>

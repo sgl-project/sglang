@@ -265,7 +265,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.is_not_in_free_group:
             self._release_page_ids(torch.unique(free_index // self.page_size))
         else:
-            self.free_group.append(free_index)
+            self.free_group.append(self._copy_for_free_group(free_index))
 
         if self.debug_mode:
             self._debug_check_no_duplicate_pages()
@@ -298,7 +298,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             if self.debug_mode:
                 self._debug_check_no_duplicate_pages()
         else:
-            self.free_page_reps_group.extend(pieces)
+            self.free_page_reps_group.extend(
+                self._copy_for_free_group(piece) for piece in pieces
+            )
 
     def _debug_check_no_duplicate_pages(self):
         # span both containers: need_sort (PD disagg) routes frees into release_pages

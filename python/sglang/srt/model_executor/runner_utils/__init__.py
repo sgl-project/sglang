@@ -26,3 +26,6 @@ from sglang.srt.model_executor.runner_utils.pool import (  # noqa: F401
     get_global_graph_memory_pool,
     set_global_graph_memory_pool,
 )
+from sglang.srt.model_executor.runner_utils.shared_read_event import (  # noqa: F401
+    maybe_publish_prefill_shared_read_done,
+)

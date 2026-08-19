@@ -56,8 +56,8 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             if is_fp8_fnuz():
                 k_scale *= 2
                 v_scale *= 2
-        elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
-            # If no scales were loaded (both scales are invalid negative
+        elif layer.k_scale <= 0.0 and layer.v_scale <= 0.0:
+            # If no scales were loaded (both scales are invalid non-positive
             # values), use the default value of 1.0
             k_scale = 1.0
             v_scale = 1.0

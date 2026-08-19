@@ -4,7 +4,9 @@ from unittest.mock import patch
 import pytest
 import torch.nn as nn
 
-from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2ArchConfig
+from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
+    LTX2VideoTransformer3DModel,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
@@ -39,7 +41,7 @@ class _RegionalModel(_CompilableModule):
 
 
 def test_ltx2_compile_conditions_match_only_direct_blocks():
-    conditions = LTX2ArchConfig()._compile_conditions
+    conditions = LTX2VideoTransformer3DModel._compile_conditions
 
     assert conditions
     assert any(condition("transformer_blocks.0", object()) for condition in conditions)

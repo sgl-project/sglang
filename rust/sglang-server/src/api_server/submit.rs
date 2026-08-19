@@ -2,20 +2,10 @@
 //! module: mint the client-visible rid (uuid hex, Python-parity), build the
 //! `Request`, and hand it to the TM with an egress receiver for the response.
 
-use std::convert::Infallible;
-
-use axum::{
-    Json,
-    http::StatusCode,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
-};
+use axum::{http::StatusCode, response::Response};
 use tokio::sync::mpsc;
 
-use super::AppState;
-use super::frame::error_value;
+use super::{AppState, native_api::native_error};
 use crate::fsm::RequestState;
 use crate::ids::Rid;
 use crate::message::{EgressItem, EgressSink, Request, RequestKind};
@@ -29,8 +19,7 @@ pub(super) async fn submit(
     state: &AppState,
     kind: RequestKind,
     // `stream`: the client is reading an SSE stream, so it expects 200 plus an
-    // error frame rather than a 4xx — same rule `pre_submit_error` applies
-    // everywhere else.
+    // error frame rather than a 4xx — `utils::response::error_response`'s rule.
     stream: bool,
 ) -> Result<(Rid, mpsc::Receiver<EgressItem>), Response> {
     let rid = match &kind {
@@ -61,76 +50,11 @@ pub(super) async fn submit(
         Err(_) => {
             tracing::error!(%rid, "tm inbox closed; request rejected");
             // Return 503 so the client can retry.
-            Err(pre_submit_error(
+            Err(native_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "service unavailable",
                 stream,
             ))
         }
-    }
-}
-
-/// Shape an error that occurs *before* (or instead of) a successful submit into a
-/// client response. Two parity points with Python's `generate_request`. The body
-/// is the same `{"error": {...}}` object every other path emits — not bare text,
-/// which a client parsing JSON chokes on. And a streaming request gets 200 plus
-/// one SSE error frame and `[DONE]`, not a 4xx: the client has already committed
-/// to reading a stream, and Python answers it inside `stream_results()`.
-pub(super) fn pre_submit_error(code: StatusCode, message: &str, stream: bool) -> Response {
-    let body = error_value(code.as_u16(), message);
-    if !stream {
-        return (code, Json(body)).into_response();
-    }
-    sse_error_response(body)
-}
-
-/// A 200 SSE response carrying one error frame + `[DONE]` — how a stream the
-/// client is already committed to reading reports a failure. Shared by every
-/// endpoint family: the native API via [`pre_submit_error`] and the OpenAI
-/// frontend's `openai_error_response`.
-pub(super) fn sse_error_response(body: serde_json::Value) -> Response {
-    let frames = [body.to_string(), "[DONE]".to_string()];
-    Sse::new(futures::stream::iter(
-        frames.map(|data| Ok::<_, Infallible>(Event::default().data(data))),
-    ))
-    .into_response()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Unary pre-submit errors are a 4xx/5xx with a JSON `{"error":...}` body;
-    /// streaming ones are 200 + an SSE error frame + `[DONE]`, because Python
-    /// answers from inside `stream_results()` once the stream is committed.
-    #[tokio::test]
-    async fn pre_submit_errors_match_python_shape() {
-        let unary = pre_submit_error(StatusCode::BAD_REQUEST, "bad input", false);
-        assert_eq!(unary.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(unary.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
-        assert_eq!(v["error"]["message"], "bad input");
-        assert_eq!(v["error"]["code"], 400);
-
-        let streamed = pre_submit_error(StatusCode::BAD_REQUEST, "bad input", true);
-        assert_eq!(
-            streamed.status(),
-            StatusCode::OK,
-            "the stream itself is 200"
-        );
-        let body = axum::body::to_bytes(streamed.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(
-            text.contains(r#""code":400"#),
-            "carries the status in-band: {text}"
-        );
-        assert!(
-            text.trim_end().ends_with("data: [DONE]"),
-            "terminated: {text}"
-        );
     }
 }

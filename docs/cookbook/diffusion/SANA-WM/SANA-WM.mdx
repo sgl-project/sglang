@@ -207,7 +207,7 @@ Notes on launch behavior:
 - **CPU offload flags are optional.** `--dit-cpu-offload`, `--text-encoder-cpu-offload`, and `--image-encoder-cpu-offload` are available; defaults are auto-adjusted from GPU memory (GPUs under 30 GB get more aggressive offloading).
 - **Multi-GPU realtime.** Prefer explicit sequence parallelism (`--sp-degree` equal to the number of GPUs for a single session). Do not enable CFG parallel for the realtime profile: the default realtime request uses `guidance_scale=1.0`, while CFG parallel requires active cond/uncond branches.
 - **FSDP.** Use `--use-fsdp-inference` only when you specifically need weight sharding for memory. For the low-latency realtime profile, prefer keeping components resident and using SP first.
-- **Warmup.** Server warmup is **automatically skipped** for the realtime pipeline — a synthetic warmup request has no WebSocket session, so the server detects the registered realtime adapter and skips it. No `--warmup` flag is needed.
+- **Warmup.** Server warmup is **automatically skipped** for the realtime pipeline — a synthetic warmup request has no WebSocket session, so the server detects the registered realtime adapter and skips it. No explicit `--warmup-mode` setting is needed.
 
 Once up, the realtime WebSocket endpoint lives at `ws://127.0.0.1:30000/v1/realtime_video/generate` (use the Python client in §7 to connect — plain `curl` does not speak the `ws://` upgrade).
 

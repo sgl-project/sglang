@@ -28,12 +28,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - suite: stage-c-2-gpu-mi350
+          - suite: nightly-stage-c-2-gpu-mi350
             runner: linux-mi35x-gpu-2
           # Use 8-GPU MI35X pool for 4-GPU suite.
-          - suite: stage-c-4-gpu-mi350
+          - suite: nightly-stage-c-4-gpu-mi350
             runner: linux-mi35x-gpu-8
-          - suite: stage-c-8-gpu-mi350
+          - suite: nightly-stage-c-8-gpu-mi350
             runner: linux-mi35x-gpu-8
     runs-on: ${{ matrix.runner }}
     steps:
@@ -80,14 +80,14 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Run miles CI suite ${{ matrix.suite }}
-        timeout-minutes: 120
+        timeout-minutes: 180
         run: |
           touch "${GITHUB_WORKSPACE}/github_summary.md"
           TEST_EXIT_CODE=0
           bash scripts/ci/amd/amd_ci_exec.sh -w /root/miles \
             -e PYTHONPATH=/root/miles:/opt/tilelang \
             -e GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md \
-            python3 tests/ci/run_suite.py --hw rocm --suite ${{ matrix.suite }} --match-all-labels \
+            python3 tests/ci/run_suite.py --hw rocm --suite ${{ matrix.suite }} --cadence nightly \
             ${{ (github.event_name != 'workflow_dispatch' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           cat "${GITHUB_WORKSPACE}/github_summary.md" >> "$GITHUB_STEP_SUMMARY" || true
           exit ${TEST_EXIT_CODE}

@@ -13,6 +13,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.condition_encoding impo
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_KEYFRAME_COND_ROWS_EXTRA_KEY,
+    MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY,
     MINIMAX_H3_REFERENCE_IMAGE_ROWS_EXTRA_KEY,
     MINIMAX_H3_REFERENCE_VIDEO_ROWS_EXTRA_KEY,
 )
@@ -68,6 +69,11 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
             # No later stage will run after an encoder failure.
             minimax_h3_cleanup_temp_dirs(batch)
             raise
+        finally:
+            # Text and visual encoding are the only full-RGB consumers. Release
+            # the shared mapping on both success and failure before later stages
+            # can retain a several-hundred-MiB request-local view.
+            batch.extra.pop(MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY, None)
 
     def _forward(self, batch: Req, server_args: ServerArgs) -> Req:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
@@ -283,7 +289,11 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
 
         if MINIMAX_H3_REFERENCE_VIDEO_ROWS_EXTRA_KEY in batch.extra:
             return
-        prepared = minimax_h3_prepared_reference_videos(batch, plan)
+        prepared = minimax_h3_prepared_reference_videos(
+            batch,
+            plan,
+            share_across_replicas=bool(self.video_vae.parallel_tiling),
+        )
         videos = prepared.get("videos")
         if not isinstance(videos, list) or not videos:
             raise ValueError(

@@ -20,6 +20,8 @@ class TestEagle3ParityCPU(SpecParityKit, Eagle3Base):
     attention_backend = "intel_amx"
     disable_overlap = True
     mem_fraction_static = 0.3
+    # CPU decode is compute-bound; a wider batch buys nothing here.
+    max_running_requests = 8
     env_overrides = ((envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY, 1),)
 
 

@@ -164,5 +164,6 @@ class FastHunyuanConfig(HunyuanConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            keep_resident_components=("vae",),
+            keep_resident_min_available_gb=60,
+            keep_resident_components=("dit", "vae"),
         )

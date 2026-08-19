@@ -14,6 +14,12 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class TestDisaggregationServerWarmup(unittest.IsolatedAsyncioTestCase):
     async def test_sends_concurrent_scalar_request_to_each_dp_rank(self):
+        from sglang.srt.runtime_context import get_context
+
+        # The warmup fan-out width comes from the published topology.
+        override = get_context().override_server_args(dp_size=4)
+        override.install()
+        self.addCleanup(override.restore)
         server_args = SimpleNamespace(dp_size=4)
         all_started = asyncio.Event()
         calls = []

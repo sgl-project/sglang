@@ -9,6 +9,7 @@ import torch.nn as nn
 from einops import rearrange
 
 from sglang.multimodal_gen.configs.models.dits.joy_image import JoyImageDiTConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_double_blocks
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_group,
@@ -348,9 +349,8 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
 
     _supports_gradient_checkpointing = True
-    _fsdp_shard_conditions = JoyImageDiTConfig()._fsdp_shard_conditions
-    _compile_conditions = JoyImageDiTConfig()._compile_conditions
-    _supported_attention_backends = JoyImageDiTConfig()._supported_attention_backends
+    _fsdp_shard_conditions = [is_blocks_or_double_blocks]
+    _compile_conditions = [is_blocks_or_double_blocks]
     param_names_mapping = JoyImageDiTConfig().param_names_mapping
     reverse_param_names_mapping = JoyImageDiTConfig().reverse_param_names_mapping
     lora_param_names_mapping = JoyImageDiTConfig().lora_param_names_mapping

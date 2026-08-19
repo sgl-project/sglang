@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: E501
 # Adapted from https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/blob/main/modeling_kimi_vl.py
-# This file is meant to be used in kimi_vl.py only
+# Shared MoonViT building blocks for kimi_vl.py and kimi_k25.py
 # Copyright 2025 The Moonshot AI Team, DeepSeek-AI, and HuggingFace Inc. team. All rights reserved.
 #
 # The code is based on llava (llava/modeling_llava.py) and DeepSeek-V3 (DeepSeek-V3/modeling_deepseek.py), but modified for KimiVL.
@@ -562,6 +562,43 @@ def patch_merger(
         )
         outputs.append(padded_seq)
         pre_sum += height * width
+
+    return outputs
+
+
+def tpool_patch_merger(
+    x: torch.Tensor,
+    grid_thws: torch.Tensor,
+    merge_kernel_size: tuple[int, int] = (2, 2),
+    *,
+    grid_thw_list: Optional[Sequence[Sequence[int]]] = None,
+) -> List[torch.Tensor]:
+    """Group spatial patches and average only across real video frames.
+
+    ``grid_thw_list`` lets a graph-aware tower pass the host grid it already
+    has instead of paying a device sync for ``grid_thws.tolist()``.
+    """
+
+    d_model = x.size(-1)
+    outputs = []
+    pre_sum = 0
+    shapes = grid_thws.tolist() if grid_thw_list is None else grid_thw_list
+    for t, h, w in shapes:
+        t, h, w = int(t), int(h), int(w)
+        seq = x[pre_sum : pre_sum + t * h * w]
+        kernel_height, kernel_width = merge_kernel_size
+        new_height, new_width = h // kernel_height, w // kernel_width
+        reshaped_seq = seq.view(
+            t, new_height, kernel_height, new_width, kernel_width, d_model
+        )
+        reshaped_seq = reshaped_seq.permute(0, 1, 3, 2, 4, 5).contiguous()
+        reshaped_seq = reshaped_seq.squeeze(0) if t == 1 else reshaped_seq.mean(dim=0)
+        outputs.append(
+            reshaped_seq.view(
+                new_height * new_width, kernel_height * kernel_width, d_model
+            )
+        )
+        pre_sum += t * h * w
 
     return outputs
 

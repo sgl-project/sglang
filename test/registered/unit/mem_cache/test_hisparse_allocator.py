@@ -9,6 +9,7 @@ import torch
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -79,7 +80,10 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         from sglang.srt.disaggregation.decode import DecodePreallocQueue
 
         fill_len = 512
-        swa_tail_len = 128
+        sliding_window_size = 200
+        # _swa_tail_len floors the window start to a page boundary:
+        # floor_align(512 - 200, 256) = 256, so the tail is one whole page.
+        swa_tail_len = 256
         kv_loc = torch.arange(512, 512 + fill_len, dtype=torch.int64)
         host_indices = torch.arange(1000, 1128, dtype=torch.int64)
 
@@ -133,9 +137,9 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             enable_hisparse=True,
             hisparse_coordinator=coordinator,
             server_args=SimpleNamespace(disaggregation_decode_enable_radix_cache=False),
+            sliding_window_size=sliding_window_size,
         )
         queue._uses_swa_tail_prealloc = MagicMock(return_value=True)
-        queue._swa_tail_len = MagicMock(return_value=swa_tail_len)
 
         result = queue._pre_alloc(req)
 
@@ -214,14 +218,18 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         manager._send_kvcache_generic = MagicMock(return_value=0)
         executor = MagicMock()
 
-        manager.send_kvcache(
-            "session",
-            np.array([1], dtype=np.int32),
-            [10000, 20000, 30000],
-            np.array([7], dtype=np.int32),
-            executor,
-            dst_device_kv_indices=np.array([21], dtype=np.int32),
-        )
+        # send_kvcache reads the memory bag (the unified-memory envelope-layout
+        # check), so the context has to be published. This is the non-unified
+        # path -- pin that explicitly rather than leaning on the default.
+        with get_context().override_server_args(enable_unified_memory=False):
+            manager.send_kvcache(
+                "session",
+                np.array([1], dtype=np.int32),
+                [10000, 20000, 30000],
+                np.array([7], dtype=np.int32),
+                executor,
+                dst_device_kv_indices=np.array([21], dtype=np.int32),
+            )
 
         kwargs = manager._send_kvcache_generic.call_args.kwargs
         self.assertEqual(kwargs["dst_device_data_ptrs"], {20000, 30000})

@@ -59,6 +59,13 @@ _EXEC_SUBS = (
 
 
 class TestConfigBags(CustomTestCase):
+    def _callTestMethod(self, method):
+        # No retry: CustomTestCase retries once in CI, but `addCleanup` runs
+        # after the last attempt, so a retry of the dual-resolve case would
+        # re-enter with the first attempt's leaked process state instead of
+        # the pristine snapshot the sibling helper restores from.
+        unittest.TestCase._callTestMethod(self, method)
+
     def setUp(self):
         rc.reset_context()
 
@@ -76,14 +83,130 @@ class TestConfigBags(CustomTestCase):
         with self.assertRaises(ValueError):
             rc.get_memory()
 
-    def test_bag_values_match_server_args(self):
-        sa = self._publish()
-        self.assertEqual(rc.get_exec().moe.moe_runner_backend, sa.moe_runner_backend)
-        self.assertEqual(rc.get_exec().kernel.attention_backend, sa.attention_backend)
-        self.assertEqual(rc.get_memory().hicache_ratio, sa.hicache_ratio)
+    def test_the_bags_carry_what_resolution_produced(self):
+        """The projection is faithful: each leaf is the *resolved* value.
+
+        Two requirements the dummy-model shortcut cannot meet: the record must
+        go through the real resolution pipeline (a dummy path returns at the
+        dummy-model boundary with every sampled leaf still raw, so raw==raw
+        would pass vacuously), and the reference must be an independent
+        resolution of the same raw input -- a fresh, never-published record,
+        resolved after restoring the process state (environ and the EnvField
+        none-flags) the first resolution may have written -- so the assertion
+        is "bag == what resolution produces", not "bag == the instance publish
+        copied from". Reproducibility (`test_resolution_is_reproducible`)
+        licenses the sibling as a stand-in for the pipeline's output. The
+        raw-differs guard keeps the comparison meaningful: every sampled leaf
+        must have moved off its dataclass default, so each equality compares a
+        value resolution demonstrably wrote. Supplied construction inputs
+        (`model_path`, `device`, `random_seed`) and leaves resolution leaves
+        alone never enter the sample -- projection coverage for those lives in
+        `test_passthrough_leaves_project_into_their_namespaces`. Step 12 keeps
+        records at the user's raw input; then the sibling goes raw and this
+        assertion starts failing for every sampled leaf, which is the signal
+        the bags became the only home of the effective value.
+        """
+        import dataclasses
+
+        sa, reference = self._resolve_published_and_sibling()
+        defaults = {f.name: f.default for f in dataclasses.fields(ServerArgs)}
+        # Leaves resolution writes on this input on both CI device shapes
+        # (CUDA host and CPU-only runner): each starts at a None default.
+        sampled = (
+            (lambda: rc.get_exec().kernel.attention_backend, "attention_backend"),
+            (lambda: rc.get_schedule().page_size, "page_size"),
+            (lambda: rc.get_schedule().chunked_prefill_size, "chunked_prefill_size"),
+            (lambda: rc.get_schedule().mem_fraction_static, "mem_fraction_static"),
+        )
+        for accessor, leaf in sampled:
+            with self.subTest(leaf=leaf):
+                # The raw-differs guard: a sampled leaf that still sits on its
+                # default (or has none to differ from) proves nothing.
+                self.assertIsNot(defaults[leaf], dataclasses.MISSING)
+                self.assertNotEqual(getattr(reference, leaf), defaults[leaf])
+                self.assertEqual(accessor(), getattr(reference, leaf))
+        # And the record agrees today, which is what step 12 changes: when this
+        # assertion starts failing for a resolution-written leaf, the flip
+        # landed and the bag is the only place the effective value lives.
         self.assertEqual(rc.get_schedule().page_size, sa.page_size)
-        self.assertEqual(rc.get_serving().host, sa.host)
-        self.assertEqual(rc.get_model().model_path, sa.model_path)
+
+    def test_passthrough_leaves_project_into_their_namespaces(self):
+        """Thin projection smoke over leaves resolution does not move.
+
+        `bag == instance` is all these equalities can claim (publish projected
+        an unchanged field into serving/memory/moe/model) -- resolution
+        faithfulness is `test_the_bags_carry_what_resolution_produced`'s job.
+        """
+        sa = self._publish()
+        sampled = (
+            (lambda: rc.get_serving().host, "host"),
+            (lambda: rc.get_memory().hicache_ratio, "hicache_ratio"),
+            (lambda: rc.get_exec().moe.moe_runner_backend, "moe_runner_backend"),
+            (lambda: rc.get_model().model_path, "model_path"),
+        )
+        for accessor, leaf in sampled:
+            with self.subTest(leaf=leaf):
+                self.assertEqual(accessor(), getattr(sa, leaf))
+
+    def _resolve_published_and_sibling(self):
+        """Resolve a real mini config twice from the same pristine process
+        state: publish the first record, hand back the never-published sibling
+        as the reference."""
+        import json
+        import os
+        import shutil
+        import tempfile
+
+        from sglang.srt.environ import EnvField, envs
+
+        config_dir = tempfile.mkdtemp(prefix="bag_contract_")
+        self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
+        with open(os.path.join(config_dir, "config.json"), "w") as handle:
+            json.dump(
+                {
+                    "architectures": ["LlamaForCausalLM"],
+                    "model_type": "llama",
+                    "hidden_size": 16,
+                    "intermediate_size": 32,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "num_hidden_layers": 2,
+                    "vocab_size": 128,
+                    "max_position_embeddings": 2048,
+                },
+                handle,
+            )
+
+        # Resolution can write process state os.environ does not carry (the
+        # multimodal transport env sticky plus the EnvField descriptor flag
+        # `set()` flips); snapshot both so the sibling resolves the same
+        # pristine input. Walk the MRO: `vars(type(envs))` alone would miss
+        # fields declared on a base class.
+        env_fields = {}
+        for klass in reversed(type(envs).__mro__):
+            for name, field in vars(klass).items():
+                if isinstance(field, EnvField):
+                    env_fields[name] = field
+        environ_before = dict(os.environ)
+        none_flags_before = {
+            name: field._set_to_none for name, field in env_fields.items()
+        }
+
+        def restore_process_state():
+            os.environ.clear()
+            os.environ.update(environ_before)
+            for name, was_none in none_flags_before.items():
+                getattr(type(envs), name)._set_to_none = was_none
+
+        self.addCleanup(restore_process_state)
+
+        def resolve():
+            return ServerArgs(model_path=config_dir, device="cuda", random_seed=42)
+
+        sa = resolve()
+        rc.publish(sa, role="scheduler")
+        restore_process_state()
+        return sa, resolve()
 
     def test_all_accessors_and_exec_subgroups(self):
         self._publish()

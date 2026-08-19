@@ -17,9 +17,8 @@ from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.fp8_utils import (
     input_to_float8,
     mxfp8_group_quantize,
-    triton_mxfp8_blockscaled_linear,
 )
-from sglang.srt.utils import is_sm100_supported, is_sm120_supported
+from sglang.srt.utils import is_blackwell_supported, is_flashinfer_available
 from sglang.test.test_utils import CustomTestCase
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
@@ -452,11 +451,20 @@ class TestMXFP8DenseLinear(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
-        if not (is_sm100_supported() or is_sm120_supported()):
-            raise unittest.SkipTest("MXFP8 requires Blackwell (SM100/SM120)")
+        if not (is_blackwell_supported() and is_flashinfer_available()):
+            raise unittest.SkipTest(
+                "MXFP8 dense linear requires Blackwell + FlashInfer"
+            )
         torch.set_default_device("cuda")
 
     def _mxfp8_dense_linear(self, M, NK, dtype, seed):
+        from flashinfer import block_scale_interleave
+
+        from sglang.srt.layers.quantization.fp8_utils import (
+            flashinfer_mxfp8_blockscaled_linear,
+            flashinfer_mxfp8_quantize,
+        )
+
         N, K = NK
         torch.manual_seed(seed)
 
@@ -465,23 +473,29 @@ class TestMXFP8DenseLinear(CustomTestCase):
 
         weight_fp32 = torch.randn((N, K), dtype=torch.float32) / 4
         weight_q, weight_scale_u8 = mxfp8_group_quantize(weight_fp32)
+        weight_scale_swizzled = block_scale_interleave(weight_scale_u8).contiguous()
 
         with torch.inference_mode():
-            q_input, input_scale_u8 = mxfp8_group_quantize(input_fp16.to(torch.float32))
-            a_dq = _mxfp8_group_dequant(q_input, input_scale_u8)
+            q_input, input_scale_swizzled = flashinfer_mxfp8_quantize(
+                input_fp16, is_sf_swizzled_layout=True, alignment=32
+            )
+            _, input_scale_linear = flashinfer_mxfp8_quantize(
+                input_fp16, is_sf_swizzled_layout=False, alignment=32
+            )
+            a_dq = _mxfp8_group_dequant(q_input, input_scale_linear.view(M, K // 32))
             b_dq = _mxfp8_group_dequant(weight_q, weight_scale_u8)
             ref_out = torch.matmul(a_dq, b_dq.t()).to(dtype)
 
-            out = triton_mxfp8_blockscaled_linear(
+            out = flashinfer_mxfp8_blockscaled_linear(
                 input=input_fp16,
                 weight=weight_q,
-                weight_scale=weight_scale_u8,
+                weight_scale=weight_scale_swizzled,
             )
-            out_prequant = triton_mxfp8_blockscaled_linear(
+            out_prequant = flashinfer_mxfp8_blockscaled_linear(
                 input=q_input,
                 weight=weight_q,
-                weight_scale=weight_scale_u8,
-                input_scale=input_scale_u8,
+                weight_scale=weight_scale_swizzled,
+                input_scale=input_scale_swizzled,
                 output_dtype=dtype,
             )
 

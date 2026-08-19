@@ -46,7 +46,11 @@ from sglang.srt.lora.utils import (
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_lora,
+    get_parallel,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_available_gpu_memory, replace_submodule
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
@@ -93,7 +97,7 @@ class LoRAManager:
         self.pending_lora_load_events = {}
 
         self.eviction_policy = server_args.lora_eviction_policy
-        self.enable_dp_attention: bool = server_args.enable_dp_attention
+        self.enable_dp_attention: bool = get_parallel().enable_dp_attention
         self._experts_shared_outer_override: Optional[bool] = (
             server_args.experts_shared_outer_loras
         )
@@ -981,6 +985,12 @@ class LoRAManager:
             ):
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
+                    if module_name.startswith("model.meta_mlp."):
+                        raise ValueError(
+                            "LoRA on Intern-S2-Mobius model.meta_mlp routed banks "
+                            "is not supported by the baseline; remove routed-expert "
+                            "targets or use a future bank-aware LoRA implementation."
+                        )
                     # FusedMoE submodules outside the decoder layer hierarchy
                     # (e.g. nested helpers under non-".layers." prefixes) have
                     # no resolvable layer id; skip them so we don't index
@@ -1024,8 +1034,8 @@ def init_lora_cuda_graph_moe_buffers(
     """
     from sglang.srt.lora.layers import FusedMoEWithLoRA
 
-    max_bs = server_args.cuda_graph_config.decode.max_bs
-    max_loras = server_args.max_loras_per_batch
+    max_bs = get_exec().graph.cuda_graph_config.decode.max_bs
+    max_loras = get_lora().max_loras_per_batch
     for module in model.modules():
         if isinstance(module, FusedMoEWithLoRA):
             lora_manager.init_cuda_graph_moe_buffers(max_bs, max_loras, dtype, module)

@@ -56,7 +56,7 @@ A per-commit suite name is **generated** from registration metadata as `{stage}-
 - **`runner_config`** — a runner-pool key from `scripts/ci/runner_configs.yml`, which maps it to the physical runner label (so `1-gpu-large` runs on `1-gpu-h100`). AMD/NPU use their own keys (e.g. `amd`).
 - **Suite** — `register_cuda_ci(stage="base-b", runner_config="1-gpu-small")` → `base-b-test-1-gpu-small`, the name you pass to `run_suite.py --suite`. The `-test-` is just the connector; never put it in `register_*_ci`.
 
-> Legacy single-string `suite=` is only for suites that don't fit that shape — nightly/stress/weekly and some AMD/CPU/NPU pools (e.g. `suite="nightly-kernel-1-gpu", nightly=True`). Per-commit tests always use `stage=` + `runner_config=`.
+> CUDA nightly uses the same shape with `stage="nightly"` (e.g. `stage="nightly", runner_config="1-gpu-large"` → `nightly-test-1-gpu-large`) and **no** `nightly=True` — the stage name carries the cadence, and setting the flag makes the test silently never run. Legacy single-string `suite=` is left only for `stress` and some AMD/CPU/NPU pools.
 
 ### All CI Suites
 
@@ -113,13 +113,14 @@ A per-commit suite name is **generated** from registration metadata as `{stage}-
 
 #### Nightly
 
-Nightly suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](../../../test/run_suite.py). They run via `nightly-test-nvidia.yml`, `nightly-test-amd.yml`, and `nightly-test-npu.yml`, not `pr-test.yml`. Examples:
+Nightly suites are listed in `NIGHTLY_SUITES` in [`test/run_suite.py`](../../../test/run_suite.py). They run via `nightly-test-nvidia.yml`, `nightly-test-amd.yml`, and `nightly-test-npu.yml`, not `pr-test.yml`.
 
-- `nightly-1-gpu` (CUDA)
-- `nightly-kernel-1-gpu` (CUDA, JIT kernel full grids)
-- `nightly-kernel-8-gpu-h200` (CUDA, multi-GPU JIT kernel nightly)
-- `nightly-8-gpu-h200` (CUDA)
-- `nightly-eval-vlm-2-gpu` (CUDA)
+CUDA nightly suites are named `nightly-test-{runner_config}` — one per machine type, holding everything that runs nightly on it. There is no per-purpose split (kernel / eval / perf / precision all share their machine's suite); `auto_partition` splits the work. Examples:
+
+- `nightly-test-1-gpu-large` (CUDA)
+- `nightly-test-2-gpu-large` (CUDA)
+- `nightly-test-8-gpu-h200` (CUDA)
+- `nightly-test-4-gpu-gb300` (CUDA)
 - `nightly-amd` (AMD)
 - `nightly-amd-8-gpu-mi35x` (AMD)
 - `nightly-1-npu-a3` (NPU)
@@ -330,8 +331,8 @@ register_cuda_ci(est_time=80, suite="base-b-test-1-gpu-small")
 # Per-commit test (large 1-gpu, runs on H100)
 register_cuda_ci(est_time=120, suite="base-b-test-1-gpu-large")
 
-# Nightly-only test
-register_cuda_ci(est_time=200, suite="nightly-1-gpu", nightly=True)
+# Nightly-only test (same shape as per-commit, stage is just "nightly")
+register_cuda_ci(est_time=200, stage="nightly", runner_config="1-gpu-large")
 
 # Multi-backend test (only when testing backend-specific code paths)
 register_cuda_ci(est_time=80, suite="base-a-test-1-gpu-small")
@@ -345,7 +346,7 @@ register_cuda_ci(est_time=80, suite="base-b-test-1-gpu-small", disabled="flaky -
 Parameters:
 - `est_time`: estimated runtime in seconds (used for CI partitioning)
 - `suite`: which CI suite to run in (see suite tables above)
-- `nightly=True`: for nightly-only tests (default `False` = per-commit)
+- `nightly=True`: legacy cadence flag, for non-CUDA nightly suites only. CUDA nightly uses `stage="nightly"` and must leave this unset
 - `disabled="reason"`: temporarily disable with explanation
 
 **Key principle**: Only add `register_amd_ci` / `register_npu_ci` when the test exercises backend-specific code paths. Common E2E tests just need `register_cuda_ci` — duplicating across backends wastes CI time.
@@ -365,12 +366,12 @@ register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="8-gpu-
 # Benchmarks in test/registered/jit/benchmark/
 register_cuda_ci(est_time=6, stage="base-b-kernel-benchmark", runner_config="1-gpu-large")
 
-# Optional nightly registration — nightly suites use the legacy single-string suite=
-register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
-register_cuda_ci(est_time=120, suite="nightly-kernel-8-gpu-h200", nightly=True)
+# Optional nightly registration — same form, stage is just "nightly"
+register_cuda_ci(est_time=120, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="nightly", runner_config="8-gpu-h200")
 ```
 
-The `stage` + `runner_config` calls generate suites like `base-b-kernel-unit-test-1-gpu-large`; nightly keeps the legacy `suite=` string. Keep `est_time`, `stage`, `runner_config`, and `suite` as **literal values** — `run_suite.py` collects them by AST parsing.
+Every call generates a suite named `{stage}-test-{runner_config}`, e.g. `base-b-kernel-unit-test-1-gpu-large` and `nightly-test-1-gpu-large`. Keep `est_time`, `stage`, `runner_config`, and `suite` as **literal values** — `run_suite.py` collects them by AST parsing.
 
 ---
 

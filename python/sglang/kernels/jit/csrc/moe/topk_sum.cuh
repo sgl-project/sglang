@@ -15,7 +15,7 @@
 
 #include <cstdint>
 
-namespace {
+namespace sglang {
 
 struct TopkSumParams {
   const bf16_t* __restrict__ in;  // [M, topk, K] contiguous
@@ -100,4 +100,4 @@ struct TopkSumKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

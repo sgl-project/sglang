@@ -33,6 +33,13 @@ logger = logging.getLogger(__name__)
 
 
 class RadixCacheCpp(BasePrefixCache):
+    @staticmethod
+    def _reject_cache_salt(cache_salt: Optional[str]) -> None:
+        if cache_salt is not None:
+            raise ValueError(
+                "cache_salt is not supported by the experimental C++ radix tree"
+            )
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -100,6 +107,7 @@ class RadixCacheCpp(BasePrefixCache):
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         key = params.key
+        self._reject_cache_salt(key.cache_salt)
         device_indices_vec, host_indices_length, node_gpu, node_cpu = (
             self.tree.match_prefix(key.raw_token_ids())
         )
@@ -173,6 +181,7 @@ class RadixCacheCpp(BasePrefixCache):
         self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
     ):
         """Cache request when it finishes."""
+        self._reject_cache_salt(req.cache_salt)
         assert req.req_pool_idx is not None
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
@@ -210,6 +219,7 @@ class RadixCacheCpp(BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""
+        self._reject_cache_salt(req.cache_salt)
         assert req.req_pool_idx is not None
         token_ids = req.get_fill_ids()
         prefill_len = len(token_ids)  # prefill only (maybe chunked)

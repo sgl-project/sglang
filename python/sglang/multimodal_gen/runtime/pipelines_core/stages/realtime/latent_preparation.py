@@ -27,8 +27,7 @@ class RealtimeChunkLatentPreparationStage(LatentPreparationStage):
         server_args: ServerArgs,
     ) -> int:
         return int(
-            batch.realtime_chunk_size
-            or self.transformer.config.arch_config.num_frames_per_block
+            batch.realtime_chunk_size or self.transformer.config.num_frames_per_block
         )
 
     def get_latent_preparation_spec(
@@ -47,7 +46,7 @@ class RealtimeChunkLatentPreparationStage(LatentPreparationStage):
         return LatentPreparationSpec(
             shape=(
                 condition_latent.shape[0],
-                self.transformer.config.arch_config.out_channels,
+                self.transformer.config.out_channels,
                 num_frames,
                 condition_latent.shape[3],
                 condition_latent.shape[4],

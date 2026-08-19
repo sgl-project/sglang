@@ -187,7 +187,7 @@ class BlockSparseAttentionImpl(AttentionImpl):
         smask: torch.Tensor,
         sct: torch.Tensor,
     ) -> torch.Tensor:
-        return torch.ops.attentions.block_sparse_attention(
+        return torch.ops.attentions.ada_block_sparse_attention(
             query=query,
             key=key,
             value=value,

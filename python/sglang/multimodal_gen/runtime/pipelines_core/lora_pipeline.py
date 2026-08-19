@@ -39,6 +39,76 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logger = init_logger(__name__)
 
 
+def _swap_peft_swiglu_fc1_lora_b(
+    source_name: str, target_name: str, weight: torch.Tensor
+) -> torch.Tensor:
+    # Only the PEFT -> native H3 FFN rewrite: ff.net.0.proj [value; gate]
+    # onto mlp.fc1 [gate; value]. Native fused mlp.fc1 and other models'
+    # ff.net.0.proj (e.g. Flux) must not match.
+    if (
+        weight.dim() != 2
+        or ".ff.net.0.proj.lora_B" not in source_name
+        or not target_name.endswith(".mlp.fc1.lora_B")
+    ):
+        return weight
+    value, gate = weight.chunk(2, dim=0)
+    return torch.cat([gate, value], dim=0)
+
+
+def stack_or_compose_fused_lora(
+    a_list: list[torch.Tensor],
+    b_list: list[torch.Tensor],
+    adapter_alpha: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, int | None]:
+    """Equal sections stay 3D-stacked; GQA sections become one 2D pair."""
+    if len({t.shape for t in a_list}) == 1 and len({t.shape for t in b_list}) == 1:
+        return torch.stack(a_list), torch.stack(b_list), None
+    ranks = [a.shape[0] for a in a_list]
+    outs = [b.shape[0] for b in b_list]
+    a_2d = torch.cat(a_list, dim=0)
+    b_2d = b_list[0].new_zeros(sum(outs), sum(ranks))
+    row = col = 0
+    for a, b, rank, out in zip(a_list, b_list, ranks, outs):
+        scale = 1.0 if adapter_alpha is None else adapter_alpha / rank
+        b_2d[row : row + out, col : col + rank] = (
+            b if scale == 1.0 else (b.float() * scale).to(dtype=b.dtype)
+        )
+        row += out
+        col += rank
+    return a_2d, b_2d, a_2d.shape[0]
+
+
+def _store_fused_lora_groups(
+    adapter: dict[str, torch.Tensor],
+    to_merge_params: dict[Hashable, dict[Any, Any]],
+    adapter_alpha: int | None,
+    device: torch.device | str,
+) -> None:
+    """Write deferred fused lora_A/B groups into the adapter dict."""
+    for a_key, a_parts in list(to_merge_params.items()):
+        if not str(a_key).endswith(".lora_A"):
+            continue
+        base = str(a_key)[: -len(".lora_A")]
+        b_key = f"{base}.lora_B"
+        b_parts = to_merge_params.get(b_key)
+        n = max(a_parts) + 1
+        if (
+            b_parts is None
+            or set(a_parts) != set(range(n))
+            or set(b_parts) != set(range(n))
+        ):
+            continue
+        a, b, fused_alpha = stack_or_compose_fused_lora(
+            [a_parts[i] for i in range(n)],
+            [b_parts[i] for i in range(n)],
+            adapter_alpha,
+        )
+        adapter[str(a_key)] = a.to(device)
+        adapter[b_key] = b.to(device)
+        if fused_alpha is not None:
+            adapter[f"{base}.alpha"] = torch.tensor(float(fused_alpha), device=device)
+
+
 class LoRAPipeline(ComposedPipelineBase):
     """
     Pipeline that supports injecting LoRA adapters into the diffusion transformer.
@@ -110,6 +180,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 self.lora_nickname,
                 self.lora_path,
                 strength=self.server_args.lora_scale,  # type: ignore
+                lora_alpha=self.server_args.lora_alpha,
             )  # type: ignore
 
     def is_target_layer(self, module_name: str) -> bool:
@@ -328,7 +399,8 @@ class LoRAPipeline(ComposedPipelineBase):
         lora_path: str | None | list[str | None],
         strength: float | list[float],
         target: str | list[str],
-    ) -> tuple[list[str], list[str | None], list[float], list[str]]:
+        lora_alpha: int | None | list[int | None],
+    ) -> tuple[list[str], list[str | None], list[float], list[str], list[int | None]]:
         """
         Normalize LoRA parameters to lists for multi-LoRA support.
 
@@ -374,7 +446,20 @@ class LoRAPipeline(ComposedPipelineBase):
                 f"Length mismatch: lora_nickname has {len(lora_nicknames)} items, "
                 f"but target has {len(targets)} items"
             )
-        return lora_nicknames, lora_paths, strengths, targets
+
+        lora_alphas = (
+            lora_alpha
+            if isinstance(lora_alpha, list)
+            else [lora_alpha] * len(lora_nicknames)
+        )
+        if len(lora_alphas) != len(lora_nicknames):
+            raise ValueError(
+                f"Length mismatch: lora_nickname has {len(lora_nicknames)} items, "
+                f"but lora_alpha has {len(lora_alphas)} items"
+            )
+        if any(alpha is not None and alpha <= 0 for alpha in lora_alphas):
+            raise ValueError("lora_alpha values must be positive integers or null")
+        return lora_nicknames, lora_paths, strengths, targets, lora_alphas
 
     def _check_lora_config_matches(
         self,
@@ -525,7 +610,7 @@ class LoRAPipeline(ComposedPipelineBase):
                     and lora_B_name in self.lora_adapters[nickname]
                 ):
                     inferred_rank = int(
-                        self.lora_adapters[nickname][lora_A_name].shape[0]
+                        self.lora_adapters[nickname][lora_A_name].shape[-2]
                     )
                     alpha_key = name + ".alpha"
                     adapter_lora_alpha = self.loaded_adapter_alphas.get(nickname)
@@ -686,6 +771,7 @@ class LoRAPipeline(ComposedPipelineBase):
         lora_nickname: str,
         rank: int,
         weight_name: str | None = None,
+        lora_alpha: int | None = None,
     ):
         """
         Load the LoRA, and setup the lora_adapters for later weight replacement
@@ -712,11 +798,11 @@ class LoRAPipeline(ComposedPipelineBase):
 
         raw_state_dict = load_file(lora_local_path)
         lora_state_dict = normalize_lora_state_dict(raw_state_dict, logger=logger)
-        adapter_lora_alpha = None
+        adapter_lora_alpha = lora_alpha
         adapter_config_path = os.path.join(
             os.path.dirname(lora_local_path), "adapter_config.json"
         )
-        if os.path.isfile(adapter_config_path):
+        if adapter_lora_alpha is None and os.path.isfile(adapter_config_path):
             with open(adapter_config_path, encoding="utf-8") as f:
                 adapter_config = json.load(f)
             if adapter_config.get("lora_alpha") is not None:
@@ -748,6 +834,9 @@ class LoRAPipeline(ComposedPipelineBase):
             # see param mapping in HunyuanVideoArchConfig
             if merge_index is not None:
                 to_merge_params[target_name][merge_index] = weight
+                # A/B of one fused layer must be laid out together (GQA B cannot stack).
+                if target_name.endswith((".lora_A", ".lora_B")):
+                    continue
                 if len(to_merge_params[target_name]) == num_params_to_merge:
                     sorted_tensors = [
                         to_merge_params[target_name][i]
@@ -759,11 +848,20 @@ class LoRAPipeline(ComposedPipelineBase):
                 else:
                     continue
 
+            weight = _swap_peft_swiglu_fc1_lora_b(name, target_name, weight)
             if target_name in self.lora_adapters[lora_nickname]:
                 raise ValueError(
                     f"Dit target weight name {target_name} already exists in lora_adapters[{lora_nickname}]"
                 )
             self.lora_adapters[lora_nickname][target_name] = weight.to(self.device)
+
+        _store_fused_lora_groups(
+            self.lora_adapters[lora_nickname],
+            to_merge_params,
+            adapter_lora_alpha,
+            self.device,
+        )
+
         self.loaded_adapter_paths[lora_nickname] = lora_path
         self.loaded_adapter_alphas[lora_nickname] = adapter_lora_alpha
         logger.info("Rank %d: loaded LoRA adapter %s", rank, lora_path)
@@ -776,6 +874,7 @@ class LoRAPipeline(ComposedPipelineBase):
         strength: float | list[float] = 1.0,
         merge_weights: bool | None = None,
         merge_mode: str | None = None,
+        lora_alpha: int | None | list[int | None] = None,
     ):  # type: ignore
         """
         Load LoRA adapter(s) into the pipeline and apply them to the specified transformer(s).
@@ -784,8 +883,10 @@ class LoRAPipeline(ComposedPipelineBase):
         merge_mode = self._resolve_lora_merge_mode(merge_weights, merge_mode)
 
         # Normalize inputs to lists for multi-LoRA support
-        lora_nicknames, lora_paths, strengths, targets = self._normalize_lora_params(
-            lora_nickname, lora_path, strength, target
+        lora_nicknames, lora_paths, strengths, targets, lora_alphas = (
+            self._normalize_lora_params(
+                lora_nickname, lora_path, strength, target, lora_alpha
+            )
         )
 
         # Validate targets
@@ -809,7 +910,7 @@ class LoRAPipeline(ComposedPipelineBase):
         rank = dist.get_rank()
 
         # load required adapters
-        for nickname, path in zip(lora_nicknames, lora_paths):
+        for nickname, path, alpha in zip(lora_nicknames, lora_paths, lora_alphas):
             if nickname not in self.lora_adapters and path is None:
                 raise ValueError(
                     f"Adapter {nickname} not found in the pipeline. Please provide lora_path to load it."
@@ -823,7 +924,12 @@ class LoRAPipeline(ComposedPipelineBase):
                     should_load = True
             if should_load:
                 adapter_updated = True
-                self.load_lora_adapter(path, nickname, rank)
+                self.load_lora_adapter(path, nickname, rank, lora_alpha=alpha)
+            elif (
+                alpha is not None and self.loaded_adapter_alphas.get(nickname) != alpha
+            ):
+                self.loaded_adapter_alphas[nickname] = alpha
+                adapter_updated = True
 
         # Group by target to apply separately
         target_to_indices = {}

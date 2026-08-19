@@ -350,6 +350,14 @@ class BaseFormatDetector(ABC):
         """
         raise NotImplementedError()
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Called once when the stream ends; flush any buffered state.
+
+        Detectors that hold text back while waiting for a marker that can no
+        longer arrive (the stream is over) override this to release it.
+        """
+        return StreamingParseResult()
+
     def supports_structural_tag(self) -> bool:
         """Return True if this detector supports structural tag format."""
         return True

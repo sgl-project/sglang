@@ -245,15 +245,17 @@ SGLANG_CACHE_DIT_MC=3 \
 sglang serve --model-path krea/Krea-2-Raw
 ```
 
-#### 4.2.2 Memory & CPU Offload
+#### 4.2.2 Memory and Component Residency
 
 Krea-2's DiT is ~24 GB in bf16 (the bulk of the model). On memory-constrained GPUs you can keep less of it resident:
 
-- `--dit-layerwise-offload`: stream the DiT's transformer blocks layer-by-layer with async host-to-device prefetch overlap, so only a small working set stays on the GPU. This is the primary way to fit Krea-2 on a single consumer / 32 GB-class card, at a modest latency cost. Tune the memory/latency trade-off with `--dit-offload-prefetch-size` (`0.0` prefetches one layer for the lowest memory; larger values prefetch more layers -- faster but more memory).
-- `--dit-cpu-offload`: keep the whole DiT in host memory. Combine it with `--dit-layerwise-offload` for the lowest peak GPU memory (weights stay on host and only the layers needed for the current step are brought on-device).
-- `--text-encoder-cpu-offload`: offload the Qwen3-VL text encoder (it is idle during the denoise loop).
-- `--vae-cpu-offload`: offload the VAE.
+- `--component-residency dit=layerwise-offload`: stream the DiT's transformer blocks layer-by-layer with async host-to-device prefetch overlap, so only a small working set stays on the GPU. This is the primary way to fit Krea-2 on a single consumer / 32 GB-class card, at a modest latency cost. Tune the memory/latency trade-off with `--dit-offload-prefetch-size` (`0.0` prefetches one layer for the lowest memory; larger values prefetch more layers -- faster but more memory).
+- `--component-residency dit=component-offload`: keep the complete DiT on CPU between denoising uses. This and layerwise offload are distinct modes; do not combine them for the same component.
+- `--component-residency text_encoder=component-offload`: offload the Qwen3-VL text encoder while it is idle during denoising.
+- `--component-residency vae=component-offload`: offload the VAE between uses.
 - `--pin-cpu-memory`: pin host memory for offload. Add only as a temporary workaround if you hit `CUDA error: invalid argument`.
+
+The legacy `--dit-layerwise-offload`, `--dit-cpu-offload`, `--text-encoder-cpu-offload`, and `--vae-cpu-offload` forms remain accepted. If both legacy DiT offload flags are enabled, layerwise offload is the effective DiT mode.
 
 On large-VRAM GPUs (e.g. H200), keep everything resident (offloads off) for the fastest latency.
 

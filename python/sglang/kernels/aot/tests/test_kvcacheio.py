@@ -3,6 +3,7 @@ import sys
 import pytest
 import torch
 from sgl_kernel.kvcacheio import (
+    transfer_embedding_ranges_direct,
     transfer_kv_all_layer,
     transfer_kv_all_layer_direct_lf_pf,
     transfer_kv_all_layer_lf_ph,
@@ -66,6 +67,65 @@ def ref_copy_with_indices_page_head(
                 dst_pool[layer_id][dst_indices[i]][head_id] = src_pool[
                     src_indices[i] // page_size
                 ][head_id][src_indices[i] % page_size][layer_id].to(dst_pool.device)
+
+
+def ref_copy_embedding_ranges(src, dst, src_starts, dst_starts, lengths):
+    for src_start, dst_start, length in zip(src_starts, dst_starts, lengths):
+        dst[dst_start : dst_start + length].copy_(
+            src[src_start : src_start + length], non_blocking=True
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.skipif(is_hip(), reason="This test covers the CUDA batch-copy op")
+@pytest.mark.parametrize("direction", ["h2d", "d2h"])
+def test_transfer_embedding_ranges_direct(direction: str):
+    dtype = torch.bfloat16
+    embedding_dim = 37
+    page_size = 4
+    fragmented_starts = [1, 11, 23]
+    contiguous_starts = [2, 6, 10]
+    lengths = [page_size, page_size, 2]
+    host_rows = 28
+    device_rows = 16
+
+    host_values = torch.arange(host_rows * embedding_dim, dtype=torch.float32).reshape(
+        host_rows, embedding_dim
+    )
+    device_values = torch.arange(
+        device_rows * embedding_dim, dtype=torch.float32
+    ).reshape(device_rows, embedding_dim)
+
+    if direction == "h2d":
+        src = host_values.to(dtype).pin_memory()
+        direct_dst = torch.full(
+            (device_rows, embedding_dim), -1, dtype=dtype, device="cuda"
+        )
+        reference_dst = torch.full_like(direct_dst, -1)
+        src_starts, dst_starts = fragmented_starts, contiguous_starts
+    else:
+        src = device_values.to(dtype).to("cuda")
+        direct_dst = torch.full(
+            (host_rows, embedding_dim), -1, dtype=dtype, pin_memory=True
+        )
+        reference_dst = torch.full(
+            (host_rows, embedding_dim), -1, dtype=dtype, pin_memory=True
+        )
+        src_starts, dst_starts = contiguous_starts, fragmented_starts
+
+    torch.cuda.synchronize()
+    copy_stream = torch.cuda.Stream()
+    assert copy_stream.cuda_stream != torch.cuda.default_stream().cuda_stream
+    with torch.cuda.stream(copy_stream):
+        ref_copy_embedding_ranges(src, reference_dst, src_starts, dst_starts, lengths)
+        transfer_embedding_ranges_direct(
+            src, direct_dst, src_starts, dst_starts, lengths
+        )
+        completion_event = torch.cuda.Event()
+        completion_event.record(copy_stream)
+
+    completion_event.synchronize()
+    torch.testing.assert_close(direct_dst, reference_dst)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

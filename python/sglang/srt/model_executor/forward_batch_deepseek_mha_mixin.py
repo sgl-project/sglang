@@ -10,6 +10,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import filter_dcp_local_chunk_kv_indices
 from sglang.srt.model_executor.forward_context import (
     get_req_to_token_pool,
     get_token_to_kv_pool,
@@ -83,6 +84,11 @@ class ForwardBatchDeepSeekMHAMixin:
                 chunk_cu_seq_lens,
                 chunk_kv_indices,
                 req_to_token.shape[1],
+            )
+            chunk_kv_indices = filter_dcp_local_chunk_kv_indices(
+                chunk_kv_indices,
+                self.prefix_chunk_starts_cpu[idx],
+                self.prefix_chunk_seq_lens_cpu[idx],
             )
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
 

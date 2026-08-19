@@ -277,14 +277,18 @@ sgl-eval run gsm8k \\
       // `auto` is a sentinel (emits no --disaggregation-ib-device flag).
       ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
       // Router fronting prefill + decode; substitute <prefill-host>/<decode-host>.
+      // ALWAYS use {{PREFILL_PORT}} / {{DECODE_PORT}} / {{ROUTER_PORT}} — the
+      // engine fills them from its own PD_PORTS (prefill serves on 30000, decode
+      // on 30100). A literal port here will not track the engine and sends the
+      // router at a port the generated decode command does not listen on.
       router: {
         port: 8000,
         command:
 `python3 -m sglang_router.launch_router \\
   --pd-disaggregation \\
-  --prefill http://<prefill-host>:30000 \\
-  --decode http://<decode-host>:30001 \\
-  --host 0.0.0.0 --port 8000 \\
+  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
+  --decode http://<decode-host>:{{DECODE_PORT}} \\
+  --host 0.0.0.0 --port {{ROUTER_PORT}} \\
   --disable-circuit-breaker \\
   --health-check-interval-secs 999999`,
       },

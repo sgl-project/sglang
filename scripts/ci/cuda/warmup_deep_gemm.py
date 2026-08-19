@@ -26,9 +26,15 @@ from math import ceil
 from pathlib import Path
 from typing import Dict, List
 
-# Shared with warmup_server.py. Wipe alongside /root/.cache/deep_gemm if you
-# clear the DeepGEMM JIT cache — a stale marker → in-test JIT compile.
-MARKER_DIR = os.path.join(os.path.expanduser("~"), ".cache", "sglang", "warmup_markers")
+from sglang.srt.environ import envs
+
+# Shared with warmup_server.py. Uses the same root as DG_JIT_CACHE_DIR below,
+# so overriding SGLANG_CACHE_DIR moves the markers and the cache together.
+# If only one moved, a marker could report a model as warmed while its cache
+# is empty, and the test would pay for the JIT compilation it should skip.
+MARKER_DIR = os.path.join(
+    os.path.expanduser(envs.SGLANG_CACHE_DIR.get()), "warmup_markers"
+)
 
 # Outer cap for stuck fallback subprocesses; CRASH_MARKERS abort sooner.
 FALLBACK_TIMEOUT_SEC = 600
@@ -67,11 +73,10 @@ CRASH_MARKERS = (
     "Received sigquit from a child",
 )
 
-# Configure DeepGEMM cache before importing deep_gemm
-os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
-    "SGLANG_DG_CACHE_DIR",
-    os.path.join(os.path.expanduser("~"), ".cache", "deep_gemm"),
-)
+# Configure DeepGEMM cache before importing deep_gemm. Read through envs so
+# this warms the directory the server will actually compile into; duplicating
+# the default here is what let the two drift apart.
+os.environ["DG_JIT_CACHE_DIR"] = envs.SGLANG_DG_CACHE_DIR.get()
 os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", "0")
 
 BLOCK_SIZE = 128
@@ -510,9 +515,7 @@ def main():
     )
     print(f"=== DeepGEMM Lightweight Warmup ({len(model_tp_pairs)} model(s)) ===")
     print(f"    Fast warmup: {fast_warmup}")
-    print(
-        f"    Cache dir: {os.environ.get('DG_JIT_CACHE_DIR', '~/.cache/deep_gemm')}\n"
-    )
+    print(f"    Cache dir: {os.environ['DG_JIT_CACHE_DIR']}\n")
 
     # Load configs and deduplicate by architecture
     seen_keys = {}

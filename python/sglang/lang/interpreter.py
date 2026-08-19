@@ -14,7 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import tqdm
 
-from sglang.global_config import global_config
+from sglang.lang.global_config import global_config
 from sglang.lang.ir import (
     SglCommitLazy,
     SglConcateAndAppend,

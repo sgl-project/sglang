@@ -12,7 +12,7 @@ on:
         type: string
         default: 'main'
       job_filter:
-        description: 'Comma-separated workflows to run: nightly-amd, nightly-amd-rocm720, pr-test-amd, pr-test-amd-rocm720. Default: all'
+        description: 'Workflows: nightly-amd, nightly-amd-rocm720, pr-test-amd (ROCm 7.0 shadow), pr-test-amd-rocm720 (ROCm 7.2 gate). Default: all'
         required: false
         type: string
         default: 'all'
@@ -154,8 +154,8 @@ jobs:
           echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| Nightly AMD (AITER Latest) | \`${{ needs.call-nightly-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Nightly AMD ROCm 7.2 | \`${{ needs.call-nightly-amd-rocm720.result }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| PR Test AMD (AITER Latest) | \`${{ needs.call-pr-test-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| PR Test AMD ROCm 7.2 | \`${{ needs.call-pr-test-amd-rocm720.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Test AMD ROCm 7.0 Shadow | \`${{ needs.call-pr-test-amd.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| PR Test AMD ROCm 7.2 Gate | \`${{ needs.call-pr-test-amd-rocm720.result }}\` |" >> $GITHUB_STEP_SUMMARY
 
       - name: Check if any job failed
         run: |

@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a import (
     IpcA2AState,
+    _peer_cuda_device,
     ipc_a2a_ready,
 )
 
@@ -39,3 +40,19 @@ def test_reinitializes_ipc_transport_for_replaced_process_group():
     init.assert_called_once_with(new_group)
     assert state.group is new_group
     assert state.calls == 0
+
+
+def test_peer_cuda_device_uses_the_ulysses_group_mapping():
+    group = object()
+    members = [("node-a", 2), ("node-a", 3)]
+
+    def gather(output, value, *, group):
+        assert value == ("node-a", 3)
+        output[:] = members
+
+    with (
+        patch(f"{_IPC}.socket.gethostname", return_value="node-a"),
+        patch(f"{_IPC}.dist.get_world_size", return_value=2),
+        patch(f"{_IPC}.dist.all_gather_object", side_effect=gather),
+    ):
+        assert _peer_cuda_device(group, rank=1, device=3) == 2

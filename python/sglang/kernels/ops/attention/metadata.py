@@ -198,6 +198,8 @@ def _fused_metadata_kernel_general(
     # pool, where req_to_token already holds physical ids.
     v2p_ptr=None,
     PAGE_MULT: tl.constexpr = 1,
+    # Unified SWA puts its independent v2p table in the legacy mapping slot.
+    SWA_MAPPING_IS_V2P: tl.constexpr = False,
 ):
     pid_b = tl.program_id(0)  # batch index
     pid_c = tl.program_id(1)  # column chunk index
@@ -268,13 +270,20 @@ def _fused_metadata_kernel_general(
     tl.store(page_table + pt_offsets, page_table_val, mask=mask, cache_modifier=".cg")
 
     if use_swa:
+        if SWA_MAPPING_IS_V2P:
+            if page_size == 1:
+                swa_mapping_index = page_index
+            else:
+                swa_mapping_index = page_index >> SHIFT
+        else:
+            swa_mapping_index = page_index * full_to_swa_mapping_stride_0
         swa_slot = tl.load(
-            full_to_swa_mapping + page_index * full_to_swa_mapping_stride_0,
+            full_to_swa_mapping + swa_mapping_index,
             mask=mask,
             other=0,
             cache_modifier=".cg",
         )
-        if page_size == 1:
+        if page_size == 1 or SWA_MAPPING_IS_V2P:
             swa_val = swa_slot
         else:
             swa_val = swa_slot >> SHIFT
@@ -594,7 +603,8 @@ def normal_decode_set_metadata(
       3. page_indices = req_to_token[pool_idx, stride_idx] (2-D gather)
       4. page_table = page_indices // page_size (floor-divide)
       4b. (unified memory) page_table = v2p_page_table[page] * kernel_page_multiplier
-      5. (optional) swa_page_table for sliding window attention
+      5. (optional) swa_page_table via the legacy full->SWA map or the unified
+         SWA pool's independent page map
 
     Step 4b is folded in rather than applied afterwards so the capture-stable
     page_table is written already translated: no separate pass a caller could
@@ -629,8 +639,19 @@ def normal_decode_set_metadata(
     page_table_stride_0 = page_table.stride(0)
     page_table_stride_1 = page_table.stride(1)
 
-    # Check if we should use the specialized fast path for page_size=1, no SWA
     use_swa = swa_page_table is not None and token_to_kv_pool is not None
+
+    # Unified SWA uses an independent SWA v2p table.
+    swa_v2p_page_table = None
+    if use_swa and token_to_kv_pool.full_to_swa_index_mapping is None:
+        from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
+
+        assert isinstance(token_to_kv_pool, UnifiedSWAKVPool)
+        assert token_to_kv_pool._swa_allocator is not None
+        swa_v2p_page_table = token_to_kv_pool._swa_allocator.virtual_to_physical
+
+    # Check if we should use the specialized fast path for page_size=1, no SWA
+    swa_uses_v2p = swa_v2p_page_table is not None
 
     if page_size == 1 and not use_swa:
         # Specialized kernel for the common case (page_size=1, no SWA)
@@ -671,15 +692,18 @@ def normal_decode_set_metadata(
         if use_swa:
             from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
-            assert isinstance(token_to_kv_pool, SWAKVPool)
             swa_page_table = swa_page_table.contiguous()
             swa_page_table_stride_0 = swa_page_table.stride(0)
             swa_page_table_stride_1 = swa_page_table.stride(1)
-            # Extract the full_to_swa_index_mapping from token_to_kv_pool
-            full_to_swa_mapping = (
-                token_to_kv_pool.full_to_swa_index_mapping.contiguous()
-            )
-            full_to_swa_mapping_stride_0 = full_to_swa_mapping.stride(0)
+            if swa_uses_v2p:
+                full_to_swa_mapping = swa_v2p_page_table.contiguous()
+                full_to_swa_mapping_stride_0 = 0
+            else:
+                assert isinstance(token_to_kv_pool, SWAKVPool)
+                full_to_swa_mapping = (
+                    token_to_kv_pool.full_to_swa_index_mapping.contiguous()
+                )
+                full_to_swa_mapping_stride_0 = full_to_swa_mapping.stride(0)
         else:
             # Dummy tensors (not used)
             swa_page_table = torch.empty(0, dtype=torch.int32, device=device)
@@ -727,6 +751,7 @@ def normal_decode_set_metadata(
             BLOCK_COLS=BLOCK_COLS,
             v2p_ptr=v2p_page_table,
             PAGE_MULT=kernel_page_multiplier,
+            SWA_MAPPING_IS_V2P=swa_uses_v2p,
             num_warps=4,
             num_stages=3,
         )

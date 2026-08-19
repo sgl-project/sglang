@@ -20,6 +20,8 @@
 
 // Local PTX primitives (mbarrier / bulk TMA / tcgen05 / warp-group sync)
 
+namespace sglang {
+
 namespace ptx {
 
 // ---- bulk 1D TMA (PTX ISA §9.7.9.25) ---------------------------------------
@@ -160,8 +162,6 @@ static SGL_DEVICE void tcgen05_wait_st() {
 
 }  // namespace ptx
 
-namespace sglang {
-
 struct AttnResTMAParams {
   const bf16_t* __restrict__ prefix_sum;  // [T, H]
   const bf16_t* __restrict__ bank;        // [T, NB_total, H]
@@ -275,19 +275,19 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
   const auto lane_id = tx % kWarpThreads;
 
   if (warp_id == 0 && lane_id < kNumStages) {
-    ::ptx::mbar_init(&smem->bar_full[lane_id], 1);
-    ::ptx::mbar_init(&smem->bar_free[lane_id], kNumConsumerWarps * kWarpThreads);
-    ::ptx::fence_mbarrier_init();
+    ptx::mbar_init(&smem->bar_full[lane_id], 1);
+    ptx::mbar_init(&smem->bar_free[lane_id], kNumConsumerWarps * kWarpThreads);
+    ptx::fence_mbarrier_init();
   } else if (warp_id == 1) {
-    ::ptx::tcgen05_alloc(::ptx::to_shared(&smem->tmem_base), kTmemCols);
-    ::ptx::tcgen05_relinquish();
+    ptx::tcgen05_alloc(ptx::to_shared(&smem->tmem_base), kTmemCols);
+    ptx::tcgen05_relinquish();
   }
 
   __syncthreads();
   if (warp_id >= kNumConsumerWarps) {  // producer warp (group); first warp works
-    if constexpr (kConsumerRegs > 0) ::ptx::setmaxnreg_dec<kProducerRegs>();
+    if constexpr (kConsumerRegs > 0) ptx::setmaxnreg_dec<kProducerRegs>();
     // TODO: reduce the register usage
-    if (warp_id == kNumConsumerWarps && ::ptx::elect_one()) {
+    if (warp_id == kNumConsumerWarps && ptx::elect_one()) {
       uint32_t global_chunks = 0;
       constexpr uint32_t kRowBytes = kDim * sizeof(bf16_t);
       for (auto token = blockIdx.x; token < params.num_tokens; token += gridDim.x) {
@@ -298,10 +298,10 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
           const auto slot = global_chunks % kNumStages;
           const auto phase = (global_chunks / kNumStages) & 1;
           if (global_chunks >= kNumStages) {
-            ::ptx::mbar_wait_parity(&smem->bar_free[slot], phase ^ 1);
+            ptx::mbar_wait_parity(&smem->bar_free[slot], phase ^ 1);
           }
           // One barrier per chunk; each row still gets its own bulk copy.
-          ::ptx::mbar_arrive_expect_tx(&smem->bar_full[slot], an * kRowBytes);
+          ptx::mbar_arrive_expect_tx(&smem->bar_full[slot], an * kRowBytes);
 #pragma unroll
           for (uint32_t r = 0; r < an; ++r) {
             const auto row = base_row + r;
@@ -310,14 +310,14 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
             // Only prefix_sum is written by the immediately-preceding kernel;
             // one wait before the first token's prefix load covers the rest.
             if (token == blockIdx.x && row == kNumRows) PDLWaitPrimary<true>();
-            ::ptx::cp_async_bulk_1d_load(&smem->buf[slot][r], src, kRowBytes, &smem->bar_full[slot]);
+            ptx::cp_async_bulk_1d_load(&smem->buf[slot][r], src, kRowBytes, &smem->bar_full[slot]);
           }
         }
       }
       PDLTriggerSecondary<true>();
     }
   } else {  // 2 consumer warp groups; one chunk per rendezvous
-    if constexpr (kConsumerRegs > 0) ::ptx::setmaxnreg_inc<kConsumerRegs>();
+    if constexpr (kConsumerRegs > 0) ptx::setmaxnreg_inc<kConsumerRegs>();
     const auto group = warp_id / (kNumConsumerWarps / kNumGroups);
     const auto tid_in_group = tx % kGroupThreads;
     const auto tmem_cw = smem->tmem_base + group * kTmemColsPerGroup;
@@ -338,8 +338,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
       }
 #pragma unroll
       for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
-        ::ptx::tcgen05_st_32x32b_x8(
-            tmem_cw + si * kVecElems, reinterpret_cast<const uint32_t*>(&staged[si * kVecElems]));
+        ptx::tcgen05_st_32x32b_x8(tmem_cw + si * kVecElems, reinterpret_cast<const uint32_t*>(&staged[si * kVecElems]));
       }
 #pragma unroll
       for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
@@ -353,10 +352,9 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
       }
 #pragma unroll
       for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
-        ::ptx::tcgen05_st_32x32b_x8(
-            tmem_ow + si * kVecElems, reinterpret_cast<const uint32_t*>(&staged[si * kVecElems]));
+        ptx::tcgen05_st_32x32b_x8(tmem_ow + si * kVecElems, reinterpret_cast<const uint32_t*>(&staged[si * kVecElems]));
       }
-      ::ptx::tcgen05_wait_st();
+      ptx::tcgen05_wait_st();
     }
 
     uint32_t global_chunks = 0;  // mirrors the producer's chunk counter
@@ -372,7 +370,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
         const uint32_t an = (kNumRows + 1 - base_row) < kChunkRows ? (kNumRows + 1 - base_row) : kChunkRows;
         const auto slot = global_chunks % kNumStages;
         const auto phase = (global_chunks / kNumStages) & 1;
-        ::ptx::mbar_wait_parity(&smem->bar_full[slot], phase);
+        ptx::mbar_wait_parity(&smem->bar_full[slot], phase);
 
         // Score pass: the cw slice is loaded once and reused across the
         // chunk's rows; each row's 16B slices land in registers. rms/dot
@@ -386,7 +384,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
           const auto tile = si * kNumGroups + group;
           if (tile >= kNumTiles) continue;
           float q[kVecElems];
-          ::ptx::tcgen05_ld_32x32b_x8(tmem_cw + si * kVecElems, reinterpret_cast<uint32_t*>(q));
+          ptx::tcgen05_ld_32x32b_x8(tmem_cw + si * kVecElems, reinterpret_cast<uint32_t*>(q));
           const auto* q2 = reinterpret_cast<const float2*>(q);
           const auto offset = tile * kTile + tid_in_group * kVecElems;
 #pragma unroll
@@ -403,7 +401,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
             }
           }
         }
-        ::ptx::mbar_arrive(&smem->bar_free[slot]);
+        ptx::mbar_arrive(&smem->bar_free[slot]);
 
         // Fused bank write: the prefix row (last row of the last chunk) is
         // already in registers; snapshot it to bank row nvb with plain
@@ -440,7 +438,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
             smem->warp_dot[warp_id][r] = acc_dot[r];
           }
         }
-        ::ptx::named_barrier_sync(kConsumerBarId, kNumConsumerThreads);
+        ptx::named_barrier_sync(kConsumerBarId, kNumConsumerThreads);
         // Lane r totals row r, then broadcasts: an*16 smem loads per warp
         // instead of per thread.
         float lane_logit = 0.f;
@@ -519,7 +517,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
       }
       float acc_sq = warp::reduce_sum(acc_sq2.x + acc_sq2.y);
       if (lane_id == 0) smem->warp_ssq[warp_id] = acc_sq;
-      ::ptx::named_barrier_sync(kConsumerBarId, kNumConsumerThreads);
+      ptx::named_barrier_sync(kConsumerBarId, kNumConsumerThreads);
       float total_sq = 0.f;
 #pragma unroll
       for (uint32_t w = 0; w < kNumConsumerWarps; ++w) {
@@ -534,7 +532,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
         const auto tile = si * kNumGroups + group;
         if (tile >= kNumTiles) continue;
         float q[kVecElems];
-        ::ptx::tcgen05_ld_32x32b_x8(tmem_ow + si * kVecElems, reinterpret_cast<uint32_t*>(q));
+        ptx::tcgen05_ld_32x32b_x8(tmem_ow + si * kVecElems, reinterpret_cast<uint32_t*>(q));
         const auto* q2 = reinterpret_cast<const float2*>(q);
         row_vec_t out_vec;
 #pragma unroll
@@ -552,9 +550,9 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
         }
       }
     }
-    ::ptx::named_barrier_sync(kConsumerBarId, kNumConsumerThreads);
+    ptx::named_barrier_sync(kConsumerBarId, kNumConsumerThreads);
     if (warp_id == 1) {
-      ::ptx::tcgen05_dealloc(smem->tmem_base, kTmemCols);
+      ptx::tcgen05_dealloc(smem->tmem_base, kTmemCols);
     }
   }
 }
@@ -677,10 +675,6 @@ __global__ void __launch_bounds__(Trait::kNumThreads, kOccupancy)
       ;
   }
 }
-
-}  // namespace sglang
-
-using namespace sglang;
 using host::distributed::CommunicatorRef;
 
 // Host launcher: constexpr kernel table over nvb.
@@ -944,3 +938,5 @@ struct AttnResFusedTmaKernel {
     LaunchKernel(grid, kNumThreads, device.unwrap(), kSmemBytes).enable_pdl(true)(kAgTable[nvb], params);
   }
 };
+
+}  // namespace sglang

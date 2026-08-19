@@ -6,6 +6,8 @@
 #include <variant>
 #endif
 
+namespace sglang {
+
 namespace host {
 
 //
@@ -332,3 +334,5 @@ static inline constexpr auto kBFloat16 = kFE8M7;
 
 static inline constexpr auto kFloat16Id = kFloat16.id();
 }  // namespace host
+
+}  // namespace sglang

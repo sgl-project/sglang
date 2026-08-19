@@ -6,20 +6,15 @@ uses swa_loc directly for SWA layers and asserts it is provided. The per-backend
 cuda-graph buffer plumbing is covered by the backend SWA integration tests.
 """
 
-import sys
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.test.test_utils import CustomTestCase
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 

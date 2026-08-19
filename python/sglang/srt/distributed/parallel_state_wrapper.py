@@ -14,13 +14,14 @@ class ParallelState:
     attn_tp_size: int
     attn_cp_rank: int
     attn_cp_size: int
+    attn_dcp_rank: int
+    attn_dcp_size: int
     attn_dp_rank: int
     attn_dp_size: int
     moe_ep_rank: int
     moe_ep_size: int
     moe_dp_rank: Optional[int]
     moe_dp_size: int
-    dcp_size: int
     gpu_id: int
 
     @staticmethod
@@ -36,13 +37,14 @@ class ParallelState:
             attn_tp_size=1,
             attn_cp_rank=0,
             attn_cp_size=1,
+            attn_dcp_rank=0,
+            attn_dcp_size=1,
             attn_dp_rank=0,
             attn_dp_size=1,
             moe_ep_rank=0,
             moe_ep_size=1,
             moe_dp_rank=0,
             moe_dp_size=1,
-            dcp_size=1,
             gpu_id=0,
         )
         kwargs.update(overrides)

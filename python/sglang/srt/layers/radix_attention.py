@@ -351,9 +351,12 @@ def _unified_attention_with_output_impl(
         kwargs["topk_indices"] = topk_indices[:real_query_num_tokens]
 
     original_out_cache_loc = forward_batch.out_cache_loc
+    original_positions = forward_batch.positions
     # Keep the original ForwardBatch object and only narrow cache locations for
     # this backend call so model/backend state is still written to the same batch.
     forward_batch.out_cache_loc = original_out_cache_loc[:real_query_num_tokens]
+    if original_positions is not None:
+        forward_batch.positions = original_positions[:real_query_num_tokens]
 
     # Store pre-allocated output for FA backend to write directly into.
     # Must slice to real_query_num_tokens to match the narrowed query shape —
@@ -370,6 +373,7 @@ def _unified_attention_with_output_impl(
         **kwargs,
     )
     forward_batch.out_cache_loc = original_out_cache_loc
+    forward_batch.positions = original_positions
 
     lse = None
     if return_lse:

@@ -16,9 +16,9 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 
-namespace sglang_ltx2_qknorm_split_rope {
+namespace sglang {
 
-namespace {
+namespace ltx2_qknorm_split_rope {
 
 constexpr int kThreads = 128;
 
@@ -172,8 +172,6 @@ inline void launch_one(
       stride_sin_t);
 }
 
-}  // namespace
-
 struct LTX2QKNormSplitRopeKernel {
   static void
   run(tvm::ffi::TensorView q_out,
@@ -273,4 +271,6 @@ struct LTX2QKNormSplitRopeKernel {
   }
 };
 
-}  // namespace sglang_ltx2_qknorm_split_rope
+}  // namespace ltx2_qknorm_split_rope
+
+}  // namespace sglang

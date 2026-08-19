@@ -16,6 +16,9 @@
 //      declares silently stops matching; the panel just shows a different cell.
 //   4. Predicate safety. showWhen / disabled / flags run against selections the
 //      author never clicked through; a throw there blanks the whole widget.
+//   5. PD/speculation reachability. A PD card must stay reachable when a base
+//      cell inherits an algorithm it declares incompatible, so choosing a PD
+//      role can remove that algorithm from the generated command.
 
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
@@ -192,6 +195,25 @@ for (const path of walk(CONFIGS)) {
         throw new Error(`curl returned ${typeof out}, expected a string`);
       }
     }, "curl");
+  }
+
+  const pd = (config.playgroundFeatures || {}).pdDisagg;
+  if (pd && typeof pd.showWhen === "function") {
+    const incompatible = (pd.incompatibleSpeculativeAlgorithms || [])
+      .map((name) => String(name).toUpperCase());
+    for (const [i, cell] of (config.cells || []).entries()) {
+      const algorithmFlag = (cell.flags || []).find((flag) =>
+        flag.split(/[\s=]/)[0] === "--speculative-algorithm");
+      const algorithm = algorithmFlag
+        ? algorithmFlag.split(/[\s=]/).filter(Boolean)[1]?.toUpperCase()
+        : null;
+      if (!algorithm || !incompatible.includes(algorithm)) continue;
+      const selection = { ...(cell.match || {}), specAlgorithm: algorithm };
+      if (!pd.showWhen(selection)) {
+        fail(where, `cells[${i}] hides PD Disagg for incompatible ${algorithm}; `
+          + "the card must remain reachable so a PD role can disable speculation");
+      }
+    }
   }
 }
 

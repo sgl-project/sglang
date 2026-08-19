@@ -161,11 +161,82 @@ export const config = {
   // cell is showing, so turning speculation on does not triple the cell count.
   overlayDims: [
     {
+      // Checkpoint choice, orthogonal to the cell grid: MXFP4 is the shipping
+      // default, NVFP4 is NVIDIA's ModelOpt mixed checkpoint (NVFP4 SiTU routed
+      // experts + FP8_PB_WO 128x128 block-FP8 attention). NVFP4 swaps the model
+      // slug (modelNames) and pins the TRT-LLM MoE runner — the auto resolution
+      // never engages TRT-LLM deferred finalize and the NVFP4 MoE raises
+      // NotImplementedError at CUDA-graph capture, while flashinfer_cutlass has
+      // no SiTU kernel. The DSPARK overlay needs no change: the same draft
+      // checkpoint serves on top of the NVFP4 base.
+      id: "quant",
+      title: "Quantization",
+      default: "mxfp4",
+      options: [
+        { id: "mxfp4", label: "MXFP4", subtitle: "Moonshot AI checkpoint" },
+        {
+          id: "nvfp4",
+          label: "NVFP4",
+          subtitle: "NVIDIA checkpoint",
+          // The NVFP4 MoE kernels (FlashInfer TRT-LLM) are Blackwell-only.
+          disabled: (s) => !["b200", "gb200", "b300", "gb300"].includes(s.hw),
+          disableReason:
+            "The nvidia/Kimi-K3-NVFP4 checkpoint needs Blackwell: its routed experts run on FlashInfer TRT-LLM NVFP4 kernels (SiTU), which do not exist for Hopper or AMD.",
+          // B200's Balanced/High-Throughput cells pin flashinfer_mxfp4; Hopper
+          // pins marlin (unreachable here — NVFP4 is Blackwell-gated). Replace
+          // whatever the cell pins with the one working NVFP4 runner.
+          stripPrefixes: ["--moe-runner-backend"],
+          flags: ["--moe-runner-backend flashinfer_trtllm"],
+          hints: [
+            "Use docker image lmsysorg/sglang:dev-dev-kimi-k3-nvfp4 (CUDA 13).",
+          ],
+        },
+      ],
+    },
+    {
+      id: "mmTransport",
+      title: "VLM Transport",
+      default: "auto",
+      showWhen: (s) => s.pdMode !== "decode",
+      options: [
+        {
+          id: "auto",
+          label: "Auto (topology-aware)",
+          hints: (s) => {
+            if (s.pdMode !== "unified") {
+              return [
+                "VLM transport: Auto -> CPU for PD; KV/KDA transfer is separate.",
+              ];
+            }
+            if (s.hw === "b300") {
+              return [
+                "VLM transport: Auto -> CUDA IPC (up to 1 GiB HBM; CPU fallback when full).",
+              ];
+            }
+            if (["gb200", "gb300"].includes(s.hw)) {
+              return [
+                "VLM transport: Auto -> CUDA VMM with IMEX, otherwise CPU (up to 1 GiB HBM).",
+              ];
+            }
+            return ["VLM transport: Auto -> CPU on this topology."];
+          },
+        },
+        {
+          id: "cpu",
+          label: "CPU (save HBM)",
+          flags: ["--mm-feature-transport cpu"],
+          hints: ["VLM transport: CPU; no GPU feature pool."],
+        },
+      ],
+    },
+    {
       id: "spec",
       title: "Spec Decode",
       default: "dspark",
       options: [
-        { id: "none", label: "Non-Spec" },
+        { id: "none", label: "Non-Spec",
+          env: (s) => (["mi350x", "mi355x"].includes(s.hw) ? ["SGLANG_MLA_DECODE_TUNE=1"] : []),
+        },
         {
           id: "dspark",
           label: "DSPARK",
@@ -297,6 +368,7 @@ export const config = {
 
   modelNames: {
     default: "moonshotai/Kimi-K3",
+    nvfp4: "nvidia/Kimi-K3-NVFP4",
   },
 
   placeholders: {
@@ -341,8 +413,14 @@ export const config = {
     gb300:  "lmsysorg/sglang:kimi-k3",
     b200:   "lmsysorg/sglang:kimi-k3",
     gb200:  "lmsysorg/sglang:kimi-k3",
-    mi350x: "lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727",
-    mi355x: "lmsysorg/sglang-rocm:rocm720-mi35x-k3-20260727",
+    mi350x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260817",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260817",
+    // NVFP4 needs a build with sgl-project/sglang#35077; the purpose-built dev
+    // image is cut from that PR's head (CUDA 13).
+    "b300|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
+    "gb300|nvfp4": "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
+    "b200|nvfp4":  "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
+    "gb200|nvfp4": "lmsysorg/sglang:dev-dev-kimi-k3-nvfp4",
   },
   // Pre-selects the issue template's `model` field on "Submit verified cell".
   github: {
@@ -422,10 +500,8 @@ export const config = {
           // Blackwell-only kernel-fusion path; selecting it reveals the Quantization sub-select.
           { id: "megamoe",          label: "MegaMoE",           flags: ["--moe-a2a-backend megamoe"],
             requiresHw: ["b200", "b300", "gb200", "gb300"] },
-          // Blackwell-only: runs the prebuilt trtllm-gen SiTU cubins; needs the
-          // downloadable SiTU cubin pool unpacked and pointed to by the env var.
+          // Blackwell-only: runs FlashInfer's official trtllm-gen SiTU kernels.
           { id: "flashinfer_mxfp4", label: "FlashInfer (MXFP4)", flags: ["--moe-runner-backend flashinfer_mxfp4"],
-            env: ["SGLANG_TRTLLM_GEN_MOE_CUBIN_POOL=/path/to/trtllm_gen_moe_cubin_pool"],
             requiresHw: ["b200", "b300", "gb200", "gb300"] },
           { id: "marlin",           label: "Marlin (W4A16)",    flags: ["--moe-runner-backend marlin"] },
         ],
@@ -817,7 +893,6 @@ export const config = {
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
         "--dcp-size 8",
-        "--disable-custom-all-reduce",
         "--mem-fraction-static 0.85",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
@@ -896,10 +971,8 @@ export const config = {
         "--pp-size 2",
         "--dcp-size 8",
         "--ep-size 8",
-        // Both pinned to the brought-up shape rather than left to the auto
-        // resolution the rest of Blackwell uses. The MXFP4 runner needs the SiTU
-        // cubin pool the published image ships; drop it to get the Marlin
-        // fallback on an install without one.
+        // Both backends are pinned to the validated recipe even though automatic
+        // resolution selects them on Blackwell.
         "--moe-runner-backend flashinfer_mxfp4",
         "--decode-attention-backend cutedsl_mla",
         "--mem-fraction-static 0.85",
@@ -963,6 +1036,7 @@ export const config = {
         "--trust-remote-code",
         "--tp-size 8",
         "--attention-backend triton",
+        "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs 256",
@@ -989,6 +1063,7 @@ export const config = {
         "--trust-remote-code",
         "--tp-size 8",
         "--attention-backend triton",
+        "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs 256",
@@ -1194,7 +1269,6 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
-        "--enable-symm-mem",
         "--mem-fraction-static 0.85",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
@@ -1259,7 +1333,6 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 16",
-        "--enable-symm-mem",
         "--mem-fraction-static 0.85",
         "--reasoning-parser kimi_k3",
         "--tool-call-parser kimi_k3",
@@ -1388,7 +1461,6 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
-        "--enable-symm-mem",
         "--mem-fraction-static 0.85",
         "--chunked-prefill-size 16384",
         "--max-prefill-tokens 16384",
@@ -1740,6 +1812,7 @@ export const config = {
         "--trust-remote-code",
         "--tp-size 8",
         "--attention-backend triton",
+        "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs 256",
@@ -1767,6 +1840,7 @@ export const config = {
         "--trust-remote-code",
         "--tp-size 8",
         "--attention-backend triton",
+        "--kv-cache-dtype fp8_e4m3",
         "--dtype bfloat16",
         "--mem-fraction-static 0.85",
         "--cuda-graph-max-bs 256",
@@ -1967,7 +2041,6 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 8",
-        "--enable-symm-mem",
         "--mem-fraction-static 0.85",
         "--disaggregation-decode-extra-slots 16",
         "--reasoning-parser kimi_k3",

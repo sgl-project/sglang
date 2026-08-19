@@ -18,11 +18,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # isort: on
-
-logger = init_logger(__name__)
 
 
 class WanCausalDMDPipeline(LoRAPipeline, ComposedPipelineBase):

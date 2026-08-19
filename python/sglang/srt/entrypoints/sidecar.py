@@ -37,6 +37,8 @@ def _loopback_host(host: str) -> str:
 
 
 def build_sidecar_endpoint(server_args) -> str:
+    """Both halves of the endpoint come from the argument: this is a helper
+    over a config object, callable before anything is published."""
     return NetworkAddress(
         _loopback_host(server_args.host), server_args.grpc_port
     ).to_url()

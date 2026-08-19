@@ -6,8 +6,9 @@ from sglang.test.performance_test_runner import PerformanceTestParams
 from sglang.test.run_combined_tests import run_combined_tests
 from sglang.test.test_utils import ModelLaunchSettings
 
-# Runs on both H200 and B200 via nightly-8-gpu-common suite
-register_cuda_ci(est_time=1800, suite="nightly-8-gpu-common", nightly=True)
+# Runs on both H200 and B200: registered once per runner_config below
+register_cuda_ci(est_time=1860, stage="nightly", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=1860, stage="nightly", runner_config="8-gpu-b200")
 
 MINIMAX_M25_MODEL_PATH = "MiniMaxAI/MiniMax-M2.5"
 
@@ -54,7 +55,7 @@ class TestMiniMaxM25(unittest.TestCase):
             test_name="MiniMax-M2.5",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.80),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_minimax_m25",
+                result_dir="performance_results_minimax_m25",
             ),
         )
 

@@ -208,6 +208,38 @@ def test_streaming_bookkeeping_for_serving_layer() -> None:
     assert json.loads(detector.streamed_args_for_tool[0]) == {"code": "a"}
 
 
+def test_stream_end_reports_truncated_tools_section(caplog) -> None:
+    """A tools section cut off before its closing tag used to vanish at
+    end-of-stream: no call, no text, no log. It must at least be reported."""
+    detector = KimiK3Detector()
+    tools = [_make_tool("python")]
+    truncated = TOOLS_OPEN + '<|open|>call tool="python" index="1"<|sep|>'
+    text, calls = _stream(detector, _chunks(truncated, 7), tools)
+    assert calls == []
+    with caplog.at_level("WARNING", logger="sglang.srt.function_call.kimik3_detector"):
+        result = detector.finish(tools)
+    assert result.calls == []
+    assert TOOLS_OPEN not in (result.normal_text or "")
+    assert "no complete tool call" in caplog.text
+
+
+def test_stream_end_releases_held_back_text() -> None:
+    detector = KimiK3Detector()
+    tools = [_make_tool("python")]
+    text, _ = _stream(detector, ["all done", "<"], tools)
+    assert text == "all done"
+    result = detector.finish(tools)
+    assert text + (result.normal_text or "") == "all done<"
+
+
+def test_stream_end_drops_truncated_marker() -> None:
+    detector = KimiK3Detector()
+    tools = [_make_tool("python")]
+    text, _ = _stream(detector, ["all done", "<|open|>"], tools)
+    result = detector.finish(tools)
+    assert text + (result.normal_text or "") == "all done"
+
+
 def test_detector_capabilities_and_registration() -> None:
     detector = KimiK3Detector()
     assert detector.supports_structural_tag()

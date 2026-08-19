@@ -1,0 +1,168 @@
+---
+title: Ling-3.0-tiny
+description: "Deploy Ling-3.0-tiny with SGLang — a compact ~7.9B total / ~1.2B active hybrid KDA + MLA MoE in BF16, FP8, or INT4, with thinking mode and tool calling."
+tag: NEW
+---
+
+## Deployment
+
+<a id="install" />
+
+<Accordion title="Install SGLang">
+
+```bash Command
+docker pull lmsysorg/sglang:dev-Ling-3.0-tiny
+```
+
+For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with what the command generator below produces.
+
+</Accordion>
+
+Pick your hardware + recipe to generate the launch command. One serving strategy is covered:
+
+- **High-Throughput** — most tokens per second across many users. Best for batch jobs. Ling-3.0-tiny ships no built-in MTP draft layer (`num_nextn_predict_layers: 0`), so there is no NEXTN speculative-decoding recipe.
+
+import { Deployment } from "/src/snippets/_deployment.jsx";
+import { config } from "/src/snippets/configs/inclusionAI/ling-3.0-tiny.jsx";
+import { benchmarks } from "/src/snippets/configs/inclusionAI/ling-3.0-tiny-benchmarks.jsx";
+
+<Deployment config={config} benchmarks={benchmarks} />
+
+## Playground
+
+The Playground is where you experiment with **SGLang features beyond the documented matrix**. The Deploy panel above only emits the curated recipe combinations on this page; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing.
+
+import { Playground } from "/src/snippets/_playground.jsx";
+
+<Playground config={config} />
+
+## 1. Model Introduction
+
+Ling-3.0-tiny is a compact hybrid-attention Mixture-of-Experts (MoE) language model from the BailingMoeV3 family — the small variant of [Ling-3.0-flash](/cookbook/autoregressive/InclusionAI/Ling-3.0-flash). It interleaves Kimi Delta Attention (KDA) linear-attention layers with gated Multi-head Latent Attention (MLA) full-attention layers on top of a fine-grained MoE feed-forward network, keeping per-token inference cost near a ~1B dense model — **~7.9B total parameters with ~1.2B active** — while retaining large-model capacity.
+
+It is a thinking model with chain-of-thought enabled by default, and it supports structured tool calling. Native context length is 128K. Unlike Ling-3.0-flash, it ships **no built-in MTP draft layer**, so it does not use NEXTN speculative decoding.
+
+**Available Models:**
+
+- **BF16**: [inclusionAI/Ling-3.0-tiny](https://huggingface.co/inclusionAI/Ling-3.0-tiny) — ~7.9B total / ~1.2B active
+- **FP8** (blockwise E4M3): [inclusionAI/Ling-3.0-tiny-fp8](https://huggingface.co/inclusionAI/Ling-3.0-tiny-fp8)
+- **INT4** (compressed-tensors W4A16): [inclusionAI/Ling-3.0-tiny-int4](https://huggingface.co/inclusionAI/Ling-3.0-tiny-int4)
+
+**License:** MIT
+
+**Resources:** [HuggingFace](https://huggingface.co/inclusionAI/Ling-3.0-tiny).
+
+## 2. Configuration Tips
+
+- At ~7.9B total / 15.8 GB in BF16 (~7.9 GB in FP8 and ~5.8 GB in INT4), a single GPU is plenty on every supported card. Tensor parallelism is only useful to raise aggregate KV-cache capacity for many long-context concurrent requests — add `--tp 2`/`--tp 4` to a multi-GPU serve directly.
+- Use the dedicated `lmsysorg/sglang:dev-Ling-3.0-tiny` runtime image; it includes the compressed-tensors Hopper and Blackwell backends that INT4 needs.
+- The FP8 checkpoint uses blockwise (128×128) E4M3 weights with dynamic activations, quantized from the BF16 model with attention projections, the dense MoE gate, and the lm_head left in higher precision. SGLang detects the format from the checkpoint's `quantization_config`, so no explicit quantization flag is needed, and the same single-GPU recipe serves it.
+- The INT4 checkpoint uses symmetric group-32 W4A16 routed experts. SGLang selects Marlin on Hopper and Triton WNA16 on Blackwell automatically; no explicit quantization or MoE backend flag is needed.
+- Unlike Ling-3.0-flash (which pairs `--reasoning-parser ling3` / `--tool-call-parser ling3`), Ling-3.0-tiny uses `--reasoning-parser deepseek-r1` and `--tool-call-parser glm45` (its auto-detected template pairing) — the template wraps tool calls in `<tool_call>` blocks and emits an inline `...</think>` chain-of-thought. Toggle them in the **Parsers** card of the [Playground](#playground).
+- Only `--model-path`, `--host`, and `--port` are needed. SGLang auto-resolves the context length (native 128K from `max_position_embeddings`), the attention backend, and `--mem-fraction-static` from the GPU and the CUDA-graph runtime, so the recipes leave them unset.
+- The chat template defaults to thinking on. Turn it off per request with `"chat_template_kwargs": {"enable_thinking": false}` for direct answers without the `...</think>` block.
+- Ling-3.0-tiny ships no built-in MTP draft layer (`num_nextn_predict_layers: 0`), so `--speculative-algorithm NEXTN` is not applicable.
+
+## 3. Advanced Usage
+
+### 3.1 Reasoning
+
+With `--reasoning-parser deepseek-r1` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)), the chain-of-thought is returned in `message.reasoning_content` and the final answer in `message.content`:
+
+<Accordion title="Thinking-mode request">
+
+```bash Command
+curl -s http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "inclusionAI/Ling-3.0-tiny",
+    "messages": [{"role": "user", "content": "What is 15% of 240?"}]
+  }'
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```json Output
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": "15% of 240 is **36**.\n\n**Calculation:** 0.15 × 240 = 36",
+        "reasoning_content": "The user is asking for 15% of 240. This is a simple percentage calculation.\n\n15% of 240 = 0.15 × 240 = 36\n\nLet me verify: 0.15 × 240 = 0.15 × 200 + 0.15 × 40 = 30 + 6 = 36. Yes, that's correct.",
+        "tool_calls": null
+      },
+      "finish_reason": "stop"
+    }
+  ]
+}
+```
+
+</Accordion>
+
+<Note>
+Thinking is controlled by the chat template's `enable_thinking` kwarg and is on by default. Disable it per request with `"chat_template_kwargs": {"enable_thinking": false}`.
+</Note>
+
+### 3.2 Tool Calling
+
+With `--tool-call-parser glm45` (toggle **Tool Call Parser** in the **Parsers** card of the [Playground above](#playground)), structured calls are parsed into `message.tool_calls` and `finish_reason` is `tool_calls`:
+
+<Accordion title="Tool-calling request">
+
+```bash Command
+curl -s http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "inclusionAI/Ling-3.0-tiny",
+    "messages": [{"role": "user", "content": "Search for the latest news about AI"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "search",
+        "description": "Search for information on the internet",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {"type": "string", "description": "The search query"}
+          },
+          "required": ["query"]
+        }
+      }
+    }],
+    "tool_choice": "auto"
+  }'
+```
+
+</Accordion>
+
+<Accordion title="Example Output">
+
+```json Output
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": "Let me search for the latest news about AI for you.",
+        "reasoning_content": "The user wants me to search for the latest news about AI. I'll use the search tool to find recent AI news.",
+        "tool_calls": [
+          {
+            "id": "call_79b73a89696d4544ac6dd724",
+            "index": 0,
+            "type": "function",
+            "function": { "name": "search", "arguments": "{\"query\": \"latest AI news 2025\"}" }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ]
+}
+```
+
+</Accordion>
+
+For more API examples, see the [SGLang Basic Usage Guide](/docs/basic_usage/send_request).

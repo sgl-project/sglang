@@ -2,25 +2,20 @@
 """Unit tests for UMBPStore with mocked HostKVCache."""
 
 import ctypes
+import importlib
+import sys
 import tempfile
 import unittest
 from dataclasses import dataclass
+from types import ModuleType, SimpleNamespace
 from typing import Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from sglang.test.ci.ci_register import register_cpu_ci
+import mori.umbp  # noqa: F401
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+from sglang.test.ci.ci_register import register_amd_ci
 
-# UMBPStore wraps mori's UMBP client (AMD/ROCm only). On machines without mori
-# (e.g. NVIDIA / CPU CI) the whole TestCase is skipped instead of failing at
-# import time, so the CI runner (`python3 <file> -f`) exits cleanly.
-try:
-    import mori.umbp  # noqa: F401
-
-    HAS_MORI = True
-except ImportError:
-    HAS_MORI = False
+register_amd_ci(est_time=30, suite="stage-a-test-1-gpu-small-amd")
 
 
 @dataclass
@@ -90,12 +85,39 @@ class MockHostKVCache:
         return bytes(ctypes.string_at(self._buffer_ptr + v_offset, self.element_size))
 
 
+class MockLogicalHostPool:
+    layout = "page_first"
+    page_size = 1
+    kv_buffer = None
+
+
+class MockHybridSidePool:
+    page_size = 1
+
+    def get_page_buffer_meta(self, indices):
+        return [1000 + i * 8 for i in range(len(indices))], [8] * len(indices)
+
+
+def import_umbp_store_module():
+    """Import UMBPStore without pulling GPU-only memory-pool dependencies."""
+    module_name = "sglang.srt.mem_cache.storage.umbp.umbp_store"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+
+    fake_memory_pool_host = ModuleType("sglang.srt.mem_cache.memory_pool_host")
+    fake_memory_pool_host.HostKVCache = object
+    with patch.dict(
+        sys.modules,
+        {"sglang.srt.mem_cache.memory_pool_host": fake_memory_pool_host},
+    ):
+        return importlib.import_module(module_name)
+
+
 def make_indices(indices):
     """Create a list that acts like a torch.Tensor of indices."""
     return indices
 
 
-@unittest.skipUnless(HAS_MORI, "mori.umbp not available (AMD/ROCm only)")
 class TestUMBPStore(unittest.TestCase):
     def test_basic_set_get(self):
         from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
@@ -288,6 +310,163 @@ class TestUMBPStore(unittest.TestCase):
             self.assertEqual(mem_pool.read_page_k(0)[0], ord("M"))
             self.assertEqual(mem_pool.read_page_v(0)[0], ord("N"))
             store.clear()
+
+
+class TestUMBPStoreDefensiveSemantics(unittest.TestCase):
+    @staticmethod
+    def _make_v2_store():
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+
+        UMBPStore = import_umbp_store_module().UMBPStore
+        store = UMBPStore.__new__(UMBPStore)
+        store.client = MagicMock()
+        store.client.is_distributed.return_value = False
+        store.registered_pools = {}
+        store._kv_anchor_is_logical = True
+        store.is_mla_backend = True
+        store.mla_suffix = ""
+        store.mha_suffix = "0"
+        store.register_mem_host_pool_v2(MockHybridSidePool(), PoolName.DEEPSEEK_V4_C4)
+        return store
+
+    def test_constructor_preserves_logical_anchor_detection(self):
+        umbp_module = import_umbp_store_module()
+
+        class FakeUMBPConfig:
+            def __init__(self):
+                self.role = None
+                self.dram = SimpleNamespace(capacity_bytes=0)
+                self.ssd = SimpleNamespace(
+                    enabled=False,
+                    storage_dir="/tmp",
+                    capacity_bytes=0,
+                    ssd_backend="file",
+                    spdk_proxy_tenant_id=0,
+                    spdk_proxy_tenant_quota_bytes=0,
+                )
+                self.distributed = None
+
+            @classmethod
+            def from_environment(cls):
+                return cls()
+
+        class FakeUMBPClient:
+            def __init__(self, _config):
+                pass
+
+        fake_role = SimpleNamespace(
+            Standalone="standalone",
+            SharedSSDLeader="leader",
+            SharedSSDFollower="follower",
+        )
+        imported = (
+            FakeUMBPClient,
+            FakeUMBPConfig,
+            fake_role,
+            None,
+            None,
+            None,
+        )
+        config = MockStorageConfig(
+            extra_config={"dram_capacity_bytes": 1024, "ssd_enabled": False}
+        )
+
+        with patch.object(umbp_module, "_import_umbp_client", return_value=imported):
+            store = umbp_module.UMBPStore(config, MockLogicalHostPool())
+
+        self.assertTrue(store._kv_anchor_is_logical)
+        self.assertEqual(store.batch_set_v1(["page0"], [0]), [True])
+
+    def test_short_batch_exists_result_fails_closed(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+
+        store = self._make_v2_store()
+        store.client.batch_exists.return_value = [True]
+        transfer = PoolTransfer(
+            name=PoolName.DEEPSEEK_V4_C4,
+            keys=["page0", "page1"],
+            host_indices=[0, 1],
+        )
+
+        result = store.batch_exists_v2(["page0", "page1"], [transfer])
+
+        self.assertEqual(result.kv_hit_pages, 0)
+
+    def test_batch_exists_v2_narrows_queries_across_side_pools(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+
+        store = self._make_v2_store()
+        store.register_mem_host_pool_v2(MockHybridSidePool(), PoolName.DEEPSEEK_V4_C128)
+        page_keys = [f"page{i}" for i in range(4)]
+        store.client.batch_exists.side_effect = [
+            [True, True, False, True],
+            [True, False],
+        ]
+        transfers = [
+            PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C4,
+                keys=page_keys,
+                host_indices=[0, 1, 2, 3],
+            ),
+            PoolTransfer(
+                name=PoolName.DEEPSEEK_V4_C128,
+                keys=page_keys,
+                host_indices=[0, 1, 2, 3],
+            ),
+        ]
+
+        result = store.batch_exists_v2(page_keys, transfers)
+
+        queried_keys = [
+            invocation.args[0]
+            for invocation in store.client.batch_exists.call_args_list
+        ]
+        self.assertEqual(
+            queried_keys,
+            [
+                [f"{key}__{PoolName.DEEPSEEK_V4_C4}" for key in page_keys],
+                [f"{key}__{PoolName.DEEPSEEK_V4_C128}" for key in page_keys[:2]],
+            ],
+        )
+        self.assertEqual(result.kv_hit_pages, 1)
+        self.assertEqual(
+            result.extra_pool_hit_pages,
+            {
+                PoolName.KV: 4,
+                PoolName.DEEPSEEK_V4_C4: 2,
+                PoolName.DEEPSEEK_V4_C128: 1,
+            },
+        )
+
+    def test_short_batch_get_result_marks_every_page_failed(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+
+        store = self._make_v2_store()
+        store.client.batch_get_into_ptr.return_value = [True]
+        transfer = PoolTransfer(
+            name=PoolName.DEEPSEEK_V4_C4,
+            keys=["page0", "page1"],
+            host_indices=[0, 1],
+        )
+
+        result = store.batch_get_v2([transfer])
+
+        self.assertEqual(result[PoolName.DEEPSEEK_V4_C4], [False, False])
+
+    def test_short_batch_set_result_marks_every_page_failed(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+
+        store = self._make_v2_store()
+        store.client.batch_put_from_ptr.return_value = [True]
+        transfer = PoolTransfer(
+            name=PoolName.DEEPSEEK_V4_C4,
+            keys=["page0", "page1"],
+            host_indices=[0, 1],
+        )
+
+        result = store.batch_set_v2([transfer])
+
+        self.assertEqual(result[PoolName.DEEPSEEK_V4_C4], [False, False])
 
 
 if __name__ == "__main__":

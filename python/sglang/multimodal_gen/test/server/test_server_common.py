@@ -36,6 +36,7 @@ from sglang.multimodal_gen.test.server.test_server_utils import (
     ServerContext,
     ServerManager,
     get_generate_fn,
+    is_missing_diffusers_pipeline_error,
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
@@ -157,22 +158,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     # picking another one (which causes the test client to connect to the wrong server).
     extra_args += " --strict-ports"
 
-    # Shape-only mesh cases (e.g. hunyuan3d_shape_gen) validate geometry via
-    # mesh-correctness and must NOT run the paint/texture stages, whose
-    # verification checks texture artifacts (paint_mesh/normal_maps/renderer)
-    # that the shape-only path never produces. Inject a pipeline-config override
-    # disabling paint for these cases.
-    if server_args.custom_validator == "mesh":
-        import json as _json
-        import tempfile as _tempfile
-
-        _paint_off_cfg = os.path.join(
-            _tempfile.gettempdir(), f"{case.id}_paint_off.json"
-        )
-        with open(_paint_off_cfg, "w") as _f:
-            _json.dump({"paint_enable": False}, _f)
-        extra_args += f" --config {_paint_off_cfg}"
-
     for arg in server_args.extras:
         extra_args += f" {arg}"
 
@@ -213,9 +198,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         # pipeline class.  This avoids hard failures when a model needs a
         # newer diffusers release than what is currently installed in CI.
         msg = str(exc)
-        if "not found in diffusers" in msg or (
-            "has no attribute" in msg and "diffusers" in msg.lower()
-        ):
+        if is_missing_diffusers_pipeline_error(msg):
             pytest.skip(
                 f"Skipping {case.id}: required diffusers pipeline class "
                 f"is not available in the installed version. "

@@ -372,6 +372,13 @@ class _ModelRegistry:
         normalized_arch = []
         for arch in architectures:
             if arch not in self.registered_models:
+                # A checkpoint may name a class that is only a rename of one we
+                # already implement (e.g. LTX-2.5's `LTX2VocoderWithBWE` is
+                # `LTX2Vocoder`); `_aliases` declares those equivalences.
+                canonical = _ALIAS_TO_MODEL.get(arch)
+                if canonical is not None and canonical in self.registered_models:
+                    normalized_arch.append(canonical)
+                    continue
                 registered_models = list(self.registered_models.keys())
                 raise Exception(
                     f"Unsupported model architecture: {arch}. Registered architectures: {registered_models}"

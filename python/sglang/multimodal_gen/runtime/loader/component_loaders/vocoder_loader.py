@@ -1,6 +1,7 @@
+import re
+
 from safetensors.torch import load_file as safetensors_load_file
 
-from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
@@ -24,11 +25,6 @@ logger = init_logger(__name__)
 class VocoderLoader(ComponentLoader):
     component_names = ["vocoder"]
     expected_library = "diffusers"
-
-    def should_offload(
-        self, server_args: ServerArgs, model_config: ModelConfig | None = None
-    ):
-        return server_args.vae_cpu_offload
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
@@ -55,8 +51,10 @@ class VocoderLoader(ComponentLoader):
             else PRECISION_TO_TYPE["fp32"]
         )
 
-        should_offload = self.should_offload(server_args)
-        target_device = self.target_device(should_offload)
+        component_starts_on_cpu = server_args.should_start_component_on_cpu(
+            component_name
+        )
+        target_device = self.target_device(component_starts_on_cpu)
 
         with set_default_torch_dtype(vocoder_dtype), skip_init_modules():
             vocoder_cls, _ = ModelRegistry.resolve_model_cls(class_name)
@@ -67,24 +65,22 @@ class VocoderLoader(ComponentLoader):
             len(safetensors_list) == 1
         ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
         loaded = safetensors_load_file(safetensors_list[0])
-        incompatible = vocoder.load_state_dict(loaded, strict=False)
-        missing_keys = []
-        unexpected_keys = []
-        try:
-            missing_keys = incompatible.missing_keys
-            unexpected_keys = incompatible.unexpected_keys
-        except AttributeError:
-            # Best-effort fallback in case older torch returns a tuple-like.
-            try:
-                missing_keys = incompatible[0]
-                unexpected_keys = incompatible[1]
-            except Exception:
-                pass
+        mapping = vocoder_config.arch_config.param_names_mapping
+        loaded = {_remap_vocoder_key(k, mapping): v for k, v in loaded.items()}
 
+        missing_keys, unexpected_keys = vocoder.load_state_dict(loaded, strict=False)
+        # A half-loaded vocoder produces plausible but wrong audio.
         if missing_keys or unexpected_keys:
-            logger.warning(
-                "Loaded vocoder with missing_keys=%d unexpected_keys=%d",
-                len(missing_keys),
-                len(unexpected_keys),
+            raise ValueError(
+                f"Vocoder weights at '{component_model_path}' do not match the "
+                f"instantiated {class_name}. Missing: {sorted(missing_keys)}. "
+                f"Unexpected: {sorted(unexpected_keys)}."
             )
         return vocoder
+
+
+def _remap_vocoder_key(key: str, param_names_mapping: dict[str, str]) -> str:
+    # Applied in order, not first-match: one key can need several rules.
+    for pattern, replacement in param_names_mapping.items():
+        key = re.sub(pattern, replacement, key)
+    return key

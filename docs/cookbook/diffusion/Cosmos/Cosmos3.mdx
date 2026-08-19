@@ -10,7 +10,7 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
 ## 1. Model Introduction
 
-[NVIDIA Cosmos3](https://huggingface.co/collections/nvidia/cosmos3) is an omnimodal world-model family for image, video, sound, and action generation. SGLang Diffusion serves the public checkpoints with the native `Cosmos3OmniDiffusersPipeline`.
+[NVIDIA Cosmos3](https://huggingface.co/collections/nvidia/cosmos3) is an omnimodal world-model family for image, video, sound, and action generation. SGLang Diffusion serves the public checkpoints with its native Cosmos3 pipeline.
 
 | Model | Status | Notes |
 | --- | --- | --- |
@@ -19,8 +19,14 @@ import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 | `nvidia/Cosmos3-Super-Text2Image` | Supported | T2I-specialized checkpoint |
 | `nvidia/Cosmos3-Super-Image2Video` | Supported | I2V-specialized checkpoint |
 | `nvidia/Cosmos3-Nano-Policy-DROID` | Supported | DROID policy action generation |
+| `nvidia/Cosmos3-Edge` | Supported | 4B dense model for T2I, T2V, I2V, V2V, and action generation |
+| `nvidia/Cosmos3-Edge-Policy-DROID` | Supported | 4B DROID policy action generation |
+| `nvidia/Cosmos3-Super-Text2Image-4Step` | Supported | 64B T2I checkpoint distilled to a fixed 4-step schedule |
+| `nvidia/Cosmos3-Super-Image2Video-4Step` | Supported | 64B I2V checkpoint distilled to a fixed 4-step schedule |
 
-Sound and action generation require the corresponding checkpoint heads. SGLang uses the flow-native `FlowUniPCMultistepScheduler` for Cosmos3 even if the checkpoint metadata names another scheduler. The default `flow_shift` is `3.0` for T2I and `10.0` for video and action modes.
+Sound and action generation require the corresponding checkpoint heads. The pipeline reads the transformer and scheduler configs at startup, so Edge and distilled checkpoints do not require architecture-specific server flags. Non-distilled checkpoints use the flow-native `FlowUniPCMultistepScheduler`; distilled checkpoints use the fixed sigma schedule stored in the checkpoint.
+
+The default `flow_shift` is `3.0` for T2I, `10.0` for non-Edge video and all action modes, and `3.0` for Edge video modes. Distilled checkpoints bake the schedule into their sigmas and do not use a request-level `flow_shift`.
 
 ## 2. Installation
 
@@ -58,6 +64,32 @@ sglang serve \
 
 The server also accepts the specialized `nvidia/Cosmos3-Super-Text2Image` and `nvidia/Cosmos3-Super-Image2Video` checkpoint IDs.
 
+### Edge checkpoints
+
+`Cosmos3-Edge` is a 4B dense model and can be served on one GPU:
+
+```bash Command
+sglang serve \
+  --model-path nvidia/Cosmos3-Edge \
+  --num-gpus 1
+```
+
+Edge is trained for 256p and 480p generation. Its default video configuration is `832x480` with `guidance_scale=5.0`; its default image configuration is `640x640` with `guidance_scale=7.0`. Supported sizes are `832x480`, `480x832`, `640x480`, `480x640`, `480x480`, `640x640`, `448x256`, `256x448`, and `256x256`.
+
+Serve the Edge DROID policy checkpoint with the same single-GPU configuration, replacing the model path with `nvidia/Cosmos3-Edge-Policy-DROID`.
+
+### Distilled checkpoints
+
+The distilled Super checkpoints are 64B models. Use multiple GPUs unless the complete model and request workload fit on one GPU:
+
+```bash Command
+sglang serve \
+  --model-path nvidia/Cosmos3-Super-Text2Image-4Step \
+  --num-gpus 4
+```
+
+For distilled I2V, replace the model path with `nvidia/Cosmos3-Super-Image2Video-4Step`. SGLang detects both checkpoints from `scheduler/scheduler_config.json`, uses the checkpoint's fixed four-step sigma schedule, and forces `guidance_scale=1.0`. Do not tune `num_inference_steps` or `flow_shift` for these checkpoints.
+
 ## 4. OpenAI-Compatible Requests
 
 ### Text to image
@@ -74,6 +106,24 @@ curl -sS -X POST http://127.0.0.1:30010/v1/images/generations \
     "num_inference_steps": 35,
     "guidance_scale": 6.0,
     "flow_shift": 3.0,
+    "seed": 0,
+    "extra_args": {
+      "use_resolution_template": false,
+      "guardrails": true
+    }
+  }'
+```
+
+With a server running `nvidia/Cosmos3-Super-Text2Image-4Step`, omit the scheduler controls and use `guidance_scale=1.0`:
+
+```bash Command
+curl -sS -X POST http://127.0.0.1:30010/v1/images/generations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "A warehouse robot folds a blue cloth on a clean workbench.",
+    "size": "640x640",
+    "n": 1,
+    "guidance_scale": 1.0,
     "seed": 0,
     "extra_args": {
       "use_resolution_template": false,
@@ -177,6 +227,23 @@ response.raise_for_status()
 Path("cosmos3_i2v.mp4").write_bytes(response.content)
 ```
 
+For the distilled I2V checkpoint, use the same API with a server running `nvidia/Cosmos3-Super-Image2Video-4Step`. The recommended request is 480p and does not specify scheduler controls:
+
+```bash Command
+job_id=$(curl -sS -X POST http://127.0.0.1:30010/v1/videos \
+  --form-string "prompt=A warehouse robot carefully places a blue box on a shelf." \
+  --form "input_reference=@first_frame.png;type=image/png" \
+  --form-string "size=832x480" \
+  --form-string "num_frames=189" \
+  --form-string "fps=24" \
+  --form-string "guidance_scale=1.0" \
+  --form-string "seed=42" \
+  --form-string 'extra_params={"guardrails":true,"use_resolution_template":false,"use_duration_template":false}' \
+  | python -c 'import json, sys; print(json.load(sys.stdin)["id"])')
+```
+
+Poll and download this job with the same status and content endpoints used by the T2V example.
+
 ### Video to video
 
 Upload a source video with `video_reference`. Cosmos3 keeps latent frames `[0, 1]` by default and generates the remaining frames. Use `condition_frame_indexes` to select different latent frames, and `condition_video_keep` to take conditioning frames from the start or end of the source.
@@ -199,7 +266,7 @@ Poll and download this job with the same status and content endpoints used by th
 
 ### Action generation
 
-For DROID policy generation, start a single-GPU server with the policy checkpoint. Cosmos3 action generation does not currently support CFG or sequence parallelism.
+For DROID policy generation, start a single-GPU server with either the Nano or Edge policy checkpoint. Cosmos3 action generation does not currently support CFG or sequence parallelism.
 
 ```bash Command
 sglang serve \
@@ -207,36 +274,60 @@ sglang serve \
   --num-gpus 1
 ```
 
-The following request predicts a 16-step action chunk from one observation. The chunk length is `num_frames - 1`, and the completed job's `action` field contains the tensor data, shape, mode, and active action dimension.
+Use `nvidia/Cosmos3-Edge-Policy-DROID` in the same command to serve the smaller 4B policy checkpoint.
 
-```bash Command
-job_id=$(curl -sS -X POST http://127.0.0.1:30010/v1/videos \
-  --form-string "prompt=Put the pot to the left of the purple item." \
-  --form "input_reference=@observation.png;type=image/png" \
-  --form-string "size=832x480" \
-  --form-string "num_frames=17" \
-  --form-string "fps=5" \
-  --form-string "num_inference_steps=30" \
-  --form-string "guidance_scale=1.0" \
-  --form-string "action_mode=policy" \
-  --form-string "domain_name=droid_lerobot" \
-  | python -c 'import json, sys; print(json.load(sys.stdin)["id"])')
+`policy` and `inverse_dynamics` return actions, so their canonical API is the synchronous `/v1/actions/generations` endpoint. The following request predicts a 16-step action chunk from one observation image. `action_horizon=16` maps to the model's `num_frames=17` convention.
 
-# After the job reaches "completed":
-curl -sS "http://127.0.0.1:30010/v1/videos/${job_id}" \
-  | python -c 'import json, sys; print(json.dumps(json.load(sys.stdin)["action"], indent=2))'
+```python Python
+import base64
+from pathlib import Path
+
+import requests
+
+image_b64 = base64.b64encode(Path("observation.png").read_bytes()).decode()
+response = requests.post(
+    "http://127.0.0.1:30010/v1/actions/generations",
+    json={
+        "input": {
+            "task": "Put the pot to the left of the purple item.",
+            "observation": {
+                "image": {"b64_json": image_b64},
+            },
+        },
+        "parameters": {
+            "action_mode": "policy",
+            "action_horizon": 16,
+            "domain_name": "droid_lerobot",
+            "height": 480,
+            "width": 832,
+            "fps": 5,
+            "num_inference_steps": 30,
+            "guidance_scale": 1.0,
+            "seed": 42,
+        },
+    },
+    timeout=300,
+)
+response.raise_for_status()
+action = response.json()["data"][0]["action"]
+print(action["shape"], action["values"])
 ```
 
-The other action modes are `forward_dynamics` (condition on an observation and an `action` JSON array to generate video) and `inverse_dynamics` (condition on a full video to predict action). Select the embodiment head with `domain_name` or `domain_id`; set `raw_action_dim` explicitly when it cannot be inferred from the domain name.
+Use `GET /v1/actions/metadata` to inspect the action modes, default horizon, padded action dimension, and accepted observation modalities. Msgpack requests and the `/v1/actions/realtime` websocket use the same action envelope.
+
+`inverse_dynamics` also uses `/v1/actions/generations`; set `action_mode="inverse_dynamics"` and pass an observation video URL or server-local path as `input.observation.video`. Select the embodiment head with `domain_name` or `domain_id`; set `raw_action_dim` explicitly when it cannot be inferred from the domain name.
+
+`forward_dynamics` is intentionally different: it consumes an action array and predicts video, so it remains on `/v1/videos`. Action-producing modes submitted to `/v1/videos` return HTTP 400 with the canonical action endpoint in the error message.
 
 ## 5. Cosmos3 Parameters
 
-Cosmos3 supports the standard SGLang video and image fields such as `size`, `num_frames`, `fps`, `num_inference_steps`, `guidance_scale`, `negative_prompt`, and `seed`.
+Cosmos3 supports the standard SGLang video and image fields such as `size`, `num_frames`, `fps`, `num_inference_steps`, `guidance_scale`, `negative_prompt`, and `seed`. For distilled checkpoints, SGLang replaces `num_inference_steps` with the checkpoint's fixed four-step schedule and forces `guidance_scale=1.0`; negative-prompt CFG and request-level `flow_shift` do not apply.
 
 Top-level Cosmos3 request fields:
 
 - `max_sequence_length`: maximum text token length used by the Cosmos3 tokenizer.
-- `flow_shift`: per-request scheduler shift. If omitted, SGLang uses `--flow-shift`, then the mode default (`3.0` for T2I and `10.0` for video/action).
+- `flow_shift`: per-request scheduler shift for non-distilled checkpoints. If omitted, SGLang uses `--flow-shift`, then the mode default (`3.0` for T2I, `10.0` for non-Edge video and all action modes, or `3.0` for Edge video).
+- `guidance_interval`: optional `[start, end]` noise interval for CFG. Non-distilled T2I defaults to `[400, 1000]`; video modes guide at every step.
 
 Cosmos3 omnimodal fields are accepted as extra JSON fields or multipart form fields:
 

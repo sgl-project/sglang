@@ -4,11 +4,14 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 from sglang.srt.batch_overlap import two_batch_overlap
-from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.base_attn_backend import (
+    AttentionBackend,
+    SharedReadEnds,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.verify_mask import VerifyMask
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 
 class TboAttnBackend(AttentionBackend):
@@ -20,6 +23,9 @@ class TboAttnBackend(AttentionBackend):
         # reads through TboAttnBackend resolve to the underlying pool.
         self.token_to_kv_pool = primary.token_to_kv_pool
         self.req_to_token_pool = primary.req_to_token_pool
+        self.extend_dummy_seqs_capped_by_req_pool = getattr(
+            primary, "extend_dummy_seqs_capped_by_req_pool", False
+        )
 
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):
@@ -113,6 +119,11 @@ class TboAttnBackend(AttentionBackend):
             child.init_forward_metadata_out_graph(
                 forward_batch=child_fb_view, in_capture=False
             )
+
+    def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
+        return SharedReadEnds.max_of(
+            b.shared_read_ends(fm) for b in (self.primary, *self.children)
+        )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         self.primary.init_forward_metadata_in_graph(forward_batch=forward_batch)

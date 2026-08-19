@@ -1,5 +1,5 @@
 import asyncio
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 
 class AsyncDictStore:
@@ -36,9 +36,31 @@ class AsyncDictStore:
         async with self._lock:
             return self._items.pop(key, None)
 
-    async def list_values(self) -> List[Dict[str, Any]]:
+    async def list_page(
+        self,
+        *,
+        after: Optional[str] = None,
+        limit: Optional[int] = None,
+        order: Optional[str] = "desc",
+    ) -> list[Dict[str, Any]]:
+        """Return a created-time ordered page, with OpenAI-style cursor semantics."""
+        normalized_order = (order or "desc").lower()
+        reverse = normalized_order != "asc"
         async with self._lock:
-            return list(self._items.values())
+            items = sorted(
+                self._items.values(),
+                key=lambda item: item.get("created_at", 0),
+                reverse=reverse,
+            )
+
+        if after is not None:
+            try:
+                index = next(i for i, item in enumerate(items) if item["id"] == after)
+                items = items[index + 1 :]
+            except StopIteration:
+                return []
+
+        return items[:limit] if limit is not None else items
 
 
 # Global stores shared by OpenAI entrypoints

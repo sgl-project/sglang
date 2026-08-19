@@ -229,7 +229,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .rid
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let req_dict = build_text_generate_dict(&rid, &req);
+        let req_dict = build_text_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
 
         let mut receiver = self
             .bridge
@@ -298,7 +298,7 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .rid
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let req_dict = build_generate_dict(&rid, &req);
+        let req_dict = build_generate_dict(&rid, &req).map_err(Status::invalid_argument)?;
 
         let mut receiver = self
             .bridge

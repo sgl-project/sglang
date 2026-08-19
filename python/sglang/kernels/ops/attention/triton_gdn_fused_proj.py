@@ -4,6 +4,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import get_bool_env_var, is_hip
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
 # =============================================================================
 # Fused kernel — reads INTERLEAVED input format
 # Used by Qwen3-Next whose checkpoint stores fused in_proj_qkvz weights
@@ -127,6 +132,8 @@ def fused_qkvzba_split_reshape_cat(
         device=mixed_ba.device,
     )
     a = torch.empty_like(b)
+    if _is_hip and batch * seq_len == 0:
+        return mixed_qkv, z, b, a
     grid = (batch * seq_len, num_heads_qk)
     fused_qkvzba_split_reshape_cat_kernel[grid](
         mixed_qkv,
@@ -292,7 +299,19 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         device=mixed_ba.device,
     )
     a = torch.empty_like(b)
+    if _is_hip and batch * seq_len == 0:
+        return mixed_qkv, z, b, a
     grid = (batch * seq_len, num_heads_qk)
+    # Each program moves `v_per_group * head_v` elements for both v and z. For
+    # the small head-group ratios (<= 512 elements) a single warp is the best
+    # fit; wider ratios (e.g. 8 v-heads per k-head) need more lanes so the
+    # per-program vector load/store does not serialize. The threshold was tuned
+    # on MI355X, so it is confined to the HIP/aiter path; every other backend
+    # keeps the original `num_warps=1`.
+    num_warps = 1
+    if _use_aiter:
+        v_elems_per_program = (num_heads_v // num_heads_qk) * head_v
+        num_warps = 1 if v_elems_per_program <= 512 else 4
     fused_qkvzba_split_reshape_cat_contiguous_kernel[grid](
         mixed_qkv,
         z,
@@ -304,7 +323,7 @@ def fused_qkvzba_split_reshape_cat_contiguous(
         num_heads_v,
         head_qk,
         head_v,
-        num_warps=1,
+        num_warps=num_warps,
         num_stages=3,
     )
     return mixed_qkv, z, b, a
@@ -387,6 +406,8 @@ def fused_qkv_split_gdn_prefill(
     )
 
     qkv_dim = num_q_heads * head_q + num_k_heads * head_k + num_v_heads * head_v
+    if _is_hip and seq_len == 0:
+        return q, k, v
     fused_qkv_split_gdn_prefill_kernel[(seq_len,)](
         q,
         k,

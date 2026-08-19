@@ -89,6 +89,10 @@ def _effective_prefix_cache_enabled(
     )
 
 
+def _cuda_graph_enabled(batch: Req) -> bool:
+    return bool(vla_options(batch).get("enable_cuda_graph", True))
+
+
 def _grouped_fingerprint(
     batch: Req,
     server_args: ServerArgs,
@@ -122,6 +126,7 @@ def _grouped_fingerprint(
         batch.action_horizon,
         batch.action_dim,
         batch.num_inference_steps,
+        _cuda_graph_enabled(batch),
     )
 
 
@@ -180,7 +185,10 @@ class VLAPrefixEncodingStage(PipelineStage):
                 vla_state(batch)["observation_batch"] for batch in group_batches
             ]
             grouped_observation = collate_vla_observation_batches(observations)
-            prefix_context = self.policy_model.encode_prefix(grouped_observation)
+            prefix_context = self.policy_model.encode_prefix(
+                grouped_observation,
+                use_cuda_graph=_cuda_graph_enabled(group_batches[0]),
+            )
             prefix_ms = (time.perf_counter() - prefix_start) * 1000
 
             for offset, (index, batch) in enumerate(group):
@@ -299,7 +307,10 @@ class VLAPrefixEncodingStage(PipelineStage):
         prefix_start = time.perf_counter()
 
         # 3. run encoding
-        prefix_context = self.policy_model.encode_prefix(observation)
+        prefix_context = self.policy_model.encode_prefix(
+            observation,
+            use_cuda_graph=_cuda_graph_enabled(batch) and not cache_enabled,
+        )
         if cache_key is not None:
             prefix_context.cache_key_digest = cache_key
 
@@ -371,7 +382,7 @@ class VLAActionDenoisingStage(PipelineStage):
                 prefix_context,
                 noise=observation.noise,
                 num_steps=group_batches[0].num_inference_steps,
-                use_cuda_graph=bool(options.get("enable_cuda_graph", True)),
+                use_cuda_graph=_cuda_graph_enabled(group_batches[0]),
                 generator=None,
             )
             synchronize_vla_action_tensor(actions)
@@ -417,7 +428,7 @@ class VLAActionDenoisingStage(PipelineStage):
                 prefix_context,
                 noise=noise,
                 num_steps=batch.num_inference_steps,
-                use_cuda_graph=bool(options.get("enable_cuda_graph", True)),
+                use_cuda_graph=_cuda_graph_enabled(batch),
                 generator=batch.generator,
             )
             synchronize_vla_action_tensor(actions)

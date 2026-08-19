@@ -10,74 +10,19 @@ from torch.nn import functional as F
 
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.quant_ref_utils import (
+    FLOAT4_E2M1_MAX,
+    FLOAT8_E4M3_MAX,
+    dequantize_nvfp4_to_dtype,
+)
 
-register_cuda_ci(est_time=300, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(est_time=300, stage="nightly", runner_config="4-gpu-b200")
 
 if torch.cuda.get_device_capability() < (10, 0):
     pytest.skip(
         reason="Nvfp4 Requires compute capability of 10 or above.",
         allow_module_level=True,
     )
-
-kE2M1ToFloat = torch.tensor(
-    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
-)
-
-FLOAT8_E4M3_MAX = 448.0
-FLOAT4_E2M1_MAX = 6.0
-
-
-def convert_swizzled_to_linear(a_sf_swizzled: torch.Tensor, m, k, block_size):
-    m_tiles = (m + 128 - 1) // 128
-    f = block_size * 4
-    k_tiles = (k + f - 1) // f
-    tmp = torch.reshape(a_sf_swizzled, (1, m_tiles, k_tiles, 32, 4, 4))
-    tmp = torch.permute(tmp, (0, 1, 4, 3, 2, 5))
-    out = tmp.reshape(m_tiles * 128, k_tiles * f // block_size)
-    return out[0:m, 0:k]
-
-
-def dequantize_nvfp4_to_dtype(
-    tensor_fp4, tensor_sf, global_scale, dtype, device, block_size=16
-):
-    """Dequantize the fp4 tensor back to high precision."""
-    # Two fp4 values are packed into one uint8.
-    assert tensor_fp4.dtype == torch.uint8
-    m, packed_k = tensor_fp4.shape
-    k = packed_k * 2
-    tensor_f32 = break_fp4_bytes(tensor_fp4, dtype)
-    tensor_f32 = tensor_f32.reshape(m, k // block_size, block_size)
-    tensor_sf = tensor_sf.view(torch.float8_e4m3fn)
-    tensor_sf = convert_swizzled_to_linear(tensor_sf, m, k, block_size)
-    tensor_sf_dtype = tensor_sf.to(torch.float32) / global_scale
-
-    # scale the tensor
-    out = (tensor_f32 * tensor_sf_dtype.unsqueeze(-1)).reshape(m, k)
-    return out.to(dtype=dtype)
-
-
-def break_fp4_bytes(a, dtype):
-    assert a.dtype == torch.uint8
-    m, n = a.shape
-
-    # Vectorized nibble processing
-    a_flat = a.flatten()
-    high = (a_flat & 0xF0) >> 4  # Upper nibbles
-    low = a_flat & 0x0F  # Lower nibbles
-
-    # Combine nibbles for batch processing
-    combined = torch.stack((low, high), dim=1).flatten()
-
-    # Vectorized sign and magnitude extraction
-    signs = (combined & 0x08).to(torch.bool)  # Sign bits
-    abs_vals = (combined & 0x07).to(torch.long)  # Magnitude indices
-
-    # Device-aware lookup and sign application
-    kE2M1 = kE2M1ToFloat.to(device=a.device)
-    values = kE2M1[abs_vals] * torch.where(signs, -1.0, 1.0)
-
-    # Reshape to final form
-    return values.reshape(m, n * 2).to(dtype=dtype)
 
 
 def compute_routing(router_logits: torch.Tensor, top_k: int):
@@ -170,7 +115,6 @@ def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids):
                 inter_blockscale,
                 inter_gs,
                 dtype=inter.dtype,
-                device=inter.device,
                 block_size=16,
             ).cuda()
             out[mask] = inter @ w2[i].transpose(0, 1)
@@ -319,7 +263,6 @@ def check_moe(
         a_scale_interleaved,
         a_global_scale,
         dtype=a.dtype,
-        device=a.device,
         block_size=quant_blocksize,
     )
 
@@ -332,7 +275,6 @@ def check_moe(
             w1_blockscale[idx],
             w1_gs[idx],
             dtype=w1.dtype,
-            device=w1.device,
             block_size=quant_blocksize,
         )
         w2_d[idx] = dequantize_nvfp4_to_dtype(
@@ -340,7 +282,6 @@ def check_moe(
             w2_blockscale[idx],
             w2_gs[idx],
             dtype=w2.dtype,
-            device=w2.device,
             block_size=quant_blocksize,
         )
 

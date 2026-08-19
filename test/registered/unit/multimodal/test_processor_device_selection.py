@@ -1,9 +1,9 @@
 """The fast-image-processor device comes from the processor's own ServerArgs.
 
-Regression: the device decision read the published global ServerArgs, which is
-last-publish-wins. Two engines in one tokenizer process then shared whichever
-config published last, so one engine's images were preprocessed on the other
-engine's GPU.
+Regression: the device decision read the published global ServerArgs, so every
+processor answered with one process-wide device. The encode-server DP workers
+each drive their own GPU, which no process-global value can express — the
+device has to come from what the worker was handed.
 """
 
 import unittest

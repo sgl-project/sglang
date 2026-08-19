@@ -181,7 +181,7 @@ def _load_sglang_component(
     sgl_args: ServerArgs,
     component: ComponentType,
     library: str,
-    text_encoder_cpu_offload: bool | None = None,
+    component_starts_on_cpu: bool | None = None,
 ) -> nn.Module:
     loader = ComponentLoader.for_component_type(component.value, library)
     if component == ComponentType.TEXT_ENCODER:
@@ -189,7 +189,7 @@ def _load_sglang_component(
             comp_path,
             sgl_args,
             component.value,
-            cpu_offload_flag=text_encoder_cpu_offload,
+            component_starts_on_cpu=component_starts_on_cpu,
         )
     else:
         component_model = loader.load_customized(comp_path, sgl_args, component.value)
@@ -477,34 +477,40 @@ class AccuracyEngine:
         for name, tensor in target.named_parameters():
             total += 1
             src_tensor = None
-            for cand in generate_name_candidates(name, reverse_mapping):
+            candidates = generate_name_candidates(name, reverse_mapping)
+            for cand in candidates:
                 if cand in lookup:
                     src_tensor = lookup[cand]
                     break
             if src_tensor is None:
-                for cand in generate_name_candidates(name, reverse_mapping):
+                for cand in candidates:
                     src_tensor = fuse_qkv(lookup, cand)
                     if src_tensor is not None:
                         break
             if src_tensor is None:
-                for cand in generate_name_candidates(name, reverse_mapping):
+                for cand in candidates:
                     src_tensor = fuse_gate_up_proj(lookup, cand)
                     if src_tensor is not None:
                         break
-            if src_tensor is None:
-                unmatched_details.append(f"{name}: no matching source tensor")
-                continue
             shard_context = shard_contexts.get(name)
             shard_world_size = (
                 shard_context.world_size if shard_context is not None else tp_world
             )
             shard_rank = shard_context.rank if shard_context is not None else rank
-            # TP-sharded params must load via their own weight_loader; the
-            # generic narrow mis-slices fused QKV/gate_up projections.
-            if shard_world_size > 1 and load_param_with_weight_loader(
+            # Production loaders own fused projection sharding and alignment
+            # padding. Use them for TP parameters and whenever a direct copy
+            # cannot represent the source layout, including TP=1.
+            requires_weight_loader = (
+                shard_world_size > 1
+                or src_tensor is None
+                or src_tensor.shape != tensor.shape
+            )
+            if requires_weight_loader and load_param_with_weight_loader(
                 tensor, name, lookup, reverse_mapping
             ):
                 matched += 1
+            elif src_tensor is None:
+                unmatched_details.append(f"{name}: no matching source tensor")
             elif copy_tensor(tensor, src_tensor, shard_world_size, shard_rank):
                 matched += 1
             else:
@@ -611,7 +617,7 @@ class AccuracyEngine:
             sgl_args,
             component,
             library,
-            text_encoder_cpu_offload=(
+            component_starts_on_cpu=(
                 False
                 if component != ComponentType.TEXT_ENCODER or materialize_sgl_on_device
                 else True

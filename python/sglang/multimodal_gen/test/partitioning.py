@@ -30,3 +30,17 @@ def partition_items_by_lpt(
         partition_sums[min_idx] += item.est_time
 
     return partitions
+
+
+def assign_partition(
+    items: list[PartitionItem], partition_id: int, num_partitions: int
+) -> list[PartitionItem]:
+    """Return the LPT slice of ``items`` owned by ``partition_id``.
+
+    The LPT pass is deterministic, so shards that each call this with the same
+    item list cover the list exactly once between them.
+    """
+    partitions = partition_items_by_lpt(items, num_partitions)
+    if partition_id < 0 or partition_id >= len(partitions):
+        return []
+    return partitions[partition_id]

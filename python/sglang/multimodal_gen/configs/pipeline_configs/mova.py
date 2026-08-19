@@ -58,8 +58,9 @@ class MOVAPipelineConfig(PipelineConfig):
 
     def get_model_deployment_config(self) -> ModelDeploymentConfig:
         return ModelDeploymentConfig(
-            auto_dit_layerwise_offload=True,
-            auto_dit_layerwise_offload_high_memory_disable_gb=130,
+            dit_layerwise_offload_modes=("auto", "memory"),
+            keep_resident_min_available_gb=130,
+            keep_resident_components=("dit", "vae"),
         )
 
     def _center_crop_and_resize(

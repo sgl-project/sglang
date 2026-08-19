@@ -10,7 +10,7 @@ from typing import Any, Callable, List, Optional
 import torch
 from torch.library import Library
 
-from sglang.kernel_api_logging import debug_torch_op
+from sglang.kernels.kernel_api_logging import debug_torch_op
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 

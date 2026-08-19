@@ -6,6 +6,8 @@ import os
 import shutil
 import tempfile
 import time
+from collections.abc import Coroutine
+from contextlib import suppress
 from typing import Any, Dict, Optional
 
 from fastapi import (
@@ -21,6 +23,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
+    DataType,
     SamplingParams,
     generate_request_id,
 )
@@ -61,6 +64,29 @@ _VIDEO_EXTENSIONS = {
     ".mpg",
     ".webm",
 }
+_VIDEO_JOB_TASKS: dict[str, asyncio.Task[None]] = {}
+
+
+def _discard_video_job_task(job_id: str, task: asyncio.Task[None]) -> None:
+    if _VIDEO_JOB_TASKS.get(job_id) is task:
+        del _VIDEO_JOB_TASKS[job_id]
+
+
+def _start_video_job(job_id: str, job: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+    task = asyncio.create_task(job, name=f"video-job-{job_id}")
+    _VIDEO_JOB_TASKS[job_id] = task
+    task.add_done_callback(lambda completed: _discard_video_job_task(job_id, completed))
+    return task
+
+
+async def shutdown_video_jobs() -> None:
+    tasks = list(_VIDEO_JOB_TASKS.values())
+    _VIDEO_JOB_TASKS.clear()
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 def _extra_value(request: VideoGenerationsRequest, name: str) -> Any:
@@ -104,6 +130,7 @@ _MULTIPART_EXTRA_FORM_FIELDS = (
     "action_normalization",
     "condition_frame_indexes_vision",
     "condition_video_keep",
+    "quality",
 )
 
 
@@ -363,6 +390,12 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "use_system_prompt": _extra_value(request, "use_system_prompt"),
         "use_guardrails": _extra_value(request, "use_guardrails"),
         "enable_teacache": request.enable_teacache,
+        "enable_cache_dit": _extra_value(request, "enable_cache_dit"),
+        "cache_dit_params": _extra_value(request, "cache_dit_params"),
+        "cfg_gate_step": _extra_value(request, "cfg_gate_step"),
+        "attention_backend_override": _extra_value(
+            request, "attention_backend_override"
+        ),
         "enable_frame_interpolation": request.enable_frame_interpolation,
         "frame_interpolation_exp": request.frame_interpolation_exp,
         "frame_interpolation_scale": request.frame_interpolation_scale,
@@ -371,6 +404,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "upscaling_model_path": request.upscaling_model_path,
         "upscaling_scale": request.upscaling_scale,
         "output_path": request.output_path,
+        "quality": _extra_value(request, "quality"),
         "output_compression": request.output_compression,
         "output_quality": request.output_quality,
         "perf_dump_path": request.perf_dump_path,
@@ -383,19 +417,31 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
 
     sampling_params_cls = _video_sampling_params_cls(server_args)
     kwargs = sampling_params_cls.lower_video_request_kwargs(request, kwargs)
-    return build_sampling_params(request_id, **kwargs)
+    sampling_params = build_sampling_params(request_id, **kwargs)
+    if (
+        isinstance(sampling_params, SamplingParams)
+        and sampling_params.data_type == DataType.ACTION
+    ):
+        raise ValueError(
+            "Action-producing policy and inverse-dynamics requests use "
+            "/v1/actions/generations; /v1/videos is reserved for visual outputs"
+        )
+    return sampling_params
 
 
 # extract metadata which http_server needs to know
 def _video_job_from_sampling(
-    request_id: str, req: VideoGenerationsRequest, sampling: SamplingParams
+    request_id: str,
+    req: VideoGenerationsRequest,
+    sampling: SamplingParams,
+    served_model_name: str,
 ) -> Dict[str, Any]:
     size_str = f"{sampling.width}x{sampling.height}"
     seconds = int(round((sampling.num_frames or 0) / float(sampling.fps or 24)))
     return {
         "id": request_id,
         "object": "video",
-        "model": req.model or "sora-2",
+        "model": req.model or served_model_name,
         "status": "queued",
         "progress": 0,
         "created_at": int(time.time()),
@@ -489,7 +535,7 @@ async def _dispatch_job_async(
         update_fields.update(final_media_fields)
         await VIDEO_STORE.update_fields(job_id, update_fields)
     except Exception as e:
-        logger.error(f"{e}")
+        logger.exception("Video job %s failed", job_id)
         await VIDEO_STORE.update_fields(
             job_id,
             {
@@ -643,6 +689,15 @@ async def create_video(
             selected = value if value is not None else extra_from_form.get(name)
             return _parse_form_extra_value(selected)
 
+        def form_text_value(name: str, value: Any) -> Any:
+            """Resolve a text field without JSON-decoding it.
+
+            Some models take a serialized JSON object as the prompt text, which
+            ``_parse_form_extra_value`` would turn back into a dict and fail
+            request validation.
+            """
+            return value if value is not None else extra_from_form.get(name)
+
         request_field_names = set(VideoGenerationsRequest.model_fields)
         extra_request_fields = {
             key: value
@@ -668,7 +723,7 @@ async def create_video(
             num_frames=num_frames_val,
             seed=form_value("seed", seed),
             generator_device=form_value("generator_device", generator_device),
-            negative_prompt=form_value("negative_prompt", negative_prompt),
+            negative_prompt=form_text_value("negative_prompt", negative_prompt),
             num_inference_steps=form_value("num_inference_steps", num_inference_steps),
             guidance_scale=form_value("guidance_scale", guidance_scale),
             guidance_scale_2=form_value("guidance_scale_2", guidance_scale_2),
@@ -804,7 +859,12 @@ async def create_video(
         scheduler_batches = sampling_params.expand_video_request_outputs_for_queue(
             batch
         )
-        job = _video_job_from_sampling(request_id, req, sampling_params)
+        job = _video_job_from_sampling(
+            request_id,
+            req,
+            sampling_params,
+            server_args.served_model_name,
+        )
         job.update(sampling_params.project_video_queued_job_fields(batch))
         await VIDEO_STORE.upsert(request_id, job)
     except Exception as e:
@@ -824,14 +884,15 @@ async def create_video(
 
     assert batch is not None
     # Enqueue the job asynchronously and return immediately
-    asyncio.create_task(
+    _start_video_job(
+        request_id,
         _dispatch_job_async(
             request_id,
             batch,
             scheduler_batches=scheduler_batches,
             temp_dirs=temp_dirs or None,
             output_persistent=output_persistent,
-        )
+        ),
     )
     return VideoResponse(**job)
 
@@ -842,25 +903,8 @@ async def list_videos(
     limit: Optional[int] = Query(None, ge=1, le=100),
     order: Optional[str] = Query("desc"),
 ):
-    # Normalize order
-    order = (order or "desc").lower()
-    if order not in ("asc", "desc"):
-        order = "desc"
-    jobs = await VIDEO_STORE.list_values()
-
-    reverse = order != "asc"
-    jobs.sort(key=lambda j: j.get("created_at", 0), reverse=reverse)
-
-    if after is not None:
-        try:
-            idx = next(i for i, j in enumerate(jobs) if j["id"] == after)
-            jobs = jobs[idx + 1 :]
-        except StopIteration:
-            jobs = []
-
-    if limit is not None:
-        jobs = jobs[:limit]
-    items = [VideoResponse(**j) for j in jobs]
+    jobs = await VIDEO_STORE.list_page(after=after, limit=limit, order=order)
+    items = [VideoResponse(**job) for job in jobs]
     return VideoListResponse(data=items)
 
 

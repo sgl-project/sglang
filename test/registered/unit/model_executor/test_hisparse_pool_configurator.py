@@ -5,7 +5,7 @@ from unittest.mock import MagicMock
 import torch
 
 from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -20,31 +20,41 @@ class TestHiSparsePoolConfigurator(CustomTestCase):
         enable_hisparse: bool,
         host_to_device_ratio: int = 1,
     ) -> int:
+        num_layers = 2
         hf_config = SimpleNamespace(
             architectures=["GlmMoeDsaForCausalLM"],
             index_topk=2048,
             index_head_dim=128,
         )
         hf_config.get_text_config = lambda: hf_config
+
+        override = get_context().override_server_args(
+            enable_hisparse=enable_hisparse,
+            hisparse_config=f'{{"host_to_device_ratio": {host_to_device_ratio}}}',
+            enable_hierarchical_cache=False,
+            disaggregation_mode="null",
+            dsa_prefill_backend="flashmla_sparse",
+            dsa_decode_backend="flashmla_sparse",
+        )
+        server_args = override.install()
+        self.addCleanup(override.restore)
+
         kvc = MagicMock(
             use_mla_backend=True,
             kv_cache_dtype=kv_cache_dtype,
+            is_draft_worker=False,
             model_config=SimpleNamespace(
                 kv_lora_rank=512,
                 qk_rope_head_dim=64,
                 hf_config=hf_config,
             ),
-            server_args=SimpleNamespace(
-                enable_hisparse=enable_hisparse,
-                hisparse_config=(f'{{"host_to_device_ratio": {host_to_device_ratio}}}'),
-                dsa_prefill_backend="flashmla_sparse",
-                dsa_decode_backend="flashmla_sparse",
-            ),
+            layer_info=SimpleNamespace(start_layer=0, end_layer=num_layers),
+            server_args=server_args,
         )
 
         with get_parallel().override(attn_tp_size=1):
             configurator = object.__new__(DefaultPoolConfigurator)
-            return configurator._compute_cell_size(kvc, num_layers=2)
+            return configurator._compute_cell_size(kvc, num_layers=num_layers)
 
     def test_mla_layout_without_hisparse(self):
         for kv_cache_dtype, expected_cell_size in (

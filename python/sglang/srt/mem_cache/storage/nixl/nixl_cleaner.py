@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.storage.nixl.nixl_routing import BUCKET_HEX_CHARS
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,12 @@ _DEFAULT_HIGH_WATERMARK = 80.0
 _DEFAULT_LOW_WATERMARK = 70.0
 _RANK_SUFFIX_RE = re.compile(r"_(\d+)_(\d+)$")
 _KV_SUFFIXES = ("_k", "_v")
+_POOL_NAME_PATTERN = "|".join(
+    sorted((re.escape(pool.value) for pool in PoolName), key=len, reverse=True)
+)
+_HYBRID_COMPONENT_SUFFIX_RE = re.compile(
+    rf"_(?:{_POOL_NAME_PATTERN})(?:_(?:temporal|conv_\d+|[kv]|\d+))?$"
+)
 _BUCKET_NAME_RE = re.compile(rf"^[0-9a-f]{{{BUCKET_HEX_CHARS}}}$")
 
 
@@ -40,10 +47,12 @@ class _GroupInfo:
 def _parse_group_key(name: str) -> str:
     """Return the logical cache-key group for one NIXL FILE object name.
 
-    The physical names are produced by ``HiCacheNixl._get_suffixed_key`` and
-    ``HiCacheNixl._get_key_list_from_meta``.
+    The physical names are produced by ``HiCacheNixl._get_suffixed_key``,
+    ``HiCacheNixl._get_key_list_from_meta``, and
+    ``HiCacheNixl._get_hybrid_component_keys``.
     """
     stem = name
+    stem = _HYBRID_COMPONENT_SUFFIX_RE.sub("", stem)
     for suffix in _KV_SUFFIXES:
         if stem.endswith(suffix):
             stem = stem[: -len(suffix)]

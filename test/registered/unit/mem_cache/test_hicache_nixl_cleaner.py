@@ -40,20 +40,7 @@ class TestHiCacheL3Cleaner(CustomTestCase):
         os.utime(path, (mtime, mtime))
         return path
 
-    def test_parse_group_key_strips_rank_and_kv_suffix(self):
-        """Keys for TP ranks and zero-copy K/V files share one cleanup group."""
-        self.assertEqual(_parse_group_key("page-a_model_0_8"), "page-a_model")
-        self.assertEqual(_parse_group_key("page-a_model_7_8_k"), "page-a_model")
-        self.assertEqual(_parse_group_key("page-a_model_7_8_v"), "page-a_model")
-        self.assertEqual(_parse_group_key("page-a_model_k"), "page-a_model")
-
-    def test_tick_deletes_oldest_group_across_bucketed_dirs(self):
-        """A cleaner batch deletes all files in the oldest logical key group."""
-        old_keys = ["page-old_model_0_2", "page-old_model_1_2"]
-        new_keys = ["page-new_model_0_2", "page-new_model_1_2"]
-        old_paths = [self._write_key(key, mtime=100.0) for key in old_keys]
-        new_paths = [self._write_key(key, mtime=200.0) for key in new_keys]
-
+    def _run_single_group_cleanup(self) -> None:
         cleaner = HiCacheL3Cleaner(
             self.base_dirs,
             tp_rank=0,
@@ -62,7 +49,6 @@ class TestHiCacheL3Cleaner(CustomTestCase):
             recheck_groups=1,
             unlink_workers=1,
         )
-
         usage_calls: dict[str, int] = {}
 
         def fake_usage(path: str) -> float:
@@ -70,8 +56,70 @@ class TestHiCacheL3Cleaner(CustomTestCase):
             return 90.0 if usage_calls[path] == 1 else 60.0
 
         cleaner._disk_usage_pct = fake_usage
-
         self.assertTrue(cleaner._tick())
+
+    def test_parse_group_key_strips_rank_and_kv_suffix(self):
+        """Keys for TP ranks and zero-copy K/V files share one cleanup group."""
+        self.assertEqual(_parse_group_key("page-a_model_0_8"), "page-a_model")
+        self.assertEqual(_parse_group_key("page-a_model_7_8_k"), "page-a_model")
+        self.assertEqual(_parse_group_key("page-a_model_7_8_v"), "page-a_model")
+        self.assertEqual(_parse_group_key("page-a_model_k"), "page-a_model")
+
+    def test_parse_group_key_strips_hybrid_component_suffix(self):
+        """All hybrid component shapes share the logical page's cleanup group."""
+        names = [
+            "page-a_model_7_8_kv_k",
+            "page-a_model_7_8_swa_k",
+            "page-a_model_7_8_swa_v",
+            "page-a_model_7_8_mamba_temporal",
+            "page-a_model_7_8_mamba_conv_0",
+            "page-a_model_7_8_indexer_2",
+            "page-a_model_7_8_draft_swa",
+            "page-a_model_deepseek_v4_c4_indexer_state_2",
+        ]
+
+        for name in names:
+            with self.subTest(name=name):
+                self.assertEqual(_parse_group_key(name), "page-a_model")
+
+    def test_tick_deletes_oldest_group_across_bucketed_dirs(self):
+        """A cleaner batch deletes all files in the oldest logical key group."""
+        old_keys = ["page-old_model_0_2", "page-old_model_1_2"]
+        new_keys = ["page-new_model_0_2", "page-new_model_1_2"]
+        old_paths = [self._write_key(key, mtime=100.0) for key in old_keys]
+        new_paths = [self._write_key(key, mtime=200.0) for key in new_keys]
+
+        self._run_single_group_cleanup()
+        self.assertFalse(any(os.path.exists(path) for path in old_paths))
+        self.assertTrue(all(os.path.exists(path) for path in new_paths))
+
+    def test_tick_deletes_hybrid_components_atomically(self):
+        """Evict every pool component and TP rank for one logical page."""
+        physical_suffixes = [
+            "",
+            "_k",
+            "_v",
+            "_kv_k",
+            "_kv_v",
+            "_swa_k",
+            "_swa_v",
+            "_mamba_temporal",
+            "_mamba_conv_0",
+        ]
+        old_keys = [
+            f"page-old_model_{rank}_2{suffix}"
+            for rank in range(2)
+            for suffix in physical_suffixes
+        ]
+        new_keys = [
+            f"page-new_model_{rank}_2{suffix}"
+            for rank in range(2)
+            for suffix in physical_suffixes
+        ]
+        old_paths = [self._write_key(key, mtime=100.0) for key in old_keys]
+        new_paths = [self._write_key(key, mtime=200.0) for key in new_keys]
+
+        self._run_single_group_cleanup()
         self.assertFalse(any(os.path.exists(path) for path in old_paths))
         self.assertTrue(all(os.path.exists(path) for path in new_paths))
 

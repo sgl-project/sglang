@@ -69,7 +69,7 @@ def should_return_warmup_result(req_or_group: Any) -> bool:
 
 
 def should_run_server_warmup(server_args: ServerArgs) -> bool:
-    return server_args.warmup and server_args.server_warmup
+    return server_args.warmup_mode == "server"
 
 
 def is_realtime_serving(server_args: ServerArgs) -> bool:
@@ -95,7 +95,7 @@ def should_run_synthetic_server_warmup(server_args: ServerArgs) -> bool:
 
 def should_run_explicit_client_warmup(server_args: ServerArgs) -> bool:
     return (
-        server_args.warmup
+        server_args.warmup_mode != "off"
         and server_args.warmup_resolutions is not None
         and supports_synthetic_warmup(server_args)
     )
@@ -253,15 +253,16 @@ class SchedulerWarmupMixin:
                 refresh=False,
             )
         self._warmup_progress_bar.update(1)
+        progress_n = self._warmup_processed
         if _is_ci_log_env():
             logger.info(
                 "Warmup requests: %s/%s %s",
-                self._warmup_progress_bar.n,
+                progress_n,
                 self._warmup_progress_bar.total,
                 self._format_warmup_req(req_or_group),
             )
 
-        if self._warmup_progress_bar.n >= self._warmup_progress_bar.total:
+        if progress_n >= self._warmup_progress_bar.total:
             self._warmup_progress_bar.close()
             self._warmup_progress_bar = None
 
@@ -298,10 +299,9 @@ class SchedulerWarmupMixin:
     ) -> list[tuple[bytes, Any]]:
         if (
             self.req_based_warmup_scheduled
-            or not self.server_args.warmup
+            or self.server_args.warmup_mode != "request"
             or not recv_reqs
             or self.server_args.warmup_resolutions is not None
-            or self.server_args.server_warmup
         ):
             return recv_reqs
 

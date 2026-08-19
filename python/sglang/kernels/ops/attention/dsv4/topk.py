@@ -16,15 +16,18 @@ from .utils import make_name
 
 
 @cache_once
-def _jit_topk_v1_module(topk: int):
+def _jit_topk_v1_module():
+    # topk (<= 1024) is a runtime argument, not a compile-time constant, so a
+    # single module serves every k. Baking it in via -DSGL_TOPK used to build one
+    # module per k, and since the macro fed a `constexpr` rather than a template
+    # parameter every module exported identically mangled symbols -- see the
+    # comment in topk_v1.cuh for how that broke the second module's launch.
     args = make_cpp_args(is_arch_support_pdl())
-    assert topk in (512, 1024), "Only support topk=512 or 1024"
     return load_jit(
-        make_name(f"topk_v1_{topk}"),
+        make_name("topk_v1"),
         *args,
         cuda_files=["deepseek_v4/topk_v1.cuh"],
         cuda_wrappers=[("topk_transform", f"TopKKernel<{args}>::transform")],
-        extra_cuda_cflags=[f"-DSGL_TOPK={topk}"],
     )
 
 
@@ -55,7 +58,7 @@ def topk_transform_512(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )
     else:
-        module = _jit_topk_v1_module(out_page_indices.shape[1])
+        module = _jit_topk_v1_module()
         module.topk_transform(
             scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
         )

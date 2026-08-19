@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import functools
 import hashlib
 import logging
 from pathlib import Path
@@ -23,6 +24,13 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_model,
+    get_spec,
+)
+from sglang.srt.utils import empty_context, log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -30,12 +38,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# TODO: Remove after FlashInfer fixes the mxfp8_gemm autotuning IMA.
-FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset({"mxfp8_gemm"})
+FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset()
 
 
 def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
-    skip_ops = set(model_runner.server_args.flashinfer_autotune_skip_ops or ())
+    skip_ops = set(get_exec().kernel.flashinfer_autotune_skip_ops or ())
     skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
     return skip_ops
 
@@ -47,24 +54,29 @@ def should_run_flashinfer_autotune(
     mr = model_runner
     if mr.device != "cuda":
         return False
-    if mr.server_args.disable_flashinfer_autotune:
+    if get_exec().kernel.disable_flashinfer_autotune:
+        return False
+    if get_exec().deterministic.enable_deterministic_inference:
+        # Tuned configs are per problem shape, so the reduction order would follow
+        # the batch shape.
         return False
 
-    server_args = mr.server_args
     if for_speculative_draft:
         backend_str = (
-            server_args.speculative_moe_runner_backend or server_args.moe_runner_backend
+            get_spec().speculative_moe_runner_backend
+            or get_exec().moe.moe_runner_backend
         )
         a2a_backend_str = (
-            server_args.speculative_moe_a2a_backend or server_args.moe_a2a_backend
+            get_spec().speculative_moe_a2a_backend or get_exec().moe.moe_a2a_backend
         )
     else:
-        backend_str = server_args.moe_runner_backend
-        a2a_backend_str = server_args.moe_a2a_backend
+        backend_str = get_exec().moe.moe_runner_backend
+        a2a_backend_str = get_exec().moe.moe_a2a_backend
 
     # Autotune can run before the MoE backend globals are initialized, so read
-    # the target or draft backend from server_args. CuteDSL v1 bypasses
-    # MoeRunner, and its dummy dispatch can exceed DeepEP low-latency's token limit.
+    # the configured backends -- the draft leaves (`get_spec()`) or the target
+    # leaves (`get_exec().moe`) above. CuteDSL v1 bypasses MoeRunner, and its
+    # dummy dispatch can exceed DeepEP low-latency's token limit.
     if backend_str == "flashinfer_cutedsl" and a2a_backend_str == "deepep":
         return False
 
@@ -93,18 +105,16 @@ def should_run_flashinfer_autotune(
     )
 
     from sglang.srt.layers.quantization.fp8_utils import (
-        get_fp8_gemm_runner_backend,
+        flashinfer_per_tensor_fp8_supported,
+        resolve_mxfp8_dense_gemm_backend,
     )
-    from sglang.srt.utils import is_sm100_supported
 
-    model_uses_modelopt_fp8 = model_quantization in (
-        "modelopt",
-        "modelopt_fp8",
-        "modelopt_mixed",
-    )
-    fp8_gemm_needs_autotune = get_fp8_gemm_runner_backend().is_flashinfer_cutlass() or (
-        model_uses_modelopt_fp8 and is_sm100_supported()
-    )
+    if model_quantization == "mxfp8":
+        fp8_gemm_needs_autotune = resolve_mxfp8_dense_gemm_backend().is_flashinfer()
+    elif model_quantization in ("modelopt", "modelopt_fp8", "modelopt_mixed"):
+        fp8_gemm_needs_autotune = flashinfer_per_tensor_fp8_supported()
+    else:
+        fp8_gemm_needs_autotune = False
 
     if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
         return False
@@ -126,12 +136,11 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     arch = f"sm{major}{minor}"
     flashinfer_version = getattr(flashinfer, "__version__", "unknown")
 
-    server_args = mr.server_args
     model_key_parts = [
-        str(server_args.model_path),
+        str(get_model().model_path),
         str(mr.dtype),
-        str(server_args.quantization),
-        str(server_args.moe_runner_backend),
+        str(get_model().quantization),
+        str(get_exec().moe.moe_runner_backend),
         str(mr.ps.tp_size),
         str(mr.ps.pp_size),
         str(mr.ps.attn_dp_size),
@@ -161,7 +170,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
 
 
 @contextlib.contextmanager
-def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool):
+def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
     from flashinfer.autotuner import autotune
 
     mr = model_runner
@@ -184,27 +193,24 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, skip_logits: bool)
     # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
     mr.forward_stream.wait_stream(torch.cuda.current_stream())
     with torch.get_device_module(mr.device).stream(mr.forward_stream):
-        maybe_skip_logits = contextlib.nullcontext()
-        if skip_logits:
-            from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+        from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
-            maybe_skip_logits = autotune_dummy_run_mode()
         skip_ops = get_flashinfer_autotune_skip_ops(mr)
-        with torch.inference_mode(), autotune(
+        with autotune(
             True,
             cache=str(autotune_cache),
             skip_ops=skip_ops,
-        ), maybe_skip_logits:
+        ), autotune_dummy_run_mode(run_lm_head=run_lm_head):
             yield
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")
 
 
 def run_flashinfer_autotune_forward(
-    model_runner: ModelRunner, forward_fn: Callable[[], None], *, skip_logits: bool
+    model_runner: ModelRunner, forward_fn: Callable[[], None], *, run_lm_head: bool
 ) -> None:
     """Run flashinfer autotune forward."""
-    with flashinfer_autotune_context(model_runner, skip_logits=skip_logits):
+    with flashinfer_autotune_context(model_runner, run_lm_head=run_lm_head):
         forward_fn()
 
 
@@ -213,7 +219,7 @@ def maybe_flashinfer_autotune_speculative_draft(
     forward_fn: Callable[[], None],
     *,
     post_warmup_hook: Optional[Callable[[], None]] = None,
-    skip_logits: bool = False,
+    run_lm_head: bool = True,
 ) -> None:
     """Run speculative draft flashinfer autotune."""
     mr = runner.model_runner
@@ -236,5 +242,87 @@ def maybe_flashinfer_autotune_speculative_draft(
         if post_warmup_hook is not None:
             post_warmup_hook()
 
-    run_flashinfer_autotune_forward(mr, run_and_reset, skip_logits=skip_logits)
+    run_flashinfer_autotune_forward(mr, run_and_reset, run_lm_head=run_lm_head)
     tuned_phases.add(phase_key)
+
+
+def maybe_flashinfer_autotune_extend(
+    runner: BaseRunner, *, decode_num_tokens: int
+) -> None:
+    """Also autotune one EXTEND-shaped dummy forward.
+
+    The decode-shaped autotune only covers token counts up to the decode
+    batch size, so larger prefill/extend batches fall outside the tuned
+    buckets and run flashinfer's default heuristic — which can be far
+    slower than the tuned tactic (e.g. trtllm-gen fp4 MoE is ~30% slower
+    untuned at >=8k tokens on sm100). One extra forward at the largest
+    per-rank extend token count tunes all buckets up to it.
+    """
+    if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
+        return
+    mr = runner.model_runner
+    # max_prefill_tokens is a per-scheduler (per dp-rank) budget, and warmup
+    # runs on all dp ranks at once, so the gathered dummy already reaches the
+    # worst-case serving gather. Do not divide by dp_size.
+    num_tokens = mr.server_args.max_prefill_tokens
+    if num_tokens <= (decode_num_tokens or 0):
+        return  # decode-shaped autotune already covered these buckets
+    if not mr.is_generation or mr.spec_algorithm.is_speculative():
+        # _dummy_run forces TARGET_VERIFY shapes for speculative runners;
+        # extend-bucket autotune for spec configs is a follow-up.
+        return
+    if mr.model_config.is_multimodal:
+        # The dummy runs mm_inputs=None, which multimodal prefill paths iterate.
+        return
+
+    if mr.attn_backend.extend_dummy_seqs_capped_by_req_pool:
+        pool_size = mr.req_to_token_pool.size
+        num_tokens_per_req = (num_tokens + pool_size - 1) // pool_size
+    else:
+        # Packed dummies tune measurably worse tactics for the same token
+        # bucket, so pack only where the backend would otherwise crash. None
+        # (not 1) keeps the backend's own seq_len_fill_value in _dummy_run.
+        num_tokens_per_req = None
+    per_req = num_tokens_per_req or 1
+    batch_size = (num_tokens + per_req - 1) // per_req
+    num_tokens = batch_size * per_req
+
+    buffers = runner._alloc_dummy_decode_buffers(
+        batch_size,
+        num_tokens_per_req=per_req,
+        allocate_logits_buffer=False,
+    )
+    canary_run_ctx = (
+        c.with_active_single_forward_manager(0)
+        if (c := mr.canary_manager) is not None
+        else empty_context()
+    )
+
+    forward_fn = functools.partial(
+        runner._dummy_run,
+        batch_size=batch_size,
+        buffers=buffers,
+        run_ctx=canary_run_ctx,
+        forward_mode_override=ForwardMode.EXTEND,
+        extend_num_tokens_per_req=num_tokens_per_req,
+    )
+
+    log_info_on_rank0(
+        logger,
+        f"FlashInfer autotune: extra EXTEND pass at {num_tokens} tokens "
+        f"({batch_size} seqs x {per_req} tokens).",
+    )
+    try:
+        run_flashinfer_autotune_forward(mr, forward_fn, run_lm_head=False)
+    except torch.OutOfMemoryError:
+        # The pass is an optimization; without headroom for the extend-shaped
+        # forward, fall back to untuned extend buckets instead of failing.
+        log_info_on_rank0(
+            logger,
+            "FlashInfer extend autotune skipped: not enough free memory "
+            f"for a {num_tokens}-token dummy forward.",
+        )
+    finally:
+        # release dummy buffers before capture measures free memory
+        del forward_fn, buffers
+        torch.cuda.empty_cache()

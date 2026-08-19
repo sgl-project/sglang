@@ -174,7 +174,7 @@ jobs:
 
   run-pr-tests-amd:
     needs: cut-release-branch
-    uses: ./.github/workflows/pr-test-amd.yml
+    uses: ./.github/workflows/pr-test-amd-rocm720.yml
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
       run_all_tests: true
@@ -213,7 +213,7 @@ jobs:
 
   run-nightly-tests-amd:
     needs: cut-release-branch
-    uses: ./.github/workflows/nightly-test-amd.yml
+    uses: ./.github/workflows/nightly-test-amd-rocm720.yml
     with:
       ref: ${{ needs.cut-release-branch.outputs.branch_name }}
     secrets: inherit

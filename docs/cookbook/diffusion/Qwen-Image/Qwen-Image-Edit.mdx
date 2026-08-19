@@ -220,17 +220,16 @@ sglang serve --model-path Qwen/Qwen-Image-Edit-2511 --port 30000
 
 ```shell Command
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-image --dataset vbench --task ti2i --num-prompts 1 --max-concurrency 1
+    --dataset vbench --task image-to-image --num-prompts 1 --max-concurrency 1
 ```
 
 **Result**:
 
 ```text Output
 ================= Serving Benchmark Result =================
-Backend:                                 sglang-image
 Model:                                   Qwen/Qwen-Image-Edit-2511
 Dataset:                                 vbench
-Task:                                    ti2i
+Task:                                    image-to-image
 --------------------------------------------------
 Benchmark duration (s):                  35.31
 Request rate:                            inf
@@ -254,17 +253,16 @@ Peak Memory Median (MB):                 47959.35
 
 ```shell Command
 python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
-    --backend sglang-image --dataset vbench --task ti2i --num-prompts 20 --max-concurrency 20
+    --dataset vbench --task image-to-image --num-prompts 20 --max-concurrency 20
 ```
 
 **Result**:
 
 ```text Output
 ================= Serving Benchmark Result =================
-Backend:                                 sglang-image
 Model:                                   Qwen/Qwen-Image-Edit-2511
 Dataset:                                 vbench
-Task:                                    ti2i
+Task:                                    image-to-image
 --------------------------------------------------
 Benchmark duration (s):                  286.11
 Request rate:                            inf

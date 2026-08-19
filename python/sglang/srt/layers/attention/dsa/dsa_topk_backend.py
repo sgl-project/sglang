@@ -158,27 +158,7 @@ class DSATopKBackend(Enum):
             import flashinfer
 
             if topk_transform_method == TopkTransformMethod.PAGED:
-                if row_starts is not None:
-                    # Packed PAGED extend uses batch-global score offsets with
-                    # request-local page tables. FlashInfer applies row_starts
-                    # to both, so reuse the SGL transform.
-                    from sgl_kernel import fast_topk_transform_fused
-
-                    page_table_size_1 = (
-                        attn_metadata.page_table_1[batch_idx_list]
-                        if batch_idx_list is not None
-                        else attn_metadata.page_table_1
-                    )
-                    return fast_topk_transform_fused(
-                        score=logits,
-                        lengths=lengths,
-                        page_table_size_1=page_table_size_1,
-                        cu_seqlens_q=cu_seqlens_q_topk,
-                        topk=topk,
-                        row_starts=row_starts,
-                    )
-
-                row_to_batch, local_row_starts = _build_flashinfer_paged_args(
+                row_to_batch, page_table_row_starts = _build_flashinfer_paged_args(
                     attn_metadata=attn_metadata,
                     row_starts=row_starts,
                     cu_seqlens_q_topk=cu_seqlens_q_topk,
@@ -195,7 +175,8 @@ class DSATopKBackend(Enum):
                     deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
                     tie_break=_flashinfer_tie_break_value(),
                     dsa_graph_safe=True,
-                    row_starts=local_row_starts,
+                    row_starts=row_starts,
+                    page_table_row_starts=page_table_row_starts,
                 )
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 if topk_indices_offset is None:
@@ -373,13 +354,13 @@ def _build_flashinfer_paged_args(
             "PAGED topk_transform with row_starts requires cu_seqlens_q metadata."
         )
 
-    local_row_starts = row_starts
-    if local_row_starts is not None and row_to_batch is not None:
-        local_row_starts = (
-            local_row_starts - attn_metadata.cu_seqlens_k[:-1][row_to_batch]
+    page_table_row_starts = row_starts
+    if page_table_row_starts is not None and row_to_batch is not None:
+        page_table_row_starts = (
+            page_table_row_starts - attn_metadata.cu_seqlens_k[:-1][row_to_batch]
         )
 
-    return row_to_batch, local_row_starts
+    return row_to_batch, page_table_row_starts
 
 
 def _flashinfer_tie_break_value() -> int:

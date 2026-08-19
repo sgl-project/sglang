@@ -20,6 +20,21 @@ from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 class PaddleOCRVLImageProcessor(QwenVLImageProcessor):
     models = [PaddleOCRVLForConditionalGeneration]
 
+    # A document page is a far heavier preprocessing unit than a chat image:
+    # resize + normalize + patchify of a full-resolution scan costs tens of
+    # milliseconds, so a single worker caps request throughput at
+    # 1 / preprocess_time regardless of how much GPU is left idle. Overlap it
+    # across workers; the work itself is unchanged.
+    #
+    # Two, not more: measured on an H200 at 32-way concurrency, two workers beat
+    # both one and four on every shape tried (1080p pages 6.72 -> 9.55 req/s at
+    # two, 8.92 at four; 360p pages with 512-token outputs 22.38 -> 25.20 at
+    # two, 25.06 at four). Past two, spreading request arrivals fragments the
+    # GPU prefill batches faster than the extra overlap pays for itself.
+    auto_mm_processor_worker_num = 2
+    auto_mm_io_worker_num = 16
+    supports_mm_processor_concurrency = True
+
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 

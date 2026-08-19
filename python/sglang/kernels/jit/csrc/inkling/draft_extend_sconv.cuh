@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 
-namespace {
+namespace sglang {
 
 struct DraftExtendParams {
   const void* __restrict__ hidden;         // [B*T, D], channel-contiguous
@@ -144,4 +144,4 @@ struct DraftExtendSconvKernel {
   }
 };
 
-}  // namespace
+}  // namespace sglang

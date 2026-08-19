@@ -570,25 +570,55 @@ class TestDSAIndexer(CustomTestCase):
         query_lens: Optional[List[int]] = None,
     ):
         num_rows = sum(query_lens) if query_lens is not None else batch_size
+        # Shifted PAGED rows use global score offsets and request-local page tables.
+        # Give each packed row more than topk entries to exercise actual selection.
+        if with_row_starts and topk_transform_method == TopkTransformMethod.PAGED:
+            max_score_len = max(max_score_len, batch_size * (topk + 1))
         logits = self._make_tie_free_logits(num_rows, max_score_len)
 
         if with_row_starts:
-            row_starts = torch.randint(
-                0,
-                max_score_len - 1,
-                (num_rows,),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            max_lengths = max_score_len - row_starts
-            random_lengths = torch.randint(
-                1,
-                max_score_len,
-                (num_rows,),
-                dtype=torch.int32,
-                device=self.device,
-            )
-            seq_lens_expanded = torch.minimum(max_lengths, random_lengths)
+            if topk_transform_method == TopkTransformMethod.PAGED:
+                packed_row_size = max_score_len // batch_size
+                self.assertGreaterEqual(packed_row_size, topk)
+                cu_seqlens_k = (
+                    torch.arange(batch_size + 1, dtype=torch.int32, device=self.device)
+                    * packed_row_size
+                )
+                if query_lens is None:
+                    row_to_batch = torch.arange(
+                        batch_size, dtype=torch.int32, device=self.device
+                    )
+                else:
+                    row_to_batch = torch.repeat_interleave(
+                        torch.arange(batch_size, dtype=torch.int32, device=self.device),
+                        torch.tensor(query_lens, dtype=torch.int32, device=self.device),
+                        output_size=num_rows,
+                    )
+                row_starts = cu_seqlens_k[:-1][row_to_batch]
+                seq_lens_expanded = torch.randint(
+                    topk + 1,
+                    packed_row_size + 1,
+                    (num_rows,),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            else:
+                row_starts = torch.randint(
+                    0,
+                    max_score_len - 1,
+                    (num_rows,),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                max_lengths = max_score_len - row_starts
+                random_lengths = torch.randint(
+                    1,
+                    max_score_len,
+                    (num_rows,),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                seq_lens_expanded = torch.minimum(max_lengths, random_lengths)
         else:
             row_starts = None
             seq_lens_expanded = torch.randint(
@@ -616,9 +646,10 @@ class TestDSAIndexer(CustomTestCase):
             )
             cu_seqlens_q[1:] = torch.cumsum(q_lens, dim=0)
             batch_idx_list = list(range(batch_size))
-        cu_seqlens_k = torch.zeros(
-            batch_size + 1, dtype=torch.int32, device=self.device
-        )
+        if not (with_row_starts and topk_transform_method == TopkTransformMethod.PAGED):
+            cu_seqlens_k = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device=self.device
+            )
         dsa_cu_seqlens_k = torch.zeros(
             num_rows + 1, dtype=torch.int32, device=self.device
         )
@@ -677,13 +708,21 @@ class TestDSAIndexer(CustomTestCase):
             topk_backend=DSATopKBackend.FLASHINFER,
         )
 
+        import flashinfer
+
         repeat_interleave = torch.repeat_interleave
+        top_k_page_table_transform = flashinfer.top_k_page_table_transform
         with (
             envs.SGLANG_DSA_FUSE_TOPK.override(True),
             patch(
                 "sglang.srt.layers.attention.dsa_backend.torch.repeat_interleave",
                 wraps=repeat_interleave,
             ) as mock_repeat_interleave,
+            patch.object(
+                flashinfer,
+                "top_k_page_table_transform",
+                wraps=top_k_page_table_transform,
+            ) as mock_top_k_page_table_transform,
         ):
             out_sgl = metadata_sgl.topk_transform(
                 logits,
@@ -699,6 +738,25 @@ class TestDSAIndexer(CustomTestCase):
                 cu_seqlens_q=q_lens,
                 batch_idx_list=batch_idx_list,
             )
+
+        if topk_transform_method == TopkTransformMethod.PAGED:
+            mock_top_k_page_table_transform.assert_called_once()
+            call_kwargs = mock_top_k_page_table_transform.call_args.kwargs
+            if row_starts is None:
+                self.assertIsNone(call_kwargs["row_starts"])
+                self.assertIsNone(call_kwargs["page_table_row_starts"])
+            else:
+                self.assertTrue(torch.equal(call_kwargs["row_starts"], row_starts))
+                self.assertIsNotNone(call_kwargs["row_to_batch"])
+                expected_page_table_row_starts = (
+                    row_starts - cu_seqlens_k[:-1][call_kwargs["row_to_batch"]]
+                )
+                self.assertTrue(
+                    torch.equal(
+                        call_kwargs["page_table_row_starts"],
+                        expected_page_table_row_starts,
+                    )
+                )
 
         if query_lens is not None:
             self.assertTrue(mock_repeat_interleave.call_args_list)

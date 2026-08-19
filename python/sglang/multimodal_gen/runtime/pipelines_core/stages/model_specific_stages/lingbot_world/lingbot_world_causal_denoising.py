@@ -12,6 +12,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.layers.kvcache.qvg_packed_cache import (
+    QVGPackedCausalKVCache,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import (
@@ -19,6 +22,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.causal_denoising import
     CausalDMDDenoisingStage,
     CausalDMDForwardContext,
     CausalDMDRealtimeCacheContext,
+    CausalKVCache,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_world.constants import (
     LINGBOT_C2WS_PLUCKER_EMB_CACHE,
@@ -47,6 +51,63 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     ``[noise(16ch), condition(20ch)]`` concatenated along channel dim.
     Each call processes one chunk (num_frames_per_block frames).
     """
+
+    def _supports_qvg_kv_cache_quantization(self) -> bool:
+        return True
+
+    def _allocate_causal_kv_cache(
+        self,
+        *,
+        batch_size: int,
+        kv_cache_size: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        dtype: torch.dtype,
+        device,
+        use_int_indices: bool = False,
+        sink_tokens: int = 0,
+        global_sink_tokens: int = 0,
+        attention_window_size: int | None = None,
+        allow_growth: bool = False,
+    ) -> list[CausalKVCache]:
+        if not self._kv_quant_args.enabled:
+            return super()._allocate_causal_kv_cache(
+                batch_size=batch_size,
+                kv_cache_size=kv_cache_size,
+                num_attention_heads=num_attention_heads,
+                attention_head_dim=attention_head_dim,
+                dtype=dtype,
+                device=device,
+                use_int_indices=use_int_indices,
+                sink_tokens=sink_tokens,
+                global_sink_tokens=global_sink_tokens,
+                attention_window_size=attention_window_size,
+                allow_growth=allow_growth,
+            )
+        if global_sink_tokens or allow_growth:
+            raise NotImplementedError(
+                "QVG packed KV cache supports only the LingBot realtime "
+                "sliding-window and sink path"
+            )
+        if attention_window_size is None:
+            attention_window_size = kv_cache_size
+        return [
+            QVGPackedCausalKVCache(
+                batch_size=batch_size,
+                cache_size=kv_cache_size,
+                num_heads=num_attention_heads,
+                head_dim=attention_head_dim,
+                dtype=dtype,
+                device=device,
+                use_int_indices=use_int_indices,
+                global_end_index=torch.zeros(1, dtype=torch.long, device=device),
+                local_end_index=torch.zeros(1, dtype=torch.long, device=device),
+                sink_tokens=sink_tokens,
+                attention_window_size=attention_window_size,
+                quant_args=self._kv_quant_args,
+            )
+            for _ in range(self.num_transformer_blocks)
+        ]
 
     def _get_causal_kv_cache_size(
         self,
@@ -141,6 +202,7 @@ class LingBotWorldCausalDMDDenoisingStage(CausalDMDDenoisingStage):
     ) -> None:
         self._reset_causal_cache_config_defaults()
         super()._apply_causal_cache_overrides(batch, server_args)
+        self._kv_quant_args = server_args.kv_cache_quant_config
         self._sync_interactive_kv_cache_window(server_args)
 
     def _reset_causal_cache_config_defaults(self) -> None:

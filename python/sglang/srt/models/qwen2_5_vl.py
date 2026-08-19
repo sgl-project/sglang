@@ -37,10 +37,6 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLVisionConfig,
 )
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-    Qwen2_5_VisionPatchEmbed,
-    Qwen2_5_VisionRotaryEmbedding,
-)
 
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
@@ -50,10 +46,12 @@ from sglang.srt.layers.attention.vision import (
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
+from sglang.srt.layers.conv import Conv3dLayer
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -85,6 +83,52 @@ _is_cpu = is_cpu()
 logger = logging.getLogger(__name__)
 
 
+class Qwen2_5_VisionPatchEmbed(nn.Module):
+    def __init__(
+        self,
+        patch_size: int,
+        temporal_patch_size: int,
+        in_channels: int,
+        embed_dim: int,
+        disable_linear: bool = False,
+    ) -> None:
+        super().__init__()
+        self.patch_size = patch_size
+        self.temporal_patch_size = temporal_patch_size
+        self.in_channels = in_channels
+        self.embed_dim = embed_dim
+        kernel_size = (temporal_patch_size, patch_size, patch_size)
+        self.proj = Conv3dLayer(
+            in_channels,
+            embed_dim,
+            kernel_size=kernel_size,
+            stride=kernel_size,
+            bias=False,
+            disable_linear=disable_linear,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states.view(
+            -1,
+            self.in_channels,
+            self.temporal_patch_size,
+            self.patch_size,
+            self.patch_size,
+        )
+        hidden_states = self.proj(hidden_states.to(self.proj.weight.dtype))
+        return hidden_states.view(-1, self.embed_dim)
+
+
+class Qwen2_5_VisionRotaryEmbedding(nn.Module):
+    def __init__(self, dim: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
+        return (position_ids.unsqueeze(-1) * self.inv_freq).flatten(1)
+
+
 class Qwen2_5_VLMLP(nn.Module):
     def __init__(
         self,
@@ -95,31 +139,73 @@ class Qwen2_5_VLMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        fuse_gate_up: bool = True,
+        tp_size: Optional[int] = None,
+        tp_rank: Optional[int] = None,
     ):
         super().__init__()
-        self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
-        self.tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
-        self.gate_up_proj = MergedColumnParallelLinear(
-            input_size=in_features,
-            output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
-            bias=bias,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-        )
-        self.down_proj = RowParallelLinear(
-            hidden_features,
-            in_features,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-        )
+        if use_data_parallel:
+            if tp_size is not None or tp_rank is not None:
+                raise ValueError(
+                    "Explicit MLP TP cannot be combined with data parallel"
+                )
+            self.tp_size, self.tp_rank = 1, 0
+        else:
+            if (tp_size is None) != (tp_rank is None):
+                raise ValueError("MLP tp_size and tp_rank must be set together")
+            self.tp_size = get_parallel().tp_size if tp_size is None else tp_size
+            self.tp_rank = get_parallel().tp_rank if tp_rank is None else tp_rank
+        self.fuse_gate_up = fuse_gate_up
+        if fuse_gate_up:
+            self.gate_up_proj = MergedColumnParallelLinear(
+                input_size=in_features,
+                output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
+                bias=bias,
+                quant_config=quant_config,
+                prefix=add_prefix("gate_up_proj", prefix),
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+            )
+        else:
+            projection_kwargs = dict(
+                input_size=in_features,
+                output_size=hidden_features,
+                bias=bias,
+                quant_config=quant_config,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+            )
+            self.gate_proj = ColumnParallelLinear(
+                **projection_kwargs,
+                prefix=add_prefix("gate_proj", prefix),
+            )
+            self.up_proj = ColumnParallelLinear(
+                **projection_kwargs,
+                prefix=add_prefix("up_proj", prefix),
+            )
+        if not self.fuse_gate_up and self.tp_size == 1:
+            self.down_proj = ReplicatedLinear(
+                hidden_features,
+                in_features,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=add_prefix("down_proj", prefix),
+            )
+        else:
+            self.down_proj = RowParallelLinear(
+                hidden_features,
+                in_features,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=add_prefix("down_proj", prefix),
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+            )
         self.hidden_act = hidden_act
-        if self.hidden_act == "silu":
+        if self.fuse_gate_up and self.hidden_act == "silu":
             self.act = SiluAndMul()
+        elif not self.fuse_gate_up:
+            self.act = ACT2FN[self.hidden_act]
         else:
             base_act = ACT2FN[self.hidden_act]
 
@@ -130,8 +216,13 @@ class Qwen2_5_VLMLP(nn.Module):
             self.act = _act_fn
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act(gate_up)
+        if self.fuse_gate_up:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act(gate_up)
+        else:
+            gate, _ = self.gate_proj(x)
+            up, _ = self.up_proj(x)
+            x = self.act(gate) * up
         x_down, _ = self.down_proj(x)
         return x_down
 
@@ -225,11 +316,18 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        cast_x_before_out_mul: bool = False,
+        force_native_norm: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.padded_context_dim = padded_context_dim * (spatial_merge_size**2)
-        self.ln_q = RMSNorm(context_dim, eps=1e-6)
+        self.ln_q = RMSNorm(
+            context_dim,
+            eps=1e-6,
+            cast_x_before_out_mul=cast_x_before_out_mul,
+            force_native=force_native_norm,
+        )
         tp_size = 1 if use_data_parallel else get_parallel().tp_size
         tp_rank = 0 if use_data_parallel else get_parallel().tp_rank
         self.mlp = nn.ModuleList(
@@ -257,10 +355,8 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x expected shape: [S, B, context_dim]
-        S, B, D = x.shape
-        x2d = x.reshape(-1, D)
-        x2d = self.ln_q(x2d)  # RMSNorm expects 2D
+        x2d = x.reshape(-1, x.shape[-1])
+        x2d = self.ln_q(x2d)
         x2d = x2d.view(-1, self.hidden_size)  # group into spatial_merge_unit
         mlp_fc1, mlp_act, mlp_fc2 = self.mlp
         x_parallel, _ = mlp_fc1(x2d)

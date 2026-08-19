@@ -22,7 +22,7 @@
 #include <cstring>
 #include <type_traits>
 
-namespace {
+namespace sglang {
 
 using PlanD = device::compress::DecodePlan;
 using PlanC = device::compress::CompressPlan;
@@ -561,8 +561,6 @@ struct FlashCompress128OnlineKernel {
   }
 };
 
-}  // namespace
-
 // ===========================================================================
 // Plan builders. Mirrors the offline v2 pattern (`c_plan.cuh`):
 //   - Decode: a single GPU kernel reads seq_lens / req_to_token /
@@ -925,9 +923,7 @@ inline OnlinePrefillPlan plan_online_prefill(
 
 }  // namespace host::compress
 
-namespace {
-
 [[maybe_unused]] constexpr auto& plan_compress_128_online_decode = host::compress::plan_online_decode;
 [[maybe_unused]] constexpr auto& plan_compress_128_online_prefill = host::compress::plan_online_prefill;
 
-}  // namespace
+}  // namespace sglang
