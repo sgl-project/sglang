@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 class MambaSSUBackend(ABC):
     prefill_requires_chunk_metadata = False
 
+    def prefill_metadata_chunk_size(self, chunk_size: int) -> int:
+        """Physical chunk size used to construct this backend's metadata."""
+        return chunk_size
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -462,6 +466,19 @@ class CakeSSUBackend(FlashInferSSDCombinedSSUBackend):
     def name(self) -> str:
         return "cake"
 
+    def prefill_metadata_chunk_size(self, chunk_size: int) -> int:
+        if chunk_size not in (128, 256):
+            raise ValueError("Cake Mamba prefill requires logical chunk_size 128 or 256")
+        return 128
+
+    def chunk_scan_combined(self, *args, **kwargs):
+        if "chunk_size" not in kwargs:
+            raise ValueError("Cake Mamba prefill requires an explicit chunk_size")
+        kwargs["chunk_size"] = self.prefill_metadata_chunk_size(
+            int(kwargs["chunk_size"])
+        )
+        return super().chunk_scan_combined(*args, **kwargs)
+
 
 _BACKEND_REGISTRY: dict[str, type[MambaSSUBackend]] = {
     "triton": TritonSSUBackend,
@@ -600,3 +617,12 @@ def mamba_chunk_scan_combined(*args, **kwargs):
 def mamba_prefill_requires_chunk_metadata() -> bool:
     """Whether the selected prefill backend needs logical chunks unconditionally."""
     return bool(getattr(_mamba_ssu_backend, "prefill_requires_chunk_metadata", False))
+
+
+def mamba_prefill_metadata_chunk_size(chunk_size: int) -> int:
+    """Resolve logical model chunks to the selected backend's physical chunks."""
+    assert _mamba_ssu_backend is not None, (
+        "Mamba backend not initialized. "
+        "Call initialize_mamba_selective_state_update_backend() first."
+    )
+    return _mamba_ssu_backend.prefill_metadata_chunk_size(chunk_size)

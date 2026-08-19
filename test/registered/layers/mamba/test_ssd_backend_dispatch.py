@@ -218,6 +218,40 @@ def test_only_flashinfer_family_requires_unconditional_chunk_metadata(monkeypatc
         assert ssu_dispatch.mamba_prefill_requires_chunk_metadata() is expected
 
 
+def test_cake_uses_c128_physical_metadata_for_c256_model_chunks(monkeypatch):
+    cake = object.__new__(ssu_dispatch.CakeSSUBackend)
+    monkeypatch.setattr(ssu_dispatch, "_mamba_ssu_backend", cake)
+    assert ssu_dispatch.mamba_prefill_metadata_chunk_size(128) == 128
+    assert ssu_dispatch.mamba_prefill_metadata_chunk_size(256) == 128
+
+    observed = {}
+
+    def parent_call(_self, *args, **kwargs):
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return "cake-prefill"
+
+    monkeypatch.setattr(
+        ssu_dispatch.FlashInferSSDCombinedSSUBackend,
+        "chunk_scan_combined",
+        parent_call,
+    )
+    assert cake.chunk_scan_combined("x", chunk_size=256) == "cake-prefill"
+    assert observed == {"args": ("x",), "kwargs": {"chunk_size": 128}}
+
+
+def test_non_cake_backends_preserve_model_chunk_size(monkeypatch):
+    for backend_cls in (
+        ssu_dispatch.TritonSSUBackend,
+        ssu_dispatch.FlashInferSSUBackend,
+        ssu_dispatch.FlashInferSSDCombinedSSUBackend,
+    ):
+        monkeypatch.setattr(
+            ssu_dispatch, "_mamba_ssu_backend", object.__new__(backend_cls)
+        )
+        assert ssu_dispatch.mamba_prefill_metadata_chunk_size(256) == 256
+
+
 def test_initialize_unknown_backend_is_fail_closed(monkeypatch):
     monkeypatch.setattr(ssu_dispatch, "_mamba_ssu_backend", None)
     args = SimpleNamespace(
