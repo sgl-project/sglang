@@ -9,6 +9,7 @@ from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_BLACKWELL,
     DEEPGEMM_MASKED_FP8_BACKEND,
+    DEEPGEMM_MASKED_FP8_PACKED_SCALES,
     DEEPGEMM_MASKED_NEED_TMA_ALIGNED_SCALES,
     DEEPGEMM_MASKED_FP8_STANDARD_SCALES,
     DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
@@ -64,8 +65,12 @@ def grouped_gemm_nt_f8f8bf16_masked(
     _, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
 
-    _sanity_check_input(lhs)
-    _sanity_check_input(rhs)
+    _sanity_check_input(
+        lhs, require_ue8m0=not DEEPGEMM_MASKED_FP8_STANDARD_SCALES
+    )
+    _sanity_check_input(
+        rhs, require_ue8m0=not DEEPGEMM_MASKED_FP8_STANDARD_SCALES
+    )
 
     lhs = _ensure_cuda(lhs)
     rhs = _ensure_cuda(rhs)
@@ -317,7 +322,9 @@ def configure_deep_gemm_num_sms(num_sms):
             deep_gemm.set_num_sms(original_num_sms)
 
 
-def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):
+def _sanity_check_input(
+    x_fp8: Tuple[torch.Tensor, torch.Tensor], *, require_ue8m0: bool = True
+):
     if not _SANITY_CHECK:
         return
 
@@ -325,7 +332,7 @@ def _sanity_check_input(x_fp8: Tuple[torch.Tensor, torch.Tensor]):
 
     if x_scale.dtype == torch.int:
         return
-    if not DEEPGEMM_SCALE_UE8M0:
+    if not DEEPGEMM_SCALE_UE8M0 or not require_ue8m0:
         return
 
     from sglang.srt.layers.quantization.fp8_utils import ceil_to_ue8m0

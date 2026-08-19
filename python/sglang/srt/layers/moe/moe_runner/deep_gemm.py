@@ -137,7 +137,10 @@ def _estimate_masked_standard_layout_peak_bytes(
         down_scale_row_bytes = 0
     else:
         block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
-        packed_scales = quant_info.use_mxfp8 or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        packed_scales = (
+            quant_info.use_mxfp8
+            or deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_PACKED_SCALES
+        )
         scale_item_bytes = (
             torch.uint8.itemsize if packed_scales else torch.float32.itemsize
         )
@@ -162,6 +165,13 @@ def _should_use_masked_standard_layout(
         raise ValueError(
             "SGLANG_DEEPGEMM_STANDARD_LAYOUT must be one of: auto, masked, compact"
         )
+    if deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_BACKEND != "native":
+        if mode == "compact":
+            raise ValueError(
+                "FlashInfer batch masked FP8 backends require "
+                "SGLANG_DEEPGEMM_STANDARD_LAYOUT=masked or auto"
+            )
+        return True
     if mode != "auto":
         return mode == "masked"
 
@@ -585,7 +595,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             recipe_a, recipe_b = None, None
 
         # GroupGemm-0
-        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        if deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_PACKED_SCALES:
             if hidden_states_scale.dtype != torch.int:
                 b, s_mn, s_k = hidden_states_scale.shape
                 assert (
@@ -1354,12 +1364,23 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale = down_input_scale.transpose(-1, -2)
         return down_input, down_input_scale
 
-    # Default plain-silu path: the unified JIT masked fused quant. Native
-    # DeepGEMM consumes packed/TMA column-major scales; FlashInfer's public
-    # batch API and Cake consume the canonical contiguous row-major layout.
-    # Produce the selected ABI directly so serving does not copy scale buffers
-    # at either grouped-GEMM boundary.
+    # Default plain-silu path. Native DeepGEMM consumes packed/TMA column-major
+    # UE8M0 scales. FlashInfer's public batch API consumes contiguous FP32
+    # scales, so use the existing fused v2 quantizer in its ordinary FP32 mode.
     expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
+    if deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_STANDARD_SCALES:
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        return sglang_per_token_group_quant_fp8(
+            gateup_output,
+            group_size=group_size,
+            scale_ue8m0=False,
+            fuse_silu_and_mul=True,
+            masked_m=masked_m,
+        )
+
     return per_token_group_quant(
         gateup_output,
         group_size=group_size,
