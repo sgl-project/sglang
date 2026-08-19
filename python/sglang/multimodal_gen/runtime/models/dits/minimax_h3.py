@@ -20,11 +20,9 @@ from safetensors.torch import safe_open
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding_,
 )
-from sglang.kernels.ops.diffusion.qknorm_rope import (
+from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
-)
-from sglang.kernels.ops.diffusion.triton.indexed_modulation import (
     indexed_gate_bf16,
     indexed_gate_bf16_,
     indexed_scale_shift_bf16_,
