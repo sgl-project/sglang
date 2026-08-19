@@ -3510,5 +3510,104 @@ class InklingReasoningEffortTest(unittest.TestCase):
         )
 
 
+class KimiK3ThinkingTestCase(unittest.TestCase):
+    """The K3 renderer's view of `thinking` / `reasoning_effort`."""
+
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def setUp(self):
+        self.tm = _MockTokenizerManager()
+        self.tm.server_args.tool_call_parser = "kimi_k3"
+        self.tm.server_args.reasoning_parser = "kimi_k3"
+        self.tm.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template = Mock(return_value=[1, 2, 3])
+        template_manager = _MockTemplateManager()
+        template_manager.chat_template_name = None
+        template_manager.jinja_template_content_format = "string"
+        self.chat = OpenAIServingChat(self.tm, template_manager)
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+
+    def _template_kwargs(self, **kwargs):
+        request = ChatCompletionRequest(model="x", messages=self.MESSAGES, **kwargs)
+        self.chat._process_messages(request, is_multimodal=False)
+        return self.tm.tokenizer.apply_chat_template.call_args.kwargs
+
+    def test_thinking_disabled_reaches_the_encoder(self):
+        kwargs = self._template_kwargs(thinking={"type": "disabled"})
+        self.assertIs(kwargs["thinking"], False)
+        self.assertNotIn("thinking_effort", kwargs)
+
+    def test_thinking_effort_wins_over_reasoning_effort(self):
+        kwargs = self._template_kwargs(
+            reasoning_effort="max", thinking={"type": "enabled", "effort": "low"}
+        )
+        self.assertEqual(kwargs["thinking_effort"], "low")
+
+    def test_chat_template_kwargs_remains_the_top_override(self):
+        kwargs = self._template_kwargs(
+            thinking={"effort": "low"},
+            chat_template_kwargs={"thinking_effort": "max"},
+        )
+        self.assertEqual(kwargs["thinking_effort"], "max")
+
+    def test_openai_tiers_map_onto_the_three_k3_levels(self):
+        for requested, expected in (
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("xhigh", "max"),
+            ("max", "max"),
+        ):
+            with self.subTest(reasoning_effort=requested):
+                kwargs = self._template_kwargs(reasoning_effort=requested)
+                self.assertEqual(kwargs["thinking_effort"], expected)
+
+    def test_effort_none_leaves_the_kwarg_off(self):
+        self.assertNotIn(
+            "thinking_effort", self._template_kwargs(reasoning_effort="none")
+        )
+
+    def test_effort_not_forwarded_when_thinking_is_off(self):
+        kwargs = self._template_kwargs(thinking={"type": "disabled", "effort": "high"})
+        self.assertIs(kwargs["thinking"], False)
+        self.assertNotIn("thinking_effort", kwargs)
+
+    def test_unsupported_effort_is_reported_by_validation(self):
+        request = ChatCompletionRequest(
+            model="x", messages=self.MESSAGES, reasoning_effort=0.5
+        )
+        self.assertIn("reasoning_effort", self.chat._validate_request(request))
+
+    def test_float_effort_is_a_client_error(self):
+        with self.assertRaises(ValueError):
+            self._template_kwargs(reasoning_effort=0.5)
+
+    def test_keep_other_than_all_rejected_when_enabled(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=self.MESSAGES,
+            thinking={"type": "enabled", "keep": "none"},
+        )
+        self.assertIn("thinking.keep", self.chat._validate_request(request))
+
+    def test_keep_ignored_when_disabled(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=self.MESSAGES,
+            thinking={"type": "disabled", "keep": "none"},
+        )
+        self.assertIsNone(self.chat._validate_request(request))
+
+    def test_keep_all_accepted(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=self.MESSAGES,
+            thinking={"type": "enabled", "keep": "all"},
+        )
+        self.assertIsNone(self.chat._validate_request(request))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

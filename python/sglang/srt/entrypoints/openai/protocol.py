@@ -770,6 +770,28 @@ _TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 _TOOL_NAME_MAX_LEN = 256
 
 
+class ThinkingParam(BaseModel):
+    """Moonshot-style thinking control, as Kimi K3 and compatible surfaces send it.
+
+    ``type`` gates reasoning, ``effort`` outranks ``reasoning_effort``, and
+    ``keep`` selects how much earlier reasoning is replayed. ``keep`` is checked
+    by the serving layer, which knows whether the active model supports anything
+    other than "all". ``adaptive`` is accepted as an alias for enabled so an
+    Anthropic-shaped value reaching this surface does not 400.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Optional[Literal["enabled", "disabled", "adaptive"]] = None
+    keep: Optional[str] = None
+    effort: ReasoningEffortType = None
+
+    @property
+    def enabled(self) -> bool:
+        """Absent or "adaptive" both mean reasoning is on; only "disabled" is off."""
+        return self.type != "disabled"
+
+
 def _has_message_level_tools(messages: Any) -> bool:
     if not isinstance(messages, list):
         return False
@@ -840,6 +862,12 @@ class ChatCompletionRequest(BaseModel):
         "'max' is an sglang extension to the OpenAI schema for "
         "models that expose a maximum-effort tier above 'high'; models that don't "
         "support it treat it the same as 'high'.",
+    )
+    thinking: Optional[ThinkingParam] = Field(
+        default=None,
+        description="Moonshot thinking control: {type: enabled|disabled, "
+        "keep: all, effort: low|high|max}. 'effort' takes precedence over "
+        "reasoning_effort; 'type: disabled' turns reasoning off.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]
@@ -1047,9 +1075,26 @@ class ChatCompletionRequest(BaseModel):
             if enabled:
                 thinking = True
 
+        # thinking.effort outranks reasoning.effort and the top-level field.
+        # chat_template_kwargs stays above all three: the renderers only fill
+        # thinking_effort when the caller has not set it themselves.
+        thinking_type = None
+        thinking_config = values.get("thinking")
+        if isinstance(thinking_config, dict):
+            thinking_effort = thinking_config.get("effort")
+            if thinking_effort is not None:
+                values["reasoning_effort"] = thinking_effort
+            thinking_type = thinking_config.get("type")
+
         effort = values.get("reasoning_effort")
         if effort is not None:
             thinking = effort != "none"
+        if thinking_type is not None:
+            thinking = thinking_type != "disabled"
+        elif thinking_config is not None and thinking is None:
+            # A thinking object with no explicit type still means "reasoning on",
+            # but never contradicts an effort that already resolved it.
+            thinking = True
 
         if thinking is not None:
             ctk = values.get("chat_template_kwargs")

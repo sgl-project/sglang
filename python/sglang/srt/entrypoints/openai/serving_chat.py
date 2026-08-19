@@ -188,6 +188,31 @@ KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
 
 
+# K3 exposes three thinking tiers. The OpenAI tiers map onto the nearest one so a
+# standard client asking for "medium" is neither rejected nor silently upgraded to
+# the strongest tier; a float is an sglang extension K3 cannot express at all.
+_KIMI_K3_EFFORT_TIERS = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
+
+
+def kimi_k3_thinking_effort(reasoning_effort: Any) -> Optional[str]:
+    """Map a request's reasoning effort onto K3's thinking_effort, or None."""
+    if reasoning_effort is None or reasoning_effort == "none":
+        return None
+    if isinstance(reasoning_effort, str) and reasoning_effort in _KIMI_K3_EFFORT_TIERS:
+        return _KIMI_K3_EFFORT_TIERS[reasoning_effort]
+    raise ValueError(
+        "Kimi K3 supports reasoning_effort 'low', 'high' or 'max' (the other "
+        f"OpenAI tiers map onto them); got {reasoning_effort!r}."
+    )
+
+
 def neutralize_kimi_k3_image_placeholder(text: str) -> str:
     return text.replace(KIMI_K3_IMAGE_PLACEHOLDER, KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED)
 
@@ -520,22 +545,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
 
             if (
-                request.reasoning_effort in ("low", "high", "max")
-                and "thinking_effort" not in template_kwargs
+                "thinking_effort" not in template_kwargs
+                and template_kwargs.get("thinking") is not False
             ):
-                template_kwargs["thinking_effort"] = request.reasoning_effort
-            elif request.reasoning_effort not in (
-                None,
-                "none",
-                "low",
-                "high",
-                "max",
-            ):
-                logger.warning(
-                    "Kimi K3 does not support reasoning_effort=%r; using the "
-                    "encoder default.",
-                    request.reasoning_effort,
-                )
+                effort = kimi_k3_thinking_effort(request.reasoning_effort)
+                if effort is not None:
+                    template_kwargs["thinking_effort"] = effort
 
             effective_tools = self._effective_tools(request)
             if (
@@ -837,6 +852,23 @@ class OpenAIServingChat(OpenAIServingBase):
         media_error = self._validate_media_content(request)
         if media_error:
             return media_error
+
+        if self.chat_encoding_spec == "kimi_k3":
+            try:
+                kimi_k3_thinking_effort(request.reasoning_effort)
+            except ValueError as exc:
+                return str(exc)
+            # K3 replays every retained reasoning block or none; there is no
+            # partial-retention mode to honor, so anything else is a client error.
+            if (
+                request.thinking is not None
+                and request.thinking.enabled
+                and request.thinking.keep not in (None, "all")
+            ):
+                return (
+                    "thinking.keep must be 'all' unless thinking.type is "
+                    f"'disabled'; got {request.thinking.keep!r}."
+                )
 
         effective_tools = self._effective_tools(request)
         has_message_tools = any(
