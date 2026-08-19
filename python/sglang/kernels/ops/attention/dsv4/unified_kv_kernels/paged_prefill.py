@@ -179,9 +179,7 @@ def _sparse_attn_v4_paged_prefill_kernel(
             other=0.0,
         )
 
-        scores = (
-            tl.dot(q, tl.trans(kv)) * softmax_scale + replicated_logit_shift
-        )
+        scores = tl.dot(q, tl.trans(kv)) * softmax_scale + replicated_logit_shift
         scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
 
         m_block = tl.max(scores, axis=1)
@@ -202,9 +200,10 @@ def _sparse_attn_v4_paged_prefill_kernel(
     # rescale BOTH l_i (for denom) AND acc (for numerator) by alpha to switch
     # to m_final frame. The sink itself adds exp(sink - m_final) to l_final
     # but contributes 0 to acc since V_sink = 0.
-    sink = tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(
-        tl.float32
-    ) + replicated_logit_shift
+    sink = (
+        tl.load(attn_sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
+        + replicated_logit_shift
+    )
     m_final = tl.maximum(m_i, sink)
     alpha = tl.exp(m_i - m_final)
     l_final = l_i * alpha + tl.exp(sink - m_final)

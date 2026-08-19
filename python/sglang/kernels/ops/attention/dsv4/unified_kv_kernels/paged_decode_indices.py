@@ -99,9 +99,7 @@ def _v4_paged_decode_indices_kernel(
     # `n` = actual valid SWA prefix count. Cast to match `win` (compile-time
     # int) — pos is i32/i64 from positions buffer.
     start = tl.maximum(pos - win + 1, 0)
-    first_owned = start + (
-        DCP_RANK + DCP_SIZE - (start % DCP_SIZE)
-    ) % DCP_SIZE
+    first_owned = start + (DCP_RANK + DCP_SIZE - (start % DCP_SIZE)) % DCP_SIZE
     n = tl.maximum(tl.cdiv(pos + 1 - first_owned, DCP_SIZE), 0)
     swa_base = tl.load(swa_indptr_ptr + t)
     csa_base = tl.load(csa_indptr_ptr + t)
@@ -217,9 +215,7 @@ def _v4_paged_single_stream_indices_kernel(
     slot = tl.load(state_slot_ptr + row)
     pos = tl.load(positions_ptr + row)
     start = tl.maximum(pos - win + 1, 0)
-    first_owned = start + (
-        DCP_RANK + DCP_SIZE - (start % DCP_SIZE)
-    ) % DCP_SIZE
+    first_owned = start + (DCP_RANK + DCP_SIZE - (start % DCP_SIZE)) % DCP_SIZE
     count = tl.maximum(tl.cdiv(pos + 1 - first_owned, DCP_SIZE), 0)
     base = tl.load(indptr_ptr + row)
     offsets = tl.arange(0, BLOCK_N)

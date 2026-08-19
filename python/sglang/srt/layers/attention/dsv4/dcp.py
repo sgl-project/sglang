@@ -113,9 +113,7 @@ def localize_compressed_indices(
     if compress_ratio not in (4, 128):
         raise ValueError(f"Unsupported DSV4 compression ratio: {compress_ratio}")
     global_compressed = global_full_indices // compress_ratio
-    owned = (global_full_indices >= 0) & (
-        global_compressed % dcp_size == dcp_rank
-    )
+    owned = (global_full_indices >= 0) & (global_compressed % dcp_size == dcp_rank)
     local = torch.where(owned, global_compressed // dcp_size, -1)
     return DSV4DCPIndices(local, owned)
 

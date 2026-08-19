@@ -36,12 +36,12 @@ from sglang.srt.layers.attention.dsv4.dcp import (
     validate_dsv4_dcp_topology,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
-from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, dcp_a2a_lse_reduce
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
     copy_metadata,
     maybe_copy_inplace,
 )
+from sglang.srt.layers.dcp import cp_lse_ag_out_rs_mha, dcp_a2a_lse_reduce
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import (
@@ -999,9 +999,7 @@ class DeepseekV4HipRadixBackend(
                 num_padding = getattr(forward_batch, "num_padding", 0)
                 if num_padding:
                     seq_lens_cpu = seq_lens_cpu.clone()
-                    seq_lens_cpu[-num_padding:] += (
-                        self.target_verify_num_draft_tokens
-                    )
+                    seq_lens_cpu[-num_padding:] += self.target_verify_num_draft_tokens
             if ragged_layout is not None:
                 ragged_layout = ragged_layout.padded_to_bucket(padded_bs=bs)
                 num_tokens_v = ragged_layout.graph_num_tokens
@@ -1854,7 +1852,9 @@ class DeepseekV4HipRadixBackend(
 
         if need_compress:
             core_attn_metadata.init_compression_metadata(
-                unified_swa_pages=getattr(self.token_to_kv_pool, "unified_swa_pages", 0),
+                unified_swa_pages=getattr(
+                    self.token_to_kv_pool, "unified_swa_pages", 0
+                ),
                 dcp_size=self.dsv4_dcp_size,
                 dcp_rank=self.dsv4_dcp_rank,
             )

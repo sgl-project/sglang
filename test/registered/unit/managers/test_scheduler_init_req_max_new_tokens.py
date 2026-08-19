@@ -89,9 +89,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             logical_capacity = (
                 scheduler.max_total_num_tokens * get_parallel().attn_dcp_size
             )
-            budget_ok = (
-                paged_input_len + candidate + page_size < logical_capacity
-            )
+            budget_ok = paged_input_len + candidate + page_size < logical_capacity
             limit_ok = not limit_active or candidate <= limit
             requested_ok = requested is None or candidate <= requested
             return context_ok and budget_ok and limit_ok and requested_ok

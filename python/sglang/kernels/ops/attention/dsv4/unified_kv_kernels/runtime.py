@@ -258,8 +258,7 @@ def build_dcp_csa_stream_reference(
         start = max(0, position - win + 1)
         swa = torch.tensor(
             [
-                state_slot[row].item() * ring_stride
-                + key_position % ring_stride
+                state_slot[row].item() * ring_stride + key_position % ring_stride
                 for key_position in range(start, position + 1)
                 if key_position % dcp_size == dcp_rank
             ],
@@ -483,9 +482,7 @@ def _prefill_lengths_kernel(
     tpic = pos - cstart
     swa_low = tl.maximum(pos - win + 1, 0)
     extend_count = tl.minimum(tpic + 1, win)
-    first_owned = swa_low + (
-        DCP_RANK + DCP_SIZE - (swa_low % DCP_SIZE)
-    ) % DCP_SIZE
+    first_owned = swa_low + (DCP_RANK + DCP_SIZE - (swa_low % DCP_SIZE)) % DCP_SIZE
     prefix_swa_count = tl.maximum(
         tl.cdiv(cstart - first_owned, DCP_SIZE),
         0,
@@ -534,9 +531,7 @@ def _build_prefill_indices_kernel(
     tpic = pos - cstart
     swa_low = tl.maximum(pos - win + 1, 0)
     extend_count = tl.minimum(tpic + 1, win)
-    first_owned = swa_low + (
-        DCP_RANK + DCP_SIZE - (swa_low % DCP_SIZE)
-    ) % DCP_SIZE
+    first_owned = swa_low + (DCP_RANK + DCP_SIZE - (swa_low % DCP_SIZE)) % DCP_SIZE
     prefix_swa_count = tl.maximum(
         tl.cdiv(cstart - first_owned, DCP_SIZE),
         0,
