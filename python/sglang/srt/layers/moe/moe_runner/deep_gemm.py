@@ -1301,7 +1301,8 @@ def _varlen_deep_gemm_silu_mul_quant(
         down_input = torch.empty(
             (E, N, D), device=hidden_states_device, dtype=torch.float8_e4m3fn
         )
-        down_input_scale = torch.empty(
+        alloc = torch.empty if use_packed else torch.zeros
+        down_input_scale = alloc(
             (E, G // 4, N) if use_packed else (E, N, G),
             device=hidden_states_device,
             dtype=torch.int32 if use_packed else torch.float32,
