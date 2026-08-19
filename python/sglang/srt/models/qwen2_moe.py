@@ -206,12 +206,50 @@ class Qwen2MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        # Set externally (see qwen3_5.py) when both projections are NVFP4 and
+        # the FlashInfer fused SiLU+mul+FP4-quant kernel is available. The
+        # fused path replaces act_fn + the down_proj input quantization with a
+        # single kernel and hands down_proj a prequantized (fp4, scale) tuple.
+        self._enable_silu_fp4_quant_fusion = False
+        self._masked_m_cache: dict = {}
+        # Lazily derived after weight load (input_scale_inv does not exist yet
+        # at construction time); the fused kernel requires a 1-D global scale.
+        self._down_input_scale_inv_1d = None
+
+    def _silu_fp4_quant_fused(self, gate_up: torch.Tensor) -> tuple:
+        from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize
+
+        if self._down_input_scale_inv_1d is None:
+            self._down_input_scale_inv_1d = self.down_proj.input_scale_inv.reshape(1)
+        num_tokens = gate_up.shape[0]
+        masked_m = self._masked_m_cache.get(num_tokens)
+        if masked_m is None:
+            masked_m = torch.tensor(
+                [num_tokens], dtype=torch.int32, device=gate_up.device
+            )
+            self._masked_m_cache[num_tokens] = masked_m
+        y_fp4, y_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
+            gate_up.unsqueeze(0),
+            masked_m,
+            self._down_input_scale_inv_1d,
+        )
+        # [M, K/2, 1] -> [M, K/2]; scale: expert-grouped 6-D swizzle
+        # (32, 4, m_blocks, 4, K/64, 1) -> the dense swizzled layout
+        # fp4_gemm expects (verified bit-exact vs fp4_quantize up to FP4
+        # rounding ties for M in 64..8192).
+        y_fp4 = y_fp4.squeeze(-1).view(torch.uint8)
+        m_padded = y_sf.shape[2] * y_sf.shape[0] * y_sf.shape[3]  # m_blocks*32*4
+        y_sf = y_sf.view(torch.uint8).permute(2, 4, 0, 1, 3, 5).reshape(m_padded, -1)
+        return y_fp4, y_sf
 
     def forward(
         self,
         x,
     ):
         gate_up, _ = self.gate_up_proj(x)
+        if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
+            x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
+            return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -326,6 +364,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                     dict(tp_rank=0, tp_size=1)
                     if (
                         get_moe_a2a_backend().is_deepep()
+                        or get_moe_a2a_backend().is_mori()
                         or get_moe_a2a_backend().is_flashinfer()
                     )
                     else {}
@@ -344,7 +383,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         else:
             self.shared_expert_gate = torch.nn.Linear(config.hidden_size, 1, bias=False)
 
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_parallel().moe_ep_size
             self.num_experts = (
@@ -590,7 +629,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
             return self._forward_deepep(hidden_states, forward_batch)
 
         use_fused_gate = (

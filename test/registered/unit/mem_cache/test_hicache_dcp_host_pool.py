@@ -66,7 +66,7 @@ class TestDcpKernelIndices(CustomTestCase):
     def test_identity_without_dcp(self):
         pool = self._bare_pool(1, 0)
         indices = torch.arange(37)
-        self.assertIs(pool.dcp_kernel_indices(indices), indices)
+        self.assertIs(pool.maybe_dcp_kernel_indices(indices), indices)
 
     def test_aligned_page_translates_to_full_physical_page(self):
         # One widened page starting at logical 512 covers physical rows
@@ -74,7 +74,7 @@ class TestDcpKernelIndices(CustomTestCase):
         indices = torch.arange(WIDENED_PAGE, 2 * WIDENED_PAGE)
         for rank in range(DCP_SIZE):
             pool = self._bare_pool(DCP_SIZE, rank)
-            out = pool.dcp_kernel_indices(indices)
+            out = pool.maybe_dcp_kernel_indices(indices)
             torch.testing.assert_close(
                 out, torch.arange(PHYSICAL_PAGE, 2 * PHYSICAL_PAGE)
             )
@@ -88,7 +88,7 @@ class TestDcpKernelIndices(CustomTestCase):
         )
         for rank in range(DCP_SIZE):
             pool = self._bare_pool(DCP_SIZE, rank)
-            out = pool.dcp_kernel_indices(indices)
+            out = pool.maybe_dcp_kernel_indices(indices)
             expected = (
                 indices[indices % DCP_SIZE == rank] // DCP_SIZE
             )  # owner rule, same as filter_dcp_local_kv_indices
@@ -98,7 +98,7 @@ class TestDcpKernelIndices(CustomTestCase):
     def test_ragged_run_is_rejected(self):
         pool = self._bare_pool(DCP_SIZE, 0)
         with self.assertRaises(AssertionError):
-            pool.dcp_kernel_indices(torch.arange(WIDENED_PAGE + 1))
+            pool.maybe_dcp_kernel_indices(torch.arange(WIDENED_PAGE + 1))
 
     def test_positional_residue_pairing_survives_host_sort(self):
         # move_indices (direct/layer_first) sorts host indices and permutes
@@ -128,7 +128,7 @@ class TestDcpKernelIndices(CustomTestCase):
             # same positions selected on both sides -> pairing preserved
             torch.testing.assert_close(host_mask, device_mask)
             self.assertEqual(
-                pool.dcp_kernel_indices(host_sorted).numel(),
+                pool.maybe_dcp_kernel_indices(host_sorted).numel(),
                 host.numel() // DCP_SIZE,
             )
 

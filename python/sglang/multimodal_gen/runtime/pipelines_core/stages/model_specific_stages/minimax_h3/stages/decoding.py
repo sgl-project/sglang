@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Mapping
+from contextlib import nullcontext
 
 import torch
 
@@ -11,6 +12,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_world_group,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -295,11 +297,16 @@ class MiniMaxH3DecodingStage(DecodingStage):
                 audio_latent.device.type == "cuda"
                 and autocast_enabled(audio_vae_dtype, server_args.disable_autocast)
             )
-            with torch.autocast(
-                device_type=audio_latent.device.type,
-                dtype=audio_vae_dtype,
-                enabled=audio_autocast_enabled,
-            ):
+            autocast_context = (
+                torch.autocast(
+                    device_type="cuda",
+                    dtype=audio_vae_dtype,
+                    enabled=audio_autocast_enabled,
+                )
+                if audio_latent.is_cuda
+                else nullcontext()
+            )
+            with autocast_context:
                 audio_decode = self._get_vae_decode_fn(
                     audio_vae,
                     server_args,
@@ -351,17 +358,23 @@ class MiniMaxH3DecodingStage(DecodingStage):
             )
             if visual_autocast_enabled:
                 selected_video_vae.prepare_decoder_autocast_weights(video_vae_dtype)
-            with torch.autocast(
-                device_type=visual_latent.device.type,
-                dtype=video_vae_dtype,
-                enabled=visual_autocast_enabled,
-            ):
+            autocast_context = (
+                torch.autocast(
+                    device_type="cuda",
+                    dtype=video_vae_dtype,
+                    enabled=visual_autocast_enabled,
+                )
+                if visual_latent.is_cuda
+                else nullcontext()
+            )
+            with autocast_context:
                 video_decode = self._get_vae_decode_fn(
                     selected_video_vae,
                     server_args,
                     decode_fn=selected_video_vae.decode_base,
                 )
-                visual_frames = video_decode(visual_decode_latent)
+                with set_forward_context(current_timestep=0, attn_metadata=None):
+                    visual_frames = video_decode(visual_decode_latent)
                 visual_frames = selected_video_vae.processor.revert_tensor(
                     visual_frames
                 )

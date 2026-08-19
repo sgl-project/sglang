@@ -166,7 +166,6 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.model_executor.runner_utils import make_war_read_done_event
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_context,
@@ -404,14 +403,9 @@ class ModelRunner:
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
-        # WAR fast-path: a decode-graph forward publishes a fresh event here after
-        # load_batch; the scheduler's WAR barrier waits on it (then clears it)
-        # instead of the whole-forward wait_stream. None -> whole-forward fallback.
-        self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
-        # Graph runners record this persistent event after shared-state reads.
-        self.war_read_done_event = make_war_read_done_event(
-            torch.get_device_module(self.device)
-        )
+        # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
+        # its worker names, and treats None as the coarse whole-forward fence.
+        self.shared_read_done_event: Optional[torch.cuda.Event] = None
 
         # CPU offload
         set_offloader(
@@ -732,7 +726,6 @@ class ModelRunner:
             self._token_oracle_manager = None
             return
         self._token_oracle_manager = install_token_oracle_from_env(
-            server_args=self.server_args,
             vocab_size=self.model_config.vocab_size,
         )
 
@@ -790,7 +783,6 @@ class ModelRunner:
         if self.spec_algorithm.is_speculative():
             return resolve_num_tokens_per_req(
                 phase="target_verify",
-                server_args=self.server_args,
                 spec_algorithm=self.spec_algorithm,
                 is_draft_worker=self.is_draft_worker,
                 num_draft_tokens=num_draft_tokens,
