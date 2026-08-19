@@ -48,6 +48,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import publish
 from sglang.srt.utils import MultiprocessingSerializer
+from sglang.srt.utils.parallel_topology import calculate_rank_ranges
 
 from .protocol import (
     CacheConfig,
@@ -640,18 +641,8 @@ def launch_weight_cache_daemons(
     import subprocess
     import sys
 
-    # Replicate _calculate_rank_ranges logic from engine.py
-    pp_size_per_node = max(pp_size // nnodes, 1)
-    nnodes_per_pp_rank = max(nnodes // pp_size, 1)
-    pp_rank_range = range(
-        pp_size_per_node * (node_rank // nnodes_per_pp_rank),
-        pp_size_per_node * (node_rank // nnodes_per_pp_rank + 1),
-    )
-    nnodes_per_tp_group = nnodes_per_pp_rank
-    tp_size_per_node = tp_size // nnodes_per_tp_group
-    tp_rank_range = range(
-        tp_size_per_node * (node_rank % nnodes_per_tp_group),
-        tp_size_per_node * (node_rank % nnodes_per_tp_group + 1),
+    pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
+        calculate_rank_ranges(nnodes, pp_size, tp_size, node_rank)
     )
 
     if nnodes > 1 and dist_init_method is None:
