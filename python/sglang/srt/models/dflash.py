@@ -23,7 +23,10 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    should_apply_lm_head_quant_method,
+)
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -57,6 +60,30 @@ def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tenso
     if _flashinfer_top_k is not None:
         return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
     return torch.topk(scores, k, dim=-1)
+
+
+def _project_candidate_logits(
+    hidden: torch.Tensor,
+    lm_head: nn.Module,
+    *,
+    num_org: int,
+    use_quant_head: bool,
+    top_k: int,
+) -> torch.Tensor:
+    """Project draft hiddens through the target head, restricted to the org vocab."""
+    # k > num_org would top-k into the masked padded tail and emit silent
+    # out-of-vocab candidates; the dense slice would error on its own.
+    assert num_org >= top_k, f"selector top_k ({top_k}) > org vocab width ({num_org})"
+    if not use_quant_head:
+        weight = lm_head.weight
+        return torch.matmul(hidden.to(weight.dtype), weight[:num_org].T)
+    # A packed weight can't be row-sliced to the org vocab like the dense path,
+    # and flashinfer's radix top-k rejects the crop view (non-contiguous), so
+    # mask the padded tail out of the top-k instead.
+    logits = lm_head.quant_method.apply(lm_head, hidden, None).contiguous()
+    if logits.shape[-1] > num_org:
+        logits[:, num_org:] = float("-inf")
+    return logits
 
 
 def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
@@ -965,18 +992,36 @@ class DFlash2DraftModel(DFlashDraftModel):
         # The worker screens the head before capture, but its eager fallback
         # (_propose_selector_block) attaches whatever the target has.
         weight = getattr(self.lm_head, "weight", None)
-        if not is_dense_head_weight(weight):
+        quant_method = getattr(self.lm_head, "quant_method", None)
+        use_quant_head = should_apply_lm_head_quant_method(self.lm_head, quant_method)
+        if not use_quant_head and not is_dense_head_weight(weight):
             raise RuntimeError(
-                "DFlash2 selector requires a dense FP16/BF16/FP32 target lm_head."
+                "DFlash2 selector requires a dense FP16/BF16/FP32 target lm_head "
+                "or a supported lm_head.quant_method."
             )
-        hidden = hidden.to(weight.dtype)
         if get_parallel().tp_size == 1:
             org = int(self.lm_head.org_vocab_size)
-            vals, ids = _radix_topk(torch.matmul(hidden, weight[:org].T), k)
+            vals, ids = _radix_topk(
+                _project_candidate_logits(
+                    hidden,
+                    self.lm_head,
+                    num_org=org,
+                    use_quant_head=use_quant_head,
+                    top_k=k,
+                ),
+                k,
+            )
             return ids.long(), self._transform_unary_logits(vals)
         shard = self.lm_head.shard_indices
         vals, ids = _radix_topk(
-            torch.matmul(hidden, weight[: int(shard.num_org_elements)].T), k
+            _project_candidate_logits(
+                hidden,
+                self.lm_head,
+                num_org=int(shard.num_org_elements),
+                use_quant_head=use_quant_head,
+                top_k=k,
+            ),
+            k,
         )
         global_ids = ids.long() + int(shard.org_vocab_start_index)
         gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
