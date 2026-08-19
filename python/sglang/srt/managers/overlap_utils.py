@@ -27,9 +27,8 @@ def decide_needs_cpu_seq_lens(
 ) -> bool:
     """Whether FutureMap must publish seq_lens_cpu / sum.
 
-    OR over per-backend needs_cpu_seq_lens; force True under TBO (it reads the
-    CPU mirror outside the backend layer to split the batch) or ngram (its
-    USE_FULL_MASK verify path reads the host mirror regardless of backend).
+    OR over per-backend needs_cpu_seq_lens; force True under TBO because it
+    reads the CPU mirror outside the backend layer to split the batch.
     """
     # Local import: keep overlap_utils' module-level deps leaf-only so it stays
     # importable everywhere; spec_info pulls in the spec/schedule_batch graph.
@@ -54,8 +53,7 @@ def decide_needs_cpu_seq_lens(
         unsupported = [
             type(backend).__name__
             for backend in attn_backends
-            if backend is None
-            or not getattr(backend, "supports_ngram_gpu_only_seq_lens", False)
+            if backend is None or getattr(backend, "needs_cpu_seq_lens", True)
         ]
         if unsupported:
             raise ValueError(
@@ -69,8 +67,8 @@ def decide_needs_cpu_seq_lens(
         # FIXME: support TBO without seq lens cpu value
         return True
     if spec_algo.is_ngram():
-        # ngram's USE_FULL_MASK verify path reads seq_lens_cpu per req to size
-        # the tree mask, regardless of the attn backend (e.g. Triton opts out).
+        # Without precompute, CPU corpus lookup still needs the current verified
+        # tokens before the next draft can be generated.
         return True
     # Skip unset slots (e.g. draft_extend_attn_backend on some spec configs);
     # missing flag -> True so undeclared backends stay on the legacy path.

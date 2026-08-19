@@ -1518,24 +1518,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         elif self.model_runner.spec_algorithm.is_ngram():
             from sglang.srt.speculative.ngram_info import NgramVerifyInput
 
-            enable_precompute = envs.SGLANG_ENABLE_NGRAM_PRECOMPUTE.get()
-            draft_token_num = self.captured_req_width
-            batch_size = num_tokens // draft_token_num
             spec_info = NgramVerifyInput(
                 draft_token=None,
-                custom_mask=(
-                    self.buffers.custom_mask[
-                        : batch_size * draft_token_num * draft_token_num
-                    ]
-                    if enable_precompute
-                    else self.buffers.custom_mask
-                ),
+                custom_mask=self.buffers.custom_mask,
                 positions=None,
                 retrieve_index=None,
                 retrieve_next_token=None,
                 retrieve_next_sibling=None,
                 draft_token_num=self.captured_req_width,
-                is_compact_mask=enable_precompute,
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 

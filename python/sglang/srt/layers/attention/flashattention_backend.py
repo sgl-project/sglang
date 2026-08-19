@@ -16,9 +16,6 @@ from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
-from sglang.kernels.ops.speculative.tree_query_kv_layout import (
-    build_tree_query_kv_layout,
-)
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.unified_mem_hooks import unified_mla_hooks
@@ -194,9 +191,6 @@ class FlashAttentionBackend(AttentionBackend):
         # tree mask is preallocated (see VerifyMask), so no
         # seq_lens_cpu / seq_lens_sum D2H sync is ever needed.
         self.needs_cpu_seq_lens = False
-        self.is_ngram = SpeculativeAlgorithm.from_string(
-            model_runner.server_args.speculative_algorithm
-        ).is_ngram()
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         # Unified pool: req_to_token holds VIRTUAL ids but the MLA per-layer views
         # are DENSE, so every page_table needs remapping. MLA-only -- the MHA/SWA
@@ -262,24 +256,6 @@ class FlashAttentionBackend(AttentionBackend):
                 max_req_pool_idx + 1, dtype=torch.int32, device=model_runner.device
             )
             self._pa_swa_max_prefill_len = 0
-
-        # NGRAM uses FA's two-stage cascade path: prefix attention followed by
-        # per-query tree attention. All metadata is built from GPU seq_lens.
-        # Local/SWA/MLA variants need separate tree-attention handling and stay
-        # on the guarded unsupported path for now. FA4's expand pass presents
-        # physical token slots as page-size-1 pages, which FA4 cannot run when
-        # startup selected its page-size-128 cache mode.
-        self.supports_ngram_gpu_only_seq_lens = self.is_ngram and not any(
-            (
-                self.use_mla,
-                self.is_encoder_decoder,
-                self.has_local_attention,
-                self.has_swa,
-                self.use_sliding_window_kv_pool,
-                fa_impl_ver == 4 and self.page_size != 1,
-            )
-        )
-        self.needs_cpu_seq_lens = not self.supports_ngram_gpu_only_seq_lens
 
         # Select version
         self.fa_impl_ver = fa_impl_ver
@@ -414,97 +390,6 @@ class FlashAttentionBackend(AttentionBackend):
             num_splits=self.num_splits,
         )
 
-    @staticmethod
-    def _has_compact_tree_mask(spec_info: Optional[SpecInput]) -> bool:
-        return spec_info is not None and spec_info.get_compact_tree_mask() is not None
-
-    def _fill_compact_tree_verify_metadata(
-        self,
-        metadata: FlashAttentionMetadata,
-        metadata_expand: FlashAttentionMetadata,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        spec_info: SpecInput,
-    ) -> None:
-        """Build the prefix/tree cascade metadata without host length reads."""
-        tree_mask = spec_info.get_compact_tree_mask()
-        if tree_mask is None:
-            raise ValueError("Compact-tree verify metadata requires a tree mask.")
-
-        bs = req_pool_indices.numel()
-        draft_token_num = self.speculative_num_draft_tokens
-        device = seq_lens.device
-
-        if metadata.cache_seqlens_int32 is None:
-            metadata.cache_seqlens_int32 = torch.empty(
-                bs, dtype=torch.int32, device=device
-            )
-            metadata.cu_seqlens_q = torch.arange(
-                0,
-                bs * draft_token_num + 1,
-                step=draft_token_num,
-                dtype=torch.int32,
-                device=device,
-            )
-            metadata.cu_seqlens_k = torch.empty(
-                bs + 1, dtype=torch.int32, device=device
-            )
-            metadata.page_table = torch.empty(
-                (bs, self.max_num_pages), dtype=torch.int32, device=device
-            )
-
-        metadata.cache_seqlens_int32.copy_(seq_lens)
-        metadata.max_seq_len_q = draft_token_num
-        metadata.max_seq_len_k = self.max_context_len
-        metadata.cu_seqlens_k[0].zero_()
-        metadata.cu_seqlens_k[1:].copy_(
-            torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
-        )
-        build_trtllm_mha_page_table(
-            req_to_token=self.req_to_token,
-            req_pool_indices=req_pool_indices,
-            cache_seqlens=metadata.cache_seqlens_int32,
-            page_table=metadata.page_table,
-            page_size=self.page_size,
-        )
-
-        num_tree_queries = bs * draft_token_num
-        if metadata_expand.cache_seqlens_int32 is None:
-            metadata_expand.cache_seqlens_int32 = torch.empty(
-                num_tree_queries, dtype=torch.int32, device=device
-            )
-            metadata_expand.cu_seqlens_q = torch.arange(
-                0, num_tree_queries + 1, dtype=torch.int32, device=device
-            )
-            metadata_expand.cu_seqlens_k = torch.empty(
-                num_tree_queries + 1, dtype=torch.int32, device=device
-            )
-            metadata_expand.page_table = torch.empty(
-                (num_tree_queries, draft_token_num),
-                dtype=torch.int32,
-                device=device,
-            )
-
-        metadata_expand.max_seq_len_q = 1
-        metadata_expand.max_seq_len_k = draft_token_num
-        build_tree_query_kv_layout(
-            tree_mask=tree_mask,
-            req_to_token=self.req_to_token,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            kv_slots=metadata_expand.page_table,
-            kv_lens=metadata_expand.cache_seqlens_int32,
-            num_draft_tokens=draft_token_num,
-        )
-        metadata_expand.cu_seqlens_k[0].zero_()
-        metadata_expand.cu_seqlens_k[1:].copy_(
-            torch.cumsum(
-                metadata_expand.cache_seqlens_int32,
-                dim=0,
-                dtype=torch.int32,
-            )
-        )
-
     def _mxfp8_sf_kwargs(self, layer, forward_batch, q_descale=None):
         """Block-scaled UE8M0 scale factors for the FA4 MXFP8 attention path.
 
@@ -623,21 +508,13 @@ class FlashAttentionBackend(AttentionBackend):
                 )
                 return
 
-            if forward_mode.is_target_verify() and (
-                self.topk > 1 or self._has_compact_tree_mask(spec_info)
-            ):
+            if forward_mode.is_target_verify() and self.topk > 1:
                 # Tree verify metadata depends on the runtime draft tree. Bind
                 # stable buffers now and fill them before each replay.
-                if self._has_compact_tree_mask(spec_info):
-                    self.forward_metadata = self.compact_tree_verify_metadata[bs]
-                    self.forward_metadata_spec_decode_expand = (
-                        self.compact_tree_verify_expand_metadata[bs]
-                    )
-                else:
-                    self.forward_metadata = self.target_verify_metadata_topk_normal[bs]
-                    self.forward_metadata_spec_decode_expand = (
-                        self.target_verify_metadata_topk_expand[bs]
-                    )
+                self.forward_metadata = self.target_verify_metadata_topk_normal[bs]
+                self.forward_metadata_spec_decode_expand = (
+                    self.target_verify_metadata_topk_expand[bs]
+                )
                 return
 
             self._apply_cuda_graph_metadata(
@@ -942,17 +819,7 @@ class FlashAttentionBackend(AttentionBackend):
             # TODO: we need to test this part for llama 4 eagle case
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
-            if self._has_compact_tree_mask(forward_batch.spec_info):
-                metadata_expand = FlashAttentionMetadata()
-                self._fill_compact_tree_verify_metadata(
-                    metadata,
-                    metadata_expand,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    forward_batch.spec_info,
-                )
-                self.forward_metadata_spec_decode_expand = metadata_expand
-            elif self.topk <= 1:
+            if self.topk <= 1:
                 ragged_layout = getattr(
                     forward_batch.spec_info, "ragged_verify_layout", None
                 )
@@ -1439,7 +1306,7 @@ class FlashAttentionBackend(AttentionBackend):
         # - The overhead of duplicated computation of the common prefix part is small for sliding window layers (seq_len <= window_size), so we can just expand it.
         use_cascade_attn = (
             forward_batch.forward_mode.is_target_verify()
-            and (self.topk > 1 or self._has_compact_tree_mask(forward_batch.spec_info))
+            and self.topk > 1
             and not is_swa_layer
         )
 
@@ -2462,54 +2329,6 @@ class FlashAttentionBackend(AttentionBackend):
                     device=self.device,
                 )
 
-        if self.is_ngram:
-            draft_token_num = self.speculative_num_draft_tokens
-            self.compact_tree_verify_metadata = {
-                "cache_seqlens": torch.zeros(
-                    max_bs, dtype=torch.int32, device=self.device
-                ),
-                "cu_seqlens_q": torch.arange(
-                    0,
-                    max_bs * draft_token_num + 1,
-                    step=draft_token_num,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                "cu_seqlens_k": torch.zeros(
-                    max_bs + 1, dtype=torch.int32, device=self.device
-                ),
-                "page_table": torch.zeros(
-                    max_bs,
-                    max_num_pages,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-            }
-            self.compact_tree_verify_expand_metadata = {
-                "cache_seqlens": torch.zeros(
-                    max_bs * draft_token_num,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                "cu_seqlens_q": torch.arange(
-                    0,
-                    max_bs * draft_token_num + 1,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                "cu_seqlens_k": torch.zeros(
-                    max_bs * draft_token_num + 1,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-                "page_table": torch.zeros(
-                    max_bs * draft_token_num,
-                    draft_token_num,
-                    dtype=torch.int32,
-                    device=self.device,
-                ),
-            }
-
         if self.topk > 1:
             self.target_verify_metadata_topk_normal = {
                 "cache_seqlens": torch.zeros(
@@ -2710,42 +2529,7 @@ class FlashAttentionBackend(AttentionBackend):
                 self.decode_cuda_graph_metadata[bs] = metadata
 
         elif forward_mode.is_target_verify():
-            if self._has_compact_tree_mask(spec_info):
-                draft_token_num = self.speculative_num_draft_tokens
-                metadata.cache_seqlens_int32 = self.compact_tree_verify_metadata[
-                    "cache_seqlens"
-                ][:bs]
-                metadata.max_seq_len_q = draft_token_num
-                metadata.cu_seqlens_q = self.compact_tree_verify_metadata[
-                    "cu_seqlens_q"
-                ][: bs + 1]
-                metadata.cu_seqlens_k = self.compact_tree_verify_metadata[
-                    "cu_seqlens_k"
-                ][: bs + 1]
-                metadata.page_table = self.compact_tree_verify_metadata["page_table"][
-                    :bs
-                ]
-
-                num_tree_queries = bs * draft_token_num
-                metadata_expand.cache_seqlens_int32 = (
-                    self.compact_tree_verify_expand_metadata["cache_seqlens"][
-                        :num_tree_queries
-                    ]
-                )
-                metadata_expand.max_seq_len_q = 1
-                metadata_expand.cu_seqlens_q = self.compact_tree_verify_expand_metadata[
-                    "cu_seqlens_q"
-                ][: num_tree_queries + 1]
-                metadata_expand.cu_seqlens_k = self.compact_tree_verify_expand_metadata[
-                    "cu_seqlens_k"
-                ][: num_tree_queries + 1]
-                metadata_expand.page_table = self.compact_tree_verify_expand_metadata[
-                    "page_table"
-                ][:num_tree_queries]
-
-                self.compact_tree_verify_metadata[bs] = metadata
-                self.compact_tree_verify_expand_metadata[bs] = metadata_expand
-            elif self.topk <= 1:
+            if self.topk <= 1:
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
                 ][:bs]
@@ -3083,17 +2867,7 @@ class FlashAttentionBackend(AttentionBackend):
                         self._sched_meta_buf[n:] = 0
 
         elif forward_mode.is_target_verify():
-            if self._has_compact_tree_mask(spec_info):
-                metadata = self.compact_tree_verify_metadata[bs]
-                metadata_expand = self.compact_tree_verify_expand_metadata[bs]
-                self._fill_compact_tree_verify_metadata(
-                    metadata,
-                    metadata_expand,
-                    req_pool_indices,
-                    seq_lens,
-                    spec_info,
-                )
-            elif self.topk <= 1:
+            if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
                 ragged_layout = getattr(spec_info, "ragged_verify_layout", None)
                 if ragged_layout is not None:

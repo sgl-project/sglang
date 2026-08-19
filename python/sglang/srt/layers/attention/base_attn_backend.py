@@ -121,10 +121,6 @@ class AttentionBackend(ABC):
     # batch_size <= req_to_token_pool.size.
     extend_dummy_seqs_capped_by_req_pool: bool = False
 
-    # NGRAM precompute uses compact tree masks and does not publish a current
-    # seq_lens_cpu mirror. Backends must opt in after both paths are audited.
-    supports_ngram_gpu_only_seq_lens: bool = False
-
     # Most attention backends can rebuild and replace forward metadata before
     # every forward. BCG capture is different: some backends expose metadata
     # tensors to kernels across graph breaks, so the captured graph depends on

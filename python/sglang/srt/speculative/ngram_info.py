@@ -18,7 +18,6 @@ class NgramVerifyInput(SpecInput):
         retrieve_next_token: torch.Tensor = None,
         retrieve_next_sibling: torch.Tensor = None,
         draft_token_num: int = None,
-        is_compact_mask: bool = False,
         future_indices: Optional[torch.Tensor] = None,
         new_seq_lens: Optional[torch.Tensor] = None,
         accept_tokens: Optional[torch.Tensor] = None,
@@ -33,7 +32,6 @@ class NgramVerifyInput(SpecInput):
         self.retrieve_next_token = retrieve_next_token
         self.retrieve_next_sibling = retrieve_next_sibling
         self.draft_token_num = draft_token_num
-        self.is_compact_mask = is_compact_mask
         self.num_tokens_per_req = draft_token_num
         self.num_tokens_for_logprob_per_req = draft_token_num
 
@@ -63,9 +61,6 @@ class NgramVerifyInput(SpecInput):
         # Irregular tree: per-level branching follows the corpus matches.
         return -1
 
-    def get_compact_tree_mask(self) -> Optional[torch.Tensor]:
-        return self.custom_mask if self.is_compact_mask else None
-
     def generate_attn_arg_prefill(
         self,
         req_pool_indices: torch.Tensor,
@@ -73,11 +68,6 @@ class NgramVerifyInput(SpecInput):
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
     ):
-        if self.get_compact_tree_mask() is not None:
-            raise RuntimeError(
-                "Compact NGRAM masks require the FA3/FA4 attention backend."
-            )
-
         bs = len(req_pool_indices)
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
