@@ -12,7 +12,7 @@ from collections import OrderedDict, defaultdict
 from contextlib import asynccontextmanager
 from enum import IntEnum
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import numpy as np
@@ -1597,6 +1597,9 @@ class MMReceiverBase(ABC):
             encode_urls if encode_urls is not None else list(server_args.encoder_urls)
         )
         self.recv_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
+        # The event loop only keeps weak references to tasks; the encode
+        # dispatch below must not be collected while it is still in flight.
+        self._background_tasks: Set[asyncio.Task] = set()
         self.host = get_local_ip_auto(server_args.host)
         self.pp_rank = pp_rank
         self.tp_rank = tp_rank
@@ -1741,7 +1744,7 @@ class MMReceiverBase(ABC):
                 f"modalities={modalities}, num_items={len(mm_data)}"
             )
             send_time = time.monotonic()
-            asyncio.create_task(
+            encode_task = asyncio.create_task(
                 self.encode(
                     req_id,
                     mm_data,
@@ -1751,6 +1754,8 @@ class MMReceiverBase(ABC):
                     encode_urls=encode_urls,
                 )
             )
+            self._background_tasks.add(encode_task)
+            encode_task.add_done_callback(self._background_tasks.discard)
             result = await asyncio.wait_for(
                 self._recv_mm_data(req_id, recv_socket, mm_processor, prompt),
                 timeout=self.recv_timeout,
