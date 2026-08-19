@@ -49,7 +49,7 @@ def test_flashinfer_fused_topk_deepseek_rejects_outside_contract(params):
     [
         (256, 16, 4, 8),
         (256, 8, 5, 8),
-        (8, 8, 4, 8),
+        (512, 8, 4, 8),
     ],
 )
 def test_outside_contract_falls_back_without_calling_flashinfer(monkeypatch, params):
