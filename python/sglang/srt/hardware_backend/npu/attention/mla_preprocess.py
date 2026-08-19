@@ -368,6 +368,10 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
                 .contiguous()
                 .view(torch.float8_e8m0fnu)
             )
+        # pd 分离,decode需要释放重复的weight
+        from sglang.srt.server_args import get_global_server_args
+        if get_global_server_args().disaggregation_mode != "null":
+            qkv_weight.data.untyped_storage().resize_(0)
 
     def get_sin_cos(self, positions):
         cos_sin = self.rotary_emb.cos_sin_cache[positions]
