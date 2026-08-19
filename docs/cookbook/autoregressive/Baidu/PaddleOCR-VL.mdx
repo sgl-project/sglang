@@ -57,7 +57,9 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ## 1. Model Introduction
 
-**PaddleOCR-VL** is Baidu's compact document-parsing vision-language model: a NaViT-style dynamic-resolution SigLIP vision encoder feeding an **ERNIE-4.5-0.3B** language backbone, 0.9B parameters in total, released under **Apache 2.0**. It targets end-to-end page parsing — text, tables, formulas, charts, seals and reading order — across **109 languages**, and is small enough that a single GPU serves it comfortably.
+**PaddleOCR-VL** is Baidu's compact document-parsing vision-language model: a NaViT-style dynamic-resolution SigLIP vision encoder feeding an **ERNIE-4.5-0.3B** language backbone, 0.9B parameters in total, released under **Apache 2.0**. It recognizes text, tables, formulas, charts and seals across **109 languages**, and is small enough that a single GPU serves it comfortably.
+
+SGLang serves **this model**, which is the recognition stage of PaddleOCR's document-parsing pipeline — not the pipeline itself. Layout and region detection, cropping, reading order and the assembly of markdown or JSON stay in PaddleOCR, which calls a model endpoint once per region. That split is why the model is prompt-conditioned rather than instruction-following: the caller decides whether a crop is a table, a formula or a chart (§3.1), and SGLang is the backend that answers.
 
 All three releases share an identical `config.json` (same `PaddleOCRVLForConditionalGeneration` architecture, same tower and backbone dimensions), so one SGLang recipe serves every variant and only the model path changes.
 
@@ -175,6 +177,17 @@ PaddleOCR-VL exposes its capabilities through a small set of fixed prompts. Send
   </tbody>
 </table>
 
+Structured tasks answer in the model's own markup, not HTML: `Table Recognition:` returns OTSL-style cell tokens (`<fcel>` per cell, `<nl>` per row), so a caller that wants HTML or markdown converts them itself.
+
+<Accordion title="Table Recognition Output">
+
+```text Output
+<fcel>Methods<fcel>R<fcel>P<fcel>F<fcel>FPS<nl><fcel>SegLink [26]<fcel>70.0<fcel>86.0<fcel>77.0<fcel>8.9<nl><fcel>PixelLink [4]<fcel>73.2<fcel>83.0<fcel>77.8<fcel>-<nl><fcel>TextSnake [18]<fcel>73.9<fcel>83.2<fcel>78.3<fcel>1.1<nl>
+... (one <fcel> per cell, one <nl> per row, to the end of the table)
+```
+
+</Accordion>
+
 <Accordion title="OCR Request (Python)">
 
 ```python Example
@@ -191,7 +204,9 @@ response = client.chat.completions.create(
                 {"type": "text", "text": "OCR:"},
                 {
                     "type": "image_url",
-                    "image_url": {"url": "https://example.com/your_page.png"},
+                    "image_url": {
+                        "url": "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/release/2.9/doc/imgs_en/img_12.jpg"
+                    },
                 },
             ],
         }
@@ -207,7 +222,12 @@ print(response.choices[0].message.content)
 <Accordion title="Example Output">
 
 ```text Output
-Pending update — paste the server's verbatim output for your page here.
+ACKNOWLEDGEMENTS
+We would like to thank all the designers and contributors who have been involved in the
+production of this book; their contributions have been indispensable to its creation. We would
+also like to express our gratitude to all the producers for their invaluable opinions and
+assistance throughout this project. And to the many others whose names are not credited but
+have made specific input in this book, we thank you for your continuous support.
 ```
 
 </Accordion>
@@ -269,7 +289,30 @@ with ThreadPoolExecutor(max_workers=16) as pool:
 <Accordion title="Example Output">
 
 ```text Output
-Pending update — paste the server's verbatim output for your document here.
+--- page 1 ---
+(a) Total-Text
+(b) Total-Text
+(c) CTW1500
+(d) CTW1500
+
+Figure 8. Visual experimental results. The blue contours are boundary proposals, and the
+green contours are final detection boundaries.
+Table 6. Experimental results on CTW-1500.
+Methods
+Ext
+R
+P
+F
+FPS
+TextSnake [18]
+Syn
+85.3
+67.9
+75.6
+-
+... (page continues)
+--- page 2 ---
+... (one block per page, in page order)
 ```
 
 </Accordion>
