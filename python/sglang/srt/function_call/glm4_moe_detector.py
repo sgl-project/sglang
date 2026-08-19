@@ -101,6 +101,12 @@ def parse_arguments(
         if arg_type == "number" and isinstance(parsed_value, str):
             parsed_value = _convert_to_number(parsed_value)
 
+        # A string-typed parameter whose JSON value is not a string at all
+        # (an unquoted numeric id like 123 or 1_234) must not be coerced to
+        # an int: keep the raw text the model emitted.
+        if arg_type == "string" and not isinstance(parsed_value, str):
+            return json_value, True
+
         return parsed_value, True
     except (json.JSONDecodeError, ValueError):
         pass
@@ -112,6 +118,9 @@ def parse_arguments(
 
         if arg_type == "number" and isinstance(parsed_value, str):
             parsed_value = _convert_to_number(parsed_value)
+
+        if arg_type == "string" and not isinstance(parsed_value, str):
+            return json_value, True
 
         return parsed_value, True
     except (json.JSONDecodeError, ValueError, KeyError):
