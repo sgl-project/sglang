@@ -14,6 +14,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+    AttentionRequirements,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
@@ -31,6 +34,7 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     _modulate_gate,
     _reorder_grouped_qkv_to_qkv,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
 )
@@ -316,6 +320,45 @@ def test_online_fp8_keeps_fp32_boundaries_and_ignored_layers_unquantized():
         model.final_layer.audio_out,
     ):
         assert isinstance(layer.quant_method, UnquantizedLinearMethod)
+
+
+def test_deferred_attention_resolution_preserves_component_override():
+    _ensure_single_process_parallel_runtime()
+    target = (
+        "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
+        "get_component_forced_attn_backend"
+    )
+    with (
+        patch(target, return_value=AttentionBackendEnum.SAGE_ATTN_3),
+        torch.device("meta"),
+    ):
+        model = MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(),
+            hf_config={},
+            quant_config=None,
+        )
+
+    class FakeBackend:
+        @staticmethod
+        def get_enum():
+            return AttentionBackendEnum.SAGE_ATTN_3
+
+    resolver_target = (
+        "sglang.multimodal_gen.runtime.models.dits.minimax_h3.get_attn_backend"
+    )
+    with (
+        patch(resolver_target, return_value=FakeBackend) as get_attn_backend,
+        patch.object(model, "modules", return_value=[]),
+    ):
+        model._resolve_attention_backend_once()
+
+    get_attn_backend.assert_called_once_with(
+        model.arch.attention_head_dim,
+        torch.bfloat16,
+        selected_attention_backend=AttentionBackendEnum.SAGE_ATTN_3,
+        attention_requirements=AttentionRequirements(packed_varlen=True),
+    )
+    assert model._resolved_attention_backend is AttentionBackendEnum.SAGE_ATTN_3
 
 
 def test_sdpa_varlen_fallback_matches_naive_packed_reference():
