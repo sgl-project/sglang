@@ -2737,6 +2737,35 @@ mod tests {
         assert!(parsed.get("messages").is_some());
     }
 
+    /// Sampling defaults and forwarded `input_ids` must survive the same
+    /// injection. This is the Kimi-K3 / DeepSeek-V4 shape: those are the models
+    /// whose ingress render is forwarded as `input_ids`, so an injection that
+    /// handled only one of the two would leave the fleet-wide sampling defaults
+    /// silently unapplied on exactly the traffic that routes through an encoder.
+    #[test]
+    fn build_outgoing_body_injects_sampling_defaults_alongside_input_ids() {
+        let body =
+            Bytes::from_static(br#"{"model":"x","messages":[{"role":"user","content":"hi"}]}"#);
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids = [1u32, 2, 3];
+        let out = build_outgoing_body(
+            &body,
+            Some(value),
+            Some(&ids),
+            None,
+            None,
+            None,
+            Some(1000),
+            Some(0.95),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed.get("input_ids"), Some(&serde_json::json!([1, 2, 3])));
+        assert_eq!(parsed.get("top_k"), Some(&serde_json::json!(1000)));
+        assert_eq!(parsed.get("top_p"), Some(&serde_json::json!(0.95)));
+        assert!(parsed.get("messages").is_some());
+    }
+
     /// `default_when_absent` fills the configured default only when the request
     /// omitted the field (absent OR explicit `null`); a client value always wins.
     #[test]
