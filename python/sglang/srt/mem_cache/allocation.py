@@ -656,17 +656,15 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
 
-    if uses_page_granular_decode(batch, token_per_req):
-        page_size = _alloc_page_size(batch)
-        publish_decode_pages(batch, page_size)
+    page_granular = uses_page_granular_decode(batch, token_per_req)
+    if page_granular:
+        # The page is published whole when it opens, so this step's slot is
+        # already in the row -- gather it instead of allocating one.
+        publish_decode_pages(batch, _alloc_page_size(batch))
         out_cache_loc = batch.req_to_token_pool.req_to_token[
             batch.req_pool_indices, seq_lens_gpu
         ].to(torch.int64)
-        for req in batch.reqs:
-            req.kv.kv_allocated_len += token_per_req
-        return out_cache_loc
-
-    if _alloc_page_size(batch) == 1:
+    elif _alloc_page_size(batch) == 1:
         # Non-paged allocation
         out_cache_loc = alloc_token_slots(batch.tree_cache, bs * token_per_req)
     else:
@@ -685,23 +683,24 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
             batch=batch,
         )
 
-    # Write to req_to_token_pool
-    if batch.model_config.is_encoder_decoder:
-        locs = batch.encoder_lens + seq_lens_gpu
-    else:
-        locs = seq_lens_gpu.clone()
+    if not page_granular:
+        # Write to req_to_token_pool
+        if batch.model_config.is_encoder_decoder:
+            locs = batch.encoder_lens + seq_lens_gpu
+        else:
+            locs = seq_lens_gpu.clone()
 
-    batch.req_to_token_pool.write(
-        (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
-    )
-
-    # DSV4-NPU hook: no-op on non-DSV4 paths.
-    if _is_npu:
-        maybe_write_dsv4_decode(
-            batch,
-            batch.seq_lens_cpu + token_per_req,
-            token_per_req,
+        batch.req_to_token_pool.write(
+            (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
         )
+
+        # DSV4-NPU hook: no-op on non-DSV4 paths.
+        if _is_npu:
+            maybe_write_dsv4_decode(
+                batch,
+                batch.seq_lens_cpu + token_per_req,
+                token_per_req,
+            )
 
     for req in batch.reqs:
         req.kv.kv_allocated_len += token_per_req
