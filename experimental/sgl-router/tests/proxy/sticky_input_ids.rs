@@ -64,6 +64,8 @@ fn config() -> Config {
                 idle_secs: 3600,
                 eviction_interval_secs: 3600,
             }),
+            fused: None,
+            eligibility: None,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
