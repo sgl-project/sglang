@@ -29,16 +29,8 @@ def launch_engine(
     run_scheduler_process_func: Callable = run_scheduler_process,
     run_detokenizer_process_func: Callable = run_detokenizer_process,
 ):
-    """Create RayEngine subprocesses / SchedulerActors. Does not start HTTP.
-
-    Returns the ``_launch_subprocesses`` 5-tuple:
-    ``(tokenizer_manager, template_manager, port_args, scheduler_init_result,
-    subprocess_watchdog)``. ``scheduler_init_result.scheduler_actors`` are the
-    SchedulerActor handles.
-    """
+    """Create RayEngine subprocesses / SchedulerActors."""
     from sglang.srt.ray.engine import RayEngine
-
-    server_args.override("ray.http_server.clear_placement_group", placement_group=None)
 
     return RayEngine._launch_subprocesses(
         server_args,
