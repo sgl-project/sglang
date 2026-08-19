@@ -31,6 +31,7 @@ class DsparkDraftSampler:
         *,
         model,
         gamma,
+        num_drafts,
         max_bs,
         device,
         confidence_fn=None,
@@ -40,17 +41,18 @@ class DsparkDraftSampler:
         self.model = model
         self.markov_head = model.markov_head
         self.gamma = int(gamma)
+        self.num_drafts = int(num_drafts)
         max_bs = int(max_bs)
         if out is not None:
-            assert out.shape == (max_bs * self.gamma,) and out.dtype == torch.int64
+            assert out.shape == (max_bs * self.num_drafts,) and out.dtype == torch.int64
             self.out = out
         else:
             self.out = torch.empty(
-                (max_bs * self.gamma,), dtype=torch.int64, device=device
+                (max_bs * self.num_drafts,), dtype=torch.int64, device=device
             )
         self.confidence_fn = confidence_fn
         self.confidence_out = (
-            torch.empty((max_bs, self.gamma), dtype=torch.float32, device=device)
+            torch.empty((max_bs, self.num_drafts), dtype=torch.float32, device=device)
             if confidence_fn is not None
             else None
         )
@@ -69,7 +71,7 @@ class DsparkDraftSampler:
                 (max_bs, vocab), dtype=torch.float32, device=device
             )
             self.corrected_out = torch.empty(
-                (max_bs * self.gamma, vocab),
+                (max_bs * self.num_drafts, vocab),
                 dtype=model.lm_head.weight.dtype,
                 device=device,
             )
@@ -119,10 +121,12 @@ class DsparkDraftSampler:
             hidden_states=hidden_states.view(bs, self.gamma, -1),
             sampler=sampler,
         )
+        assert draft_tokens.shape == (bs, self.num_drafts)
         self.out[: draft_tokens.numel()].copy_(draft_tokens.reshape(-1))
         if self.folded_sampling:
-            self.corrected_out[: bs * self.gamma].copy_(
-                corrected_logits.reshape(bs * self.gamma, -1)
+            assert corrected_logits.shape[:2] == (bs, self.num_drafts)
+            self.corrected_out[: bs * self.num_drafts].copy_(
+                corrected_logits.reshape(bs * self.num_drafts, -1)
             )
         if self.confidence_out is not None:
             confidence = self.confidence_fn(
@@ -131,10 +135,11 @@ class DsparkDraftSampler:
                 draft_tokens=draft_tokens,
                 confidence_tap=confidence_tap,
             )
+            assert confidence.shape == (bs, self.num_drafts)
             self.confidence_out[:bs].copy_(confidence)
 
 
-def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
+def _resolve_folded_sampling(*, model, num_drafts, max_bs, device, tp_rank) -> bool:
     """The sampling buffers are baked into the captured draft graph, so AUTO
     must decide before capture from a free-memory probe."""
     mode = envs.SGLANG_DSPARK_FOLDED_SAMPLING.get()
@@ -144,7 +149,7 @@ def _resolve_folded_sampling(*, model, gamma, max_bs, device, tp_rank) -> bool:
         return True
     vocab = int(model.lm_head.org_vocab_size)
     noise_bytes = max_bs * vocab * 4
-    logits_bytes = max_bs * gamma * vocab * model.lm_head.weight.dtype.itemsize
+    logits_bytes = max_bs * num_drafts * vocab * model.lm_head.weight.dtype.itemsize
     need_gb = (noise_bytes + logits_bytes) / (1 << 30)
     available_gb = get_available_gpu_memory(
         device, torch.get_device_module().current_device()
@@ -168,6 +173,7 @@ def maybe_build_draft_sampler(
     *,
     draft_model,
     gamma: int,
+    num_drafts: int,
     max_bs: int,
     device,
     tp_rank: int,
@@ -189,7 +195,11 @@ def maybe_build_draft_sampler(
     if getattr(draft_model, "markov_head", None) is None:
         return _eager("no markov head")
     folded_sampling = _resolve_folded_sampling(
-        model=draft_model, gamma=gamma, max_bs=max_bs, device=device, tp_rank=tp_rank
+        model=draft_model,
+        num_drafts=num_drafts,
+        max_bs=max_bs,
+        device=device,
+        tp_rank=tp_rank,
     )
     if tp_rank == 0:
         logger.info(
@@ -199,6 +209,7 @@ def maybe_build_draft_sampler(
     return DsparkDraftSampler(
         model=draft_model,
         gamma=gamma,
+        num_drafts=num_drafts,
         max_bs=max_bs,
         device=device,
         confidence_fn=confidence_fn,
