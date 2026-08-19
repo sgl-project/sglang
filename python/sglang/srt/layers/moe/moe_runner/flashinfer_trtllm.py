@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextvars
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Generator, Optional, cast
@@ -44,6 +45,12 @@ from sglang.srt.utils.common import (
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
 logger = __import__("logging").getLogger(__name__)
+
+
+def _small_nvfp4_moe_enabled() -> bool:
+    """Opt-in gate for the experimental small-M CUTLASS path."""
+    return os.environ.get("SGLANG_NVFP4_SMALL_MOE", "0") == "1"
+
 
 _deferred_finalize_enabled: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "flashinfer_trtllm_deferred_finalize_enabled", default=False
@@ -936,6 +943,53 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
+
+    # The TRT-LLM path has already converted ModelOpt weights to the
+    # FlashInfer-compatible packed W4A4 representation ([Up; Gate]).  For the
+    # decode-sized shapes used by Qwen3.6, the small-M FlashInfer CUTLASS path
+    # avoids the relatively expensive TRT-LLM dispatch setup.  Keep this
+    # explicitly
+    # opt-in until it has been validated on a particular deployment.
+    if (
+        _small_nvfp4_moe_enabled()
+        and not quant_info.use_per_token_activation
+        and getattr(dispatch_output, "hidden_states_scale", None) is None
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.ndim == 2
+        and hidden_states.shape[0] <= 8
+        and hidden_states.shape[1] == 2048
+        and quant_info.intermediate_size_per_partition == 512
+        and quant_info.gemm1_clamp_limit is None
+        and not getattr(runner_config, "no_combine", False)
+        and TopKOutputChecker.format_is_standard(topk_output)
+        and topk_output.topk_ids.shape[1] <= 8
+    ):
+        from sglang.jit_kernel.nvfp4 import nvfp4_small_moe
+
+        # g1_scale_c = w2_input_scale_quant * g1_alphas_up.  Serialized
+        # ModelOpt checkpoints use a shared GEMM1 scale for gate/up, so this
+        # recovers the W2 input quantization scale without retaining another
+        # large parameter tensor in the runner metadata.
+        g2_scale = quant_info.g1_scale_c / quant_info.g1_alphas
+        output = nvfp4_small_moe(
+            hidden_states,
+            topk_output.topk_ids.to(torch.int32),
+            topk_output.topk_weights.to(torch.float32),
+            quant_info.w13_weight,
+            quant_info.w13_weight_scale,
+            quant_info.g1_alphas,
+            quant_info.w13_input_scale_quant,
+            quant_info.w2_weight,
+            quant_info.w2_weight_scale,
+            quant_info.g2_alphas,
+            g2_scale,
+            routed_scaling_factor=(
+                runner_config.routed_scaling_factor
+                if runner_config.routed_scaling_factor is not None
+                else 1.0
+            ),
+        )
+        return StandardCombineInput(hidden_states=output)
 
     # Quantize hidden states to FP4
     hidden_states_scale = (

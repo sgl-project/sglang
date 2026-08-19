@@ -131,6 +131,38 @@ def _jit_nvfp4_blockwise_moe_module() -> Module:
         )
 
 
+_nvfp4_small_moe_cutlass_params: dict[tuple, object] = {}
+
+
+def _get_nvfp4_small_moe_cutlass_params(
+    input: torch.Tensor, num_experts: int, intermediate_size: int
+):
+    """Return persistent grouped-CUTLASS metadata for a small-M shape."""
+    from sglang.srt.layers.moe.cutlass_moe_params import (
+        CutlassMoEParams,
+        CutlassMoEType,
+    )
+
+    key = (
+        input.device.type,
+        input.device.index,
+        num_experts,
+        intermediate_size,
+        input.shape[1],
+    )
+    params = _nvfp4_small_moe_cutlass_params.get(key)
+    if params is None:
+        params = CutlassMoEParams(
+            CutlassMoEType.BlockscaledFP4,
+            input.device,
+            num_experts=num_experts,
+            intermediate_size_per_partition=intermediate_size,
+            hidden_size=input.shape[1],
+        )
+        _nvfp4_small_moe_cutlass_params[key] = params
+    return params
+
+
 @debug_kernel_api
 def cutlass_scaled_fp4_mm(
     a: torch.Tensor,
@@ -211,6 +243,124 @@ def cutlass_fp4_group_mm(
         layout_sfa,
         layout_sfb,
     )
+    return output
+
+
+@debug_kernel_api
+def nvfp4_small_moe(
+    input: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w13: torch.Tensor,
+    w13_scales: torch.Tensor,
+    g1_alpha: torch.Tensor,
+    g1_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scales: torch.Tensor,
+    g2_alpha: torch.Tensor,
+    g2_scale: torch.Tensor,
+    gemm1_clamp: Optional[torch.Tensor] = None,
+    routed_scaling_factor: float = 1.0,
+    w1_up_first: bool = True,
+) -> torch.Tensor:
+    """Small-M routed NVFP4 W4A4 path backed by CUTLASS grouped GEMM.
+
+    Production calls use the same block-scaled Tensor Core grouped GEMM as the
+    regular CUTLASS MoE path; this is both numerically faithful to the W4A4
+    contract and fast enough for the M=1/2 decode workload.  ``w1_up_first``
+    selects whether W13 is stored as [Up; Gate] (the FlashInfer/ModelOpt
+    TRT-LLM layout) or the historical [Gate; Up] layout.
+    """
+    assert input.dtype == torch.bfloat16
+    assert input.ndim == 2 and input.shape[0] <= 8 and input.shape[1] == 2048
+    assert topk_ids.dtype == torch.int32 and topk_ids.ndim == 2
+    assert topk_weights.dtype == torch.float32
+    assert topk_weights.shape == topk_ids.shape
+    assert topk_ids.shape[1] <= 8
+    assert w13.dtype == torch.uint8 and w2.dtype == torch.uint8
+    assert w13.ndim == 3 and w13.shape[1:] == (1024, 1024)
+    assert w2.ndim == 3 and w2.shape[1:] == (2048, 256)
+    assert w13.shape[0] == w2.shape[0]
+    assert w13_scales.dtype == torch.float8_e4m3fn
+    assert w2_scales.dtype == torch.float8_e4m3fn
+    assert g1_alpha.dtype == torch.float32 and g2_alpha.dtype == torch.float32
+    assert g1_scale.dtype == torch.float32 and g2_scale.dtype == torch.float32
+    if gemm1_clamp is None:
+        gemm1_clamp = torch.empty(0, dtype=torch.float32, device=input.device)
+    else:
+        assert gemm1_clamp.dtype == torch.float32
+
+    if gemm1_clamp.numel() != 0:
+        raise NotImplementedError("small-M CUTLASS path does not support GEMM1 clamp")
+
+    if w1_up_first:
+        # FlashInfer's SM120 CUTLASS kernel is the production Tensor Core
+        # implementation for the already-packed [Up; Gate] ModelOpt layout.
+        # Keep this fast path here so callers can opt in without rebuilding or
+        # copying the several-hundred-megabyte expert weight tensors.
+        from flashinfer.fused_moe import cutlass_fused_moe
+        from flashinfer.fused_moe.core import ActivationType
+
+        quant_scales = [
+            g1_scale,
+            w13_scales.view(torch.int32),
+            g1_alpha,
+            g2_scale,
+            w2_scales.view(torch.int32),
+            g2_alpha,
+        ]
+        output = cutlass_fused_moe(
+            input=input,
+            token_selected_experts=topk_ids.to(torch.int),
+            token_final_scales=topk_weights,
+            fc1_expert_weights=w13.view(torch.long),
+            fc2_expert_weights=w2.view(torch.long),
+            output_dtype=input.dtype,
+            quant_scales=quant_scales,
+            input_sf=None,
+            tp_size=1,
+            tp_rank=0,
+            ep_size=1,
+            ep_rank=0,
+            tune_max_num_tokens=max(1, int(input.shape[0])),
+            activation_type=ActivationType.Swiglu,
+        )[0]
+        if routed_scaling_factor != 1.0:
+            output = output * routed_scaling_factor
+        return output
+
+    num_experts = int(w13.shape[0])
+    intermediate_size = int(w13.shape[1] // 2)
+    params = _get_nvfp4_small_moe_cutlass_params(input, num_experts, intermediate_size)
+
+    def _per_expert_scale(scale: torch.Tensor) -> torch.Tensor:
+        if scale.numel() == 1:
+            return scale.reshape(1).expand(num_experts).contiguous()
+        assert (
+            scale.numel() == num_experts
+        ), f"expected scalar or {num_experts} activation scales, got {tuple(scale.shape)}"
+        return scale.reshape(num_experts).contiguous()
+
+    from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
+
+    output = cutlass_moe_fp4(
+        input,
+        _per_expert_scale(g1_scale),
+        w13,
+        w13_scales,
+        g1_alpha,
+        _per_expert_scale(g2_scale),
+        w2,
+        w2_scales,
+        g2_alpha,
+        topk_weights,
+        topk_ids,
+        params,
+        no_combine=False,
+        w1_up_first=w1_up_first,
+    )
+    if routed_scaling_factor != 1.0:
+        output = output * routed_scaling_factor
     return output
 
 

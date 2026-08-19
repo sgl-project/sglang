@@ -361,6 +361,7 @@ def cutlass_moe_fp4(
     params: CutlassMoEParams,
     apply_router_weight_on_input: bool = False,
     no_combine: bool = False,
+    w1_up_first: bool = False,
 ):
     """
     MoE implementation for FP4 Inputs
@@ -468,6 +469,15 @@ def cutlass_moe_fp4(
         params.to_gemm1_args(),
     )
     del rep_a_fp4, rep_a_blockscale
+
+    if w1_up_first:
+        # Some ModelOpt/FlashInfer checkpoints store W13 as [Up; Gate],
+        # whereas the historical CUTLASS path consumes [Gate; Up].  Swap the
+        # small GEMM output instead of copying every expert weight tensor.
+        c1 = c1.reshape(m_a * num_topk, 2, params.intermediate_size_per_partition)
+        c1 = c1.flip(dims=[1]).reshape(
+            m_a * num_topk, 2 * params.intermediate_size_per_partition
+        )
 
     # fused: SiLU + mul then FP4 quant (expert-packed)
     int_fp4, int_blockscale = silu_and_mul_scaled_fp4_experts_quant_packed(
