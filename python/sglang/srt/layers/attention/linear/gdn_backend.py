@@ -350,13 +350,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
+        _mamba_cache = (
+            model_runner.req_to_token_pool.mamba_pool.mamba_cache
         )
-        if not is_cpu() and not is_npu():
-            assert (
-                self.conv_states_shape[-1] < FLA_CHUNK_SIZE
-            ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+        if _mamba_cache is not None:
+            self.conv_states_shape = _mamba_cache.conv[0].shape
+            if not is_cpu() and not is_npu():
+                assert (
+                    self.conv_states_shape[-1] < FLA_CHUNK_SIZE
+                ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+        else:
+            # Non-CUDA backends (e.g. MLX) do not allocate the mamba conv
+            # cache: the forward pass runs through the native backend
+            # (mlx_lm), not this Triton/CUDA linear-attention kernel, so
+            # there is no conv-state shape to read here.
+            self.conv_states_shape = None
 
         backends = model_runner.linear_attn_backends
         self.kernel_dispatcher = GDNKernelDispatcher(
