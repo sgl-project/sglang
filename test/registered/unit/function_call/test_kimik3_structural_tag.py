@@ -412,6 +412,119 @@ def test_strict_schema_handles_one_sided_negative_integer_minimum():
         )
 
 
+def test_strict_schema_relaxes_non_ascii_property_names():
+    """A declared non-ASCII property name is unsatisfiable in xgrammar, so the
+    argument falls back to the bare type instead of an impossible grammar."""
+    key = "abc\U0001f60a"
+    tool = Tool(
+        type="function",
+        function=Function(
+            name="submit",
+            strict=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "type": "object",
+                        "properties": {key: {"type": "string"}},
+                        "required": [key],
+                        "additionalProperties": False,
+                    }
+                },
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        ),
+    )
+    grammar = _grammar([tool], tool_choice="required")
+
+    for spelling in (
+        json.dumps({key: ""}),
+        json.dumps({key: ""}, ensure_ascii=False),
+    ):
+        assert _accepts(
+            grammar,
+            _tools_section(_call("submit", 1, _argument("value", "object", spelling))),
+        ), spelling
+    # ASCII siblings keep their constraint: a wrong type is still refused.
+    assert not _accepts(
+        grammar,
+        _tools_section(_call("submit", 1, _argument("value", "number", "1"))),
+    )
+
+
+def test_unreferenced_definition_does_not_relax_other_arguments():
+    tool = Tool(
+        type="function",
+        function=Function(
+            name="submit",
+            strict=True,
+            parameters={
+                "type": "object",
+                "properties": {"amount": {"$ref": "#/$defs/Money"}},
+                "required": ["amount"],
+                "additionalProperties": False,
+                "$defs": {
+                    "Money": {"type": "integer"},
+                    # Never referenced by any argument of this tool.
+                    "Loc": {
+                        "type": "object",
+                        "properties": {
+                            "\u0433\u043e\u0440\u043e\u0434\u0435": {"type": "string"}
+                        },
+                    },
+                },
+            },
+        ),
+    )
+    grammar = _grammar([tool], tool_choice="required")
+
+    assert _accepts(
+        grammar, _tools_section(_call("submit", 1, _argument("amount", "number", "5")))
+    )
+    # Still constrained: the relaxation did not leak across from `Loc`.
+    assert not _accepts(
+        grammar,
+        _tools_section(_call("submit", 1, _argument("amount", "string", "five"))),
+    )
+
+
+def test_strict_schema_keeps_ascii_property_names_constrained():
+    tool = Tool(
+        type="function",
+        function=Function(
+            name="submit",
+            strict=True,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "type": "object",
+                        "properties": {"only": {"type": "string"}},
+                        "required": ["only"],
+                        "additionalProperties": False,
+                    }
+                },
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        ),
+    )
+    grammar = _grammar([tool], tool_choice="required")
+    assert _accepts(
+        grammar,
+        _tools_section(
+            _call("submit", 1, _argument("value", "object", '{"only": "x"}'))
+        ),
+    )
+    assert not _accepts(
+        grammar,
+        _tools_section(
+            _call("submit", 1, _argument("value", "object", '{"other": "x"}'))
+        ),
+    )
+
+
 def test_strict_schema_preserves_additional_properties_default():
     tool = Tool(
         type="function",
