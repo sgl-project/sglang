@@ -4354,6 +4354,8 @@ class Scheduler(
         # Requested via env var but silently downgraded when FDFO is off, so
         # report what the scheduler actually resolved rather than what was asked.
         ret["dllm_mixed_batch_enabled"] = self.dllm_mixed_batch_enabled
+        ret["dllm_num_rounds"] = self.dllm_num_rounds
+        ret["dllm_num_mixed_rounds"] = self.dllm_num_mixed_rounds
 
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager

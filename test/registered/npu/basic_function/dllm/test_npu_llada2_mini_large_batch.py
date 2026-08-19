@@ -31,13 +31,25 @@ MAX_RUNNING_REQUESTS = 64
 
 
 def assert_mixed_rounds(test, expected: bool):
-    """The flag is requested by env var but downgraded when FDFO is off, so the
-    only honest check is what the scheduler resolved -- otherwise a test that
-    fails to pass the flag through looks identical to one that passes it."""
+    """Assert on what the scheduler actually built, not just what it resolved.
+
+    ``dllm_mixed_batch_enabled`` is a startup constant: a server that resolved
+    it to True but never put a prefill row and a decode row in the same round
+    would satisfy it identically. ``dllm_num_mixed_rounds`` counts the rounds
+    whose can_run_list held both phases, so it separates the two. Call this
+    after traffic has flowed -- on an idle server every counter is 0.
+    """
     states = requests.get(test.base_url + "/server_info").json()["internal_states"]
     test.assertTrue(states, "server reported no internal states")
     for state in states:
         test.assertEqual(state["dllm_mixed_batch_enabled"], expected)
+        test.assertGreater(state["dllm_num_rounds"], 0, "no dLLM round was scheduled")
+        if expected:
+            test.assertGreater(
+                state["dllm_num_mixed_rounds"], 0, "no round mixed the two phases"
+            )
+        else:
+            test.assertEqual(state["dllm_num_mixed_rounds"], 0)
 
 
 _LARGE_BATCH_ARGS = [
@@ -68,7 +80,11 @@ class TestLLaDA2MiniLargeBatch(GSM8KAscendMixin, CustomTestCase):
     gsm8k_parallel = MAX_RUNNING_REQUESTS
     accuracy = 0.88
 
-    def test_resolved_mixed_round_mode(self):
+    def test_gsm8k(self):
+        # Override rather than assert in a sibling test method: the round
+        # counters only mean something after traffic, and unittest's
+        # alphabetical ordering is not a contract to lean on.
+        super().test_gsm8k()
         assert_mixed_rounds(self, False)
 
 
@@ -88,7 +104,11 @@ class TestLLaDA2MiniMixedRound(GSM8KAscendMixin, CustomTestCase):
     # than through envs.override() in setUpClass.
     env = {**GSM8KAscendMixin.env, "SGLANG_ENABLE_DLLM_MIXED_BATCH": "1"}
 
-    def test_resolved_mixed_round_mode(self):
+    def test_gsm8k(self):
+        # Override rather than assert in a sibling test method: the round
+        # counters only mean something after traffic, and unittest's
+        # alphabetical ordering is not a contract to lean on.
+        super().test_gsm8k()
         assert_mixed_rounds(self, True)
 
 
