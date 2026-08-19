@@ -2176,9 +2176,22 @@ class DeepseekV4DecoderLayer(nn.Module):
             if moe_a2a_backend.is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
-                assert moe_a2a_backend.is_deepep() or moe_a2a_backend.is_megamoe(), (
-                    "CP requires DeepEP or megaMoE "
-                    "(moe_a2a_backend == deepep or megamoe). "
+                # No CP gather/combine here: these backends route this rank's
+                # own CP token slice through their own a2a. deepep and mori
+                # both take DeepseekV2MoE.forward_deepep, whose combine returns
+                # complete (not partial) per-token outputs, so no cross-rank SUM
+                # follows. That also makes the replicated TP1 shared expert that
+                # is_mori() forces on safe here: forward_deepep adds it once, on
+                # local rows, with nothing downstream to sum it per rank.
+                # megamoe is intercepted earlier by should_use_mega_moe and does
+                # its own CP-aware combine.
+                assert (
+                    moe_a2a_backend.is_deepep()
+                    or moe_a2a_backend.is_megamoe()
+                    or moe_a2a_backend.is_mori()
+                ), (
+                    "CP requires DeepEP, megaMoE or MoRI "
+                    "(moe_a2a_backend == deepep, megamoe or mori). "
                     f"Got {moe_a2a_backend.value}."
                 )
         elif _use_tp_moe_gather:

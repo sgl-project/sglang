@@ -7072,7 +7072,15 @@ class ServerArgs:
                 )
 
     def _required_mori_dispatch_tokens_per_rank(self) -> int:
-        """Max tokens a single rank dispatches through MoRI in one forward."""
+        """Max tokens a single rank dispatches through MoRI in one forward.
+
+        Deliberately NOT divided by attn_cp_size under prefill CP. CP normally
+        gives each rank chunked_prefill_size / attn_cp_size rows, but the split
+        is per-batch: ``can_dsa_cp_split`` falls back to a plain replicated
+        prefill whenever a sequence is shorter than the split threshold, and in
+        that fallback every rank dispatches the full chunk. The bound has to
+        cover the fallback, so it stays at chunked_prefill_size.
+        """
         return self.chunked_prefill_size
 
     def _required_pplx_dispatch_tokens_per_rank(self) -> int:
