@@ -91,8 +91,8 @@ async def simulator_get_request(
     slowdown_factor: float = 1.0,
 ) -> AsyncGenerator[DatasetRow, None]:
     """Generate simulator traffic while retaining official BLOCKING pacing."""
-    # SGLang v0.5.16 parses --use-trace-timestamps but its benchmark() does not
-    # forward the value to get_request(). Preserve it in our entry point.
+    # The benchmark may not forward --use-trace-timestamps to get_request(),
+    # so preserve the parsed value in this adapter.
     use_trace_timestamps = use_trace_timestamps or _USE_TRACE_TIMESTAMPS
     if _SIMULATOR_MODE == "blocking":
         async for request in _ORIGINAL_GET_REQUEST(
@@ -244,6 +244,8 @@ def _simulator_argument_parser(base_parser):
                 and "autobench" not in choices
             ):
                 kwargs["choices"] = [*choices, "autobench"]
+            if "--warmup-requests" in name_or_flags:
+                kwargs["default"] = 0
             return super().add_argument(*name_or_flags, **kwargs)
 
     return SimulatorArgumentParser

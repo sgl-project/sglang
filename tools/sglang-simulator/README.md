@@ -5,6 +5,14 @@ replacing model forward execution with a latency predictor. It supports
 timestamped trace replay, synthetic workloads, hierarchical cache simulation,
 and serving-compatible metrics without loading model weights.
 
+## Compatibility
+
+SGLang Simulator tracks the current SGLang `main` branch and maintains
+compatibility with the two most recent SGLang releases. For the current
+integration, the maintained release pair is `v0.5.16` and `v0.5.17`.
+Compatibility code uses API and capability checks instead of branching on
+version numbers.
+
 ## Requirements
 
 - A compatible SGLang checkout. The simulator uses the SGLang source from the
@@ -107,7 +115,6 @@ python3 -m sglang_simulator.simulation.bench_serving \
   --dataset-path /absolute/path/to/trace.jsonl \
   --use-trace-timestamps \
   --num-prompts 100 \
-  --warmup-requests 0 \
   --profile \
   --output-file "$SIMULATOR_OUTPUT_DIR/benchmark.json"
 ```
@@ -120,7 +127,15 @@ table and output file. If the benchmark points at another directory, it may show
 unrelated stale metrics or client wall-clock values. Use the same fresh path in
 both terminals for every run.
 
-Server options are normal SGLang command-line arguments. For direct Python
+The simulator always runs the SGLang runtime with `tp_size=ep_size=dp_size=pp_size=1`
+and both attention/decode context-parallel sizes set to `1`. Parallel CLI options
+accepted by SGLang are therefore ignored by this simulator entry point. This keeps
+simulator-only CPU work single-process; it does not change the modeled deployment.
+Set the real deployment topology under `scheduler` in `--sim-config-path`. That
+topology drives predictor and cache-resource modeling without launching physical
+parallel workers.
+
+Other server options are normal SGLang command-line arguments. For direct Python
 integration, see
 [`test_simulation_sglang_runner.py`](test/test_simulation_sglang_runner.py); for the
 process/HTTP path, see
@@ -158,9 +173,12 @@ A simulator configuration has three sections:
     "database_path": "/absolute/path/to/replay_table.json"
   },
   "scheduler": {
-    "tp_size": 1,
-    "ep_size": 1,
+    "tp_size": 4,
+    "ep_size": 4,
     "dp_size": 1,
+    "pp_size": 1,
+    "cp_size": 1,
+    "cp_style": "none",
     "data_type": "BF16",
     "kv_cache_data_type": "BF16",
     "backend_name": "sglang"
@@ -170,8 +188,13 @@ A simulator configuration has three sections:
 
 - `platform` describes the simulated accelerator and storage bandwidth.
 - `predictor` selects forward-latency prediction.
-- `scheduler` describes target parallelism and backend metadata. It does not
-  launch physical tensor-parallel workers.
+- `scheduler` describes the real target deployment topology and backend metadata.
+  `tp_size`, `ep_size`, `dp_size`, `pp_size`, and `cp_size` are modeled values;
+  they do not launch physical workers. For AIConfigurator, `tp_size` is converted
+  to attention TP after removing modeled DP and CP, while `cp_size` is passed as
+  AIConfigurator context parallelism. `cp_style` uses the AIConfigurator values
+  such as `none`, `allgather`, `ulysses`, or `ring`. Decode-only `dcp_size` has no
+  separate AIConfigurator field and is not modeled yet.
 
 ### Prefix-cache accuracy
 

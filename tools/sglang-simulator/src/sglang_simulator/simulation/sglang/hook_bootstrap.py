@@ -57,8 +57,8 @@ def run_simulator_scheduler_process(*args, **kwargs):
     """Spawn-safe scheduler entry point which installs SGLang Simulator before SGLang imports."""
     install_simulator_hooks()
 
-    # Import only after hook installation. SGLang v0.5.16 forces the spawn start
-    # method, so parent-process monkey patches are not inherited by the scheduler.
+    # Spawned workers do not inherit parent-process monkey patches, so import
+    # the scheduler only after installing hooks in this process.
     from sglang.srt.managers.scheduler import run_scheduler_process
 
     return run_scheduler_process(*args, **kwargs)
@@ -68,8 +68,8 @@ def run_simulator_detokenizer_process(*args, **kwargs):
     """Spawn-safe detokenizer entry point which installs SGLang Simulator before imports."""
     install_simulator_hooks()
 
-    # Detokenizer imports schedule_batch and memory_pool on v0.5.16. Installing
-    # hooks first keeps this CPU-only process from loading real GPU kernels.
+    # Install hooks before transitive schedule_batch and memory_pool imports
+    # so this CPU-only process does not load real GPU kernels.
     from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 
     return run_detokenizer_process(*args, **kwargs)

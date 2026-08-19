@@ -6,7 +6,7 @@ import time
 from dataclasses import asdict
 from typing import Any
 
-from sglang_simulator.compat import override_server_args
+from sglang_simulator.compat import validate_simulator_server_args
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
@@ -294,19 +294,13 @@ class C_SchedulerHook(BaseHook):
 
         def wrapped_init(self, *args, **kwargs):
             logger.info(simulation_mode_log_message(C_SchedulerHook.SIM_MODE))
-            # Disable overlap schedule
+            # Supported entry points prepare the final config before publication.
             server_args = get_obj_from_args(
                 "sglang.srt.server_args.ServerArgs", *args, **kwargs
             )
+            validate_simulator_server_args(server_args)
             C_SchedulerHook.OVERLAP_SCHEDULE = not getattr(
                 server_args, "disable_overlap_schedule", False
-            )
-            override_server_args(
-                server_args,
-                disable_overlap_schedule=True,
-                attention_backend="torch_native",
-                prefill_attention_backend="torch_native",
-                decode_attention_backend="torch_native",
             )
             logger.debug(
                 f"Overlap schedule simulation mode: {C_SchedulerHook.OVERLAP_SCHEDULE}."
@@ -350,11 +344,10 @@ class C_SchedulerHook(BaseHook):
                 time.perf_counter() - start
             )
 
-            # v0.5.16 returns NextBatchPlan instead of ScheduleBatch directly.
+            # Accept both a plan wrapper and a direct batch return value.
             new_batch = getattr(result, "batch_to_run", result)
 
-            # NextBatchPlan carries the running batch as a return value.  self.running_batch
-            # is not updated until get_new_batch_prefill() returns to the scheduler.
+            # A plan reports the running batch before self.running_batch is updated.
             running_batch = getattr(result, "running_batch", self.running_batch)
 
             now = time.time()
@@ -417,8 +410,7 @@ class C_SchedulerHook(BaseHook):
                     for req in batch.reqs:
                         extend_length = getattr(req, "extend_input_len", None)
                         if extend_length is None:
-                            # v0.5.16 replaced extend_input_len with an
-                            # explicit half-open token range.
+                            # The range API represents extend tokens as a half-open interval.
                             extend_length = req.extend_range.length
                         simulation_batch.reqs.append(
                             ScheduleRequest(
@@ -482,17 +474,8 @@ class C_SchedulerHook(BaseHook):
                 hicache_l2_load_stats = StateManager.pop_hicache_l2_load_stats()
                 hicache_l2_backup_dur = StateManager.pop_hicache_l2_backup_dur()
                 current_inference_dur = StateManager.get_current_inference_dur()
-                # Experimental DSv4 approximation: real H2D load is pipelined
-                # layer-by-layer with forward. Keep reported l2_load_latency raw,
-                # but only expose roughly one layer of load on the sim clock.
-                HICACHE_LAYERWISE_LOAD_DIVISOR = float(
-                    os.environ.get("HICACHE_LAYERWISE_LOAD_DIVISOR", "1.0")
-                )
-                effective_hicache_l2_load_dur = (
-                    hicache_l2_load_dur / HICACHE_LAYERWISE_LOAD_DIVISOR
-                )
                 visible_l2_load_dur = effective_l2_load_delay(
-                    effective_hicache_l2_load_dur,
+                    hicache_l2_load_dur,
                     StateManager.get_last_inference_dur(),
                     C_SchedulerHook.OVERLAP_SCHEDULE,
                 )
@@ -501,12 +484,8 @@ class C_SchedulerHook(BaseHook):
                     visible_l2_load_dur,
                 )
 
-                if C_SchedulerHook.OVERLAP_SCHEDULE:
-                    StateManager.step_global_clock(visible_l2_load_dur)
-                    StateManager.step_global_clock(current_inference_dur)
-                else:
-                    StateManager.step_global_clock(visible_l2_load_dur)
-                    StateManager.step_global_clock(current_inference_dur)
+                StateManager.step_global_clock(visible_l2_load_dur)
+                StateManager.step_global_clock(current_inference_dur)
                 # Step CPU overhead BEFORE recording latencies,
                 # so current iter's CPU time is reflected in current iter's TTFT.
                 now = time.time()
@@ -649,5 +628,4 @@ class C_SchedulerHook(BaseHook):
         target.init_request_dispatcher = wrapped_init_request_dispatcher
 
         if original_recv_requests:
-            # version <= 0.5.12.post1
             target.recv_requests = wrapped_recv_requests

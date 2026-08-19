@@ -24,6 +24,8 @@ class SchedulerConfig:
     ep_size: int = 1
     dp_size: int = 1
     pp_size: int = 1
+    cp_size: int = 1
+    cp_style: str = "none"
 
     # DSv4 KV cache calculator inputs (sourced from server_args)
     page_size: Optional[int] = None
@@ -47,7 +49,13 @@ class SchedulerConfig:
 
     @property
     def attn_tp_size(self) -> int:
-        return self.tp_size / self.dp_size
+        divisor = self.dp_size * self.cp_size
+        if self.tp_size % divisor != 0:
+            raise ValueError(
+                "tp_size must be divisible by dp_size * cp_size: "
+                f"{self.tp_size} % ({self.dp_size} * {self.cp_size}) != 0"
+            )
+        return self.tp_size // divisor
 
     @property
     def attn_dp_size(self) -> int:
@@ -55,7 +63,12 @@ class SchedulerConfig:
 
     @property
     def moe_tp_size(self) -> int:
-        return self.tp_size / self.ep_size
+        if self.tp_size % self.ep_size != 0:
+            raise ValueError(
+                "tp_size must be divisible by ep_size: "
+                f"{self.tp_size} % {self.ep_size} != 0"
+            )
+        return self.tp_size // self.ep_size
 
     @property
     def moe_ep_size(self) -> int:

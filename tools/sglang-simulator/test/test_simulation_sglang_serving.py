@@ -85,7 +85,6 @@ class SGLangServingRunner:
             f"--simulator-mode={self.mode}",
             "--backend=sglang",
             f"--base-url={self.base_url}",
-            "--warmup-requests=0",
             f"--model={ASSETS / 'qwen3-8b'}",
             f"--tokenizer={EXAMPLES / 'assets' / 'tokenizer'}",
             "--num-prompts=3",

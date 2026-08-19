@@ -94,6 +94,9 @@ jobs:
               - "test/**/!(*.md)"
               - "rust/**"
               - "proto/sglang/runtime/v1/sglang.proto"
+            simulator:
+              - ".github/workflows/pr-test-extra.yml"
+              - ".github/workflows/_pr-test-simulator-cpu.yml"
               - "tools/sglang-simulator/**/!(*.md)"
             multimodal_gen:
               - ".github/workflows/pr-test.yml"

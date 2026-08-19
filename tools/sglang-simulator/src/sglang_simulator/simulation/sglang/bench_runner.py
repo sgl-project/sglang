@@ -6,7 +6,7 @@ from dataclasses import asdict
 from typing import Iterator
 
 import numpy as np
-from sglang_simulator.compat import override_server_args
+from sglang_simulator.compat import apply_simulator_server_args
 from sglang_simulator.dataset import (
     BaseDataset,
     GenericRequest,
@@ -50,9 +50,10 @@ class SGLangSimulationEngine(Engine):
 class SGLangBenchmarkRunner(BaseBenchmarkRunner):
     def __init__(self, server_args: ServerArgs):
         # disable some features which is not necessary for simulation.
-        override_server_args(server_args, disable_cuda_graph=True)
-        self.server_args = server_args
-        self.engine = SGLangSimulationEngine(**asdict(server_args))
+        server_args_kwargs = asdict(server_args)
+        apply_simulator_server_args(server_args_kwargs)
+        self.engine = SGLangSimulationEngine(**server_args_kwargs)
+        self.server_args = self.engine.server_args
         self._shutdown = False
 
     def flush_cache(self):

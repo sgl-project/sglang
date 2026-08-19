@@ -104,6 +104,8 @@ def get_perf_model(
         moe_tp_size=sched_config.moe_tp_size,
         moe_ep_size=sched_config.moe_ep_size,
         attention_dp_size=sched_config.attn_dp_size,
+        cp_size=sched_config.cp_size,
+        cp_style=sched_config.cp_style,
         gemm_quant_mode=MAP_DTYPE_TO_GEMMQuantMode.get(
             sched_config.data_type, GEMMQuantMode.bfloat16
         ),

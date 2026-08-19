@@ -68,6 +68,23 @@ class C_ModelRunnerHook(BaseHook):
             return None
 
         def wrapped_init_attention_backends(self):
+            try:
+                from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
+                    resolve_attention_backend_strs,
+                )
+            except ImportError:
+                default_backend = self.server_args.attention_backend
+                self.prefill_attention_backend_str = (
+                    self.server_args.prefill_attention_backend or default_backend
+                )
+                self.decode_attention_backend_str = (
+                    self.server_args.decode_attention_backend or default_backend
+                )
+            else:
+                resolved = resolve_attention_backend_strs(model_runner=self)
+                self.prefill_attention_backend_str = resolved.prefill
+                self.decode_attention_backend_str = resolved.decode
+
             self.attn_backend = None
             self.decode_attn_backend = None
             self.decode_attn_backend_group = None
