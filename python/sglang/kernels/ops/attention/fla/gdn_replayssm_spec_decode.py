@@ -789,20 +789,12 @@ def gdn_replayssm_compact_commit_kernel(
         active_g = tl.where(active_mask, gates, 0.0)
         active_prefix = tl.cumsum(active_g, axis=0)
         active_total = tl.sum(active_g, axis=0)
-        active_decay = tl.where(
-            active_mask, tl.exp(active_total - active_prefix), 0.0
-        )
-        active_updates = (updates * active_decay[:, None]).to(
-            k_cache.dtype.element_ty
-        )
-        active_delta = tl.dot(
-            tl.trans(keys), active_updates, input_precision="ieee"
-        )
+        active_decay = tl.where(active_mask, tl.exp(active_total - active_prefix), 0.0)
+        active_updates = (updates * active_decay[:, None]).to(k_cache.dtype.element_ty)
+        active_delta = tl.dot(tl.trans(keys), active_updates, input_precision="ieee")
         tl.store(
             p_h0,
-            (old_state * tl.exp(active_total) + active_delta).to(
-                p_h0.dtype.element_ty
-            ),
+            (old_state * tl.exp(active_total) + active_delta).to(p_h0.dtype.element_ty),
             mask=mask_v[None, :],
         )
 
@@ -812,24 +804,18 @@ def gdn_replayssm_compact_commit_kernel(
             track_g = tl.where(track_mask, gates, 0.0)
             track_prefix = tl.cumsum(track_g, axis=0)
             track_total = tl.sum(track_g, axis=0)
-            track_decay = tl.where(
-                track_mask, tl.exp(track_total - track_prefix), 0.0
-            )
+            track_decay = tl.where(track_mask, tl.exp(track_total - track_prefix), 0.0)
             track_updates = (updates * track_decay[:, None]).to(
                 k_cache.dtype.element_ty
             )
-            track_delta = tl.dot(
-                tl.trans(keys), track_updates, input_precision="ieee"
-            )
+            track_delta = tl.dot(tl.trans(keys), track_updates, input_precision="ieee")
             tl.store(
                 h0
                 + track_idx * stride_state_slot
                 + i_hv * V * K
                 + o_v[None, :] * K
                 + o_k[:, None],
-                (old_state * tl.exp(track_total) + track_delta).to(
-                    h0.dtype.element_ty
-                ),
+                (old_state * tl.exp(track_total) + track_delta).to(h0.dtype.element_ty),
                 mask=mask_v[None, :],
             )
 
