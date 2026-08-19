@@ -757,13 +757,12 @@ def forward_dsa_core_npu(
         and not forward_batch.forward_mode.is_draft_extend_v2()
         and not forward_batch.forward_mode.is_target_verify()
     ):
-        attn_output = attn_output.transpose(0, 1)
-        torch.bmm(
+        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
             attn_output,
             m.w_vc,
-            out=attn_bmm_output.view(-1, m.num_local_heads, m.v_head_dim).transpose(
-                0, 1
-            ),
+            perm_x1=(1, 0, 2),
+            perm_x2=(0, 1, 2),
+            perm_y=(1, 0, 2),
         )
     else:
         attn_output = attn_output.contiguous()
