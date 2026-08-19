@@ -1079,6 +1079,11 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
+        if (
+            getattr(self.hf_config, "model_type", None) == "glm5_next"
+            or getattr(self.hf_text_config, "model_type", None) == "glm5_next_text"
+        ) and not getattr(self.hf_text_config, "mhc", False):
+            hc_mult = 1
         # mHC-flattened hidden size; None when not running an mHC model
         # (e.g. non-DeepSeek-V4 configs without ``hc_mult``).
         self.hc_hidden_size = self.hidden_size * hc_mult if hc_mult > 1 else None
