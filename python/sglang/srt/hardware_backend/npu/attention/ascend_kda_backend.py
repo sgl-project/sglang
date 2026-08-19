@@ -10,6 +10,10 @@ from sgl_kernel_npu.fla.kda_prefill import (
     chunk_gla_fwd_o_gk_npu,
     recompute_w_u_fwd_npu,
 )
+from sgl_kernel_npu.fla.kda_ragged import (
+    gather_kda_verify_output_npu,
+    scatter_kda_verify_inputs_npu,
+)
 from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
 from sgl_kernel_npu.fla.solve_tril import solve_tril_npu
 from sgl_kernel_npu.fla.utils import prepare_chunk_indices
@@ -447,15 +451,25 @@ class AscendKDAAttnBackend(KDAAttnBackend):
                 if envs.SGLANG_NPU_REUSE_KDA_VERIFY_METADATA.get():
                     self._dense_token_indices = dense_token_indices
                     self._dense_token_indices_key = dense_indices_key
-            dense_qkv = self._scatter_tokens_to_dense(
-                mixed_qkv, dense_token_indices, num_dense_tokens
-            ).view(batch_size, draft_token_num, -1)
-            dense_a = self._scatter_gate_to_dense(
-                a, dense_token_indices, num_dense_tokens
-            )
-            dense_b = self._scatter_gate_to_dense(
-                b, dense_token_indices, num_dense_tokens
-            )
+            if envs.SGLANG_NPU_FUSED_KDA_RAGGED_IO.get():
+                dense_qkv, dense_a, dense_b = scatter_kda_verify_inputs_npu(
+                    mixed_qkv,
+                    a,
+                    b,
+                    query_start_loc,
+                    draft_token_num=draft_token_num,
+                )
+                dense_qkv = dense_qkv.view(batch_size, draft_token_num, -1)
+            else:
+                dense_qkv = self._scatter_tokens_to_dense(
+                    mixed_qkv, dense_token_indices, num_dense_tokens
+                ).view(batch_size, draft_token_num, -1)
+                dense_a = self._scatter_gate_to_dense(
+                    a, dense_token_indices, num_dense_tokens
+                )
+                dense_b = self._scatter_gate_to_dense(
+                    b, dense_token_indices, num_dense_tokens
+                )
 
         intermediate_indices = self.verify_intermediate_state_indices[:batch_size]
         conv_states = cache.conv[0]
@@ -529,6 +543,8 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         )
         if dense_token_indices is None:
             return out
+        if envs.SGLANG_NPU_FUSED_KDA_RAGGED_IO.get():
+            return gather_kda_verify_output_npu(out, dense_token_indices)
         padded_out = out.new_zeros(1, num_dense_tokens + 1, *out.shape[2:])
         padded_out[:, :num_dense_tokens] = out
         return padded_out[:, dense_token_indices]
