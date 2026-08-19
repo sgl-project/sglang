@@ -729,6 +729,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         None
     };
 
+    if let Some(configured) = config.router_config.source_label_header.as_deref() {
+        match configured.parse::<http::HeaderName>() {
+            Ok(header) => {
+                if !metrics::set_source_label_header(header) {
+                    warn!("Ignoring --source-label-header '{configured}': a different header is already active in this process");
+                }
+            }
+            Err(_) => {
+                warn!("Ignoring --source-label-header '{configured}': not a valid HTTP header name")
+            }
+        }
+    }
+
     if let Some(prometheus_config) = &config.prometheus_config {
         metrics::start_prometheus(prometheus_config.clone());
     }

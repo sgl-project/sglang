@@ -33,6 +33,7 @@ pub struct RouterConfig {
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub request_id_headers: Option<Vec<String>>,
+    pub source_label_header: Option<String>,
     #[serde(default = "default_pool_idle_timeout_secs")]
     pub pool_idle_timeout_secs: u64,
     #[serde(default = "default_connect_timeout_secs")]
@@ -521,6 +522,7 @@ impl Default for RouterConfig {
             log_dir: None,
             log_level: None,
             request_id_headers: None,
+            source_label_header: None,
             pool_idle_timeout_secs: default_pool_idle_timeout_secs(),
             connect_timeout_secs: default_connect_timeout_secs(),
             pool_max_idle_per_host: default_pool_max_idle_per_host(),
@@ -646,6 +648,7 @@ mod tests {
         assert!(config.trace_config.is_none());
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
+        assert!(config.source_label_header.is_none());
         assert_eq!(
             config.pool_idle_timeout_secs,
             DEFAULT_POOL_IDLE_TIMEOUT_SECS

@@ -382,6 +382,7 @@ impl PDRouter {
             model,
             endpoint,
             bool_to_static_str(context.is_stream),
+            headers,
         );
         // Clone request once outside the retry loop, then use Arc to share across attempts
         // This avoids O(retries) clones by sharing the same data
