@@ -292,6 +292,16 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     `flash_layout=False`. See `create_fused_set_kv_buffer_arg` below.
     """
     pool = get_token_to_kv_pool()
+    # Unified-pool interaction: SWA-hybrid composites are excluded by the
+    # SWAKVPool isinstance below (UnifiedSWAKVPool subclasses it), and a
+    # mamba-hybrid HybridLinearKVPool passes — but no mamba-hybrid model calls
+    # this today, so the unified pool never reaches the fused store.
+    # TODO(unified-memory): if one ever does, note that
+    # `create_fused_set_kv_buffer_arg` hands the kernel the raw
+    # `forward_batch.out_cache_loc`, which under the unified pool is a VIRTUAL
+    # id. That becomes correct once write-loc translation is centralized at
+    # ForwardBatch preparation (later PR in this series); until then such a
+    # model must not fuse under --enable-unified-memory.
     return (
         _is_cuda
         and pool.dtype == torch.bfloat16

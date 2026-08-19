@@ -98,7 +98,6 @@ def _make_unified(page_size=1, n_full_tokens=64, n_mamba_slots=8):
         device=_DEV,
         enable_memory_saver=False,
         page_size=page_size,
-        view_tail_pad_bytes=page_size * full.entry_bytes(),
     )
     return pool, full, mamba
 

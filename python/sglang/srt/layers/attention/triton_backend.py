@@ -25,6 +25,10 @@ from sglang.srt.layers.dcp import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.multi_ended_allocator import (
+    UnifiedMambaTokenToKVPoolAllocator,
+    UnifiedSWATokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -181,13 +185,35 @@ class TritonAttnBackend(AttentionBackend):
         # byte-identical to the slot-based envelope.
         self.page_size = getattr(model_runner, "page_size", 1) or 1
         # Unified pool v2p hook (None = no-op): req_to_token holds VIRTUAL ids but
-        # kernels need the kernel-facing id space — PHYSICAL for MHA, DENSE for the
-        # dense-view MLA pool (translate_kv_loc_dense falls back to the physical
-        # translate when kernel_page_multiplier == 1, so preferring it is exact for
-        # both). Applied eagerly so the captured graph has no translate.
-        self._translate_kv_loc = getattr(
-            self.token_to_kv_pool_allocator, "translate_kv_loc_dense", None
-        ) or getattr(self.token_to_kv_pool_allocator, "translate_kv_loc", None)
+        # kernels need the kernel-facing id space. `translate_kv_loc_dense` is
+        # exact for both layouts — it collapses onto the plain physical
+        # translate at kernel_page_multiplier 1 (strided views) — so it is the
+        # only handle needed. Applied eagerly so the captured graph carries no
+        # translate.
+        #
+        # Two conditions, and BOTH are required. The allocator must be one of
+        # the unified composites (they are the only allocators that mint
+        # virtual ids; everything else already hands out kernel-facing ones)...
+        #
+        # ...and this runner's pool must be the one those ids address. A
+        # speculative DRAFT runner is handed the TARGET's allocator — it shares
+        # the virtual id space and req_to_token — while owning a SEPARATE KV
+        # pool, direct-indexed by those virtual ids and sized to that virtual
+        # space. Translating there maps the draft's indices into the TARGET's
+        # kernel-facing space and then applies them to a pool that expects the
+        # raw virtual id: out of bounds on both rails. Probing the allocator
+        # alone is what makes DSPARK + --enable-unified-memory fault.
+        _alloc = self.token_to_kv_pool_allocator
+        if (
+            isinstance(
+                _alloc,
+                (UnifiedMambaTokenToKVPoolAllocator, UnifiedSWATokenToKVPoolAllocator),
+            )
+            and _alloc.get_kvcache() is self.token_to_kv_pool
+        ):
+            self._translate_kv_loc = _alloc.translate_kv_loc_dense
+        else:
+            self._translate_kv_loc = None
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = get_spec().speculative_eagle_topk or 0
@@ -446,6 +472,50 @@ class TritonAttnBackend(AttentionBackend):
         )
         return kv_indptr
 
+    def _translate_kv_indices_ragged(
+        self,
+        kv_indices: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        bs: int,
+        filled_len: Optional[int],
+    ) -> torch.Tensor:
+        """Virtual->kernel-facing translate of a ragged kv_indices buffer;
+        no-op when translation is off (baseline / speculative draft runner).
+
+        `kv_indices` is frequently OVER-ALLOCATED: when the CPU token total is
+        unavailable (gpu_only decode) the caller sizes it to
+        `bs * max_context_len` with `torch.empty`, leaving the tail past the
+        ragged frontier UNINITIALIZED. The attention kernel reads only
+        `[0, kv_indptr[bs])` via the indptr, so that tail is harmless to it —
+        but the translate's `virtual_to_physical[...]` gather touches EVERY
+        element, and an uninitialized tail id beyond the v2p length trips a
+        device-side assert (IndexKernel.cu "index out of bounds"). Recycled
+        device memory makes that near-certain: a previous forward's translated
+        buffer leaves DENSE ids there, which are ~kernel_page_multiplier times
+        larger than any valid virtual id.
+
+        So translate ONLY the `[0, filled_len)` prefix that
+        `_fill_kv_indptr_and_indices` actually wrote, and return it (downstream
+        reads are indptr-bounded, so the shorter buffer is equivalent).
+
+        `filled_len` is the exact ragged length when the caller already knows
+        it without a sync (`forward_batch.seq_lens_sum` / a CPU prefix-sum);
+        None falls back to reading `kv_indptr[bs]` (one D2H sync — only
+        reached on mirror-less batches, and strictly better than the crash it
+        replaces). Translating the real prefix keeps the check honest: a
+        genuinely out-of-range id inside the written region still asserts.
+
+        TODO(unified-memory): removed when the read-path choke point lands in
+        a later PR — its page-table builder emits kernel-facing ids straight
+        into the ragged prefix, so there is no whole-buffer translate left to
+        bound.
+        """
+        if self._translate_kv_loc is None:
+            return kv_indices
+        if filled_len is None:
+            filled_len = int(kv_indptr[bs].item())
+        return self._translate_kv_loc(kv_indices[:filled_len])
+
     def _update_decode_kv_buffers(
         self,
         bs: int,
@@ -623,6 +693,14 @@ class TritonAttnBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
+        # BEFORE the fill kernels run: the refill below translates the read
+        # buffers in place over [0, host-published bound), while the fill only
+        # writes the ragged prefix the GPU seq_lens describe. Zero the translate
+        # region first so any host-over-bound tail translates from the sink
+        # slot instead of from a previous replay's leftovers — see
+        # _zero_cuda_graph_kv_translate_region for the failure this prevents.
+        self._zero_cuda_graph_kv_translate_region(forward_batch, bs)
+
         if in_capture:
             assert forward_batch.encoder_lens is None, "Not supported"
             # Multi-step spec decode: kv buffers come from spec_info, not the
@@ -697,12 +775,63 @@ class TritonAttnBackend(AttentionBackend):
         )
         return self.cuda_graph_swa_out_cache_loc[:n]
 
+    def _zero_cuda_graph_kv_translate_region(
+        self, forward_batch: ForwardBatch, bs: int
+    ) -> None:
+        """Zero the read-buffer regions the refill's translate will cover,
+        BEFORE the fill kernels write their ragged prefix. No-op without the
+        unified pool.
+
+        The refill (`_translate_cuda_graph_shared_pool_locs`) translates
+        [0, host-published bound) IN PLACE over PERSISTENT buffers, while the
+        fill covers only [0, sum(GPU seq_lens)). For plain decode those bounds
+        agree, but a speculative verify batch publishes host mirrors ABOVE the
+        fill — the block drafters set seq_lens_cpu to prefix + one verify
+        window while the GPU seq_lens driving the fill stay at the committed
+        prefix. The tail of the translate region is then whatever the PREVIOUS
+        replay left there: already-translated kernel-facing ids, which a
+        second translate feeds back into the v2p gather — out of bounds by
+        construction, since kernel-facing ids run kernel_page_multiplier times
+        past the table. A shorter request replaying after a longer one
+        finished lands its tail exactly on that residue, so the first such
+        verify kills the server.
+
+        Zeroing first makes the over-bound tail translate from virtual id 0 —
+        the reserved sink slot in every id space — matching the eager verify
+        branch's zero-init. Nothing to zero when the host mirror is absent:
+        the translate then bounds itself by the indptr, which IS the fill.
+        """
+        if self._translate_kv_loc is None:
+            return
+        n_kv = forward_batch.seq_lens_sum
+        if n_kv is not None and n_kv > 0:
+            n_kv = min(n_kv, self.cuda_graph_kv_indices.shape[0])
+            self.cuda_graph_kv_indices[:n_kv].zero_()
+        if (
+            self.sliding_window_size is not None
+            and self.sliding_window_size > 0
+            and forward_batch.seq_lens_cpu is not None
+        ):
+            n_win = int(
+                forward_batch.seq_lens_cpu[:bs]
+                .clamp(max=self.sliding_window_size)
+                .sum()
+            )
+            if n_win > 0:
+                n_win = min(n_win, self.cuda_graph_window_kv_indices.shape[0])
+                self.cuda_graph_window_kv_indices[:n_win].zero_()
+
     def _translate_cuda_graph_shared_pool_locs(
         self, forward_batch: ForwardBatch, bs: int
     ) -> Optional[torch.Tensor]:
         """Unified pool: eager v2p translate of the cuda-graph read+write LOC buffers,
         run BEFORE graph.replay() reading the live post-compaction v2p, so the
         captured graph carries zero translate nodes. No-op for non-unified pools.
+
+        The translate regions were ZEROED before the fill kernels ran
+        (`_zero_cuda_graph_kv_translate_region`), so a host bound above the
+        ragged fill translates from the sink slot, never from a previous
+        replay's already-translated leftovers.
 
         Read buffers (full kv_indices, SWA window) are translated IN PLACE; the
         full-attn WRITE loc is RETURNED as the [:n] view of the backend-owned
@@ -777,10 +906,14 @@ class TritonAttnBackend(AttentionBackend):
                         self.kv_indptr,
                     )
                 else:
-                    # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
-                    seq_lens_sum = forward_batch.seq_lens_sum
-                    if seq_lens_sum is None:
-                        seq_lens_sum = bs * self.max_context_len
+                    # gpu_only: seq_lens_sum may be None; over-allocate is safe
+                    # (ragged write + prefix-only translate).
+                    real_total = forward_batch.seq_lens_sum
+                    seq_lens_sum = (
+                        real_total
+                        if real_total is not None
+                        else bs * self.max_context_len
+                    )
                     kv_indices = torch.empty(
                         seq_lens_sum, dtype=torch.int64, device=self.device
                     )
@@ -790,8 +923,9 @@ class TritonAttnBackend(AttentionBackend):
                         forward_batch.req_pool_indices,
                         kv_indices,
                     )
-                    if self._translate_kv_loc is not None:
-                        kv_indices = self._translate_kv_loc(kv_indices)
+                    kv_indices = self._translate_kv_indices_ragged(
+                        kv_indices, kv_indptr, bs, real_total
+                    )
                 if (
                     self.sliding_window_size is not None
                     and self.sliding_window_size > 0
@@ -865,18 +999,42 @@ class TritonAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=self.device,
             )
-            # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
-            seq_lens_sum = forward_batch.seq_lens_sum
-            if seq_lens_sum is None:
-                seq_lens_sum = bs * self.max_context_len
-            kv_indices = torch.empty(
-                seq_lens_sum, dtype=torch.int64, device=self.device
+            # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged
+            # write + prefix-only translate).
+            real_total = forward_batch.seq_lens_sum
+            seq_lens_sum = (
+                real_total if real_total is not None else bs * self.max_context_len
             )
+            if self._translate_kv_loc is not None and real_total is not None:
+                # TARGET_VERIFY's seq_lens_sum may be an UPPER BOUND, not the
+                # exact ragged total: the block drafters publish host seq_lens
+                # as prefix + one verify block while the GPU seq_lens (which
+                # drive the ragged fill) stay at the committed prefix — see
+                # dspark_draft's draft_seq_lens_sum. The translate below covers
+                # [0, real_total), so a [filled, real_total) uninitialized tail
+                # would device-assert in the v2p gather. Zero-init: virtual id
+                # 0 is always in range (the reserved sink slot) and the
+                # attention read is kv_indptr-bounded regardless.
+                kv_indices = torch.zeros(
+                    seq_lens_sum, dtype=torch.int64, device=self.device
+                )
+            else:
+                kv_indices = torch.empty(
+                    seq_lens_sum, dtype=torch.int64, device=self.device
+                )
             kv_indptr = self._fill_kv_indptr_and_indices(
                 bs,
                 forward_batch.seq_lens,
                 forward_batch.req_pool_indices,
                 kv_indices,
+            )
+            # Unified pool read path: req_to_token rows hold VIRTUAL ids;
+            # translate to kernel-facing for the verify attention read (mirrors
+            # the decode/extend branches — this branch was the missing one).
+            # Only the ragged prefix is translated; see
+            # _translate_kv_indices_ragged.
+            kv_indices = self._translate_kv_indices_ragged(
+                kv_indices, kv_indptr, bs, real_total
             )
 
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
@@ -917,11 +1075,15 @@ class TritonAttnBackend(AttentionBackend):
                     self.kv_indptr,
                 )
             else:
-                # gpu_only leaves _cpu unset; over-allocate is safe (ragged write).
+                # gpu_only leaves _cpu unset; over-allocate is safe (ragged
+                # write + prefix-only translate).
                 if forward_batch.extend_prefix_lens_cpu is not None:
-                    kv_indices_len = sum(forward_batch.extend_prefix_lens_cpu)
+                    real_total = sum(forward_batch.extend_prefix_lens_cpu)
                 else:
-                    kv_indices_len = bs * self.max_context_len
+                    real_total = None
+                kv_indices_len = (
+                    real_total if real_total is not None else bs * self.max_context_len
+                )
                 kv_indices = torch.empty(
                     kv_indices_len,
                     dtype=torch.int64,
@@ -933,8 +1095,9 @@ class TritonAttnBackend(AttentionBackend):
                     forward_batch.req_pool_indices,
                     kv_indices,
                 )
-                if self._translate_kv_loc is not None:
-                    kv_indices = self._translate_kv_loc(kv_indices)
+                kv_indices = self._translate_kv_indices_ragged(
+                    kv_indices, kv_indptr, bs, real_total
+                )
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
                 (
                     window_kv_indptr,
