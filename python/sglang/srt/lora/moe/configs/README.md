@@ -339,6 +339,25 @@ Qwen3.5-397B, Inkling-Small on GB300/B200/H200).
   byte-identical to the rank rule's, so forcing them re-runs the incumbent
   rather than testing it. Those inherit GB300's numbers.
 
+The gate/up A family is NOT a tuner axis, so its prefill/decode split was
+argued rather than measured until 2026-08-19. It is measured now, B200,
+Qwen3.5-35B shared-outer, one plan row flipped per arm via a config-dir
+override, base/variant interleaved over two rounds:
+
+| flip | metric | base | flipped |
+|---|---|---|---|
+| `decode.wide_windows` -> `token_dedup_grouped` | decode tput | 5881 tok/s | 5266, **-10.5%** |
+| `prefill.token_dedup` -> `grouped` | prefill ttft | 70.87ms | 73.45ms, **-3.6%** |
+
+Both shipped choices are right, and the control is that each variant moved only
+its own metric: the decode flip left prefill at 71.00 vs 70.87ms, the prefill
+flip left decode at 5881.8 vs 5881.1 tok/s. Note the decode loss is far larger
+than the extra route explains -- that route is only 5.5us per layer, built by
+the shared CUDA align because one row per token with one bucket per adapter
+falls under both fused thresholds. Flipping the family also forces a token-major
+gate/up bridge, and that is where the decode cost actually lives. A family flip
+is never just one stage.
+
 Provenance and the full axis inventory: the campaign's best-config tables
 document, plus `B200_POLICY_ADJUDICATION_20260814.md`.
 
