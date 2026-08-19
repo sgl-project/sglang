@@ -157,7 +157,7 @@ def _build_virtual_topk_ids(
         # An idle DP rank arrives with zero tokens; cdiv(0, block) is no grid.
         return virtual_topk_ids
 
-    block_size = 1024
+    block_size = 1024  # pairs per program; never swept, flat map over pairs
     _build_virtual_topk_ids_kernel[(triton.cdiv(topk_ids.numel(), block_size),)](
         topk_ids,
         token_lora_mapping,
@@ -195,7 +195,7 @@ def build_virtual_expert_routing(
     is_shared_outer: bool = False,
     view: RouteViewKind = RouteViewKind.ALIGNED,
     workspace: MoeLoraWorkspace | None = None,
-    scratch_prefix: str | None = None,
+    tensor_prefix: str | None = None,
 ) -> RouteView:
     if view not in RouteViewKind:
         raise ValueError(
@@ -230,9 +230,9 @@ def build_virtual_expert_routing(
     ):
         from sglang.srt.lora.moe.fused_align import fused_align_block_size
 
-        if workspace is None or scratch_prefix is None:
+        if workspace is None or tensor_prefix is None:
             raise ValueError(
-                "the fused aligned builder needs workspace and scratch_prefix "
+                "the fused aligned builder needs workspace and tensor_prefix "
                 f"(view={view.value}, virtual experts={num_virtual}, "
                 f"pairs={topk_ids.numel()})"
             )
@@ -246,7 +246,7 @@ def build_virtual_expert_routing(
                 block_size=block_size,
                 capacity=_routing_capacity(topk_ids.numel(), block_size, num_virtual),
                 workspace=workspace,
-                scratch_prefix=scratch_prefix,
+                tensor_prefix=tensor_prefix,
             )
         )
         return RouteView(

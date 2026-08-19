@@ -386,12 +386,12 @@ class TestRoutePdlWiring(unittest.TestCase):
             view,
             is_shared_outer=False,
             workspace=None,
-            scratch_prefix=None,
+            tensor_prefix=None,
         ):
             # Every route gets the SAME local expert count; only the flag
             # differs, and it has to match the route being built.
             self.assertEqual(num_local_experts, 2)
-            calls.append((scratch_prefix, is_shared_outer))
+            calls.append((tensor_prefix, is_shared_outer))
             return _route(
                 topk_ids,
                 token_lora_mapping,
@@ -470,7 +470,7 @@ class TestRoutePdlWiring(unittest.TestCase):
             view,
             is_shared_outer=False,
             workspace=None,
-            scratch_prefix=None,
+            tensor_prefix=None,
         ):
             standard_calls.append(view)
             padded = torch.zeros(1, dtype=torch.int32)
@@ -606,11 +606,11 @@ class TestSharedTokenRoute(unittest.TestCase):
             view,
             is_shared_outer=False,
             workspace=None,
-            scratch_prefix=None,
+            tensor_prefix=None,
         ):
             calls.append(
                 (
-                    scratch_prefix,
+                    tensor_prefix,
                     route_topk_ids.clone(),
                     route_token_lora_mapping.clone(),
                 )
@@ -657,7 +657,7 @@ class TestSharedTokenRoute(unittest.TestCase):
         The hazard is the fused builder's process-global scratch cache, which is
         keyed by bucket count alone: two routes at the same V would share one
         scalar, and the T-row shared-token plan would clobber the T*K-row pair
-        plan. build_virtual_expert_routing allocates per ``scratch_prefix``
+        plan. build_virtual_expert_routing allocates per ``tensor_prefix``
         instead, so what this has to pin is that build_routes hands every route
         a DISTINCT prefix -- storage isolation per name is the workspace's own
         contract.
@@ -700,14 +700,14 @@ class TestSharedTokenRoute(unittest.TestCase):
                     view,
                     is_shared_outer=False,
                     workspace=None,
-                    scratch_prefix=None,
+                    tensor_prefix=None,
                 ):
                     self.assertEqual(view, "aligned")
                     self.assertIsNotNone(workspace)
-                    prefixes.append(scratch_prefix)
+                    prefixes.append(tensor_prefix)
                     # Model the real allocation: one scalar per route, named.
                     padded = workspace.tensor(
-                        f"{scratch_prefix}:padded_pairs",
+                        f"{tensor_prefix}:padded_pairs",
                         (1,),
                         dtype=torch.int32,
                         device=route_topk_ids.device,

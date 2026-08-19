@@ -98,7 +98,7 @@ def build_routes(
                 block_size=block_size,
                 view=RouteViewKind.ALIGNED,
                 workspace=workspace,
-                scratch_prefix="route:aligned_per_expert",
+                tensor_prefix="route:aligned_per_expert",
             )
         if RouteRequirement.ALIGNED_SHARED_OUTER in requirements:
             values["aligned_shared_outer"] = build_virtual_expert_routing(
@@ -110,7 +110,7 @@ def build_routes(
                 block_size=block_size,
                 view=RouteViewKind.ALIGNED,
                 workspace=workspace,
-                scratch_prefix="route:aligned_shared_outer",
+                tensor_prefix="route:aligned_shared_outer",
             )
 
     if RouteRequirement.SHARED_TOKEN_PLAN in requirements:
@@ -143,7 +143,7 @@ def build_routes(
             block_size=block_size,
             view=RouteViewKind.ALIGNED,
             workspace=workspace,
-            scratch_prefix="route:shared_token",
+            tensor_prefix="route:shared_token",
         )
 
     return MoeLoraRoutes(**values)

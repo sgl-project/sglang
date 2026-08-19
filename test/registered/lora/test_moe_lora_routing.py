@@ -82,7 +82,7 @@ class TestMoeLoraRouting(CustomTestCase):
             block_size=block_size,
             view=view,
             workspace=MoeLoraWorkspace(),
-            scratch_prefix="test:route",
+            tensor_prefix="test:route",
         )
 
     def test_narrower_views_refuse_fields_they_did_not_build(self):
@@ -234,7 +234,7 @@ class TestMoeLoraRouting(CustomTestCase):
                         block_size=16,
                         view=RouteViewKind.ALIGNED,
                         workspace=MoeLoraWorkspace(),
-                        scratch_prefix="test:route",
+                        tensor_prefix="test:route",
                     )
                 finally:
                     fused_align.fused_align_block_size = original
@@ -290,7 +290,7 @@ class TestMoeLoraRouting(CustomTestCase):
                     block_size=16,
                     view=RouteViewKind.ALIGNED,
                     workspace=MoeLoraWorkspace(),
-                    scratch_prefix="test:route",
+                    tensor_prefix="test:route",
                 )
                 num_pairs = num_tokens * top_k
                 keys = (

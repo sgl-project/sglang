@@ -66,10 +66,19 @@ import triton.language as tl
 from sglang.srt.lora.moe.routing import virtual_expert_ids_inline
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
-# Launch tiles, selected by a 64-point sweep over 4 representative cells on
-# GB300 (tune_fused_align.py, 2026-07-25: best 83.45us vs 88-100us untuned).
+# Launch tiles. Swept on GB300 2026-07-25 (64 points, 4 cells), then
+# re-verified per-kernel on H200/B200/GB300 2026-08-19 at production geometry
+# (5 cells x 48 configs, profiler GPU time, noise <=1%): KEEP THESE. No
+# alternative wins everywhere -- scan and expand are minimax-optimal (every
+# other value regresses 7-18% in some cell), and hist's ~4%-median rivals
+# regress up to 1.9% elsewhere. Per-cell oracles would save 0.1-2.7us of an
+# 8-60us build, so a per-geometry table buys nothing.
+#
 # Module constants rather than runtime autotune: graph capture wants one
-# deterministic launch shape per call site.
+# deterministic launch shape per call site. NB: time these with the profiler,
+# not CUDA events around the call -- the host side is 70-90% of the wall time
+# and hides the config entirely (it measured the shipped config 9.6% faster
+# than itself).
 HIST_BLOCK = 512
 HIST_WARPS = 8
 EXPAND_BLOCK = 128
@@ -202,7 +211,6 @@ def _expand_and_scatter_kernel(
         block_ids = pid * BLOCK + tl.arange(0, BLOCK)
         block_mask = block_ids < num_blocks
         if USE_PDL:
-            # Everything below reads scan output (block_cum / bucket_end).
             tl.extra.cuda.gdc_wait()
         low = tl.zeros(block_ids.shape, dtype=tl.int32)
         high = tl.full(block_ids.shape, NUM_BUCKETS, dtype=tl.int32)
@@ -267,29 +275,14 @@ def fused_align_block_size(
     block_size: int,
     capacity: int,
     workspace: MoeLoraWorkspace,
-    scratch_prefix: str,
+    tensor_prefix: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return ``(sorted_pair_ids, block_virtual_expert_ids, num_pairs_post_padded)``.
-
-    Same plan contract as the incumbent align, computed from the SOURCE
-    tensors: no ``virtual_topk_ids`` is written or read anywhere.
-
-    The chain's metadata is workspace-owned and named, one set per route:
-    graph capture bakes the addresses, so they must survive replay, and
-    ``counts`` is zero on entry because the scan re-zeroes it after its final
-    read -- an invariant that only holds while the same buffer persists, and
-    which is why this is not fresh-allocated per call. Distinct
-    ``scratch_prefix`` per route is what keeps two routes at the same bucket
-    count from sharing a scalar.
-    """
     device = topk_ids.device
     num_pairs = topk_ids.numel()
     top_k = topk_ids.shape[1]
     lora_experts_per_adapter = 1 if is_shared_outer else num_local_experts
     num_virtual = lora_experts_per_adapter * max_loras
     num_buckets = num_virtual + 1
-    # int32 key math holds only below 2**31; nothing upstream enforces it, and
-    # a wrapped key would silently land in a valid-looking bucket.
     if num_buckets >= 2**31 or capacity >= 2**31:
         raise ValueError(
             f"fused align uses int32 plan math: num_buckets={num_buckets} and "
@@ -298,28 +291,31 @@ def fused_align_block_size(
     routed_expert_id_bound = num_local_experts
     num_blocks = capacity // block_size
 
-    # Every host-fallible operation happens BEFORE the first launch, so an
-    # exception cannot leave this entry's counts dirty between K1 and K2.
-    def counter(name: str, size: int, *, zero_first: bool = False) -> torch.Tensor:
-        return workspace.tensor(
-            f"{scratch_prefix}:{name}",
-            (size,),
-            dtype=torch.int32,
-            device=device,
-            **({"zero_on_first_allocation": True} if zero_first else {}),
-        )
-
-    counts = counter("counts", num_buckets, zero_first=True)
-    block_cumulative = counter("block_cumulative", num_buckets + 1)
-    cursor = counter("cursor", num_buckets)
-    bucket_end = counter("bucket_end", num_buckets)
-    num_pairs_post_padded_out = counter("padded_pairs", 1)
+    counts = workspace.tensor(
+        f"{tensor_prefix}:counts",
+        (num_buckets,),
+        dtype=torch.int32,
+        device=device,
+        zero_on_first_allocation=True,
+    )
+    block_cumulative = workspace.tensor(
+        f"{tensor_prefix}:block_cumulative",
+        (num_buckets + 1,),
+        dtype=torch.int32,
+        device=device,
+    )
+    cursor = workspace.tensor(
+        f"{tensor_prefix}:cursor", (num_buckets,), dtype=torch.int32, device=device
+    )
+    bucket_end = workspace.tensor(
+        f"{tensor_prefix}:bucket_end", (num_buckets,), dtype=torch.int32, device=device
+    )
+    num_pairs_post_padded_out = workspace.tensor(
+        f"{tensor_prefix}:padded_pairs", (1,), dtype=torch.int32, device=device
+    )
     sorted_pair_ids = torch.empty(capacity, dtype=torch.int32, device=device)
     block_virtual_expert_ids = torch.empty(num_blocks, dtype=torch.int32, device=device)
-    # PDL is always on where the architecture supports it: measured
-    # +0.5..+2.0% decode on every model and GPU, prefill within +-1.3%
-    # (2026-08 twins), and arming every composition measured a wash against
-    # partial arming (2026-08-19 twin). The check is @cache_once.
+
     from sglang.kernels.jit.utils import is_arch_support_pdl
 
     use_pdl = is_arch_support_pdl()

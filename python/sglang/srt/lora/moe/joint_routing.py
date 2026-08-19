@@ -26,6 +26,9 @@ from sglang.srt.lora.moe.routing import (
 )
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
+# Inherited from fused_align's swept values, not swept for these kernels --
+# which write two count arrays per pass, so the shapes need not transfer. The
+# warps below are inline literals (8 and 4) rather than constants.
 _HIST_BLOCK = 512
 _EXPAND_BLOCK = 128
 _SCAN_CHUNK = 2048
