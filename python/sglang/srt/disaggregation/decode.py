@@ -1609,8 +1609,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         swa_used = swa_total - swa_available - swa_evictable
         swa_growth_potential = max(0, n_active * window_size - swa_used)
         swa_reserved_tokens = min(reserved_tokens, swa_growth_potential)
-        swa_allocatable_tokens = swa_available + swa_evictable - max(
-            swa_reserved_tokens, need_swa_space_for_single_req
+        swa_allocatable_tokens = (
+            swa_available
+            + swa_evictable
+            - max(swa_reserved_tokens, need_swa_space_for_single_req)
         )
 
         # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
