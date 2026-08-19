@@ -49,8 +49,6 @@ def fast_topk_transform_fused(
     cu_seqlens_q: torch.Tensor,
     topk: int,
     row_starts: Optional[torch.Tensor] = None,
-    compact_page_table: Optional[torch.Tensor] = None,
-    compact_indptr: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Get the topk indices of the score tensor and then transform the topk indices
@@ -67,12 +65,6 @@ def fast_topk_transform_fused(
             For each row i, topk only applies to section [row_starts[i], row_starts[i] + lengths[i]]
             of the score tensor. It's only used for cases where the key is
             ragged, i.e. during extend and draft extend.
-        compact_page_table: Optional flat int32 buffer receiving a second copy
-            of the result with the -1 padding removed, i.e. row i occupies
-            [compact_indptr[i], compact_indptr[i + 1]). Decode only.
-        compact_indptr: Optional int32 buffer of at least B+1 entries giving the
-            row offsets of compact_page_table. Its per-row length must be
-            min(lengths[i], topk), which is what the kernel writes.
     Returns:
         The topk indices tensor of shape (B, topk)
     """
@@ -80,20 +72,10 @@ def fast_topk_transform_fused(
         topk == 2048
     ), "fast_topk_transform_fused is only optimized for deepseek v3.2 model, where topk=2048"
     assert score.dim() == 2
-    assert (compact_page_table is None) == (
-        compact_indptr is None
-    ), "compact_page_table and compact_indptr must be given together"
     src_page_table = page_table_size_1
     dst_page_table = score.new_empty((score.shape[0], topk), dtype=torch.int32)
     torch.ops.sgl_kernel.fast_topk_transform_fused(
-        score,
-        lengths,
-        dst_page_table,
-        src_page_table,
-        cu_seqlens_q,
-        row_starts,
-        compact_page_table,
-        compact_indptr,
+        score, lengths, dst_page_table, src_page_table, cu_seqlens_q, row_starts
     )
     return dst_page_table
 

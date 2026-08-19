@@ -88,14 +88,6 @@ class DSATopKBackend(Enum):
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
     ) -> torch.Tensor:
-        # Only the sgl_kernel decode transform below can fill this, so clear the
-        # report up front and let that branch claim it. Layers that reuse an
-        # earlier layer's top-k never reach here at all, which is why a stale
-        # True cannot linger: their buffer is still the one that was written.
-        compaction = attn_metadata.aiter_compaction
-        if compaction is not None:
-            compaction.written = False
-
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
 
@@ -139,30 +131,14 @@ class DSATopKBackend(Enum):
                     if batch_idx_list is not None
                     else attn_metadata.page_table_1
                 )
-                # Only a one-row-per-request launch can also emit the compacted
-                # list: the packed and verify shapes fold several query rows onto
-                # one source row, which a per-row indptr cannot describe.
-                fused = (
-                    compaction
-                    if row_starts is None and batch_idx_list is None
-                    else None
-                )
-                topk_indices = fast_topk_transform_fused(
+                return fast_topk_transform_fused(
                     score=logits,
                     lengths=lengths,
                     page_table_size_1=page_table_size_1,
                     cu_seqlens_q=cu_seqlens_q_topk,
                     topk=topk,
                     row_starts=row_starts,
-                    compact_page_table=None if fused is None else fused.indices,
-                    compact_indptr=None if fused is None else fused.indptr,
                 )
-                if fused is not None:
-                    # After the call, so a rejected launch leaves the consumer
-                    # gathering for itself rather than trusting a buffer that
-                    # was never filled.
-                    fused.written = True
-                return topk_indices
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 if topk_indices_offset is None:
                     raise RuntimeError(

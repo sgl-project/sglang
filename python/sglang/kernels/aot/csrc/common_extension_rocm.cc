@@ -39,7 +39,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   m.def(
       "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor dst_page_table, Tensor src_page_table, Tensor "
-      "cu_seqlens_q, Tensor? row_starts, Tensor? compact_page_table=None, Tensor? compact_indptr=None) -> ()");
+      "cu_seqlens_q, Tensor? row_starts) -> ()");
   m.impl("fast_topk_transform_fused", torch::kCUDA, &fast_topk_transform_interface);
 
   m.def(

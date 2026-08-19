@@ -66,27 +66,6 @@ __device__ void naive_topk_transform(
   }
 }
 
-// As naive_topk_transform, but also emits the valid prefix into a gap-free
-// buffer. The padded table keeps a fixed TopK stride per row; `compact_entry`
-// already points at this row's slot in a layout whose per-row length is
-// min(length, TopK), so the valid entries land back to back.
-__device__ void naive_topk_transform_compact(
-    int32_t length,
-    int32_t* __restrict__ dst_page_table,
-    const int32_t* __restrict__ src_page_table,
-    int32_t* __restrict__ compact_entry) {
-  const auto tid = threadIdx.x;
-  for (auto i = tid; i < TopK; i += kThreadsPerBlock) {
-    if (i < length) {
-      const auto slot = src_page_table[i];
-      dst_page_table[i] = slot;
-      compact_entry[i] = slot;
-    } else {
-      dst_page_table[i] = -1;
-    }
-  }
-}
-
 // keep the first `length` entries, set others to -1
 __device__ void naive_topk_transform_ragged(
     const float* __restrict__ score, int32_t length, int32_t* __restrict__ topk_indices_ragged, int32_t offset) {
@@ -292,9 +271,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
         const FastTopKParams params,
         int32_t* __restrict__ dst_page_table,
         const int32_t* __restrict__ src_page_table,
-        const int64_t src_stride,
-        int32_t* __restrict__ compact_page_table,
-        const int32_t* __restrict__ compact_indptr) {
+        const int64_t src_stride) {
   const auto& [input, _1, _2, lengths, input_stride] = params;
   const auto bid = static_cast<uint64_t>(blockIdx.x);
   const auto tid = threadIdx.x;
@@ -303,14 +280,7 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
   const auto src_page_entry = src_page_table + bid * src_stride;
   const auto dst_page_entry = dst_page_table + bid * TopK;
   const auto score = input + bid * input_stride;
-  // Optional second output: the same slots without the -1 padding, which is the
-  // layout aiter's sparse MLA reads. Writing it here costs two stores of values
-  // already in registers and saves a whole compaction launch per top-k table.
-  int32_t* compact_entry = compact_page_table == nullptr ? nullptr : compact_page_table + compact_indptr[bid];
   if (length <= TopK) {
-    if (compact_entry != nullptr) {
-      return naive_topk_transform_compact(length, dst_page_entry, src_page_entry, compact_entry);
-    }
     return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
   } else {
     __shared__ int s_indices[TopK];
@@ -320,17 +290,10 @@ __global__ __launch_bounds__(kThreadsPerBlock)  // decode
     static_assert(TopK / kThreadsPerBlock == 2);
     const auto idx_0 = tid;
     const auto pos_0 = s_indices[idx_0];
-    const auto slot_0 = src_page_entry[pos_0];
-    dst_page_entry[idx_0] = slot_0;
+    dst_page_entry[idx_0] = src_page_entry[pos_0];
     const auto idx_1 = tid + kThreadsPerBlock;
     const auto pos_1 = s_indices[idx_1];
-    const auto slot_1 = src_page_entry[pos_1];
-    dst_page_entry[idx_1] = slot_1;
-    if (compact_entry != nullptr) {
-      // length > TopK, so all TopK entries are valid and the compact row is full.
-      compact_entry[idx_0] = slot_0;
-      compact_entry[idx_1] = slot_1;
-    }
+    dst_page_entry[idx_1] = src_page_entry[pos_1];
   }
 }
 
@@ -496,9 +459,7 @@ void fast_topk_transform_interface(
     at::Tensor& dst_page_table,
     const at::Tensor& src_page_table,
     const at::Tensor& cu_seqlens_q,
-    std::optional<at::Tensor> row_starts_opt,
-    std::optional<at::Tensor> compact_page_table_opt,
-    std::optional<at::Tensor> compact_indptr_opt) {
+    std::optional<at::Tensor> row_starts_opt) {
   CHECK_CUDA(score);
   CHECK_CUDA(lengths);
   CHECK_CUDA(dst_page_table);
@@ -507,9 +468,6 @@ void fast_topk_transform_interface(
   if (row_starts_opt.has_value()) {
     CHECK_CUDA(row_starts_opt.value());
   }
-  TORCH_CHECK(
-      compact_page_table_opt.has_value() == compact_indptr_opt.has_value(),
-      "compact_page_table and compact_indptr must be given together");
   const auto params = get_params(score, lengths, row_starts_opt);
   const auto B = score.size(0);
   TORCH_CHECK(dst_page_table.dim() == 2 && dst_page_table.is_contiguous());
@@ -532,41 +490,10 @@ void fast_topk_transform_interface(
   // decode: row_starts_opt is null, invokes the decode kernel
   // target verify: row_starts_opt is null, invokes the prefill kernel
   const auto is_decode = !row_starts_opt.has_value() && prefill_bs == B;
-
-  int32_t* compact_page_table_ptr = nullptr;
-  const int32_t* compact_indptr_ptr = nullptr;
-  if (compact_page_table_opt.has_value()) {
-    // Only the decode kernel emits the gap-free table: the prefill kernels map
-    // several query rows onto one source row, so a per-row indptr would not
-    // describe their output.
-    TORCH_CHECK(is_decode, "compact_page_table is only supported on the decode path");
-    const auto& compact_page_table = compact_page_table_opt.value();
-    const auto& compact_indptr = compact_indptr_opt.value();
-    CHECK_CUDA(compact_page_table);
-    CHECK_CUDA(compact_indptr);
-    TORCH_CHECK(compact_page_table.dim() == 1 && compact_page_table.is_contiguous());
-    TORCH_CHECK(compact_page_table.scalar_type() == at::kInt);
-    TORCH_CHECK(compact_indptr.dim() == 1 && compact_indptr.is_contiguous());
-    TORCH_CHECK(compact_indptr.scalar_type() == at::kInt);
-    TORCH_CHECK(compact_indptr.size(0) >= B + 1, "compact_indptr must hold at least B+1 entries");
-    // Per-row length is min(length, TopK), so B*TopK bounds compact_indptr[B]
-    // without having to read the indptr back from the device.
-    TORCH_CHECK(
-        compact_page_table.numel() >= B * static_cast<int64_t>(TopK),
-        "compact_page_table must hold at least B*TopK entries");
-    compact_page_table_ptr = compact_page_table.data_ptr<int32_t>();
-    compact_indptr_ptr = compact_indptr.data_ptr<int32_t>();
-  }
-
   if (is_decode) {
     setup_kernel_smem_once<topk_transform_decode_kernel, kSmem>();
     topk_transform_decode_kernel<<<grid, block, kSmem, stream>>>(
-        params,
-        dst_page_table.data_ptr<int32_t>(),
-        src_page_table.data_ptr<int32_t>(),
-        src_stride,
-        compact_page_table_ptr,
-        compact_indptr_ptr);
+        params, dst_page_table.data_ptr<int32_t>(), src_page_table.data_ptr<int32_t>(), src_stride);
   } else {
     setup_kernel_smem_once<topk_transform_prefill_kernel, kSmem>();
     topk_transform_prefill_kernel<<<grid, block, kSmem, stream>>>(
