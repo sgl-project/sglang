@@ -261,8 +261,7 @@ def capture_prefill_graph(
     if (
         model_runner.spec_algorithm.is_eagle()
         and not model_runner.is_draft_worker
-        and get_server_return_hidden_states_mode(model_runner.server_args)
-        < CaptureHiddenMode.FULL
+        and get_server_return_hidden_states_mode() < CaptureHiddenMode.FULL
         and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     ):
         logger.info(
