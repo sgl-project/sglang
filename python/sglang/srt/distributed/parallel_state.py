@@ -1079,7 +1079,8 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu:
+        if _is_npu or _is_cpu:
+            # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
             return
@@ -1259,7 +1260,8 @@ class GroupCoordinator:
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu:
+        if _is_npu or _is_cpu:
+            # TODO: add optimized all_gather_into_tensor kernel for cpu
             self._all_gather_into_tensor(output, input)
         else:
             # XPU and CUDA both go through reg_all_gather_into_tensor (custom_op) to
@@ -2372,12 +2374,16 @@ def initialize_model_parallel(
 
     Let's say we use 2 GPUs for attention context parallelism (attn_cp_size=2) and 4 GPUs for
     attention tensor parallelism (attn_tp_size=4). As for MoE part, we use 2 GPUs for moe data
-    parallelism (moe_dp_size=2) and 4 GPUs for moe expert parallelism (moe_ep_size=4). The present
+    parallelism (moe_dp_size=2) and 4 GPUs for moe expert parallelism (moe_ep_size=4). Note that
+    this implies tensor_model_parallel_size=8 (attn_tp_size = tp_size // attn_cp_size //
+    attn_dp_size), so all 8 GPUs form a single tensor model-parallel group. The present
     function will create the following groups:
-        2 tensor model-parallel groups:
-            [g0, g1, g2, g3], [g4, g5, g6, g7]
+        1 tensor model-parallel group:
+            [g0, g1, g2, g3, g4, g5, g6, g7]
         4 attention context-parallel groups:
             [g0, g4], [g1, g5], [g2, g6], [g3, g7]
+        2 attention tensor-parallel groups:
+            [g0, g1, g2, g3], [g4, g5, g6, g7]
         2 moe expert-parallel groups:
             [g0, g1, g2, g3], [g4, g5, g6, g7]
         4 moe data-parallel groups:
