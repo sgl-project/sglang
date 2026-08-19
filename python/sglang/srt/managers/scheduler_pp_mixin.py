@@ -119,21 +119,7 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    if (
-                        is_npu()
-                        and not self.pp_group.is_first_rank
-                        and self.pending_proxy_send_dict is not None
-                    ):
-                        # Middle/last rank with pending proxy from prev
-                        # iteration: paired send + recv via
-                        # batch_isend_irecv.
-                        pp_proxy_tensors = (
-                            self._pp_send_recv_proxy_tensors_npu()
-                        )
-                    else:
-                        # First rank (never recv), or first iteration of
-                        # non-first rank (recv-only, no pending send yet).
-                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -144,27 +130,7 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                if not is_npu():
-                    self._pp_commit_comm_work(self.send_proxy_work)
-                elif (
-                    self.pp_group.is_first_rank
-                    and self.pending_proxy_send_dict is not None
-                ):
-                    # NPU first rank: send pending proxy (send-only).
-                    # First rank never recv proxy, so it cannot use the
-                    # paired send_recv path.  The next rank's batch_isend_irecv
-                    # (or irecv for its first iteration) provides the
-                    # matching recv.
-                    self.device_module.current_stream().wait_event(
-                        self.launch_event
-                    )
-                    proxy_send_work = self._pp_send_dict_to_next_stage(
-                        self.pending_proxy_send_dict,
-                        async_send=True,
-                        msg_type="proxy",
-                    )
-                    self._pp_commit_comm_work(proxy_send_work)
-                    self.pending_proxy_send_dict = None
+                self._pp_commit_comm_work(self.send_proxy_work)
                 if cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
@@ -190,29 +156,17 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
                     if cur_batch:
-                        if is_npu():
-                            # Stash proxy tensors for paired send_recv in
-                            # the next iteration (batch_isend_irecv).
-                            self.pending_proxy_send_dict = dict(
-                                result.pp_hidden_states_proxy_tensors.tensors
+                        self.device_module.current_stream().wait_event(
+                            self.launch_event
+                        )
+                        with torch.profiler.record_function(
+                            "send_proxy_dict_to_next_stage"
+                        ):
+                            self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                                result.pp_hidden_states_proxy_tensors.tensors,
+                                async_send=True,
+                                msg_type="proxy",
                             )
-                            self.pending_proxy_send_dict["__msg_type__"] = (
-                                "proxy"
-                            )
-                        else:
-                            self.device_module.current_stream().wait_event(
-                                self.launch_event
-                            )
-                            with torch.profiler.record_function(
-                                "send_proxy_dict_to_next_stage"
-                            ):
-                                self.send_proxy_work = (
-                                    self._pp_send_dict_to_next_stage(
-                                        result.pp_hidden_states_proxy_tensors.tensors,
-                                        async_send=True,
-                                        msg_type="proxy",
-                                    )
-                                )
 
                 self.pp_outputs = next_pp_outputs
 
@@ -315,13 +269,13 @@ class SchedulerPPMixin:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
-                # if get_parallel().pp_async_batch_depth > 0:
-                #     next_pp_outputs, next_batch_result, d2h_event = (
-                #         self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                #             next_first_rank_mb_id,
-                #             next_mb_id,
-                #         )
-                #     )
+                if get_parallel().pp_async_batch_depth > 0:
+                    next_pp_outputs, next_batch_result, d2h_event = (
+                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                            next_first_rank_mb_id,
+                            next_mb_id,
+                        )
+                    )
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if cur_batch:
                     if self.enable_staging:
@@ -624,7 +578,6 @@ class SchedulerPPMixin:
         self.send_proxy_work = []
         self.send_output_work = []
         self.launch_event = None
-        self.pending_proxy_send_dict: Optional[Dict[str, torch.Tensor]] = None
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
@@ -1145,29 +1098,6 @@ class SchedulerPPMixin:
                 )
             )
         return pp_proxy_tensors
-
-    def _pp_send_recv_proxy_tensors_npu(self: Scheduler) -> Optional[PPProxyTensors]:
-        """Paired send/recv of proxy tensors using batch_isend_irecv for NPU.
-
-        Sends the stashed ``pending_proxy_send_dict`` to the next PP stage
-        while simultaneously receiving new proxy tensors from the previous
-        stage.  This avoids the deadlock that can occur on HCCL when
-        separate ``isend`` / ``irecv`` calls block waiting for a matching
-        peer operation.
-        """
-        pending = self.pending_proxy_send_dict
-        self.pending_proxy_send_dict = None
-
-        all_gather_group = (
-            self.attn_tp_group if self.require_attn_tp_allgather else None
-        )
-
-        recv_dict = self.pp_group.send_recv_tensor_dict(
-            send_tensor_dict=pending,
-            send_all_gather_group=all_gather_group,
-            recv_all_gather_group=all_gather_group,
-        )
-        return PPProxyTensors(recv_dict)
 
     def _pp_recv_dict_from_prev_stage(
         self: Scheduler,
