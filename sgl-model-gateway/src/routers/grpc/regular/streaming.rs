@@ -563,7 +563,7 @@ impl StreamingProcessor {
         // Phase 5: Usage chunk
         if let Some(stream_opts) = stream_options {
             if stream_opts.include_usage.unwrap_or(false) {
-                let total_prompt: u32 = prompt_tokens.values().sum();
+                let total_prompt: u32 = aggregate_prompt_tokens(&prompt_tokens);
                 let total_completion: u32 = completion_tokens.values().sum();
 
                 let usage_chunk = ChatCompletionStreamResponse::builder(request_id, model)
@@ -588,7 +588,7 @@ impl StreamingProcessor {
         grpc_stream.mark_completed();
 
         // Record streaming metrics
-        let total_prompt: u32 = prompt_tokens.values().sum();
+        let total_prompt: u32 = aggregate_prompt_tokens(&prompt_tokens);
         let total_completion: u32 = completion_tokens.values().sum();
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
@@ -1325,6 +1325,17 @@ impl StreamingProcessor {
     }
 }
 
+/// Aggregate the prompt token count across all `n` choices of one request.
+///
+/// The prompt is prefilled once and shared by every choice, so each choice's
+/// `Complete` message reports the SAME full prompt length. Summing across the
+/// choice indices would multiply the prompt by `n` and inflate both the
+/// reported `usage.prompt_tokens`/`total_tokens` and the input-token metric.
+/// Take the shared value (the max) so the prompt is counted exactly once.
+fn aggregate_prompt_tokens(prompt_tokens: &HashMap<u32, u32>) -> u32 {
+    prompt_tokens.values().copied().max().unwrap_or(0)
+}
+
 /// Build SSE response with proper headers
 pub(crate) fn build_sse_response(
     rx: mpsc::UnboundedReceiver<Result<Bytes, io::Error>>,
@@ -1342,4 +1353,40 @@ pub(crate) fn build_sse_response(
         .headers_mut()
         .insert("Connection", HeaderValue::from_static("keep-alive"));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::aggregate_prompt_tokens;
+
+    #[test]
+    fn prompt_tokens_counted_once_for_n_choices() {
+        // n=3: SGLang prefills the prompt once and shares it across all three
+        // choices, so every choice's Complete message reports the same full
+        // prompt length (100). The aggregate must be 100, not 300 (summing the
+        // per-index values would triple-count the shared prompt).
+        let mut prompt_tokens = HashMap::new();
+        prompt_tokens.insert(0u32, 100u32);
+        prompt_tokens.insert(1u32, 100u32);
+        prompt_tokens.insert(2u32, 100u32);
+
+        assert_eq!(aggregate_prompt_tokens(&prompt_tokens), 100);
+    }
+
+    #[test]
+    fn prompt_tokens_single_choice_unchanged() {
+        let mut prompt_tokens = HashMap::new();
+        prompt_tokens.insert(0u32, 42u32);
+
+        assert_eq!(aggregate_prompt_tokens(&prompt_tokens), 42);
+    }
+
+    #[test]
+    fn prompt_tokens_empty_is_zero() {
+        let prompt_tokens: HashMap<u32, u32> = HashMap::new();
+
+        assert_eq!(aggregate_prompt_tokens(&prompt_tokens), 0);
+    }
 }
