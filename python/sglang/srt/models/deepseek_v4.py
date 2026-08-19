@@ -143,6 +143,7 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,
+    quant_blocks_shared_experts_fusion,
 )
 from sglang.srt.models.deepseek_v2 import (
     ParallelLMHead,
@@ -308,6 +309,89 @@ _is_gfx942_supported = is_gfx942_supported()
 if _use_aiter:
     if _is_gfx95_supported:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
+
+
+def _wo_a_aiter_gemm_eligible(
+    flag: bool, use_aiter: bool, is_hip: bool, is_gfx95: bool
+) -> bool:
+    """Static eligibility for the aiter ``wo_a`` reroute.
+
+    Folds the opt-in flag, the global ``SGLANG_USE_AITER`` switch, and the
+    HIP/gfx95 platform gates into one predicate. Evaluated once at import (see
+    ``_wo_a_aiter_batched_gemm_enabled``) so none of it runs on the per-token
+    decode critical path.
+    """
+    return bool(flag and use_aiter and is_hip and is_gfx95)
+
+
+# Read the opt-in flag and import the aiter kernel ONCE at module import: the
+# decode ``wo_a`` matmul runs per layer/token on the critical path, so it must
+# not pay an ``EnvBool.get()`` plus a function-local import on every call. If the
+# path is eligible but the kernel import fails, disable it here and fall back to
+# the einsum for the process (logged once) instead of retrying every step.
+_wo_a_aiter_batched_gemm_enabled = _wo_a_aiter_gemm_eligible(
+    envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.get(),
+    _use_aiter,
+    _is_hip,
+    _is_gfx95_supported,
+)
+_wo_a_batched_gemm_bf16 = None
+if _wo_a_aiter_batched_gemm_enabled:
+    try:
+        from aiter.ops.triton.gemm.batched.batched_gemm_bf16 import (
+            batched_gemm_bf16 as _wo_a_batched_gemm_bf16,
+        )
+    except Exception as err:  # pragma: no cover - env-dependent
+        _wo_a_aiter_batched_gemm_enabled = False
+        logger.warning(
+            "aiter wo_a batched_gemm_bf16 import failed; using einsum for wo_a "
+            "for the rest of this process: %s",
+            err,
+        )
+
+# Flipped once if the (already-imported) aiter kernel raises at runtime, so a
+# per-call kernel failure falls back to the einsum for the rest of the process
+# instead of re-raising (and re-logging) on every layer/token.
+_wo_a_aiter_batched_gemm_disabled = False
+
+
+def _apply_wo_a_bf16_matmul(
+    o: torch.Tensor, wo_a: torch.Tensor, is_decode: bool
+) -> torch.Tensor:
+    """wo_a (attn output -> o_proj low-rank) bf16 batched matmul.
+
+    ``o`` is ``[T, G, D]`` (tokens, groups, head_dim) and ``wo_a`` is
+    ``[G, R, D]`` (groups, o_lora_rank, head_dim); the result is ``[T, G, R]``.
+
+    Dispatch contract: on the decode path, when the reroute is enabled
+    (``_wo_a_aiter_batched_gemm_enabled``, computed once at import) and has not
+    been disabled by a prior runtime failure, call the pre-imported aiter
+    ``batched_gemm_bf16`` (``Y[i] = X[i] @ W[i]^T``). Otherwise -- prefill, any
+    gate off, or after a failure -- use the numerically-equivalent
+    ``torch.einsum("tgd,grd->tgr", ...)``. The first runtime kernel failure
+    disables the reroute for the process (logged once).
+    """
+    global _wo_a_aiter_batched_gemm_disabled
+    if (
+        is_decode
+        and _wo_a_aiter_batched_gemm_enabled
+        and not _wo_a_aiter_batched_gemm_disabled
+    ):
+        try:
+            # aiter batched_gemm_bf16: XQ[B,M,K] @ WQ[B,N,K]^T -> [B,M,N].
+            # Here batch = group G: XQ = o.transpose(0,1) [G,T,D], WQ = wo_a
+            # [G,R,D] -> [G,T,R] -> transpose back to [T,G,R].
+            xq = o.transpose(0, 1).contiguous()
+            y = _wo_a_batched_gemm_bf16(xq, wo_a, dtype=torch.bfloat16)
+            return y.transpose(0, 1).contiguous()
+        except Exception as err:
+            _wo_a_aiter_batched_gemm_disabled = True
+            logger.warning(
+                "aiter wo_a batched_gemm_bf16 failed; disabling the reroute and "
+                "falling back to einsum for the rest of this process: %s",
+                err,
+            )
+    return torch.einsum("tgd,grd->tgr", o, wo_a)
 
 
 def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
@@ -1581,7 +1665,9 @@ class MQALayer(MqaAttentionBase):
             o = output
         else:
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            o = torch.einsum("tgd,grd->tgr", o, wo_a)
+            o = _apply_wo_a_bf16_matmul(
+                o, wo_a, is_decode=forward_batch.forward_mode.is_decode()
+            )
 
         o, _ = self.wo_b(o.flatten(1))
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
@@ -1779,7 +1865,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, norm is not None
 
-        if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
+        if _is_hip:
             from aiter.ops.mhc import mhc_pre
 
             post, comb, y = mhc_pre(
@@ -1860,7 +1946,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
             return mhc_post(x, residual, post, comb)
 
-        elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
+        elif _is_hip:
             from aiter.ops.mhc import mhc_post
 
             result = torch.empty_like(residual)
@@ -2036,7 +2122,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         _use_tp_attn_a2a_scatter = (
             not _use_cp
-            and envs.SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER.get()
             and get_parallel().attn_tp_size > 1
             and not get_moe_a2a_backend().is_none()
         )
@@ -3016,6 +3101,14 @@ class DeepseekV4ForCausalLM(nn.Module):
         """V4 only fuses when explicitly asked to, and then the checkpoint must
         carry exactly one shared expert. Asked by the loader before any layer is
         built."""
+        # Need to disable if quant precision mismatch, even if
+        # --enforce-shared-experts-fusion is specified
+        if quant_blocks_shared_experts_fusion(quant_config):
+            return (
+                "Quantization keeps shared experts at a higher precision than the "
+                "routed experts, so they cannot be fused into the quantized "
+                "routed-expert path."
+            )
         if not get_exec().moe.enforce_shared_experts_fusion:
             return "Config does not support fused shared expert(s)."
         if hf_config.n_shared_experts != 1:
@@ -3211,10 +3304,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self._mhc_prewarmed_at_load:
             return
         self._mhc_prewarmed_at_load = True
-        if _is_npu or not (
-            envs.SGLANG_DSV4_MHC_PREWARM.get()
-            and envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get()
-        ):
+        if _is_npu or not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             return
         layer = next(
             (m for m in self.model.layers if isinstance(m, DeepseekV4DecoderLayer)),
