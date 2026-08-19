@@ -1851,6 +1851,11 @@ class MHATokenToKVPool(KVCache):
         self.quant_method = (
             quant_method if quant_method is not None else UnquantizedKVCacheMethod()
         )
+        if self.use_hnd and self.is_quantized_kv_cache:
+            raise ValueError(
+                "Quantized KV cache does not support SGLANG_USE_HND_KVCACHE. "
+                "Quantized KV buffers and their scale buffers use NHD slot-row layout."
+            )
 
         self._create_buffers()
 
@@ -2227,10 +2232,6 @@ class MHATokenToKVPool(KVCache):
         return ptrs, lens, item_lens
 
     def get_cpu_copy(self, indices, mamba_indices=None):
-        assert not self.use_hnd, (
-            "CPU KV offload indexes by slot (NHD); HND KV cache "
-            "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
-        )
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -2238,35 +2239,74 @@ class MHATokenToKVPool(KVCache):
             kv_cache_cpu.append([])
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                k_cpu = self.k_buffer[layer_id][chunk_indices].to(
-                    "cpu", non_blocking=True
-                )
-                v_cpu = self.v_buffer[layer_id][chunk_indices].to(
-                    "cpu", non_blocking=True
-                )
-                kv_cache_cpu[-1].append([k_cpu, v_cpu])
+                if self.use_hnd:
+                    # A slot is [page, :, off, :] (not a contiguous row); gather by
+                    # (page, off) into an NHD-style (N, head_num, head_dim) tensor.
+                    pages = chunk_indices // self.page_size
+                    offs = chunk_indices % self.page_size
+                    k_cpu = self.k_buffer[layer_id][pages, :, offs, :].to(
+                        "cpu", non_blocking=True
+                    )
+                    v_cpu = self.v_buffer[layer_id][pages, :, offs, :].to(
+                        "cpu", non_blocking=True
+                    )
+                else:
+                    k_cpu = self.k_buffer[layer_id][chunk_indices].to(
+                        "cpu", non_blocking=True
+                    )
+                    v_cpu = self.v_buffer[layer_id][chunk_indices].to(
+                        "cpu", non_blocking=True
+                    )
+                chunk_cpu = [k_cpu, v_cpu]
+                if self.is_quantized_kv_cache and self.k_scale_buffer is not None:
+                    # Packed FP4 data is unusable without its per-token block scales.
+                    k_scale_cpu = self.k_scale_buffer[layer_id][chunk_indices].to(
+                        "cpu", non_blocking=True
+                    )
+                    v_scale_cpu = self.v_scale_buffer[layer_id][chunk_indices].to(
+                        "cpu", non_blocking=True
+                    )
+                    chunk_cpu.extend([k_scale_cpu, v_scale_cpu])
+                kv_cache_cpu[-1].append(chunk_cpu)
         current_platform.synchronize()
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
-        assert not self.use_hnd, (
-            "CPU KV offload indexes by slot (NHD); HND KV cache "
-            "(SGLANG_USE_HND_KVCACHE) is not supported with CPU offload yet."
-        )
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                k_cpu, v_cpu = (
-                    kv_cache_cpu[layer_id][i // chunk_size][0],
-                    kv_cache_cpu[layer_id][i // chunk_size][1],
-                )
+                chunk_cpu = kv_cache_cpu[layer_id][i // chunk_size]
+                k_cpu, v_cpu = chunk_cpu[:2]
                 assert k_cpu.shape[0] == v_cpu.shape[0] == len(chunk_indices)
                 k_chunk = k_cpu.to(self.k_buffer[0].device, non_blocking=True)
                 v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
-                self.k_buffer[layer_id][chunk_indices] = k_chunk
-                self.v_buffer[layer_id][chunk_indices] = v_chunk
+                if self.use_hnd:
+                    # Mirror get_cpu_copy: scatter the NHD-style chunk back by (page, off).
+                    pages = chunk_indices // self.page_size
+                    offs = chunk_indices % self.page_size
+                    self.k_buffer[layer_id][pages, :, offs, :] = k_chunk
+                    self.v_buffer[layer_id][pages, :, offs, :] = v_chunk
+                else:
+                    self.k_buffer[layer_id][chunk_indices] = k_chunk
+                    self.v_buffer[layer_id][chunk_indices] = v_chunk
+                if self.is_quantized_kv_cache and self.k_scale_buffer is not None:
+                    assert len(chunk_cpu) == 4
+                    k_scale_cpu, v_scale_cpu = chunk_cpu[2:]
+                    assert (
+                        k_scale_cpu.shape[0]
+                        == v_scale_cpu.shape[0]
+                        == len(chunk_indices)
+                    )
+                    k_scale_chunk = k_scale_cpu.to(
+                        self.k_scale_buffer[0].device, non_blocking=True
+                    )
+                    v_scale_chunk = v_scale_cpu.to(
+                        self.v_scale_buffer[0].device, non_blocking=True
+                    )
+                    self.k_scale_buffer[layer_id][chunk_indices] = k_scale_chunk
+                    self.v_scale_buffer[layer_id][chunk_indices] = v_scale_chunk
         current_platform.synchronize()
 
     def _get_key_buffer(self, layer_id: int):
