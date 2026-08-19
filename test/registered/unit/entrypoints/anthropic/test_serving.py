@@ -301,7 +301,7 @@ class TestAnthropicServing(unittest.TestCase):
         ]
         self.assertEqual(sig_deltas, [])
 
-    def test_stream_usage_subtracts_cache_read_and_omits_final_input_tokens(self):
+    def test_stream_usage_subtracts_cache_read_and_repeats_final_input_tokens(self):
         usage = {
             "prompt_tokens": 10,
             "completion_tokens": 0,
@@ -337,8 +337,46 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(
             message_start["message"]["usage"]["cache_read_input_tokens"], 4
         )
-        self.assertNotIn("input_tokens", message_delta["usage"])
+        # Usage on ``message_delta`` is cumulative: the input-side counters are
+        # repeated verbatim from ``message_start`` so a client that only reads
+        # the final event still sees the full accounting.
+        self.assertEqual(message_delta["usage"]["input_tokens"], 6)
+        self.assertEqual(message_delta["usage"]["cache_read_input_tokens"], 4)
         self.assertEqual(message_delta["usage"]["output_tokens"], 2)
+
+    def test_stream_final_usage_matches_message_start_without_cache(self):
+        """Without cache hits the final delta still carries ``input_tokens``.
+
+        Clients that track context consumption from the last usage payload
+        (the Anthropic SDK's accumulated final message, usage-metering
+        proxies, CLI context meters) see zero input otherwise.
+        """
+        usage = {"prompt_tokens": 25, "completion_tokens": 0, "total_tokens": 25}
+        final_usage = {"prompt_tokens": 25, "completion_tokens": 15, "total_tokens": 40}
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _chunk([_choice({"content": "hi"})], usage=usage),
+                _chunk([], usage=final_usage),
+                "data: [DONE]\n\n",
+            ]
+        )
+
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        message_start = next(e for e in events if e["type"] == "message_start")
+        message_delta = next(e for e in events if e["type"] == "message_delta")
+
+        self.assertEqual(
+            message_delta["usage"]["input_tokens"],
+            message_start["message"]["usage"]["input_tokens"],
+        )
+        self.assertEqual(message_delta["usage"]["input_tokens"], 25)
+        self.assertEqual(message_delta["usage"]["output_tokens"], 15)
+        # No cache hits: the optional cache counter stays absent on both events.
+        self.assertNotIn("cache_read_input_tokens", message_start["message"]["usage"])
+        self.assertNotIn("cache_read_input_tokens", message_delta["usage"])
 
     def test_non_streaming_usage_subtracts_cache_read_tokens(self):
         response = ChatCompletionResponse.model_validate(
