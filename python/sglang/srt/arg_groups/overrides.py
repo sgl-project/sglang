@@ -1311,6 +1311,9 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
 
 @_register_for(
     "Qwen3NextForCausalLM",
+    "Qwen3_5ForCausalLM",
+    "Qwen3_5ForCausalLMMTP",
+    "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
     "InternS2MobiusForConditionalGeneration",
@@ -1371,6 +1374,9 @@ def _qwen3vl_overrides(server_args: Any, hf_config: Any) -> dict:
     "Qwen3MoeForCausalLM",
     "Qwen3VLMoeForConditionalGeneration",
     "Qwen3NextForCausalLM",
+    "Qwen3_5ForCausalLM",
+    "Qwen3_5ForCausalLMMTP",
+    "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
@@ -1498,6 +1504,9 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "KimiK3ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
         "Qwen3NextForCausalLM",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForCausalLMMTP",
+        "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "InternS2MobiusForConditionalGeneration",
@@ -1520,6 +1529,9 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
 _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
     {
         "KimiLinearForCausalLM",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForCausalLMMTP",
+        "Qwen3_5MoeForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3NextForCausalLM",
@@ -1588,6 +1600,25 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
         else:
             declared["mamba_radix_cache_strategy"] = "no_buffer"
             declared["disable_overlap_schedule"] = True
+
+    strategy = declared.get(
+        "mamba_radix_cache_strategy", view.mamba_radix_cache_strategy
+    )
+    if (
+        is_npu()
+        and view.attention_backend == "ascend"
+        and supports_mamba_cache_extra_buffer(view, model_arch)
+        and strategy == "no_buffer"
+        and view.page_size is not None
+        and view.page_size != 1
+    ):
+        logger.warning(
+            f"{model_arch} with Ascend attention uses page_size={view.page_size}, "
+            "while the mamba no_buffer radix cache requires page_size=1. "
+            "Automatically using --mamba-radix-cache-strategy extra_buffer "
+            "to keep prefix cache enabled."
+        )
+        declared["mamba_radix_cache_strategy"] = "extra_buffer"
     return declared
 
 
@@ -1970,6 +2001,8 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3NextForCausalLM",
         "KimiK25ForConditionalGeneration",
+        "Qwen3_5ForCausalLMMTP",
+        "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
