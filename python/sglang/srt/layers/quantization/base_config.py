@@ -10,9 +10,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 import torch
 from torch import nn
 
-from sglang.srt.checkpoint_quantization import (
-    canonicalize_modelopt_quant_algo,
-)
+from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
@@ -205,10 +203,6 @@ class QuantizationConfig(ABC):
             canonical_method = canonicalize_modelopt_quant_algo(quant_algo)
             if canonical_method is not None:
                 return canonical_method
-            # Preserve compatibility for vendor-specific FP4 spellings that
-            # predate the canonical allowlist above.
-            if "NVFP4" in quant_algo or "FP4" in quant_algo:
-                return "modelopt_fp4"
 
         # The hf_quant_config may be a parsed quant config, so we need to check the
         # quant_method.

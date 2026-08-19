@@ -13,8 +13,8 @@ from sglang.multimodal_gen.runtime.layers.quantization import (
     get_quantization_config,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.checkpoint_quantization import (
-    canonicalize_modelopt_quant_algo,
+from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
+from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
 )
 

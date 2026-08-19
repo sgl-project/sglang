@@ -2,9 +2,10 @@
 
 import unittest
 
-from sglang.srt.checkpoint_quantization import (
+from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.model_loader.checkpoint_quantization import (
     CheckpointQuantSpec,
-    canonicalize_modelopt_quant_algo,
     resolve_checkpoint_quant_spec,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -41,6 +42,19 @@ class TestResolveCheckpointQuantSpec(CustomTestCase):
         for quant_algo, expected in cases.items():
             with self.subTest(quant_algo=quant_algo):
                 self.assertEqual(canonicalize_modelopt_quant_algo(quant_algo), expected)
+
+    def test_srt_modelopt_override_uses_the_exact_algorithm_allowlist(self):
+        self.assertEqual(
+            QuantizationConfig._modelopt_override_quantization_method(
+                {"quant_algo": "NVFP4"}, "modelopt"
+            ),
+            "modelopt_fp4",
+        )
+        self.assertIsNone(
+            QuantizationConfig._modelopt_override_quantization_method(
+                {"quant_algo": "NVFP4_FAKE"}, "modelopt"
+            )
+        )
 
     def test_top_level_quantization_config(self):
         config = {
