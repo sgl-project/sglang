@@ -99,6 +99,14 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.plugins import load_plugins
+from sglang.srt.runtime_context import (
+    configured_pp_size,
+    get_exec,
+    get_model,
+    get_parallel,
+    get_serving,
+    publish,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -157,9 +165,9 @@ def init_tokenizer_manager(
     template_manager = TemplateManager()
     template_manager.initialize_templates(
         tokenizer_manager=tokenizer_manager,
-        model_path=server_args.model_path,
-        chat_template=server_args.chat_template,
-        completion_template=server_args.completion_template,
+        model_path=get_model().model_path,
+        chat_template=get_serving().chat_template,
+        completion_template=get_serving().completion_template,
     )
 
     # Resolve any remaining auto parsers using template manager's detection results
@@ -278,8 +286,8 @@ class Engine(EngineScoreMixin, EngineBase):
         self.template_manager = template_manager
         self._scheduler_init_result = scheduler_init_result
         # Engine-spawned weight cache daemons owned by *this* instance (empty
-        # unless --weight-cache-mode daemon). Kept per-instance so two Engines
-        # in one process each reap only their own daemons in shutdown().
+        # unless --weight-cache-mode daemon), so shutdown() reaps exactly what
+        # this Engine spawned.
         self._weight_cache_daemon_procs = weight_cache_daemon_procs
         if tokenizer_manager is not None:
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
@@ -335,7 +343,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 routed_dp_rank = data_parallel_rank
 
         if routed_dp_rank is not None:
-            dp_size = self.server_args.dp_size
+            dp_size = get_parallel().dp_size
             if dp_size <= 1 and routed_dp_rank == 0:
                 logger.debug(
                     f"routed_dp_rank={routed_dp_rank} is ignored because dp_size={dp_size}"
@@ -660,7 +668,7 @@ class Engine(EngineScoreMixin, EngineBase):
         (``python -m sglang.srt.weight_cache.daemon``) plus
         ``--weight-cache-mode client``, where the daemon outlives the engine.
         """
-        if server_args.dp_size > 1:
+        if get_parallel().dp_size > 1:
             raise ValueError(
                 "Weight cache daemon mode does not support dp_size > 1. "
                 "Please set --dp-size 1 when using --weight-cache-mode daemon."
@@ -680,7 +688,7 @@ class Engine(EngineScoreMixin, EngineBase):
         pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
             _calculate_rank_ranges(
                 server_args.nnodes,
-                server_args.pp_size,
+                configured_pp_size(),
                 tp_size,
                 server_args.node_rank,
             )
@@ -701,7 +709,7 @@ class Engine(EngineScoreMixin, EngineBase):
         daemon_procs = []
         logger.info(
             f"Launching {num_daemons} weight cache daemon(s) on node "
-            f"{server_args.node_rank} for model={server_args.model_path}, "
+            f"{server_args.node_rank} for model={get_model().model_path}, "
             f"pp_ranks={pp_rank_range.start}..{pp_rank_range.stop - 1}, "
             f"tp_ranks={tp_rank_range.start}..{tp_rank_range.stop - 1}, "
             f"dist_init_method={dist_init_method}"
@@ -736,7 +744,7 @@ class Engine(EngineScoreMixin, EngineBase):
                     "-m",
                     "sglang.srt.weight_cache.daemon",
                     "--model-path",
-                    server_args.model_path,
+                    get_model().model_path,
                     "--gpu-id",
                     str(gpu_id),
                     "--tp-size",
@@ -744,22 +752,22 @@ class Engine(EngineScoreMixin, EngineBase):
                     "--tp-rank",
                     str(tp_rank),
                     "--pp-size",
-                    str(server_args.pp_size),
+                    str(configured_pp_size()),
                     "--pp-rank",
                     str(pp_rank),
                     "--dp-size",
                     "1",
                     "--ep-size",
-                    str(server_args.ep_size),
+                    str(get_parallel().ep_size),
                     "--load-format",
-                    server_args.load_format,
+                    get_model().load_format,
                     "--dtype",
-                    server_args.dtype,
+                    get_model().dtype,
                     "--dist-init-method",
                     dist_init_method,
                 ]
-                if server_args.quantization:
-                    cmd += ["--quantization", server_args.quantization]
+                if get_model().quantization:
+                    cmd += ["--quantization", get_model().quantization]
                 if (
                     server_args.model_loader_extra_config
                     and server_args.model_loader_extra_config != "{}"
@@ -862,7 +870,7 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         scheduler_procs = []
         use_dp_controller = (
-            server_args.dp_size > 1 or server_args.ep_join_mode == "scale"
+            get_parallel().dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
         )
 
         if not use_dp_controller:
@@ -875,7 +883,7 @@ class Engine(EngineScoreMixin, EngineBase):
             pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
                 _calculate_rank_ranges(
                     server_args.nnodes,
-                    server_args.pp_size,
+                    configured_pp_size(),
                     server_args.tp_size,
                     server_args.node_rank,
                 )
@@ -982,7 +990,7 @@ class Engine(EngineScoreMixin, EngineBase):
         processes: List[mp.Process] = []
         names: List[str] = []
 
-        if server_args.detokenizer_worker_num <= 1:
+        if get_serving().detokenizer_worker_num <= 1:
             proc = mp.Process(
                 target=run_detokenizer_process_func,
                 args=(server_args, port_args),
@@ -995,7 +1003,7 @@ class Engine(EngineScoreMixin, EngineBase):
         router_ipc_name = port_args.detokenizer_ipc_name
         worker_ipc_names: List[str] = []
         try:
-            for i in range(server_args.detokenizer_worker_num):
+            for i in range(get_serving().detokenizer_worker_num):
                 worker_ipc = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
                 port_args.detokenizer_ipc_name = worker_ipc
                 proc = mp.Process(
@@ -1109,9 +1117,13 @@ class Engine(EngineScoreMixin, EngineBase):
         ):
             resolve_auto_parsers(server_args)
 
-        # Launch daemons (daemon mode only). Handles are threaded back to the
-        # owning Engine instance (not a class attr) so two Engines in one process
-        # don't clobber each other's daemon list.
+        # Resolution is complete here; this process goes on to host the
+        # tokenizer manager or the multi-tokenizer router, whose own publish
+        # re-projects the same object.
+        publish(server_args, role="tokenizer")
+
+        # Launch daemons (daemon mode only). The handles travel back to the
+        # Engine that spawned them; shutdown() reaps from there.
         weight_cache_daemon_procs: List = []
         if server_args.weight_cache_mode == "daemon":
             weight_cache_daemon_procs = cls._launch_weight_cache_daemons(server_args)
@@ -1352,15 +1364,34 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         return msgspec_to_builtins(
             {
-                **self.tokenizer_manager.resolved_config_dict(
-                    dataclasses.asdict(self.tokenizer_manager.server_args)
-                ),
+                **dataclasses.asdict(self.tokenizer_manager.server_args),
                 **self._scheduler_init_result.scheduler_infos[0],
                 "startup_time": self.tokenizer_manager.startup_time,
                 "internal_states": internal_states,
                 "version": __version__,
             }
         )
+
+    def get_model_info(self):
+        """What this engine is serving right now.
+
+        `get_server_info` answers with the record: the launch configuration,
+        parsers included -- `auto` resolves into the record before the config
+        is published. This surface adds what the control plane changed after
+        publication: the model a weight update swapped in, its load format, an
+        operator-set weight version. The HTTP and gRPC model-info endpoints
+        answer with the same fields.
+        """
+        tm = self.tokenizer_manager
+        return {
+            "model_path": tm.model_path,
+            "served_model_name": tm.served_model_name,
+            "is_generation": tm.is_generation,
+            "weight_version": tm.config_value("weight_version"),
+            "load_format": tm.config_value("load_format"),
+            "reasoning_parser": tm.config_value("reasoning_parser"),
+            "tool_call_parser": tm.config_value("tool_call_parser"),
+        }
 
     def init_weights_update_group(
         self,
@@ -1830,7 +1861,7 @@ def _compute_parallelism_ranks(
     server_args: ServerArgs, tp_rank: int
 ) -> Tuple[int, int, int]:
     """Compute attention-CP, MoE-DP, and MoE-EP ranks for a TP rank."""
-    attn_dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+    attn_dp_size = get_parallel().dp_size if get_parallel().enable_dp_attention else 1
 
     # Parallelism hierarchy (outermost to innermost):
     # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
@@ -1841,6 +1872,6 @@ def _compute_parallelism_ranks(
     moe_ep_rank = (
         tp_rank
         % (server_args.tp_size // server_args.moe_dp_size)
-        // (server_args.tp_size // server_args.moe_dp_size // server_args.ep_size)
+        // (server_args.tp_size // server_args.moe_dp_size // get_parallel().ep_size)
     )
     return attn_cp_rank, moe_dp_rank, moe_ep_rank

@@ -98,8 +98,24 @@ class VAELoader(ComponentLoader):
     component_names = ["vae", "audio_vae", "video_vae"]
     expected_library = "diffusers"
 
+    def customized_load_kwargs_for_component(
+        self, server_args: ServerArgs, component_name: str
+    ) -> dict[str, bool]:
+        if current_platform.is_mps() and self._is_component_set_as_layerwise_load(
+            server_args, component_name
+        ):
+            logger.info(
+                "Loading %s on CPU first for MPS layerwise offload", component_name
+            )
+            return {"cpu_offload_flag": True}
+        return {}
+
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        cpu_offload_flag: bool = False,
     ):
         """Load the VAE based on the model path, and inference args."""
         config = get_diffusers_component_config(component_path=component_model_path)
@@ -133,8 +149,9 @@ class VAELoader(ComponentLoader):
             # NOTE: some post init logics are only available after updated with config
             vae_config.post_init()
 
-        component_starts_on_cpu = server_args.should_start_component_on_cpu(
-            component_name
+        component_starts_on_cpu = (
+            server_args.should_start_component_on_cpu(component_name)
+            or cpu_offload_flag
         )
         target_device = self.target_device(component_starts_on_cpu)
 
@@ -190,7 +207,11 @@ class VAELoader(ComponentLoader):
             loaded.update(safetensors_load_file(sf_path))
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_name)
         strict_load = native_only
-        vae.load_state_dict(loaded, strict=strict_load)
+        vae.load_state_dict(
+            loaded,
+            strict=strict_load,
+            assign=bool(cpu_offload_flag and current_platform.is_mps()),
+        )
 
         if not strict_load:
             state_keys = set(vae.state_dict().keys())
