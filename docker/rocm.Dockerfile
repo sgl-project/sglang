@@ -1,8 +1,16 @@
 # Usage (to build SGLang ROCm docker image):
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm724 -t v0.5.10.post1-rocm724-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm724 -t v0.5.10.post1-rocm724-mi35x -f rocm.Dockerfile .
+#
+# Flavor notes:
+#   GPU_ARCH=*-rocm720 and *-rocm724 upgrade the stack to torch 2.11
+#   (+torchvision 0.26 / torchaudio 2.11) and AITER-managed Triton. The base
+#   images retain their existing Python versions (3.10 for 7.2.0, 3.12 for
+#   7.2.4).
 
 # Usage (to build SGLang ROCm + Mori docker image):
 # remove --build-arg NIC_BACKEND=ainic since new MoRI JIT will do NIC auto detection on target
@@ -23,8 +31,10 @@
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_942_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+ARG BASE_IMAGE_942_ROCM724="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
 ARG BASE_IMAGE_950="rocm/sgl-dev:rocm7-vllm-20250904"
 ARG BASE_IMAGE_950_ROCM720="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+ARG BASE_IMAGE_950_ROCM724="rocm/pytorch:rocm7.2.4_ubuntu24.04_py3.12_pytorch_release_2.10.0"
 
 # This is necessary for scope purpose
 ARG GPU_ARCH=gfx950
@@ -40,14 +50,36 @@ ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 
 # ===============================
-# Base image 942 with rocm720 and args
+# Base image 942 with rocm720 and args (Python 3.10 + torch 2.11)
 FROM $BASE_IMAGE_942_ROCM720 AS gfx942-rocm720
 ENV BUILD_VLLM="0"
+# Install AITER's pinned Triton after all other Python dependencies.
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+# Pin the ROCm torch stack for every pip invocation in this flavor. The file is
+# filled in after the torch 2.11 upgrade below; it must already exist (empty is
+# valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
+ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
+RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
+
+# ===============================
+# Base image 942 with rocm724 and args (Python 3.12 + torch 2.11)
+FROM $BASE_IMAGE_942_ROCM724 AS gfx942-rocm724
+ENV BUILD_VLLM="0"
+# Install AITER's pinned Triton after all other Python dependencies.
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+# Pin the ROCm torch stack for every pip invocation in this flavor. The file is
+# filled in after the torch 2.11 upgrade below; it must already exist (empty is
+# valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
+ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
+RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
 # ===============================
 # Base image 950 and args
@@ -60,14 +92,34 @@ ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
 
 # ===============================
-# Base image 950 with rocm720 and args
+# Base image 950 with rocm720 and args (Python 3.10 + torch 2.11)
 FROM $BASE_IMAGE_950_ROCM720 AS gfx950-rocm720
 ENV BUILD_VLLM="0"
+# See gfx942-rocm720: install AITER's pinned Triton last.
 ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+# See gfx942-rocm720: constrain the torch stack during all pip operations.
+ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
+RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
+
+# ===============================
+# Base image 950 with rocm724 and args (Python 3.12 + torch 2.11)
+FROM $BASE_IMAGE_950_ROCM724 AS gfx950-rocm724
+ENV BUILD_VLLM="0"
+# See gfx942-rocm724: install AITER's pinned Triton last.
+ENV BUILD_TRITON="1"
+ENV BUILD_LLVM="0"
+ENV BUILD_AITER_ALL="1"
+ENV BUILD_MOONCAKE="1"
+ENV AITER_COMMIT_DEFAULT="d9e5ef7ce08ee7045d583aed768cff41aa9210fe"
+# Pin the ROCm torch stack for every pip invocation in this flavor. The file is
+# filled in after the torch 2.11 upgrade below; it must already exist (empty is
+# valid) because pip reads PIP_CONSTRAINT from the first pip call onwards.
+ENV PIP_CONSTRAINT="/etc/sglang/constraints/torch-rocm.txt"
+RUN mkdir -p /etc/sglang/constraints && : > /etc/sglang/constraints/torch-rocm.txt
 
 # Local source stage: with BRANCH_TYPE=local the build context is copied here and
 # used instead of git clone (mirrors docker/Dockerfile's local_src stage).
@@ -90,6 +142,13 @@ ARG BRANCH_TYPE=remote
 
 # Version override for setuptools_scm (used in nightly builds)
 ARG SETUPTOOLS_SCM_PRETEND_VERSION=""
+
+# ROCm 7.2 torch upgrade pins. Torch 2.11 for ROCm 7.2 is only published on the
+# PyTorch Foundation index; AMD's repo.radeon.com wheels top out at torch 2.10.
+ARG TORCH_ROCM_INDEX_URL="https://download.pytorch.org/whl/rocm7.2"
+ARG TORCH_ROCM_VERSION="2.11.0+rocm7.2"
+ARG TORCHVISION_ROCM_VERSION="0.26.0+rocm7.2"
+ARG TORCHAUDIO_ROCM_VERSION="2.11.0+rocm7.2"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG AITER_COMMIT=""
@@ -159,7 +218,7 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
 # See https://github.com/ROCm/ROCm/issues/5992
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm720*) \
+      *rocm720*|*rocm724*) \
         echo "ROCm 7.2 (GPU_ARCH=${GPU_ARCH}): libdrm-amdgpu packages already present, skipping"; \
         ;; \
       *) \
@@ -187,13 +246,42 @@ RUN apt-get purge -y sccache; python -m pip uninstall -y sccache; rm -f "$(which
 # The ROCm 7.2 base image (rocm/pytorch) does not pre-install this package.
 RUN set -eux; \
     case "${GPU_ARCH}" in \
-      *rocm720*) \
+      *rocm720*|*rocm724*) \
         echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
         cd /opt/rocm/share/amd_smi \
         && python3 -m pip install --no-cache-dir . \
         ;; \
       *) \
         echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip amdsmi installation"; \
+        ;; \
+    esac
+
+# -----------------------
+# ROCm 7.2.0/7.2.4: upgrade to torch 2.11 (+ vision/audio), which pulls
+# triton-rocm 3.6.0.
+# Done here, before AITER / sgl-kernel, so those extensions build against torch 2.11's ABI.
+RUN case "${GPU_ARCH}" in \
+      *-rocm720|*-rocm724) \
+        python3 -m pip install --no-cache-dir --index-url "${TORCH_ROCM_INDEX_URL}" \
+            "torch==${TORCH_ROCM_VERSION}" \
+            "torchvision==${TORCHVISION_ROCM_VERSION}" \
+            "torchaudio==${TORCHAUDIO_ROCM_VERSION}" \
+        ;; \
+      *) \
+        echo "Not a ROCm 7.2 flavor (GPU_ARCH=${GPU_ARCH}), keep base torch/triton"; \
+        ;; \
+    esac
+
+# Populate the PIP_CONSTRAINT file defined by the ROCm 7.2 stages so that
+# resolving AITER and SGLang dependencies cannot replace the torch stack above.
+# 'triton' is deliberately left out because AITER installs its own pinned wheel
+# after all other Python dependencies.
+RUN case "${GPU_ARCH}" in \
+      *-rocm720|*-rocm724) \
+        python3 -m pip freeze \
+          | grep -E '^(torch|torchvision|torchaudio|triton-rocm|pytorch-triton-rocm)(==| @ )' \
+          > /etc/sglang/constraints/torch-rocm.txt \
+        && cat /etc/sglang/constraints/torch-rocm.txt \
         ;; \
     esac
 
@@ -319,13 +407,43 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
     && AMDGPU_TARGET=$GPU_ARCH_LIST python setup_rocm.py install \
     && cd ../../../.. \
     && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml \
+    # srt_hip pins compressed-tensors==0.15.0, which requires torch<2.11 and so
+    # cannot be satisfied on the ROCm 7.2 torch 2.11 stack. The *_torch211
+    # extras carry a 0.16.0 pin instead; all other flavors keep the extras they
+    # used before.
+    && case "${GPU_ARCH}" in \
+         *-rocm720|*-rocm724) srt_extras="srt_hip_torch211,diffusion_hip"; all_extras="all_hip_torch211" ;; \
+         *) srt_extras="srt_hip,diffusion_hip"; all_extras="all_hip" ;; \
+       esac \
     && if [ "$BUILD_TYPE" = "srt" ]; then \
-         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[srt_hip,diffusion_hip]"; \
+         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[${srt_extras}]"; \
        else \
-         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[all_hip]"; \
+         export SETUPTOOLS_SCM_PRETEND_VERSION="${SETUPTOOLS_SCM_PRETEND_VERSION}" && python -m pip --no-cache-dir install -e "python[${all_extras}]"; \
        fi
 
+# AITER stream handling on torch 2.11 (rocm720 and rocm724). Runs here rather
+# than next to the AITER clone because it shares its logic with the CI installer
+# via a script from the sglang checkout, which only exists from this point on.
+# AITER is installed editable, so patching its source after the install still
+# takes effect.
+RUN case "${GPU_ARCH}" in \
+      *-rocm720|*-rocm724) \
+        python3 /sgl-workspace/sglang/scripts/ci/amd/patch_aiter_torch_stream.py \
+        ;; \
+    esac
+
 RUN python -m pip cache purge
+
+RUN case "${GPU_ARCH}" in \
+      *-rocm720|*-rocm724) \
+        python3 -m pip check \
+        && python3 -c "import importlib.metadata as m; import torch, torchao, torchaudio, torchvision, triton; expected={'torch':'2.11.','torchao':'0.9.','torchaudio':'2.11.','torchvision':'0.26.'}; actual={'torch':torch.__version__,'torchao':m.version('torchao'),'torchaudio':torchaudio.__version__,'torchvision':torchvision.__version__,'triton':triton.__version__}; assert torch.version.hip, actual; assert all(actual[name].startswith(version) for name, version in expected.items()), actual; print('Validated ROCm stack:', actual, 'HIP', torch.version.hip)" \
+        && if pip list --format=freeze | grep -Eq '^nvidia-.*-cu[0-9]+'; then \
+             echo "ERROR: NVIDIA CUDA runtime packages were installed into the ROCm image"; \
+             exit 1; \
+           fi \
+        ;; \
+    esac
 
 # Copy config files to support MI300X in virtualized environments (MI300X_VF).  Symlinks will not be created in image build.
 RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
@@ -536,6 +654,13 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   apt-get update && apt-get install -y --no-install-recommends \
       build-essential autoconf automake libtool pkg-config git \
       libibverbs-dev librdmacm-dev rdma-core && rm -rf /var/lib/apt/lists/*; \
+  # Mooncake's dependencies.sh apt-installs Ubuntu's libabsl-dev (20220623 on
+  # the noble base used by rocm724). NIXL's meson then finds absl_base but no
+  # absl_log and refuses to fall back to its bundled Abseil -- "that would
+  # result in a mix of Abseil versions at runtime" -- so nixl fails at metadata
+  # generation. Drop just the -dev package (headers and pkg-config files); the
+  # runtime library that already-built components link against stays in place.
+  case "${GPU_ARCH}" in *-rocm724) apt-get remove -y libabsl-dev ;; esac; \
   pip install --no-cache-dir meson ninja pybind11 meson-python patchelf pyyaml; \
   git clone --depth=1 -b "${UCX_BRANCH}" "${UCX_REPO}" /sgl-workspace/ucx; \
   cd /sgl-workspace/ucx && ./autogen.sh && mkdir build && cd build && \
@@ -556,73 +681,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   SITE=$(python3 -c "import sysconfig; print(sysconfig.get_paths()[\"purelib\"])"); \
   ln -sfn nixl_rocm "$SITE/nixl"; \
   echo "export LD_LIBRARY_PATH=/opt/ucx/lib:\${LD_LIBRARY_PATH}" >> /etc/bash.bashrc'
-
-# -----------------------
-# Hot patch: torch-ROCm
-# The artifact hardcoded the supported triton version to be 3.5.1.
-# Rewrite the restriction directly.
-ARG TORCH_ROCM_FILE="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl"
-RUN mkdir /tmp/whl && cd /tmp/whl \
-     && export TORCH_ROCM_FILE="${TORCH_ROCM_FILE}" \
-     && cat > hack.py <<"PY"
-import zipfile, csv, os, re
-from pathlib import Path
-
-fname = os.environ["TORCH_ROCM_FILE"]
-in_whl  = Path("/")   / fname
-out_whl = Path("/tmp")/ fname
-work = Path("/tmp/whl")
-
-# 1) Extract
-with zipfile.ZipFile(in_whl, "r") as z:
-    z.extractall(work)
-
-# 2) Locate dist-info and patch METADATA (edit this logic to match your exact line)
-dist_info = next(work.glob("*.dist-info"))
-meta = dist_info / "METADATA"
-txt = meta.read_text(encoding="utf-8")
-
-# Example: replace one exact requirement form.
-# Adjust the string to match what you actually see.
-pat = r"^Requires-Dist:\s*triton==3.5.1[^\s]*;"
-txt2, n = re.subn(pat, r"triton>=3.5.1;", txt, flags=re.MULTILINE)
-if txt2 == txt:
-    raise SystemExit("Did not find expected Requires-Dist line to replace in METADATA")
-meta.write_text(txt2, encoding="utf-8")
-
-# 3) Hacky step: blank hash/size columns in RECORD
-record = dist_info / "RECORD"
-rows = []
-with record.open(newline="", encoding="utf-8") as f:
-    for r in csv.reader(f):
-        if not r:
-            continue
-        # keep filename, blank out hash and size
-        rows.append([r[0], "", ""])
-with record.open("w", newline="", encoding="utf-8") as f:
-    csv.writer(f).writerows(rows)
-
-# 4) Re-zip as a wheel
-with zipfile.ZipFile(out_whl, "w", compression=zipfile.ZIP_DEFLATED) as z:
-    for p in work.rglob("*"):
-        if p.is_file():
-            z.write(p, p.relative_to(work).as_posix())
-
-print("Wrote", out_whl)
-PY
-
-RUN cd /tmp/whl \
-    && case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        python hack.py \
-        && python3 -m pip install --force --no-deps /tmp/${TORCH_ROCM_FILE} \
-        && rm -fr /tmp/whl /tmp/${TORCH_ROCM_FILE} \
-        ;; \
-      *) \
-        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
-        ;; \
-    esac
 
 # -----------------------
 # Hot patch: transformers dynamic_module_utils symlink bug (v5.12.1).
@@ -658,15 +716,78 @@ PY
 # Install the Triton AITER pins, replacing the base image's. No version check
 # on purpose: the pin is AITER's to move, and its installer enforces a floor.
 #
-# Keep this last. Base ROCm Torch pins triton==3.5.1 and the torch patch above
-# is what drops that pin, so installing Triton any earlier lets the next pip
-# install pull CUDA torch instead. The hip check below is the tripwire.
+# Keep this last. ROCm torch 2.11 initially installs triton-rocm 3.6.0; AITER's
+# installer replaces it with AITER-managed Triton. No later pip install should
+# overwrite that selected distribution. The metadata patch below updates
+# torch's recorded requirement to match, and the HIP check is the tripwire.
 RUN if [ "$BUILD_TRITON" = "1" ]; then \
         cd /sgl-workspace/aiter \
      && test -f .github/scripts/install_triton.sh \
      && PIP_NO_CACHE_DIR=1 bash .github/scripts/install_triton.sh \
      && python3 -c "import torch; from importlib.metadata import version; v = version('triton'); k = version('triton-kernels'); assert torch.version.hip is not None, torch.__version__; print(f'[Triton] ROCm Torch {torch.__version__}, Triton {v}, triton-kernels {k}')"; \
     fi
+
+# The installer above uninstalls the triton-rocm that torch 2.11 hard-requires,
+# so torch is left naming a distribution nothing provides. See the script for
+# why neither leaving triton-rocm installed nor leaving the metadata stale works.
+RUN python3 /sgl-workspace/sglang/scripts/ci/amd/patch_torch_triton_requirement.py
+
+# Validate the stack that actually ships, after the Triton swap above. The
+# earlier check ran before it, so it could not catch a broken Triton wiring, and
+# the components installed in between are free to move torch underneath us.
+#
+# This gate checks torch's own recorded requirements rather than running `pip
+# check` over the whole environment: TileLang publishes metadata this image
+# cannot satisfy (it requires torch-c-dlpack-ext, and an apache-tvm-ffi range
+# that its own build pins outside of), so a whole-environment check fails here
+# for reasons that have nothing to do with the torch stack. The earlier gate
+# still runs `pip check`, since it sits before the TileLang build.
+RUN <<'EOF'
+set -eu
+case "${GPU_ARCH}" in
+  *-rocm720|*-rocm724) ;;
+  *) echo "[Final] Not a ROCm 7.2 flavor (GPU_ARCH=${GPU_ARCH}), skip"; exit 0 ;;
+esac
+python3 -m pip check || echo "[Final] pip check reported the above; only the torch stack is enforced"
+python3 - <<'PY'
+import importlib.metadata as metadata
+import re
+
+import torch
+from packaging.requirements import Requirement
+
+assert torch.__version__.startswith("2.11."), torch.__version__
+assert torch.version.hip, torch.__version__
+
+installed = {}
+for dist in metadata.distributions():
+    name = dist.metadata["Name"]
+    if name:
+        installed[re.sub(r"[-_.]+", "-", name).lower()] = dist.version
+
+unmet = []
+for spec in metadata.distribution("torch").requires or []:
+    requirement = Requirement(spec)
+    if requirement.marker and not requirement.marker.evaluate({"extra": ""}):
+        continue
+    version = installed.get(re.sub(r"[-_.]+", "-", requirement.name).lower())
+    if version is None:
+        unmet.append(f"{requirement} -> not installed")
+    elif not requirement.specifier.contains(version, prereleases=True):
+        unmet.append(f"{requirement} -> {version}")
+assert not unmet, f"torch requirements are unsatisfied: {unmet}"
+
+cuda = sorted(name for name in installed if re.fullmatch(r"nvidia-.*-cu[0-9]+", name))
+assert not cuda, f"NVIDIA CUDA runtime packages in a ROCm image: {cuda}"
+
+print(
+    "[Final] torch", torch.__version__,
+    "HIP", torch.version.hip,
+    "triton", metadata.version("triton"),
+    "triton-kernels", metadata.version("triton-kernels"),
+)
+PY
+EOF
 
 # -----------------------
 # Performance environment variable.
@@ -675,6 +796,10 @@ RUN if [ "$BUILD_TRITON" = "1" ]; then \
 ENV SGLANG_DISABLE_CUDNN_CHECK=1
 ENV HIP_FORCE_DEV_KERNARG=1
 ENV HSA_NO_SCRATCH_RECLAIM=1
+# Work around ROCM-21485: the CUDA/ROCm IPC path leaks GPU memory (a freed IPC
+# block is not returned to the driver). Legacy IPC mode releases it. Verified on
+# ROCm 7.2.1 and 7.2.4.
+ENV HSA_ENABLE_IPC_MODE_LEGACY=1
 ENV SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 ENV SGLANG_INT4_WEIGHT=0
 ENV SGLANG_MOE_PADDING=1

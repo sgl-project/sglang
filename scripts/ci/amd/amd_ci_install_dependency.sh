@@ -30,7 +30,6 @@ EXTRAS="dev_hip,tracing"
 if [ -n "$OPTIONAL_DEPS" ]; then
     EXTRAS="dev_hip,tracing,${OPTIONAL_DEPS}"
 fi
-echo "Installing python extras: [${EXTRAS}]"
 
 # Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
 if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
@@ -41,6 +40,16 @@ else
 fi
 
 # Install the required dependencies in CI.
+# ROCm 7.2 images ship torch 2.11, which srt_hip cannot satisfy (it pins
+# compressed-tensors 0.15.0, requiring torch<2.11). Select the torch 2.11
+# extras based on the installed torch version rather than the ROCm patch level.
+IMAGE_TORCH_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.__version__)')
+IMAGE_HIP_VERSION=$(docker exec ci_sglang python3 -c 'import torch; print(torch.version.hip or "")')
+if [[ "${IMAGE_TORCH_VERSION}" == 2.11.* ]]; then
+  EXTRAS="${EXTRAS/dev_hip/dev_hip_torch211}"
+fi
+echo "Image torch ${IMAGE_TORCH_VERSION}, HIP ${IMAGE_HIP_VERSION}; installing python extras: [${EXTRAS}]"
+
 # Fix permissions on pip cache, ignore errors from concurrent access or missing temp files
 docker exec ci_sglang chown -R root:root /sgl-data/pip-cache 2>/dev/null || true
 docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade pip
@@ -221,6 +230,8 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     cd /sgl-workspace/mori
     git checkout '${MORI_COMMIT}'
     git submodule update --init --recursive
+    apt-get update
+    apt-get install -y --no-install-recommends libgrpc++-dev 2>/dev/null || true
     python3 setup.py develop
     python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))' > /etc/ld.so.conf.d/torch.conf
     ldconfig
@@ -344,6 +355,14 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
         pip install -r requirements.txt
     "
 
+    # The re-clone above discards the image's patched torch_utils.py, and this
+    # rebuild path is exactly when it is needed most (validating a new AITER
+    # commit), so re-apply the same patch the Dockerfile applies.
+    if [[ "${IMAGE_HIP_VERSION}" == 7.2* ]]; then
+        docker exec ci_sglang python3 \
+            /sglang-checkout/scripts/ci/amd/patch_aiter_torch_stream.py
+    fi
+
     if [[ "${GPU_ARCH}" == "mi35x" ]]; then
         GPU_ARCH_LIST="gfx950"
     else
@@ -362,12 +381,42 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
             bash .github/scripts/install_triton.sh
         "
     fi
+    AITER_TRITON_MODE="1"
 
     # build AITER
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
-        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        AITER_USE_SYSTEM_TRITON=${AITER_TRITON_MODE} GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
     "
+
+    if [[ "${INSTALL_AITER_TRITON}" == "true" ]]; then
+        # The installer above moved Triton out from under the image's copy, so
+        # re-point torch's recorded requirement the same way the Dockerfile does.
+        docker exec ci_sglang python3 \
+            /sglang-checkout/scripts/ci/amd/patch_torch_triton_requirement.py
+
+        docker exec -i ci_sglang python3 - <<'PY'
+import importlib.metadata as metadata
+import pathlib
+import re
+
+import triton
+
+triton_version = metadata.version("triton")
+
+installer = pathlib.Path(
+    "/sgl-workspace/aiter/.github/scripts/install_triton.sh"
+).read_text()
+expected = re.search(r'"triton==([^"]+)"', installer).group(1)
+assert triton_version.startswith(expected), (expected, triton_version)
+assert triton.__version__.startswith(expected), (expected, triton.__version__)
+assert "triton-custom" not in triton.__file__, triton.__file__
+print(
+    f"[CI-AITER-CHECK] Validated AITER Triton {triton_version} "
+    f"from {triton.__file__}"
+)
+PY
+    fi
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
 fi
