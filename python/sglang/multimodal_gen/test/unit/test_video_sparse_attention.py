@@ -80,9 +80,9 @@ def test_vsa_forward_cur_topk_uses_padded_kv_block_count(monkeypatch):
     monkeypatch.setattr(vsa_module, "video_sparse_attn", fake_video_sparse_attn)
 
     query = torch.ones(1, padded_seq_len, 1, 1)
-    output = object.__new__(VideoSparseAttentionImpl).forward(
-        query, query, query, query, metadata
-    )
+    impl = object.__new__(VideoSparseAttentionImpl)
+    impl.stage2_backend = "vsa"
+    output = impl.forward(query, query, query, query, metadata)
 
     assert unpadded_topk < expected_topk
     assert captured["topk"] == expected_topk
@@ -104,3 +104,54 @@ def test_vsa_cur_topk_clamps_to_valid_block_range():
 
     metadata.VSA_sparsity = -0.01
     assert _compute_cur_topk(metadata) == num_kv_blocks
+
+
+def test_cake_stage2_uses_direct_topk_metadata(monkeypatch):
+    metadata = VideoSparseAttentionMetadataBuilder().build(
+        current_timestep=0,
+        raw_latent_shape=(2, 8, 8),
+        patch_size=(1, 1, 1),
+        VSA_sparsity=0.5,
+        device=torch.device("cpu"),
+    )
+    num_blocks = metadata.variable_block_sizes.numel()
+    sequence = num_blocks * math.prod(VSA_TILE_SIZE)
+    query = torch.randn(1, sequence, 1, 128, dtype=torch.bfloat16)
+    gate = torch.zeros_like(query)
+    captured = {}
+
+    class FakeCakeWrapper:
+        def plan(self, *args, **kwargs):
+            captured["plan_args"] = args
+            captured["plan_kwargs"] = kwargs
+
+        def run(self, q, k, v):
+            captured["run_shapes"] = (q.shape, k.shape, v.shape)
+            return torch.zeros_like(q)
+
+    monkeypatch.setattr(vsa_module, "_validate_cake_inputs", lambda *_args: None)
+    monkeypatch.setattr(
+        vsa_module, "_create_cake_wrapper", lambda _device: FakeCakeWrapper()
+    )
+
+    impl = object.__new__(VideoSparseAttentionImpl)
+    impl.stage2_backend = "cake"
+    impl.head_size = 128
+    impl.softmax_scale = 128**-0.5
+    impl._cake_wrapper = None
+    impl._cake_q2k_num = {}
+    output = impl.forward(query, query, query, gate, metadata)
+
+    q2k_indices = captured["plan_kwargs"]["q2k_indices"]
+    q2k_num = captured["plan_kwargs"]["q2k_num"]
+    assert q2k_indices.dtype == torch.int32
+    assert q2k_indices.is_contiguous()
+    assert q2k_indices.shape == (1, num_blocks, 1)
+    assert torch.equal(q2k_num, torch.ones((1, num_blocks), dtype=torch.int32))
+    assert captured["plan_kwargs"]["kv_block_lens"] is metadata.variable_block_sizes
+    assert captured["run_shapes"] == (
+        torch.Size((sequence, 1, 128)),
+        torch.Size((sequence, 1, 128)),
+        torch.Size((sequence, 1, 128)),
+    )
+    assert torch.count_nonzero(output) == 0

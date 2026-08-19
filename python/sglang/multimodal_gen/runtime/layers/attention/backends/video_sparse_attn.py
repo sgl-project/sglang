@@ -98,9 +98,7 @@ def construct_variable_block_sizes(
         t_sizes[:, None, None]  # [n_t, 1,   1]
         * h_sizes[None, :, None]  # [1,   n_h, 1]
         * w_sizes[None, None, :]  # [1,   1,   n_w]
-    ).reshape(
-        -1
-    )  # [n_t * n_h * n_w]
+    ).reshape(-1)  # [n_t * n_h * n_w]
 
     return block_sizes
 
@@ -175,6 +173,75 @@ def _compute_cur_topk(attn_metadata: VideoSparseAttentionMetadata) -> int:
     return max(1, min(cur_topk, num_kv_blocks))
 
 
+def _compressed_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the VSA compressed branch and return its direct top-k metadata."""
+    batch_size, num_heads, seq_len, head_dim = query.shape
+    block_elements = math.prod(VSA_TILE_SIZE)
+    denominator = variable_block_sizes.view(1, 1, -1, 1)
+    compressed = [
+        (
+            tensor.view(
+                batch_size,
+                num_heads,
+                seq_len // block_elements,
+                block_elements,
+                head_dim,
+            )
+            .float()
+            .sum(dim=3)
+            / denominator
+        ).to(tensor.dtype)
+        for tensor in (query, key, value)
+    ]
+    query_compress, key_compress, value_compress = compressed
+    scores = torch.matmul(query_compress, key_compress.transpose(-2, -1))
+    scores /= math.sqrt(head_dim)
+    probabilities = torch.softmax(scores, dim=-1)
+    output = torch.matmul(probabilities, value_compress)
+    output = (
+        output.view(batch_size, num_heads, -1, 1, head_dim)
+        .repeat(1, 1, 1, block_elements, 1)
+        .view(batch_size, num_heads, seq_len, head_dim)
+    )
+    topk_indices = torch.topk(probabilities, topk, dim=-1).indices
+    return output, topk_indices
+
+
+def _create_cake_wrapper(device: torch.device):
+    from flashinfer.sparse import BlockSparseAttentionWrapper
+
+    # Cake consumes direct q2k metadata and does not use FlashInfer's generic
+    # sparse-planner workspace. One wrapper is created per transformer layer.
+    workspace = torch.empty((0,), dtype=torch.uint8, device=device)
+    return BlockSparseAttentionWrapper(workspace, backend="cake")
+
+
+def _validate_cake_inputs(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    gate_compress: torch.Tensor,
+) -> None:
+    if query.device.type != "cuda":
+        raise ValueError("Cake VSA requires CUDA inputs")
+    if torch.cuda.get_device_capability(query.device) not in ((10, 0), (10, 3)):
+        raise ValueError("Cake VSA requires SM100 or SM103")
+    if not (query.shape == key.shape == value.shape == gate_compress.shape):
+        raise ValueError("Cake VSA requires matching Q/K/V/gate shapes")
+    if query.shape[0] != 1:
+        raise ValueError("Cake VSA currently requires batch size 1")
+    if query.shape[-1] != 128:
+        raise ValueError("Cake VSA currently requires head size 128")
+    if not (query.dtype == key.dtype == value.dtype == torch.bfloat16):
+        raise ValueError("Cake VSA currently requires BF16 Q/K/V")
+
+
 class VideoSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
     def __init__(self):
         pass
@@ -245,8 +312,83 @@ class VideoSparseAttentionImpl(AttentionImpl):
         **extra_impl_args,
     ) -> None:
         self.prefix = prefix
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.head_size = head_size
+        self.softmax_scale = softmax_scale
         sp_group = get_sp_group()
         self.sp_size = sp_group.world_size
+        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+        config = get_global_server_args().attention_backend_config or {}
+        self.stage2_backend = str(config.get("stage2_backend", "vsa")).lower()
+        if self.stage2_backend not in ("vsa", "cake"):
+            raise ValueError(
+                "video sparse attention stage2_backend must be 'vsa' or 'cake', "
+                f"got {self.stage2_backend!r}"
+            )
+        self._cake_wrapper = None
+        self._cake_q2k_num: dict[tuple[int, ...], torch.Tensor] = {}
+
+    def _forward_cake(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        gate_compress: torch.Tensor,
+        attn_metadata: VideoSparseAttentionMetadata,
+        cur_topk: int,
+    ) -> torch.Tensor:
+        _validate_cake_inputs(query, key, value, gate_compress)
+        query_hsd, key_hsd, value_hsd, gate_hsd = [
+            tensor.transpose(1, 2).contiguous()
+            for tensor in (query, key, value, gate_compress)
+        ]
+        output_compress, topk_indices = _compressed_attention(
+            query_hsd,
+            key_hsd,
+            value_hsd,
+            attn_metadata.variable_block_sizes,
+            cur_topk,
+        )
+
+        q2k_indices = topk_indices[0].to(torch.int32).contiguous()
+        q2k_shape = tuple(q2k_indices.shape)
+        q2k_num = self._cake_q2k_num.get(q2k_shape)
+        if q2k_num is None or q2k_num.device != query.device:
+            q2k_num = torch.full(
+                q2k_shape[:2],
+                q2k_shape[2],
+                dtype=torch.int32,
+                device=query.device,
+            )
+            self._cake_q2k_num[q2k_shape] = q2k_num
+
+        if self._cake_wrapper is None:
+            self._cake_wrapper = _create_cake_wrapper(query.device)
+        sequence = query.shape[1]
+        num_heads = query.shape[2]
+        self._cake_wrapper.plan(
+            None,
+            None,
+            sequence,
+            sequence,
+            math.prod(VSA_TILE_SIZE),
+            math.prod(VSA_TILE_SIZE),
+            num_heads,
+            num_heads,
+            self.head_size,
+            q_data_type=query.dtype,
+            kv_data_type=key.dtype,
+            o_data_type=query.dtype,
+            sm_scale=self.softmax_scale,
+            kv_block_lens=attn_metadata.variable_block_sizes,
+            q2k_indices=q2k_indices,
+            q2k_num=q2k_num,
+        )
+        output_select = self._cake_wrapper.run(query[0], key[0], value[0])
+        output_select_hsd = output_select.transpose(0, 1).unsqueeze(0)
+        return (output_compress * gate_hsd + output_select_hsd).transpose(1, 2)
 
     def tile(
         self,
@@ -306,12 +448,21 @@ class VideoSparseAttentionImpl(AttentionImpl):
         gate_compress: torch.Tensor,
         attn_metadata: VideoSparseAttentionMetadata,
     ) -> torch.Tensor:
+        cur_topk = _compute_cur_topk(attn_metadata)
+        if self.stage2_backend == "cake":
+            return self._forward_cake(
+                query,
+                key,
+                value,
+                gate_compress,
+                attn_metadata,
+                cur_topk,
+            )
+
         query = query.transpose(1, 2).contiguous()
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()
         gate_compress = gate_compress.transpose(1, 2).contiguous()
-
-        cur_topk = _compute_cur_topk(attn_metadata)
 
         if video_sparse_attn is None:
             raise NotImplementedError("video_sparse_attn is not installed")
