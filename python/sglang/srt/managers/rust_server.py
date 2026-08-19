@@ -45,10 +45,80 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.io_struct import BatchTokenIDOutput
     from sglang.srt.managers.scheduler import Scheduler
-    from sglang.srt.rust_extensions._server import MmSpec, Server, ServerArgs
+    from sglang.srt.rust_extensions._server import (
+        MmSpec,
+        Server,
+        ServerArgs as RustServerArgs,
+    )
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def build_rust_server_args(
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    max_total_num_tokens: int = 0,
+) -> RustServerArgs:
+    """Build the typed launch handoff shared by Rust server entrypoints.
+
+    The extension constructor requires every field as a typed keyword, so a
+    missing, extra, or mistyped field fails at boot instead of silently using a
+    different value.
+    """
+
+    from sglang.srt.rust_extensions import load_rust_extension
+
+    ext = load_rust_extension("sglang.srt.rust_extensions._server")
+    disaggregation_mode = {
+        "null": ext.DisaggregationMode.Null,
+        "prefill": ext.DisaggregationMode.Prefill,
+        "decode": ext.DisaggregationMode.Decode,
+    }[server_args.disaggregation_mode]
+    return ext.ServerArgs(
+        model_path=server_args.model_path,
+        served_model_name=server_args.served_model_name,
+        tokenizer_path=server_args.tokenizer_path,
+        revision=server_args.revision,
+        host=server_args.host,
+        port=server_args.port,
+        log_level=server_args.log_level,
+        log_level_http=server_args.log_level_http,
+        chat_template=server_args.chat_template,
+        tool_call_parser=server_args.tool_call_parser,
+        reasoning_parser=server_args.reasoning_parser,
+        stream_response_default_include_usage=(
+            server_args.stream_response_default_include_usage
+        ),
+        tokenizer_worker_num=server_args.tokenizer_worker_num,
+        detokenizer_worker_num=server_args.detokenizer_worker_num,
+        skip_tokenizer_init=server_args.skip_tokenizer_init,
+        incremental_streaming_output=server_args.incremental_streaming_output,
+        disaggregation_mode=disaggregation_mode,
+        model_config=ext.ModelConfig(
+            context_len=model_config.context_len,
+            vocab_size=model_config.vocab_size,
+            is_multimodal=model_config.is_multimodal,
+            # Resolved default sampling params (generation_config.json when
+            # `--sampling-defaults model`, {} otherwise). The Rust server
+            # consumes these for omitted temperature/top_p in chat conversions
+            # instead of hard-coding the OpenAI terminal defaults.
+            default_sampling_params=ext.DefaultSamplingParams(
+                **model_config.get_default_sampling_params()
+            ),
+        ),
+        # `preferred_sampling_params` is deliberately absent. Each caller
+        # rejects the flag until the Rust path can merge it into every request.
+        allow_auto_truncate=server_args.allow_auto_truncate,
+        enable_return_hidden_states=server_args.enable_return_hidden_states,
+        # Not a `server_args` field. `TokenizerManager` derives it, and Rust
+        # ingress needs the same value for its total-token check.
+        num_reserved_tokens=compute_num_reserved_tokens(server_args),
+        # Launch-time facts reported by `/server_info`. A renderer has no
+        # scheduler capacity, so its caller leaves `max_total_num_tokens` at 0.
+        version=__version__,
+        max_total_num_tokens=max_total_num_tokens,
+    )
 
 
 class NativeMmSpec(msgspec.Struct, frozen=True, kw_only=True):
@@ -415,7 +485,11 @@ class RustServer:
         )
 
         server = Server(
-            cls._build_server_args(scheduler),
+            build_rust_server_args(
+                scheduler.server_args,
+                scheduler.model_config,
+                scheduler.max_total_num_tokens,
+            ),
             # None -> run unpinned; the list carries the pinning decision.
             cores=server_cores,
             http_addr=http_addr,
@@ -721,7 +795,7 @@ class RustServer:
         """The typed MM handoff for ``Server.start_mm_workers``: the
         :class:`NativeMmSpec` fields the Rust pipeline consumes, as the Rust
         extension's own ``MmSpec`` class (same required-keyword contract as
-        :meth:`_build_server_args`; ``family`` / ``resample`` become the
+        :func:`build_rust_server_args`; ``family`` / ``resample`` become the
         extension's ``MmFamily`` / ``MmResample`` enums)."""
         from sglang.srt.rust_extensions import load_rust_extension
 

@@ -1,0 +1,64 @@
+---
+title: "Standalone request rendering"
+description: "Convert OpenAI chat and completion requests into SGLang token-in generate requests without starting an inference engine."
+---
+
+The standalone renderer reuses the Rust frontend's chat formatting, sampling
+conversion, tokenizer, and context-length checks. It does not load model
+weights or start a scheduler.
+
+## Start the renderer
+
+Use a Hugging Face model identifier or local model directory as `MODEL_PATH`.
+The model must include a supported tokenizer configuration.
+
+```bash
+sglang render MODEL_PATH --host 0.0.0.0 --port 30000
+```
+
+The renderer serves these endpoints:
+
+- `POST /v1/chat/completions/render`
+- `POST /v1/completions/render`
+- `GET /health`
+
+## Render a request
+
+Send the same body you would send to the corresponding OpenAI generation
+endpoint.
+
+```bash
+curl http://localhost:30000/v1/chat/completions/render \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "MODEL_PATH",
+    "messages": [{"role": "user", "content": "Explain radix caching."}],
+    "max_completion_tokens": 128
+  }'
+```
+
+The response is an SGLang-native request containing `rid`, `input_ids`,
+`sampling_params`, `stream`, and the current logprob and hidden-state request
+metadata. You can send this JSON directly to `/generate` on a compatible
+SGLang inference server. Completion rendering returns an ordered array because
+a completion request can contain multiple prompts or `n` choices. Chat
+rendering currently requires `n=1` and returns one object.
+
+## Output ownership
+
+Rendering ends at the token-in request. Sending the result to `/generate`
+returns SGLang-native generation output; the renderer does not turn that output
+into an OpenAI Chat Completions or Completions response.
+
+The normal OpenAI endpoints retain response-side reasoning splitting, tool-call
+parsing, streaming shaping, and usage aggregation. A disaggregated token-in and
+token-out frontend must retain the corresponding response context and perform
+those steps after generation. That response-side contract is not part of the
+initial standalone renderer.
+
+## Current scope
+
+The standalone renderer is text-only. Multimodal features and identities,
+cache salt and extra keys, priority metadata, Responses API, and Anthropic
+Messages API are not part of the initial contract. API-key authentication and
+TLS termination are also not implemented on this standalone surface.

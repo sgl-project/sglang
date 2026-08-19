@@ -5,8 +5,8 @@
 //!
 //! [`ServerArgs`] / [`ModelConfig`] / [`DefaultSamplingParams`] /
 //! [`DisaggregationMode`] / [`MmSpec`] / [`MmFamily`] / [`MmResample`] are
-//! also `#[pyclass]`es: the Python scheduler (`RustServer._build_server_args`
-//! / `_build_mm_spec`) constructs them directly by keyword and hands them to
+//! also `#[pyclass]`es: the Python scheduler (`build_rust_server_args` /
+//! `RustServer._build_mm_spec`) constructs them directly by keyword and hands them to
 //! `Server`. There is one schema — this file — and
 //! pyo3 enforces it at construction: every field is a required, typed
 //! constructor argument, so a drifted caller fails at boot rather than running
@@ -67,7 +67,7 @@ impl Default for RuntimeConfig {
     }
 }
 
-/// The scheduler's launch-time handoff (`RustServer._build_server_args`):
+/// The scheduler's launch-time handoff (`build_rust_server_args`):
 /// the `server_args` fields the rust server reads, the resolved
 /// [`ModelConfig`], and launch-time stamps. Values are post-`__post_init__`
 /// (all paths and names resolved). Constructed from Python via the `#[new]` in
@@ -139,7 +139,7 @@ pub struct ServerArgs {
     pub enable_return_hidden_states: bool,
     /// Output slots reserved per request on top of its input (eagle stores draft
     /// tokens there). Not a `server_args` field — `TokenizerManager` derives it and
-    /// `RustServer._build_server_args` stamps it in, so both sides count alike.
+    /// `build_rust_server_args` stamps it in, so both sides count alike.
     pub num_reserved_tokens: u64,
     /// Launch-time stamps (not `server_args` fields): sglang package version
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.

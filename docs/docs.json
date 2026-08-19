@@ -924,6 +924,7 @@
             "pages": [
               "docs/advanced_features/overview",
               "docs/advanced_features/server_arguments",
+              "docs/advanced_features/standalone_request_rendering",
               "docs/advanced_features/session_radix_cache",
               "docs/advanced_features/hyperparameter_tuning",
               "docs/advanced_features/attention_backend",

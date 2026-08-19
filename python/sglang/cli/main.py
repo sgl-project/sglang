@@ -24,6 +24,11 @@ def main():
         help="Run inference on a multimodal model.",
         add_help=False,
     )
+    subparsers.add_parser(
+        "render",
+        help="Launch a standalone text preprocessing server.",
+        add_help=False,
+    )
 
     # simple commands
     version_parser = subparsers.add_parser(
@@ -42,5 +47,9 @@ def main():
         from sglang.cli.generate import generate
 
         generate(args, extra_argv)
+    elif args.subcommand == "render":
+        from sglang.cli.render import render
+
+        render(args, extra_argv)
     elif args.subcommand == "version":
         version(args, extra_argv)

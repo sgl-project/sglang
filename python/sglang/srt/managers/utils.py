@@ -396,7 +396,7 @@ def compute_num_reserved_tokens() -> int:
     The current eagle implementation stores draft tokens in the output token
     slots, so the context budget has to account for them; every other algorithm
     reserves nothing. Shared by `TokenizerManager` and the rust server's
-    `server_args` handoff (`RustServer._build_server_args`), which needs the same
+    typed `server_args` handoff, which needs the same
     number to run the total-token check in Rust.
     """
     spec = get_spec()
