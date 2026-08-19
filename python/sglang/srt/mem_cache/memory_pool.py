@@ -131,6 +131,16 @@ def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
     return np.prod(t.shape) * t.dtype.itemsize
 
 
+def _is_noop_kv_scale(scale) -> bool:
+    """Whether dividing by ``scale`` can be skipped as an exact identity.
+
+    Only host-side scalars are inspected: reading a device tensor would force a
+    device sync and is illegal under CUDA-graph capture, so a tensor scale always
+    takes the normal division path.
+    """
+    return scale is None or (isinstance(scale, (int, float)) and float(scale) == 1.0)
+
+
 def _set_kv_buffer_impl(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -2241,6 +2251,62 @@ class MHATokenToKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
+    def can_store_kv_fused_cast(
+        self,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale=None,
+        v_scale=None,
+    ) -> bool:
+        """Whether a pending dtype cast can be folded into the paged write.
+
+        ``reshape_and_cache_flash`` converts on store, so the separate
+        ``.to(self.dtype)`` pass -- one full-tensor elementwise kernel per tensor
+        per layer -- is only needed when this returns False. The kernel reuses K's
+        head geometry for V and assumes each token's (head, dim) block is dense,
+        and it can only take a device-tensor scale, so a non-unit host scalar
+        falls back.
+        """
+        if self.kv_cache_layout != "nhd" or self.use_hnd:
+            return False
+        if self.is_quantized_kv_cache or self.store_dtype != torch.uint8:
+            return False
+        if cache_k.dtype == self.dtype or cache_k.dtype != cache_v.dtype:
+            return False
+        if self.head_dim != self.v_head_dim:
+            return False
+        if not (_is_noop_kv_scale(k_scale) and _is_noop_kv_scale(v_scale)):
+            return False
+        row = self.head_num * self.head_dim
+        return (
+            cache_k.is_contiguous()
+            and cache_v.is_contiguous()
+            and cache_k.shape == cache_v.shape
+            and cache_k.numel() % row == 0
+        )
+
+    def store_kv_fused_cast(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ) -> None:
+        """Cast K/V to the cache dtype and scatter both into the paged buffers in
+        one launch. Guard with :meth:`can_store_kv_fused_cast`."""
+        from sglang.kernels.ops.attention.utils import launch_reshape_and_cache_flash
+
+        shape = (-1, self.head_num, self.head_dim)
+        # unsqueeze(1) presents the flat slot-indexed buffer as a page-size-1
+        # paged cache, which is the layout the kernel indexes with `loc`.
+        launch_reshape_and_cache_flash(
+            cache_k.view(shape),
+            cache_v.view(shape),
+            self._get_key_buffer(layer_id).unsqueeze(1),
+            self._get_value_buffer(layer_id).unsqueeze(1),
+            loc,
+        )
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -2276,9 +2342,9 @@ class MHATokenToKVPool(KVCache):
             return
 
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
+            if not _is_noop_kv_scale(k_scale):
                 cache_k.div_(k_scale)
-            if v_scale is not None:
+            if not _is_noop_kv_scale(v_scale):
                 cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
@@ -2649,9 +2715,9 @@ class MHATokenToKVPool(KVCache):
             )
 
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
+            if not _is_noop_kv_scale(k_scale):
                 cache_k.div_(k_scale)
-            if v_scale is not None:
+            if not _is_noop_kv_scale(v_scale):
                 cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
@@ -2997,9 +3063,9 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
         else:
             layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
+            if not _is_noop_kv_scale(k_scale):
                 cache_k.div_(k_scale)
-            if v_scale is not None:
+            if not _is_noop_kv_scale(v_scale):
                 cache_v.div_(v_scale)
 
             from sglang.srt.layers.quantization.kvfp4_tensor import (
@@ -4918,8 +4984,14 @@ class MiniMaxSparseKVPool(KVCache):
             )
             return
 
-        # Fallback: separate stores (identical semantics).
-        self.set_kv_buffer(layer, loc, cache_k, cache_v)
+        # Fallback: separate stores (identical semantics). The main K/V write
+        # still folds its bf16 -> cache-dtype cast into the scatter when the
+        # layout allows, which is what the ROCm decode path takes.
+        main = self.main_pool
+        if main.can_store_kv_fused_cast(cache_k, cache_v):
+            main.store_kv_fused_cast(layer.layer_id, loc, cache_k, cache_v)
+        else:
+            self.set_kv_buffer(layer, loc, cache_k, cache_v)
         if disable_value:
             self.set_index_k_buffer(layer, loc, cache_idx_k)
         else:
