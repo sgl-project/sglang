@@ -28,7 +28,10 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 if _is_npu:
-    from sgl_kernel_npu.dspark.top1 import select_global_top1_npu
+    from sgl_kernel_npu.dspark.top1 import (
+        select_global_top1_npu,
+        select_local_top1_after_add_npu,
+    )
 
 StepSampler = Callable[[torch.Tensor, int], torch.Tensor]
 
@@ -241,11 +244,7 @@ class VanillaMarkov(nn.Module):
     ) -> torch.Tensor:
         shard = self._tp_shard
         assert shard is not None
-        latent = self.get_prev_embeddings(token_ids)
-        weight_local = self.markov_w2.weight[
-            shard.org_vocab_start : shard.org_vocab_end
-        ]
-        bias_local = F.linear(latent.to(weight_local.dtype), weight_local)
+        bias_local = self._build_step_bias_local(token_ids)
         pad = shard.num_embeddings_per_partition - bias_local.shape[-1]
         if pad < 0:
             raise RuntimeError(
@@ -256,6 +255,15 @@ class VanillaMarkov(nn.Module):
         # Preserve the eager path's dtype promotion/rounding before the
         # collective. This is important for exact greedy proposal parity.
         return base_local + bias_local
+
+    def _build_step_bias_local(self, token_ids: torch.Tensor) -> torch.Tensor:
+        shard = self._tp_shard
+        assert shard is not None
+        latent = self.get_prev_embeddings(token_ids)
+        weight_local = self.markov_w2.weight[
+            shard.org_vocab_start : shard.org_vocab_end
+        ]
+        return F.linear(latent.to(weight_local.dtype), weight_local)
 
     def sample_greedy_block_sharded(
         self,
@@ -281,18 +289,26 @@ class VanillaMarkov(nn.Module):
         sampled_tokens = []
         prev_tokens = first_prev_tokens.long()
         for step_idx in range(proposal_len):
-            step_local = self._build_step_logits_local(
-                base_local=base_logits[:, step_idx, :], token_ids=prev_tokens
-            )
             org_width = shard.org_vocab_end - shard.org_vocab_start
-            local_value, local_idx = step_local[:, :org_width].max(dim=-1)
-            global_idx = local_idx + shard.org_vocab_start
-            # Token ids below 2**24 are represented exactly in float32;
-            # DSpark vocabularies are also bounded by the int32 sampler
-            # contract.
-            candidates_local = torch.stack(
-                (local_value.float(), global_idx.float()), dim=-1
-            )
+            if _is_npu:
+                bias_local = self._build_step_bias_local(prev_tokens)
+                candidates_local = select_local_top1_after_add_npu(
+                    base_logits[:, step_idx, :org_width],
+                    bias_local,
+                    vocab_offset=shard.org_vocab_start,
+                )
+            else:
+                step_local = self._build_step_logits_local(
+                    base_local=base_logits[:, step_idx, :], token_ids=prev_tokens
+                )
+                local_value, local_idx = step_local[:, :org_width].max(dim=-1)
+                global_idx = local_idx + shard.org_vocab_start
+                # Token ids below 2**24 are represented exactly in float32;
+                # DSpark vocabularies are also bounded by the int32 sampler
+                # contract.
+                candidates_local = torch.stack(
+                    (local_value.float(), global_idx.float()), dim=-1
+                )
             candidates = self._shard_group.all_gather(candidates_local, dim=1).view(
                 batch_size, shard.tp_size, 2
             )
