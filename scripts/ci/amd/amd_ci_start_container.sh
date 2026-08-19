@@ -392,34 +392,52 @@ docker exec ci_sglang mkdir -p \
 # setuptools-scm / vcs_versioning can resolve the package version.
 docker exec ci_sglang git config --global --add safe.directory /sglang-checkout
 
-# TEST-ONLY (branch bingxche/rocm715-fullflow): the ROCm 7.15 images enumerate
-# zero GPUs here (torch.cuda.get_device_capability -> "Invalid device id") while
-# the same image reports device_count 8 on a dev host. Dump the device plumbing
-# on both sides of the container boundary so the cause can be told apart: host
-# driver too old for the 7.15 HSA runtime, missing device nodes, or group
-# permissions. Never fail the job on the probe.
-# Revert before merging anything from this branch.
+# TEST-ONLY (branch bingxche/rocm715-fullflow): the ROCm 7.15 images fail every
+# test with AssertionError("Invalid device id"), which torch raises only when
+# current_device() returns an index device_count() rejects -- so is_available()
+# was true and enumeration still went wrong. The same image is healthy on a dev
+# MI300X, including with a single render node and with every *VISIBLE_DEVICES*
+# permutation, so the remaining suspect is the runner host's KFD/amdgpu driver
+# against the 7.15 HSA runtime. Capture the device plumbing on both sides of the
+# container boundary, plus the same torch probe in the published ROCm 7.0 image
+# when it is already cached, which isolates driver from stack on one host.
+# Never fail the job on the probe. Revert before merging anything from this branch.
 {
-  echo "===== rocm715-fullflow GPU visibility probe ====="
-  echo "--- host ---"
+  echo "===== rocm715-fullflow GPU probe: host ====="
   echo "kernel: $(uname -r)"
-  echo "amdgpu: $(cat /sys/module/amdgpu/version 2>/dev/null || echo unknown)"
-  echo "kfd nodes: $(ls /sys/class/kfd/kfd/topology/nodes 2>/dev/null | tr '\n' ' ' || echo none)"
-  ls -l /dev/kfd 2>&1 | head -3
-  ls -l /dev/dri 2>&1 | head -20
-  echo "podinfo: $(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo absent)"
+  echo "amdgpu module version: $(cat /sys/module/amdgpu/version 2>/dev/null || echo absent)"
+  echo "dkms: $(dkms status 2>&1 | head -5 || echo unavailable)"
+  echo "podinfo gha-render-devices: $(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo absent)"
   echo "DEVICE_FLAG: ${DEVICE_FLAG}"
   echo "host id: $(id)"
-  echo "--- container ---"
+  ls -l /dev/kfd 2>&1 | head -3
+  ls -l /dev/dri/ 2>&1 | head -20
+  echo "-- KFD node0 properties --"
+  head -25 /sys/devices/virtual/kfd/kfd/topology/nodes/0/properties 2>&1 || echo "unreadable"
+
+  echo "===== rocm715-fullflow GPU probe: container (ROCm 7.15) ====="
   docker exec ci_sglang bash -c '
     ls -l /dev/kfd 2>&1 | head -3
-    ls -l /dev/dri 2>&1 | head -20
+    ls -l /dev/dri/ 2>&1 | head -20
     echo "container id: $(id)"
-    env | grep -iE "VISIBLE_DEVICES|^HSA_|^ROCR_|^HIP_" | sort
-    echo "-- rocm-smi --"; rocm-smi 2>&1 | head -12
-    echo "-- rocminfo agents --"; rocminfo 2>&1 | grep -E "Name:|Marketing|Runtime Version" | head -12
+    echo "-- rocm-smi --"; (rocm-smi --showproductname 2>&1 | head -15) || echo "rocm-smi unavailable"
+    echo "-- amd-smi --";  (amd-smi list 2>&1 | head -15)              || echo "amd-smi unavailable"
     echo "-- torch --"
-    python3 -c "import torch; print(\"torch\", torch.__version__); print(\"is_available\", torch.cuda.is_available()); print(\"device_count\", torch.cuda.device_count())" 2>&1 | tail -5
   '
+  docker exec ci_sglang python3 /sglang-checkout/scripts/ci/amd/rocm715_gpu_probe.py 2>&1
+
+  # Same probe, same host, published ROCm 7.0 image. Only when it is already in
+  # the runner's local cache: this is a diagnostic, not worth a 16 GB pull.
+  baseline_image=$(find_latest_image "${GPU_ARCH}" 2>/dev/null || true)
+  if [[ -n "${baseline_image}" ]] && [[ -n "$(docker images -q "${baseline_image}" 2>/dev/null)" ]]; then
+    echo "===== rocm715-fullflow GPU probe: container (baseline ${baseline_image}) ====="
+    docker run --rm --user root --device=/dev/kfd ${DEVICE_FLAG} \
+      --group-add video --security-opt seccomp=unconfined \
+      -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
+      "${baseline_image}" \
+      python3 /sglang-checkout/scripts/ci/amd/rocm715_gpu_probe.py 2>&1
+  else
+    echo "===== baseline ROCm 7.0 image not cached locally; skipping comparison ====="
+  fi
   echo "===== end probe ====="
 } || true
