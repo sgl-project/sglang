@@ -80,6 +80,8 @@ def _make_model_runner(
     disaggregation_decode_extra_slots=0,
     kv_lora_rank=512,
     qk_rope_head_dim=64,
+    swa_kv_lora_rank=128,
+    swa_qk_rope_head_dim=32,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -96,11 +98,12 @@ def _make_model_runner(
     mr.sliding_window_size = sliding_window_size
 
     mc = SimpleNamespace()
-    mc.attention_arch = AttentionArch.MHA
     mc.head_dim = head_dim
     mc.v_head_dim = v_head_dim
     mc.kv_lora_rank = kv_lora_rank
     mc.qk_rope_head_dim = qk_rope_head_dim
+    mc.swa_kv_lora_rank = swa_kv_lora_rank
+    mc.swa_qk_rope_head_dim = swa_qk_rope_head_dim
     mc.attention_arch = AttentionArch.MLA if use_mla_backend else AttentionArch.MHA
     mc.is_hybrid_swa = is_hybrid_swa
     mc.full_attention_layer_ids = (
@@ -316,6 +319,58 @@ class TestHybridSWAConfigurator(CustomTestCase):
         available = 10_000_000
         mr, _, config = self._run(available)
         used = _actual_memory_used(mr, config)
+        self.assertLessEqual(used, available)
+        self.assertGreater(used, available * 0.99)
+
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=576,
+    )
+    def test_mla_uses_full_and_swa_latent_geometry(
+        self,
+        mock_calculate_mla_kv_cache_dim,
+    ):
+        """Hybrid MLA pools must not be sized from MHA head geometry."""
+        available = 10_000_000
+        full_layers = 2
+        swa_layers = 3
+        swa_kv_lora_rank = 128
+        swa_qk_rope_head_dim = 32
+        mr = _make_model_runner(
+            self,
+            num_kv_heads=32,
+            head_dim=256,
+            v_head_dim=256,
+            use_mla_backend=True,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=list(range(full_layers)),
+            swa_attention_layer_ids=list(range(full_layers, full_layers + swa_layers)),
+            swa_num_kv_heads=16,
+            swa_head_dim=128,
+            swa_v_head_dim=128,
+            swa_kv_lora_rank=swa_kv_lora_rank,
+            swa_qk_rope_head_dim=swa_qk_rope_head_dim,
+            swa_full_tokens_ratio=0.5,
+        )
+
+        with mock_cpu_env(kv_size=2):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, page_size=1)
+
+        expected_full_per_token = 576 * 2
+        expected_swa_per_token = (swa_kv_lora_rank + swa_qk_rope_head_dim) * 2
+        self.assertEqual(cfg._full_per_token, expected_full_per_token)
+        self.assertEqual(cfg._swa_per_token, expected_swa_per_token)
+        mock_calculate_mla_kv_cache_dim.assert_called_once()
+
+        used = (
+            config.full_max_total_num_tokens * expected_full_per_token * full_layers
+            + config.swa_max_total_num_tokens * expected_swa_per_token * swa_layers
+        )
         self.assertLessEqual(used, available)
         self.assertGreater(used, available * 0.99)
 
