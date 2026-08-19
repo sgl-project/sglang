@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import logging
+import math
 from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
@@ -678,6 +679,12 @@ class TboForwardBatchPreparer:
         _tbo_padded_len = (
             (end_token_index - start_token_index - 1) // attention_tp_size + 1
         ) * attention_tp_size
+        if _is_hip:
+            from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
+            align = math.lcm(attention_tp_size, get_cp_padding_align_size())
+            n_tokens = end_token_index - start_token_index
+            _tbo_padded_len = ((n_tokens + align - 1) // align) * align
         output_dict["tbo_padded_len"] = _tbo_padded_len
 
         for key in [
