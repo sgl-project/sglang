@@ -93,6 +93,19 @@ class TestLlama32Detector(CustomTestCase):
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, "The weather is nice today.")
 
+    def test_non_object_json_does_not_crash(self):
+        # A model may emit valid JSON that is not an object (a bare array,
+        # string or number) after the <|python_tag|> token. This must not
+        # raise AttributeError inside parse_base_json; it should simply
+        # produce no tool calls.
+        for text in (
+            "<|python_tag|>[1, 2, 3]",
+            '<|python_tag|>"hello"',
+            "<|python_tag|>42",
+        ):
+            result = self.detector.detect_and_parse(text, self.tools)
+            self.assertEqual(len(result.calls), 0)
+
     def test_multiple_json_objects(self):
         text = '<|python_tag|>{"name": "get_weather", "arguments": {"city": "Beijing"}};{"name": "search", "arguments": {"query": "restaurants"}}'
         result = self.detector.detect_and_parse(text, self.tools)
