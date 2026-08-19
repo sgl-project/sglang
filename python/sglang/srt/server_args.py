@@ -2668,14 +2668,22 @@ class ServerArgs:
     enable_hierarchical_cache: A[bool, "Enable hierarchical cache", NS("memory")] = (
         False
     )
+    hicache_host_memory_mode: A[
+        str,
+        Arg(
+            help="Whether host memory is a persistent HiCache tier (cache) or a transient staging buffer between GPU and the storage backend (buffer_only). buffer_only requires --hicache-storage-backend.",
+            choices=["cache", "buffer_only"],
+        ),
+        NS("memory"),
+    ] = "cache"
     hicache_ratio: A[
         Optional[float],
-        "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0, or 1.0 for host-pool decode retraction.",
+        "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode, 1.2 in buffer_only mode, or 1.0 for host-pool decode retraction.",
         NS("memory"),
     ] = None
     hicache_size: A[
         int,
-        "The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
+        "The size of host KV cache memory pool in gigabytes. Overrides --hicache-ratio in either host memory mode.",
         NS("memory"),
     ] = 0
     hicache_write_policy: A[
@@ -2714,6 +2722,7 @@ class ServerArgs:
             help="The storage backend for hierarchical KV cache. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: backend_name (custom name), module_path (Python module path), class_name (backend class name).",
             choices=[
                 "file",
+                "sim",
                 "mooncake",
                 "hf3fs",
                 "nixl",
@@ -3356,9 +3365,9 @@ class ServerArgs:
         (
             "Opt-in to the adaptive queue-based delay trigger (independent of the "
             "slot-based one). Delays prefill until the waiting queue reaches "
-            "min(running_req * ratio, max_prefill_bs) so small fragments batch "
-            "into a larger prefill. Unset (default) keeps the original slot-only "
-            "behavior. Typical: 0.1 ~ 0.5."
+            "min(running_req * ratio, prefill_max_requests), falling back to the "
+            "observed max_prefill_bs when no request limit is set. Unset (default) "
+            "keeps the original slot-only behavior. Typical: 0.1 ~ 0.5."
         ),
         NS("schedule"),
     ] = None
@@ -6013,15 +6022,44 @@ class ServerArgs:
 
         prefill_backend, decode_backend = self._resolved_attention_backends()
         if "trtllm_mha" in (prefill_backend, decode_backend):
-            if prefill_backend == "trtllm_mha" and not is_sm100_supported():
+            if prefill_backend == "trtllm_mha" and not (
+                is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
+            ):
                 raise ValueError(
-                    "TRTLLM MHA backend for prefill is only supported on Blackwell GPUs (SM100). Please use a different prefill backend."
+                    "TRTLLM MHA backend for prefill requires Hopper (SM90), Blackwell (SM100), or SM120 GPUs. "
+                    "Please use a different prefill backend."
+                )
+            if (
+                prefill_backend == "trtllm_mha"
+                and is_sm120_supported()
+                and (
+                    self.kv_cache_dtype == "fp8_e4m3"
+                    or (
+                        envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get()
+                        or 0.0
+                    )
+                    > 0
+                )
+            ):
+                raise ValueError(
+                    "TRTLLM FMHAv2 prefill on SM120 does not support "
+                    "fp8_e4m3 KV cache or skip-softmax."
                 )
             if decode_backend == "trtllm_mha" and not (
                 is_sm90_supported() or is_sm100_supported() or is_sm120_supported()
             ):
                 raise ValueError(
                     "TRTLLM MHA backend for decode is only supported on Hopper (SM90), Blackwell (SM100) and (SM120) GPUs. Please use a different decode backend."
+                )
+            if (
+                prefill_backend == "trtllm_mha"
+                and not is_sm100_supported()
+                and (self.enable_prefill_context_parallel or self.attn_cp_size > 1)
+            ):
+                raise ValueError(
+                    "Prefill context parallelism with the TRTLLM MHA prefill backend "
+                    "requires SM100 (trtllm-gen context kernel): the SM90/SM120 "
+                    "fmha_v2 prefill path does not implement CP shard masking."
                 )
 
         run_post_process_pass(self, _attention_backend_fa3_fp8_fallback)
@@ -7364,8 +7402,20 @@ class ServerArgs:
             )
 
     def _handle_hicache_ratio_default(self):
+        """Default the host/device ratio per host memory mode.
+
+        Runs before the dummy-model boundary: direct HostKVCache consumers
+        (unit fixtures, dummy-model launches) must never see a None ratio.
+        buffer_only stages in flight rather than retaining, so it needs only
+        enough to cover the write backlog plus parked prefetches.
+
+        A decode server keeps the ratio unset here: kv_cache_builder resolves
+        it against the retraction-backup backend (1.0 for host_pool, else 2.0).
+        """
         if self.hicache_ratio is None and self.disaggregation_mode != "decode":
-            self.hicache_ratio = 2.0
+            self.hicache_ratio = (
+                1.2 if self.hicache_host_memory_mode == "buffer_only" else 2.0
+            )
 
     def _handle_hicache(self):
         """Normalize hicache-related knobs into a valid runtime configuration.
@@ -7385,6 +7435,8 @@ class ServerArgs:
         ):
             return
 
+        self._validate_hicache_host_memory_mode()
+
         # Step 1: Initial layout-io compatibility normalization.
         self._resolve_layout_io_compatibility()
 
@@ -7393,6 +7445,51 @@ class ServerArgs:
 
         # Step 3: DCP compatibility for the L2 (device<->host) path.
         self._resolve_hicache_dcp_compatibility()
+
+    def _validate_hicache_host_memory_mode(self):
+        if self.hicache_host_memory_mode not in ("cache", "buffer_only"):
+            raise ValueError(
+                "hicache_host_memory_mode must be 'cache' or 'buffer_only', "
+                f"got {self.hicache_host_memory_mode!r}"
+            )
+
+        # Both modes are defaulted upstream (a decode server resolves the
+        # ratio later, in kv_cache_builder), so this fires only if that
+        # defaulting regresses -- never build an unsized host pool.
+        if (
+            self.hicache_size <= 0
+            and self.hicache_ratio is None
+            and self.disaggregation_mode != "decode"
+        ):
+            raise ValueError(
+                f"--hicache-host-memory-mode {self.hicache_host_memory_mode} "
+                "requires a host pool size: pass --hicache-size or "
+                "--hicache-ratio."
+            )
+
+        if self.hicache_host_memory_mode == "cache":
+            return
+
+        if self.hicache_storage_backend is None:
+            raise ValueError(
+                "--hicache-host-memory-mode buffer_only requires a storage backend "
+                "(--hicache-storage-backend): host memory is only a staging buffer "
+                "and all cached data lives in storage."
+            )
+        if self.hicache_write_policy == "write_back":
+            raise ValueError(
+                "--hicache-host-memory-mode buffer_only does not support "
+                "--hicache-write-policy write_back; use write_through or "
+                "write_through_selective."
+            )
+        if self.disaggregation_mode == "decode":
+            raise ValueError(
+                "--hicache-host-memory-mode buffer_only is not supported on "
+                "decode instances: the decode-side prefetch and offload paths "
+                "bypass the buffer-mode pipeline, fetching without its prefix "
+                "context and never consuming its staged holds. Prefill "
+                "instances share the standard scheduler path and are supported."
+            )
 
     def _resolve_hicache_dcp_compatibility(self):
         if self.dcp_size <= 1 or not self.enable_hierarchical_cache:
@@ -8026,41 +8123,6 @@ class ServerArgs:
             "1" if requested_transport == "cuda_ipc" else "0"
         )
 
-    def _handle_custom_all_reduce_v2_multinode(self):
-        # Custom all-reduce v2's graph zero-copy path uses IPC handles and is
-        # intra-node only. On MNNVL-fabric devices (GB200/GB300) the eager pull
-        # path works across nodes via the symm-mem workspace, so opt into the
-        # multinode mode automatically (a failed fabric rendezvous falls back
-        # to the legacy path at init). Elsewhere force-disable v2 on
-        # multi-node so the dispatch falls back to the legacy CustomAllreduce
-        # path, unless the MNNVL opt-in is set explicitly.
-        if self.nnodes <= 1 or not envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
-            return
-        if (
-            not envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.is_set()
-            and is_mnnvl_fabric_device()
-            # CustomAllReduceV2 supports world sizes 2..8 only
-            # (can_use_custom_all_reduce_v2 rejects larger groups); don't
-            # auto-opt-in a TP16+ launch just to fall back downstream.
-            and self.tp_size <= 8
-        ):
-            logger.info(
-                "MNNVL fabric device detected with nnodes=%d: enabling "
-                "custom all-reduce v2 multinode mode "
-                "(SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE=1; set it "
-                "to 0 to opt out).",
-                self.nnodes,
-            )
-            envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.set("1")
-        if not envs.SGLANG_ENABLE_CUSTOM_ALL_REDUCE_V2_MULTINODE.get():
-            if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set():
-                logger.warning(
-                    "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 because nnodes=%d "
-                    "(custom all-reduce v2 is intra-node only).",
-                    self.nnodes,
-                )
-            envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
-
     def _handle_environment_variables(self):
         self._handle_multimodal_feature_transport()
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
@@ -8072,7 +8134,6 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
-        self._handle_custom_all_reduce_v2_multinode()
         if self.enable_deterministic_inference:
             envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
         if self.debug_cuda_graph:
