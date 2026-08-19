@@ -5,6 +5,7 @@ including content format detection and message processing.
 """
 
 import logging
+import re
 
 import jinja2
 import transformers.utils.chat_template_utils as hf_chat_utils
@@ -89,9 +90,19 @@ def detect_jinja_template_content_format(chat_template: str) -> str:
     - If template has loops like {%- for content in message['content'] -%} → 'openai'
     - Otherwise → 'string'
     """
-    # Shortcut for multimodal templates
-    if any(
-        keyword in chat_template for keyword in ["image", "audio", "video", "vision"]
+    # Shortcut for multimodal templates. Match the media keywords only as whole
+    # tokens, not as substrings of unrelated words: a bare `keyword in template`
+    # test fires on words like "revision"/"provision"/"television", so a
+    # text-only template that happens to contain one is misclassified as "openai"
+    # and an OpenAI parts-list content then renders as a Python list repr into the
+    # prompt. The negative letter look-around still matches real content-type
+    # tokens (`image`, `image_url`, `input_audio`, `video`, ...). Genuine
+    # multimodal templates that iterate `message['content']` are also caught by
+    # the AST check below regardless.
+    if re.search(
+        r"(?<![a-z])(image|audio|video|vision)(?![a-z])",
+        chat_template,
+        re.IGNORECASE,
     ):
         return "openai"
 
