@@ -298,9 +298,19 @@ def _format_old_new_metrics(metrics):
     return f"ssim={metrics.ssim:.4f}, mean_abs_diff={metrics.mean_abs_diff:.2f}"
 
 
+QUALITY_GATE_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _is_quality_gate_image(path):
+    return path.lower().endswith(QUALITY_GATE_IMAGE_EXTS)
+
+
 def validate_gt_files(files_to_upload, changed_files, remote_image_entries, token):
     failures = []
     for path, content in files_to_upload:
+        if not _is_quality_gate_image(path):
+            print(f"Skipping quality gate for non-image GT file: {path}")
+            continue
         quality_metrics = compute_image_quality_metrics(content)
         quality_reasons = get_quality_failure_reasons(quality_metrics)
         if quality_reasons:
@@ -310,6 +320,8 @@ def validate_gt_files(files_to_upload, changed_files, remote_image_entries, toke
             )
 
     for path, content in changed_files:
+        if not _is_quality_gate_image(path):
+            continue
         remote_entry = remote_image_entries.get(path)
         if not remote_entry:
             continue
