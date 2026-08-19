@@ -404,9 +404,8 @@ class ModelRunner:
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
-        # Published by the step's last shared-buffer-reading phase (decode graph,
-        # eagle draft extend, or prefill); the scheduler's WAR barrier waits on it
-        # then clears it. None -> coarse whole-forward wait_stream.
+        # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
+        # its worker names, and treats None as the coarse whole-forward fence.
         self.shared_read_done_event: Optional[torch.cuda.Event] = None
         # Events the publishers record into the mailbox above. Depth 2: the
         # barrier drains the mailbox once per step, so at most one record can
@@ -734,7 +733,6 @@ class ModelRunner:
             self._token_oracle_manager = None
             return
         self._token_oracle_manager = install_token_oracle_from_env(
-            server_args=self.server_args,
             vocab_size=self.model_config.vocab_size,
         )
 
@@ -792,7 +790,6 @@ class ModelRunner:
         if self.spec_algorithm.is_speculative():
             return resolve_num_tokens_per_req(
                 phase="target_verify",
-                server_args=self.server_args,
                 spec_algorithm=self.spec_algorithm,
                 is_draft_worker=self.is_draft_worker,
                 num_draft_tokens=num_draft_tokens,

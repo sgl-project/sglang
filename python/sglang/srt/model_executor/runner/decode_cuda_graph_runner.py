@@ -467,9 +467,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _record_in_graph_metadata_prep_done(self):
         # Purely a marker at this point in the graph; where the shared reads
         # actually end is the attn backend's call.
-        if not torch.cuda.is_current_stream_capturing():
+        if not self.device_module.is_current_stream_capturing():
             # Warmup shares this body. Breakable capture still plants: it opens
             # segment 1 on context entry and every segment re-arms the node.
+            # Routed through device_module so XPU (torch.xpu) is picked up
+            # instead of hitting torch.cuda dummy stubs on non-CUDA builds.
             return
         if self.in_graph_metadata_prep_done is None:
             self.in_graph_metadata_prep_done = make_external_event(self.device_module)
@@ -486,17 +488,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return self.attn_backend
 
     def _resolve_shared_read_ends(self, attn_backend, forward_mode) -> SharedReadEnds:
-        """The backend's declaration, demoted when this runner cannot record
-        there. UNKNOWN records nothing (scheduler keeps the coarse fence)."""
-        if forward_mode.is_target_verify():
-            if not self.model_runner.spec_algorithm.is_last_shared_read_phase(
-                forward_mode
-            ):
-                return SharedReadEnds.UNKNOWN
-        elif not forward_mode.is_decode():
-            return SharedReadEnds.UNKNOWN
         declared = attn_backend.shared_read_ends(forward_mode)
-
         if (
             declared is SharedReadEnds.IN_REPLAY
             and self.in_graph_metadata_prep_done is None
