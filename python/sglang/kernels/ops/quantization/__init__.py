@@ -130,11 +130,13 @@ def per_token_group_quant(
     *,
     out_dtype: Optional[torch.dtype] = None,
     column_major_scales: bool = False,
+    unpacked_ue8m0_scales: bool = False,
 ):
     """Unified per-token-group quantization (JIT). Returns ``(x_q, x_s)``.
 
     bf16/fp16 input, fp8_e4m3/int8 output, group size 16..256, fp32 or
-    packed-UE8M0 scales in row-/col-major layouts, optional fused
+    packed-UE8M0 scales in row-/col-major layouts (or exact UE8M0 powers of
+    two in row-major fp32 with ``unpacked_ue8m0_scales=True``), optional fused
     ``silu_and_mul`` and masked EP-MoE schedule (``masked_m`` +
     ``expected_m`` grid hint). Pass ``output_q``/``output_s`` to quantize into
     caller-owned buffers (layout inferred from their dtype/strides), or omit
@@ -151,6 +153,7 @@ def per_token_group_quant(
         expected_m,
         out_dtype=out_dtype,
         column_major_scales=column_major_scales,
+        unpacked_ue8m0_scales=unpacked_ue8m0_scales,
     )
 
 
