@@ -39,7 +39,8 @@
 //                      `verificationStatus` overrides it with a third state —
 //                      "verified" | "in-progress" | "unverified" — for a recipe
 //                      whose verification round is open rather than absent.
-//   modelNames         HF slug lookup, `hw|variant|quant` then `variant|quant`
+//   modelNames         HF slug lookup, `hw|variant|quant`, `variant|quant`,
+//                      `hw|quant`, `quant`, `hw`, then `default`
 //   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
 //   curl               cURL template (uses {{MODEL_NAME}} + placeholders), or
 //                      `(selection, cell) => template` when the request payload
@@ -643,10 +644,15 @@ export const Deployment = ({ config, benchmarks }) => {
 
   // Lookup walks most-specific to least so a config that drops the variant/quant
   // dims can key its HF slug on `hw` alone, or on the single "default" entry.
+  // The `hw|quant` and bare `quant` rungs cover a `matchDims` config that declares
+  // no variant dim at all — there `sel.variant` is undefined, so the two leading
+  // keys can never hit.
   const resolveModelName = (sel) => {
     const keys = [
       `${sel.hw}|${sel.variant}|${sel.quant}`,
       `${sel.variant}|${sel.quant}`,
+      `${sel.hw}|${sel.quant}`,
+      sel.quant,
       sel.hw,
       "default",
     ];

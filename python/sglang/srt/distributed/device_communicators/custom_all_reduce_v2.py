@@ -31,6 +31,11 @@ from sglang.kernels.ops.communication.all_reduce import (
     IPCManager,
     custom_all_reduce,
 )
+from sglang.srt.cuda_vmm_utils import (
+    VmmGraphInputManager,
+    compute_graph_capture_bases,
+    is_vmm_pointer,
+)
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -42,11 +47,6 @@ from .custom_all_reduce_utils import (
     can_use_custom_all_reduce_with_nvlink,
     is_one_nvlink_clique,
     is_weak_contiguous,
-)
-from .vmm_utils import (
-    VmmGraphInputManager,
-    compute_graph_capture_bases,
-    is_vmm_pointer,
 )
 
 logger = logging.getLogger(__name__)

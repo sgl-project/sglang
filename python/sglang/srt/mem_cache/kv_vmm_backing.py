@@ -11,51 +11,18 @@ import torch
 import torch.utils.cpp_extension
 from torch.cuda.memory import CUDAPluggableAllocator
 
+from sglang.srt.cuda_vmm_utils import (
+    VmmReservation,
+    align_up,
+    allocation_handle_type_name,
+    get_device_granularity,
+    make_device_allocation_prop,
+)
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KvBufferDesc
 
 logger = logging.getLogger(__name__)
-
-_drv = None
-
-
-def _driver():
-    global _drv
-    if _drv is None:
-        from cuda.bindings import driver
-
-        _drv = driver
-    return _drv
-
-
-def _check(result, label: str):
-    drv = _driver()
-    err = result[0] if isinstance(result, tuple) else result
-    if err != drv.CUresult.CUDA_SUCCESS:
-        raise RuntimeError(f"{label} failed: {err}")
-    return result[1] if isinstance(result, tuple) and len(result) > 1 else None
-
-
-def align_up(value: int, alignment: int) -> int:
-    return (value + alignment - 1) // alignment * alignment
-
-
-def query_granularity(device_id: int) -> int:
-    """Minimum CUDA virtual-memory allocation granularity (bytes) for ``device_id``."""
-    drv = _driver()
-    prop = drv.CUmemAllocationProp()
-    prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-    prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
-    prop.location.id = int(device_id)
-    return int(
-        _check(
-            drv.cuMemGetAllocationGranularity(
-                prop,
-                drv.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM,
-            ),
-            "cuMemGetAllocationGranularity",
-        )
-    )
 
 
 # Bump allocator: hands back base+cursor, bounded by the RESERVED size (not the
@@ -110,34 +77,21 @@ class KvVmmArena:
         # (they race and one loads a half-relinked copy -> undefined symbol crash).
         self._sfx = f"{os.getpid()}_{KvVmmArena._instance_count}"
         KvVmmArena._instance_count += 1
-        drv = _driver()
         with torch.cuda.device(self.device_id):
-            _check(drv.cuInit(0), "cuInit")
-            self._prop = drv.CUmemAllocationProp()
-            self._prop.type = drv.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-            self._prop.location.type = drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
-            self._prop.location.id = self.device_id
-            self.granularity = query_granularity(self.device_id)
-            self._access = drv.CUmemAccessDesc()
-            self._access.location.type = (
-                drv.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE
-            )
-            self._access.location.id = self.device_id
-            self._access.flags = (
-                drv.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-            )
+            prop = make_device_allocation_prop(self.device_id)
+            self.handle_type = prop.requestedHandleTypes
+            self.granularity = get_device_granularity(self.device_id)
 
             self.reserved = self._align(reserve_bytes)
             # Align the base to granularity so base + (granularity-aligned cursor) is
             # always a valid cuMemMap address for per-buffer commit_range().
-            self.base = int(
-                _check(
-                    drv.cuMemAddressReserve(self.reserved, self.granularity, 0, 0),
-                    "cuMemAddressReserve",
-                )
+            self._allocation = VmmReservation(
+                self.reserved,
+                prop,
+                self.device_id,
+                alignment=self.granularity,
             )
-            # commit_range bookkeeping: mapped VA -> (size, handle); committed bytes per offset.
-            self._ranges = {}
+            self.base = self._allocation.base
             self._committed_by_offset = {}
             self._range_backed = 0
             self._closed = False
@@ -153,11 +107,12 @@ class KvVmmArena:
         self.pool = torch.cuda.MemPool(self._allocator, no_split=True)
         logger.info(
             "KvVmmArena[%s] ready: device=%d reserved_va=%.1f GiB "
-            "granularity=%d KiB",
+            "granularity=%d KiB handle_type=%s",
             self._sfx,
             self.device_id,
             self.reserved / (1024**3),
             self.granularity // 1024,
+            allocation_handle_type_name(self.handle_type),
         )
 
     def _align(self, v: int) -> int:
@@ -183,16 +138,16 @@ class KvVmmArena:
         )
         self._so_path = f"{out_dir}/{libname}.so"
         lib = ctypes.CDLL(self._so_path)
-        self._fn_set_base = getattr(lib, f"kvarena_set_base_{self._sfx}")
+        self._fn_set_base = lib[f"kvarena_set_base_{self._sfx}"]
         self._fn_set_base.argtypes = [ctypes.c_void_p]
         self._fn_set_base.restype = None
-        self._fn_set_reserved = getattr(lib, f"kvarena_set_reserved_{self._sfx}")
+        self._fn_set_reserved = lib[f"kvarena_set_reserved_{self._sfx}"]
         self._fn_set_reserved.argtypes = [ctypes.c_size_t]
         self._fn_set_reserved.restype = None
-        self._fn_set_align = getattr(lib, f"kvarena_set_align_{self._sfx}")
+        self._fn_set_align = lib[f"kvarena_set_align_{self._sfx}"]
         self._fn_set_align.argtypes = [ctypes.c_size_t]
         self._fn_set_align.restype = None
-        self._fn_cursor = getattr(lib, f"kvarena_cursor_{self._sfx}")
+        self._fn_cursor = lib[f"kvarena_cursor_{self._sfx}"]
         self._fn_cursor.argtypes = []
         self._fn_cursor.restype = ctypes.c_size_t
         return lib
@@ -217,24 +172,13 @@ class KvVmmArena:
                 f"commit_range [{offset}, {offset + want}) exceeds reservation "
                 f"{self.reserved}"
             )
-        drv = _driver()
         add = want - prev
-        addr = self.base + offset + prev
         with torch.cuda.device(self.device_id):
-            handle = _check(drv.cuMemCreate(add, self._prop, 0), "cuMemCreate")
-            try:
-                _check(drv.cuMemMap(addr, add, 0, handle, 0), "cuMemMap")
-                _check(
-                    drv.cuMemSetAccess(addr, add, [self._access], 1), "cuMemSetAccess"
-                )
-            except Exception:
-                # Roll back this failed extension; leave already-mapped ranges intact.
-                unmap = drv.cuMemUnmap(addr, add)
-                unmap = unmap[0] if isinstance(unmap, tuple) else unmap
-                rel = drv.cuMemRelease(handle)
-                rel = rel[0] if isinstance(rel, tuple) else rel
-                raise
-        self._ranges[addr] = (add, handle)
+            self._allocation.map(
+                offset + prev,
+                add,
+                retain_handle=True,
+            )
         self._committed_by_offset[offset] = want
         self._range_backed += add
 
@@ -251,25 +195,11 @@ class KvVmmArena:
         if self._closed:
             return
         self._closed = True
-        drv = _driver()
         try:
             torch.cuda.synchronize()
         except Exception as e:  # pragma: no cover
             logger.warning("KvVmmArena.close synchronize failed: %s", e)
-        for addr, (size, handle) in self._ranges.items():
-            err = drv.cuMemUnmap(addr, size)
-            err = err[0] if isinstance(err, tuple) else err
-            if err != drv.CUresult.CUDA_SUCCESS:
-                logger.warning("cuMemUnmap range -> %s", err)
-            err = drv.cuMemRelease(handle)
-            err = err[0] if isinstance(err, tuple) else err
-            if err != drv.CUresult.CUDA_SUCCESS:
-                logger.warning("cuMemRelease range -> %s", err)
-        self._ranges.clear()
-        err = drv.cuMemAddressFree(self.base, self.reserved)
-        err = err[0] if isinstance(err, tuple) else err
-        if err != drv.CUresult.CUDA_SUCCESS:
-            logger.warning("cuMemAddressFree -> %s", err)
+        self._allocation.close()
 
 
 # torch's caching allocator hands the pluggable allocator whole large-pool segments
@@ -326,12 +256,11 @@ class KvVmmBufferOwner:
 
         itemsize = store_dtype.itemsize
         with torch.cuda.device(self.device_id):
-            gran = query_granularity(self.device_id)
+            gran = get_device_granularity(self.device_id)
             reserved_spans = [d.reserved_span_bytes(itemsize) for d in buffer_descs]
             aligned = [align_up(s, gran) for s in reserved_spans]
             reserve_bytes = sum(a + _PER_BUFFER_VA_SLACK for a in aligned) + gran
             self._arena = KvVmmArena(self.device_id, reserve_bytes=reserve_bytes)
-            assert self._arena.granularity == gran, (self._arena.granularity, gran)
 
             # NORMAL torch tensors through the arena MemPool; torch.empty never touches
             # the unbacked tail.

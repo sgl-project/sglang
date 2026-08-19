@@ -10,12 +10,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(
-    est_time=1800,
-    suite="full-16-npu-a3",
-    nightly=True,
-    disabled="Currently it is executed by the npu performance workflow.",
-)
+register_npu_ci(est_time=1800, suite="base-c-test-perf-16-npu-a3")
 
 KIMI_K2_6_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -32,6 +27,7 @@ KIMI_K2_6_ENVS = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_NPU_USE_MLAPO": "1",
     "SGLANG_NPU_USE_MULTI_STREAM": "1",
+    "SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE": "64",
 }
 
 KIMI_K2_6_OTHER_ARGS = [

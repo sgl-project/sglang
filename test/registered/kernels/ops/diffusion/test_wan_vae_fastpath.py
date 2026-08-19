@@ -66,5 +66,14 @@ def test_fused_module_gate_dispatch() -> None:
     assert torch.equal(fused(x), expected)
 
 
+@torch.no_grad()
+def test_kernel_rejects_empty_input() -> None:
+    x = torch.empty(1, 96, 0, 2, 2, device="cuda", dtype=torch.bfloat16).to(
+        memory_format=torch.channels_last_3d
+    )
+    gamma = torch.ones(96, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
+    assert wan_rmsnorm_silu(x, gamma) is None
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

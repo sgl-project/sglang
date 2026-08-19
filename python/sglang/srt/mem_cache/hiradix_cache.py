@@ -65,6 +65,7 @@ from sglang.srt.observability.metrics_collector import (
     StorageMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.runtime_context import get_memory
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -86,7 +87,7 @@ class HiRadixCache(RadixCache):
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = get_mha_host_pool_cls(self.kv_cache)(
                 self.kv_cache,
-                server_args.hicache_ratio,
+                get_memory().hicache_ratio,
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
@@ -104,7 +105,7 @@ class HiRadixCache(RadixCache):
             _parallel = get_parallel()
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
+                get_memory().hicache_ratio,
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
@@ -579,7 +580,6 @@ class HiRadixCache(RadixCache):
         cleanup even if queue sizes temporarily differ across ranks.
         """
         self._drain_storage_control_queues_impl(
-            n_revoke=None,
             n_storage_hit=0,
             n_backup=None,
             n_release=None,
@@ -588,7 +588,6 @@ class HiRadixCache(RadixCache):
 
     def _drain_storage_control_queues_impl(
         self,
-        n_revoke: Optional[int],
         n_storage_hit: Optional[int],
         n_backup: Optional[int],
         n_release: Optional[int],
@@ -605,10 +604,6 @@ class HiRadixCache(RadixCache):
                     break
                 drained += 1
                 yield item
-
-        def _drain_revoke():
-            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                self._revoke_pending_prefetch(req_id)
 
         def _drain_and_alloc_storage_hit():
             # The L3 hit count is now known, so reserve exactly that much host
@@ -627,6 +622,13 @@ class HiRadixCache(RadixCache):
                 if operation.is_terminated():
                     # request was aborted while the storage query was in flight
                     self._revoke_pending_prefetch(req_id)
+                    continue
+                if operation.storage_hit_count < self.prefetch_threshold:
+                    # not to prefetch if not enough benefits
+                    self._revoke_pending_prefetch(req_id)
+                    logger.debug(
+                        f"Revoking prefetch for request {req_id} due to insufficient hits ({operation.storage_hit_count})."
+                    )
                     continue
 
                 alloc_len = operation.storage_hit_count
@@ -676,7 +678,6 @@ class HiRadixCache(RadixCache):
                 host_indices = torch.cat(host_indices_list, dim=0)
                 cc.mem_pool_host.free(host_indices)
 
-        _drain_revoke()
         _drain_and_alloc_storage_hit()
         _drain_backup()
         _drain_release()
@@ -963,7 +964,12 @@ class HiRadixCache(RadixCache):
             token_ids = []
             for n in chain:
                 token_ids.extend(n.key.token_ids)
-        key = RadixKey(token_ids, top.key.extra_key, top.key.is_bigram)
+        key = RadixKey(
+            token_ids,
+            top.key.extra_key,
+            top.key.is_bigram,
+            cache_salt=top.key.cache_salt,
+        )
 
         if all(n.hash_value is not None for n in chain):
             hash_value = []
@@ -997,7 +1003,6 @@ class HiRadixCache(RadixCache):
         cache_controller = self.cache_controller
         storage_queue_sizes = (
             (
-                cache_controller.prefetch_revoke_queue.qsize(),
                 cache_controller.prefetch_hit_queue.qsize(),
                 cache_controller.ack_backup_queue.qsize(),
                 cache_controller.host_mem_release_queue.qsize(),
@@ -1475,6 +1480,7 @@ class HiRadixCache(RadixCache):
             new_input_tokens,
             extra_key=last_host_node.key.extra_key,
             is_bigram=self.is_eagle,
+            cache_salt=last_host_node.key.cache_salt,
         ).page_aligned(self.page_size)
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
@@ -1531,9 +1537,8 @@ class HiRadixCache(RadixCache):
             self.loading_check(finish_count=load_finish_count)
 
             if self.enable_storage and storage_queue_sizes:
-                n_revoke, n_storage_hit, n_backup, n_release = storage_queue_sizes[:4]
+                n_storage_hit, n_backup, n_release = storage_queue_sizes[:3]
                 self._drain_storage_control_queues_impl(
-                    n_revoke=n_revoke,
                     n_storage_hit=n_storage_hit,
                     n_backup=n_backup,
                     n_release=n_release,
@@ -1553,7 +1558,6 @@ class HiRadixCache(RadixCache):
 
         qsizes = torch.tensor(
             [
-                cc.prefetch_revoke_queue.qsize(),
                 cc.prefetch_hit_queue.qsize(),
                 cc.ack_backup_queue.qsize(),
                 cc.host_mem_release_queue.qsize(),
@@ -1562,9 +1566,8 @@ class HiRadixCache(RadixCache):
         )
         self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
 
-        n_revoke, n_storage_hit, n_backup, n_release = map(int, qsizes.tolist())
+        n_storage_hit, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
-            n_revoke=n_revoke,
             n_storage_hit=n_storage_hit,
             n_backup=n_backup,
             n_release=n_release,
@@ -1777,6 +1780,7 @@ class HiRadixCache(RadixCache):
             new_input_tokens,
             extra_key=last_host_node.key.extra_key,
             is_bigram=self.is_eagle,
+            cache_salt=last_host_node.key.cache_salt,
         )
         # align the number of fetching tokens to the page size
         prefetch_key = prefetch_key.page_aligned(self.page_size)
@@ -1896,6 +1900,9 @@ class HiRadixCache(RadixCache):
 
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
+        )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
         )
         child.parent = new_node
         child.key = child.key[split_len:]

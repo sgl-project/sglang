@@ -50,7 +50,9 @@ from sglang.srt.mem_cache.multi_ended_allocator import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import split_node_hash_value
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import (
+    mamba_cache_chunk_size,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -102,6 +104,8 @@ class TreeNode:
         self.host_value = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
+        # Namespace-aware hashes used only for external KV events.
+        self.event_hash_value: Optional[List[str]] = None
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -450,7 +454,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self.req_to_token_pool: HybridReqToTokenPool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
-        self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        self.mamba_cache_chunk_size = mamba_cache_chunk_size()
 
         self.page_size = params.page_size
         self.disable = params.disable
@@ -627,7 +631,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             result = self.insert(
                 InsertParams(
-                    key=RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                    key=RadixKey(
+                        token_ids[:page_aligned_len],
+                        req.extra_key,
+                        cache_salt=req.cache_salt,
+                    ),
                     value=page_aligned_kv_indices,
                     mamba_value=mamba_value,
                     prev_prefix_len=req.cache_protected_len,
@@ -737,7 +745,11 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         result = self.insert(
             InsertParams(
-                key=RadixKey(page_aligned_token_ids, req.extra_key),
+                key=RadixKey(
+                    page_aligned_token_ids,
+                    req.extra_key,
+                    cache_salt=req.cache_salt,
+                ),
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_donated,
                 prev_prefix_len=req.cache_protected_len,
@@ -750,7 +762,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
-            MatchPrefixParams(key=RadixKey(page_aligned_token_ids, req.extra_key))
+            MatchPrefixParams(
+                key=RadixKey(
+                    page_aligned_token_ids,
+                    req.extra_key,
+                    cache_salt=req.cache_salt,
+                )
+            )
         )
         new_indices, new_last_node = (
             match_result.device_indices,
@@ -1211,6 +1229,9 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.parent.children[key.child_key(self.page_size)] = new_node
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
+        )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
         )
 
         # insert the new node and child into the full lru list, insert

@@ -11,8 +11,10 @@ class WeightLoadPlan:
     checkpoint_load_device: torch.device
     # Device required while running process_weights_after_loading; None means unchanged.
     weight_postprocess_device: torch.device | None = None
-    # Delay non-FSDP component CPU offload until after weight postprocessing.
-    defer_component_cpu_offload: bool = False
+    # Delay final CPU placement until after device-side weight postprocessing.
+    defer_cpu_placement: bool = False
+    # keep the complete mapped checkpoint state dict on the load device
+    load_full_state_dict_on_device: bool = False
 
     @classmethod
     def for_component(
@@ -20,7 +22,8 @@ class WeightLoadPlan:
         *,
         checkpoint_load_device: torch.device,
         needs_device_weight_postprocess: bool,
-        component_cpu_offload: bool,
+        component_starts_on_cpu: bool,
+        load_full_state_dict_on_device: bool = False,
     ) -> "WeightLoadPlan":
         # if on-device weight postprocessing is required, load directly to device to speedup loading
         weight_postprocess_device = (
@@ -29,7 +32,8 @@ class WeightLoadPlan:
         return cls(
             checkpoint_load_device=checkpoint_load_device,
             weight_postprocess_device=weight_postprocess_device,
-            defer_component_cpu_offload=(
-                needs_device_weight_postprocess and component_cpu_offload
+            defer_cpu_placement=(
+                needs_device_weight_postprocess and component_starts_on_cpu
             ),
+            load_full_state_dict_on_device=load_full_state_dict_on_device,
         )

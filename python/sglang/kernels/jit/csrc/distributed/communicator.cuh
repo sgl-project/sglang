@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+namespace sglang {
+
 namespace host::distributed {
 
 inline CommunicatorObj::CommunicatorObj(
@@ -111,3 +113,5 @@ inline void register_communicator() {
       .def_ro("rank", &Class::rank)
       .def("_config", &Class::config);
 }
+
+}  // namespace sglang

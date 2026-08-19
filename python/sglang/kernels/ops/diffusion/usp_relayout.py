@@ -16,6 +16,8 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 @cache_once
 def _jit_usp_relayout_module(dtype: torch.dtype) -> Module:
+    if dtype not in _SUPPORTED_DTYPES:
+        raise RuntimeError(f"Unsupported usp_merge_heads dtype: {dtype}")
     args = make_cpp_args(dtype)
     return load_jit(
         "diffusion_usp_relayout",
@@ -24,7 +26,7 @@ def _jit_usp_relayout_module(dtype: torch.dtype) -> Module:
         cuda_wrappers=[
             (
                 "usp_merge_heads",
-                "sglang_usp_relayout::" f"UspMergeHeadsKernel<{args}>::run",
+                "usp_relayout::" f"UspMergeHeadsKernel<{args}>::run",
             ),
         ],
     )

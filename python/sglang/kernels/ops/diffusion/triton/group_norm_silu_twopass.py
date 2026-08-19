@@ -133,35 +133,36 @@ def _gn_silu_rows(x3, weight, bias, num_groups, eps, apply_silu):
     nchunks = triton.cdiv(rows, rows_per_prog)
     psum = torch.empty((n_batch, nchunks, c), device=x3.device, dtype=torch.float32)
     psq = torch.empty_like(psum)
-    _gn_partial_rows_kernel[(nchunks, n_batch)](
-        x3, psum, psq, rows, rows_per_prog, C=c, BLOCK_R=block_r, num_warps=4
-    )
-    ss = torch.empty((n_batch, 2, c), device=x3.device, dtype=torch.float32)
-    block_k = max(1, min(4096 // cpg, triton.next_power_of_2(nchunks)))
-    _gn_finalize_kernel[(num_groups, n_batch)](
-        psum,
-        psq,
-        weight,
-        bias,
-        ss,
-        nchunks,
-        rows * cpg,
-        eps,
-        c,
-        CPG=cpg,
-        BLOCK_K=block_k,
-        num_warps=4,
-    )
-    y3 = torch.empty_like(x3)
-    _gn_apply_rows_kernel[(triton.cdiv(rows, block_r), n_batch)](
-        x3, ss, y3, rows, C=c, BLOCK_R=block_r, SILU=apply_silu, num_warps=4
-    )
+    with torch.get_device_module().device(x3.device):
+        _gn_partial_rows_kernel[(nchunks, n_batch)](
+            x3, psum, psq, rows, rows_per_prog, C=c, BLOCK_R=block_r, num_warps=4
+        )
+        ss = torch.empty((n_batch, 2, c), device=x3.device, dtype=torch.float32)
+        block_k = max(1, min(4096 // cpg, triton.next_power_of_2(nchunks)))
+        _gn_finalize_kernel[(num_groups, n_batch)](
+            psum,
+            psq,
+            weight,
+            bias,
+            ss,
+            nchunks,
+            rows * cpg,
+            eps,
+            c,
+            CPG=cpg,
+            BLOCK_K=block_k,
+            num_warps=4,
+        )
+        y3 = torch.empty_like(x3)
+        _gn_apply_rows_kernel[(triton.cdiv(rows, block_r), n_batch)](
+            x3, ss, y3, rows, C=c, BLOCK_R=block_r, SILU=apply_silu, num_warps=4
+        )
     return y3
 
 
 def _twopass_supported(x, weight, bias, num_groups) -> bool:
     """Tensor-level support check shared by the 4D and rows entry points."""
-    if not (x.is_cuda and not torch.is_grad_enabled()):
+    if not (x.is_cuda and x.numel() > 0 and not torch.is_grad_enabled()):
         return False
     if x.requires_grad or x.dtype not in _SUPPORTED_DTYPES:
         return False
@@ -169,6 +170,13 @@ def _twopass_supported(x, weight, bias, num_groups) -> bool:
         return False
     c = x.shape[1] if x.dim() == 4 else x.shape[-1]
     if weight.shape != (c,) or bias.shape != (c,):
+        return False
+    if not (
+        weight.device == bias.device == x.device
+        and weight.dtype == bias.dtype == x.dtype
+        and weight.is_contiguous()
+        and bias.is_contiguous()
+    ):
         return False
     if num_groups < 1 or c % num_groups != 0:
         return False

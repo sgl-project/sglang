@@ -54,6 +54,28 @@ def test_ltx2_ada_values9(
 
     assert len(actual) == 9
     for actual_value, expected_value in zip(actual, expected):
+        assert actual_value.is_contiguous()
+        torch.testing.assert_close(actual_value, expected_value, atol=0, rtol=0)
+
+
+@torch.no_grad()
+def test_ltx2_ada_values9_torch_compile_fullgraph() -> None:
+    hidden = 4096
+    scale_shift_table = torch.randn(
+        9, hidden, device=DEVICE, dtype=torch.bfloat16
+    ).contiguous()
+    timestep = torch.randn(
+        1, 1, 9 * hidden, device=DEVICE, dtype=torch.bfloat16
+    ).contiguous()
+
+    actual = torch.compile(ltx2_ada_values9, fullgraph=True)(
+        scale_shift_table, timestep
+    )
+    expected = _reference(scale_shift_table, timestep)
+
+    assert len(actual) == 9
+    for actual_value, expected_value in zip(actual, expected):
+        assert actual_value.is_contiguous()
         torch.testing.assert_close(actual_value, expected_value, atol=0, rtol=0)
 
 

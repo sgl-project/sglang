@@ -18,10 +18,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.ops.diffusion.bitexact_gate import (
+    BitExactFusionGate,
+    tensors_equal,
+)
 from sglang.kernels.ops.diffusion.fused_linear_gelu import (
     can_fuse_linear_gelu,
+    fused_gelu_active,
     fused_linear_gelu_tanh,
     mark_fused_gelu_site,
+)
+from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
+from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
+    can_use_fused_layernorm_modulate,
+    can_use_fused_qk_head_layernorm,
+    fused_layernorm_modulate,
+    fused_qk_head_layernorm,
+    is_plain_layer_norm,
 )
 from sglang.multimodal_gen.configs.models.dits.glmimage import GlmImageDitConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -56,10 +69,117 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
 
 logger = init_logger(__name__)
 
 _is_cuda = current_platform.is_cuda()
+
+_GLM_LN_MOD = BitExactFusionGate("GLM fused LN+modulate")
+_GLM_QK_LN = BitExactFusionGate("GLM fused qk-LayerNorm")
+
+
+def _eager_ln_modulate(
+    norm: nn.LayerNorm,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return norm(x).to(dtype=dtype) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+def _glm_ln_modulate(
+    norm: nn.LayerNorm,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Single-kernel ``LN(x) * (1 + scale) + shift``, bit-exact vs eager.
+
+    Bit-exactness depends on which LayerNorm kernel aten dispatches to, so
+    the first call verifies ``torch.equal`` against the eager chain and
+    disables the fast path permanently on any mismatch.
+    """
+    verified = _GLM_LN_MOD.verified
+    if (
+        not _GLM_LN_MOD.disabled
+        and _is_cuda
+        and dtype is x.dtype
+        and is_plain_layer_norm(norm, x.shape[-1])
+        and can_use_fused_layernorm_modulate(x, scale, shift)
+        and (verified or _GLM_LN_MOD.can_attempt_once())
+    ):
+        try:
+            out = fused_layernorm_modulate(x, scale, shift, norm.eps)
+        except Exception as exc:
+            _GLM_LN_MOD.on_exception(exc, logger=logger)
+        else:
+            if verified:
+                return out
+            return _GLM_LN_MOD.accept_or_fallback(
+                out,
+                _eager_ln_modulate(norm, x, scale, shift, dtype),
+                logger=logger,
+                mismatch_msg=(
+                    "GLM fused LN+modulate fast path is not bit-exact against "
+                    "this platform's LayerNorm dispatch; falling back to eager"
+                ),
+            )
+
+    return _eager_ln_modulate(norm, x, scale, shift, dtype)
+
+
+def _glm_qk_layernorm(
+    norm_q: nn.LayerNorm,
+    norm_k: nn.LayerNorm,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    dtype: torch.dtype,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-head LayerNorm over q and k in one launch, bit-exact vs eager.
+
+    First call verifies ``torch.equal`` against the eager pair and falls
+    back permanently on any mismatch.
+    """
+    verified = _GLM_QK_LN.verified
+    if (
+        not _GLM_QK_LN.disabled
+        and _is_cuda
+        and dtype is query.dtype
+        and dtype is key.dtype
+        and is_plain_layer_norm(norm_q, query.shape[-1])
+        and is_plain_layer_norm(norm_k, key.shape[-1])
+        and norm_q.eps == norm_k.eps
+        and can_use_fused_qk_head_layernorm(query, key)
+        and (verified or _GLM_QK_LN.can_attempt_once())
+    ):
+        try:
+            out = fused_qk_head_layernorm(query, key, norm_q.eps)
+        except Exception as exc:
+            _GLM_QK_LN.on_exception(exc, logger=logger)
+        else:
+            if verified:
+                return out
+            ref = (
+                norm_q(query).to(dtype=dtype),
+                norm_k(key).to(dtype=dtype),
+            )
+            return _GLM_QK_LN.accept_or_fallback(
+                out,
+                ref,
+                equal=tensors_equal,
+                logger=logger,
+                mismatch_msg=(
+                    "GLM fused qk-LayerNorm fast path is not bit-exact against "
+                    "this platform's LayerNorm dispatch; falling back to eager"
+                ),
+            )
+
+    return norm_q(query).to(dtype=dtype), norm_k(key).to(dtype=dtype)
 
 
 class GlmImageLayerKVCache:
@@ -275,10 +395,6 @@ class GlmImageAdaLayerNormZero(nn.Module):
         temb: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         dtype = hidden_states.dtype
-        norm_hidden_states = self.norm(hidden_states).to(dtype=dtype)
-        norm_encoder_hidden_states = self.norm_context(encoder_hidden_states).to(
-            dtype=dtype
-        )
 
         emb, _ = self.linear(temb)
         (
@@ -296,12 +412,12 @@ class GlmImageAdaLayerNormZero(nn.Module):
             c_gate_mlp,
         ) = emb.chunk(12, dim=1)
 
-        hidden_states = norm_hidden_states * (
-            1 + scale_msa.unsqueeze(1)
-        ) + shift_msa.unsqueeze(1)
-        encoder_hidden_states = norm_encoder_hidden_states * (
-            1 + c_scale_msa.unsqueeze(1)
-        ) + c_shift_msa.unsqueeze(1)
+        hidden_states = _glm_ln_modulate(
+            self.norm, hidden_states, scale_msa, shift_msa, dtype
+        )
+        encoder_hidden_states = _glm_ln_modulate(
+            self.norm_context, encoder_hidden_states, c_scale_msa, c_shift_msa, dtype
+        )
 
         return (
             hidden_states,
@@ -340,9 +456,7 @@ class GlmImageGELU(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self._sgl_fused_gelu_enabled and can_fuse_linear_gelu(
-            self.proj, hidden_states
-        ):
+        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -514,10 +628,13 @@ class GlmImageAttention(torch.nn.Module):
         value = value.unflatten(2, (self.num_local_kv_heads, -1))
 
         # 2. QK normalization
-        if self.norm_q is not None:
-            query = self.norm_q(query).to(dtype=dtype)
-        if self.norm_k is not None:
-            key = self.norm_k(key).to(dtype=dtype)
+        if self.norm_q is not None and self.norm_k is not None:
+            query, key = _glm_qk_layernorm(self.norm_q, self.norm_k, query, key, dtype)
+        else:
+            if self.norm_q is not None:
+                query = self.norm_q(query).to(dtype=dtype)
+            if self.norm_k is not None:
+                key = self.norm_k(key).to(dtype=dtype)
 
         # 3. Rotational positional embeddings applied to latent stream
         if image_rotary_emb is not None:
@@ -683,9 +800,11 @@ class GlmImageTransformerBlock(nn.Module):
 
         ff_output = self.ff(norm_hidden_states)
         ff_output_context = self.ff(norm_encoder_hidden_states)
-        hidden_states = hidden_states + ff_output * gate_mlp.unsqueeze(1)
-        encoder_hidden_states = (
-            encoder_hidden_states + ff_output_context * c_gate_mlp.unsqueeze(1)
+        hidden_states = residual_gate_add(
+            hidden_states, ff_output, gate_mlp.unsqueeze(1)
+        )
+        encoder_hidden_states = residual_gate_add(
+            encoder_hidden_states, ff_output_context, c_gate_mlp.unsqueeze(1)
         )
 
         return hidden_states, encoder_hidden_states
@@ -776,6 +895,8 @@ class GlmImageAdaLayerNormContinuous(nn.Module):
         # *** NO SiLU here ***
         emb = self.linear(conditioning_embedding.to(x.dtype))
         scale, shift = torch.chunk(emb, 2, dim=1)
+        if is_plain_layer_norm(self.norm, x.shape[-1]):
+            return _glm_ln_modulate(self.norm, x, scale, shift, x.dtype)
         x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
         return x
 
@@ -820,8 +941,7 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     ):
         super().__init__(config=config, hf_config=hf_config)
 
-        self.config_data = config  # Store config
-        arch_config = config.arch_config
+        arch_config = self.config
 
         self.in_channels = arch_config.in_channels
         self.out_channels = arch_config.out_channels
@@ -867,7 +987,6 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         # 3. Transformer blocks
-        self._supported_attention_backends = arch_config._supported_attention_backends
         self.transformer_blocks = nn.ModuleList(
             [
                 GlmImageTransformerBlock(
@@ -977,8 +1096,15 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         hidden_states = self.image_projector(hidden_states)
         encoder_hidden_states = self.glyph_projector(encoder_hidden_states)
+
         prior_embedding = self.prior_token_embedding(prior_token_id)
-        prior_embedding = prior_embedding.masked_fill(prior_token_drop.unsqueeze(-1), 0)
+        if is_in_breakable_cuda_graph():
+            prior_embedding = prior_embedding.masked_fill(
+                prior_token_drop.unsqueeze(-1), 0
+            )
+        else:
+            prior_embedding[prior_token_drop] *= 0.0
+
         prior_hidden_states = self.prior_projector(prior_embedding)
         # SP: when latents are H-sharded, hidden_states has fewer patches than prior_hidden_states.
         # Shard prior_hidden_states along seq dim to match (prior is row-major, same as latent patches).
