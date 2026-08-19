@@ -43,6 +43,7 @@ from sglang.kernels.ops.attention.flash_mla_sm120 import (
     _sm120_sparse_decode_fwd,
     _split_kv_pages_to_64,
     flash_mla_with_kvcache_sm120,
+    flashinfer_dsv4_decode_supports_num_heads,
 )
 from sglang.kernels.ops.attention.flash_mla_sm120_triton import (
     _apply_attn_sink,
@@ -500,6 +501,53 @@ class TestEntryPointDispatch(CustomTestCase):
         torch.testing.assert_close(
             out_fi.to(torch.float32),
             out_triton.to(torch.float32),
+            atol=5e-2,
+            rtol=5e-2,
+        )
+
+    def test_flashinfer_exact_16_heads_matches_padded_64_heads(self):
+        """TP4's 16 real heads agree with the legacy padded layer contract."""
+        if not flashinfer_dsv4_decode_supports_num_heads(16, 1):
+            self.skipTest("FlashInfer has no 16-head DSV4 decode specialization")
+
+        self.assertFalse(flashinfer_dsv4_decode_supports_num_heads(16, 65))
+
+        num_pages, page_size, topk = 2, 64, 128
+        k_cache, _ = _build_kvcache(num_pages, page_size, device=self.device, seed=17)
+        q, indices = _build_q_indices(
+            1,
+            16,
+            topk,
+            num_pages,
+            page_size,
+            device=self.device,
+            seed=29,
+        )
+        topk_length = torch.tensor([topk], dtype=torch.int32, device=self.device)
+        sink = torch.linspace(-1.0, 1.0, 16, dtype=torch.float32, device=self.device)
+
+        q_padded = torch.zeros(1, 1, 64, _D, dtype=torch.bfloat16, device=self.device)
+        q_padded[:, :, :16].copy_(q)
+        sink_padded = torch.zeros(64, dtype=torch.float32, device=self.device)
+        sink_padded[:16].copy_(sink)
+
+        common = dict(
+            k_cache=k_cache,
+            indices=indices,
+            topk_length=topk_length,
+            head_dim_v=_D,
+            softmax_scale=_D**-0.5,
+        )
+        with mock.patch.object(fmod, "_sm120_default_backend", "flashinfer"):
+            out_exact, _ = flash_mla_with_kvcache_sm120(q=q, attn_sink=sink, **common)
+            out_padded, _ = flash_mla_with_kvcache_sm120(
+                q=q_padded, attn_sink=sink_padded, **common
+            )
+
+        self.assertEqual(out_exact.shape, (1, 1, 16, _D))
+        torch.testing.assert_close(
+            out_exact.float(),
+            out_padded[:, :, :16].float(),
             atol=5e-2,
             rtol=5e-2,
         )

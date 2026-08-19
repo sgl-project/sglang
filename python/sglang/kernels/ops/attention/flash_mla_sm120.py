@@ -13,7 +13,8 @@ separate region at the end of each page.
 
 import logging
 import math
-from typing import Optional
+from functools import lru_cache
+from typing import FrozenSet, Optional, Tuple
 
 import torch
 import triton
@@ -208,6 +209,34 @@ def _sm120_sparse_decode_fwd(
 # SM120 FlashMLA: default FlashInfer (CUTLASS SM120 sparse MLA decode).
 # Override with SGLANG_SM120_FLASHMLA_BACKEND=triton|torch to force fallback.
 _sm120_default_backend = envs.SGLANG_SM120_FLASHMLA_BACKEND.get()
+
+
+@lru_cache(maxsize=1)
+def _flashinfer_dsv4_decode_capabilities() -> Tuple[int, FrozenSet[int]]:
+    """Read the installed FlashInfer DSV4 decode capabilities once."""
+    try:
+        from flashinfer.mla._sparse_mla_sm120 import (
+            _DECODE_DSV4_DISPATCH,
+            _DECODE_MAX_TOKENS,
+        )
+    except (AttributeError, ImportError):
+        return 0, frozenset()
+
+    return int(_DECODE_MAX_TOKENS), frozenset(
+        heads for heads, _ in _DECODE_DSV4_DISPATCH
+    )
+
+
+def flashinfer_dsv4_decode_supports_num_heads(num_heads: int, num_tokens: int) -> bool:
+    """Return whether FlashInfer will use a DSV4 decode specialization.
+
+    Keep this capability check fail-closed because SGLang can be used with a
+    locally installed FlashInfer even though the release dependency is pinned.
+    The padded 64-head path remains the safe fallback for older builds and for
+    prefill-sized batches, whose supported head counts differ from decode.
+    """
+    decode_max_tokens, supported_heads = _flashinfer_dsv4_decode_capabilities()
+    return num_tokens <= decode_max_tokens and num_heads in supported_heads
 
 
 def flash_mla_with_kvcache_sm120(**kwargs):
