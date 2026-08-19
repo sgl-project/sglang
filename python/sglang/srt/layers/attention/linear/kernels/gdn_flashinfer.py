@@ -185,6 +185,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self._cake_gdn_arch = None
         self._cake_gdn_entries = {}
         self._cake_gdn_outputs = {}
+        self._cake_gdn_prefill_outputs = {}
+        self._cake_gdn_prefill_workspaces = {}
+        self._cake_gdn_prefill_dummies = {}
         self._cake_gdn_dt_bias_fp32 = {}
         self._cake_gdn_logged_routes = set()
 
@@ -340,6 +343,244 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             converted = dt_bias.detach().float()
             self._cake_gdn_dt_bias_fp32[key] = converted
         return converted
+
+    @staticmethod
+    def _cake_prefill_grid_x(
+        *,
+        route_id: str,
+        num_seqs: int,
+        max_seq_len: int,
+        num_v_heads: int,
+        max_active_clusters: int,
+    ) -> tuple[int, int]:
+        """Return the frozen Cake prefill tile count and persistent grid."""
+
+        dvsplit = route_id.endswith(".dvsplit")
+        total_tiles = num_seqs * num_v_heads * (2 if dvsplit else 1)
+        if dvsplit:
+            return total_tiles, min(max_active_clusters, total_tiles)
+        if total_tiles <= 128:
+            return total_tiles, total_tiles
+        max_chunks = (max_seq_len + 63) // 64
+        if max_chunks <= 8:
+            return total_tiles, min(128, total_tiles)
+        if total_tiles == 256 and max_active_clusters in (148, 160):
+            return total_tiles, 128
+        return total_tiles, min(max_active_clusters, total_tiles)
+
+    def _cake_prefill_output_buffer(
+        self,
+        q: torch.Tensor,
+        *,
+        layer_id: int,
+        total_tokens: int,
+        num_v_heads: int,
+    ) -> torch.Tensor:
+        """Return a stream-local output view with bounded retained capacity."""
+
+        stream_handle = int(torch.cuda.current_stream(q.device).cuda_stream)
+        key = (q.device.index, stream_handle, layer_id, num_v_heads, q.dtype)
+        output = self._cake_gdn_prefill_outputs.get(key)
+        if output is None or output.shape[0] < total_tokens:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Cake GDN prefill output was not prepared before CUDA Graph capture"
+                )
+            output = torch.empty(
+                total_tokens,
+                num_v_heads,
+                128,
+                dtype=q.dtype,
+                device=q.device,
+            )
+            self._cake_gdn_prefill_outputs[key] = output
+        return output[:total_tokens]
+
+    def _cake_prefill_workspace(
+        self,
+        q: torch.Tensor,
+        *,
+        layer_id: int,
+        grid_x: int,
+    ) -> torch.Tensor:
+        """Return the 4 x 128-byte per-CTA pointer-TMA workspace."""
+
+        stream_handle = int(torch.cuda.current_stream(q.device).cuda_stream)
+        key = (q.device.index, stream_handle, layer_id)
+        required_bytes = grid_x * 4 * 128
+        workspace = self._cake_gdn_prefill_workspaces.get(key)
+        if workspace is None or workspace.numel() < required_bytes:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Cake GDN prefill workspace was not prepared before CUDA Graph capture"
+                )
+            workspace = torch.empty(
+                required_bytes, dtype=torch.uint8, device=q.device
+            )
+            self._cake_gdn_prefill_workspaces[key] = workspace
+        return workspace
+
+    def _cake_prefill_dummy_buffers(
+        self, q: torch.Tensor, *, state_dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (q.device.index, state_dtype)
+        buffers = self._cake_gdn_prefill_dummies.get(key)
+        if buffers is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Cake GDN prefill dummy buffers were not prepared before CUDA Graph capture"
+                )
+            buffers = (
+                torch.empty(1, dtype=state_dtype, device=q.device),
+                torch.empty(1, dtype=torch.int32, device=q.device),
+            )
+            self._cake_gdn_prefill_dummies[key] = buffers
+        return buffers
+
+    def _try_cake_prefill(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        state: torch.Tensor,
+        state_indices: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        seq_lens_cpu: Optional[list[int]],
+        layer_id: Optional[int],
+        num_state_checkpoints: int,
+        state_checkpoint_every_n_tokens: int,
+    ) -> Optional[torch.Tensor]:
+        """Launch one exact Cake non-CP prefill route or fail closed."""
+
+        if (
+            self._cake_gdn_api is None
+            or layer_id is None
+            or not seq_lens_cpu
+            or num_state_checkpoints != 0
+            or state_checkpoint_every_n_tokens != 0
+        ):
+            return None
+        total_tokens, num_q_heads, head_size = q.shape
+        num_k_heads = k.shape[1]
+        num_v_heads = v.shape[1]
+        num_seqs = len(seq_lens_cpu)
+        max_seq_len = max(seq_lens_cpu)
+        tensors = (q, k, v, alpha, beta, state, state_indices, cu_seqlens)
+        if (
+            head_size != 128
+            or num_v_heads < num_q_heads
+            or tuple(k.shape) != (total_tokens, num_k_heads, 128)
+            or tuple(v.shape) != (total_tokens, num_v_heads, 128)
+            or num_k_heads != num_q_heads
+            or sum(seq_lens_cpu) != total_tokens
+            or min(seq_lens_cpu) <= 0
+            or any(tensor.device != q.device for tensor in tensors)
+            or any(tensor.dtype != torch.bfloat16 for tensor in (q, k, v, state))
+            or alpha.dtype != torch.float32
+            or beta.dtype != torch.float32
+            or tuple(alpha.shape) != (total_tokens, num_v_heads)
+            or tuple(beta.shape) != (total_tokens, num_v_heads)
+            or not alpha.is_contiguous()
+            or not beta.is_contiguous()
+            or state_indices.dtype != torch.int32
+            or tuple(state_indices.shape) != (num_seqs,)
+            or not state_indices.is_contiguous()
+            or cu_seqlens.dtype != torch.int32
+            or tuple(cu_seqlens.shape) != (num_seqs + 1,)
+            or not cu_seqlens.is_contiguous()
+            or not q.is_contiguous()
+            or not k.is_contiguous()
+            or not v.is_contiguous()
+            or state.ndim != 4
+            or tuple(state.shape[1:]) != (num_v_heads, 128, 128)
+            or tuple(state.stride()[1:]) != (128 * 128, 128, 1)
+            or state.stride(0) < num_v_heads * 128 * 128
+        ):
+            return None
+
+        try:
+            route = self._cake_gdn_api.select_cake_gdn_prefill_variant(
+                arch=self._cake_gdn_arch,
+                io_dtype="bfloat16",
+                state_dtype="bfloat16",
+                num_seqs=num_seqs,
+                total_seq_len=total_tokens,
+                max_seq_len=max_seq_len,
+                num_q_heads=num_q_heads,
+                num_k_heads=num_k_heads,
+                num_v_heads=num_v_heads,
+                use_initial_state=True,
+                store_final_state=True,
+                checkpoint_every_n_tokens=0,
+                use_state_indices=True,
+            )
+        except self._cake_gdn_api.CakeGDNUnsupportedError:
+            return None
+
+        entry = self._cake_gdn_entries.get(route.variant_name)
+        if entry is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Cake GDN prefill kernel was not loaded before CUDA Graph capture"
+                )
+            entry = self._cake_gdn_api.load_cake_gdn_kernel(
+                route.variant_name, self._cake_gdn_arch
+            )
+            self._cake_gdn_entries[route.variant_name] = entry
+
+        max_active_clusters = 148 if self._cake_gdn_arch == "sm_100a" else 160
+        total_tiles, grid_x = self._cake_prefill_grid_x(
+            route_id=route.route_id,
+            num_seqs=num_seqs,
+            max_seq_len=max_seq_len,
+            num_v_heads=num_v_heads,
+            max_active_clusters=max_active_clusters,
+        )
+        output = self._cake_prefill_output_buffer(
+            q,
+            layer_id=layer_id,
+            total_tokens=total_tokens,
+            num_v_heads=num_v_heads,
+        )
+        workspace = self._cake_prefill_workspace(
+            q, layer_id=layer_id, grid_x=grid_x
+        )
+        empty_state, empty_i32 = self._cake_prefill_dummy_buffers(
+            q, state_dtype=state.dtype
+        )
+        entry(
+            q,
+            k,
+            v,
+            output,
+            alpha,
+            beta,
+            cu_seqlens,
+            state_indices,
+            state,
+            state,
+            empty_state,
+            empty_i32,
+            workspace,
+            state.stride(0),
+            state.stride(0),
+            0,
+            128**-0.5,
+            num_seqs,
+            num_q_heads,
+            num_v_heads,
+            total_tiles,
+            grid_x,
+            1,
+            1,
+        )
+        if route.route_id not in self._cake_gdn_logged_routes:
+            self._cake_gdn_logged_routes.add(route.route_id)
+            logger.info("Using %s", route.route_id)
+        return output.view(1, total_tokens, num_v_heads, 128)
 
     def _try_cake_decode(
         self,
@@ -593,6 +834,23 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # g (alpha) and beta: [1, seq, HV] -> [seq, HV], float32 for FlashInfer
         alpha_fi = torch.exp(g[0].to(torch.float32))
         beta_fi = beta[0].to(torch.float32)
+
+        output_cake = self._try_cake_prefill(
+            q=q_fi,
+            k=k_fi,
+            v=v_fi,
+            alpha=alpha_fi,
+            beta=beta_fi,
+            state=ssm_states,
+            state_indices=cache_indices,
+            cu_seqlens=query_start_loc,
+            seq_lens_cpu=kwargs.get("seq_lens_cpu"),
+            layer_id=kwargs.get("layer_id"),
+            num_state_checkpoints=num_state_checkpoints,
+            state_checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+        )
+        if output_cake is not None:
+            return output_cake, None, None
 
         if self.use_state_pool:
             # Negative indices (e.g. -1) are padding markers for slots not yet

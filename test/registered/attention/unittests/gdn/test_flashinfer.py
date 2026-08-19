@@ -9,6 +9,9 @@ from sglang.srt.utils import is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
     GDNAttentionCase,
+    _cache_indices,
+    _pure_torch_gdn_reference,
+    _ssm_states,
     build_gdn_attention_fixture,
     make_gdn_cases,
     run_gdn_attention_case,
@@ -358,6 +361,18 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         linear_attn_decode_backend="flashinfer",
         linear_attn_prefill_backend="flashinfer",
     )
+    CAKE_PREFILL_CASE = GDNAttentionCase(
+        name="flashinfer_cake_gdn_tp4_prefill_b4_s64",
+        backend="flashinfer",
+        forward_mode=ForwardMode.EXTEND,
+        num_k_heads=4,
+        num_v_heads=8,
+        page_size=16,
+        prefix_lens=(4, 7, 10, 13),
+        extend_lens=(64,) * 4,
+        linear_attn_decode_backend="flashinfer",
+        linear_attn_prefill_backend="flashinfer",
+    )
     CAKE_VERIFY_CASE = GDNAttentionCase(
         name="flashinfer_cake_gdn_tp4_verify_b8_t4",
         backend="flashinfer",
@@ -401,6 +416,47 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
                 cuda_graph_capture_batch_size=4,
             )
         self.assertGreater(load_kernel.call_count, eager_load_count)
+
+    def test_cake_exact_prefill_updates_indexed_state_in_place(self):
+        cake_api = self._cake_api_or_skip()
+        fixture = build_gdn_attention_fixture(
+            self,
+            self.CAKE_PREFILL_CASE,
+            head_k_dim=self.HEAD_DIM,
+            head_v_dim=self.HEAD_DIM,
+        )
+        initial_ssm_states = _ssm_states(fixture).clone()
+        with mock.patch.object(
+            cake_api,
+            "load_cake_gdn_kernel",
+            wraps=cake_api.load_cake_gdn_kernel,
+        ) as load_kernel:
+            dispatcher = fixture.backend.linear_attn_backend.kernel_dispatcher
+            with mock.patch.object(
+                dispatcher,
+                "extend",
+                wraps=dispatcher.extend,
+            ) as extend:
+                actual = run_gdn_fixture_eager(fixture)
+        expected = _pure_torch_gdn_reference(fixture, initial_ssm_states)
+        cache_indices = _cache_indices(fixture)
+
+        self.assertGreater(load_kernel.call_count, 0)
+        extend.assert_called_once()
+        self.assertIs(
+            extend.call_args.kwargs["seq_lens_cpu"],
+            fixture.forward_batch.extend_seq_lens_cpu,
+        )
+        self.assertEqual(extend.call_args.kwargs["layer_id"], 0)
+        torch.testing.assert_close(
+            actual, expected.output, atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            _ssm_states(fixture)[cache_indices],
+            expected.final_states[cache_indices],
+            atol=1e-2,
+            rtol=1e-2,
+        )
 
     def test_cake_exact_verify_eager_and_cuda_graph(self):
         cake_api = self._cake_api_or_skip()

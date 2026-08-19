@@ -704,6 +704,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_checkpoint_every_n_tokens=(
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                layer_id=layer.layer_id,
             )
 
             if is_npu() and last_recurrent_state is not None:
