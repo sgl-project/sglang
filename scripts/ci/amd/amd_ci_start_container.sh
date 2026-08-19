@@ -23,9 +23,11 @@ ROCM_VERSION="rocm700"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
 # In-network mirror of rocm/sgl-dev, populated by the nightly release workflow.
-# Set AMD_CI_DOCKER_REGISTRY_MIRROR to retarget it, or to the empty string to
-# pull straight from Docker Hub, without editing this script.
-LOCAL_DOCKER_REGISTRY="${AMD_CI_DOCKER_REGISTRY_MIRROR-10.44.14.109:5000}"
+# Only the MI300 scale sets can route to it, so it is enabled per architecture
+# once the GPU arch is known below. AMD_CI_DOCKER_REGISTRY_MIRROR overrides that
+# either way: a host:port to retarget it, or the empty string to always pull
+# from Docker Hub.
+DEFAULT_DOCKER_REGISTRY_MIRROR="10.44.14.109:5000"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
@@ -61,7 +63,7 @@ while [[ $# -gt 0 ]]; do
       echo "  ENABLE_CACHE_HOST=1|0"
       echo "      Mount /home/runner/sglang-data to /sgl-data. Defaults to 1 when RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
       echo "  AMD_CI_DOCKER_REGISTRY_MIRROR=HOST:PORT"
-      echo "      In-network registry to pull rocm/sgl-dev from before falling back to Docker Hub. Defaults to ${LOCAL_DOCKER_REGISTRY:-<none>}. Set to the empty string to always use Docker Hub."
+      echo "      In-network registry to pull rocm/sgl-dev from before falling back to Docker Hub. Defaults to ${DEFAULT_DOCKER_REGISTRY_MIRROR} on mi30x and to none on mi35x, which cannot route to it. Set to the empty string to always use Docker Hub."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -96,6 +98,22 @@ case "${GPU_ARCH}" in
     GPU_ARCH="mi30x"
     ;;
 esac
+
+# Enable the mirror only where it is routable. Probes from every linux-mi35x-*
+# pool time out after a flat 15s, so attempting it there only delays the Docker
+# Hub pull that has to happen anyway.
+if [[ -n "${AMD_CI_DOCKER_REGISTRY_MIRROR+x}" ]]; then
+  LOCAL_DOCKER_REGISTRY="${AMD_CI_DOCKER_REGISTRY_MIRROR}"
+elif [[ "${GPU_ARCH}" == "mi30x" ]]; then
+  LOCAL_DOCKER_REGISTRY="${DEFAULT_DOCKER_REGISTRY_MIRROR}"
+else
+  LOCAL_DOCKER_REGISTRY=""
+fi
+if [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
+  echo "Registry mirror for ${GPU_ARCH}: ${LOCAL_DOCKER_REGISTRY}"
+else
+  echo "No registry mirror for ${GPU_ARCH}; pulling from Docker Hub."
+fi
 
 
 # Set up DEVICE_FLAG based on Kubernetes pod info
@@ -247,7 +265,7 @@ if [[ -n "${CUSTOM_IMAGE}" ]]; then
   IMAGE="${CUSTOM_IMAGE}"
   IMAGE_SOURCE="custom-image"
   echo "Using custom image: ${IMAGE}"
-  if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
+  if [[ -n "${LOCAL_DOCKER_REGISTRY}" && "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
     docker pull "${IMAGE}"
   else
     retry_with_backoff 6 docker pull "${IMAGE}"

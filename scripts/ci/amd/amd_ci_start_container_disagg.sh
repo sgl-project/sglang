@@ -20,8 +20,9 @@ VERSION_RESOLVE_SECONDS=$SECONDS
 ROCM_VERSION="rocm700"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
-# See amd_ci_start_container.sh for AMD_CI_DOCKER_REGISTRY_MIRROR.
-LOCAL_DOCKER_REGISTRY="${AMD_CI_DOCKER_REGISTRY_MIRROR-10.44.14.109:5000}"
+# Enabled per architecture once the GPU arch is known below; see
+# amd_ci_start_container.sh for AMD_CI_DOCKER_REGISTRY_MIRROR.
+DEFAULT_DOCKER_REGISTRY_MIRROR="10.44.14.109:5000"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
@@ -73,6 +74,20 @@ case "${GPU_ARCH}" in
     GPU_ARCH="mi30x"
     ;;
 esac
+
+# Only MI300 can route to the mirror; see amd_ci_start_container.sh.
+if [[ -n "${AMD_CI_DOCKER_REGISTRY_MIRROR+x}" ]]; then
+  LOCAL_DOCKER_REGISTRY="${AMD_CI_DOCKER_REGISTRY_MIRROR}"
+elif [[ "${GPU_ARCH}" == "mi30x" ]]; then
+  LOCAL_DOCKER_REGISTRY="${DEFAULT_DOCKER_REGISTRY_MIRROR}"
+else
+  LOCAL_DOCKER_REGISTRY=""
+fi
+if [[ -n "${LOCAL_DOCKER_REGISTRY}" ]]; then
+  echo "Registry mirror for ${GPU_ARCH}: ${LOCAL_DOCKER_REGISTRY}"
+else
+  echo "No registry mirror for ${GPU_ARCH}; pulling from Docker Hub."
+fi
 
 
 # Set up DEVICE_FLAG based on Kubernetes pod info
