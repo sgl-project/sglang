@@ -426,6 +426,16 @@ class Platform:
         attention_cls_str = self.get_attn_backend_cls_str(*args, **kwargs)
         return resolve_obj_by_qualname(attention_cls_str)
 
+    def tensor_on_device(self, t: torch.nn.Modulee) -> bool:
+        """Check if a tensor is on the current platform's device."""
+        device_type = t.device.type
+
+        if self.is_cuda():
+            return device_type == "cuda"
+        if self.is_npu():
+            return device_type == "npu"
+
+        raise False
 
 class UnspecifiedPlatform(Platform):
     _enum = PlatformEnum.UNSPECIFIED
