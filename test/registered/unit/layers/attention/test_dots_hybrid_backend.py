@@ -1,0 +1,78 @@
+import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+import torch
+
+from sglang.srt.layers.attention.dots_hybrid_backend import (
+    DotsHybridAttnBackend,
+    DotsSWAMLAAttnBackend,
+    _metadata_mismatches_dp_padded_batch,
+)
+from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+def _batch(*, bs: int, num_tokens: int, original_bs: int | None = None):
+    return SimpleNamespace(
+        batch_size=bs,
+        out_cache_loc=torch.zeros(num_tokens, dtype=torch.int64),
+        forward_mode=SimpleNamespace(),
+        _original_batch_size=original_bs,
+    )
+
+
+def _fa_metadata(*, bs: int, num_tokens: int):
+    return FlashAttentionMetadata(
+        page_table=torch.zeros((bs, 4), dtype=torch.int32),
+        swa_page_table=torch.zeros((bs, 4), dtype=torch.int32),
+        cache_seqlens_int32=torch.ones(bs, dtype=torch.int32),
+        swa_out_cache_loc=torch.zeros(num_tokens, dtype=torch.int64),
+    )
+
+
+def test_mismatch_detects_short_page_table_and_swa_loc():
+    metadata = _fa_metadata(bs=1, num_tokens=1)
+    assert _metadata_mismatches_dp_padded_batch(metadata, _batch(bs=2, num_tokens=2))
+
+    metadata = _fa_metadata(bs=2, num_tokens=2)
+    assert not _metadata_mismatches_dp_padded_batch(
+        metadata, _batch(bs=2, num_tokens=2)
+    )
+
+
+def test_swa_backend_rebuilds_when_dp_padding_changes_rows():
+    inner = SimpleNamespace(
+        forward_metadata=_fa_metadata(bs=1, num_tokens=1),
+        init_forward_metadata=MagicMock(),
+    )
+    backend = object.__new__(DotsSWAMLAAttnBackend)
+    backend.backend = inner
+    backend._active_backend = inner
+    backend._prefill_metadata = None
+    backend._dp_rebuilt_batch_id = None
+    backend.init_forward_metadata = MagicMock()
+
+    backend.maybe_rebuild_metadata_after_dp_padding(_batch(bs=2, num_tokens=2))
+    backend.init_forward_metadata.assert_called_once()
+
+
+def test_hybrid_rebuilds_when_dp_padding_changes_batch_size():
+    matching = _fa_metadata(bs=2, num_tokens=2)
+    hybrid = object.__new__(DotsHybridAttnBackend)
+    hybrid.dsa_backend = SimpleNamespace(forward_metadata=matching)
+    hybrid.swa_backend = SimpleNamespace(forward_metadata=matching)
+    hybrid._dp_rebuilt_batch_id = None
+    hybrid.init_forward_metadata = MagicMock()
+
+    hybrid.maybe_rebuild_metadata_after_dp_padding(
+        _batch(bs=2, num_tokens=2, original_bs=1)
+    )
+    hybrid.init_forward_metadata.assert_called_once()
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__]))

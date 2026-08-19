@@ -173,29 +173,38 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
     ) -> None:
         self.maybe_rebuild_metadata_after_dp_padding(forward_batch)
 
-    @contextmanager
-    def _use_draft_step_out_cache_loc(self, forward_batch: ForwardBatch):
-        """Expose only this backend's draft-step write locations to FA."""
+    def select_draft_step_out_cache_loc(self, forward_batch: ForwardBatch):
+        """Return this draft step's write locations from a combined SWA buffer."""
         from sglang.srt.layers.attention.flashattention_backend import (
             FlashAttentionBackend,
         )
 
-        original = forward_batch.out_cache_loc
+        out_cache_loc = forward_batch.out_cache_loc
         backend = self._active_backend
+        if not isinstance(backend, FlashAttentionBackend):
+            return out_cache_loc
         if (
-            isinstance(backend, FlashAttentionBackend)
-            and original is not None
+            out_cache_loc is not None
             and forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is not None
             and backend.speculative_num_steps > 0
-            and original.numel()
+            and out_cache_loc.numel()
             == forward_batch.batch_size * backend.topk * backend.speculative_num_steps
         ):
-            forward_batch.out_cache_loc = original.view(
+            return out_cache_loc.view(
                 forward_batch.batch_size,
                 backend.topk,
                 backend.speculative_num_steps,
             )[:, :, backend.speculative_step_id].reshape(-1)
+        return out_cache_loc
+
+    @contextmanager
+    def _use_draft_step_out_cache_loc(self, forward_batch: ForwardBatch):
+        """Expose only this backend's draft-step write locations to FA."""
+        original = forward_batch.out_cache_loc
+        forward_batch.out_cache_loc = self.select_draft_step_out_cache_loc(
+            forward_batch
+        )
         try:
             yield
         finally:

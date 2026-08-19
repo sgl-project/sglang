@@ -1022,8 +1022,14 @@ class Dots3AttentionMLA(nn.Module):
                 swa_loc is None
                 or swa_loc.shape[0] != forward_batch.out_cache_loc.shape[0]
             ):
+                if isinstance(backend, DotsSWAMLAAttnBackend):
+                    out_cache_loc = backend.select_draft_step_out_cache_loc(
+                        forward_batch
+                    )
+                else:
+                    out_cache_loc = forward_batch.out_cache_loc
                 swa_loc = get_token_to_kv_pool().translate_loc_from_full_to_swa(
-                    forward_batch.out_cache_loc
+                    out_cache_loc
                 )
         return KVWriteLoc(forward_batch.out_cache_loc, swa_loc=swa_loc)
 
