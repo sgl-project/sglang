@@ -73,6 +73,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     build_nvfp4_config_from_safetensors_list,
     get_quant_config,
@@ -249,19 +250,19 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         plan = WeightLoadPlan.for_component(
             checkpoint_load_device=device,
             needs_device_weight_postprocess=True,
-            component_cpu_offload=True,
+            component_starts_on_cpu=True,
         )
 
         self.assertEqual(plan.checkpoint_load_device, device)
         self.assertEqual(plan.weight_postprocess_device, device)
-        self.assertTrue(plan.defer_component_cpu_offload)
+        self.assertTrue(plan.defer_cpu_placement)
         self.assertFalse(plan.load_full_state_dict_on_device)
 
     def test_weight_load_plan_can_keep_full_state_dict_on_device(self):
         plan = WeightLoadPlan.for_component(
             checkpoint_load_device=torch.device("cuda:0"),
             needs_device_weight_postprocess=False,
-            component_cpu_offload=False,
+            component_starts_on_cpu=False,
             load_full_state_dict_on_device=True,
         )
 
@@ -270,7 +271,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
     def test_unquantized_cpu_offload_loads_checkpoint_on_cpu(self):
         device = _resolve_checkpoint_load_device(
             torch.device("cuda:0"),
-            component_cpu_offload=True,
+            component_starts_on_cpu=True,
             runtime_quant_config=None,
         )
 
@@ -280,7 +281,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         runtime_device = torch.device("cuda:0")
         device = _resolve_checkpoint_load_device(
             runtime_device,
-            component_cpu_offload=True,
+            component_starts_on_cpu=True,
             runtime_quant_config=object(),
         )
 
@@ -290,7 +291,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         runtime_device = torch.device("cuda:0")
         device = _resolve_checkpoint_load_device(
             runtime_device,
-            component_cpu_offload=False,
+            component_starts_on_cpu=False,
             runtime_quant_config=None,
         )
 
@@ -313,6 +314,13 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             _warn_if_expected_param_dtype_missing(model, torch.bfloat16)
 
         warning.assert_called_once()
+
+    def test_modelopt_fp8_serialized_checkpoint_needs_device_postprocess(self):
+        self.assertTrue(
+            _needs_device_weight_postprocess(
+                ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+            )
+        )
 
     def test_online_fp8_needs_device_weight_postprocess(self):
         self.assertTrue(_needs_device_weight_postprocess(Fp8Config()))
@@ -482,6 +490,37 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertTrue(config.load_in_4bit)
         self.assertEqual(config.bnb_4bit_quant_type, "nf4")
 
+    def test_fp8_quant_config_resolves_from_text_config(self):
+        config = get_quant_config(
+            {
+                "text_config": {
+                    "quantization_config": {
+                        "quant_method": "fp8",
+                        "activation_scheme": "dynamic",
+                    }
+                }
+            },
+            "/unused/component/path",
+        )
+
+        self.assertIsInstance(config, Fp8Config)
+        self.assertTrue(config.is_checkpoint_fp8_serialized)
+
+    def test_bitsandbytes_quant_config_resolves_from_compression_config(self):
+        config = get_quant_config(
+            {
+                "compression_config": {
+                    "quant_method": "bitsandbytes",
+                    "load_in_4bit": True,
+                    "bnb_4bit_quant_storage": "uint8",
+                }
+            },
+            "/unused/component/path",
+        )
+
+        self.assertEqual(config.get_name(), "bitsandbytes")
+        self.assertTrue(config.load_in_4bit)
+
     def test_nvfp4_safetensors_inference_ignores_fp8_fallback_scales(self):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
             save_file(
@@ -644,14 +683,18 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             ],
         )
 
-        block = FluxSingleTransformerBlock(
-            dim=64,
-            num_attention_heads=4,
-            attention_head_dim=16,
-            mlp_ratio=2.0,
-            quant_config=quant_config,
-            prefix="single_transformer_blocks.0",
-        )
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant.current_platform.get_device_capability",
+            return_value=DeviceCapability(10, 0),
+        ):
+            block = FluxSingleTransformerBlock(
+                dim=64,
+                num_attention_heads=4,
+                attention_head_dim=16,
+                mlp_ratio=2.0,
+                quant_config=quant_config,
+                prefix="single_transformer_blocks.0",
+            )
 
         self.assertEqual(block.proj_mlp.prefix, "single_transformer_blocks.0.proj_mlp")
         self.assertEqual(block.proj_out.prefix, "single_transformer_blocks.0.proj_out")

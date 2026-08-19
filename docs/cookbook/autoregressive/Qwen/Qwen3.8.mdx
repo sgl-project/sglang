@@ -1,7 +1,6 @@
 ---
 title: Qwen3.8
 description: "Deploy Qwen3.8 with SGLang — day-0 recipes for Qwen's 2.4T-parameter (95B active) hybrid GDN/GQA Mixture-of-Experts model on NVIDIA and AMD."
-tag: NEW
 ---
 
 ## Deployment
@@ -45,7 +44,7 @@ docker pull lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812
 MI300X (CDNA3, gfx942 — ROCm 7.00):
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.17-rocm700-mi30x-20260812
+docker pull lmsysorg/sglang-rocm:v0.5.17-rocm700-mi30x-20260813
 ```
 
 For how to launch either image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). Substitute the inner `sglang serve ...` with whatever the command generator below produces.
@@ -95,7 +94,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 **Recommended generation:** `temperature=1.0`, `top_p=0.95`, `top_k=20`, `min_p=0.0`, `presence_penalty=0.0`, `repetition_penalty=1.0`. Raising `presence_penalty` toward 2 curbs runaway repetition at some risk of language mixing. For agentic work Qwen suggests allowing 262,144 tokens of reasoning and 131,072 for the final response.
 
-**Resources:** Each precision is its own repo — [BF16](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B) · [FP8](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8) · [NVFP4, NVIDIA Blackwell (RadixArk)](https://huggingface.co/RadixArk/Qwen3.8-2.4T-A95B-NVFP4) · [MXFP4, AMD CDNA4 (Qwen)](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4). Speculative-decoding draft model: [`RadixArk/Qwen3.8-Max-DSpark`](https://huggingface.co/RadixArk/Qwen3.8-Max-DSpark) (see [3.3](#3-3-dspark-and-replayssm-speculative-decoding)).
+**Resources:** Each precision is its own repo — [BF16](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B) · [FP8](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8) · [NVFP4, NVIDIA Blackwell (RadixArk)](https://huggingface.co/RadixArk/Qwen3.8-2.4T-A95B-NVFP4) · [MXFP4, AMD CDNA4 (Qwen)](https://huggingface.co/Qwen/Qwen3.8-2.4T-A95B-FP8-MXFP4). Speculative-decoding draft model: [`RadixArk/Qwen3.8-2.4T-A95B-DSpark`](https://huggingface.co/RadixArk/Qwen3.8-2.4T-A95B-DSpark) (see [3.3](#3-3-dspark-and-replayssm-speculative-decoding)).
 
 ## 2. Configuration Tips
 
@@ -178,6 +177,18 @@ The FP8 ladder spans the whole curve on 4 nodes × 4 GPUs:
 Balanced and High Throughput share one shape and differ only in capacity. Low Latency is the odd one out: narrow EP wins at low concurrency, where spending ranks on expert parallelism costs more than it returns. MTP is off at saturation because draft-plus-verify overhead outweighs the speedup. NVFP4 has only two tiers — its recipes span different GPU counts (8 vs 16) and the wide-EP one holds capacity fixed across its whole concurrency list, so no third operating point exists.
 
 Extra build requirements: FP8 Balanced and High Throughput need the **DeepEP v2 wheel** (`2.1.0+01dc3aa`), since their `--moe-a2a-backend deepep_v2` flags do not exist upstream. NVFP4 High Throughput needs `nvfp4_agg_wideep_dep16_flashinfer_setup.sh` run first, and its `SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8192` is not optional — unset it falls back to 1024 and startup raises once `1024 × ep_size` no longer covers the largest CuteDSL MoE forward.
+
+### GB300 PD disaggregation layouts
+
+The PD role selector adds the role and transfer flags to the selected base recipe. It does not resize the prefill and decode workers. Use separate workers with the layouts below for the measured GB300 operating points:
+
+| Checkpoint and operating point | Prefill workers | Decode worker | Capacity setting |
+|---|---|---|---|
+| FP8, high throughput | 2 × TP1 / PP16 | DP4-attention / TP4 / EP16, DeepEP v2 + EPLB | Keep frontend concurrency above the decode MRR so prefill remains queued |
+| NVFP4, high throughput | 2 × TP1 / PP6 | DP2-attention / TP4 / EP8, FlashInfer one-sided A2A | Prefill MRR 128 per worker; decode MRR 512; frontend concurrency 1536 |
+| NVFP4, low latency | TP4 / PP2 | TP16 | Decode MRR 1 and frontend concurrency 1 at the latency endpoint |
+
+For NVFP4 with NEXTN, use the 3/1/4 settings on both roles so the prefill worker transfers the draft state. Enable ReplaySSM on the decode role. The generated router command sets the main policy to `round_robin`, which applies to prefill, and keeps the decode policy explicit; the server-side `--load-balance-method` does not configure router worker selection. Round robin is the measured choice for the fixed-shape throughput runs above. For agentic workloads with substantial repeated-prefix reuse, consider cache-aware routing, especially on the prefill side, and validate the cache-locality versus load-balance tradeoff on the target workload.
 
 ### AllReduce fusion
 
@@ -295,7 +306,7 @@ We trained a **DSpark** draft model for Qwen3.8 with SpecForge. Turn it on with 
 
 ```bash Command
 --speculative-algorithm DSPARK \
---speculative-draft-model-path RadixArk/Qwen3.8-Max-DSpark
+--speculative-draft-model-path RadixArk/Qwen3.8-2.4T-A95B-DSpark
 ```
 
 **ReplaySSM is a separate opt-in.** `--enable-linear-replayssm-spec` defaults off and DSpark does not turn it on, so add it with the **ReplaySSM (spec)** row in the flag-select list. With it on (see [Configuration Tips](#2-configuration-tips) above for how it works), the verify kernel stores each draft step's raw inputs instead of snapshotting the full K×V GDN state, and a single fold kernel replays the accepted prefix from the last committed checkpoint. It's a pure side channel behind a ring buffer — the verify output is bitwise unchanged — so there's no accuracy tradeoff, only a memory one.

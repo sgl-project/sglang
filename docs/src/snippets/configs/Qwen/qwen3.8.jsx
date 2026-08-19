@@ -93,7 +93,7 @@ export const config = {
     b200:   "lmsysorg/sglang:qwen38",
     b300:   "lmsysorg/sglang:qwen38",
     gb300:  "lmsysorg/sglang:qwen38",
-    mi300x: "lmsysorg/sglang-rocm:v0.5.17-rocm700-mi30x-20260812",
+    mi300x: "lmsysorg/sglang-rocm:v0.5.17-rocm700-mi30x-20260813",
     mi350x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812",
     mi355x: "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260812",
   },
@@ -215,7 +215,7 @@ export const config = {
         // Gate the chip on both so the panel can't emit a command that aborts.
         { id: "dspark",  label: "DSpark",
           flags: ["--speculative-algorithm DSPARK",
-                  "--speculative-draft-model-path RadixArk/Qwen3.8-Max-DSpark"],
+                  "--speculative-draft-model-path RadixArk/Qwen3.8-2.4T-A95B-DSpark"],
           disable: [
             { when: { dpAttnOn: [true] },
               reason: "DSpark with DP-Attention additionally requires --enable-dp-lm-head, the built-in TP MoE (--moe-a2a-backend none) and no context parallel. Turn DP-Attention off in the Attention card above, or pick a cell that doesn't use it." },
@@ -272,6 +272,7 @@ export const config = {
       ibDevices: [{ id: "auto", label: "Auto" }, "mlx5_0", "mlx5_7"],
       // Ports come from the engine's PD_PORTS, not literals — the decode role
       // serves on 30100, so a hardcoded target would not reach it.
+      // In PD mode, --policy is the prefill fallback; keep decode explicit.
       router: {
         port: 8000,
         command:
@@ -279,6 +280,8 @@ export const config = {
   --pd-disaggregation \\
   --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
   --decode http://<decode-host>:{{DECODE_PORT}} \\
+  --policy round_robin \\
+  --decode-policy round_robin \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
   --worker-startup-timeout-secs 7200 \\
   --request-timeout-secs 6900 \\
@@ -825,7 +828,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--mamba-ssm-dtype bfloat16",
         "--speculative-algorithm DSPARK",
-        "--speculative-draft-model-path RadixArk/Qwen3.8-Max-DSpark",
+        "--speculative-draft-model-path RadixArk/Qwen3.8-2.4T-A95B-DSpark",
         "--mem-fraction-static 0.95",
         "--chunked-prefill-size 8192",
         "--max-prefill-tokens 8192",
@@ -858,7 +861,7 @@ export const config = {
         "--mamba-radix-cache-strategy extra_buffer",
         "--mamba-ssm-dtype bfloat16",
         "--speculative-algorithm DSPARK",
-        "--speculative-draft-model-path RadixArk/Qwen3.8-Max-DSpark",
+        "--speculative-draft-model-path RadixArk/Qwen3.8-2.4T-A95B-DSpark",
         "--mem-fraction-static 0.90",
         "--chunked-prefill-size 8192",
         "--max-prefill-tokens 8192",
@@ -884,7 +887,7 @@ export const config = {
         "--tp-size 32",
         "--mamba-ssm-dtype bfloat16",
         "--speculative-algorithm DSPARK",
-        "--speculative-draft-model-path RadixArk/Qwen3.8-Max-DSpark",
+        "--speculative-draft-model-path RadixArk/Qwen3.8-2.4T-A95B-DSpark",
         "--mem-fraction-static 0.95",
         "--chunked-prefill-size 8192",
         "--max-prefill-tokens 8192",
@@ -920,7 +923,7 @@ export const config = {
         "--mamba-radix-cache-strategy extra_buffer",
         "--mamba-ssm-dtype bfloat16",
         "--speculative-algorithm DSPARK",
-        "--speculative-draft-model-path RadixArk/Qwen3.8-Max-DSpark",
+        "--speculative-draft-model-path RadixArk/Qwen3.8-2.4T-A95B-DSpark",
         "--mem-fraction-static 0.80",
         "--max-running-requests 128",
         "--chunked-prefill-size 8192",
