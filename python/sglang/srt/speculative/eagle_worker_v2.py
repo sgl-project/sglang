@@ -204,7 +204,8 @@ def _try_greedy_draft_extend_topk1(
     """Greedy draft-extend selection, or None to keep softmax + fast_topk.
 
     Eligible ROCm AITER requests reuse the same raw-logit helper as
-    `draft_forward`. CUDA topk=1 keeps `argmax`. Other cases return None.
+    `draft_forward`. Used by both prefill and decode draft-extend. CUDA
+    topk=1 keeps `argmax`. Other cases return None.
     """
     if _use_aiter_draft_topk1(topk, hot_token_id, use_rejection_sampling):
         logits = (
@@ -936,15 +937,30 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
         if use_rejection_sampling:
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits,
+                batch.sampling_info,
+                use_rejection_sampling,
+            )
             topk_p, topk_index = fast_sample(probs, num_samples=1)
         else:
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            greedy = _try_greedy_draft_extend_topk1(
+                logits_output.next_token_logits,
+                self.topk,
+                self.hot_token_id,
+                use_rejection_sampling=False,
+            )
+            if greedy is not None:
+                topk_p, topk_index = greedy
+                probs = None
+            else:
+                probs = renorm_draft_probs(
+                    logits_output.next_token_logits,
+                    batch.sampling_info,
+                    use_rejection_sampling,
+                )
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
