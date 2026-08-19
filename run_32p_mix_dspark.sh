@@ -67,6 +67,8 @@ do
         # overlap as the default until that graph/stream combination is fixed.
         export SGLANG_NPU_FUSED_COLLECTIVE_MATMUL=0
         export SGLANG_NPU_FUSED_RMS_QUANT=1
+        export SGLANG_NPU_FUSED_KDA_VERIFY_GATES=1
+        export SGLANG_NPU_QUANT_SHARED_AG=1
         export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
         export SGLANG_ENABLE_SPEC_V2=1
         export SGLANG_RAGGED_VERIFY_MODE=static

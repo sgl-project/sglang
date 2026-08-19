@@ -22,6 +22,7 @@ from sgl_kernel_npu.mamba.kda_state_commit import (
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.kda import chunk_kda_scaled_dot_kkt_fwd
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kda_backend import (
     KDAAttnBackend,
     ragged_verify_dense_scatter_indices,
@@ -438,23 +439,36 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
         v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
 
-        # Keep raw gates until the recurrent kernel. This preserves the K3 FP32
-        # safe-gate contract while avoiding two per-layer activation launches.
+        fuse_gate_activations = envs.SGLANG_NPU_FUSED_KDA_VERIFY_GATES.get()
+        if fuse_gate_activations:
+            # Keep raw gates until the recurrent kernel. This preserves the K3
+            # FP32 safe-gate contract while avoiding two per-layer launches.
+            verify_a = dense_a
+            verify_b = dense_b
+        else:
+            verify_a = fused_kda_gate_npu(
+                dense_a.flatten(-2),
+                layer.A_log,
+                layer.head_k_dim,
+                gate_bias=layer.dt_bias,
+                lower_bound=layer.lower_bound,
+            )
+            verify_b = dense_b.float().sigmoid()
         out = kda_target_verify_npu(
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             q=q,
             k=k,
             v=v,
-            a=dense_a,
-            b=dense_b,
+            a=verify_a,
+            b=verify_b,
             initial_state_source=cache.temporal,
             initial_state_indices=cache_indices[:batch_size],
             intermediate_states_buffer=intermediate_state,
             intermediate_state_indices=intermediate_indices,
             cache_steps=draft_token_num,
-            gates_are_preactivated=False,
-            lower_bound=layer.lower_bound,
+            gates_are_preactivated=not fuse_gate_activations,
+            lower_bound=layer.lower_bound if fuse_gate_activations else None,
         )
         if dense_token_indices is None:
             return out

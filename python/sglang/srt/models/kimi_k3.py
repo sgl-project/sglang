@@ -644,6 +644,7 @@ class KimiK3MoE(nn.Module):
         self._npu_quant_shared_input = False
         if (
             _is_npu
+            and envs.SGLANG_NPU_QUANT_SHARED_AG.get()
             and self._shared_experts_attn_tp_comm
             and self.shared_experts is not None
             and not self._npu_fused_shared_experts

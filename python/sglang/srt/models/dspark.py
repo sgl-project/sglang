@@ -290,7 +290,7 @@ class VanillaMarkov(nn.Module):
         prev_tokens = first_prev_tokens.long()
         for step_idx in range(proposal_len):
             org_width = shard.org_vocab_end - shard.org_vocab_start
-            if _is_npu:
+            if _is_npu and envs.SGLANG_DSPARK_FAST_KERNEL.get():
                 bias_local = self._build_step_bias_local(prev_tokens)
                 candidates_local = select_local_top1_after_add_npu(
                     base_logits[:, step_idx, :org_width],
