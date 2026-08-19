@@ -283,26 +283,16 @@ class BaseRunner(ABC):
 
     def _pre_initialize_hipblas_handle(self):
         """Force hipBLAS handle creation before CUDA graph capture on ROCm.
-
-        hipBLAS creates its handle lazily on first use. When a GEMM has no
-        tuned aiter config, aiter falls back to ``F.linear``, and if that first
-        call happens inside an active HIP graph capture the lazy
-        ``hipblasCreate`` is illegal: it returns
-        ``HIPBLAS_STATUS_INTERNAL_ERROR`` and invalidates the capture, which
-        then fails later with confusing errors (Triton "operation not permitted
-        when stream is capturing", or an abort in the aiter custom all-reduce).
-
         Running one tiny matmul here creates the handle on a normal stream so
         the fallback inside capture reuses it.
         """
         if not _is_hip:
             return
-
         try:
             a = torch.zeros((1, 1), dtype=self.model_runner.dtype, device="cuda")
             torch.matmul(a, a)
             torch.cuda.synchronize()
-        except Exception as e:  # pragma: no cover - warmup must never be fatal
+        except Exception as e:
             logger.warning(f"hipBLAS handle pre-initialization skipped: {e}")
 
     def _pre_initialize_fi_a2a_workspace(self):
