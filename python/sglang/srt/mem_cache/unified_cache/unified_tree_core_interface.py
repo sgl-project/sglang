@@ -174,6 +174,16 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def backfill_missing_hash_values(self) -> int:
+        """Hash every node built while storage was disabled; return how many.
+
+        Called when a storage backend is attached at runtime: nodes already in
+        the tree carry no hash, and hashing their descendants against them would
+        restart the page hash chain mid-sequence.
+        """
+        ...
+
+    @abstractmethod
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The NodeId anchoring matches for the namespace."""
         ...
