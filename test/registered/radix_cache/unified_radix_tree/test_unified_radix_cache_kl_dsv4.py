@@ -16,13 +16,14 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_in_ci,
     popen_launch_server,
+    unified_radix_tree_server_env,
 )
 
 DSV4_FLASH_MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 DSV4_DSPARK_MODEL = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
 DSV4_FLASH_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=2400, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=4800, stage="extra-b", runner_config="4-gpu-h100")
 
 
 def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):
@@ -35,6 +36,7 @@ def _assert_dsv4_decode_cached_tokens(result, history_len, output_len, label):
 class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """DeepSeek V4 Flash FP8 + HiCache + UnifiedRadixCache."""
 
+    tree_core_backend = "python"
     tp_size = 4
     pp_size = 1
     hicache_io_backend = "direct"
@@ -98,10 +100,10 @@ class TestUnifiedDeepSeekV4FlashHiCache(UnifiedRadixTreeTestMixin, CustomTestCas
             cls.base_url,
             timeout=DSV4_FLASH_LAUNCH_TIMEOUT,
             other_args=cls._server_args(),
-            env={
-                "SGLANG_DSV4_FP4_EXPERTS": "0",
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
-            },
+            env=unified_radix_tree_server_env(
+                cls.tree_core_backend,
+                SGLANG_DSV4_FP4_EXPERTS="0",
+            ),
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
 
@@ -125,6 +127,7 @@ class TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
 class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
     """DeepSeek V4 Flash FP8 + HiCache L3 (file backend) + UnifiedRadixCache."""
 
+    tree_core_backend = "python"
     l3_prefetch_page_size = 256
     l3_prefetch_prompt_pages = 4
     max_running_requests = 4
@@ -169,11 +172,11 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
                 "--max-running-requests",
                 str(cls.max_running_requests),
             ],
-            env={
-                "SGLANG_DSV4_FP4_EXPERTS": "0",
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
-                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
-            },
+            env=unified_radix_tree_server_env(
+                cls.tree_core_backend,
+                SGLANG_DSV4_FP4_EXPERTS="0",
+                SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=cls.hicache_dir,
+            ),
         )
 
     @classmethod
@@ -186,6 +189,7 @@ class TestUnifiedDeepSeekV4FlashHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
 class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
     """DeepSeek V4 Flash EAGLE + HiCache L3 should load from storage."""
 
+    tree_core_backend = "python"
     page_size = 256
     l3_prefetch_page_size = 256
     l3_prefetch_prompt_pages = 4
@@ -246,11 +250,11 @@ class TestUnifiedDeepSeekV4FlashEagleHiCacheL3(AccuracyTwoPassMixin, CustomTestC
                 "--speculative-num-draft-tokens",
                 "4",
             ],
-            env={
-                "SGLANG_DSV4_FP4_EXPERTS": "0",
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
-                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
-            },
+            env=unified_radix_tree_server_env(
+                cls.tree_core_backend,
+                SGLANG_DSV4_FP4_EXPERTS="0",
+                SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=cls.hicache_dir,
+            ),
         )
 
     @classmethod
@@ -383,11 +387,37 @@ class TestUnifiedDeepSeekV4FlashDSparkHiCacheL3(
                 "--speculative-algorithm",
                 "DSPARK",
             ],
-            env={
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
-                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
-            },
+            env=unified_radix_tree_server_env(
+                cls.tree_core_backend,
+                SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR=cls.hicache_dir,
+            ),
         )
+
+
+class TestRustUnifiedDeepSeekV4FlashHiCache(TestUnifiedDeepSeekV4FlashHiCache):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedDeepSeekV4FlashHiCachePageFirstDirect(
+    TestUnifiedDeepSeekV4FlashHiCachePageFirstDirect
+):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedDeepSeekV4FlashHiCacheL3(TestUnifiedDeepSeekV4FlashHiCacheL3):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedDeepSeekV4FlashEagleHiCacheL3(
+    TestUnifiedDeepSeekV4FlashEagleHiCacheL3
+):
+    tree_core_backend = "rust"
+
+
+class TestRustUnifiedDeepSeekV4FlashDSparkHiCacheL3(
+    TestUnifiedDeepSeekV4FlashDSparkHiCacheL3
+):
+    tree_core_backend = "rust"
 
 
 if __name__ == "__main__":
