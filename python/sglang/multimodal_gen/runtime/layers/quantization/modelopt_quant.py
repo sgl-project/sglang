@@ -462,6 +462,20 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
     """NVFP4 linear method using the selected FP4 GEMM backend."""
 
     def __init__(self, quant_config: ModelOptFp4Config):
+        # the FlashInfer FP4 kernels this method dispatches to are Blackwell-only.
+        # without this the load succeeds and the failure surfaces much later as
+        # an opaque CUDA error inside the kernel. an undetectable capability is
+        # left alone rather than rejected, so this only ever converts a crash
+        # into a message and never blocks a card that would have worked.
+        capability = current_platform.get_device_capability()
+        min_capability = quant_config.get_min_capability()
+        if capability is not None and capability.to_int() < min_capability:
+            raise RuntimeError(
+                f"NVFP4 checkpoints need compute capability "
+                f"{min_capability // 10}.{min_capability % 10} or newer "
+                f"(Blackwell); this GPU is {capability.as_version_str()}. "
+                f"Load an FP8 or BF16 checkpoint instead."
+            )
         self.quant_config = quant_config
 
     def create_weights(

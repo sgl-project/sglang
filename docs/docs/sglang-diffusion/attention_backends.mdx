@@ -632,6 +632,37 @@ sglang generate \
 
 Component keys match pipeline module names from `model_index.json`, such as `text_encoder`, `text_encoder_2`, `transformer`, `transformer_2`, or `connectors`.
 
+### Per-request override (denoise loop)
+
+A single server can serve exact and approximate attention side by side: requests
+may switch the DiT denoise attention backend via the `attention_backend_override`
+sampling param. Valid values are the exact/drop-in dense kernels — `fa`,
+`torch_sdpa`, `sage_attn`, `sage_attn_3`. The field participates in the
+dynamic-batch signature, so requests with different backends never share a batch.
+
+```bash
+sglang generate \
+  --model-path <MODEL_PATH_OR_ID> \
+  --prompt "..." \
+  --attention-backend-override sage_attn
+```
+
+```python
+client.images.generate(
+    model="<MODEL_PATH_OR_ID>",
+    prompt="...",
+    extra_body={"attention_backend_override": "sage_attn"},
+)
+```
+
+Incompatible server settings **reject the request** (with a server log) instead
+of silently falling back: breakable CUDA graphs and `torch.compile` bake the
+attention kernel into a captured/traced graph; sparse server backends
+(`sliding_tile_attn`, `video_sparse_attn`, ...) cannot be mixed with per-request
+dense switching; under ring parallelism the target must be ring-capable. Note
+`sage_attn` / `sage_attn_3` are lossy (quantized attention) — validate quality
+on your workload.
+
 ### Sage then Sol hybrid
 
 `sol_attn` keeps the first `dense_steps` steps dense. Set
