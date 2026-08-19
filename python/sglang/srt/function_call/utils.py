@@ -1,4 +1,5 @@
 import ast
+import json
 import threading
 import warnings
 from json import JSONDecodeError, JSONDecoder
@@ -8,7 +9,6 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 import orjson
 import partial_json_parser
 from partial_json_parser.core.options import Allow
-
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 
 _STANDARD_JSON_SCHEMA_TYPES = {
@@ -254,6 +254,15 @@ def _run_ast_quiet(fn, *args):
 
 def safe_literal_eval(value: str) -> Any:
     return _run_ast_quiet(ast.literal_eval, value)
+
+
+def is_json_finite(value: Any) -> bool:
+    """Return whether value can be encoded as standards-compliant JSON."""
+    try:
+        json.dumps(value, allow_nan=False)
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def safe_ast_parse(source: str) -> ast.Module:

@@ -168,11 +168,9 @@ class PoolsideV1Detector(BaseFormatDetector):
           - everything else (int,
             number, bool, object, …)  → json.loads, then safe_literal_eval
 
-        Each decoder result is round-tripped through `json.dumps` before being
-        returned; non-JSON-serializable values (sets / complex / bytes from
-        `ast.literal_eval`) are rejected to the next decoder, ultimately
-        falling through to the raw-string fallback rather than crashing the
-        streaming JSON emission downstream.
+        Each decoder result is encoded with `allow_nan=False` before being
+        returned. Non-JSON values and non-finite numbers are rejected to the
+        next decoder, then to the raw-string fallback.
         """
         spec = schema.get(key) if isinstance(schema, dict) else None
         param_type = str(spec.get("type", "")).lower() if isinstance(spec, dict) else ""
@@ -183,10 +181,8 @@ class PoolsideV1Detector(BaseFormatDetector):
         for decoder in decoders:
             try:
                 result = decoder(raw)
-                # ast.literal_eval can return non-JSON-serializable values
-                # (sets, complex numbers); reject so json.dumps downstream
-                # doesn't choke.
-                json.dumps(result)
+                # Reject values that downstream cannot encode as standard JSON.
+                json.dumps(result, allow_nan=False)
                 return result
             except (ValueError, SyntaxError, TypeError):
                 continue

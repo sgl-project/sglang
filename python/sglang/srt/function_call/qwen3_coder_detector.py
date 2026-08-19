@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import re
 from typing import Any, List, Optional
 
@@ -12,6 +13,7 @@ from sglang.srt.function_call.core_types import (
 )
 from sglang.srt.function_call.utils import (
     infer_type_from_json_schema,
+    is_json_finite,
     safe_literal_eval,
 )
 
@@ -135,9 +137,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 maybe_convert = (
                     False if "." in param_value or "e" in param_value.lower() else True
                 )
-                param_value: float = float(param_value)
-                if maybe_convert and param_value.is_integer():
-                    param_value = int(param_value)
+                converted = float(param_value)
+                if not math.isfinite(converted):
+                    raise ValueError
+                if maybe_convert and converted.is_integer():
+                    return int(converted)
+                return converted
             except Exception:
                 logger.warning(
                     f"Parsed value '{param_value}' of parameter '{param_name}' is not a float in tool "
@@ -158,20 +163,22 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 or param_type.startswith("list")
             ):
                 try:
-                    param_value = json.loads(param_value)
-                    return param_value
+                    parsed = json.loads(param_value)
+                    if is_json_finite(parsed):
+                        return parsed
                 except Exception:
                     logger.warning(
                         f"Parsed value '{param_value}' of parameter '{param_name}' cannot be parsed with json.loads in tool "
                         f"'{func_name}', will try other methods to parse it."
                     )
             try:
-                param_value = safe_literal_eval(param_value)
+                parsed = safe_literal_eval(param_value)
             except Exception:
                 logger.warning(
                     f"Parsed value '{param_value}' of parameter '{param_name}' cannot be converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
                 )
-            return param_value
+                return param_value
+            return parsed if is_json_finite(parsed) else param_value
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """One-shot parsing for non-streaming scenarios."""
