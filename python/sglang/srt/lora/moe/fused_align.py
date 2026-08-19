@@ -1,60 +1,6 @@
-"""Fused ID + histogram + scan + scatter route plan (plan section 7.1 candidate).
-
-Derives the `(adapter, LoRA expert)` key inline through the SAME device
-helper the ``fused_ids`` view uses — so the plan-free and plan-based paths
-cannot disagree — and has no bucket ceiling, unlike the JIT CUDA align whose
-EPT ladder tops out at 32767 virtual experts.
-
-Steady-state launch structure (3 kernels, no memset, no per-call metadata
-allocation):
-
-    K1  fused key + histogram        multi-CTA over pairs
-    K2  padded exclusive scan        single CTA over V+1 buckets
-    K3  block labels + padding fill, multi-CTA over blocks and over pairs,
-        and pair scatter             split by program id
-
-The kernel-audit findings this design answers (execution plan section 40):
-
-* **No counts memset.** Per-bucket metadata (counts / block_cum / cursor /
-  bucket_end / num_pairs_post_padded) is cached per ``(device, num_buckets)``
-  with counts zeroed once at creation; K2 re-zeroes counts AFTER its last read,
-  so the invariant "counts is zero between calls" self-restores. K2 cannot
-  simply be "the last reader" by accident: K3 needs each block's data end, so
-  K2 materializes ``bucket_end = slot_start + count`` explicitly — the audit
-  caught that zeroing counts while K3 still re-read them would collapse every
-  ``real_end`` to ``slot_start`` and overwrite scattered pairs with padding.
-* **Coalesced padding fill.** The fill is a 2D store over
-  ``block_ids[:, None] * BM + arange(0, BM)[None, :]`` — contiguous per lane
-  row. The previous per-lane unrolled loop issued BLOCK_SIZE_M stores whose
-  warps strided 64 B apart: zero coalescing on every one of them.
-* **PDL that actually forms edges.** This repo's Triton kernels enable PDL
-  with a launch-side ``launch_pdl=True`` kwarg (see decode_attention.py); the
-  constexpr alone compiles the intrinsics but never creates an edge. Edges are
-  consecutive-launch only: K1->K2 and K2->K3. The waits sit immediately before
-  the first predecessor-dependent access of each consumer half, so K3's
-  scatter half runs its whole key recompute (scan-independent) before waiting.
-* **int32 index math** end to end; the key domain is bounded by V+1 < 2^31.
-* **Graph capture with production PDL-off execution** uses stable
-  runner-workspace addresses, and every replay's K2 re-establishes the counts
-  invariant. PDL is an
-  explicit, default-off plan choice: after the sentinel-search fix, both PDL
-  states pass the exact full-history replay, while bounded composed off/on
-  twins decide whether it is worth enabling. An eager exception BETWEEN K1
-  and K2 would leave scratch dirty; all allocation, lookup, and contract
-  validation is therefore hoisted above the first launch.
-
-Determinism: K3 claims slots with an atomic cursor, so intra-bucket pair ORDER
-varies run to run. That is permitted — intra-bucket order carries no semantics
-(the incumbent CUDA and torch paths already disagree on it) and every consumer
-writes ``out[pair_id]``, indexed by pair, with fixed-order accumulation. The
-registered test pins both properties: plans vary, consumer output is bitwise
-stable.
-
-Blocks past ``num_pairs_post_padded`` keep garbage labels/slots: every consumer
-early-returns on that device scalar before loading either array. Blocks INSIDE
-the plan are fully initialized, including the sentinel bucket's — the aligned
-B kernels read a ``-1`` block's slots to zero their output rows, which
-is how uninitialized sentinel tails caused an illegal memory access.
+"""Build the aligned route in three kernels -- fused key + histogram, padded
+scan, block labels + pair scatter -- with no memset, no per-call metadata, and
+no bucket ceiling.
 """
 
 from __future__ import annotations
@@ -66,19 +12,6 @@ import triton.language as tl
 from sglang.srt.lora.moe.routing import virtual_expert_ids_inline
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
-# Launch tiles. Swept on GB300 2026-07-25 (64 points, 4 cells), then
-# re-verified per-kernel on H200/B200/GB300 2026-08-19 at production geometry
-# (5 cells x 48 configs, profiler GPU time, noise <=1%): KEEP THESE. No
-# alternative wins everywhere -- scan and expand are minimax-optimal (every
-# other value regresses 7-18% in some cell), and hist's ~4%-median rivals
-# regress up to 1.9% elsewhere. Per-cell oracles would save 0.1-2.7us of an
-# 8-60us build, so a per-geometry table buys nothing.
-#
-# Module constants rather than runtime autotune: graph capture wants one
-# deterministic launch shape per call site. NB: time these with the profiler,
-# not CUDA events around the call -- the host side is 70-90% of the wall time
-# and hides the config entirely (it measured the shipped config 9.6% faster
-# than itself).
 HIST_BLOCK = 512
 HIST_WARPS = 8
 EXPAND_BLOCK = 128
@@ -102,11 +35,7 @@ def _fused_hist_kernel(
     BLOCK: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
-    """Histogram the fused key over pairs; the key array is never materialized.
-
-    Relies on counts arriving ZEROED (the cache-invariant maintained by the
-    scan kernel), so there is no zeroing pass and no predecessor edge.
-    """
+    """Histogram the fused key over pairs; counts arrive zeroed, no memset pass."""
     pair_ids = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     pair_mask = pair_ids < num_pairs
     virtual_ids = virtual_expert_ids_inline(
@@ -140,15 +69,8 @@ def _padded_scan_kernel(
     CHUNK: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
-    """Exclusive scan of block-padded bucket sizes. One CTA, O(V), sequential.
-
-    Also restores the counts-are-zero invariant: each chunk's counts are
-    zeroed AFTER being read, so the next forward's histogram needs no memset.
-    ``bucket_end`` (= first slot + count) is materialized here because K3's
-    fill needs it after counts are gone.
-    """
+    """Exclusive scan of block-padded bucket sizes; re-zeroes counts as it reads."""
     if USE_PDL:
-        # First dependent access is the counts load below; no useful preamble.
         tl.extra.cuda.gdc_wait()
     running = 0
     for base in range(0, num_buckets, CHUNK):
@@ -161,6 +83,7 @@ def _padded_scan_kernel(
         tl.store(block_cum_ptr + offs, block_start, mask=mask)
         slot_start = block_start * BLOCK_SIZE_M
         tl.store(cursor_ptr + offs, slot_start, mask=mask)
+        # bucket_end must be materialized here; counts are gone by the fill.
         tl.store(bucket_end_ptr + offs, slot_start + counts, mask=mask)
         running += tl.sum(blocks)
     tl.store(block_cum_ptr + num_buckets, running)
@@ -193,19 +116,7 @@ def _expand_and_scatter_kernel(
     SEARCH_STEPS: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
-    """Two scan consumers on one grid, split by program id.
-
-    Block half (``pid < num_block_programs``): binary-search ``block_cum`` for
-    each block's owning bucket, store the label (-1 for the sentinel bucket and
-    for blocks past the padded end), and fill the padding tail from
-    ``bucket_end`` with one coalesced 2D store.
-
-    Scatter half: recompute the fused key (two loads and integer math — CHEAPER
-    than storing and reloading a [T, K] key array, which is the round trip this
-    kernel exists to remove), claim a slot from the bucket cursor, store the
-    pair id. The key recompute is scan-independent, so under PDL it runs before
-    the wait.
-    """
+    """Both scan consumers on one grid, split by program id: labels, then scatter."""
     pid = tl.program_id(0)
     if pid < num_block_programs:
         block_ids = pid * BLOCK + tl.arange(0, BLOCK)
@@ -244,6 +155,8 @@ def _expand_and_scatter_kernel(
         )
         return
 
+    # Recomputing the key beats a [T, K] round trip, and needs no scan -- so it
+    # runs before the wait below.
     pair_ids = (pid - num_block_programs) * BLOCK + tl.arange(0, BLOCK)
     pair_mask = pair_ids < num_pairs
     virtual_ids = virtual_expert_ids_inline(
@@ -259,7 +172,6 @@ def _expand_and_scatter_kernel(
     )
     buckets = tl.where(virtual_ids < 0, NUM_BUCKETS - 1, virtual_ids)
     if USE_PDL:
-        # The cursor is scan output; the key recompute above is not.
         tl.extra.cuda.gdc_wait()
     slots = tl.atomic_add(cursor_ptr + buckets, 1, mask=pair_mask)
     tl.store(sorted_pair_ids_ptr + slots, pair_ids, mask=pair_mask)
@@ -277,6 +189,7 @@ def fused_align_block_size(
     workspace: MoeLoraWorkspace,
     tensor_prefix: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the aligned route: sorted_pair_ids, block_ids, padded_pair_count."""
     device = topk_ids.device
     num_pairs = topk_ids.numel()
     top_k = topk_ids.shape[1]
@@ -371,12 +284,8 @@ def fused_align_block_size(
         SHARED_OUTER=is_shared_outer,
         BLOCK=EXPAND_BLOCK,
         BLOCK_SIZE_M=block_size,
-        # The search interval is [0, NUM_BUCKETS], not [0, NUM_BUCKETS).
-        # It therefore contains NUM_BUCKETS + 1 possible states.  Using
-        # (num_buckets - 1).bit_length() is one iteration short whenever the
-        # bucket count is a power of two.  The smallest production example is
-        # one shared-outer adapter plus the sentinel bucket: with one step,
-        # an all-sentinel route is incorrectly labelled adapter 0.
+        # The search picks one of NUM_BUCKETS + 1 answers, so it needs
+        # num_buckets.bit_length() steps -- one fewer and a sentinel reads as 0.
         SEARCH_STEPS=max(1, num_buckets.bit_length()),
         USE_PDL=use_pdl,
         num_warps=EXPAND_WARPS,
