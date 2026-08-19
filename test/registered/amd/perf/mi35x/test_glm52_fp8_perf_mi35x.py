@@ -1,9 +1,10 @@
 """MI35x nightly performance benchmark for GLM-5.2-FP8 (8-GPU).
 
 Benchmarks zai-org/GLM-5.2-FP8 at TP8 with the cookbook's MI355X / FP8 /
-low-latency / single-node server configuration. The 8K-input / 1K-output
-batch-1 and batch-16 workloads match the published cookbook cells, making the
-nightly report useful for detecting drift from the recipe it protects.
+low-latency / single-node server configuration. At 8K-input / 1K-output,
+batch 1 and 16 are the concurrency points the cookbook publishes, so drift from
+the recipe shows up directly; 8 and 64 extend the sweep to keep the batch range
+the retired GLM-5.1 MI35x benchmark used to cover.
 
 This runs after the GLM-5.2 accuracy test in the same ROCm 7.2 job. The
 checkpoint is therefore already cached, accuracy gates performance, and the
@@ -36,9 +37,10 @@ class TestGLM52FP8PerfMI35x(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
-        # Repeat batch 1 as an unreported warmup, then measure the two
-        # concurrency points published for the low-latency cookbook recipe.
-        cls.batch_sizes = [1, 1, 16]
+        # The leading 1 is repeated so the report helper drops it as a warmup
+        # run: this step launches its own server, so the first request pays for
+        # warmup and batch 1 is the row that distorts most.
+        cls.batch_sizes = [1, 1, 8, 16, 64]
         cls.input_lens = tuple(_parse_int_list_env("NIGHTLY_INPUT_LENS", "8192"))
         cls.output_lens = tuple(_parse_int_list_env("NIGHTLY_OUTPUT_LENS", "1024"))
         cls.model_config = {
