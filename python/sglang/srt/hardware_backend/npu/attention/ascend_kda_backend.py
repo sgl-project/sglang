@@ -153,6 +153,15 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         )
         self.kernel_dispatcher.extend_kernel = _AscendKDAExtendKernel()
         self._dense_verify_metadata_cache = {}
+        self._dense_token_indices = None
+        self._dense_token_indices_key = None
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        # Ragged-to-dense indices depend on this forward's query_start_loc.
+        # Clear once here; the first KDA layer computes them for all layers.
+        self._dense_token_indices = None
+        self._dense_token_indices_key = None
 
     def _get_dense_verify_metadata(
         self,
@@ -419,11 +428,25 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             dense_a = a
             dense_b = b
         else:
-            dense_token_indices = ragged_verify_dense_scatter_indices(
-                query_start_loc=query_start_loc,
-                seq_len=seq_len,
-                draft_token_num=draft_token_num,
+            dense_indices_key = (
+                query_start_loc.data_ptr(),
+                seq_len,
+                draft_token_num,
             )
+            if (
+                envs.SGLANG_NPU_REUSE_KDA_VERIFY_METADATA.get()
+                and self._dense_token_indices_key == dense_indices_key
+            ):
+                dense_token_indices = self._dense_token_indices
+            else:
+                dense_token_indices = ragged_verify_dense_scatter_indices(
+                    query_start_loc=query_start_loc,
+                    seq_len=seq_len,
+                    draft_token_num=draft_token_num,
+                )
+                if envs.SGLANG_NPU_REUSE_KDA_VERIFY_METADATA.get():
+                    self._dense_token_indices = dense_token_indices
+                    self._dense_token_indices_key = dense_indices_key
             dense_qkv = self._scatter_tokens_to_dense(
                 mixed_qkv, dense_token_indices, num_dense_tokens
             ).view(batch_size, draft_token_num, -1)
