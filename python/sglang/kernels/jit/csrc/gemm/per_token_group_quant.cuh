@@ -103,14 +103,15 @@ struct ScaleStoreArgs {
         << " group_bytes=" << group_bytes;
   }
 
-  template <bool kUe8m0, bool kRowMajor, bool kAligned>
+  template <bool kUe8m0, bool kRowMajor, bool kAligned, bool kScaleFp32>
   SGL_DEVICE void store(
       const uint32_t expert_idx,  // for non-masked, should be 0
       const uint32_t token_idx,
       const uint32_t group_idx,
       const scale_t<kUe8m0> scale_inv) const {
     static_assert(kAligned || kUe8m0, "Only ue8m0 scales can be unaligned (pad to 4 bytes)");
-    using T = scale_t<kUe8m0>;
+    static_assert(!kScaleFp32 || (kUe8m0 && kRowMajor && kAligned));
+    using T = std::conditional_t<kScaleFp32, float, scale_t<kUe8m0>>;
     if constexpr (kRowMajor || !kUe8m0) {
       // normal linear layout for scale
       // 1. row major + fp32/ue8m0 scale
@@ -120,7 +121,12 @@ struct ScaleStoreArgs {
       const uint64_t offset = expert_idx * expert_stride   // expert
                               + token_idx * token_stride   // token
                               + group_idx * group_stride;  // group
-      static_cast<T*>(this->base)[offset] = scale_inv;
+      if constexpr (kScaleFp32) {
+        static_cast<T*>(this->base)[offset] =
+            __uint_as_float(static_cast<uint32_t>(scale_inv) << 23);
+      } else {
+        static_cast<T*>(this->base)[offset] = scale_inv;
+      }
       if constexpr (!kAligned) this->fill_unaligned(group_idx, offset);
     } else {
       // col major + ue8m0 scale: int32 [(E,) ceil(G/4), T] buffer viewed as
@@ -218,7 +224,8 @@ template <
     bool kUe8m0_,
     bool kRowMajor_,
     bool kAligned_,
-    bool kFuseSiluAndMul_>
+    bool kFuseSiluAndMul_,
+    bool kScaleFp32_ = false>
 struct QuantTrait {
   // rename
   using InputType = InputType_;
@@ -228,6 +235,7 @@ struct QuantTrait {
   static constexpr bool kRowMajor = kRowMajor_;
   static constexpr bool kAligned = kAligned_;
   static constexpr bool kFuseSiluAndMul = kFuseSiluAndMul_;
+  static constexpr bool kScaleFp32 = kScaleFp32_;
   static constexpr uint32_t kBlockSize = 256;
   static constexpr uint32_t kVecSize = 32u / 2;
   static constexpr uint32_t kNumLanes = kGroupSize / kVecSize;
@@ -236,6 +244,7 @@ struct QuantTrait {
   static_assert(16 <= kGroupSize && kGroupSize <= 256, "supported group sizes are 16..256");
   static_assert(kGroupSize % kVecSize == 0 && 1 <= kNumLanes && kNumLanes <= device::kWarpThreads);
   static_assert(!kUe8m0 || std::is_same_v<QuantType, fp8_e4m3_t>, "ue8m0 scales imply fp8 output");
+  static_assert(!kScaleFp32 || (kUe8m0 && kRowMajor && kAligned));
 
   SGL_DEVICE static void
   run(const QuantKernelParams& params,
@@ -328,7 +337,8 @@ struct QuantTrait {
     }
 
     out.store(params.output.get<Q>(expert_idx, token_idx) + group_offset, lane_id);
-    params.scale.store<kUe8m0, kRowMajor, kAligned>(expert_idx, token_idx, group_idx, scale_inv);
+    params.scale.store<kUe8m0, kRowMajor, kAligned, kScaleFp32>(
+        expert_idx, token_idx, group_idx, scale_inv);
   }
 
   SGL_DEVICE static void run_fp32(
@@ -387,7 +397,8 @@ struct QuantTrait {
     }
 
     out.store(params.output.get<Q>(expert_idx, token_idx) + group_offset, lane_id);
-    params.scale.store<kUe8m0, kRowMajor, kAligned>(expert_idx, token_idx, group_idx, scale_inv);
+    params.scale.store<kUe8m0, kRowMajor, kAligned, kScaleFp32>(
+        expert_idx, token_idx, group_idx, scale_inv);
   }
 };
 
@@ -467,7 +478,7 @@ QuantHostContext<Trait> build_quant_context( //
   using namespace host;
   using T = typename Trait::InputType;
   using Q = typename Trait::QuantType;
-  using S = std::conditional_t<Trait::kUe8m0, int32_t, float>;
+  using S = std::conditional_t<Trait::kUe8m0 && !Trait::kScaleFp32, int32_t, float>;
   constexpr int64_t kSiluFactor = Trait::kFuseSiluAndMul ? 2 : 1;
 
   auto device = SymbolicDevice{};
@@ -505,12 +516,14 @@ QuantHostContext<Trait> build_quant_context( //
   const uint32_t num_scale_groups = G.unwrap();
   CHECK_HOST(hidden_size % Trait::kGroupSize == 0);
   CHECK_HOST(input.size(-1) == hidden_size * kSiluFactor);
-  CHECK_HOST(num_scale_groups == (Trait::kUe8m0 ? div_ceil(num_groups, 4) : num_groups));
+  CHECK_HOST(
+      num_scale_groups ==
+      (Trait::kUe8m0 && !Trait::kScaleFp32 ? div_ceil(num_groups, 4) : num_groups));
   // Pack-tail alignment only exists for the 4-per-int32 ue8m0 layouts; fp32
   // scales are unpacked (kAligned is fixed true by the static_assert). Exact
   // match: kAligned = false with an aligned num_groups would make
   // fill_unaligned zero bytes past the row.
-  if constexpr (Trait::kUe8m0) {
+  if constexpr (Trait::kUe8m0 && !Trait::kScaleFp32) {
     CHECK_HOST(Trait::kAligned == (num_groups % 4 == 0));
   }
   auto scale_args = detail::ScaleStoreArgs{
@@ -522,13 +535,13 @@ QuantHostContext<Trait> build_quant_context( //
   };
   if constexpr (Trait::kRowMajor) {
     CHECK_HOST(scale_args.group_stride == 1);
-    if constexpr (Trait::kUe8m0) {
+    if constexpr (Trait::kUe8m0 && !Trait::kScaleFp32) {
       scale_args.expert_stride *= 4;  // i32 -> u8
       scale_args.token_stride *= 4;   // i32 -> u8
     }
   } else {  // col major
     CHECK_HOST(scale_args.token_stride == 1);
-    if constexpr (Trait::kUe8m0) {
+    if constexpr (Trait::kUe8m0 && !Trait::kScaleFp32) {
       scale_args.expert_stride *= 4;  // i32 -> u8
       scale_args.group_stride *= 4;   // i32 -> u8
       // The device store hardcodes token_idx * 4 bytes in this layout (it
@@ -570,9 +583,11 @@ template <
     bool kRowMajor,
     bool kAligned,
     bool kFuseSiluAndMul,
+    bool kScaleFp32,
     bool kUsePDL>
 struct PerTokenGroupQuantFlatKernel {
-  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
+  using Trait =
+      QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul, kScaleFp32>;
 
   static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView output_q, tvm::ffi::TensorView output_s) {
     using namespace host;
@@ -594,9 +609,11 @@ template <
     bool kRowMajor,
     bool kAligned,
     bool kFuseSiluAndMul,
+    bool kScaleFp32,
     bool kUsePDL>
 struct PerTokenGroupQuantMaskedKernel {
-  using Trait = QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul>;
+  using Trait =
+      QuantTrait<InputType, QuantType, kGroupSize, kUe8m0, kRowMajor, kAligned, kFuseSiluAndMul, kScaleFp32>;
 
   // expected_m: optional host-side expected-tokens-per-expert hint (the same
   // hint SGLang passes to deep_gemm's masked grouped GEMM); <= 0 means
