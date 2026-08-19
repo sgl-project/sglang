@@ -886,7 +886,9 @@ class MiniMaxH3MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fc2",
         )
-        self.reuse_fc1_activation = quant_config is None
+        self.reuse_fc1_activation = quant_config is None or (
+            quant_config.get_name() == "gguf"
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.device.type == "mps":
