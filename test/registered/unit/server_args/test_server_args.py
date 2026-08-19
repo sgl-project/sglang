@@ -519,7 +519,9 @@ class TestLoadBalanceMethod(unittest.TestCase):
             disaggregation_transfer_backend="mori",
             dcp_size=4,
         )
-        with self.assertRaisesRegex(ValueError, "mooncake or nixl"):
+        with self.assertRaisesRegex(
+            ValueError, "mooncake, nixl, or fake for synthetic benchmarking"
+        ):
             server_args._handle_pd_disaggregation()
 
     def test_pd_decode_dcp_allows_fake_transfer_backend(self):

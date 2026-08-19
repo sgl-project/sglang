@@ -44,7 +44,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         ):
             raise ValueError(
                 "PD decode DCP requires --disaggregation-transfer-backend "
-                "mooncake or nixl (or fake for synthetic benchmarking), got "
+                "mooncake, nixl, or fake for synthetic benchmarking, got "
                 f"{server_args.disaggregation_transfer_backend!r}."
             )
         if server_args.disaggregation_decode_enable_radix_cache:
