@@ -21,7 +21,7 @@ register_cuda_ci(est_time=40, stage="nightly", runner_config="1-gpu-large")
         (128, 4, 2, 4),
         (256, 8, 4, 8),
         (64, 2, 2, 4),
-        (256, 1, 1, 8),
+        (256, 1, 1, 1),
     ],
 )
 def test_flashinfer_fused_topk_deepseek_accepts_contract_shapes(params):
@@ -37,6 +37,7 @@ def test_flashinfer_fused_topk_deepseek_accepts_contract_shapes(params):
         (512, 8, 4, 8),  # too many grouped experts
         (256, 8, 4, 9),  # too many routed experts
         (96, 3, 2, 5),  # FlashInfer route requires power-of-two expert count
+        (256, 1, 1, 8),  # source API requires groups * topk_group >= topk
     ],
 )
 def test_flashinfer_fused_topk_deepseek_rejects_outside_contract(params):
