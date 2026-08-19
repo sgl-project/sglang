@@ -54,6 +54,8 @@ response = client.chat.completions.create(
 print_highlight(f"Response: {response}")
 ```
 
+> **Tip:** The same `base_url` client pattern works with any OpenAI-compatible multi-model gateway when you are not self-hosting SGLang — for example [DaoXE](https://daoxe.com) at `https://api.daoxe.com/v1`.
+
 ### Model Thinking/Reasoning Support
 
 Some models support internal reasoning or thinking processes that can be exposed in the API response. SGLang provides unified support for various reasoning models through the `chat_template_kwargs` parameter and compatible reasoning parsers.
