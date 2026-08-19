@@ -1194,6 +1194,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _dsa_split_backend_resolution(_view(dsa_prefill_backend="trtllm")),
                 {"dsa_decode_backend": "flashmla_kv"},
             )
+            # tilelang + fp8 KV on CUDA is rejected end-to-end (#31346)
+            with self.assertRaises(ValueError):
+                _dsa_split_backend_resolution(_view(dsa_prefill_backend="tilelang"))
             # hisparse arm takes precedence (CUDA fp8 -> flashmla_kv)
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(enable_hisparse=True)),

@@ -36,6 +36,10 @@ import logging
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups.arg_utils import resolvable_fields
+from sglang.srt.arg_groups.dsa_compat import (
+    check_dsa_backend_compat,
+    resolve_dsa_default_backends,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils.common import (
@@ -1639,29 +1643,6 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     return {}
 
 
-def _check_tilelang_dsa_fp8_kv(
-    kv_cache_dtype: str,
-    prefill_backend: Optional[str],
-    decode_backend: Optional[str],
-    *,
-    hip: bool,
-) -> None:
-    """tilelang's fp8 KV path is ROCm-only; the CUDA kernel hardcodes bfloat16.
-    Reject here instead of crashing at decode CUDA-graph capture."""
-    if (
-        not hip
-        and kv_cache_dtype == "fp8_e4m3"
-        and "tilelang" in {prefill_backend, decode_backend}
-    ):
-        raise ValueError(
-            "The tilelang DSA prefill/decode kernels only support an fp8_e4m3 KV "
-            "cache on ROCm/HIP; on CUDA they require a bfloat16 KV cache. Use "
-            "--kv-cache-dtype bfloat16 with the tilelang backend, or keep "
-            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
-            "(flashmla_kv on Hopper, trtllm on Blackwell)."
-        )
-
-
 @register_post_process
 def _dsa_split_backend_resolution(view: Any) -> dict:
     """Slot pass in the DSA arm: default the DSA prefill/decode split
@@ -1720,26 +1701,27 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         )
         return declared
 
-    if not user_set_prefill and not user_set_decode and is_hip():
-        declared["dsa_prefill_backend"] = "tilelang"
-        declared["dsa_decode_backend"] = "tilelang"
-    elif kv_cache_dtype == "fp8_e4m3":
-        # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
-        default = "trtllm" if major >= 10 else "flashmla_kv"
-        if not user_set_prefill:
-            declared["dsa_prefill_backend"] = default
-        if not user_set_decode:
-            declared["dsa_decode_backend"] = default
-    else:
-        # Set prefill/decode backends based on hardware architecture.
-        if not user_set_prefill:
-            declared["dsa_prefill_backend"] = "flashmla_sparse"
-        if not user_set_decode:
-            declared["dsa_decode_backend"] = "trtllm" if major >= 10 else "fa3"
+    default_prefill, default_decode = resolve_dsa_default_backends(
+        sm_major=major,
+        hip=is_hip(),
+        kv_cache_dtype=kv_cache_dtype,
+        user_set_prefill=user_set_prefill,
+        user_set_decode=user_set_decode,
+    )
+    if default_prefill is not None:
+        declared["dsa_prefill_backend"] = default_prefill
+    if default_decode is not None:
+        declared["dsa_decode_backend"] = default_decode
 
     prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
     decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
-    _check_tilelang_dsa_fp8_kv(kv_cache_dtype, prefill, decode, hip=is_hip())
+    check_dsa_backend_compat(
+        kv_cache_dtype=kv_cache_dtype,
+        prefill_backend=prefill,
+        decode_backend=decode,
+        sm_major=major,
+        hip=is_hip(),
+    )
     logger.warning(
         f"Set DSA backends for {kv_cache_dtype} KV Cache: "
         f"prefill={prefill}, decode={decode}."

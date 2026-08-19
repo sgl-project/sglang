@@ -7,7 +7,7 @@ but got float8_e4m3fn``.
 
 import unittest
 
-from sglang.srt.arg_groups.overrides import _check_tilelang_dsa_fp8_kv
+from sglang.srt.arg_groups.dsa_compat import check_dsa_backend_compat
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -18,23 +18,53 @@ class TestDsaTilelangFp8Validation(CustomTestCase):
 
     def test_cuda_fp8_tilelang_decode_rejected(self):
         with self.assertRaises(ValueError):
-            _check_tilelang_dsa_fp8_kv("fp8_e4m3", "flashmla_kv", "tilelang", hip=False)
+            check_dsa_backend_compat(
+                kv_cache_dtype="fp8_e4m3",
+                prefill_backend="flashmla_kv",
+                decode_backend="tilelang",
+                sm_major=9,
+                hip=False,
+            )
 
     def test_cuda_fp8_tilelang_prefill_rejected(self):
         with self.assertRaises(ValueError):
-            _check_tilelang_dsa_fp8_kv("fp8_e4m3", "tilelang", "trtllm", hip=False)
+            check_dsa_backend_compat(
+                kv_cache_dtype="fp8_e4m3",
+                prefill_backend="tilelang",
+                decode_backend="trtllm",
+                sm_major=9,
+                hip=False,
+            )
 
     def test_hip_fp8_tilelang_allowed(self):
         # ROCm has a real fp8 tilelang kernel
-        _check_tilelang_dsa_fp8_kv("fp8_e4m3", "tilelang", "tilelang", hip=True)
+        check_dsa_backend_compat(
+            kv_cache_dtype="fp8_e4m3",
+            prefill_backend="tilelang",
+            decode_backend="tilelang",
+            sm_major=9,
+            hip=True,
+        )
 
     def test_bf16_tilelang_allowed(self):
         # what the CUDA kernel expects
-        _check_tilelang_dsa_fp8_kv("bfloat16", "tilelang", "tilelang", hip=False)
+        check_dsa_backend_compat(
+            kv_cache_dtype="bfloat16",
+            prefill_backend="tilelang",
+            decode_backend="tilelang",
+            sm_major=9,
+            hip=False,
+        )
 
     def test_cuda_fp8_non_tilelang_allowed(self):
         # fp8-capable backends must pass
-        _check_tilelang_dsa_fp8_kv("fp8_e4m3", "flashmla_kv", "trtllm", hip=False)
+        check_dsa_backend_compat(
+            kv_cache_dtype="fp8_e4m3",
+            prefill_backend="flashmla_kv",
+            decode_backend="trtllm",
+            sm_major=9,
+            hip=False,
+        )
 
 
 if __name__ == "__main__":
