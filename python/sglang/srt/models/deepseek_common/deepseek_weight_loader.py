@@ -506,7 +506,7 @@ class DeepseekV2WeightLoaderMixin:
                 for name in weight_names:
                     if "kv_b_proj" in name:
                         layer_id = int(name.split(".")[2])
-                        if layer_id < self.config.num_hidden_layers:
+                        if self.model.start_layer <= layer_id < self.model.end_layer:
                             layer_ids.add(layer_id)
 
         for layer_id in layer_ids:
