@@ -23,7 +23,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY = "minimax_h3_single_rank_text_encode"
+_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY = "minimax_h3_single_copy_text_encode"
 
 
 class MiniMaxH3TextEncodingStage(TextEncodingStage):
@@ -108,13 +108,14 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         batches: list[Req],
         server_args: ServerArgs,
     ) -> list[Req]:
-        """Distribute independent H3 presentations over replicated encoders.
+        """Distribute independent H3 presentations over encoder copies.
 
         H3 presentations have variable multimodal layouts, so they cannot be
         stacked into the generic text batch without changing padding/kernels.
-        Assigning one complete request to a rank preserves the exact
-        single-request encoder path, then broadcasts that request's native
-        payload to the other ranks.
+        Assigning one complete request to a copy preserves the exact
+        single-request encoder path. A copy may itself span a TP group; the
+        orthogonal encoder-DP group then broadcasts that request's native
+        payload to the other copies.
         """
         grouped = self._group_requests_by_fingerprint(
             batches,
@@ -142,14 +143,14 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             payload = None
             if dp_group.rank_in_group == owner:
                 try:
-                    first_batch.extra[_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY] = (
+                    first_batch.extra[_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY] = (
                         True
                     )
                     try:
                         first_result = self(first_batch, server_args)
                     finally:
                         first_batch.extra.pop(
-                            _MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY, None
+                            _MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY, None
                         )
                     payload = first_result.extra.get(
                         MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY
@@ -191,7 +192,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         self._dp_choice_logged = True
         logger.info(
             "encoder_parallel: distributing %d independent MiniMax H3 "
-            "presentations over %d replicated encoder ranks",
+            "presentations over %d encoder copies",
             batch_size,
             world_size,
         )
@@ -381,7 +382,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
                 share_across_replicas=(
                     world > 1
                     and not bool(
-                        batch.extra.get(_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY)
+                        batch.extra.get(_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY)
                     )
                 ),
             )
@@ -536,7 +537,7 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             pixel_values_videos=pixel_values_videos,
             video_grid_thw=video_grid_thw,
         )
-        if batch.extra.get(_MINIMAX_H3_SINGLE_RANK_TEXT_ENCODE_EXTRA_KEY):
+        if batch.extra.get(_MINIMAX_H3_SINGLE_COPY_TEXT_ENCODE_EXTRA_KEY):
             batch.extra.pop(MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY, None)
         return {
             "positive": {

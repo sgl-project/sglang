@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """SubBlock block-sparse attention backend.
 
-Routes FlashInfer's 64-token block-sparse kernel with a K-side sub-block
-log-sum-exp score (see ``backends/subblock_sparse/``). Everything is training-free:
-the router runs before attention and produces the ``q2k_block_index`` the
-kernel consumes.
+Routes the same 64-token SubBlock plan to SGLang's CuTe-DSL block-sparse
+FlashAttention kernel on SM90 or FlashInfer's kernel on SM100. A log-sum-exp
+over query/key sub-block pairs selects the blocks (see ``backends/subblock_sparse/``).
+Everything is training-free: the router runs before attention and produces
+the ``q2k_block_index`` the selected kernel consumes.
 
 Sparsity is not applied everywhere. The early denoise steps settle the layout
 of the sample and tolerate approximation badly, so the backend falls back to
@@ -16,11 +17,12 @@ individual keys of the defaults below::
     --attention-backend subblock_sparse_attn \
     --attention-backend-config '{"sparsity": 0.85}'
 
-Requirements inherited from the kernel: compute capability 10.0 (B200 / GB200
-class -- it is built for ``sm_100a``, which does not forward-run on 10.3 or
-12.x), bf16, head_dim 128. Inside the DiT, any call the kernel cannot serve --
-cross/refiner attention, short sequences, non-bf16 -- runs dense instead. On any
-other GPU the resolver refuses the backend at startup rather than falling back.
+Requirements inherited from the kernels: compute capability 9.0 (Hopper) or
+10.0 (B200 / GB200), bf16, head_dim 128. Hopper uses SGLang's CuTe-DSL SM90
+block-sparse FlashAttention kernel; B200 uses FlashInfer's ``sm_100a`` blk64
+kernel. Inside the DiT, any call the kernels cannot serve -- cross/refiner
+attention, short sequences, non-bf16 -- runs dense instead. On any other GPU
+the resolver refuses the backend at startup rather than falling back.
 
 ``--attention-backend`` reaches every component, and the text encoder admits
 only fa / torch_sdpa / sage_attn_3, so pair it with
@@ -54,6 +56,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 # The kernel is fixed at 64-token blocks and 128-wide heads.
+SUBBLOCK_SPARSE_BLOCK_SIZE = 64
 SUBBLOCK_SPARSE_HEAD_DIM = 128
 
 # Defaults for the schedule; override through --attention-backend-config.
@@ -112,8 +115,124 @@ def _cached_block_sizes(seq_len: int, device: torch.device) -> torch.Tensor:
     return SubBlockRouter.block_sizes(seq_len, device)
 
 
-class SubBlockSparseAttentionBackend(AttentionBackend):
+@functools.lru_cache(maxsize=1)
+def _load_sm90_block_sparse_attention():
+    """Load the CuTe-DSL Hopper path only when an SM90 device selects it.
 
+    Keeping these imports lazy avoids pulling the sizeable CuTe dependency tree
+    into the existing SM100 path, whose FlashInfer blk64 kernel is plain CUDA.
+    """
+    from sglang.kernels.ops.attention.flash_attn.cute.block_sparsity import (
+        BlockSparseTensorsTorch,
+    )
+    from sglang.kernels.ops.attention.flash_attn.cute.interface import flash_attn_func
+
+    return BlockSparseTensorsTorch, flash_attn_func
+
+
+def _sm90_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    topk: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Run a SubBlock routing plan through the existing SM90 CuTe kernel."""
+    BlockSparseTensorsTorch, flash_attn_func = _load_sm90_block_sparse_attention()
+
+    # The router contract permits indices in any order, while the SM90 sparse
+    # pipeline consumes each list from high slot to low slot and applies
+    # sequence-tail masking to the first block. Sort explicitly so the largest
+    # block id -- the possible ragged tail -- occupies the highest slot without
+    # depending on the fused top-k kernel's current ascending output order.
+    ordered_index = q2k_block_index.sort(dim=-1).values
+    block_counts = torch.full(
+        ordered_index.shape[:-1],
+        topk,
+        dtype=torch.int32,
+        device=ordered_index.device,
+    )
+    sparse_tensors = BlockSparseTensorsTorch(
+        mask_block_cnt=block_counts,
+        mask_block_idx=ordered_index,
+        # There are no always-dense blocks in a SubBlock routing plan. The
+        # block-sparse broadcast pattern records both absent tensors as None
+        # and participates in the compile key, so mask-only and mask+full calls
+        # cannot share a compiled kernel.
+        full_block_cnt=None,
+        full_block_idx=None,
+        block_size=(SUBBLOCK_SPARSE_BLOCK_SIZE, SUBBLOCK_SPARSE_BLOCK_SIZE),
+    )
+    out, _ = flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=False,
+        num_splits=1,
+        block_sparse_tensors=sparse_tensors,
+    )
+    return out
+
+
+def _sm100_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    topk: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Run a SubBlock routing plan through FlashInfer's SM100 kernel."""
+    out = load_bsa_attn_blk64_fwd()(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        topk,
+        block_sizes=_cached_block_sizes(k.shape[1], k.device),
+        q2k_block_nums=None,  # the budget is uniform across rows
+        softmax_scale=softmax_scale,
+    )
+    return out[0] if isinstance(out, tuple) else out
+
+
+@functools.lru_cache(maxsize=None)
+def _get_subblock_sparse_attention_runner(device: torch.device):
+    """Resolve the architecture-specific kernel once per CUDA device."""
+    capability = torch.cuda.get_device_capability(device)
+    if capability == (9, 0):
+        return _sm90_sparse_attention
+    if capability == (10, 0):
+        return _sm100_sparse_attention
+    raise RuntimeError(
+        "SubBlock sparse attention supports compute capability 9.0 or 10.0; "
+        f"this tensor is on a {capability[0]}.{capability[1]} device."
+    )
+
+
+def _run_subblock_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q2k_block_index: torch.Tensor,
+    topk: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Dispatch the same 64x64 routing plan to Hopper or Blackwell."""
+    runner = _get_subblock_sparse_attention_runner(q.device)
+    return runner(
+        q,
+        k,
+        v,
+        q2k_block_index,
+        topk,
+        softmax_scale,
+    )
+
+
+class SubBlockSparseAttentionBackend(AttentionBackend):
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [SUBBLOCK_SPARSE_HEAD_DIM]
@@ -285,7 +404,6 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
         """q, k, v: ``[1, S, H, 128]`` bf16 -> same shape."""
-        bsa_attn_blk64_fwd = load_bsa_attn_blk64_fwd()
         plan = self.router.route(
             q, k, sparsity=self.schedule.sparsity, softmax_scale=self.softmax_scale
         )
@@ -296,17 +414,14 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             f"keeping {plan.topk}/{plan.num_blocks} key blocks per query block "
             f"(sparsity {1 - plan.density:.4f})"
         )
-        out = bsa_attn_blk64_fwd(
+        return _run_subblock_sparse_attention(
             q,
             k,
             v,
             plan.index,
             plan.topk,
-            block_sizes=_cached_block_sizes(k.shape[1], k.device),
-            q2k_block_nums=None,  # the budget is uniform across rows
-            softmax_scale=self.softmax_scale,
+            self.softmax_scale,
         )
-        return out[0] if isinstance(out, tuple) else out
 
     def forward(
         self,
