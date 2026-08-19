@@ -126,9 +126,6 @@ class DotsSWAMLAAttnBackend(AttentionBackend):
         self._prefill_metadata: DotsSWAMLAPrefillMetadata | None = None
         self._dp_rebuilt_batch_id: int | None = None
 
-    def __getattr__(self, name):
-        return getattr(self.backend, name)
-
     @property
     def forward_metadata(self):
         return self._active_backend.forward_metadata
