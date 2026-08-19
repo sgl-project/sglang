@@ -4,7 +4,11 @@
 //! request and response primitives. Native [`ChunkEvent`] values remain the one
 //! backend output type for both unary and streaming responses.
 
-use axum::{Router, http::StatusCode, response::Response};
+use axum::{
+    Router,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use futures::StreamExt;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -113,6 +117,28 @@ pub(super) fn error_payload(code: StatusCode, message: impl Into<String>) -> ser
 /// streaming → 200 with one SSE error frame + `[DONE]`.
 pub(super) fn openai_error(code: StatusCode, message: impl Into<String>, stream: bool) -> Response {
     error_response(code, error_payload(code, message), stream)
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(in crate::http_server) struct OpenAIRequestError(String);
+
+impl From<String> for OpenAIRequestError {
+    fn from(message: String) -> Self {
+        Self(message)
+    }
+}
+
+impl From<&str> for OpenAIRequestError {
+    fn from(message: &str) -> Self {
+        Self(message.to_owned())
+    }
+}
+
+impl IntoResponse for OpenAIRequestError {
+    fn into_response(self) -> Response {
+        openai_error(StatusCode::BAD_REQUEST, self.0, false)
+    }
 }
 
 /// Drain one submitted request to its terminal output: fold frames, disarm

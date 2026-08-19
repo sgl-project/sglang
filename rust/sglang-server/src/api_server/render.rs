@@ -178,7 +178,7 @@ async fn render_chat(
     .await
     {
         Ok(requests) => requests,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let native = native_requests
         .into_iter()
@@ -204,7 +204,7 @@ async fn render_completions(
     let native_requests =
         match lower_completion_requests(&state.server_args, &request, &response_id) {
             Ok(requests) => requests,
-            Err(message) => return openai_error(StatusCode::BAD_REQUEST, message, false),
+            Err(error) => return error.into_response(),
         };
     let futures = native_requests
         .into_iter()

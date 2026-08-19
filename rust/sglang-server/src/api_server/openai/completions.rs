@@ -24,8 +24,8 @@ use tokio::sync::mpsc;
 use super::super::guard::AbortGuard;
 use super::super::submit::submit;
 use super::{
-    AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
-    openai_error, submit_generation, unix_seconds_u32,
+    AppState, MAX_OPENAI_CHOICES, OpenAIRequestError, collect_output, error_payload,
+    indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::message::config::ServerArgs;
 use crate::message::finish_reason::Matched;
@@ -67,9 +67,9 @@ pub(in crate::http_server) fn lower_completion_requests(
     server_args: &ServerArgs,
     request: &CreateCompletionRequest,
     response_id: &str,
-) -> Result<Vec<GenerateRequest>, String> {
+) -> Result<Vec<GenerateRequest>, OpenAIRequestError> {
     if request.model != server_args.served_model_name {
-        return Err(format!("The model `{}` does not exist", request.model));
+        return Err(format!("The model `{}` does not exist", request.model).into());
     }
     if request.prompt_embeds.is_some() {
         return Err("prompt_embeds is not supported by the Rust frontend".into());
@@ -146,7 +146,7 @@ async fn completions(
     let native_requests =
         match lower_completion_requests(&state.server_args, &request, &response_id) {
             Ok(requests) => requests,
-            Err(message) => return openai_error(StatusCode::BAD_REQUEST, message, false),
+            Err(error) => return error.into_response(),
         };
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);

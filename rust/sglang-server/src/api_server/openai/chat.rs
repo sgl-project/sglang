@@ -34,8 +34,8 @@ use super::tools::{
     parse_chat_tool_calls,
 };
 use super::{
-    AppState, ChatFormatter, collect_output, contains_media, error_payload, indexed_decode_stream,
-    openai_error, submit_generation, unix_seconds_u32,
+    AppState, ChatFormatter, OpenAIRequestError, collect_output, contains_media, error_payload,
+    indexed_decode_stream, openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::ids::Rid;
@@ -53,43 +53,23 @@ pub(in crate::http_server) async fn lower_chat_requests(
     chat_formatter: Option<ChatFormatter>,
     request: &mut CreateChatCompletionRequest,
     response_id: &str,
-) -> Result<Vec<GenerateRequest>, Response> {
+) -> Result<Vec<GenerateRequest>, OpenAIRequestError> {
     if request.model != server_args.served_model_name {
-        return Err(openai_error(
-            StatusCode::BAD_REQUEST,
-            format!("The model `{}` does not exist", request.model),
-            false,
-        ));
+        return Err(format!("The model `{}` does not exist", request.model).into());
     }
     if request.messages.is_empty() {
-        return Err(openai_error(
-            StatusCode::BAD_REQUEST,
-            "messages cannot be empty",
-            false,
-        ));
+        return Err("messages cannot be empty".into());
     }
     if serde_json::to_value(&request.messages).is_ok_and(|messages| contains_media(&messages)) {
-        return Err(openai_error(
-            StatusCode::BAD_REQUEST,
-            "image, audio, video, and file message content is not supported",
-            false,
-        ));
+        return Err("image, audio, video, and file message content is not supported".into());
     }
     if request.n == Some(0) {
-        return Err(openai_error(
-            StatusCode::BAD_REQUEST,
-            "n must be at least 1",
-            false,
-        ));
+        return Err("n must be at least 1".into());
     }
     #[allow(deprecated)]
     let max_tokens = request.max_completion_tokens.or(request.max_tokens);
     if max_tokens == Some(0) {
-        return Err(openai_error(
-            StatusCode::BAD_REQUEST,
-            "max_completion_tokens must be positive",
-            false,
-        ));
+        return Err("max_completion_tokens must be positive".into());
     }
     if request.modalities.as_ref().is_some_and(|modalities| {
         serde_json::to_value(modalities).is_ok_and(|value| value.to_string().contains("\"audio\""))
@@ -98,24 +78,20 @@ pub(in crate::http_server) async fn lower_chat_requests(
         || request.web_search_options.is_some()
         || request.mm_processor_kwargs.is_some()
     {
-        return Err(openai_error(
-            StatusCode::BAD_REQUEST,
-            "audio, prediction, web search, and multimodal inputs are not supported",
-            false,
-        ));
+        return Err(
+            "audio, prediction, web search, and multimodal inputs are not supported".into(),
+        );
     }
     #[allow(deprecated)]
     if request.function_call.is_some() || request.functions.is_some() {
-        return Err(openai_error(
-            StatusCode::BAD_REQUEST,
-            "deprecated function_call/functions are not supported; use tools and tool_choice",
-            false,
-        ));
+        return Err(
+            "deprecated function_call/functions are not supported; use tools and tool_choice"
+                .into(),
+        );
     }
 
     let tool_choice = dynamo_tool_choice(&request.tool_choice);
-    let parser = resolve_chat_parser(server_args, request, &tool_choice)
-        .map_err(|message| openai_error(StatusCode::BAD_REQUEST, message, false))?;
+    let parser = resolve_chat_parser(server_args, request, &tool_choice)?;
     let tools = chat_tool_definitions(request);
     let prompt = prepare_chat_request(chat_formatter, request).await?;
     let sampling = chat_sampling(
@@ -126,8 +102,7 @@ pub(in crate::http_server) async fn lower_chat_requests(
         tools.as_deref().unwrap_or_default(),
         request.parallel_tool_calls,
         server_args,
-    )
-    .map_err(|message| openai_error(StatusCode::BAD_REQUEST, message, false))?;
+    )?;
 
     let n = request.n.unwrap_or(1) as usize;
     let stream = request.stream.unwrap_or(false);
@@ -213,7 +188,7 @@ async fn chat_completions(
     .await
     {
         Ok(requests) => requests,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let tool_choice = dynamo_tool_choice(&request.tool_choice);
     let parser = match resolve_chat_parser(&state.server_args, &request, &tool_choice) {
@@ -297,26 +272,18 @@ async fn chat_completions(
 pub(super) async fn prepare_chat_request(
     chat_formatter: Option<ChatFormatter>,
     request: &mut CreateChatCompletionRequest,
-) -> Result<String, Response> {
+) -> Result<String, OpenAIRequestError> {
     let Some(formatter) = chat_formatter else {
-        return Err(openai_error(
-            StatusCode::BAD_REQUEST,
-            "this model has no usable chat template",
-            false,
-        ));
+        return Err("this model has no usable chat template".into());
     };
     // Template stops first, then the request's own — Python
     // `_apply_conversation_template` (`conv.stop_str` + `request.stop`). A
     // token-id stop cannot be merged into the string list (Python has no such
     // field), so it is kept alone.
     merge_template_stops(request, &formatter);
-    let prompt = formatter.render(request).map_err(|error| {
-        openai_error(
-            StatusCode::BAD_REQUEST,
-            format!("chat template render failed: {error}"),
-            false,
-        )
-    })?;
+    let prompt = formatter
+        .render(request)
+        .map_err(|error| format!("chat template render failed: {error}"))?;
     Ok(prompt)
 }
 
