@@ -407,9 +407,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 del down_input
         elif self.use_swizzle:
             swiglu_limit_arg: Optional[float] = self.swiglu_limit
-            use_contig_swizzle = self.use_swizzle and not running_state.get(
-                "deepep_v2_disable_contig_swizzle", False
-            )
 
             down_input_fp8 = torch.empty(
                 (all_tokens, N // 2),
@@ -432,7 +429,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 swiglu_limit=swiglu_limit_arg,
-                swizzle=use_contig_swizzle,
+                swizzle=self.use_swizzle,
             )
             del gateup_output
         else:
@@ -1470,12 +1467,6 @@ def pre_permute_deepep_v2_to_deep_gemm(
             "DeepEP v2 -> DeepGEMM requires FP8 dispatch output with activation scales. "
             "Use --deepep-v2-dispatcher-output-dtype fp8 or select a BF16 runner such as triton."
         )
-    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-        # The MegaMoE memory optimization enables a swizzled activation kernel
-        # for its gran=8 interleaved gate/up layout. DeepEP v2's contiguous adapter
-        # is validated with the non-swizzled activation layout; using the
-        # swizzled reader here mixes gate/up pairs and breaks generation.
-        running_state["deepep_v2_disable_contig_swizzle"] = True
     assert runner_config.activation == "silu"
 
     if is_expanded:
