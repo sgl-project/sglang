@@ -277,9 +277,9 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
 
 def _handle_dspark(server_args: ServerArgs) -> None:
     _is_npu = server_args.device.startswith("npu")
-    if not server_args.device.startswith("cuda") and not _is_npu:
+    if not server_args.device.startswith(("cuda", "npu")):
         raise ValueError(
-            "DSpark speculative decoding only supports CUDA and NPU devices."
+            "DSpark speculative decoding only supports CUDA or NPU device."
         )
 
     # dp_size==1 with dp_attention is a degenerate flag under DSV4 CP; skip DP-only checks.

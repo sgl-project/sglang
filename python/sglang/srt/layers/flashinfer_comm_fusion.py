@@ -389,6 +389,8 @@ class FlashInferWorkspaceManager:
         self.max_token_num = None
         self.hidden_dim = None
         self.dtype = None
+        self.backend = None
+        self.use_fp32_lamport = None
         self.initialized = False
         # Track max sizes ever requested so the workspace only grows (fewer recreates)
         self._max_token_num_seen: Optional[int] = None
@@ -523,19 +525,24 @@ class FlashInferWorkspaceManager:
             self.max_token_num = alloc_token_num
             self.hidden_dim = alloc_hidden_dim
             self.dtype = dtype or torch.bfloat16
+            self.backend = self.workspace.backend
+            self.use_fp32_lamport = (
+                self.workspace.metadata["use_fp32_lamport"]
+                if self.backend == "trtllm"
+                else None
+            )
             self.initialized = True
 
-            backend_name = getattr(self.workspace, "backend", "unknown")
             if not self._logged_init:
                 logger.info(
                     f"FlashInfer AllReduce Fusion enabled and workspace initialized: "
-                    f"backend={backend_name}, rank={rank}, world_size={world_size}, "
+                    f"backend={self.backend}, rank={rank}, world_size={world_size}, "
                     f"max_token_num={self.max_token_num}, hidden_dim={self.hidden_dim}"
                 )
                 self._logged_init = True
             else:
                 logger.debug(
-                    f"FlashInfer workspace re-initialized: backend={backend_name}, "
+                    f"FlashInfer workspace re-initialized: backend={self.backend}, "
                     f"rank={rank}, world_size={world_size}"
                 )
         except Exception as e:
@@ -611,6 +618,8 @@ class FlashInferWorkspaceManager:
                 self.max_token_num = None
                 self.hidden_dim = None
                 self.dtype = None
+                self.backend = None
+                self.use_fp32_lamport = None
                 self._logged_init = False
 
 
@@ -922,6 +931,18 @@ def can_use_flashinfer_allreduce(
             and hidden_dim <= workspace_manager.hidden_dim
             and workspace_manager.dtype == input_.dtype
         )
+
+    # TRT-LLM logs a warning when its validator rejects an expected fallback.
+    # Mirror only the conditions that prove its workspace is insufficient:
+    # total element capacity and FP32-Lamport compatibility. MNNVL has a
+    # byte/strategy-based contract and does not emit that warning, so its
+    # authoritative validator remains the source of truth below.
+    if workspace_manager.backend == "trtllm" and (
+        token_num * hidden_dim
+        > workspace_manager.max_token_num * workspace_manager.hidden_dim
+        or workspace_manager.use_fp32_lamport != (input_.dtype == torch.float32)
+    ):
+        return False
 
     return workspace_manager.is_buffer_size_sufficient(
         token_num=token_num,

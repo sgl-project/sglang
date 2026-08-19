@@ -1336,6 +1336,7 @@
                   {
                     "group": "Baidu",
                     "pages": [
+                      "cookbook/autoregressive/Baidu/PaddleOCR-VL",
                       "cookbook/autoregressive/Baidu/Unlimited-OCR"
                     ]
                   },
@@ -1469,8 +1470,10 @@
                   },
                   {
                     "group": "LTX",
+                    "tag": "NEW",
                     "pages": [
-                      "cookbook/diffusion/LTX/LTX2 & LTX2.3"
+                      "cookbook/diffusion/LTX/LTX2 & LTX2.3",
+                      "cookbook/diffusion/LTX/LTX2.5"
                     ]
                   },
                   {
@@ -1511,10 +1514,24 @@
                     ]
                   },
                   {
+                    "group": "SANA Video",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/SANA-Video/SANA-Video"
+                    ]
+                  },
+                  {
                     "group": "MiniMax",
                     "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/MiniMax/MiniMax-H3"
+                    ]
+                  },
+                  {
+                    "group": "LingBot Video",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/LingBot-Video/LingBot-Video-MoE"
                     ]
                   },
                   {
@@ -1591,6 +1608,7 @@
                   "docs/sglang-diffusion/performance-optimization",
                   "docs/sglang-diffusion/deployment_cookbook",
                   "docs/sglang-diffusion/attention_backends",
+                  "docs/sglang-diffusion/fused_kernels",
                   "docs/sglang-diffusion/parallelism",
                   "docs/sglang-diffusion/ring_sp_performance",
                   "docs/sglang-diffusion/encoder_parallel",

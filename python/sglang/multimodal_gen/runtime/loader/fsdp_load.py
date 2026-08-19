@@ -231,7 +231,7 @@ def maybe_load_fsdp_model(
     hsdp_shard_dim: int,
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
-    cpu_offload: bool = False,
+    component_starts_on_cpu: bool = False,
     fsdp_inference: bool = False,
     output_dtype: torch.dtype | None = None,
     pin_cpu_memory: bool = True,
@@ -251,6 +251,8 @@ def maybe_load_fsdp_model(
               original parameter dtypes
             - Weight loading and casting
         reduce_dtype: Data type for gradient reduction in FSDP mixed precision.
+        component_starts_on_cpu: Load a non-FSDP component onto CPU initially.
+            Runtime residency strategies move it to the compute device before use.
         strict: If True, enforce strict state dict loading (all keys must match).
         weight_load_plan: Optional checkpoint/postprocess device plan for this load.
     """
@@ -293,16 +295,21 @@ def maybe_load_fsdp_model(
         logger.info("Disabling FSDP for MPS platform as it's not compatible")
 
     weight_load_plan = weight_load_plan or WeightLoadPlan(checkpoint_load_device=device)
-    defer_cpu_offload = bool(
-        cpu_offload and weight_load_plan.defer_component_cpu_offload
+    mps_zero_copy_weight_loading = bool(
+        current_platform.is_mps()
+        and weight_load_plan.mps_layerwise_cpu_staging
+        and weight_load_plan.checkpoint_load_device.type == "cpu"
     )
-    if defer_cpu_offload and use_fsdp:
-        logger.warning(
-            "Ignoring deferred CPU offload for FSDP loading; keeping the existing "
-            "FSDP offload policy."
-        )
-        defer_cpu_offload = False
-    load_cpu_offload = bool(cpu_offload and not defer_cpu_offload)
+    if mps_zero_copy_weight_loading:
+        # layerwise offload replaces block parameters with mps placeholders after
+        # load, so compatible checkpoint tensors stay file-backed on CPU
+        model._mps_zero_copy_weight_loading = True
+    defer_cpu_placement = bool(
+        component_starts_on_cpu
+        and weight_load_plan.defer_cpu_placement
+        and not use_fsdp
+    )
+    load_on_cpu = bool(component_starts_on_cpu and not defer_cpu_placement)
     weight_postprocess_device = weight_load_plan.weight_postprocess_device
     if use_fsdp and weight_postprocess_device is not None:
         logger.warning("Ignoring weight postprocess device override for FSDP loading.")
@@ -327,7 +334,7 @@ def maybe_load_fsdp_model(
         )
         shard_model(
             model,
-            cpu_offload=load_cpu_offload,
+            cpu_offload=False,
             reshard_after_forward=True,
             mp_policy=mp_policy,
             mesh=device_mesh,
@@ -408,8 +415,9 @@ def maybe_load_fsdp_model(
         weight_load_plan.checkpoint_load_device,
         param_dtype,
         strict=strict,
-        cpu_offload=load_cpu_offload,
+        cpu_offload=load_on_cpu,
         param_names_mapping=param_names_mapping_fn,
+        mps_zero_copy_weight_loading=mps_zero_copy_weight_loading,
         preconverted_state_dict=preconverted_state_dict,
     )
     if bnb_quant_states:
@@ -444,7 +452,7 @@ def maybe_load_fsdp_model(
             p.requires_grad = False
 
     # 4. deferred cpu offload
-    if defer_cpu_offload:
+    if defer_cpu_placement:
         model.to("cpu")
 
     return model
@@ -533,6 +541,7 @@ def load_model_from_full_model_state_dict(
     strict: bool = False,
     cpu_offload: bool = False,
     param_names_mapping: Callable[[str], tuple[str, Any, Any]] | None = None,
+    mps_zero_copy_weight_loading: bool = False,
     preconverted_state_dict: (
         tuple[
             dict[
@@ -557,6 +566,7 @@ def load_model_from_full_model_state_dict(
         strict (bool): flag to check if to load the model in strict mode
         cpu_offload (bool): flag to check if FSDP offload is enabled
         param_names_mapping (Optional[Callable[[str], str]]): a function that maps full param name to sharded param name
+        mps_zero_copy_weight_loading (bool): retain compatible CPU checkpoint tensors for MPS layerwise offload
     Returns:
         ``NamedTuple`` with ``missing_keys`` and ``unexpected_keys`` fields:
             * **missing_keys** is a list of str containing the missing keys
@@ -698,7 +708,17 @@ def load_model_from_full_model_state_dict(
                 if actual_param is not None
                 else None
             )
-            if weight_loader is not None:
+            use_checkpoint_tensor_directly = bool(
+                mps_zero_copy_weight_loading
+                and actual_param is not None
+                and not getattr(actual_param, "mps_zero_copy_unsafe", False)
+                and tuple(meta_sharded_param.shape) == tuple(full_tensor.shape)
+                and full_tensor.device.type == "cpu"
+                and full_tensor.dtype == target_dtype
+            )
+            if use_checkpoint_tensor_directly:
+                sharded_tensor = full_tensor
+            elif weight_loader is not None:
                 assert actual_param is not None
                 if _can_assign_cpu_tensor_without_copy(
                     actual_param,

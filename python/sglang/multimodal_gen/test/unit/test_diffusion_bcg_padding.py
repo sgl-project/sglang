@@ -50,6 +50,13 @@ class ZImageTransformer2DModel(torch.nn.Module):
         return torch.zeros(pos_ids.shape[0], 8, device=pos_ids.device)
 
 
+def _fake_cache_dit_batch(*, is_warmup: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        is_warmup=is_warmup,
+        sampling_params=SimpleNamespace(enable_cache_dit=None, cache_dit_params=None),
+    )
+
+
 class TestDiffusionBCGPadding(unittest.TestCase):
     def setUp(self):
         self.stage = DenoisingStage.__new__(DenoisingStage)
@@ -388,6 +395,20 @@ class TestDiffusionBCGPadding(unittest.TestCase):
         ):
             self.assertIn(config_name, BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS)
 
+    def test_ltx_models_are_registered_as_bcg_supported(self):
+        for model_id in (
+            "lightricks/ltx-2",
+            "lightricks/ltx-2.3",
+        ):
+            self.assertIn(model_id, BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS)
+
+        self.assertIn(
+            "LTX2PipelineConfig", BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
+        )
+        self.assertIn(
+            "LTX23PipelineConfig", BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS
+        )
+
     def test_dynamic_varlen_mask_meta_rebuilds_once_per_replay_token(self):
         builder = DynamicVarlenMaskMeta()
         mask = torch.tensor([[True, True, False, False]])
@@ -429,7 +450,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
 
         self.assertIsNone(self.stage._maybe_get_bcg_runner(self.qwen_model))
         self.stage._maybe_torch_compile(self.qwen_model)
-        self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=True))
+        self.stage._maybe_enable_cache_dit(1, _fake_cache_dit_batch(is_warmup=True))
         self.assertEqual(self.stage._bcg_runners, {})
 
     def test_bcg_warns_when_cache_dit_is_requested(self):
@@ -441,8 +462,10 @@ class TestDiffusionBCGPadding(unittest.TestCase):
             patch.object(self.stage, "_cache_dit_requested", return_value=True),
             patch.object(denoising_module.logger, "warning") as warning,
         ):
-            self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=True))
-            self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=False))
+            self.stage._maybe_enable_cache_dit(1, _fake_cache_dit_batch(is_warmup=True))
+            self.stage._maybe_enable_cache_dit(
+                1, _fake_cache_dit_batch(is_warmup=False)
+            )
 
         warning.assert_called_once_with(
             "Cache-DiT was requested but is disabled because breakable CUDA "
@@ -460,7 +483,7 @@ class TestDiffusionBCGPadding(unittest.TestCase):
                 "logger.warning_once"
             ) as warning_once,
         ):
-            self.stage._maybe_enable_cache_dit(1, SimpleNamespace(is_warmup=True))
+            self.stage._maybe_enable_cache_dit(1, _fake_cache_dit_batch(is_warmup=True))
 
         warning_once.assert_not_called()
 

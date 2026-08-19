@@ -43,10 +43,10 @@ logger = init_logger(__name__)
 def _resolve_checkpoint_load_device(
     runtime_device: torch.device,
     *,
-    component_cpu_offload: bool,
+    component_starts_on_cpu: bool,
     runtime_quant_config: object | None,
 ) -> torch.device:
-    if component_cpu_offload and runtime_quant_config is None:
+    if component_starts_on_cpu and runtime_quant_config is None:
         return torch.device("cpu")
     return runtime_device
 
@@ -136,6 +136,18 @@ class TransformerLoader(ComponentLoader):
     ]
     expected_library = "diffusers"
 
+    def customized_load_kwargs_for_component(
+        self, server_args: ServerArgs, component_name: str
+    ) -> dict[str, bool]:
+        if current_platform.is_mps() and self._is_component_set_as_layerwise_load(
+            server_args, component_name
+        ):
+            logger.info(
+                "Loading %s on CPU first for MPS layerwise offload", component_name
+            )
+            return {"cpu_offload_flag": True}
+        return {}
+
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
@@ -151,17 +163,16 @@ class TransformerLoader(ComponentLoader):
         )
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        cpu_offload_flag: bool = False,
     ):
         """Load the transformer based on the model path, and inference args."""
         component_server_args = _server_args_for_transformer_component(
             server_args, component_name
         )
-        if server_args.cpu_offload_components is not None:
-            component_server_args = copy.copy(component_server_args)
-            component_server_args.dit_cpu_offload = (
-                server_args.should_cpu_offload_component(component_name)
-            )
 
         # 1. hf config
         config = get_diffusers_component_config(component_path=component_model_path)
@@ -172,11 +183,15 @@ class TransformerLoader(ComponentLoader):
 
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
-        component_name = _normalize_component_type(component_name)
+        component_type = _normalize_component_type(component_name)
         server_args.model_paths[component_name] = component_model_path
-        if component_name in ("transformer", "unconditional_transformer", "video_dit"):
+        if component_type in (
+            "transformer",
+            "unconditional_transformer",
+            "video_dit",
+        ):
             pipeline_dit_config_attr = "dit_config"
-        elif component_name in ("audio_dit",):
+        elif component_type == "audio_dit":
             pipeline_dit_config_attr = "audio_dit_config"
         else:
             raise ValueError(f"Invalid module name: {component_name}")
@@ -193,7 +208,15 @@ class TransformerLoader(ComponentLoader):
             component_model_path=component_model_path,
             model_cls=model_cls,
             cls_name=cls_name,
+            component_name=component_name,
         )
+        # Quantization adapters may require resident weights, so placement must
+        # be resolved after they have validated the component configuration.
+        component_starts_on_cpu = (
+            server_args.should_start_component_on_cpu(component_name)
+            or cpu_offload_flag
+        )
+        use_fsdp = server_args.should_use_fsdp_for_component(component_name)
 
         logger.info(
             "Loading %s from %s safetensors file(s) %s, param_dtype: %s",
@@ -253,10 +276,14 @@ class TransformerLoader(ComponentLoader):
             logger.debug("quantization config: %s", init_params["quant_config"])
 
         local_torch_device = get_local_torch_device()
-        checkpoint_load_device = _resolve_checkpoint_load_device(
-            local_torch_device,
-            component_cpu_offload=bool(component_server_args.dit_cpu_offload),
-            runtime_quant_config=quant_spec.runtime_quant_config,
+        checkpoint_load_device = (
+            torch.device("cpu")
+            if cpu_offload_flag
+            else _resolve_checkpoint_load_device(
+                local_torch_device,
+                component_starts_on_cpu=component_starts_on_cpu,
+                runtime_quant_config=quant_spec.runtime_quant_config,
+            )
         )
         direct_gpu_weight_loading = bool(
             component_server_args.direct_gpu_weight_loading
@@ -268,8 +295,11 @@ class TransformerLoader(ComponentLoader):
         weight_load_plan = WeightLoadPlan.for_component(
             checkpoint_load_device=checkpoint_load_device,
             needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
-            component_cpu_offload=bool(component_server_args.dit_cpu_offload),
+            component_starts_on_cpu=component_starts_on_cpu,
             load_full_state_dict_on_device=direct_gpu_weight_loading,
+            mps_layerwise_cpu_staging=bool(
+                cpu_offload_flag and current_platform.is_mps()
+            ),
         )
         if direct_gpu_weight_loading:
             logger.warning(
@@ -304,9 +334,9 @@ class TransformerLoader(ComponentLoader):
                 device=local_torch_device,
                 hsdp_replicate_dim=server_args.hsdp_replicate_dim,
                 hsdp_shard_dim=server_args.hsdp_shard_dim,
-                cpu_offload=component_server_args.dit_cpu_offload,
+                component_starts_on_cpu=component_starts_on_cpu,
                 pin_cpu_memory=component_server_args.pin_cpu_memory,
-                fsdp_inference=component_server_args.use_fsdp_inference,
+                fsdp_inference=use_fsdp,
                 param_dtype=quant_spec.param_dtype,
                 reduce_dtype=torch.float32,
                 output_dtype=None,
