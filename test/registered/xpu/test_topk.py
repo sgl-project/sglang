@@ -28,6 +28,11 @@ from sglang.test.test_utils import CustomTestCase
 register_xpu_ci(est_time=5, suite="stage-b-test-1-gpu-xpu")
 
 
+def _set_seed_and_device():
+    torch.manual_seed(1024)
+    return torch.device("xpu")
+
+
 def _scatter_by_expert(
     weights: torch.Tensor, indices: torch.Tensor, num_columns: int
 ) -> torch.Tensor:
@@ -90,8 +95,7 @@ class TestBiasedGroupedTopK(CustomTestCase):
         bias_dtype,
         routed_scaling_factor,
     ):
-        torch.manual_seed(1024)
-        device = torch.device("xpu")
+        device = _set_seed_and_device()
 
         # expand gating_output by M, otherwise bfloat16 fall into same value aftering truncating
         hidden_states = torch.randn(M, 100, dtype=torch.bfloat16, device=device)
@@ -169,8 +173,7 @@ class TestBiasedGroupedTopK(CustomTestCase):
         renormalize = True
         routed_scaling_factor = 2.5
 
-        torch.manual_seed(1024)
-        device = torch.device("xpu")
+        device = _set_seed_and_device()
 
         bs = [1, 2, 4, 8]
         seq_len = 1024
@@ -231,8 +234,7 @@ class TestBiasedGroupedTopK(CustomTestCase):
         renormalize = True
         routed_scaling_factor = 2.5
 
-        torch.manual_seed(1024)
-        device = torch.device("xpu")
+        device = _set_seed_and_device()
 
         bs = [1]
         seq_len = 1024
@@ -285,11 +287,10 @@ class TestBiasedGroupedTopK(CustomTestCase):
         gating_dtype = torch.float32
         bias_dtype = torch.float32
         renormalize = True
-        scoring_func = "sqrtsoftplus"
+        scoring_func_list = ["sqrtsoftplus", "sigmoid"]
         routed_scaling_factor = 2.5
 
-        torch.manual_seed(1024)
-        device = torch.device("xpu")
+        device = _set_seed_and_device()
 
         bs = [1]
         seq_len = 1024
@@ -298,61 +299,61 @@ class TestBiasedGroupedTopK(CustomTestCase):
 
         for E_num in E_num_list:
             for M in num_tokens:
-                for num_fused_shared_experts in num_fused_shared_experts_list:
+                for scoring_func in scoring_func_list:
+                    for num_fused_shared_experts in num_fused_shared_experts_list:
 
-                    topk_routed = topk_value - num_fused_shared_experts
-                    hidden_states = torch.randn(
-                        M, 100, dtype=gating_dtype, device=device
-                    )
-                    gating_output = torch.randn(
-                        M, E_num, dtype=gating_dtype, device=device
-                    )
-                    correction_bias = torch.randn(
-                        E_num, dtype=bias_dtype, device=device
-                    )
+                        topk_routed = topk_value - num_fused_shared_experts
+                        hidden_states = torch.randn(
+                            M, 100, dtype=gating_dtype, device=device
+                        )
+                        gating_output = torch.randn(
+                            M, E_num, dtype=gating_dtype, device=device
+                        )
+                        correction_bias = torch.randn(
+                            E_num, dtype=bias_dtype, device=device
+                        )
 
-                    ref_topk_weights, ref_topk_ids = native_biased_topk(
-                        hidden_states,
-                        gating_output,
-                        correction_bias,
-                        topk_value,
-                        renormalize,
-                        scoring_func,
-                        num_fused_shared_experts,
-                        routed_scaling_factor,
-                        apply_routed_scaling_factor_on_output=True,
-                    )
+                        ref_topk_weights, ref_topk_ids = native_biased_topk(
+                            hidden_states,
+                            gating_output,
+                            correction_bias,
+                            topk_value,
+                            renormalize,
+                            scoring_func,
+                            num_fused_shared_experts,
+                            routed_scaling_factor,
+                            apply_routed_scaling_factor_on_output=True,
+                        )
 
-                    # fused version
-                    topk_weights, topk_ids = biased_topk_xpu(
-                        hidden_states,
-                        gating_output,
-                        correction_bias,
-                        topk_value,
-                        renormalize,
-                        scoring_func,
-                        num_fused_shared_experts,
-                        routed_scaling_factor,
-                        apply_routed_scaling_factor_on_output=True,
-                    )
+                        # fused version
+                        topk_weights, topk_ids = biased_topk_xpu(
+                            hidden_states,
+                            gating_output,
+                            correction_bias,
+                            topk_value,
+                            renormalize,
+                            scoring_func,
+                            num_fused_shared_experts,
+                            routed_scaling_factor,
+                            apply_routed_scaling_factor_on_output=True,
+                        )
 
-                    torch.testing.assert_close(
-                        _scatter_by_expert(
-                            topk_weights[:, :topk_routed],
-                            topk_ids[:, :topk_routed],
-                            E_num,
-                        ),
-                        _scatter_by_expert(
-                            ref_topk_weights[:, :topk_routed],
-                            ref_topk_ids[:, :topk_routed],
-                            E_num,
-                        ),
-                    )
+                        torch.testing.assert_close(
+                            _scatter_by_expert(
+                                topk_weights[:, :topk_routed],
+                                topk_ids[:, :topk_routed],
+                                E_num,
+                            ),
+                            _scatter_by_expert(
+                                ref_topk_weights[:, :topk_routed],
+                                ref_topk_ids[:, :topk_routed],
+                                E_num,
+                            ),
+                        )
 
     def test_hash_topk(self):
         """Guard the XPU fused hash-topk path against math/ID drift from torch."""
-        torch.manual_seed(1024)
-        device = torch.device("xpu")
+        device = _set_seed_and_device()
 
         E_num_list = [256, 384]
         topk = 6

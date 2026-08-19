@@ -1319,8 +1319,10 @@ def biased_topk_xpu(
         scoring_func,
         num_fused_shared_experts,
         renormalize,
-        routed_scaling_factor,
-        apply_routed_scaling_factor_on_output,
+        routed_scaling_factor=(routed_scaling_factor if routed_scaling_factor else 1.0),
+        apply_routed_scaling_factor_on_output=bool(
+            apply_routed_scaling_factor_on_output
+        ),
     )
 
     return output, indices
