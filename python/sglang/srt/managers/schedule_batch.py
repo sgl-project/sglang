@@ -1006,6 +1006,12 @@ class Req(ReqDllmMixin):
         # Whether the UniBoost gamma-Ada controller already recorded this
         # request's end-to-end latency (set in uniboost_record_finished).
         self.uniboost_latency_recorded = False
+        # UniBoost rank-invariant mode (tp_size > 1): arrival sequence number
+        # and forward-step count at first scheduling pass; assigned by
+        # SchedulePolicy._uniboost_assign_arrival_seq, identical on every TP
+        # rank because the broadcast request stream order is identical.
+        self.uniboost_arrival_seq: Optional[int] = None
+        self.uniboost_enqueue_step: Optional[int] = None
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref

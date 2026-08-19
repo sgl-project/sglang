@@ -538,8 +538,16 @@ class Envs:
     SGLANG_UNIBOOST_GAMMA = EnvFloat(10.0)
     # Estimated prefill cost per uncached prompt token, in microseconds.
     SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN = EnvFloat(64.0)
-    # Allow uniboost with tp_size > 1 (experimental; see schedule_policy.py).
+    # Deprecated no-op: rank-invariant uniboost is now the default for
+    # tp_size > 1 (see schedule_policy.py). Kept so existing deployments that
+    # set it keep working; setting it only logs a deprecation notice.
     SGLANG_UNIBOOST_ALLOW_TP = EnvBool(False)
+    # Escape hatch: force the legacy fcfs fallback for tp_size > 1 instead of
+    # the rank-invariant uniboost mode.
+    SGLANG_UNIBOOST_FORCE_FCFS_TP = EnvBool(False)
+    # Rank-invariant mode (tp_size > 1): pseudo-seconds per arrival sequence
+    # step, so the arrival term trades sanely against the boost b_gamma.
+    SGLANG_UNIBOOST_TP_ARRIVAL_STEP_S = EnvFloat(0.01)
     # gamma-Ada: adapt gamma online to the observed latency-tail shape.
     SGLANG_UNIBOOST_GAMMA_ADA = EnvBool(False)
     SGLANG_UNIBOOST_GAMMA_MIN = EnvFloat(1.0)
@@ -549,6 +557,10 @@ class Envs:
     SGLANG_UNIBOOST_GAMMA_ADA_MIN_SAMPLES = EnvInt(200)
     SGLANG_UNIBOOST_GAMMA_ADA_BETA = EnvFloat(0.3)
     SGLANG_UNIBOOST_TAIL_SENSITIVITY = EnvFloat(4.0)
+    # Rank-invariant mode (tp_size > 1): gamma-Ada refits synchronously every
+    # K recorded completions (a deterministic completion-count trigger)
+    # instead of on the wall-clock daemon thread.
+    SGLANG_UNIBOOST_GAMMA_ADA_REFIT_EVERY_K = EnvInt(256)
     # Frontier-K cheap matching: per scheduling pass, re-run radix prefix
     # matching only for the top-K sorted candidates (the admission frontier);
     # deeper entries keep their last-known match. <=0 = full-queue matching.
