@@ -164,6 +164,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         prefix: str,
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
         if isinstance(layer, LinearBase):
             # If linear_fp8_config is set, use FP8 for linear layers
@@ -175,6 +176,17 @@ class CompressedTensorsConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             layer.scheme = scheme
             return CompressedTensorsLinearMethod(self)
+
+        # ParallelLMHead inherits VocabParallelEmbedding, but its weights are
+        # consumed as a linear projection by the sampler. Quantized checkpoints
+        # therefore provide packed linear weights rather than an embedding weight.
+        if isinstance(layer, ParallelLMHead):
+            scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
+            if scheme is None:
+                return UnquantizedLinearMethod()
+            layer.scheme = scheme
+            return CompressedTensorsLinearMethod(self)
+
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, FusedMoE):

@@ -18,6 +18,7 @@ import torch
 
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
+    CompressedTensorsLinearMethod,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16,
@@ -26,6 +27,7 @@ from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
     should_ignore_layer,
 )
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.test.test_utils import CustomTestCase
 
 EXPERTS_LAYER = "model.language_model.layers.0.mlp.experts"
@@ -186,6 +188,51 @@ class TestMixedPrecisionFormat(CustomTestCase):
         self.assertEqual(scheme.pack_factor, 32 // 4)
         self.assertEqual(scheme.strategy, "group")
         self.assertEqual(scheme.group_size, 128)
+
+
+class TestQuantizedParallelLMHead(CustomTestCase):
+    """A quantized lm_head must use the linear compressed-tensors path."""
+
+    def test_quantized_lm_head_uses_linear_method(self):
+        config = _mixed_precision_config(
+            {
+                **WNA16_GROUP,
+                "targets": ["lm_head"],
+            }
+        )
+        quant_config = CompressedTensorsConfig.from_config(config)
+
+        with mock.patch.object(
+            CompressedTensorsConfig, "_check_scheme_supported", return_value=True
+        ):
+            lm_head = ParallelLMHead(
+                64,
+                128,
+                params_dtype=torch.float16,
+                quant_config=quant_config,
+                prefix="lm_head",
+                enable_tp=False,
+            )
+
+        self.assertIsInstance(lm_head.quant_method, CompressedTensorsLinearMethod)
+        self.assertIsInstance(lm_head.scheme, CompressedTensorsWNA16)
+        self.assertFalse(hasattr(lm_head, "weight"))
+
+        loaded_weight = torch.arange(
+            lm_head.weight_packed.numel(), dtype=torch.int32
+        ).reshape_as(lm_head.weight_packed)
+        loaded_scale = torch.arange(
+            lm_head.weight_scale.numel(), dtype=torch.float16
+        ).reshape_as(lm_head.weight_scale)
+        loaded_shape = torch.tensor([64, 128], dtype=torch.int64)
+
+        for param, loaded in (
+            (lm_head.weight_packed, loaded_weight),
+            (lm_head.weight_scale, loaded_scale),
+            (lm_head.weight_shape, loaded_shape),
+        ):
+            param.weight_loader(param, loaded)
+            self.assertTrue(torch.equal(param, loaded))
 
 
 if __name__ == "__main__":
