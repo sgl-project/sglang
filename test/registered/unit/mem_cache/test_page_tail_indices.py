@@ -61,29 +61,24 @@ class TestWritePageTailIndices(CustomTestCase):
                 write_page_tail_indices(rtt, req_pool_indices, write_ends, page_size)
 
                 offsets = torch.arange(_ROW_WIDTH, dtype=rtt.dtype) % page_size
-                for row, end in zip(req_pool_indices.tolist(), write_ends.tolist()):
+                touched = req_pool_indices.tolist()
+                for row, end in zip(touched, write_ends.tolist()):
                     ceiling = -(-end // page_size) * page_size
                     where = f"{page_size=} {row=} {end=}"
+                    after, prior = rtt[row], before[row]
+
+                    page_offsets = after[:ceiling] % page_size
+                    tail_pages = after[end:ceiling] // page_size
+                    last_page = after[end - 1] // page_size
+
+                    self.assertTrue(torch.equal(page_offsets, offsets[:ceiling]), where)
+                    self.assertTrue(torch.all(tail_pages == last_page), where)
+                    self.assertTrue(torch.equal(after[:end], prior[:end]), where)
                     self.assertTrue(
-                        torch.equal(rtt[row, :ceiling] % page_size, offsets[:ceiling]),
-                        where,
-                    )
-                    if ceiling > end:
-                        self.assertTrue(
-                            torch.all(
-                                rtt[row, end:ceiling] // page_size
-                                == rtt[row, end - 1] // page_size
-                            ),
-                            where,
-                        )
-                    self.assertTrue(torch.equal(rtt[row, :end], before[row, :end]))
-                    self.assertTrue(
-                        torch.equal(rtt[row, ceiling:], before[row, ceiling:]), where
+                        torch.equal(after[ceiling:], prior[ceiling:]), where
                     )
 
-                untouched = sorted(
-                    set(range(num_rows)) - set(req_pool_indices.tolist())
-                )
+                untouched = [r for r in range(num_rows) if r not in touched]
                 self.assertTrue(torch.equal(rtt[untouched], before[untouched]))
 
 
