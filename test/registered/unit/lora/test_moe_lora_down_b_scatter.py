@@ -458,7 +458,6 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
     from sglang.srt.lora.moe.lora_b import one_launch_sliced_lora_b
     from sglang.srt.lora.moe.route_view import RouteViewKind
     from sglang.srt.lora.moe.routing import (
-        _only,
         build_virtual_expert_routing,
     )
 
@@ -480,15 +479,13 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
             "down_rows": down_rows,
         }.items()
     }
-    aligned = _only(
-        build_virtual_expert_routing(
-            gpu["topk_ids"],
-            gpu["token_lora_mapping"],
-            num_local_experts=num_experts,
-            max_loras=_SLOTS,
-            block_size=16,
-            view=RouteViewKind.ALIGNED,
-        )
+    aligned, _ = build_virtual_expert_routing(
+        gpu["topk_ids"],
+        gpu["token_lora_mapping"],
+        num_local_experts=num_experts,
+        max_loras=_SLOTS,
+        block_size=16,
+        view=RouteViewKind.ALIGNED,
     )
 
     # Shipped tail: one-launch down-B writes the materialized LoRA delta,
@@ -560,15 +557,13 @@ def test_scatter_matches_the_standalone_downb_plus_post_reorder(
     # Base-only traffic: the launch is a bitwise no-op on the base rows and
     # the outputs collapse to the plain base combine.
     base_slots = torch.full_like(gpu["token_lora_mapping"], -1)
-    aligned_base = _only(
-        build_virtual_expert_routing(
-            gpu["topk_ids"],
-            base_slots,
-            num_local_experts=num_experts,
-            max_loras=_SLOTS,
-            block_size=16,
-            view=RouteViewKind.ALIGNED,
-        )
+    aligned_base, _ = build_virtual_expert_routing(
+        gpu["topk_ids"],
+        base_slots,
+        num_local_experts=num_experts,
+        max_loras=_SLOTS,
+        block_size=16,
+        view=RouteViewKind.ALIGNED,
     )
     scattered_base = gpu["down_rows"].clone()
     invoke_down_b_scatter(
@@ -591,22 +586,19 @@ def test_scatter_rejects_a_mismatched_route_block() -> None:
     )
     from sglang.srt.lora.moe.route_view import RouteViewKind
     from sglang.srt.lora.moe.routing import (
-        _only,
         build_virtual_expert_routing,
     )
 
     device = torch.device("cuda")
     topk_ids, token_lora_mapping, _weights, bridge, b_down = _kernel_case(4, 2, 4, 7)
     src2dst, down_rows = _src2dst_rows(topk_ids, 4, "masked", 7)
-    aligned = _only(
-        build_virtual_expert_routing(
-            topk_ids.to(device),
-            token_lora_mapping.to(device),
-            num_local_experts=4,
-            max_loras=_SLOTS,
-            block_size=32,
-            view=RouteViewKind.ALIGNED,
-        )
+    aligned, _ = build_virtual_expert_routing(
+        topk_ids.to(device),
+        token_lora_mapping.to(device),
+        num_local_experts=4,
+        max_loras=_SLOTS,
+        block_size=32,
+        view=RouteViewKind.ALIGNED,
     )
     with pytest.raises(ValueError, match="BLOCK_SIZE_M"):
         invoke_down_b_scatter(

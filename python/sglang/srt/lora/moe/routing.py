@@ -5,7 +5,8 @@ outer factors -- either raw or sorted into whole blocks. build_routes asks for
 what the plan declared, build_virtual_expert_routing decides how each grouping
 gets built, and _build_aligned does the block-aligned work in three kernels from
 route_kernels.py. Sorting earns its own kernels only above the thresholds below;
-under them the JIT align is cheaper.
+under them the shared CUDA align is cheaper -- and above 8191 buckets it is the
+only option, because that kernel asserts it cannot take more.
 """
 
 from __future__ import annotations
@@ -32,8 +33,9 @@ from sglang.srt.lora.moe.route_kernels import (
 from sglang.srt.lora.moe.route_view import RouteView, RouteViewKind
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
-# Smallest bucket count (V) and pair count (P) at which the fused align
-# builder beats the JIT one; either alone is enough to switch.
+# Smallest bucket count (V) and pair count (P) at which our three kernels beat
+# the shared CUDA align; either alone is enough to switch, and V is also that
+# kernel's own hard ceiling.
 FUSED_ALIGN_MIN_VIRTUAL_EXPERTS = 8192
 FUSED_ALIGN_MIN_PAIRS = 16384
 
@@ -341,8 +343,8 @@ def build_virtual_expert_routing(
     }
     lora_experts_per_adapter = 1 if is_shared_outer else num_local_experts
     if view is RouteViewKind.RAW:
-        raw = RouteView(**common)
-        return (None, raw) if is_shared_outer else (raw, None)
+        route = RouteView(**common)
+        return (None, route) if is_shared_outer else (route, None)
 
     num_virtual = lora_experts_per_adapter * max_loras
     if (
@@ -378,19 +380,13 @@ def build_virtual_expert_routing(
     sorted_pair_ids, block_virtual_expert_ids, num_pairs_post_padded = (
         _align_block_size_jit(virtual_topk_ids, block_size, num_virtual)
     )
-    jit = RouteView(
+    route = RouteView(
         **common,
         maybe_sorted_pair_ids=sorted_pair_ids,
         maybe_block_virtual_expert_ids=block_virtual_expert_ids,
         maybe_num_pairs_post_padded=num_pairs_post_padded,
     )
-    return (None, jit) if is_shared_outer else (jit, None)
-
-
-def _only(pair: tuple[RouteView | None, RouteView | None]) -> RouteView:
-    """The single route a non-joint build produced."""
-    per_expert, shared = pair
-    return shared if per_expert is None else per_expert
+    return (None, route) if is_shared_outer else (route, None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,27 +429,23 @@ def build_routes(
     requirements = plan.route_requirements()
     values: dict[str, object] = {}
     if RouteRequirement.RAW_PER_EXPERT in requirements:
-        values["raw_per_expert"] = _only(
-            build_virtual_expert_routing(
-                topk_ids,
-                token_lora_mapping,
-                num_local_experts=num_local_experts,
-                max_loras=max_loras,
-                block_size=block_size,
-                view=RouteViewKind.RAW,
-            )
+        values["raw_per_expert"], _ = build_virtual_expert_routing(
+            topk_ids,
+            token_lora_mapping,
+            num_local_experts=num_local_experts,
+            max_loras=max_loras,
+            block_size=block_size,
+            view=RouteViewKind.RAW,
         )
     if RouteRequirement.RAW_SHARED_OUTER in requirements:
-        values["raw_shared_outer"] = _only(
-            build_virtual_expert_routing(
-                topk_ids,
-                token_lora_mapping,
-                num_local_experts=num_local_experts,
-                is_shared_outer=True,
-                max_loras=max_loras,
-                block_size=block_size,
-                view=RouteViewKind.RAW,
-            )
+        _, values["raw_shared_outer"] = build_virtual_expert_routing(
+            topk_ids,
+            token_lora_mapping,
+            num_local_experts=num_local_experts,
+            is_shared_outer=True,
+            max_loras=max_loras,
+            block_size=block_size,
+            view=RouteViewKind.RAW,
         )
 
     if plan.route_builder is RouteBuilderFamily.JOINT_SHARED_OUTER:
@@ -471,31 +463,27 @@ def build_routes(
         values["aligned_shared_outer"] = shared
     else:
         if RouteRequirement.ALIGNED_PER_EXPERT in requirements:
-            values["aligned_per_expert"] = _only(
-                build_virtual_expert_routing(
-                    topk_ids,
-                    token_lora_mapping,
-                    num_local_experts=num_local_experts,
-                    max_loras=max_loras,
-                    block_size=block_size,
-                    view=RouteViewKind.ALIGNED,
-                    workspace=workspace,
-                    tensor_prefix="route:aligned_per_expert",
-                )
+            values["aligned_per_expert"], _ = build_virtual_expert_routing(
+                topk_ids,
+                token_lora_mapping,
+                num_local_experts=num_local_experts,
+                max_loras=max_loras,
+                block_size=block_size,
+                view=RouteViewKind.ALIGNED,
+                workspace=workspace,
+                tensor_prefix="route:aligned_per_expert",
             )
         if RouteRequirement.ALIGNED_SHARED_OUTER in requirements:
-            values["aligned_shared_outer"] = _only(
-                build_virtual_expert_routing(
-                    topk_ids,
-                    token_lora_mapping,
-                    num_local_experts=num_local_experts,
-                    is_shared_outer=True,
-                    max_loras=max_loras,
-                    block_size=block_size,
-                    view=RouteViewKind.ALIGNED,
-                    workspace=workspace,
-                    tensor_prefix="route:aligned_shared_outer",
-                )
+            _, values["aligned_shared_outer"] = build_virtual_expert_routing(
+                topk_ids,
+                token_lora_mapping,
+                num_local_experts=num_local_experts,
+                is_shared_outer=True,
+                max_loras=max_loras,
+                block_size=block_size,
+                view=RouteViewKind.ALIGNED,
+                workspace=workspace,
+                tensor_prefix="route:aligned_shared_outer",
             )
 
     if RouteRequirement.SHARED_TOKEN_PLAN in requirements:
@@ -519,18 +507,16 @@ def build_routes(
             device=topk_ids.device,
             zero_on_first_allocation=True,
         )
-        values["shared_token"] = _only(
-            build_virtual_expert_routing(
-                token_experts,
-                shared_token_lora_mapping,
-                num_local_experts=num_local_experts,
-                is_shared_outer=True,
-                max_loras=max_loras,
-                block_size=block_size,
-                view=RouteViewKind.ALIGNED,
-                workspace=workspace,
-                tensor_prefix="route:shared_token",
-            )
+        _, values["shared_token"] = build_virtual_expert_routing(
+            token_experts,
+            shared_token_lora_mapping,
+            num_local_experts=num_local_experts,
+            is_shared_outer=True,
+            max_loras=max_loras,
+            block_size=block_size,
+            view=RouteViewKind.ALIGNED,
+            workspace=workspace,
+            tensor_prefix="route:shared_token",
         )
 
     return MoeLoraRoutes(**values)

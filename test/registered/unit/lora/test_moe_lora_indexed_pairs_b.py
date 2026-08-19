@@ -38,10 +38,7 @@ from sglang.srt.lora.moe.lora_b import (
     run_lora_b,
 )
 from sglang.srt.lora.moe.route_view import RouteView, RouteViewKind
-from sglang.srt.lora.moe.routing import (
-    _only,
-    build_virtual_expert_routing,
-)
+from sglang.srt.lora.moe.routing import build_virtual_expert_routing
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
@@ -94,21 +91,17 @@ def _views(topk_ids, token_lora_mapping, num_experts, device):
         max_loras=_SLOTS,
         block_size=16,
     )
-    aligned = _only(
-        build_virtual_expert_routing(
-            topk_ids.to(device),
-            token_lora_mapping.to(device),
-            view=RouteViewKind.ALIGNED,
-            **kwargs,
-        )
+    aligned, _ = build_virtual_expert_routing(
+        topk_ids.to(device),
+        token_lora_mapping.to(device),
+        view=RouteViewKind.ALIGNED,
+        **kwargs,
     )
-    raw = _only(
-        build_virtual_expert_routing(
-            topk_ids.to(device),
-            token_lora_mapping.to(device),
-            view=RouteViewKind.RAW,
-            **kwargs,
-        )
+    raw, _ = build_virtual_expert_routing(
+        topk_ids.to(device),
+        token_lora_mapping.to(device),
+        view=RouteViewKind.RAW,
+        **kwargs,
     )
     return aligned, raw
 

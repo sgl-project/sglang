@@ -5,10 +5,7 @@ import unittest
 import torch
 
 from sglang.srt.lora.moe.route_view import RouteViewKind
-from sglang.srt.lora.moe.routing import (
-    _only,
-    build_virtual_expert_routing,
-)
+from sglang.srt.lora.moe.routing import build_virtual_expert_routing
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -75,18 +72,17 @@ class TestMoeLoraRouting(CustomTestCase):
         view=RouteViewKind.ALIGNED,
     ):
         # A real workspace, since the fused builder requires one.
-        return _only(
-            build_virtual_expert_routing(
-                torch.tensor(topk_ids, dtype=dtype, device=self.device),
-                torch.tensor(adapters, dtype=dtype, device=self.device),
-                num_local_experts=num_local_experts,
-                max_loras=max_loras,
-                block_size=block_size,
-                view=view,
-                workspace=MoeLoraWorkspace(),
-                tensor_prefix="test:route",
-            )
+        per_expert, _ = build_virtual_expert_routing(
+            torch.tensor(topk_ids, dtype=dtype, device=self.device),
+            torch.tensor(adapters, dtype=dtype, device=self.device),
+            num_local_experts=num_local_experts,
+            max_loras=max_loras,
+            block_size=block_size,
+            view=view,
+            workspace=MoeLoraWorkspace(),
+            tensor_prefix="test:route",
         )
+        return per_expert
 
     def test_narrower_views_refuse_fields_they_did_not_build(self):
         """A view must not silently hand back a field it never computed.
@@ -187,7 +183,6 @@ class TestMoeLoraRouting(CustomTestCase):
         from sglang.srt.lora.moe.routing import (
             FUSED_ALIGN_MIN_PAIRS,
             FUSED_ALIGN_MIN_VIRTUAL_EXPERTS,
-            _only,
             build_virtual_expert_routing,
         )
 
@@ -230,17 +225,15 @@ class TestMoeLoraRouting(CustomTestCase):
                         return original(*args, **kwargs)
 
                     routing_module._build_aligned = spy
-                    route = _only(
-                        build_virtual_expert_routing(
-                            ids,
-                            slots,
-                            num_local_experts=num_local_experts,
-                            max_loras=32,
-                            block_size=16,
-                            view=RouteViewKind.ALIGNED,
-                            workspace=MoeLoraWorkspace(),
-                            tensor_prefix="test:route",
-                        )
+                    route, _ = build_virtual_expert_routing(
+                        ids,
+                        slots,
+                        num_local_experts=num_local_experts,
+                        max_loras=32,
+                        block_size=16,
+                        view=RouteViewKind.ALIGNED,
+                        workspace=MoeLoraWorkspace(),
+                        tensor_prefix="test:route",
                     )
                 finally:
                     routing_module._build_aligned = original
@@ -288,17 +281,15 @@ class TestMoeLoraRouting(CustomTestCase):
                     generator=generator,
                     dtype=torch.int32,
                 ).to(self.device)
-                route = _only(
-                    build_virtual_expert_routing(
-                        topk_ids,
-                        token_lora_mapping,
-                        num_local_experts=num_local_experts,
-                        max_loras=max_loras,
-                        block_size=16,
-                        view=RouteViewKind.ALIGNED,
-                        workspace=MoeLoraWorkspace(),
-                        tensor_prefix="test:route",
-                    )
+                route, _ = build_virtual_expert_routing(
+                    topk_ids,
+                    token_lora_mapping,
+                    num_local_experts=num_local_experts,
+                    max_loras=max_loras,
+                    block_size=16,
+                    view=RouteViewKind.ALIGNED,
+                    workspace=MoeLoraWorkspace(),
+                    tensor_prefix="test:route",
                 )
                 num_pairs = num_tokens * top_k
                 keys = (
