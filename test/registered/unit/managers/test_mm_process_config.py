@@ -180,6 +180,15 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         self.assertEqual(proc.mm_processor_worker_num, 2)
         self.assertIsNotNone(proc.mm_processor_executor)
 
+    def test_clone_resolves_tokenizer_like_init(self):
+        proc = self._make_processor({})
+
+        wrapping = MagicMock()
+        self.assertIs(proc._resolve_processor(wrapping)[1], wrapping.tokenizer)
+
+        bare = MagicMock(spec=["encode"])
+        self.assertIs(proc._resolve_processor(bare)[1], bare)
+
     def test_explicit_io_worker_count_overrides_auto(self):
         from sglang.srt.multimodal.processors.base_processor import (
             BaseMultimodalProcessor,
@@ -709,6 +718,7 @@ class TestOverrideProcessorsConfigInjection(CustomTestCase):
         proc.disable_fast_image_processor = server_args.disable_fast_image_processor
         proc.skip_tokenizer_init = server_args.skip_tokenizer_init
         proc._processor = mock_hf_processor
+        proc._tokenizer = mock_hf_processor.tokenizer
         proc.image_config = mm_process_config.get("image", {})
         proc.video_config = mm_process_config.get("video", {})
         proc.audio_config = mm_process_config.get("audio", {})

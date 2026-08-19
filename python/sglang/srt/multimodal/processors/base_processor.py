@@ -190,6 +190,17 @@ class MultimodalSpecialTokens:
         return self.combined_regex
 
 
+def _tokenizer_of(processor):
+    """The tokenizer reached from an HF processor.
+
+    Some processors (e.g. InternVL) are handed a tokenizer directly as their
+    ``_processor`` rather than one that wraps a tokenizer. Every path that
+    resolves a tokenizer -- construction and per-worker processor clones alike --
+    goes through here, so a clone cannot resolve differently from the original.
+    """
+    return processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
@@ -284,12 +295,7 @@ class BaseMultimodalProcessor(ABC):
                 "trusted" if self.trust_mm_content_hashes else "verified",
             )
 
-        # Resolve tokenizer: some processors (e.g. InternVL) pass a tokenizer
-        # directly as _processor rather than a processor that wraps a tokenizer.
-        if hasattr(self._processor, "tokenizer"):
-            self._tokenizer = self._processor.tokenizer
-        else:
-            self._tokenizer = self._processor
+        self._tokenizer = _tokenizer_of(self._processor)
 
         # Same guard as in serving_chat.py against double BOS.
         try:
@@ -606,7 +612,7 @@ class BaseMultimodalProcessor(ABC):
     def _resolve_processor(self, processor=None):
         if processor is None:
             return self._processor, self._tokenizer
-        return processor, processor.tokenizer
+        return processor, _tokenizer_of(processor)
 
     def _fast_image_processor_device(self, processor) -> Optional[str]:
         """The device for the fast image processor, or None to leave it unset.
