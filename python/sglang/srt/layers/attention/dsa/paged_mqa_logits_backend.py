@@ -9,6 +9,7 @@ class DSAPagedMQALogitsBackend(Enum):
     DEEPGEMM = "deepgemm"
     CUTEDSL = "cutedsl"
     AITER = "aiter"
+    TORCH = "torch"
 
     def is_deepgemm(self) -> bool:
         return self == DSAPagedMQALogitsBackend.DEEPGEMM
@@ -18,6 +19,15 @@ class DSAPagedMQALogitsBackend(Enum):
 
     def is_aiter(self) -> bool:
         return self == DSAPagedMQALogitsBackend.AITER
+
+    def is_torch(self) -> bool:
+        return self == DSAPagedMQALogitsBackend.TORCH
+
+    def uses_deepgemm_metadata(self) -> bool:
+        return self in (
+            DSAPagedMQALogitsBackend.DEEPGEMM,
+            DSAPagedMQALogitsBackend.CUTEDSL,
+        )
 
     @staticmethod
     def resolve(value: str) -> DSAPagedMQALogitsBackend:
@@ -29,6 +39,8 @@ class DSAPagedMQALogitsBackend(Enum):
                 )
             return DSAPagedMQALogitsBackend.AITER
 
+        if value == "torch":
+            return DSAPagedMQALogitsBackend.TORCH
         if value == "auto" or value == "deepgemm":
             return DSAPagedMQALogitsBackend.DEEPGEMM
         if value == "aiter":

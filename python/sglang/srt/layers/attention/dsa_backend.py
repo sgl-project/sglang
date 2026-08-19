@@ -47,6 +47,9 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
+from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
+    DSAPagedMQALogitsBackend,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_round_robin_split,
     compute_dsa_seqlens,
@@ -278,6 +281,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
+    "torch",
     "trtllm",
 ]
 
@@ -339,6 +343,13 @@ class DeepseekSparseAttnBackend(
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
+        )
+        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
+            getattr(
+                model_runner.server_args,
+                "dsa_paged_mqa_logits_backend",
+                "auto",
+            )
         )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
@@ -402,6 +413,14 @@ class DeepseekSparseAttnBackend(
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+
+        if "torch" in (self.dsa_prefill_impl, self.dsa_decode_impl):
+            if self.kv_cache_dtype != torch.bfloat16:
+                raise ValueError(
+                    "The torch DSA attention backend currently requires "
+                    "--kv-cache-dtype bfloat16; got "
+                    f"kv_cache_dtype={self.kv_cache_dtype}."
+                )
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
         # runs FP8 (requires fp8_e4m3 KV) and is SM90-only, so validate both at
@@ -681,6 +700,8 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
+        if not self._uses_deepgemm_paged_mqa_metadata():
+            return
         new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32_2d, 64, deep_gemm.get_num_sms()
         )
@@ -688,6 +709,25 @@ class DeepseekSparseAttnBackend(
             object.__setattr__(metadata, "paged_mqa_schedule_metadata", new_schedule)
         else:
             metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+
+    def _build_paged_mqa_schedule_metadata(
+        self, seqlens_32_2d: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        if not self._uses_deepgemm_paged_mqa_metadata() or not is_cuda():
+            return None
+        return deep_gemm.get_paged_mqa_logits_metadata(
+            seqlens_32_2d, 64, deep_gemm.get_num_sms()
+        )
+
+    def _uses_deepgemm_paged_mqa_metadata(self) -> bool:
+        # Defaulting to DeepGEMM preserves the legacy behavior for lightweight
+        # test doubles constructed without running __init__.
+        backend = getattr(
+            self,
+            "paged_mqa_logits_backend",
+            DSAPagedMQALogitsBackend.DEEPGEMM,
+        )
+        return backend.uses_deepgemm_metadata()
 
     def _build_topk_v2_plan(
         self, seqlens_expanded: torch.Tensor
@@ -1019,10 +1059,14 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+        if (
+            self._uses_deepgemm_paged_mqa_metadata()
+            and is_cuda()
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_batch.forward_mode,
@@ -1033,8 +1077,8 @@ class DeepseekSparseAttnBackend(
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
             # require SPLIT_KV = 256; this is independent of the cache page size.
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+            paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
+                paged_mqa_ctx_lens_2d
             )
 
         metadata = DSAMetadata(
@@ -1368,16 +1412,20 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
+        if (
+            self._uses_deepgemm_paged_mqa_metadata()
+            and is_cuda()
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
+            )
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+            paged_mqa_schedule_metadata = self._build_paged_mqa_schedule_metadata(
+                paged_mqa_ctx_lens_2d
             )
 
         metadata = DSAMetadata(
@@ -1645,11 +1693,16 @@ class DeepseekSparseAttnBackend(
                 )
                 metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
 
-        # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if is_cuda() and (
+        paged_mqa_forward_mode = (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend_v2()
+        )
+        # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
+        if (
+            self._uses_deepgemm_paged_mqa_metadata()
+            and is_cuda()
+            and paged_mqa_forward_mode
         ):
             if forward_mode.is_draft_extend_v2():
                 schedule_seqlens_expanded = metadata.dsa_seqlens_expanded
@@ -1665,13 +1718,14 @@ class DeepseekSparseAttnBackend(
                     bs,
                 )
             self._refresh_paged_mqa_schedule_metadata(metadata, seqlens_32_2d)
-            self._refresh_topk_v2_plan(metadata)
             # `copy_` preserves the buffer's data_ptr that the captured graph captured.
             if not target_verify_ctx_lens_written:
                 if metadata.paged_mqa_ctx_lens_2d is None:
                     object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
                 else:
                     metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+        if is_cuda() and paged_mqa_forward_mode:
+            self._refresh_topk_v2_plan(metadata)
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.dsa_cache_seqlens_int32 is not None
@@ -2046,6 +2100,26 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
+        elif dsa_impl == "torch":
+            if topk_transform_method == TopkTransformMethod.RAGGED:
+                page_table_1 = topk_indices
+                if any(forward_batch.extend_prefix_lens_cpu):
+                    page_table_1_flattened = (
+                        self.forward_metadata.page_table_1_flattened
+                    )
+                    assert page_table_1_flattened is not None
+                    kv_cache = kv_cache.index_select(
+                        0, page_table_1_flattened.to(torch.long)
+                    )
+                else:
+                    kv_cache = _cat([k, k_rope], dim=-1)
+            return self._forward_torch_sparse_mla(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+            )
         elif dsa_impl in ("flashmla_sparse", "flashmla_sparse_q8"):
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 _has_prefix = any(forward_batch.extend_prefix_lens_cpu)
@@ -2281,6 +2355,14 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
                 topk_length=metadata.dsa_cache_seqlens_int32,
+            )
+        elif self.dsa_decode_impl == "torch":
+            return self._forward_torch_sparse_mla(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
             )
         elif self.dsa_decode_impl == "flashinfer_sparse_mla":
             if q_all is None:
@@ -2935,6 +3017,26 @@ class DeepseekSparseAttnBackend(
             indices=page_table_1.unsqueeze(1),
             sm_scale=sm_scale,
             d_v=v_head_dim,
+        )
+
+    def _forward_torch_sparse_mla(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        from sglang.kernels.ops.attention.dsa.torch_sparse_mla import (
+            torch_sparse_mla,
+        )
+
+        return torch_sparse_mla(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            kv_cache=kv_cache,
+            indices=page_table_1,
+            sm_scale=sm_scale,
         )
 
     def _forward_aiter(

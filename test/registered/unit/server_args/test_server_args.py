@@ -43,6 +43,29 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_torch_dsa_cli_choices_are_accepted(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--dsa-paged-mqa-logits-backend",
+                "torch",
+                "--dsa-prefill-backend",
+                "torch",
+                "--dsa-decode-backend",
+                "torch",
+                "--kv-cache-dtype",
+                "bfloat16",
+                "--disable-cuda-graph",
+            ]
+        )
+
+        self.assertEqual(args.dsa_paged_mqa_logits_backend, "torch")
+        self.assertEqual(args.dsa_prefill_backend, "torch")
+        self.assertEqual(args.dsa_decode_backend, "torch")
+        self.assertEqual(args.kv_cache_dtype, "bfloat16")
+        self.assertTrue(args.disable_cuda_graph)
+
     def test_return_hidden_states_mode_configuration(self):
         disabled = ServerArgs(model_path="dummy")
         self.assertFalse(disabled.enable_return_hidden_states)

@@ -354,6 +354,7 @@ DSA_CHOICES = [
     "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
+    "torch",
     "aiter",
     "trtllm",
 ]
@@ -361,7 +362,13 @@ NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
-DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
+DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = [
+    "auto",
+    "deepgemm",
+    "cutedsl",
+    "torch",
+    "aiter",
+]
 
 MAMBA_RADIX_CACHE_STRATEGY_CHOICES = [
     "auto",
@@ -1794,7 +1801,7 @@ class ServerArgs:
     dsa_prefill_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype. The 'torch' correctness backend is explicit opt-in, currently requires bfloat16 KV cache and eager execution, and disables overlap scheduling.",
             choices=DSA_CHOICES,
             resolvable=True,
         ),
@@ -1803,7 +1810,7 @@ class ServerArgs:
     dsa_decode_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype. The 'torch' correctness backend is explicit opt-in, currently requires bfloat16 KV cache and eager execution, and disables overlap scheduling.",
             choices=DSA_CHOICES,
             resolvable=True,
         ),
@@ -1812,7 +1819,7 @@ class ServerArgs:
     dsa_paged_mqa_logits_backend: A[
         str,
         Arg(
-            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'aiter' (ROCm only).",
+            help="DSA indexer paged MQA logits kernel backend. Options: 'auto' (default; DeepGEMM on CUDA, aiter on ROCm), 'deepgemm', 'cutedsl' (CuTe DSL kernel, SM 100 (Blackwell) only; wins at low batch size and long context), 'torch' (explicit correctness fallback; eager mode only), 'aiter' (ROCm only).",
             choices=DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES,
         ),
         NS("exec.kernel"),
