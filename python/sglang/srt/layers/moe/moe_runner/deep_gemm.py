@@ -1364,23 +1364,9 @@ def _varlen_deep_gemm_silu_mul_quant(
             down_input_scale = down_input_scale.transpose(-1, -2)
         return down_input, down_input_scale
 
-    # Default plain-silu path. Native DeepGEMM consumes packed/TMA column-major
-    # UE8M0 scales. FlashInfer's public batch API consumes contiguous FP32
-    # scales, so use the existing fused v2 quantizer in its ordinary FP32 mode.
+    # Keep the native packed UE8M0 quantization for every Blackwell backend.
+    # Public batch APIs receive a lossless FP32 expansion at the GEMM boundary.
     expected_m = ceil_div(num_real_tokens * topk, E) if num_real_tokens else None
-    if deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_STANDARD_SCALES:
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
-
-        return sglang_per_token_group_quant_fp8(
-            gateup_output,
-            group_size=group_size,
-            scale_ue8m0=False,
-            fuse_silu_and_mul=True,
-            masked_m=masked_m,
-        )
-
     return per_token_group_quant(
         gateup_output,
         group_size=group_size,
@@ -1388,7 +1374,7 @@ def _varlen_deep_gemm_silu_mul_quant(
         fuse_silu_and_mul=True,
         masked_m=masked_m,
         expected_m=expected_m,
-        column_major_scales=not deep_gemm_wrapper.DEEPGEMM_MASKED_FP8_STANDARD_SCALES,
+        column_major_scales=True,
     )
 
 

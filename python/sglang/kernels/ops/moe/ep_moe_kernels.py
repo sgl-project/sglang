@@ -1609,14 +1609,7 @@ def moe_ep_deepgemm_preprocess(
         )
         gateup_input_scale = gateup_input_scale.transpose(1, 2)
     elif is_fp8:
-        # The public batch API consumes the canonical contiguous FP32 scales.
-        # Its format is intentionally independent from the process-wide native
-        # DeepGEMM UE8M0 setting used by dense/attention layers.
-        hidden_states, scale = per_token_group_quant_fp8(
-            hidden_states,
-            block_k,
-            scale_ue8m0=False,
-        )
+        hidden_states, scale = per_token_group_quant_fp8(hidden_states, block_k)
         gateup_input_scale = torch.empty(
             (gateup_input.size(0), gateup_input.size(1), scale.size(1)),
             device=hidden_states.device,
