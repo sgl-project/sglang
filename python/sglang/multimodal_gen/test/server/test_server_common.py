@@ -51,10 +51,17 @@ from sglang.multimodal_gen.test.test_utils import (
     _consistency_gt_filenames,
     _get_consistency_gt_dir,
     action_gt_exists,
+    audio_gt_exists,
+    compare_audio_with_gt,
     compare_with_gt,
+    encode_audio_gt_wav,
+    extract_audio_pcm_from_video_bytes,
     extract_key_frames_from_video,
     get_action_consistency_gt_candidates,
     get_action_consistency_gt_remote_files,
+    get_audio_consistency_gt_candidates,
+    get_audio_consistency_gt_remote_files,
+    get_audio_consistency_thresholds,
     get_consistency_gt_candidates,
     get_consistency_gt_remote_files,
     get_consistency_threshold_path,
@@ -63,6 +70,7 @@ from sglang.multimodal_gen.test.test_utils import (
     gt_exists,
     image_bytes_to_numpy,
     load_action_consistency_gt,
+    load_audio_consistency_gt,
     load_consistency_gt,
     save_consistency_failure_artifact,
     save_missing_consistency_gt_artifact,
@@ -739,6 +747,67 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             f"max_mean_abs_diff={result.max_mean_abs_diff:.4f})"
         )
 
+        if case.sampling_params.expect_audio_output:
+            self._validate_audio_consistency(case, content)
+
+    def _validate_audio_consistency(
+        self,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> None:
+        num_gpus = case.server_args.num_gpus
+        output_audio = extract_audio_pcm_from_video_bytes(content)
+        if not audio_gt_exists(case.id, num_gpus):
+            artifact_dir = os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR")
+            if artifact_dir:
+                artifact_path = Path(artifact_dir) / (
+                    f"{case.id}_{num_gpus}gpu_audio.wav"
+                )
+                artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                artifact_path.write_bytes(encode_audio_gt_wav(output_audio))
+                logger.info("[Artifact] Saved missing audio GT: %s", artifact_path)
+            names = ", ".join(get_audio_consistency_gt_candidates(case.id, num_gpus))
+            pytest.fail(f"Audio GT not found for {case.id}. Expected one of: {names}")
+
+        gt_audio = load_audio_consistency_gt(case.id, num_gpus)
+        result = compare_audio_with_gt(
+            output_audio,
+            gt_audio,
+            get_audio_consistency_thresholds(case.id),
+        )
+        if not result.passed:
+            gt_remote_info = "\n".join(
+                f"    - {filename}: {url}"
+                for filename, url in get_audio_consistency_gt_remote_files(
+                    case.id, num_gpus
+                )
+            )
+            pytest.fail(
+                f"Audio consistency check failed for {case.id}:\n"
+                f"  Metrics: spectral_similarity={result.spectral_similarity:.4f}, "
+                f"waveform_correlation={result.waveform_correlation:.4f}, "
+                f"rms_db_diff={result.rms_db_diff:.4f}, "
+                f"duration_diff={result.duration_diff:.4f}s\n"
+                f"  Thresholds: spectral_similarity>="
+                f"{result.thresholds.spectral_similarity_threshold}, "
+                f"waveform_correlation>="
+                f"{result.thresholds.waveform_correlation_threshold}, "
+                f"rms_db_diff<={result.thresholds.rms_db_diff_threshold}, "
+                f"duration_diff<={result.thresholds.duration_diff_threshold}s\n"
+                f"  Compared GT files and links:\n{gt_remote_info}"
+            )
+
+        logger.info(
+            "[Consistency] %s: PASSED audio GT check "
+            "(spectral_similarity=%.4f, waveform_correlation=%.4f, "
+            "rms_db_diff=%.4f, duration_diff=%.4fs)",
+            case.id,
+            result.spectral_similarity,
+            result.waveform_correlation,
+            result.rms_db_diff,
+            result.duration_diff,
+        )
+
     def _extract_action_array(
         self,
         payload: dict[str, Any],
@@ -865,16 +934,22 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 logger.warning(
                     f"{case.id}: expected 3 frames, got {len(frames)}, skipping frame save"
                 )
-                return
+            else:
+                # Save frames (reuse naming from _consistency_gt_filenames)
+                filenames = _consistency_gt_filenames(case.id, num_gpus, is_video=True)
+                from PIL import Image
 
-            # Save frames (reuse naming from _consistency_gt_filenames)
-            filenames = _consistency_gt_filenames(case.id, num_gpus, is_video=True)
-            from PIL import Image
+                for frame, fn in zip(frames, filenames):
+                    frame_path = out_dir / fn
+                    Image.fromarray(frame).save(frame_path)
+                    logger.info(f"Saved GT frame: {frame_path}")
 
-            for frame, fn in zip(frames, filenames):
-                frame_path = out_dir / fn
-                Image.fromarray(frame).save(frame_path)
-                logger.info(f"Saved GT frame: {frame_path}")
+            if case.sampling_params.expect_audio_output:
+                audio_path = out_dir / f"{case.id}_{num_gpus}gpu_audio.wav"
+                audio_path.write_bytes(
+                    encode_audio_gt_wav(extract_audio_pcm_from_video_bytes(content))
+                )
+                logger.info("Saved GT audio: %s", audio_path)
         else:
             # Save image
             from sglang.multimodal_gen.test.test_utils import detect_image_format

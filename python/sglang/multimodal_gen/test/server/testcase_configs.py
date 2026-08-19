@@ -248,6 +248,7 @@ class DiffusionSamplingParams:
 
     # output format
     output_format: str | None = None  # "png", "jpeg", "mp4", etc.
+    expect_audio_output: bool = False
 
     num_outputs_per_prompt: int = 1
 

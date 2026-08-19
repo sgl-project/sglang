@@ -51,6 +51,7 @@ from sglang.multimodal_gen.test.test_utils import (
     get_video_frame_count,
     is_image_url,
     prepare_perf_log,
+    validate_audio_output,
     validate_image,
     validate_image_file,
     validate_openai_video,
@@ -1022,6 +1023,15 @@ def get_generate_fn(
         validate_video_file(
             tmp_path, expected_filename, expected_width, expected_height
         )
+        if sampling_params.expect_audio_output:
+            audio_info = validate_audio_output(tmp_path)
+            logger.info(
+                "%s: validated audio output (%s Hz, %s channels, %.3fs)",
+                case_id,
+                audio_info.sample_rate,
+                audio_info.channels,
+                audio_info.duration_seconds,
+            )
 
         if expected_frame_count is not None:
             actual_count = get_video_frame_count(tmp_path)
