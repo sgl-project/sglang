@@ -869,6 +869,7 @@ class Envs:
     # Fuse K3 latent RMSNorm with the dynamic-int8 quantization for up-proj.
     SGLANG_NPU_FUSED_RMS_QUANT = EnvBool(False)
     SGLANG_NPU_FUSED_KDA_VERIFY_GATES = EnvBool(False)
+    SGLANG_NPU_REUSE_KDA_VERIFY_METADATA = EnvBool(False)
     SGLANG_NPU_QUANT_SHARED_AG = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(

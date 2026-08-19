@@ -152,6 +152,33 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             )
         )
         self.kernel_dispatcher.extend_kernel = _AscendKDAExtendKernel()
+        self._dense_verify_metadata_cache = {}
+
+    def _get_dense_verify_metadata(
+        self,
+        batch_size: int,
+        draft_token_num: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (batch_size, draft_token_num, device)
+        cached = self._dense_verify_metadata_cache.get(key)
+        if cached is None:
+            num_accepted_tokens = torch.full(
+                (batch_size,),
+                draft_token_num,
+                dtype=torch.int32,
+                device=device,
+            )
+            dense_query_start_loc = torch.arange(
+                0,
+                batch_size * draft_token_num + 1,
+                step=draft_token_num,
+                dtype=torch.int32,
+                device=device,
+            )
+            cached = (num_accepted_tokens, dense_query_start_loc)
+            self._dense_verify_metadata_cache[key] = cached
+        return cached
 
     def _get_conv_weights_t(
         self, layer: RadixLinearAttention, dtype: torch.dtype
@@ -409,19 +436,26 @@ class AscendKDAAttnBackend(KDAAttnBackend):
 
         intermediate_indices = self.verify_intermediate_state_indices[:batch_size]
         conv_states = cache.conv[0]
-        num_accepted_tokens = torch.full(
-            (batch_size,),
-            draft_token_num,
-            dtype=torch.int32,
-            device=mixed_qkv.device,
-        )
-        dense_query_start_loc = torch.arange(
-            0,
-            num_dense_tokens + 1,
-            step=draft_token_num,
-            dtype=torch.int32,
-            device=mixed_qkv.device,
-        )
+        if envs.SGLANG_NPU_REUSE_KDA_VERIFY_METADATA.get():
+            num_accepted_tokens, dense_query_start_loc = (
+                self._get_dense_verify_metadata(
+                    batch_size, draft_token_num, mixed_qkv.device
+                )
+            )
+        else:
+            num_accepted_tokens = torch.full(
+                (batch_size,),
+                draft_token_num,
+                dtype=torch.int32,
+                device=mixed_qkv.device,
+            )
+            dense_query_start_loc = torch.arange(
+                0,
+                num_dense_tokens + 1,
+                step=draft_token_num,
+                dtype=torch.int32,
+                device=mixed_qkv.device,
+            )
         processed_qkv = torch.ops.npu.causal_conv1d(
             dense_qkv.reshape(num_dense_tokens, -1).contiguous(),
             self._get_conv_weights_t(layer, mixed_qkv.dtype),
