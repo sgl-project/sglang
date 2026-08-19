@@ -38,6 +38,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         num_v_heads: int,
         head_v_dim: int,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Packed decode fast path: feed the conv-1d output ``mixed_qkv``
@@ -67,6 +68,11 @@ class TritonKDAKernel(LinearAttnKernelBase):
             and replayssm_g is not None
             and replayssm_write_pos is not None
         ):
+            if lower_bound is not None:
+                raise NotImplementedError(
+                    "KDA safe gate (lower_bound) is not implemented in the "
+                    "ReplaySSM decode kernel; disable --enable-linear-replayssm."
+                )
             K = ssm_states.shape[-1]  # ssm_states: [num_slots, HV, V, K]
             fused_recurrent_linear_replayssm_decode(
                 mixed_qkv=mixed_qkv,
@@ -105,6 +111,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             out=out,
             ssm_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
+            lower_bound=lower_bound,
         )
         # [B, 1, HV, V] -> [1, B, HV, V] view to match existing decode layout.
         return out.transpose(0, 1)
@@ -122,6 +129,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         return fused_sigmoid_gating_delta_rule_update(
@@ -139,6 +147,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             softplus_beta=1.0,
             softplus_threshold=20.0,
             is_kda=True,
+            lower_bound=lower_bound,
         )
 
     def target_verify(
@@ -158,6 +167,13 @@ class TritonKDAKernel(LinearAttnKernelBase):
         intermediate_state_indices: torch.Tensor,
         cache_steps: int,
         retrieve_parent_token: torch.Tensor,
+        lower_bound: Optional[float] = None,
+        # fused ReplaySSM ring-write (dense verify only; off elsewhere).
+        cache_ring: bool = False,
+        replayssm_rawv: Optional[torch.Tensor] = None,
+        replayssm_rawk: Optional[torch.Tensor] = None,
+        replayssm_g: Optional[torch.Tensor] = None,
+        replayssm_beta: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         # KDA MTP / speculative-decode verify via the fused KDA kernel (IS_KDA=True),
@@ -186,6 +202,12 @@ class TritonKDAKernel(LinearAttnKernelBase):
             intermediate_state_indices=intermediate_state_indices,
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
+            lower_bound=lower_bound,
+            cache_ring=cache_ring,
+            replayssm_rawv=replayssm_rawv,
+            replayssm_rawk=replayssm_rawk,
+            replayssm_g=replayssm_g,
+            replayssm_beta=replayssm_beta,
         )
 
     def extend(

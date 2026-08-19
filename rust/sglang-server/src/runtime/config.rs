@@ -72,6 +72,18 @@ pub struct ServerArgs {
     /// HF revision, used only when `tokenizer_path` is a repo id. `None` → main.
     #[serde(default)]
     pub revision: Option<String>,
+    /// Weight format selected by `--load-format`, reported by `/get_model_info`.
+    /// The blob carries the post-`__post_init__` value (`auto` is already
+    /// narrowed to `gguf` / `mistral` / `runai_streamer` / `remote` where the
+    /// checkpoint demands it). Not consumed for loading -- the scheduler owns
+    /// that; `None` only when the blob omits the key.
+    #[serde(default)]
+    pub load_format: Option<String>,
+    /// Operator-supplied weight version, reported by `/model_info`. Defaults to
+    /// `"default"` on the Python side, so it is present in every blob; `None`
+    /// only when the blob omits the key.
+    #[serde(default)]
+    pub weight_version: Option<String>,
     /// HTTP bind address (see [`Self::bind`]).
     #[serde(default = "default_host")]
     pub host: String,
@@ -158,6 +170,11 @@ pub struct ModelConfig {
     /// boot ([`ServerArgs::validate_mandatory`]).
     #[serde(default)]
     pub vocab_size: Option<u64>,
+    /// Whether the model accepts multimodal inputs. Gates the MM Encoding branch
+    /// in tm-ingress; `false` silently ignores mm fields, as the Python
+    /// `TokenizerManager` does with `mm_processor is None`.
+    #[serde(default)]
+    pub is_multimodal: bool,
     /// Resolved default sampling parameters, stamped by
     /// `RustServer._build_server_args` from Python's
     /// `ModelConfig.get_default_sampling_params()`. Already gated on
@@ -257,6 +274,12 @@ impl ServerArgs {
     /// receives the registrations.
     pub fn enable_pd_bootstrap(&self) -> bool {
         self.disaggregation_mode == "prefill"
+    }
+
+    /// Whether the served model is multimodal, from the scheduler's dump. See
+    /// [`ModelConfig::is_multimodal`].
+    pub fn model_is_multimodal(&self) -> bool {
+        self.model_config.is_multimodal
     }
 
     /// Bind address `host:port`. `host` is expected to be an IP — the result is

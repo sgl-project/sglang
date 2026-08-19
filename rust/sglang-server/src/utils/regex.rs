@@ -263,7 +263,6 @@ fn cache_bound(pattern: &str, max_len: usize) {
 /// can pair one pattern's bound with another's, and there is no second route to a
 /// bound that could drift from the validated one.
 pub struct RegexPattern<'a> {
-    #[allow(dead_code)]
     pattern: &'a str,
     max_len: usize,
 }
@@ -310,7 +309,6 @@ impl<'a> RegexPattern<'a> {
         Ok(Self { pattern, max_len })
     }
 
-    #[allow(dead_code)]
     /// The admitted pattern. See the field note on why this is kept.
     #[allow(dead_code)]
     pub fn pattern(&self) -> &str {
