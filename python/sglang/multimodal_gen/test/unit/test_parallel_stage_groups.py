@@ -13,7 +13,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentResidencyManager,
     ComponentUse,
 )
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_resident_strategies import (
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
     ComponentResidencyStrategy,
     ResidentStrategy,
 )
