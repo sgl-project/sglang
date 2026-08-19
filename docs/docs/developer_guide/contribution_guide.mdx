@@ -180,11 +180,13 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
   - Always prefer new files to introduce specific components for your new hardware (e.g., `allocator_ascend.py`).
   - If you write multiple if/else blocks for new features, ensure the common path (e.g., NVIDIA hardware or the existing code path) is the first branch.
 
-## How to update sglang-kernel
+## How to update kernels in SGLang
+
+Choose the implementation and release path based on the kernel's dependencies. For a lightweight kernel that does not depend on CUTLASS or another large C++ project, prefer the in-tree JIT kernel path. Use the AOT `sglang-kernel` path for heavyweight kernels, large C++ dependencies, or operations that need wheel packaging and Torch operator registration. FlashInfer-based kernels are an exception and may still use the JIT path. SGLang also consumes separately released custom builds of DeepGEMM and DeepEP; update those in their source repositories as described below.
+
+### Update sglang-kernel
 
 The `sglang-kernel` distribution (formerly `sgl-kernel`) is a separate Python package, but its source now lives in this repository under `python/sglang/kernels/aot/`. Normal PR CI builds and installs a PR-local `sglang-kernel` wheel, so it can test an AOT kernel and its caller together. This does not establish compatibility after merge: installed SGLang and scheduled CI use the released version pinned in `python/pyproject.toml`. If a caller unconditionally requires a new operator or a changed kernel contract, first merge and release the kernel, update the pinned `sglang-kernel` version, and then land the caller. A combined PR is acceptable only when every supported path remains correct with the pinned wheel—for example, when the caller checks operator availability and retains a semantically equivalent fallback until the released wheel includes the change. Selective `/rerun-test` and `/rerun-group` workflows do not install PR-local wheels and cannot validate the combined AOT path.
-
-For a lightweight kernel that does not depend on CUTLASS or another large C++ project, prefer the JIT kernel path. Use the AOT `sglang-kernel` path for heavyweight kernels, large C++ dependencies, or operations that need wheel packaging and Torch operator registration. FlashInfer-based kernels are an exception and may still use the JIT path.
 
 For an AOT kernel change:
 
@@ -192,6 +194,14 @@ For an AOT kernel change:
 2. Expose the Python API under `python/sglang/kernels/aot/python/sgl_kernel/`.
 3. Add correctness tests under `python/sglang/kernels/aot/tests/` and a benchmark under `python/sglang/kernels/aot/benchmark/` when applicable.
 4. Build and test from `python/sglang/kernels/aot/` following its [README](https://github.com/sgl-project/sglang/tree/main/python/sglang/kernels/aot/README.md). Do not bump the pinned `sglang-kernel` version in `python/pyproject.toml` merely to test a PR-local kernel change.
+
+### Update sgl-deep-gemm
+
+Develop SGLang's customized DeepGEMM package on the [`dev` branch of `sgl-project/DeepGEMM`](https://github.com/sgl-project/DeepGEMM/tree/dev). Rebase incoming changes onto `dev`, place new or modified package tests under `sgl_deep_gemm/tests/`, and follow the [`sgl-deep-gemm` README](https://github.com/sgl-project/DeepGEMM/blob/dev/sgl_deep_gemm/README.md) to build and install a local wheel. After the implementation is merged, ask the SGLang team to run the [sgl-deep-gemm release workflow](https://github.com/sgl-project/sglang/actions/workflows/release-whl-deepgemm.yml) with the new version, CUDA target, and DeepGEMM branch. Once all required wheels are published and verified, update the `sgl-deep-gemm` pin in `python/pyproject.toml` before landing SGLang code that requires the new or changed behavior.
+
+### Update sgl-deep-ep
+
+Develop `sgl-deep-ep` in [`sgl-project/DeepEP`](https://github.com/sgl-project/DeepEP). Use the implementation branch for the target platform: `sgl-deepep` for CUDA 13 on x86_64 or aarch64, `sgl-deepep-cu12-x86` for CUDA 12.9 on x86_64, or `sgl-deepep-cu12-arm` for CUDA 12.9 on aarch64. Merge packaging changes into `sgl-deepep-packaging`, then follow the [`sgl-deep-ep` README](https://github.com/sgl-project/DeepEP/blob/sgl-deepep-packaging/sgl_deep_ep/README.md) to build and validate the package. Ask the SGLang team to run the [sgl-deep-ep release workflow](https://github.com/sgl-project/sglang/actions/workflows/release-whl-deepep.yml) with the new version, CUDA target, and packaging ref. After verifying the published wheels for the supported Python versions and architectures, update the `sgl-deep-ep` pin in `python/pyproject.toml` before landing dependent SGLang changes.
 
 ## Tips for newcomers
 
