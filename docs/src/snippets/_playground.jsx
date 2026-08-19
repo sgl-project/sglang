@@ -171,13 +171,15 @@ export const Playground = ({ config }) => {
     return null;
   };
 
-  // hw|variant|quant → variant|quant → hw|quant → quant → "".
+  // hw|variant|quant → variant|quant → hw|quant → quant → hw → default.
   const resolveModelName = (sel) => {
     const keys = [
       `${sel.hw}|${sel.variant}|${sel.quant}`,
       `${sel.variant}|${sel.quant}`,
       `${sel.hw}|${sel.quant}`,
       sel.quant,
+      sel.hw,
+      "default",
     ];
     for (const k of keys) {
       const hit = config.modelNames[k];
