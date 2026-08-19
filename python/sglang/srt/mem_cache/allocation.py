@@ -134,18 +134,65 @@ def write_page_tail_indices(
     req_to_token[req_pool_indices[:, None].expand_as(positions), positions] = values
 
 
+def write_page_tail_mapping(
+    allocator,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    write_ends: torch.Tensor,
+    page_size: int,
+) -> None:
+    """The SWA counterpart of write_page_tail_indices: publish full->swa for the
+    rest of the last page, so a decode step landing there finds a live mapping."""
+    if page_size == 1:
+        return
+
+    device = req_to_token.device
+    steps = torch.arange(page_size - 1, device=device, dtype=write_ends.dtype)
+    last_pos = (write_ends - 1).clamp(min=0)
+    last_full = req_to_token[req_pool_indices, last_pos].to(torch.int64)
+    last_swa = allocator.full_to_swa_index_mapping[last_full].to(torch.int64)
+
+    ceilings = ((write_ends + page_size - 1) // page_size * page_size)[:, None]
+    in_page = write_ends[:, None] + steps[None, :] < ceilings
+    # Lanes past the ceiling re-publish the last real pair, an idempotent write.
+    offsets = steps[None, :] + 1
+    full_indices = torch.where(
+        in_page, last_full[:, None] + offsets, last_full[:, None]
+    )
+    swa_indices = torch.where(in_page, last_swa[:, None] + offsets, last_swa[:, None])
+    allocator.set_full_to_swa_mapping(full_indices.reshape(-1), swa_indices.reshape(-1))
+
+
+def write_page_tail(
+    allocator,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    write_ends: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Publish the rest of the last page: row indices always, plus the full->swa
+    mapping when the allocator keeps one."""
+    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+
+    write_page_tail_indices(req_to_token, req_pool_indices, write_ends, page_size)
+    if isinstance(allocator, SWATokenToKVPoolAllocator):
+        write_page_tail_mapping(
+            allocator, req_to_token, req_pool_indices, write_ends, page_size
+        )
+
+
 def uses_page_granular_decode(batch: ScheduleBatch, token_per_req: int) -> bool:
-    # Exact type, not isinstance: every allocator that wraps or extends the plain
-    # paged one (SWA mapping, DSV4 bundles, hisparse buffers) does per-step work
-    # beyond handing out an index, so it keeps the per-token path.
+    # Exact type, not isinstance: DSV4 bundles and hisparse device buffers do
+    # per-step work beyond handing out an index, so they keep the per-token path.
     from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 
     return (
         _alloc_page_size(batch) > 1
         and token_per_req == 1
         and not batch.model_config.is_encoder_decoder
         and type(batch.tree_cache.token_to_kv_pool_allocator)
-        is PagedTokenToKVPoolAllocator
+        in (PagedTokenToKVPoolAllocator, SWATokenToKVPoolAllocator)
     )
 
 
@@ -439,7 +486,8 @@ def alloc_for_extend(
         prefix_tensors,
         batch.req_to_token_pool,
     )
-    write_page_tail_indices(
+    write_page_tail(
+        batch.tree_cache.token_to_kv_pool_allocator,
         batch.req_to_token_pool.req_to_token,
         req_pool_indices_device,
         batch.seq_lens,
