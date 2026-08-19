@@ -26,6 +26,7 @@ _HUNYUAN_TOKEN_NAMES = (
     "arg_key",
     "arg_value",
     "think",
+    "answer",
 )
 
 _HUNYUAN_TOKEN_RE = re.compile(
