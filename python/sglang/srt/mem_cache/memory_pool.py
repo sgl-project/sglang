@@ -47,6 +47,7 @@ from sglang.kernels.ops.kvcache.cache_move import (
     copy_all_layer_kv_cache_func,
     set_kv_buffer_prefix_valid_tiled,
     store_cache_4d,
+    store_k_slots,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
@@ -4915,7 +4916,13 @@ class MiniMaxSparseKVPool(KVCache):
             cache_idx_k = cache_idx_k.to(sub_pool.dtype)
         if sub_pool.store_dtype != sub_pool.dtype:
             cache_idx_k = cache_idx_k.view(sub_pool.store_dtype)
-        sub_pool.k_buffer[mapped_id][loc] = cache_idx_k
+        k_buffer = sub_pool.k_buffer[mapped_id]
+        if cache_idx_k.is_contiguous():
+            # A plain scatter instead of ATen advanced indexing, whose index_put
+            # pays for broadcast/index machinery this store does not need.
+            store_k_slots(k_buffer, cache_idx_k.view(-1, *k_buffer.shape[1:]), loc)
+        else:
+            k_buffer[loc] = cache_idx_k
 
     def _can_fuse_kv_index_store(
         self,

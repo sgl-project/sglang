@@ -304,3 +304,86 @@ def store_cache_4d(
         BLOCK=BLOCK,
         num_warps=4,
     )
+
+
+@triton.jit
+def store_k_slots_kernel(
+    k_buffer_ptr,
+    src_ptr,
+    loc_ptr,
+    stride_dst_slot,
+    stride_src_row,
+    ROW_DIM: tl.constexpr,  # head_num * head_dim
+    BLOCK: tl.constexpr,
+):
+    """Token-parallel scatter of one K tensor into a slot-major buffer.
+
+    Grid: ``(N, ceil(ROW_DIM / BLOCK))`` -- one program per (token, row block).
+    Writes ``k_buffer[loc[i]] = src[i]`` for ``i in [0, N)``.
+
+    Cuda-graph safe: no host branching on tensor values and no ``.item()``.
+    """
+    pid_n = tl.program_id(0)
+    pid_b = tl.program_id(1)
+
+    loc = tl.load(loc_ptr + pid_n).to(tl.int64)
+    # Padded / inactive rows are signalled by a negative slot; skipping them
+    # matches reshape_and_cache_flash, which consumes the same `loc`.
+    if loc < 0:
+        return
+
+    off = pid_b * BLOCK + tl.arange(0, BLOCK)
+    mask = off < ROW_DIM
+    src = tl.load(src_ptr + pid_n * stride_src_row + off, mask=mask)
+    tl.store(k_buffer_ptr + loc * stride_dst_slot + off, src, mask=mask)
+
+
+def store_k_slots(k_buffer: torch.Tensor, src: torch.Tensor, loc: torch.Tensor) -> None:
+    """Scatter ``src[i]`` into ``k_buffer[loc[i]]`` in one launch.
+
+    Replaces ``k_buffer[loc] = src`` (ATen advanced indexing, which dispatches
+    an ``index_put`` kernel) for a K-only cache.
+
+    Contract:
+        - ``k_buffer``: slot-major ``(num_slots, head_num, head_dim)``.
+        - ``src``: ``(N, head_num, head_dim)`` with the same dtype.
+        - both contiguous in the trailing ``(head_num, head_dim)`` dims, so the
+          kernel can address them as one flat ``ROW_DIM`` axis.
+        - ``loc``: 1-D, N elements; negative entries are skipped.
+
+    Returns nothing; writes in place.
+    """
+    if loc.numel() == 0:
+        return
+    assert k_buffer.ndim == src.ndim == 3, (
+        f"store_k_slots: k_buffer/src must be 3-D, got {k_buffer.ndim}/{src.ndim}"
+    )
+    assert k_buffer.dtype == src.dtype, (
+        f"store_k_slots: dtype mismatch: {k_buffer.dtype} vs {src.dtype}"
+    )
+    assert k_buffer.shape[1:] == src.shape[1:], (
+        f"store_k_slots: row shape mismatch: {tuple(k_buffer.shape)} vs "
+        f"{tuple(src.shape)}"
+    )
+    assert src.shape[0] == loc.numel(), (
+        f"store_k_slots: src/loc batch mismatch: {src.shape[0]} vs {loc.numel()}"
+    )
+    for name, t in (("k_buffer", k_buffer), ("src", src)):
+        assert t.stride(-1) == 1 and t.stride(-2) == t.shape[-1], (
+            f"store_k_slots: {name} trailing dims must be contiguous; "
+            f"got stride={t.stride()}, shape={tuple(t.shape)}"
+        )
+
+    ROW_DIM = k_buffer.shape[1] * k_buffer.shape[2]
+    BLOCK = 128
+    grid = (loc.numel(), triton.cdiv(ROW_DIM, BLOCK))
+    store_k_slots_kernel[grid](
+        k_buffer,
+        src,
+        loc,
+        k_buffer.stride(0),
+        src.stride(0),
+        ROW_DIM=ROW_DIM,
+        BLOCK=BLOCK,
+        num_warps=4,
+    )
