@@ -132,10 +132,14 @@ def resolve_runtime_config(
 
 def read_draft_checkpoint_config(*, server_args: ServerArgs) -> DSparkDraftConfig:
     """Load and normalize the DSpark draft checkpoint configuration."""
+    from sglang.srt.arg_groups.overrides import resolved_view
     from sglang.srt.utils.hf_transformers_utils import get_config
 
     draft_hf_config = None
-    if server_args.speculative_draft_model_path == server_args.model_path:
+    if (
+        server_args.speculative_draft_model_path
+        == resolved_view(server_args).model_path
+    ):
         draft_hf_config = server_args.get_model_config().hf_config
     if draft_hf_config is None:
         draft_hf_config = get_config(
