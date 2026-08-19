@@ -504,7 +504,7 @@ class VerifyMLA:
         qo_indptr,
         kv_indptr,
         sm_scale,
-        draft_block_causal=True,
+        is_causal=True,
     ):
         grid = (bs, self.h_q)
         _verify_mla_combine_stage2[grid](
@@ -541,7 +541,7 @@ class VerifyMLA:
             BLOCK_N=self.block_n,
             KV_GROUP_NUM=self.kv_group_num,
             HAS_KV_HEADS=self.has_kv_heads,
-            IS_CAUSAL=draft_block_causal,
+            IS_CAUSAL=is_causal,
             num_warps=4,
             num_stages=1,
         )
