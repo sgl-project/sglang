@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.dsv4.dcp import (
     localize_full_indices,
     merge_c4_topk_candidates,
     select_dcp_attn_sink,
+    select_dsv4_attn_sink_input,
     validate_dsv4_dcp_topology,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -66,6 +67,34 @@ class TestDSV4DCPLayout(CustomTestCase):
                     * local_heads
                 ]
                 torch.testing.assert_close(got, expected)
+
+    def test_unified_sink_input_uses_tp_local_heads_only_for_dcp1(self):
+        global_sink = torch.arange(128, dtype=torch.float32)
+        local_heads = 16
+        for tp_rank in range(8):
+            padded_local_sink = torch.zeros(64, dtype=torch.float32)
+            padded_local_sink[:local_heads] = global_sink[
+                tp_rank * local_heads : (tp_rank + 1) * local_heads
+            ]
+            dcp1_sink = select_dsv4_attn_sink_input(
+                global_sink,
+                padded_local_sink,
+                local_heads,
+                dcp_size=1,
+            )
+            torch.testing.assert_close(
+                dcp1_sink,
+                global_sink[tp_rank * local_heads : (tp_rank + 1) * local_heads],
+            )
+            self.assertEqual(dcp1_sink.numel(), local_heads)
+
+            dcp8_sink = select_dsv4_attn_sink_input(
+                global_sink,
+                padded_local_sink,
+                local_heads,
+                dcp_size=8,
+            )
+            self.assertIs(dcp8_sink, global_sink)
 
     def test_full_owner_and_local_rows(self):
         global_indices = torch.arange(8192, dtype=torch.int64)
