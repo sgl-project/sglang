@@ -49,6 +49,29 @@ def main():
     for var in sorted(k for k in os.environ if "VISIBLE_DEVICES" in k.upper()):
         print(f"  env {var} = {os.environ[var]!r}")
 
+    # device_count() on ROCm is amdsmi-based and only falls back to the HIP
+    # runtime count when amdsmi returns a negative number, so an amdsmi count of
+    # exactly 0 gives device_count() 0 while is_available(), which asks the HIP
+    # runtime directly, stays true. Sample each step of that path to see which
+    # one produces the 0.
+    print("  -- device_count internals --")
+    show("_C._cuda_getDeviceCount()", torch._C._cuda_getDeviceCount)
+    show("cuda._HAS_PYNVML", lambda: torch.cuda._HAS_PYNVML)
+    show("cuda._parse_visible_devices()", lambda: torch.cuda._parse_visible_devices()[:8])
+    show("cuda._raw_device_count_amdsmi()", torch.cuda._raw_device_count_amdsmi)
+    show("cuda._device_count_amdsmi()", torch.cuda._device_count_amdsmi)
+
+    print("  -- amdsmi directly --")
+
+    def handles():
+        import amdsmi
+
+        amdsmi.amdsmi_init()
+        return len(amdsmi.amdsmi_get_processor_handles())
+
+    show("amdsmi module", lambda: __import__("amdsmi").__file__)
+    show("amdsmi processor handles", handles)
+
 
 if __name__ == "__main__":
     main()

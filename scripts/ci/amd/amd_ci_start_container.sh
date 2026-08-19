@@ -426,18 +426,29 @@ docker exec ci_sglang git config --global --add safe.directory /sglang-checkout
   '
   docker exec ci_sglang python3 /sglang-checkout/scripts/ci/amd/rocm715_gpu_probe.py 2>&1
 
-  # Same probe, same host, published ROCm 7.0 image. Only when it is already in
-  # the runner's local cache: this is a diagnostic, not worth a 16 GB pull.
+  echo "-- /sys as the container sees it --"
+  docker exec ci_sglang bash -c '
+    echo "drm: $(ls /sys/class/drm 2>&1 | tr "\n" " ")"
+    echo "kfd nodes: $(ls /sys/class/kfd/kfd/topology/nodes 2>&1 | tr "\n" " ")"
+    for n in /sys/class/kfd/kfd/topology/nodes/*/; do
+      echo "  node $(basename $n) render_minor=$(awk "/^drm_render_minor/{print \$2}" $n/properties 2>/dev/null) gfx=$(awk "/^gfx_target_version/{print \$2}" $n/properties 2>/dev/null)"
+    done
+  '
+
+  # Same probe, same host, published ROCm 7.0 image: the one comparison that
+  # separates the driver from the stack. Worth the pull, since it decides
+  # whether this is a 7.15 problem or a runner problem.
   baseline_image=$(find_latest_image "${GPU_ARCH}" 2>/dev/null || true)
-  if [[ -n "${baseline_image}" ]] && [[ -n "$(docker images -q "${baseline_image}" 2>/dev/null)" ]]; then
+  if [[ -n "${baseline_image}" ]]; then
     echo "===== rocm715-fullflow GPU probe: container (baseline ${baseline_image}) ====="
+    docker pull "${baseline_image}" >/dev/null 2>&1 || true
     docker run --rm --user root --device=/dev/kfd ${DEVICE_FLAG} \
       --group-add video --security-opt seccomp=unconfined \
       -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
       "${baseline_image}" \
       python3 /sglang-checkout/scripts/ci/amd/rocm715_gpu_probe.py 2>&1
   else
-    echo "===== baseline ROCm 7.0 image not cached locally; skipping comparison ====="
+    echo "===== could not resolve a baseline ROCm 7.0 image; skipping comparison ====="
   fi
   echo "===== end probe ====="
 } || true
