@@ -201,7 +201,6 @@ def fused_align_block_size(
             f"fused align uses int32 plan math: num_buckets={num_buckets} and "
             f"capacity={capacity} must both be < 2**31"
         )
-    routed_expert_id_bound = num_local_experts
     num_blocks = capacity // block_size
 
     counts = workspace.tensor(
@@ -223,7 +222,7 @@ def fused_align_block_size(
     bucket_end = workspace.tensor(
         f"{tensor_prefix}:bucket_end", (num_buckets,), dtype=torch.int32, device=device
     )
-    num_pairs_post_padded_out = workspace.tensor(
+    num_pairs_post_padded = workspace.tensor(
         f"{tensor_prefix}:padded_pairs", (1,), dtype=torch.int32, device=device
     )
     sorted_pair_ids = torch.empty(capacity, dtype=torch.int32, device=device)
@@ -239,7 +238,7 @@ def fused_align_block_size(
         token_lora_mapping,
         counts,
         num_pairs,
-        routed_expert_id_bound,
+        num_local_experts,
         NUM_BUCKETS=num_buckets,
         LORA_EXPERTS_PER_ADAPTER=lora_experts_per_adapter,
         MAX_LORAS=max_loras,
@@ -254,7 +253,7 @@ def fused_align_block_size(
         block_cumulative,
         cursor,
         bucket_end,
-        num_pairs_post_padded_out,
+        num_pairs_post_padded,
         num_buckets,
         BLOCK_SIZE_M=block_size,
         CHUNK=SCAN_CHUNK,
@@ -273,7 +272,7 @@ def fused_align_block_size(
         sorted_pair_ids,
         block_virtual_expert_ids,
         num_pairs,
-        routed_expert_id_bound,
+        num_local_experts,
         num_blocks,
         num_block_programs,
         NUM_BUCKETS=num_buckets,
@@ -286,9 +285,9 @@ def fused_align_block_size(
         BLOCK_SIZE_M=block_size,
         # The search picks one of NUM_BUCKETS + 1 answers, so it needs
         # num_buckets.bit_length() steps -- one fewer and a sentinel reads as 0.
-        SEARCH_STEPS=max(1, num_buckets.bit_length()),
+        SEARCH_STEPS=num_buckets.bit_length(),
         USE_PDL=use_pdl,
         num_warps=EXPAND_WARPS,
         **pdl_kwargs,
     )
-    return sorted_pair_ids, block_virtual_expert_ids, num_pairs_post_padded_out
+    return sorted_pair_ids, block_virtual_expert_ids, num_pairs_post_padded
