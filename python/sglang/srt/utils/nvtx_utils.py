@@ -116,4 +116,5 @@ def profile_method(
 # Pre-bound per-subsystem helpers: torch spans always (under a profiler), nvtx
 # ranges only when that subsystem's gate is on.
 scheduler_nvtx_method = partial(profile_method, nvtx_enabled=NVTX_SCHEDULER_ENABLED)
+scheduler_nvtx_range = partial(profile_range, nvtx_enabled=NVTX_SCHEDULER_ENABLED)
 operations_nvtx_range = partial(profile_range, nvtx_enabled=NVTX_OPERATIONS_ENABLED)

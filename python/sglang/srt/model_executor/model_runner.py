@@ -217,7 +217,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
-from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.nvtx_utils import NVTX_SCHEDULER_ENABLED, profile_range
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
     get_offloader,
@@ -1517,7 +1517,11 @@ class ModelRunner:
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(build_step_span_name(forward_batch))
+        step_span_ctx = profile_range(
+            build_step_span_name(forward_batch),
+            color="orange",
+            nvtx_enabled=NVTX_SCHEDULER_ENABLED,
+        )
 
         canary_ctx = (
             context_tuple(

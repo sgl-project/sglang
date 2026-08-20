@@ -1,6 +1,9 @@
 import torch
 
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.base import (
+    BaseTokenToKVPoolAllocator,
+    pinned_int64_pair,
+)
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
@@ -106,6 +109,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_attn_allocator.available_size(),
             self.swa_attn_allocator.available_size(),
         )
+
+    @property
+    def _mapping_zero(self) -> torch.Tensor:
+        """Cached device scalar for clearing mapping entries.
+
+        ``mapping[idx] = 0`` wraps the python int in a CPU tensor and stages it
+        through a blocking pageable H2D copy, which on the scheduler stream
+        waits out the in-flight forward.
+        """
+        z = getattr(self, "_mapping_zero_cache", None)
+        if z is None:
+            z = torch.zeros(
+                (), dtype=self.full_to_swa_index_mapping.dtype, device=self.device
+            )
+            self._mapping_zero_cache = z
+        return z
 
     def full_available_size(self):
         return self.full_attn_allocator.available_size()
@@ -261,9 +280,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device = self.device
         swa_prefix_lens = torch.zeros((1,), dtype=torch.int64, device=device)
         swa_prefix_lens_cpu = torch.zeros((1,), dtype=torch.int64)
-        swa_seq_lens = torch.tensor([swa_tail_len], dtype=torch.int64, device=device)
-        swa_seq_lens_cpu = torch.tensor([swa_tail_len], dtype=torch.int64)
-        swa_last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+        swa_seq_lens_cpu, swa_seq_lens = pinned_int64_pair([swa_tail_len], device)
+        _, swa_last_loc = pinned_int64_pair([-1], device)
 
         alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
             swa_prefix_lens,
@@ -282,7 +300,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if swa_tail_len < extend_num_tokens:
             self.full_to_swa_index_mapping[
                 alloc_full_indices[:-swa_tail_len].to(torch.int64)
-            ] = 0
+            ] = self._mapping_zero
         return alloc_full_indices
 
     def alloc_decode(
@@ -361,7 +379,68 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
         swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[mapping_indices] = 0
+        self.full_to_swa_index_mapping[mapping_indices] = self._mapping_zero
+
+    def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Free the full-attention pool only; see free_swa_segment for the rest."""
+        self.full_attn_allocator.free_segment(free_index, start_pos=start_pos)
+
+    def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Sync-free counterpart of free_swa() for a request's kv row slice.
+
+        free_swa() has to discover which pages carry SWA state by reading the
+        mapping back (unique + a ``> 0`` mask), and both are data-dependent, so
+        the host stalls -- behind the in-flight forward, since the scheduler
+        stream is WAR-fenced. Here the caller names an all-mapped, page-aligned
+        range instead, so the pages can be named positionally.
+
+        The mapping preserves a token's offset within its page (both pools
+        advance on the same seq_lens), so one full token every ``page_size``
+        positions hits exactly one distinct SWA page, and all of them.
+
+        Contract: ``start_pos`` is page-aligned and every page in
+        ``[start_pos, start_pos + free_index.numel())`` is SWA-mapped.
+        """
+        if free_index.numel() == 0:
+            return
+        ps = self.page_size
+        if ps == 1:
+            self.free_swa(free_index)
+            return
+        assert start_pos % ps == 0, f"swa segment start {start_pos} not page-aligned"
+        self.free_swa_page_reps(free_index[::ps])
+
+    def free_swa_page_reps(self, full_reps: torch.Tensor) -> None:
+        """Free SWA pages named by one full-pool token per page, at page bases.
+
+        The reps-taking half of free_swa_segment(), split out so a caller that
+        already gathered representatives for a whole batch (see
+        ``free_swa_out_of_window_slots_batch``) can release them in one call
+        without going back through the syncing discovery path.
+
+        Contract: every element sits at its page's base (kv index offset == row
+        offset, which is what the page-aligned range starts guarantee), its page
+        is SWA-mapped, and no page appears twice.
+        """
+        if full_reps.numel() == 0:
+            return
+        reps = full_reps.to(torch.int64)
+        swa_reps = self.full_to_swa_index_mapping[reps]
+        if getattr(self.swa_attn_allocator, "debug_mode", False):
+            # Catches a caller passing a range that isn't fully SWA-mapped,
+            # which would otherwise release the padded page 0.
+            assert bool(
+                (swa_reps > 0).all().item()
+            ), "free_swa_page_reps on an unmapped range"
+        self.swa_attn_allocator.free_page_reps(swa_reps)
+        # reps sit at page bases, so the pages' tokens are a plain broadcast --
+        # no unique needed to clear them.
+        page_offsets = torch.arange(
+            self.page_size, dtype=torch.int64, device=reps.device
+        )
+        self.full_to_swa_index_mapping[
+            (reps[:, None] + page_offsets[None, :]).reshape(-1)
+        ] = self._mapping_zero
 
     def free_group_begin(self):
         super().free_group_begin()

@@ -1458,6 +1458,10 @@ class SchedulerPPMixin:
                 pp_good_rids=good_consensus_prealloc_rids,
                 pp_bad_rids=bad_consensus_prealloc_rids,
             )
+            # pop_preallocated() only queues the page/state readback; the PP loop
+            # has no post-launch flush site, so it must be issued here or
+            # send_metadata() is never sent and the KV transfer never starts.
+            self.disagg_decode_prealloc_queue.flush_pending_metadata()
             self.disagg_decode_transfer_queue.extend(good_reqs)
             return [
                 [req.req.rid for req in good_reqs],
