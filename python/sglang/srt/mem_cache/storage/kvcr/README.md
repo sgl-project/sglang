@@ -59,7 +59,8 @@ python3 -m dynamo.sglang \
       "control_host": "127.0.0.1",
       "control_port": 25000,
       "control_advertise_host": "127.0.0.1",
-      "enable_remote_hint": true}' \
+      "enable_remote_hint": true,
+      "prefetch_timeout_base": 15.0}' \
   --kv-events-config '{"publisher": "zmq", "endpoint": "tcp://*:35000", "topic": "kv"}'
 ```
 
@@ -67,7 +68,14 @@ Worker 2 uses `control_port` 25001 and event port 35001. Both need
 `DYN_DISCOVERY_BACKEND=file` and the same `DYN_FILE_KV` directory, and the
 frontend must be started with the same two.
 
-Three settings are load-bearing and easy to get wrong:
+Four settings are load-bearing and easy to get wrong:
+
+- **`prefetch_timeout_base` must be raised for the remote path.** The default
+  linear budget is `base + per_ki_token × tokens/1024` = `1.0 + 0.25 ×
+  tokens/1024`, which is 1.48 s for a 1984-token prefix. A *local* L3 read fits
+  in that; a hinted *remote* fetch does not — measured 1.2–3.9 s for the same
+  31 pages, because it crosses the control plane and a NIXL transfer. See
+  "Why the default prefetch timeout is wrong for a remote fetch" below.
 
 - **`--kv-events-config` is required.** The dynamo router builds hint candidates
   only from an event-driven index. Without KV events the router still routes,
@@ -78,6 +86,78 @@ Three settings are load-bearing and easy to get wrong:
 - **Keep the host pool at least as large as the device pool.** See "Known
   issues" below; this one stops offload permanently.
 
+### Why the default prefetch timeout is wrong for a remote fetch
+
+`hicache_storage_prefetch_policy` defaults to `timeout`, and that timeout is
+linear in the fetch size:
+
+```
+timeout = prefetch_timeout_base + prefetch_timeout_per_ki_token * tokens / 1024
+        = 1.0 + 0.25 * 1984 / 1024
+        = 1.484 s          # for the 31-page prefix used by every test here
+```
+
+Those defaults were picked for a *local* L3 read. A hinted remote fetch is a
+different order of magnitude — it dials the source's control plane, waits for
+the source to pin, and then moves the pages over NIXL. Measured on the loopback
+two-worker stack, for exactly those 31 pages: **1.2 s, 2.3 s, 2.4 s, 3.9 s**.
+So the budget is under the *median*, and whether a fetch survives is a coin
+flip on scheduler timing.
+
+Losing that race is silent and looks nothing like a timeout:
+
+1. `check_prefetch_progress` finds the budget exhausted and calls
+   `terminate_prefetch`, which sets the terminated flag.
+2. The transfer is still running on the storage thread. It completes normally,
+   all pages retrieved, and calls `operation.increment(...)`.
+3. `increment` returns `False` because the op is already terminated, so
+   `completed_tokens` stays **0**.
+4. The tree sees `completed_tokens == 0` and discards the fetch.
+
+Nothing logs a warning: the backend succeeded, the transfer succeeded, and the
+discard is an ordinary "nothing usable fetched" path. The KVCR counters make it
+unmistakable once you look — `hinted_pages_requested == hinted_pages_loaded`
+with no shortfall anywhere — while `cached_tokens` is 0. **Fully-loaded
+counters next to a zero `cached_tokens` mean the result was thrown away after
+arrival, and this timeout is the first thing to check.**
+
+`prefetch_timeout_base: 15.0` is what every run below used. It is a ceiling on
+a path that fails to a recompute, not a latency you pay: a fetch that is
+genuinely never coming still ends the request correctly, just later. Tighten it
+if you have measured your own remote fetch, but measure the tail, not the mean.
+
+This is not specific to buffer mode. Both host-memory modes go through the same
+`can_terminate_prefetch`, and both fail 4/4 at the default and pass 4/4 at 15 s.
+
+### Host memory mode: `cache` vs `buffer_only`
+
+Both are supported and verified. `--hicache-host-memory-mode` picks between
+them:
+
+- **`cache`** (default) — host RAM is a real L2 tier. Pages offloaded from the
+  device stay resident and are served back on a later local hit, and KVCR sits
+  under that as L3.
+- **`buffer_only`** ([#34798](https://github.com/sgl-project/sglang/pull/34798))
+  — host RAM is a transient staging buffer, never a tier. Writes stage device
+  KV through op-owned bounces into storage and free them at the storage ack;
+  reads fetch storage hits into bounces and publish into the device tree at
+  prefill admission. KVCR becomes the only thing holding KV off-device.
+
+The router hint works identically in both, which is why supporting both cost
+nothing: the hint rides the *operation* (`StorageOperation.router_hint` →
+`HiCacheStorageExtraInfo.extra_info`), not the host-memory tier, and buffer mode
+reaches storage through the same `cache_controller.prefetch` /
+`write_storage` entry points as cache mode.
+
+Two constraints on `buffer_only`, both from upstream:
+
+- It is only implemented for `UnifiedRadixCache`, which is selected by
+  `SGLANG_ENABLE_UNIFIED_RADIX_TREE=1`, an **env var and not a CLI flag** — so
+  the env gate has to be set together with the mode or `registry.py` raises at
+  startup. Easy to miss when scripting a mode sweep.
+- Not supported on decode instances (PD-disagg decode bypasses the buffer-mode
+  pipeline) or with `--hicache-write-policy write_back`.
+
 ### Sizing the two tiers together
 
 `--hicache-size` and `--mem-fraction-static` must be chosen as a pair. They are
@@ -86,7 +166,7 @@ modes are quiet:
 
 - Too *small* a host tier relative to the device tier trips known issue 1 —
   offload stops for the life of the process.
-- Too *large* a `local_dram_bytes` trips known issue 3 — the worker refuses to
+- Too *large* a `local_dram_bytes` trips known issue 4 — the worker refuses to
   start with `KVCR progress thread did not start`.
 
 The trap is that backing away from one walks into the other. Shrinking
@@ -152,6 +232,12 @@ superset — no state is lost by waiting, only by not waiting.
   Re-verified against `nvidia-kvcr` `873391c` after the rename, 2/2, counters
   showing no shortfall anywhere in the chain: source `deposit_pages_stored=64`,
   destination `hinted_pages_requested=62 hinted_pages_loaded=62`.
+- **Both host-memory modes, 4/4 each** (`cache` and `buffer_only`), same
+  two-instance hint-driven test, `prefetch_timeout_base: 15.0`. At the default
+  timeout both modes fail 4/4 — the mode is not what decides it. Worth stating
+  plainly: the earlier 2/2 `cache` result above was taken at the default and
+  was luck, not a stable pass. Anything measured on this path before the
+  timeout was raised should be re-run rather than trusted.
 - TP=2. Found and fixed two silent per-rank bugs on the way (a bind collision,
   and both ranks dialing the same source port) — the symptom was correct-looking
   output built from the wrong shard, so the test compares generated text, not
@@ -190,14 +276,25 @@ sizing issue below, and *not* `local_dram_bytes`.
    `deposit_pages_offered` absent from the counter line entirely. Note this
    presents as a *remote-hint* failure even though nothing about the hint path
    is wrong; see "Sizing the two tiers together" above, and mind that backing
-   away from issue 3 is the usual way to arrive here.
+   away from issue 4 is the usual way to arrive here.
 
-2. **A peer restart costs ~34 s of degraded P2P** (KVCR-side; reported
+2. **The default prefetch timeout silently discards a successful remote fetch.**
+   `1.0 + 0.25 × tokens/1024` is under the measured remote-fetch latency, and
+   losing the race throws the fetch away *after* every page has arrived —
+   `increment` is refused on a terminated op, `completed_tokens` stays 0, and
+   nothing warns. Diagnostic signature: `hinted_pages_requested ==
+   hinted_pages_loaded` with `cached_tokens=0`. Not backend-specific and not
+   mode-specific; upstream's defaults are simply sized for a local L3 read. Set
+   `prefetch_timeout_base` (see the section above). The right long-term fix is
+   probably upstream — either a backend-declared default, or not discarding a
+   transfer that completed between the termination decision and the increment.
+
+3. **A peer restart costs ~34 s of degraded P2P** (KVCR-side; reported
    separately). Transient and self-healing, no wrong answers, no operator
    action. The restarted worker is only affected as a *source*; as a destination
    it works immediately.
 
-3. **`local_dram_bytes` ≥ 32 GiB fails to start** — NIXL registration exceeds
+4. **`local_dram_bytes` ≥ 32 GiB fails to start** — NIXL registration exceeds
    KVCR's 10 s progress-thread join timeout (`RuntimeError: KVCR progress thread
    did not start`). 14.9 GiB is fine; the threshold is somewhere between. The
    timeout (`_JOIN_TIMEOUT_SECONDS` in `kvcr/progress.py`) has been 10 s since
@@ -205,14 +302,14 @@ sizing issue below, and *not* `local_dram_bytes`.
    a regression. When shrinking to get past it, shrink
    `--mem-fraction-static` too — otherwise you land on issue 1.
 
-4. **The source offers no framework memory as a NIXL source.** `pin_adapter.py`
+5. **The source offers no framework memory as a NIXL source.** `pin_adapter.py`
    declines every pin request: pinning a HiCache host page safely needs a
    residency index inside HiRadixCache that this backend does not have (that is
    the Shared-HiCache adapter — separate work). Everything served comes from
    KVCR's own tier, where its refcount holds the slot for the duration of the
    write. Cost is a miss, never a wrong result.
 
-5. **Benchmarked only on two models.** Dense Qwen3-8B showed +53–59% qps and
+6. **Benchmarked only on two models.** Dense Qwen3-8B showed +53–59% qps and
    −50% TTFT, but only once the distinct working set exceeded the device pool;
    an FP8 MoE model showed +20% on the same harness. Do not extrapolate the
    dense number — and note both were taken before the KVCR rename.
@@ -223,7 +320,7 @@ sizing issue below, and *not* `local_dram_bytes`.
 |---|---|
 | `kvcr_store.py` | the whole backend: the `HiCacheStorage` surface, deposit/get, the remote-hint path, counters |
 | `router_hint.py` | parsing the dynamo hint and normalizing block hashes (the wire seam — a mismatch here silently makes every hint cover zero pages) |
-| `pin_adapter.py` | the KVCR→framework pin callbacks, deliberately declining (see issue 4) |
+| `pin_adapter.py` | the KVCR→framework pin callbacks, deliberately declining (see issue 5) |
 | `kvcr_config.py` | `--hicache-storage-backend-extra-config` schema and timeouts |
 
 Outside this directory the change is small — 13 files, ~190 lines, mostly
