@@ -1,5 +1,7 @@
 import asyncio
 import os
+
+import requests
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -27,7 +29,7 @@ from sglang.srt.multimodal.mm_utils import (
     process_anyres_image,
 )
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils import ImageData, load_image, logger
+from sglang.srt.utils import ImageData, get_image_bytes, load_image, logger
 from sglang.utils import get_exception_traceback
 
 
@@ -45,18 +47,21 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
 
     @staticmethod
     def _preprocess_image_task(
-        image,
-        image_size,
+        image_input,
         image_hash,
         image_aspect_ratio: Optional[str] = None,
         image_grid_pinpoints: Optional[str] = None,
         processor=None,
     ):
-        # CPU-bound preprocessing of an already-loaded image. Loading is done
-        # separately so the wait_for budget in the caller covers CPU work only.
+        # CPU-bound decode + preprocessing. `image_input` is either the raw bytes
+        # of a remote image (already fetched off the cpu pool) or a local/inline
+        # input load_image can resolve without network. Either way decode happens
+        # here, parallel across cpu workers, and only compact data crosses the
+        # process boundary (never a decoded image).
         image_processor = processor.image_processor
 
         try:
+            image, image_size = load_image(image_input, False)
             if image_size is not None:
                 # It is a video with multiple images
                 pixel_values = image_processor(image)["pixel_values"]
@@ -92,17 +97,20 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         except Exception:
             logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
 
-    async def _load_image_with_retry(self, url):
-        # Fetch + decode in the io thread pool, retrying transient failures.
+    async def _fetch_remote_image_bytes(self, url):
+        # Fetch a remote image's compressed bytes in the io thread pool, retrying
+        # only transient network failures. Each attempt is bounded by
+        # REQUEST_TIMEOUT inside download_remote_media, so total time is bounded.
         loop = asyncio.get_running_loop()
-        max_retries = int(os.environ.get("SGLANG_MM_LOAD_MAX_RETRIES", "2"))
+        max_retries = max(0, int(os.environ.get("SGLANG_MM_LOAD_MAX_RETRIES", "2")))
         delay = 0.5
         for attempt in range(max_retries + 1):
             try:
-                return await loop.run_in_executor(
-                    self.io_executor, load_image, url, False
-                )
-            except Exception:
+                return await loop.run_in_executor(self.io_executor, get_image_bytes, url)
+            except (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+            ):
                 if attempt >= max_retries:
                     raise
                 await asyncio.sleep(delay)
@@ -115,19 +123,23 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         grid_pinpoints: str,
     ):
         url = image_data.url if isinstance(image_data, ImageData) else image_data
-        image_hash = hash(url)
+        image_hash = hash(url) if isinstance(url, (str, bytes)) else None
 
-        # Load (network) outside the cpu pool and the wait_for budget below, so a
-        # slow fetch can't starve cpu workers or trip the CPU timeout.
-        image, image_size = await self._load_image_with_retry(url)
+        # Only remote URLs hit the network, and that fetch is what used to sit
+        # inside the cpu-preprocess timeout budget. Pull it into the io pool so a
+        # slow fetch can't starve cpu workers or trip the CPU timeout. Local and
+        # inline inputs (file://, data:, base64, bytes) decode instantly in the
+        # worker, so pass them through unchanged.
+        image_input = url
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            image_input = await self._fetch_remote_image_bytes(url)
 
         if self.cpu_executor is not None:
             loop = asyncio.get_running_loop()
             fut = loop.run_in_executor(
                 self.cpu_executor,
                 LlavaImageProcessor._preprocess_image_task,
-                image,
-                image_size,
+                image_input,
                 image_hash,
                 aspect_ratio,
                 grid_pinpoints,
@@ -137,8 +149,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
             return await asyncio.wait_for(fut, timeout=timeout)
         else:
             return LlavaImageProcessor._preprocess_image_task(
-                image,
-                image_size,
+                image_input,
                 image_hash,
                 aspect_ratio,
                 grid_pinpoints,
