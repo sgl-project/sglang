@@ -875,8 +875,6 @@ class Envs:
     SGLANG_NPU_FUSED_KDA_ONORM = EnvBool(False)
     SGLANG_NPU_REUSE_KDA_VERIFY_METADATA = EnvBool(False)
     SGLANG_NPU_QUANT_SHARED_AG = EnvBool(False)
-    # Carry K3 shared-expert INT8 activations and FP32 scales in one AG packet.
-    SGLANG_NPU_PACKED_QUANT_SHARED_AG = EnvBool(False)
     # Use the graph-safe Triton-Ascend kernel for masked speculative KV commits.
     SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NPU_USE_TRITON_KV_CACHE_STORE"
