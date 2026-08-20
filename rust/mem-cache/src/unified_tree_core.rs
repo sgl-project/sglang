@@ -2759,6 +2759,21 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .unwrap_or_default()
     }
 
+    /// Hash every node built while storage was disabled.
+    pub fn backfill_missing_hash_values(&mut self) -> usize {
+        let root_id = self.arena.root();
+        let mut filled = 0;
+        for node_id in self.collect_all_nodes_() {
+            if node_id == root_id || self.arena.node(node_id).hash_value.is_some() {
+                continue;
+            }
+            let hash_values = self.arena.compute_node_hash_values(node_id, self.page_size);
+            self.arena.node_mut(node_id).hash_value = Some(hash_values);
+            filled += 1;
+        }
+        filled
+    }
+
     /// The NodeId anchoring matches; the single root serves every namespace.
     pub fn root_node_handle(&self, _extra_key: Option<&str>) -> NodeId {
         self.arena.node(self.arena.root()).id

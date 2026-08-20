@@ -57,7 +57,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     RadixCacheWalkResult,
     UnifiedTreeCoreInterface,
 )
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, mamba_cache_chunk_size
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -299,6 +299,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             self.device = torch.device("cpu")
 
         self.enable_kv_cache_events = params.enable_kv_cache_events
+        has_mamba = ComponentType.MAMBA in self.tree_components
+        mamba_max_states_per_path = (
+            get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
+        )
 
         self._binding = self._binding_class()(
             TreeCoreInitParamsBinding(
@@ -311,14 +315,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 swa_sliding_window_size=params.sliding_window_size,
                 enable_kv_cache_events=params.enable_kv_cache_events,
                 mamba_cache_chunk_size=(
-                    get_server_args().mamba_cache_chunk_size
-                    if ComponentType.MAMBA in self.tree_components
-                    else None
+                    mamba_cache_chunk_size() if has_mamba else None
                 ),
                 mamba_max_states_per_path=(
-                    get_server_args().mamba_max_states_per_path
-                    if ComponentType.MAMBA in self.tree_components
-                    and get_server_args().mamba_max_states_per_path >= 0
+                    mamba_max_states_per_path
+                    if mamba_max_states_per_path >= 0
                     else None
                 ),
             ),
@@ -751,6 +752,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def get_hash_values(self, node_id: NodeId) -> list[str]:
         return self._binding.get_hash_values(node_id)
+
+    def backfill_missing_hash_values(self) -> int:
+        return self._binding.backfill_missing_hash_values()
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         return self._binding.root_node_handle(extra_key)

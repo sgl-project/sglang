@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.utils import hash_str_to_int64
+from sglang.srt.runtime_context import get_context
 
 
 def _tree_core(**params_overrides) -> RustUnifiedTreeCore:
@@ -818,30 +819,24 @@ def test_every_pool_name_crosses_the_prefetch_commit_boundary():
         )
 
 
-def _mamba_tree_core(page_size: int = 1, **params_overrides) -> RustUnifiedTreeCore:
-    from sglang.srt.server_args import set_global_server_args_for_scheduler
-
-    # The adapter only reads mamba_cache_chunk_size off the global server args.
-    set_global_server_args_for_scheduler(
-        SimpleNamespace(mamba_cache_chunk_size=256, mamba_max_states_per_path=-1)
-    )
-    return _tree_core(
-        tree_components=(ComponentType.FULL, ComponentType.MAMBA),
-        page_size=page_size,
-        **params_overrides,
-    )
+def _mamba_tree_core(
+    page_size: int = 1,
+    mamba_max_states_per_path: int = -1,
+    **params_overrides,
+) -> RustUnifiedTreeCore:
+    with get_context().override_server_args(
+        _mamba_cache_chunk_size=256,
+        mamba_max_states_per_path=mamba_max_states_per_path,
+    ):
+        return _tree_core(
+            tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+            page_size=page_size,
+            **params_overrides,
+        )
 
 
 def _mamba_tree_core_with_cap(cap: int) -> RustUnifiedTreeCore:
-    from sglang.srt.server_args import set_global_server_args_for_scheduler
-
-    set_global_server_args_for_scheduler(
-        SimpleNamespace(mamba_cache_chunk_size=256, mamba_max_states_per_path=cap)
-    )
-    return _tree_core(
-        tree_components=(ComponentType.FULL, ComponentType.MAMBA),
-        page_size=1,
-    )
+    return _mamba_tree_core(mamba_max_states_per_path=cap)
 
 
 def _mamba_insert(core, token_ids, indices, mamba_slot):
