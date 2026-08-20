@@ -538,14 +538,6 @@ class KimiK3MoE(nn.Module):
             or _a2a_backend.is_mori()
         )
 
-        # The flashinfer_mxfp4 (trtllm-gen) runner quantizes routed_input with
-        # the strided-input JIT group quant (_use_jit_mxfp8_quant in mxfp4.py),
-        # so the fused-front split view can be consumed as is; other runners
-        # (e.g. marlin) require a dense buffer.
-        self._moe_front_needs_contiguous = (
-            not get_moe_runner_backend().is_flashinfer_mxfp4()
-        )
-
         # Defer the trtllm-gen finalize (top-k weighted unpermute) out of the
         # MoE op and fuse it into the push all-reduce's staging pass
         # (k3_ar_fusion.finalize_all_reduce_push_norm): the rank-local latent
