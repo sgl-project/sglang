@@ -1243,30 +1243,50 @@ class _FileBackedBlock(torch.nn.Module):
 
 
 class _FileBackedModel(torch.nn.Module):
-    def __init__(self, path: pathlib.Path) -> None:
+    def __init__(self, path: pathlib.Path, num_blocks: int = 1) -> None:
         super().__init__()
-        self.blocks = torch.nn.ModuleList([_FileBackedBlock(path)])
+        self.blocks = torch.nn.ModuleList(
+            [
+                _FileBackedBlock(path.with_name(f"{path.name}.{i}"))
+                for i in range(num_blocks)
+            ]
+        )
 
 
-def _mapped_manager(tmp_path, monkeypatch, *, available_gib):
+# one _FileBackedBlock weight: 64 float32
+_BLOCK_BYTES = 64 * 4
+
+
+def _mapped_manager(
+    tmp_path,
+    monkeypatch,
+    *,
+    available_gib=None,
+    available_bytes=None,
+    num_blocks=1,
+    pin_budget_bytes=None,
+):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
     )
     monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
-    # Two bindings for one fact: the budget module's copy is what decides
-    # whether the copies fit, and layerwise_offload's own is what the log reports.
-    available_bytes = int(available_gib * 1024**3)
-    for module in (host_memory_budget, layerwise_offload_mod):
-        monkeypatch.setattr(
-            module, "host_memory_available_bytes", lambda: available_bytes
-        )
-    model = _FileBackedModel(tmp_path / "weights.bin")
+    if available_bytes is None:
+        available_bytes = int(available_gib * 1024**3)
+    monkeypatch.setattr(
+        host_memory_budget, "host_memory_available_bytes", lambda: available_bytes
+    )
+    model = _FileBackedModel(tmp_path / "weights.bin", num_blocks=num_blocks)
     return LayerwiseOffloadManager(
         model=model,
         layers_attr_str="blocks",
-        num_layers=1,
+        num_layers=num_blocks,
         enabled=True,
         pin_cpu_memory=True,
+        pin_budget=(
+            host_memory_budget.HostPinBudget(available_bytes=pin_budget_bytes)
+            if pin_budget_bytes is not None
+            else None
+        ),
         prefetch_size=1,
     )
 
@@ -1275,7 +1295,9 @@ def test_weights_stay_on_the_mapping_when_copies_do_not_fit(tmp_path, monkeypatc
     if not pathlib.Path("/proc/self/maps").exists():
         pytest.skip("needs /proc to tell a mapping from anonymous memory")
     # the reserve alone exceeds this, so no copy can be afforded
-    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    manager = _mapped_manager(
+        tmp_path, monkeypatch, available_gib=0.001, pin_budget_bytes=0
+    )
     assert manager._mapped_cpu_weights[0], "expected the weight to stay mapped"
     assert manager._weight_metadata[0]["blocks.0.weight"]["mapped"] is True
     assert not manager._consolidated_cpu_weights.get(0)
@@ -1292,7 +1314,9 @@ def test_weights_are_copied_when_they_fit(tmp_path, monkeypatch):
 def test_a_mapped_weight_is_not_written_back(tmp_path, monkeypatch):
     if not pathlib.Path("/proc/self/maps").exists():
         pytest.skip("needs /proc to tell a mapping from anonymous memory")
-    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    manager = _mapped_manager(
+        tmp_path, monkeypatch, available_gib=0.001, pin_budget_bytes=0
+    )
     before = manager._mapped_cpu_weights[0]["blocks.0.weight"].clone()
     manager._gpu_layers.add(0)
     manager.sync_layer_to_cpu(0)
@@ -1329,12 +1353,70 @@ def test_the_mapped_store_survives_the_placeholder(tmp_path, monkeypatch):
     assert manager._mapped_bytes == sum(
         t.numel() * t.element_size() for t in stored.values()
     ), "the byte counter and the store must describe the same weights"
+def test_only_the_layers_the_budget_covers_are_pinned(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    # 2 GiB of reserve plus room for two of the four layers
+    budget = 2 * 1024**3 + 2 * _BLOCK_BYTES
+    manager = _mapped_manager(
+        tmp_path,
+        monkeypatch,
+        available_bytes=budget,
+        pin_budget_bytes=budget,
+        num_blocks=4,
+    )
+    pinned = {i for i in range(4) if manager._consolidated_cpu_weights.get(i)}
+    mapped = {i for i in range(4) if manager._mapped_cpu_weights.get(i)}
+    assert pinned == {0, 1}, "the layers the budget covers, taken in index order"
+    assert mapped == {2, 3}
+    assert not (pinned & mapped), "a layer is in one store or the other"
+
+
+def test_every_layer_is_pinned_when_the_budget_covers_them(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(
+        tmp_path,
+        monkeypatch,
+        available_gib=64,
+        pin_budget_bytes=64 * 1024**3,
+        num_blocks=4,
+    )
+    assert not any(manager._mapped_cpu_weights.get(i) for i in range(4))
+    assert all(manager._consolidated_cpu_weights.get(i) for i in range(4))
+
+
+def test_no_layer_is_pinned_when_the_budget_is_spent(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    manager = _mapped_manager(
+        tmp_path, monkeypatch, available_bytes=0, pin_budget_bytes=0, num_blocks=4
+    )
+    assert all(manager._mapped_cpu_weights.get(i) for i in range(4))
+
+
+def test_an_unpinnable_layer_is_still_copied_when_the_copies_fit(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    # no pinned budget at all, but plenty of host memory: a pageable copy is
+    # guaranteed resident where a mapping can be dropped and re-read
+    manager = _mapped_manager(
+        tmp_path,
+        monkeypatch,
+        available_gib=64,
+        pin_budget_bytes=0,
+        num_blocks=4,
+    )
+    assert not any(manager._mapped_cpu_weights.get(i) for i in range(4))
+    assert all(manager._consolidated_cpu_weights.get(i) for i in range(4))
 
 
 def test_mapped_weights_are_visible_to_checksums(tmp_path, monkeypatch):
     if not pathlib.Path("/proc/self/maps").exists():
         pytest.skip("needs /proc to tell a mapping from anonymous memory")
-    manager = _mapped_manager(tmp_path, monkeypatch, available_gib=0.001)
+    manager = _mapped_manager(
+        tmp_path, monkeypatch, available_gib=0.001, pin_budget_bytes=0
+    )
     names = {name for name, _ in manager.iter_cpu_weights()}
     assert "blocks.0.weight" in names
 

@@ -18,7 +18,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
     HostPinBudget,
     describe_host_memory,
     host_copies_would_not_fit,
-    host_memory_available_bytes,
     module_weight_bytes,
     pin_benefit_bytes,
 )
@@ -209,6 +208,8 @@ class LayerwiseOffloadManager:
         resident_layers: int = 0,
         initialize: bool = True,
         residency_policy: str = RESIDENCY_POLICY_LEADING,
+        pin_budget: HostPinBudget | None = None,
+        pin_component_name: str = "layerwise offload",
     ) -> None:
         self.model = model
         self.layers_attr_str = layers_attr_str
@@ -217,6 +218,10 @@ class LayerwiseOffloadManager:
         # mps shares physical memory with the CPU and has no pinned host memory
         # or CUDA-style copy streams
         self.pin_cpu_memory = bool(pin_cpu_memory and not self._synchronous_mps)
+        # asked per layer rather than for the whole component; see
+        # _plan_pinned_layers
+        self._pin_budget = pin_budget
+        self._pin_component_name = pin_component_name
         # an explicit MPS zero avoids staging the next layer alongside the
         # active one; MPS has no transfer overlap to recover from that cost
         self.prefetch_size = (
@@ -390,47 +395,94 @@ class LayerwiseOffloadManager:
 
         self._finalize_initialization()
 
-    def _keep_weights_on_their_mapping(self, layer_groups: Dict) -> bool:
-        """Whether to leave file-backed weights on their mapping.
+    def _layer_byte_totals(
+        self, layer_groups: Dict
+    ) -> Tuple[Dict[int, int], Dict[int, int]]:
+        """Per layer: (all weight bytes, the subset that are checkpoint views)."""
+        totals: Dict[int, int] = {}
+        mapped: Dict[int, int] = {}
+        for layer_idx, dtype_to_params in layer_groups.items():
+            total = 0
+            from_mapping = 0
+            for weights in dtype_to_params.values():
+                for _, weight in weights:
+                    tensor = self._to_local_tensor(weight)
+                    nbytes = tensor.untyped_storage().nbytes()
+                    total += nbytes
+                    if self._mapped_regions.holds(tensor):
+                        from_mapping += nbytes
+            totals[layer_idx] = total
+            mapped[layer_idx] = from_mapping
+        return totals, mapped
 
-        Copying them into host memory buys pinning, and pinning is what lets the
-        copy stream run ahead of compute -- worth 1.03 s against 1.90 s per step
-        on a measured Wan2.1 run, so it is not given up lightly.
+    def _plan_layer_hosting(self, layer_groups: Dict) -> Dict[int, str]:
+        """Where each layer's weights live on the host: pinned, pageable or mapped.
 
-        It is given up when the copies do not fit. H3's DiT is 61.73 GiB of
-        weights, of which 50.53 GiB arrive as views into the checkpoint; on a
-        32 GiB host the copy cannot be made at all, and the choice is between a
-        mapping and not running. Above that, page-cache residency makes the read
-        nearly as fast as pinned -- 12.38 GB/s against 13.39 measured -- and what
-        is lost is the overlap, not the bandwidth.
+        Pinning is what lets the copy stream run ahead of compute -- 1.03 s
+        against 1.90 s per step on a measured Wan2.1 run. Measured on H3 against
+        ComfyUI on the same RTX 4090, which stages every weight in host memory:
+        6.75 s per denoise step against 13.37 with nothing pinned.
+
+        The budget used to be asked for the whole component at once, so H3's DiT
+        -- 60.12 GB of weights against 28.56 GB spendable -- pinned nothing at
+        all. Asking per layer spends what there is.
+
+        A layer that misses the budget falls back the way it always did, to a
+        pageable copy, and only stays on its mapping when those copies do not
+        fit either. The order matters: a pageable copy transfers synchronously,
+        since the driver stages it through its own pinned buffer, so it buys
+        none of the overlap -- but it is guaranteed resident, where a mapping can
+        be dropped and re-read from disk.
+
+        Which layers get pinned hardly matters. The loop walks 0..n-1 once per
+        denoise step, so every layer is read equally often and any fixed subset
+        of size k covers k/n of the reads. Index order keeps it deterministic.
         """
-        if not self._mapped_regions.available:
-            return False
-        mapped_bytes = sum(
-            tensor.untyped_storage().nbytes()
-            for dtype_to_params in layer_groups.values()
-            for weights in dtype_to_params.values()
-            for _, weight in weights
-            for tensor in (self._to_local_tensor(weight),)
-            if self._mapped_regions.holds(tensor)
-        )
-        if mapped_bytes <= 0:
-            return False
-        # The copies land in host memory on top of the page cache already holding
-        # these bytes, so the room needed is the copy itself plus a reserve.
-        if not host_copies_would_not_fit(mapped_bytes):
-            return False
-        available = host_memory_available_bytes()
-        logger.info(
-            "Layerwise offload: leaving %.2f GiB of weights on the checkpoint "
-            "mapping -- copying them into host memory needs more than the "
-            "%.2f GiB available. The page cache decides what stays resident, so "
-            "reads may come from disk; the copies cannot be pinned, so they run "
-            "on the compute stream instead of ahead of it.",
-            mapped_bytes / 1024**3,
-            available / 1024**3,
-        )
-        return True
+        totals, mapped = self._layer_byte_totals(layer_groups)
+        if self.pin_cpu_memory and self._pin_budget is None:
+            return {idx: "pinned" for idx in totals}
+
+        pinned_bytes = 0
+        hosting: Dict[int, str] = {}
+        spendable = self._pin_budget.spendable_bytes if self._pin_budget else 0
+        for layer_idx in sorted(totals):
+            layer_bytes = totals[layer_idx]
+            if self.pin_cpu_memory and pinned_bytes + layer_bytes <= spendable:
+                hosting[layer_idx] = "pinned"
+                pinned_bytes += layer_bytes
+            else:
+                hosting[layer_idx] = "pageable"
+        if pinned_bytes and self._pin_budget is not None:
+            self._pin_budget.request(
+                component_name=self._pin_component_name, weight_bytes=pinned_bytes
+            )
+
+        unpinned = [idx for idx, where in hosting.items() if where != "pinned"]
+        unpinned_bytes = sum(totals[idx] for idx in unpinned)
+        if unpinned and host_copies_would_not_fit(unpinned_bytes):
+            for layer_idx in unpinned:
+                if mapped[layer_idx]:
+                    hosting[layer_idx] = "mapped"
+
+        if unpinned:
+            counts = {where: 0 for where in ("pinned", "pageable", "mapped")}
+            for where in hosting.values():
+                counts[where] += 1
+            logger.info(
+                "Layerwise offload: %s pins %d of %d layers (%.2f GiB of %.2f GiB "
+                "spendable). Of the rest, %d are copied into pageable host memory "
+                "and %d stay on the checkpoint mapping. Pinning every layer would "
+                "need %.2f GiB.",
+                self._pin_component_name,
+                counts["pinned"],
+                len(totals),
+                pinned_bytes / 1024**3,
+                spendable / 1024**3,
+                counts["pageable"],
+                counts["mapped"],
+                sum(totals.values()) / 1024**3,
+            )
+        return hosting
 
     def _initialize_layer_weights(self) -> None:
         self._named_parameters = dict(self.model.named_parameters())
@@ -451,7 +503,7 @@ class LayerwiseOffloadManager:
                 local_tensor.dtype, []
             ).append((name, tensor))
 
-        keep_mapping = self._keep_weights_on_their_mapping(layer_groups)
+        layer_hosting = self._plan_layer_hosting(layer_groups)
 
         # 2. concat and offload (in pinned memory)
         for layer_idx, dtype_to_params in layer_groups.items():
@@ -460,11 +512,14 @@ class LayerwiseOffloadManager:
             self._mapped_cpu_weights[layer_idx] = {}
             self._weight_metadata[layer_idx] = {}
 
+            hosting = layer_hosting.get(layer_idx, "pinned")
+            pin_this_layer = hosting == "pinned"
+
             for dtype, weights in dtype_to_params.items():
                 contiguous_weights: List[Tuple[str, torch.Tensor, torch.Tensor]] = []
                 for name, weight in weights:
                     local_weight = self._to_local_tensor(weight)
-                    if keep_mapping and self._mapped_regions.holds(local_weight):
+                    if hosting == "mapped" and self._mapped_regions.holds(local_weight):
                         # Already a view into the checkpoint. Copying it would
                         # add a second copy of bytes the page cache holds
                         # anyway, and that copy is what does not fit.
@@ -499,7 +554,7 @@ class LayerwiseOffloadManager:
                         size=local_weight.shape,
                         stride=local_weight.stride(),
                         dtype=dtype,
-                        pin_memory=self.pin_cpu_memory,
+                        pin_memory=pin_this_layer,
                     )
                     cpu_tensor.copy_(local_weight)
                     self._strided_cpu_weights[layer_idx][name] = cpu_tensor
@@ -531,7 +586,7 @@ class LayerwiseOffloadManager:
 
                 # create concatenated CPU buffer (in pinned memory)
                 cpu_buffer = torch.empty(
-                    total_numel, dtype=dtype, pin_memory=self.pin_cpu_memory
+                    total_numel, dtype=dtype, pin_memory=pin_this_layer
                 )
 
                 # offload weights to the buffer
@@ -1239,20 +1294,20 @@ class LayerwiseOffloadableModuleMixin:
 
             # Pinning these weights is what lets the copy stream run ahead of
             # compute, but pinned pages are the ones the kernel cannot reclaim,
-            # so a component only gets them while the budget lasts.
-            pin_cpu_memory = server_args.pin_cpu_memory
-            if pin_cpu_memory and pin_budget is not None:
-                pin_cpu_memory = pin_budget.request(
-                    component_name=f"{component_name or type(self).__name__}.{layer_name}",
-                    weight_bytes=module_weight_bytes(module_list),
-                )
+            # so they are handed out only while the budget lasts. The budget goes
+            # to the manager rather than being spent here, because it is asked
+            # per layer: a component too large to pin whole can still pin part of
+            # itself. See _plan_layer_hosting.
+            pin_component_name = f"{component_name or type(self).__name__}.{layer_name}"
 
             manager = LayerwiseOffloadManager(
                 model=self,
                 layers_attr_str=layer_name,
                 num_layers=num_layers,
                 enabled=True,
-                pin_cpu_memory=pin_cpu_memory,
+                pin_cpu_memory=server_args.pin_cpu_memory,
+                pin_budget=pin_budget,
+                pin_component_name=pin_component_name,
                 prefetch_size=prefetch_size,
                 resident_layers=resident_layers,
                 initialize=False,
