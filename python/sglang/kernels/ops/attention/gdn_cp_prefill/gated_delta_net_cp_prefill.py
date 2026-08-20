@@ -1,4 +1,5 @@
-# Vendored from flashinfer 0.6.18.dev20260807 (SM100 GDN CP prefill closure);
+# Vendored from flashinfer-ai/flashinfer main at 76704c4 (SM100 GDN CP
+# prefill closure, incl. #4436 pooled state / checkpointing / dtype parity);
 # pending a FlashInfer release that ships it.
 # Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
@@ -160,6 +161,7 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         io_dtype: Type[cutlass.Numeric],
         acc_dtype: Type[cutlass.Numeric],
         state_dtype: Type[cutlass.Numeric],
+        checkpoint_dtype: Type[cutlass.Numeric],
         mma_tiler_qk: Tuple[int, int, int],
         mma_tiler_qs: Tuple[int, int, int],
         mma_tiler_qkv: Tuple[int, int, int],
@@ -173,11 +175,14 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         enable_checkpoints: bool = False,
         is_persistent: bool = True,
         cu_seqlens_dtype: Type[cutlass.Numeric] = cutlass.Int32,
+        checkpoint_cu_starts_dtype: Type[cutlass.Numeric] | None = None,
     ):
         self.io_dtype = io_dtype
         self.cu_seqlens_dtype = cu_seqlens_dtype
+        self.checkpoint_cu_starts_dtype = checkpoint_cu_starts_dtype
         self.acc_dtype = acc_dtype
         self.state_dtype = state_dtype
+        self.checkpoint_dtype = checkpoint_dtype
         self.mma_tiler_qk = mma_tiler_qk
         self.mma_tiler_qs = mma_tiler_qs
         self.mma_tiler_qkv = mma_tiler_qkv
@@ -191,7 +196,7 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         # initial state, zero, or the fixed-up state from the previous CP chunk.
         self.use_initial_state = True
         self.store_final_state = store_final_state
-        self.enable_checkpoints = False
+        self.enable_checkpoints = enable_checkpoints
         self.is_persistent = False
 
         # ------------------------------------------------------------------
@@ -273,8 +278,10 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         self.manual_cache_key(
             "io_dtype",
             "cu_seqlens_dtype",
+            "checkpoint_cu_starts_dtype",
             "acc_dtype",
             "state_dtype",
+            "checkpoint_dtype",
             "mma_tiler_qk",
             "mma_tiler_qs",
             "mma_tiler_qkv",
@@ -283,6 +290,7 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             "head_ratio",
             "needs_initial_state",
             "store_final_state",
+            "enable_checkpoints",
         )
 
     def _setup_attributes(self):
@@ -391,6 +399,9 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         fixed_state: cute.Tensor,
         initial_state: Optional[cute.Tensor],
         state_out: cute.Tensor,
+        state_checkpoints: cute.Tensor,
+        checkpoint_cu_starts: cute.Tensor,
+        checkpoint_every_n_tokens: cutlass.Int32,
         cp_chunk_len: cutlass.Int32,
         total_cp_chunks: cutlass.Int32,
         max_cp_chunks_per_seq: cutlass.Int32,
@@ -535,6 +546,29 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             )
         else:
             state_out = fixed_state
+        if cutlass.const_expr(self.enable_checkpoints):
+            state_checkpoints = cute.make_tensor(
+                state_checkpoints.iterator,
+                cute.make_layout(
+                    (
+                        state_checkpoints.shape[2],
+                        state_checkpoints.shape[3],
+                        (h_r, h_qv),
+                        state_checkpoints.shape[0],
+                    ),
+                    stride=(
+                        state_checkpoints.stride[2],
+                        state_checkpoints.stride[3],
+                        (
+                            state_checkpoints.stride[1],
+                            h_r * state_checkpoints.stride[1],
+                        ),
+                        state_checkpoints.stride[0],
+                    ),
+                ),
+            )
+        else:
+            state_checkpoints = state_out
 
         # ------------------------------------------------------------------
         # Build tiled MMAs  (one per logical GEMM group, differing in operand major modes)
@@ -838,6 +872,9 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             fixed_state,
             initial_state,
             state_out,
+            state_checkpoints,
+            checkpoint_cu_starts,
+            checkpoint_every_n_tokens,
             cp_chunk_len,
             h_r * h_qv,
             scale,
@@ -883,7 +920,8 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         valid_chunk_len = cutlass.Int32(0)
         if chunk_idx < num_cp_chunks:
             valid_chunk_len = varlen_chunk_valid_len(seq_len, chunk_idx, cp_chunk_len)
-        tok_offset = seq_start + chunk_idx * cp_chunk_len
+        seq_token_offset = chunk_idx * cp_chunk_len
+        tok_offset = seq_start + seq_token_offset
         cp_chunk_idx = varlen_chunk_idx(seq_idx, seq_start, chunk_idx, cp_chunk_len)
         t_blocks_per_cp_chunk = cute.ceil_div(cp_chunk_len, self.b_t)
         t_block_start = varlen_chunk_idx(
@@ -897,6 +935,8 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             num_cp_chunks,
             cp_chunk_idx,
             t_block_start,
+            seq_len,
+            seq_token_offset,
         )
 
     # -----------------------------------------------------------------------
@@ -928,6 +968,9 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         mFixedState: cute.Tensor,
         mInitialState: Optional[cute.Tensor],
         mStateOut: cute.Tensor,
+        mStateCheckpoints: cute.Tensor,
+        checkpoint_cu_starts: cute.Tensor,
+        checkpoint_every_n_tokens: cutlass.Int32,
         cp_chunk_len: cutlass.Int32,
         num_sab_heads: cutlass.Int32,
         scale: cutlass.Float32,
@@ -976,6 +1019,8 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             num_cp_chunks,
             cp_chunk_idx,
             t_block_start,
+            seq_len,
+            seq_token_offset,
         ) = self.get_cp_work(cu_seqlens, bidy, bidx, num_sab_heads, cp_chunk_len)
         # ------------------------------------------------------------------
         # TMA descriptor GMEM workspace - one q/k/v/o descriptor set per CTA.
@@ -1309,6 +1354,9 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
                     sO, o_smem_layout_staged.inner
                 )
                 checkpoint_offset = 0
+                if cutlass.const_expr(self.enable_checkpoints):
+                    checkpoint_offset = cutlass.Int32(checkpoint_cu_starts[bidy])
+                    checkpoint_offset += seq_token_offset // checkpoint_every_n_tokens
                 is_first_chunk = True
                 for chunk_idx in cutlass.range(num_chunks_b):
                     (
@@ -1330,7 +1378,11 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
                         scale,
                         (tiled_mma_kv, tiled_mma_qs, tiled_mma_qkv),
                         (sV_pisl, sCumsumlog, sCumprod, sCumprod, sO_pisl),
-                        (mStateOut, checkpoint_offset, cutlass.Int32(0)),
+                        (
+                            mStateCheckpoints,
+                            checkpoint_offset,
+                            checkpoint_every_n_tokens,
+                        ),
                         (
                             load_v_consumer,
                             load_gate_consumer,
@@ -1344,24 +1396,43 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
                             decay_v_ready_producer,
                             o_store_producer,
                         ),
-                        (chunk_idx, num_pairs_b, head_idx, chunk_len, is_first_chunk),
+                        (
+                            chunk_idx,
+                            num_pairs_b,
+                            head_idx,
+                            chunk_len,
+                            is_first_chunk,
+                            seq_token_offset,
+                            seq_len,
+                        ),
                     )
                     is_first_chunk = False
 
-                if cp_chunk_idx_in_seq == num_cp_chunks - 1:
+                store_output_state = cp_chunk_idx_in_seq == num_cp_chunks - 1
+                store_cp_boundary = False
+                if cutlass.const_expr(self.enable_checkpoints):
+                    cp_chunk_end = seq_token_offset + chunk_len
+                    store_cp_boundary = cp_chunk_end % checkpoint_every_n_tokens == 0
+                # The ending CTA owns its CP-boundary checkpoint.  This avoids
+                # racing its main-kernel state against the next CTA's fixed state.
+                if store_output_state or store_cp_boundary:
                     kv_acc_consumer = self._store_final_state(
                         tidx,
                         mStateOut,
+                        mFixedState,
                         None,
                         head_idx,
                         bidy,
+                        cp_chunk_idx,
                         tmem_ptr,
                         tiled_mma_kv,
                         kv_acc_consumer,
                         chunk_len,
-                        mStateOut,
-                        cutlass.Int32(0),
-                        cutlass.Int32(0),
+                        seq_token_offset + chunk_len,
+                        mStateCheckpoints,
+                        checkpoint_offset,
+                        checkpoint_every_n_tokens,
+                        store_output_state,
                     )
                 else:
                     kv_acc_handle = kv_acc_consumer.wait_and_advance()
@@ -2363,22 +2434,26 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         tidx,
         # full output-state GMEM tensor (DK, DV, (h_r, h_qv), B) fp32
         mS_out,
+        mFixedState,
         mS_indices,
         head_idx,
         batch_idx,
+        fixed_state_idx,
         tmem_ptr,
         tiled_mma_kv,
         # MMA -> CG1 consumer; waited+released inside this method
         kv_acc_consumer,
         seqlen_b,
+        checkpoint_token,
         mS_checkpoints,
         checkpoint_offset,
         checkpoint_every_n_tokens,
+        store_output_state,
     ):
-        """Store final recurrent state from TMEM (fp32) to GMEM mS_out.
+        """Store a CP-boundary checkpoint and, if requested, the final state.
 
-        Waits for the last GEMM-7 (kv_acc) to complete, reads state TMEM -> registers,
-        writes registers -> GMEM fp32, then releases the consumer handle.
+        Checkpoints use the fixup-produced FP32 fixed state, matching the public
+        output-state path.  The optional final state uses the main-kernel TMEM state.
         """
         num_threads_cg1 = self.threads_per_warp * len(self.compute_group_1_warp_ids)
         cg1_tidx = tidx % num_threads_cg1
@@ -2410,7 +2485,22 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         tTR_tCtState = thr_state_t2r.partition_S(tCtState_mn_view)
         tTR_tCcState = thr_state_t2r.partition_D(tCcState)
         tTR_rState = cute.make_rmem_tensor_like(tTR_tCcState, self.acc_dtype)
+        atom_state_r2t = cute.make_copy_atom(
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+        )
+        tiled_state_r2t = tcgen05.make_tmem_copy(atom_state_r2t, tCtState_for_t2r)
+        thr_state_r2t = tiled_state_r2t.get_slice(cg1_tidx)
+        tRT_tCcState = thr_state_r2t.partition_S(tCcState)
+        tGR_rFixedState = cute.make_rmem_tensor_like(tRT_tCcState, self.acc_dtype)
         tRG_rState = cute.make_rmem_tensor_like(tTR_tCcState, self.state_dtype)
+        tRC_rCheckpoint = cute.make_rmem_tensor_like(
+            tTR_tCcState, self.checkpoint_dtype
+        )
+        gFixedCheckpoint = cute.flat_divide(
+            mFixedState[None, None, head_idx, fixed_state_idx],
+            (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
+        )[None, None, 0, 0]
+        tGR_tCgFixedState = thr_state_r2t.partition_S(gFixedCheckpoint)
 
         # Wait for last GEMM-7 to finish.
         kv_acc_handle = kv_acc_consumer.wait_and_advance()
@@ -2428,34 +2518,46 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             else:
                 tRG_rState = tTR_rState
             if cutlass.const_expr(self.enable_checkpoints):
-                if seqlen_b % checkpoint_every_n_tokens == 0:
-                    num_valid_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
-                    if num_valid_chunks_b % 2 == 0:
-                        gS_checkpoints = cute.flat_divide(
-                            mS_checkpoints[None, None, head_idx, checkpoint_offset],
-                            (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-                        )[None, None, 0, 0]
-                        tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
-                        cute.autovec_copy(
-                            tRG_rState[None, 0, sub],
-                            tSgCheckpoints[None, 0, sub],
-                            l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                if checkpoint_token % checkpoint_every_n_tokens == 0:
+                    cute.autovec_copy(
+                        tGR_tCgFixedState[None, 0, sub],
+                        tGR_rFixedState[None, 0, sub],
+                        l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                    )
+                    gS_checkpoints = cute.flat_divide(
+                        mS_checkpoints[None, None, head_idx, checkpoint_offset],
+                        (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
+                    )[None, None, 0, 0]
+                    tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
+                    if cutlass.const_expr(self.acc_dtype != self.checkpoint_dtype):
+                        tRC_rCheckpoint[None, 0, sub].store(
+                            tGR_rFixedState[None, 0, sub]
+                            .load()
+                            .to(self.checkpoint_dtype)
                         )
+                    else:
+                        tRC_rCheckpoint = tGR_rFixedState
+                    cute.autovec_copy(
+                        tRC_rCheckpoint[None, 0, sub],
+                        tSgCheckpoints[None, 0, sub],
+                        l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                    )
             if cutlass.const_expr(self.store_final_state):
-                if cutlass.const_expr(mS_indices is not None):
-                    state_idx = mS_indices[batch_idx]
-                else:
-                    state_idx = batch_idx
-                gS_out = cute.flat_divide(
-                    mS_out[None, None, head_idx, state_idx],
-                    (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
-                )[None, None, 0, 0]
-                tRG_tCgState = thr_state_t2r.partition_D(gS_out)
-                cute.autovec_copy(
-                    tRG_rState[None, 0, sub],
-                    tRG_tCgState[None, 0, sub],
-                    l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
-                )
+                if store_output_state:
+                    if cutlass.const_expr(mS_indices is not None):
+                        state_idx = mS_indices[batch_idx]
+                    else:
+                        state_idx = batch_idx
+                    gS_out = cute.flat_divide(
+                        mS_out[None, None, head_idx, state_idx],
+                        (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
+                    )[None, None, 0, 0]
+                    tRG_tCgState = thr_state_t2r.partition_D(gS_out)
+                    cute.autovec_copy(
+                        tRG_rState[None, 0, sub],
+                        tRG_tCgState[None, 0, sub],
+                        l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                    )
         kv_acc_handle.release()
         return kv_acc_consumer
 
@@ -2688,7 +2790,15 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             o_store_producer,
         ) = pipeline_args
         tiled_mma_kv, tiled_mma_qs, tiled_mma_qkv = mma_args
-        chunk_iter, num_pairs_b, head_idx, seqlen_b, is_first_chunk = work_args
+        (
+            chunk_iter,
+            num_pairs_b,
+            head_idx,
+            seqlen_b,
+            is_first_chunk,
+            seq_token_offset,
+            seq_len,
+        ) = work_args
 
         # ------------------------------------------------------------------
         # Preamble (identical to compute_group_1)
@@ -2726,7 +2836,9 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         tTR_tCcState = thr_state_t2r.partition_D(tCcState)
         tRT_tCtState = thr_state_r2t.partition_D(tCtState_mn_view)
         tTR_rState = cute.make_rmem_tensor_like(tTR_tCcState, self.acc_dtype)
-        tRG_rState = cute.make_rmem_tensor_like(tTR_tCcState, self.state_dtype)
+        tRC_rCheckpoint = cute.make_rmem_tensor_like(
+            tTR_tCcState, self.checkpoint_dtype
+        )
 
         state_inp_shape = tiled_mma_qs.partition_shape_A(
             (self.mma_tiler_qs[0], self.mma_tiler_qs[2])
@@ -2937,10 +3049,10 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             )
             cute.arch.fence_view_async_tmem_store()
             state_inp_handle.commit()
-            checkpoint_token = self.b_t * chunk_iter
+            checkpoint_token = seq_token_offset + self.b_t * chunk_iter
             if cutlass.const_expr(self.enable_checkpoints):
-                if checkpoint_token > 0:
-                    if checkpoint_token <= seqlen_b:
+                if chunk_iter > 0:
+                    if checkpoint_token < seq_token_offset + seqlen_b:
                         if checkpoint_token % checkpoint_every_n_tokens == 0:
                             gS_checkpoints = cute.flat_divide(
                                 mS_checkpoints[
@@ -2955,16 +3067,18 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
                                 ),
                             )[None, None, 0, 0]
                             tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
-                            if cutlass.const_expr(self.state_dtype != self.acc_dtype):
-                                tRG_rState[None, 0, None].store(
+                            if cutlass.const_expr(
+                                self.checkpoint_dtype != self.acc_dtype
+                            ):
+                                tRC_rCheckpoint[None, 0, None].store(
                                     tTR_rState[None, 0, None]
                                     .load()
-                                    .to(self.state_dtype)
+                                    .to(self.checkpoint_dtype)
                                 )
                             else:
-                                tRG_rState = tTR_rState
+                                tRC_rCheckpoint = tTR_rState
                             cute.autovec_copy(
-                                tRG_rState[None, 0, None],
+                                tRC_rCheckpoint[None, 0, None],
                                 tSgCheckpoints[None, 0, None],
                                 l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                             )
@@ -2976,8 +3090,8 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
                 tRT_tCtState[None, 0, None, kv_prev_handle.index],
             )
             if cutlass.const_expr(self.enable_checkpoints):
-                if checkpoint_token > 0:
-                    if checkpoint_token <= seqlen_b:
+                if chunk_iter > 0:
+                    if checkpoint_token < seq_token_offset + seqlen_b:
                         if checkpoint_token % checkpoint_every_n_tokens == 0:
                             checkpoint_offset += 1
             cute.arch.fence_view_async_tmem_store()

@@ -1,4 +1,5 @@
-# Vendored from flashinfer 0.6.18.dev20260807 (SM100 GDN CP prefill closure);
+# Vendored from flashinfer-ai/flashinfer main at 76704c4 (SM100 GDN CP
+# prefill closure, incl. #4436 pooled state / checkpointing / dtype parity);
 # pending a FlashInfer release that ships it.
 import cutlass
 import cutlass.cute as cute

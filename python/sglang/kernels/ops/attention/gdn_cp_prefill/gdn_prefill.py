@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Vendored from flashinfer 0.6.18.dev20260807 (SM100 GDN CP prefill closure);
+# Vendored from flashinfer-ai/flashinfer main at 76704c4 (SM100 GDN CP
+# prefill closure, incl. #4436 pooled state / checkpointing / dtype parity);
 # pending a FlashInfer release that ships it.
 
 import math
@@ -36,9 +37,6 @@ from flashinfer.utils import get_compute_capability, get_device_sm_count
 from sglang.kernels.ops.attention.gdn_cp_prefill.flashinfer_compat import (
     get_device_name,
 )
-from sglang.kernels.ops.attention.gdn_cp_prefill.varlen_helper import (
-    should_use_cp_host,
-)
 
 try:
     from sglang.kernels.ops.attention.gdn_cp_prefill.gdn_cp_prefill import (
@@ -46,9 +44,12 @@ try:
     )
 except ImportError:
     cp_delta_rule_dsl_sm100 = None
+from sglang.kernels.ops.attention.gdn_cp_prefill.varlen_helper import (
+    is_integer_dtype,
+    should_use_cp_host,
+)
 
-
-_SM100_STATE_DTYPES: tuple[torch.dtype, ...] = (
+_STATE_DTYPES: tuple[torch.dtype, ...] = (
     torch.float32,
     torch.bfloat16,
     torch.float16,
@@ -94,7 +95,7 @@ def _cp_delta_rule_rejection_reason(
         checkpoint_every_n_tokens > 0
         or state_checkpoints is not None
         or checkpoint_cu_starts is not None
-    ):
+    ) and arch_major not in (9, 10, 12):
         return "CP delta rule does not support state checkpointing yet"
     if q.shape[-1] != 128:
         return f"CP delta rule only supports head_size=128, got {q.shape[-1]}"
@@ -121,12 +122,6 @@ def _cp_delta_rule_rejection_reason(
     if initial_state is not None:
         if state_indices is None and not initial_state.is_contiguous():
             return "CP delta rule requires initial_state to be contiguous"
-        if state_indices is not None and initial_state.stride()[1:] != (
-            initial_state.shape[2] * initial_state.shape[3],
-            initial_state.shape[3],
-            1,
-        ):
-            return "CP delta rule requires initial_state to be contiguous in [H, V, K]"
     return None
 
 
@@ -149,6 +144,7 @@ def chunk_gated_delta_rule(
     checkpoint_every_n_tokens: int = 0,
     use_cp: Literal["auto"] | bool = "auto",
     state_indices: Optional[torch.Tensor] = None,
+    _cp_chunk_len: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -180,9 +176,8 @@ def chunk_gated_delta_rule(
     initial_state : torch.Tensor, optional
         Initial KV state. Packed, sequence-ordered shape
         ``[num_seqs, num_sab_heads, head_size, head_size]``.  Must be
-        float32 on SM90/SM120.  The SM100 path also accepts bfloat16,
-        float16, float8_e4m3fn, and float8_e5m2.  Starts from zero state
-        when ``None``.  When ``state_indices`` is given (SM100/SM103 only),
+        float32, bfloat16, float16, float8_e4m3fn, or float8_e5m2. Starts from zero state
+        when ``None``.  When ``state_indices`` is given (SM90/SM100/SM103/SM120),
         this is instead the state **pool** ``[N_pool, num_sab_heads,
         head_size, head_size]`` and sequence ``i`` reads its initial state
         from row ``state_indices[i]``; the pool may be non-compact (padded
@@ -206,9 +201,8 @@ def chunk_gated_delta_rule(
         ``None``.
     output_state : torch.Tensor, optional
         Pre-allocated output state tensor. Packed, sequence-ordered shape
-        ``[num_seqs, num_sab_heads, head_size, head_size]``.  Must be float32
-        on SM90/SM120.  The SM100 path also accepts bfloat16, float16,
-        float8_e4m3fn, and float8_e5m2.  Required when
+        ``[num_seqs, num_sab_heads, head_size, head_size]``. May be float32,
+        bfloat16, float16, float8_e4m3fn, or float8_e5m2. Required when
         ``output_final_state=True``.  When ``state_indices`` is given it is
         instead the output state **pool** ``[N_pool, ...]`` and sequence
         ``i``'s final state is written to row ``state_indices[i]`` (in place
@@ -217,10 +211,10 @@ def chunk_gated_delta_rule(
         buffer would be indexed out of bounds by the pool slot ids).
     state_checkpoints : torch.Tensor, optional
         Pre-allocated checkpoint tensor of shape ``[total_checkpoints,
-        num_sab_heads, head_size, head_size]``.  Must be float32 on
-        SM90/SM120.  The SM100 path also accepts bfloat16, float16,
-        float8_e4m3fn, and float8_e5m2.  Required when
-        ``checkpoint_every_n_tokens > 0``.
+        num_sab_heads, head_size, head_size]``. May be float32, bfloat16,
+        float16, float8_e4m3fn, or float8_e5m2. Required when
+        ``checkpoint_every_n_tokens > 0``. Context-parallel checkpointing is
+        currently supported on SM90, SM100, and SM120.
     checkpoint_cu_starts : torch.Tensor, optional
         Cumulative checkpoint counts of shape ``[num_seqs + 1]``, int64.
         ``checkpoint_cu_starts[i+1] - checkpoint_cu_starts[i]`` is the
@@ -236,7 +230,7 @@ def chunk_gated_delta_rule(
         routing, ``True`` requires CP support, and ``False`` disables CP.
         Default: ``"auto"``.
     state_indices : torch.Tensor, optional
-        Int32 tensor of shape ``[num_seqs]`` (SM100/SM103 only). When provided,
+        Int32 tensor of shape ``[num_seqs]`` (SM90/SM100/SM103/SM120). When provided,
         ``initial_state`` and ``output_state`` are treated as a state pool whose
         first dimension is indexed by these slot ids rather than laid out in
         sequence order: sequence ``i`` reads its initial state from row
@@ -302,6 +296,10 @@ def chunk_gated_delta_rule(
         )
 
     assert cu_seqlens is not None, "cu_seqlens is required for varlen mode"
+    if not is_integer_dtype(cu_seqlens.dtype):
+        raise ValueError(
+            f"cu_seqlens must have an integer dtype, got {cu_seqlens.dtype}"
+        )
 
     num_seqs = cu_seqlens.size(0) - 1
     total_seq_len = q.size(0)
@@ -313,13 +311,10 @@ def chunk_gated_delta_rule(
 
     if checkpoint_every_n_tokens > 0:
         assert state_checkpoints is not None and checkpoint_cu_starts is not None
-        state_checkpoint_dtypes: tuple[torch.dtype, ...] = (torch.float32,)
-        if q.is_cuda and get_compute_capability(q.device)[0] == 10:
-            state_checkpoint_dtypes = _SM100_STATE_DTYPES
-        if state_checkpoints.dtype not in state_checkpoint_dtypes:
+        if state_checkpoints.dtype not in _STATE_DTYPES:
             raise ValueError(
                 "state_checkpoints must have dtype "
-                f"{_format_dtype_list(state_checkpoint_dtypes)}, "
+                f"{_format_dtype_list(_STATE_DTYPES)}, "
                 f"got {state_checkpoints.dtype}"
             )
         if state_checkpoints.ndim != 4:
@@ -328,9 +323,10 @@ def chunk_gated_delta_rule(
                 f"[total_checkpoints, num_sab_heads, head_size, head_size], "
                 f"got {state_checkpoints.ndim}D"
             )
-        if checkpoint_cu_starts.dtype != torch.int64:
+        if not is_integer_dtype(checkpoint_cu_starts.dtype):
             raise ValueError(
-                f"checkpoint_cu_starts must be int64, got {checkpoint_cu_starts.dtype}"
+                "checkpoint_cu_starts must have an integer dtype, "
+                f"got {checkpoint_cu_starts.dtype}"
             )
         if checkpoint_cu_starts.ndim != 1:
             raise ValueError(
@@ -379,14 +375,21 @@ def chunk_gated_delta_rule(
     )
     will_use_cp = use_cp is True or (use_cp == "auto" and cp_heuristic_matches)
     if state_indices is not None:
-        # Indexed state-pool I/O is only implemented in the SM100/SM103 non-CP
-        # CuTe-DSL kernel. Reject it on every other dispatch path (SM90, SM120,
-        # or CP) rather than silently ignoring it and reading/writing the state
-        # in packed, sequence-ordered layout.
-        if _arch_major != 10:
+        if not is_integer_dtype(state_indices.dtype):
+            raise ValueError(
+                f"state_indices must have an integer dtype, got {state_indices.dtype}"
+            )
+        if state_indices.shape != (num_seqs,):
+            raise ValueError(
+                f"state_indices must have shape {(num_seqs,)}, "
+                f"got {tuple(state_indices.shape)}"
+            )
+        # Reject unsupported dispatch paths rather than silently reading/writing
+        # the state in packed, sequence-ordered layout.
+        if _arch_major not in (9, 10, 12):
             raise NotImplementedError(
-                "state_indices is only supported on the SM100/SM103 GDN prefill "
-                f"kernel (non-CP); got compute-capability major {_arch_major}, "
+                "state_indices is only supported on the SM90/SM100/SM103/SM120 GDN "
+                f"prefill kernels; got compute-capability major {_arch_major}, "
                 f"use_cp={use_cp!r}."
             )
         # The kernel writes each final state to output_state[state_indices[i]],
@@ -455,6 +458,15 @@ def chunk_gated_delta_rule(
             state_indices_kwargs = (
                 {"state_indices": state_indices} if state_indices is not None else {}
             )
+            checkpoint_kwargs = (
+                {
+                    "state_checkpoints": state_checkpoints,
+                    "checkpoint_cu_starts": checkpoint_cu_starts,
+                    "checkpoint_every_n_tokens": checkpoint_every_n_tokens,
+                }
+                if _arch_major in (9, 10, 12)
+                else {}
+            )
             cp_delta_rule_dsl(
                 output,
                 output_state,
@@ -467,7 +479,9 @@ def chunk_gated_delta_rule(
                 _scale,
                 initial_state=initial_state,
                 max_seqlen=total_seq_len,
+                cp_chunk_len=_cp_chunk_len,
                 **state_indices_kwargs,
+                **checkpoint_kwargs,
             )
             if output_final_state:
                 return output, output_state
@@ -510,11 +524,6 @@ def chunk_gated_delta_rule(
             )
         )
 
-        # Convert checkpoint_cu_starts from int64 cu_starts to int32 cu_checkpoints
-        _cu_checkpoints = None
-        if checkpoint_every_n_tokens > 0 and checkpoint_cu_starts is not None:
-            _cu_checkpoints = checkpoint_cu_starts.to(torch.int32)
-
         chunk_gated_delta_rule_sm100(
             q,
             k,
@@ -522,12 +531,12 @@ def chunk_gated_delta_rule(
             _g,
             _beta,
             output,
-            cu_seqlens.to(torch.int32),
+            cu_seqlens,
             initial_state,
             output_state,
             _scale,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-            cu_checkpoints=_cu_checkpoints,
+            cu_checkpoints=checkpoint_cu_starts,
             output_checkpoints=state_checkpoints,
             state_indices=state_indices,
         )
@@ -536,10 +545,13 @@ def chunk_gated_delta_rule(
         if chunk_gated_delta_rule_sm120 is None:
             raise NotImplementedError("SM120 GDN prefill DSL kernel is unavailable")
         if output_state is None:
+            output_state_shape = (
+                initial_state.shape
+                if state_indices is not None and initial_state is not None
+                else (num_seqs, num_sab_heads, head_size, head_size)
+            )
             output_state = torch.empty(
-                (num_seqs, num_sab_heads, head_size, head_size),
-                dtype=torch.float32,
-                device=device,
+                output_state_shape, dtype=torch.float32, device=device
             )
         chunk_gated_delta_rule_sm120(
             output,
@@ -550,15 +562,12 @@ def chunk_gated_delta_rule(
             initial_state,
             g,
             beta,
-            cu_seqlens.to(torch.int64),
+            cu_seqlens,
             _scale,
             state_checkpoints,
-            (
-                checkpoint_cu_starts.to(torch.int64)
-                if checkpoint_cu_starts is not None
-                else None
-            ),
+            checkpoint_cu_starts,
             checkpoint_every_n_tokens,
+            state_indices=state_indices,
         )
     elif _arch_major == 9:
         # SM90 Hopper path (CuTe DSL kernel)
@@ -581,15 +590,12 @@ def chunk_gated_delta_rule(
             initial_state,
             g,
             beta,
-            cu_seqlens.to(torch.int64),
+            cu_seqlens,
             _scale,
             state_checkpoints,
-            (
-                checkpoint_cu_starts.to(torch.int64)
-                if checkpoint_cu_starts is not None
-                else None
-            ),
+            checkpoint_cu_starts,
             checkpoint_every_n_tokens,
+            state_indices=state_indices,
         )
     else:
         raise NotImplementedError("GDN prefill DSL kernel is unavailable")
