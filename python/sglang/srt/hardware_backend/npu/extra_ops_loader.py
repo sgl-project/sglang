@@ -25,7 +25,36 @@ class OpLibSpec:
 
 
 class TorchOpLoader:
-    """Load a standalone .so into ``torch.ops`` and validate its operators."""
+    """
+    Loader for PyTorch custom operators from shared libraries.
+    
+    This class handles the registration and initialization of custom PyTorch
+    operators (Ops) from dynamically linked shared object (.so) files. It supports
+    environment-based library path discovery, dependency pre-loading, and
+    operator existence validation.
+    
+    Usage:
+        1. Create an OpLibSpec with operator metadata
+        2. Instantiate TorchOpLoader with the spec
+        3. Call initialize() to load and register the operators
+        
+    Example:
+        >>> spec = OpLibSpec(
+        ...     name="My custom ops",
+        ...     so_env="MY_LIB_SO_PATH",
+        ...     namespace="_C_my_lib",
+        ...     required_ops=("op1", "op2"),
+        ...     pre_load_imports=("torch", "other_dep"),
+        ... )
+        >>> loader = TorchOpLoader(spec)
+        >>> lib_path = loader.initialize()
+        >>> # Ops are now registered under namespace: _C_my_lib.op1()
+    
+    The loader will raise appropriate exceptions if:
+        - The shared library cannot be found (via SO_PATH env var or default paths)
+        - Pre-load imports fail
+        - Required operators are missing after loading
+    """
 
     def __init__(self, spec: OpLibSpec) -> None:
         self._spec = spec
