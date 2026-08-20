@@ -357,6 +357,47 @@ def _read_process_mappings() -> tuple[list[int], list[int], list[bool]] | None:
     return [r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows]
 
 
+class ProcessMappings:
+    """One snapshot of this process's address space.
+
+    Built once and asked many times: re-reading /proc/self/maps per tensor would
+    dominate a loop over a checkpoint's worth of weights. Linux only; elsewhere
+    every tensor simply reports as not file-backed.
+    """
+
+    def __init__(self) -> None:
+        self._mappings = _read_process_mappings()
+
+    def is_file_backed(self, tensor: torch.Tensor) -> bool:
+        """Whether this tensor's bytes live in a file mapping.
+
+        File-backed pages are the only host memory the kernel can reclaim
+        without swap, so this is the question that decides whether a host copy
+        costs the process anything it cannot give back.
+        """
+        if self._mappings is None or tensor.device.type != "cpu":
+            return False
+        try:
+            pointer = tensor.untyped_storage().data_ptr()
+        except Exception:
+            return False
+        if pointer == 0:
+            return False
+        # CUDA's host allocator sits behind a mapping that carries a pathname,
+        # so the check below would call pinned memory file-backed. It is not:
+        # the kernel cannot reclaim it at all.
+        try:
+            if tensor.is_pinned():
+                return False
+        except Exception:
+            pass
+        starts, ends, backed = self._mappings
+        index = bisect.bisect_right(starts, pointer) - 1
+        if index < 0 or pointer >= ends[index]:
+            return False
+        return backed[index]
+
+
 def component_residency_bytes(module) -> Dict[str, int]:
     """Where a component's weights actually sit, in bytes.
 
@@ -380,16 +421,7 @@ def component_residency_bytes(module) -> Dict[str, int]:
 
     totals = {"vram": 0, "host_pinned": 0, "host_mapped": 0, "host": 0}
     seen: set[int] = set()
-    mappings = _read_process_mappings()
-
-    def is_file_backed(pointer: int) -> bool:
-        if mappings is None:
-            return False
-        starts, ends, backed = mappings
-        index = bisect.bisect_right(starts, pointer) - 1
-        if index < 0 or pointer >= ends[index]:
-            return False
-        return backed[index]
+    mappings = ProcessMappings()
 
     def add(tensor: torch.Tensor) -> None:
         try:
@@ -410,7 +442,7 @@ def component_residency_bytes(module) -> Dict[str, int]:
             pinned = False
         if pinned:
             bucket = "host_pinned"
-        elif is_file_backed(pointer):
+        elif mappings.is_file_backed(tensor):
             bucket = "host_mapped"
         else:
             bucket = "host"

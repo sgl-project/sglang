@@ -8,6 +8,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.loader.utils import ProcessMappings
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     COMPONENT_RESIDENCY_GROUPS,
     LAYERWISE_OFFLOAD,
@@ -261,9 +262,14 @@ class LayerwiseOffloadManager:
         # layer_idx -> {dtype: consolidated_pinned_cpu_tensor}
         # stores the consolidated weight from a same layer, of same dtype
         self._consolidated_cpu_weights: Dict[int, Dict[torch.dtype, torch.Tensor]] = {}
-        # layer_idx -> {name: pinned_cpu_tensor_with_original_stride}
-        # stores tensors whose original non-contiguous stride/layout must be preserved
-        self._strided_cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
+        # layer_idx -> {name: this weight's own host tensor}
+        # for weights that cannot be a slice of the flat buffer: a layout that
+        # has to survive, or a checkpoint mapping worth keeping
+        self._standalone_cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
+        # Asked once per weight during initialization, so snapshot the address
+        # space rather than re-reading /proc for each one.
+        self._process_mappings = ProcessMappings()
+        self._kept_mappings = 0
         # mps keeps the original CPU tensor for each layer instead of building a
         # second flattened host copy
         self._mps_cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -334,6 +340,19 @@ class LayerwiseOffloadManager:
     ) -> torch.Tensor:
         return self._wrap_for_target(target, self._get_shared_empty_tensor(dtype))
 
+    def _can_keep_mapping(self, local_weight: torch.Tensor) -> bool:
+        """Whether this weight's host store can just be the checkpoint mapping.
+
+        Only when pinning is off. A pinned host copy is what lets the copy
+        stream run ahead of compute, and a mapping cannot be pinned and stay
+        reclaimable at the same time, so with pinning on the copy earns its
+        cost. With pinning off the copy earns nothing: it moves the same bytes
+        at the same speed into memory the kernel can no longer drop.
+        """
+        if self.pin_cpu_memory or self._synchronous_mps:
+            return False
+        return self._process_mappings.is_file_backed(local_weight)
+
     @staticmethod
     def _get_alignment_numel(dtype: torch.dtype, alignment_bytes: int = 32) -> int:
         element_size = torch.empty((), dtype=dtype).element_size()
@@ -394,19 +413,46 @@ class LayerwiseOffloadManager:
         # 2. concat and offload (in pinned memory)
         for layer_idx, dtype_to_params in layer_groups.items():
             self._consolidated_cpu_weights[layer_idx] = {}
-            self._strided_cpu_weights[layer_idx] = {}
+            self._standalone_cpu_weights[layer_idx] = {}
             self._weight_metadata[layer_idx] = {}
 
             for dtype, weights in dtype_to_params.items():
                 contiguous_weights: List[Tuple[str, torch.Tensor, torch.Tensor]] = []
                 for name, weight in weights:
                     local_weight = self._to_local_tensor(weight)
+
+                    if self._can_keep_mapping(local_weight):
+                        # The checkpoint is already mapped and these bytes are
+                        # exactly what the copy needs, so keep the mapping as
+                        # the host store. Copying it into anonymous memory would
+                        # buy nothing and cost the kernel its ability to reclaim
+                        # those pages, which without swap it otherwise has.
+                        # detach first: the line below rebinds weight.data, and
+                        # local_weight may be that same object, so storing it
+                        # directly would hand the placeholder back as the weight
+                        self._standalone_cpu_weights[layer_idx][
+                            name
+                        ] = local_weight.detach()
+                        self._weight_metadata[layer_idx][name] = {
+                            "dtype": dtype,
+                            "shape": local_weight.shape,
+                            "stride": local_weight.stride(),
+                            "standalone_host_store": True,
+                        }
+                        weight.data = self._get_shared_empty_tensor_for_target(
+                            weight, dtype
+                        )
+                        self._kept_mappings += 1
+                        continue
+
                     if local_weight.is_contiguous():
                         contiguous_weights.append((name, weight, local_weight))
                         continue
 
-                    # Preserve non-contiguous layouts such as the transposed FP8
-                    # weight views expected by CUTLASS kernels.
+                    # A weight gets its own host tensor when it cannot live as a
+                    # slice of the flat buffer -- here because a non-contiguous
+                    # layout has to survive, such as the transposed FP8 weight
+                    # views CUTLASS kernels expect.
                     cpu_tensor = torch.empty_strided(
                         size=local_weight.shape,
                         stride=local_weight.stride(),
@@ -414,12 +460,12 @@ class LayerwiseOffloadManager:
                         pin_memory=self.pin_cpu_memory,
                     )
                     cpu_tensor.copy_(local_weight)
-                    self._strided_cpu_weights[layer_idx][name] = cpu_tensor
+                    self._standalone_cpu_weights[layer_idx][name] = cpu_tensor
                     self._weight_metadata[layer_idx][name] = {
                         "dtype": dtype,
                         "shape": local_weight.shape,
                         "stride": local_weight.stride(),
-                        "preserve_strides": True,
+                        "standalone_host_store": True,
                     }
                     weight.data = self._get_shared_empty_tensor_for_target(
                         weight, dtype
@@ -459,7 +505,7 @@ class LayerwiseOffloadManager:
                         "numel": numel,
                         "shape": local_weight.shape,
                         "stride": local_weight.stride(),
-                        "preserve_strides": False,
+                        "standalone_host_store": False,
                     }
 
                     weight.data = self._get_shared_empty_tensor_for_target(
@@ -477,6 +523,13 @@ class LayerwiseOffloadManager:
 
         self.register_forward_hooks()
         self._configured = True
+        if self._kept_mappings:
+            logger.info(
+                "Layerwise offload kept %d of this module's weights on the "
+                "checkpoint mapping instead of copying them; those pages stay "
+                "reclaimable, which without swap anonymous ones are not.",
+                self._kept_mappings,
+            )
         logger.debug(
             f"LayerwiseOffloadManager initialized with num prefetched layer: {self.prefetch_size}, num resident layers: {self.resident_layers}, total num layers: {self.num_layers}, residency policy: {self.residency_policy}"
         )
@@ -651,12 +704,12 @@ class LayerwiseOffloadManager:
             # so the recorded event covers both flat-buffer and stride-preserving copies.
             for name, meta in self._weight_metadata[layer_idx].items():
                 target = self.get_target_with_name(name)
-                if meta.get("preserve_strides", False):
+                if meta.get("standalone_host_store", False):
                     # Recreate the original view layout instead of flatten+view.
                     # ModelOpt FP8 relies on a transposed runtime weight layout,
                     # so preserving stride is part of correctness, not just an
                     # optimization detail.
-                    cpu_tensor = self._strided_cpu_weights[layer_idx][name]
+                    cpu_tensor = self._standalone_cpu_weights[layer_idx][name]
                     gpu_tensor = torch.empty_strided(
                         size=meta["shape"],
                         stride=meta["stride"],
@@ -762,8 +815,8 @@ class LayerwiseOffloadManager:
         for name, meta in self._weight_metadata.get(layer_idx, {}).items():
             target = self.get_target_with_name(name)
             target_local = self._to_local_tensor(target)
-            if meta.get("preserve_strides", False):
-                self._strided_cpu_weights[layer_idx][name].copy_(target_local.cpu())
+            if meta.get("standalone_host_store", False):
+                self._standalone_cpu_weights[layer_idx][name].copy_(target_local.cpu())
                 continue
 
             gpu_weight = target_local.flatten().cpu()
@@ -859,8 +912,8 @@ class LayerwiseOffloadManager:
                 )
 
             dtype = meta["dtype"]
-            if meta.get("preserve_strides", False):
-                self._strided_cpu_weights[layer_idx][name].copy_(
+            if meta.get("standalone_host_store", False):
+                self._standalone_cpu_weights[layer_idx][name].copy_(
                     local_loaded_weight.to(dtype=dtype)
                 )
             else:
@@ -897,12 +950,11 @@ class LayerwiseOffloadManager:
 
         for layer_idx in sorted(self._weight_metadata):
             for name, meta in self._weight_metadata[layer_idx].items():
-                if meta.get("preserve_strides", False):
-                    # Some quantized weights rely on a non-contiguous layout.
-                    # Yield the strided tensor directly instead of rebuilding it
-                    # from the flat buffer, which would silently lose the
-                    # original stride information.
-                    yield name, self._strided_cpu_weights[layer_idx][name]
+                if meta.get("standalone_host_store", False):
+                    # This weight has its own host tensor, so yield it directly
+                    # rather than rebuilding it from the flat buffer, which
+                    # would silently lose its layout.
+                    yield name, self._standalone_cpu_weights[layer_idx][name]
                     continue
 
                 dtype = meta["dtype"]

@@ -1,3 +1,4 @@
+import pathlib
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _ModelOptFp8OffloadAdapter,
 )
+from sglang.multimodal_gen.runtime.loader.utils import ProcessMappings
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     component_residency_strategies as component_residency_strategies_mod,
 )
@@ -237,7 +239,7 @@ def test_layerwise_offload_preserves_non_contiguous_stride(monkeypatch):
     )
 
     meta = manager._weight_metadata[0]["blocks.0.weight"]
-    assert meta["preserve_strides"] is True
+    assert meta["standalone_host_store"] is True
 
     restored_weight = model.blocks[0].weight.data
     assert restored_weight.shape == original_weight.shape
@@ -714,8 +716,8 @@ def test_layerwise_offload_aligns_contiguous_tensor_offsets(monkeypatch):
 
     weight_meta = manager._weight_metadata[0]["blocks.0.weight"]
     bias_meta = manager._weight_metadata[0]["blocks.0.bias"]
-    assert weight_meta["preserve_strides"] is False
-    assert bias_meta["preserve_strides"] is False
+    assert weight_meta["standalone_host_store"] is False
+    assert bias_meta["standalone_host_store"] is False
     assert weight_meta["offset"] == 0
     assert bias_meta["offset"] % 8 == 0
 
@@ -1218,3 +1220,79 @@ def test_strided_forward_leaves_exactly_the_resident_set(monkeypatch):
     resident = set(range(8)) - set(manager._streamed_order)
     assert resident <= manager._gpu_layers
     assert len(manager._gpu_layers) <= len(resident) + manager.prefetch_size
+
+
+def _file_backed_model(tmp_path, monkeypatch):
+    """A model whose block weight is a view into a file, like a mapped checkpoint."""
+    backing = tmp_path / "weights.bin"
+    backing.write_bytes(b"\x00" * 4096)
+    mapped = torch.from_file(str(backing), shared=True, size=256, dtype=torch.float32)
+    mapped.copy_(torch.arange(256, dtype=torch.float32))
+
+    model = torch.nn.Module()
+    block = torch.nn.Module()
+    block.weight = torch.nn.Parameter(mapped.reshape(16, 16), requires_grad=False)
+    model.blocks = torch.nn.ModuleList([block])
+    return model
+
+
+def test_a_mapped_weight_is_kept_rather_than_copied(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    model = _file_backed_model(tmp_path, monkeypatch)
+    expected = model.blocks[0].weight.detach().clone()
+
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=1,
+    )
+
+    assert manager._kept_mappings == 1
+    stored = manager._standalone_cpu_weights[0]["blocks.0.weight"]
+    # still the mapping, which is the whole point: a copy would be anonymous
+    # memory the kernel could not reclaim
+    assert ProcessMappings().is_file_backed(stored)
+    assert manager._weight_metadata[0]["blocks.0.weight"]["standalone_host_store"]
+
+    manager.release_layer(0)
+    manager.prefetch_layer(0, non_blocking=False)
+    assert torch.equal(model.blocks[0].weight.data, expected)
+
+
+def test_pinning_still_copies_a_mapped_weight(tmp_path, monkeypatch):
+    if not pathlib.Path("/proc/self/maps").exists():
+        pytest.skip("needs /proc to tell a mapping from anonymous memory")
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    model = _file_backed_model(tmp_path, monkeypatch)
+
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=1,
+        enabled=True,
+        pin_cpu_memory=True,
+        prefetch_size=1,
+    )
+
+    # pinning is what lets the copy stream run ahead, and a mapping cannot be
+    # pinned and stay reclaimable, so here the copy earns its cost
+    assert manager._kept_mappings == 0
+    buffers = manager._consolidated_cpu_weights[0]
+    assert buffers, "expected the weight to land in a consolidated buffer"
+    for buf in buffers.values():
+        # pinned, therefore not something the kernel can reclaim -- which is
+        # what the mapping would have given up in exchange for async copies
+        assert not ProcessMappings().is_file_backed(buf)
