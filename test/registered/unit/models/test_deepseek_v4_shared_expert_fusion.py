@@ -170,27 +170,24 @@ class TestDeepseekV4SharedExpertFusionPolicy(CustomTestCase):
             )
 
     def test_mixed_precision_quant_vetoes_even_when_enforced(self):
-        """A precision mismatch causes crash when shared expert fusion is enabled,
-        so --enforce-shared-experts-fusion must not override it. Guards the gap
-        where the enforce early-return skipped the quant check entirely."""
+        """Non-HIP fusion keeps the generic precision-mismatch veto."""
         self._publish(enforce=True)
         mixed = SimpleNamespace(
             get_name=lambda: "quark", can_fuse_shared_expert=lambda: False
         )
-        self.assertIn(
-            "higher precision",
-            DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
-                SimpleNamespace(n_shared_experts=1), mixed
-            ),
-        )
-        matched = SimpleNamespace(
-            get_name=lambda: "quark", can_fuse_shared_expert=lambda: True
-        )
-        self.assertIsNone(
-            DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
-                SimpleNamespace(n_shared_experts=1), matched
+        with patch.object(deepseek_v4, "_is_hip", False):
+            self.assertIn(
+                "higher precision",
+                DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                    SimpleNamespace(n_shared_experts=1), mixed
+                ),
             )
-        )
+        with self._fhmoe_environment():
+            self.assertIsNone(
+                DeepseekV4ForCausalLM.shared_experts_fusion_disable_reason(
+                    self._valid_config(), self._valid_quant_config()
+                )
+            )
 
     def test_dspark_entry_class_uses_the_v4_gate(self):
         """A DSV4 DSpark draft must inherit the target's default fusion policy."""

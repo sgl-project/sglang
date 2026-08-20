@@ -3117,9 +3117,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         carry exactly one shared expert. Asked by the loader before any layer
         is built.
         """
-        # Need to disable if quant precision mismatch, even if
-        # --enforce-shared-experts-fusion is specified
-        if quant_blocks_shared_experts_fusion(quant_config):
+        # FHMoE intentionally keeps the shared expert at native FP8 while
+        # routed experts remain MXFP4; let its dedicated eligibility checks
+        # handle this precision mismatch on the HIP/AITER path.
+        if quant_blocks_shared_experts_fusion(quant_config) and not (
+            _is_hip and _use_aiter
+        ):
             return (
                 "Quantization keeps shared experts at a higher precision than the "
                 "routed experts, so they cannot be fused into the quantized "
