@@ -11,7 +11,6 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=3600, suite="base-c-test-perf-2-npu-a3")
 register_npu_ci(est_time=6500, suite="nightly-acc-2-npu-a3", nightly=True)
-register_npu_ci(est_time=9000, suite="nightly-rerun-qwen3-vl-8b-mmmu", nightly=True)
 
 _is_pr_pipeline = os.environ.get("GITHUB_EVENT_NAME") == "pull_request"
 
