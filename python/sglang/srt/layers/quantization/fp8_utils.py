@@ -285,9 +285,13 @@ class Fp8GemmRunnerBackend(Enum):
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     AITER = "aiter"
+    B12X = "b12x"
 
     def is_auto(self) -> bool:
         return self == Fp8GemmRunnerBackend.AUTO
+
+    def is_b12x(self) -> bool:
+        return self == Fp8GemmRunnerBackend.B12X
 
     def is_flashinfer_trtllm(self) -> bool:
         return self == Fp8GemmRunnerBackend.FLASHINFER_TRTLLM
@@ -676,6 +680,69 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
     return output.to(dtype=output_dtype).view(*output_shape)
 
 
+# b12x block-FP8 linear (SM12x / GB10). One packed-weight cache keyed by the
+# source weight tensor: the dispatched callable carries no layer object, and
+# some callers pass synthetically stacked weights that belong to no layer
+# (e.g. the DSpark fused KV projection), so the weight tensor is the only
+# stable identity. pack_weight re-quantizes float32 block scales onto
+# ceil-UE8M0 (DeepGEMM parity) host-side, once per weight.
+_b12x_packed_weights = None
+
+
+def b12x_w8a8_block_fp8_linear_with_fallback(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if (
+        isinstance(input, tuple)
+        or input_scale is not None
+        or tuple(block_size) != (128, 128)
+        or weight.shape[1] % 128 != 0
+        or input.dtype not in (torch.bfloat16, torch.float16)
+    ):
+        return cutlass_w8a8_block_fp8_linear_with_fallback(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
+
+    from b12x.gemm import block_fp8_linear as bfl
+
+    global _b12x_packed_weights
+    if _b12x_packed_weights is None:
+        from torch.utils.weak import WeakTensorKeyDictionary
+
+        _b12x_packed_weights = WeakTensorKeyDictionary()
+    packed = _b12x_packed_weights.get(weight)
+    if packed is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "b12x block-fp8 weight packing requested during CUDA graph "
+                "capture; the eager pre-capture run must pack it first."
+            )
+        import os
+
+        os.environ.setdefault(
+            "B12X_COMPILE_CACHE_DIR", envs.SGLANG_B12X_CACHE_DIR.get()
+        )
+        packed = bfl.pack_weight(weight, weight_scale, block_size=(128, 128))
+        _b12x_packed_weights[weight] = packed
+
+    input_2d = input.reshape(-1, input.shape[-1])
+    if not input_2d.is_contiguous():
+        input_2d = input_2d.contiguous()
+    output = bfl.run(
+        source=input_2d,
+        packed_weight=packed,
+        bias=bias,
+        expected_m=int(input_2d.shape[0]),
+        stream=torch.cuda.current_stream().cuda_stream,
+    )
+    return output.view(*input.shape[:-1], weight.shape[0])
+
+
 def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
     """Dispatch based on explicitly selected backend."""
     if backend.is_flashinfer_trtllm():
@@ -733,6 +800,21 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
 
     elif backend.is_triton():
         return triton_w8a8_block_fp8_linear
+
+    elif backend.is_b12x():
+        if not is_sm120_supported():
+            raise RuntimeError(
+                "--fp8-gemm-backend=b12x requires SM120/SM121 (DGX Spark / "
+                "RTX PRO family)."
+            )
+        try:
+            from b12x.gemm import block_fp8_linear  # noqa: F401
+        except ImportError as e:
+            raise RuntimeError(
+                "--fp8-gemm-backend=b12x requested but b12x is not "
+                "importable; install the pinned tree (see mxfp4_b12x_moe.py)."
+            ) from e
+        return b12x_w8a8_block_fp8_linear_with_fallback
 
     else:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
