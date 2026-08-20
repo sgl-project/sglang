@@ -2001,19 +2001,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         node = self.node_by_id(node_id)
         cache_actions: list[CacheAction | ComponentAction] = []
         if self.is_write_back:
-            # Write-back may reclaim a duplicate host copy while H->D DMA is
-            # still reading it, so pin every source node until the ack.
-            for xfers in ([kv_xfer], *comp_xfers.values()):
-                for xfer in xfers:
-                    for nid in xfer.nodes_to_load or ():
-                        pinned = self.node_by_id(nid)
-                        # One live load-back per node; only the same anchor may
-                        # re-pin (a node can sit in Full and aux transfer lists).
-                        assert pinned.load_back_pending_id in (None, node_id), (
-                            f"node {nid} pinned by load-back "
-                            f"{pinned.load_back_pending_id}, new anchor {node_id}"
-                        )
-                        pinned.load_back_pending_id = node_id
+            # Pin Full KV host slots against duplicate reclaim until the ack.
+            # Auxiliary pools have independent host locks and may legitimately
+            # load the same radix node under a different anchor.
+            for nid in kv_xfer.nodes_to_load or ():
+                pinned = self.node_by_id(nid)
+                assert pinned.load_back_pending_id in (None, node_id), (
+                    f"node {nid} pinned by load-back "
+                    f"{pinned.load_back_pending_id}, new anchor {node_id}"
+                )
+                pinned.load_back_pending_id = node_id
         kv_xfer.device_indices = device_indices
         self.components_by_type[BASE_COMPONENT_TYPE].commit_hicache_transfer(
             node,
