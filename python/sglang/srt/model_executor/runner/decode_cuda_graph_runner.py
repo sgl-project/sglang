@@ -467,9 +467,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _record_in_graph_metadata_prep_done(self):
         # Purely a marker at this point in the graph; where the shared reads
         # actually end is the attn backend's call.
-        if not torch.cuda.is_current_stream_capturing():
+        if not self.device_module.is_current_stream_capturing():
             # Warmup shares this body. Breakable capture still plants: it opens
             # segment 1 on context entry and every segment re-arms the node.
+            # Routed through device_module so XPU (torch.xpu) is picked up
+            # instead of hitting torch.cuda dummy stubs on non-CUDA builds.
             return
         if self.in_graph_metadata_prep_done is None:
             self.in_graph_metadata_prep_done = make_external_event(self.device_module)

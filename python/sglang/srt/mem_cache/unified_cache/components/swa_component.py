@@ -452,6 +452,9 @@ class SWAComponent(TreeComponent):
         super().__init__(cache, params)
         self._session_leaf_covered_len: dict[str, dict[UnifiedTreeNode, int]] = {}
         self.sliding_window_size = params.sliding_window_size
+        self.full_window_pages = (
+            self.sliding_window_size + params.page_size - 1
+        ) // params.page_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
         # Strict bit-exact SWA HiCache (unified_kv only): when True, SWA host
@@ -1342,12 +1345,27 @@ class SWAComponent(TreeComponent):
                 return PreparePrefetchResult()
             num_tokens = window_pages * ring
         else:
-            sw_pages = (
-                self.cache.sliding_window_size + self.cache.page_size - 1
-            ) // self.cache.page_size
-            if sw_pages == 0 or prefetch_tokens // self.cache.page_size < sw_pages:
+            sw_pages = self.full_window_pages
+            if sw_pages == 0:
                 return PreparePrefetchResult()
-            num_tokens = sw_pages * self.cache.page_size
+            prefetch_pages = prefetch_tokens // self.cache.page_size
+            if prefetch_pages >= sw_pages:
+                num_pages = sw_pages
+            elif prefetch_pages <= 0:
+                return PreparePrefetchResult()
+            elif (
+                self.tree_core.is_root(node_id)
+                or self.cache.host_memory_mode == "buffer_only"
+            ):
+                # Sub-window fetch: at root the sequence IS its window; mid-tree
+                # (buffer mode) the window head is the device prefix's own ring
+                # state, so only the suffix needs fetching.
+                num_pages = prefetch_pages
+            else:
+                # Cache-mode graft: a mid-tree window head is not
+                # device-guaranteed, require a full window.
+                return PreparePrefetchResult()
+            num_tokens = num_pages * self.cache.page_size
         host_indices = self._swa_kv_pool_host.alloc(num_tokens)
         if host_indices is None:
             self.cache.evict_host(num_tokens, ComponentType.SWA)
@@ -1497,22 +1515,23 @@ class SWAComponent(TreeComponent):
 
         if phase == CacheTransferPhase.PREFETCH:
             assert host_indices is not None
-            # Strict windows are ring-paged; the placeholder key count must match
-            # the page count `_sync_trailing_keys` will rewrite to Full hashes,
-            # so each requested window page is keyed by the same Full hash its
-            # carrier stored it under (BACKUP_STORAGE keys=[_swa_l3_key]) -- a
-            # window is then fetched iff its Full page also hit.
+            # Keys are unknowable at build time; placeholders carry the
+            # count, _sync_trailing_keys fills the real trailing hashes.
+            # Strict windows are ring-paged, so the count is in rings: each
+            # requested window page must be keyed by the same Full hash its
+            # carrier stored it under (BACKUP_STORAGE keys=[_swa_l3_key]), which
+            # is what makes a window fetch iff its Full page also hit.
             stride = (
                 self._swa_kv_pool_host.slot_page_size
                 if self._strict_bit_exact
                 else self.tree_core.page_size
             )
-            sw_pages = host_indices.numel() // stride
+            num_pages = host_indices.numel() // stride
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
                     host_indices=host_indices,
-                    keys=["__placeholder__"] * sw_pages,
+                    keys=["__placeholder__"] * num_pages,
                     hit_policy=PoolHitPolicy.TRAILING_PAGES,
                 )
             ]
@@ -2234,6 +2253,21 @@ class SWAComponent(TreeComponent):
             and insert_result.inserted_host_node is not None
             else None
         )
+        if anchor is not self.tree_core.root_node:
+            # Cache-mode graft commit only (buffer fills never reach here):
+            # a hit-shrunk window mid-tree is missing its head — drop it.
+            # Root anchors are complete windows of their own. The requirement
+            # has to be counted in the same unit as ``window_require_pages``,
+            # which is strides: rings under the strict ring-paged pool, and
+            # page_size pages (== full_window_pages) otherwise.
+            require_pages = (
+                max(1, -(-self.sliding_window_size // stride))
+                if self._strict_bit_exact
+                else self.full_window_pages
+            )
+            if window_require_pages < require_pages:
+                self._release_swa_host(host_indices, cache_actions)
+                return
         if (
             target is None
             or window_require_pages == 0

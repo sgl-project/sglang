@@ -1336,6 +1336,7 @@
                   {
                     "group": "Baidu",
                     "pages": [
+                      "cookbook/autoregressive/Baidu/PaddleOCR-VL",
                       "cookbook/autoregressive/Baidu/Unlimited-OCR"
                     ]
                   },
@@ -1607,6 +1608,7 @@
                   "docs/sglang-diffusion/performance-optimization",
                   "docs/sglang-diffusion/deployment_cookbook",
                   "docs/sglang-diffusion/attention_backends",
+                  "docs/sglang-diffusion/fused_kernels",
                   "docs/sglang-diffusion/parallelism",
                   "docs/sglang-diffusion/ring_sp_performance",
                   "docs/sglang-diffusion/encoder_parallel",

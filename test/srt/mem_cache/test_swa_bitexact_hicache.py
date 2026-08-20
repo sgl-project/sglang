@@ -609,6 +609,24 @@ class TestStrictL3Coupled(unittest.TestCase):
             self._build_prefetch(comp, prefetch_tokens=2 * self.PAGE_SIZE)
         )
 
+    def _controller_self(self, ring):
+        # Minimal stand-in for HybridCacheController: _sync_trailing_keys reads
+        # the per-pool page size (the ring, for the strict SWA pool) and can
+        # release a tail when the hit undershoots the pre-allocated buffer.
+        released = []
+        return types.SimpleNamespace(
+            page_size=self.PAGE_SIZE,
+            mem_pool_host=types.SimpleNamespace(
+                entry_map={
+                    PoolName.SWA: types.SimpleNamespace(
+                        host_pool=types.SimpleNamespace(page_size=ring)
+                    )
+                }
+            ),
+            append_host_mem_release=lambda **kw: released.append(kw),
+            _released=released,
+        )
+
     def test_prefetch_placeholders_resolve_to_carrier_backup_keys(self):
         # End-to-end key contract: the placeholders a strict PREFETCH emits are
         # rewritten by the controller's _sync_trailing_keys to the SAME Full page
@@ -628,10 +646,13 @@ class TestStrictL3Coupled(unittest.TestCase):
         # rewrite the 2 placeholders to the last 2 hit-page hashes (the window).
         all_hashes = [f"ph{i}" for i in range(8)]
         kv_hit_pages = 8
+        ctl = self._controller_self(self.PAGE_SIZE)
         HybridCacheController._sync_trailing_keys(
-            None, transfers, all_hashes, kv_hit_pages
+            ctl, transfers, all_hashes, kv_hit_pages
         )
         self.assertEqual(transfers[0].keys, ["ph6", "ph7"])
+        # Full window hit: the buffer matches the key count, nothing released.
+        self.assertEqual(ctl._released, [])
         # The tail carrier BACKUP_STORAGE key for the same page is hash_value[-1]
         # == "ph7"; the trailing window keys end on it (co-lifetime holds).
         self.assertEqual(transfers[0].keys[-1], all_hashes[kv_hit_pages - 1])
@@ -648,8 +669,11 @@ class TestStrictL3Coupled(unittest.TestCase):
         )
         transfers = self._build_prefetch(comp, prefetch_tokens=8 * self.PAGE_SIZE)
         all_hashes = [f"ph{i}" for i in range(8)]
-        HybridCacheController._sync_trailing_keys(None, transfers, all_hashes, 3)
+        ctl = self._controller_self(self.PAGE_SIZE)
+        HybridCacheController._sync_trailing_keys(ctl, transfers, all_hashes, 3)
         self.assertEqual(transfers[0].keys, ["ph1", "ph2"])
+        # Still a whole window of keys, so the buffer is kept intact.
+        self.assertEqual(ctl._released, [])
 
 
 class TestEvictDeviceOnOwnerRelease(unittest.TestCase):
@@ -754,11 +778,16 @@ class TestSwaL3RoundTrip(unittest.TestCase):
         attached = []
         comp._attach_swa_host_value = lambda n, s: attached.append(n)
         comp._release_swa_host = lambda s, actions: None
+        comp.sliding_window_size = self.RING
+        # Page-unit window count, deliberately != the ring-unit count (1): a
+        # mid-tree commit that requires this many pages would drop the window.
+        comp.full_window_pages = self.RING // self.PAGE_SIZE
         comp.cache = types.SimpleNamespace(page_size=self.PAGE_SIZE)
         comp.tree_core = types.SimpleNamespace(
             page_size=self.PAGE_SIZE,
             has_swa_host_pool=True,
             enable_hicache=True,
+            root_node=object(),  # anchor is mid-tree, not the root
             _split_node=lambda *a, **k: (None, None),
         )
         comp._attached = attached
@@ -860,11 +889,16 @@ class TestSwaStateCommitCouplingGuard(unittest.TestCase):
         attached = []
         comp._attach_swa_host_value = lambda n, s: attached.append(n)
         comp._release_swa_host = lambda s, actions: None
+        comp.sliding_window_size = self.RING
+        # Page-unit window count, deliberately != the ring-unit count (1): a
+        # mid-tree commit that requires this many pages would drop the window.
+        comp.full_window_pages = self.RING // self.PAGE_SIZE
         comp.cache = types.SimpleNamespace(page_size=self.PAGE_SIZE)
         comp.tree_core = types.SimpleNamespace(
             page_size=self.PAGE_SIZE,
             has_swa_host_pool=True,
             enable_hicache=True,
+            root_node=object(),  # anchor is mid-tree, not the root
             _split_node=lambda *a, **k: (None, None),
         )
         comp._attached = attached
