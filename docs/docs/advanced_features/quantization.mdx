@@ -1,7 +1,7 @@
 ---
 title: "Quantization"
 metatags:
-    description: "SGLang quantization: FP8, FP4, AWQ, GPTQ, ModelOpt, torchao. Offline and online quantization methods for efficient LLM inference."
+    description: "SGLang quantization: FP8, FP4, AWQ, GPTQ, ModelOpt. Offline and online quantization methods for efficient LLM inference."
 ---
 SGLang supports various quantization methods, including offline quantization and online dynamic quantization.
 
@@ -47,7 +47,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Yes</td>
       <td>Yes</td>
       <td>Yes (A5)</td>
-      <td>On GPU: requires CDNA3/CDNA4 with MXFP support (uses Aiter). On Ascend NPU (A5): W4A4 MXFP4 for Qwen3 dense LLM (MXFP4 weights + activations) — online uses dual-level MXFP4, offline <code>W4A4_MXFP4</code> checkpoints (single-level) are auto-detected via <code>modelslim</code></td>
+      <td>On GPU: requires CDNA3/CDNA4 with MXFP support (uses Aiter). On Ascend NPU (A5): W4A4 MXFP4 for Qwen3 dense and MoE LLMs (MXFP4 weights + activations) — dense models support online dual-level MXFP4; offline <code>W4A4_MXFP4</code> dense and MoE checkpoints (single-level) are auto-detected via <code>modelslim</code></td>
     </tr>
     <tr>
       <td><code>mxfp8</code></td>
@@ -61,7 +61,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>No</td>
       <td>No</td>
       <td>Yes (A5)</td>
-      <td>Ascend NPU only; online W4A8 for Qwen3 dense LLM (MXFP4 weights + MXFP8 activations) on A5 series; offline <code>W4A8_MXFP</code> checkpoints are auto-detected via <code>modelslim</code></td>
+      <td>Ascend NPU only; online W4A8 for Qwen3 dense LLM (MXFP4 weights + MXFP8 activations) on A5 series; offline <code>W4A8_MXFP</code> dense and MoE checkpoints are auto-detected via <code>modelslim</code></td>
     </tr>
     <tr>
       <td><code>blockwise_int8</code></td>
@@ -181,13 +181,6 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Experimental</td>
       <td>No</td>
       <td>Depends on bitsandbytes ROCm support</td>
-    </tr>
-    <tr>
-      <td><code>torchao</code> (<code>int4wo</code>, etc.)</td>
-      <td>Yes</td>
-      <td>Partial</td>
-      <td>No</td>
-      <td><code>int4wo</code> not supported on AMD; other methods may work</td>
     </tr>
     <tr>
       <td><code>modelslim</code></td>
@@ -814,7 +807,9 @@ MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression t
     - [x]  ```W8A8``` linear with offline quantization of activations
     - [x]  ```W8A8_DYNAMIC``` linear with online quantization of activations
     - [x]  ```W4A4_DYNAMIC``` MOE with online quantization of activations
+    - [x]  ```W4A4_MXFP4``` MOE with dynamic MXFP4 activation quantization
     - [x]  ```W4A8_DYNAMIC``` MOE with online quantization of activations
+    - [x]  ```W4A8_MXFP``` MOE with dynamic MXFP8 activation quantization
     - [x]  ```W8A8_DYNAMIC``` MOE with online quantization of activations
     - [ ]  ```W4A8``` linear TBD
     - [ ]  ```W4A16``` linear TBD
@@ -839,29 +834,6 @@ python3 -m sglang.launch_server \
 ```
 
 Our team is working on supporting more online quantization methods. SGLang will soon support methods including but not limited to `["awq", "gptq", "marlin", "gptq_marlin", "awq_marlin", "bitsandbytes", "gguf"]`.
-
-### torchao online quantization method
-
-SGLang also supports quantization methods based on [torchao](https://github.com/pytorch/ao). You can simply specify `--torchao-config` in the command line to support this feature. For example, if you want to enable `int4wo-128` for model `meta-llama/Meta-Llama-3.1-8B-Instruct`, you can launch the server with the following command:
-
-```bash Command
-python3 -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
-    --torchao-config int4wo-128 \
-    --port 30000 --host 0.0.0.0
-```
-
-SGLang supports the following quantization methods based on torchao `["int8dq", "int8wo", "fp8wo", "fp8dq-per_tensor", "fp8dq-per_row", "int4wo-32", "int4wo-64", "int4wo-128", "int4wo-256"]`.
-
-Note: According to [this issue](https://github.com/sgl-project/sglang/issues/2219#issuecomment-2561890230), `"int8dq"` method currently has some bugs when using together with cuda graph capture. So we suggest to disable cuda graph capture when using `"int8dq"` method. Namely, please use the following command:
-
-```bash Command
-python3 -m sglang.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
-    --torchao-config int8dq \
-    --disable-cuda-graph \
-    --port 30000 --host 0.0.0.0
-```
 
 ### `nvfp4_online` online quantization method
 
@@ -895,7 +867,7 @@ Other layers (e.g. projections in the attention layers) have their weights quant
 
 ### `quark_mxfp4` online quantization method
 
-SGLang running on AMD GPUs with hardware FP4 support (CDNA4 architecture, e.g. MI355x) supports the quantization method `--quantization quark_mxfp4`, that will quantize BF16 model weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and MXFP4 GEMMs instead of BF16 GEMMs.
+SGLang running on AMD GPUs with hardware FP4 support (CDNA4 architecture, e.g. MI355x) supports the quantization method `--quantization quark_mxfp4`, that will quantize BF16 or NVFP4 model weights to MXFP4 at load time, use dynamic MXFP4 quantization for activations and MXFP4 GEMMs instead of BF16 GEMMs.
 
 Example (BF16 to MXFP4 requantization):
 
@@ -905,7 +877,24 @@ sglang serve --model-path Qwen/Qwen3-30B-A3B \
     --quantization quark_mxfp4
 ```
 
-The option `--quantization quark_mxfp4` also supports converting FP8 dense and MOE models to MXFP4, following this logic:
+#### Online NVFP4 to MXFP4 Requantization
+
+The option `--quantization quark_mxfp4` supports converting NVFP4 checkpoints (e.g. `nvidia/Kimi-K2.6-NVFP4`) to MXFP4 at load time to allow efficient inference using supported AMD hardware (gfx95x+):
+
+- The quantization metadata of the source NVFP4 checkpoint is read from either `config.json` (`quantization_config`) or a standalone `hf_quant_config.json`;
+- Producer-declared excluded modules will remain in higher precision;
+- NVFP4 checkpoints with mixed precision (`"quant_algo": "MIXED_PRECISION"`, e.g. `nvidia/Qwen3.5-397B-A17B-NVFP4-V2`) are also supported.
+
+Example (NVFP4 to MXFP4 requantization):
+
+```bash
+sglang serve --model-path nvidia/Kimi-K2.6-NVFP4 \
+    --tensor-parallel-size 4 \
+    --quantization quark_mxfp4 \
+```
+#### Online FP8 to MXFP4 Requantization
+
+The option `--quantization quark_mxfp4` supports converting FP8 dense and MOE models to MXFP4, following this logic:
 
 1. Load an FP8 weight tensor,
 2. Dequantize it to BF16,
@@ -969,7 +958,6 @@ For the full quantization + format conversion workflow and a complete list of su
 - [NVIDIA Model Optimizer (ModelOpt)](https://github.com/NVIDIA/Model-Optimizer)
 - [NVIDIA Model Optimizer LLM PTQ](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/llm_ptq)
 - [Petit: NVFP4 on ROCm](https://github.com/causalflow-ai/petit-kernel) — [LMSYS blog](https://lmsys.org/blog/2025-09-21-petit-amdgpu/), [AMD ROCm blog](https://rocm.blogs.amd.com/artificial-intelligence/fp4-mixed-precision/README.html)
-- [Torchao: PyTorch Architecture Optimization](https://github.com/pytorch/ao)
 - [vLLM Quantization](https://docs.vllm.ai/en/latest/quantization/)
 - [auto-round](https://github.com/intel/auto-round)
 - [ModelSlim](https://gitcode.com/Ascend/msmodelslim)

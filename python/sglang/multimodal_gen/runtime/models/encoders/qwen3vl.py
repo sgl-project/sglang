@@ -6,8 +6,6 @@ from transformers import (
 )
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.utils import TransformersKwargs, is_torchdynamo_compiling
-from transformers.utils.generic import is_flash_attention_requested
-from transformers.vision_utils import get_vision_cu_seqlens, get_vision_position_ids
 
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLConfig
 from sglang.multimodal_gen.runtime.distributed import (
@@ -31,7 +29,15 @@ from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_vision import (
+    Qwen3VLVisionTransformer,
+)
+from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
+    apply_qwen_vl_text_rope,
+    build_qwen_vl_text_rope,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.srt.layers.layernorm import RMSNorm
 
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 import logging
@@ -56,11 +62,16 @@ from transformers.models.qwen3_vl.configuration_qwen3_vl import (
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLCausalLMOutputWithPast,
     Qwen3VLModelOutputWithPast,
-    Qwen3VLTextRMSNorm,
-    Qwen3VLTextRotaryEmbedding,
-    Qwen3VLVisionModel,
-    apply_rotary_pos_emb,
 )
+
+
+def _make_text_rms_norm(hidden_size: int, eps: float) -> RMSNorm:
+    return RMSNorm(
+        hidden_size,
+        eps=eps,
+        cast_x_before_out_mul=True,
+        force_native=True,
+    )
 
 
 class Qwen3VLQuantizedLinear(ReplicatedLinear):
@@ -270,12 +281,9 @@ class Qwen3VLTextAttention(nn.Module):
             use_tensor_parallel=use_tensor_parallel,
             prefix=f"{prefix}.o_proj",
         )
-        self.q_norm = Qwen3VLTextRMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
-        )  # unlike olmo, only on the head dim!
-        self.k_norm = Qwen3VLTextRMSNorm(
-            self.head_dim, eps=config.rms_norm_eps
-        )  # thus post q_norm does not need reshape
+        self.q_norm = _make_text_rms_norm(self.head_dim, config.rms_norm_eps)
+        self.k_norm = _make_text_rms_norm(self.head_dim, config.rms_norm_eps)
+        self.rotary_emb = build_qwen_vl_text_rope(config, mrope_interleaved=True)
 
         self.attn = LocalAttention(
             num_heads=self.num_heads,
@@ -292,7 +300,7 @@ class Qwen3VLTextAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor],
         past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
@@ -309,14 +317,15 @@ class Qwen3VLTextAttention(nn.Module):
         ).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(
-            query_states, key_states, cos, sin
+        query_states, key_states = apply_qwen_vl_text_rope(
+            self.rotary_emb,
+            position_ids,
+            query_states,
+            key_states,
         )
 
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_values.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
@@ -432,17 +441,16 @@ class Qwen3VLTextDecoderLayer(nn.Module):
             use_tensor_parallel=use_tensor_parallel,
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = Qwen3VLTextRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.input_layernorm = _make_text_rms_norm(
+            config.hidden_size, config.rms_norm_eps
         )
-        self.post_attention_layernorm = Qwen3VLTextRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.post_attention_layernorm = _make_text_rms_norm(
+            config.hidden_size, config.rms_norm_eps
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -460,7 +468,6 @@ class Qwen3VLTextDecoderLayer(nn.Module):
             past_key_values=past_key_values,
             use_cache=use_cache,
             cache_position=cache_position,
-            position_embeddings=position_embeddings,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -474,6 +481,8 @@ class Qwen3VLTextDecoderLayer(nn.Module):
 
 
 class Qwen3VLTextModel(nn.Module):
+    # used only as `self.embed_tokens(input_ids)`; no tied output head here
+    host_resident_table_names = ["embed_tokens"]
     config: Qwen3VLTextConfig
     _no_split_modules = ["Qwen3VLTextDecoderLayer"]
 
@@ -505,8 +514,7 @@ class Qwen3VLTextModel(nn.Module):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
-        self.norm = Qwen3VLTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3VLTextRotaryEmbedding(config=config)
+        self.norm = _make_text_rms_norm(config.hidden_size, config.rms_norm_eps)
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -582,15 +590,10 @@ class Qwen3VLTextModel(nn.Module):
             position_ids = position_ids[None, ...].expand(3, position_ids.shape[0], -1)
 
         if position_ids.ndim == 3 and position_ids.shape[0] == 4:
-            text_position_ids = position_ids[0]
             position_ids = position_ids[1:]
-        else:
-            text_position_ids = position_ids[0]
 
         hidden_states = inputs_embeds
 
-        # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         # decoder layers
@@ -598,11 +601,10 @@ class Qwen3VLTextModel(nn.Module):
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
-                position_ids=text_position_ids,
+                position_ids=position_ids,
                 past_key_values=past_key_values,
                 cache_position=cache_position,
                 output_attentions=output_attentions,
-                position_embeddings=position_embeddings,
                 **kwargs,
             )
             # hidden_states = layer_outputs
@@ -662,11 +664,18 @@ class Qwen3VLModel(nn.Module):
     config: Qwen3VLConfig
     _no_split_modules = ["Qwen3VLTextDecoderLayer", "Qwen3VLVisionBlock"]
 
-    def __init__(self, config, *, use_tensor_parallel: bool = False):
+    def __init__(
+        self,
+        config,
+        *,
+        quant_config: QuantizationConfig | None = None,
+        use_tensor_parallel: bool = False,
+    ):
         super().__init__()
-        self.visual = Qwen3VLVisionModel._from_config(config.vision_config)
+        self.visual = Qwen3VLVisionTransformer(config.vision_config)
         self.language_model = Qwen3VLTextModel(
             config.text_config,
+            quant_config=quant_config,
             use_tensor_parallel=use_tensor_parallel,
         )
         self.rope_deltas = None  # cache rope_deltas here
@@ -874,18 +883,7 @@ class Qwen3VLModel(nn.Module):
         pixel_values: torch.FloatTensor,
         grid_thw: Optional[torch.LongTensor],
     ):
-        pixel_values = pixel_values.type(self.visual.dtype)
-        vision_kwargs = {}
-        if grid_thw is not None and grid_thw.device.type == "cpu":
-            if not is_flash_attention_requested(self.visual.config):
-                vision_kwargs = {
-                    "position_ids": get_vision_position_ids(
-                        grid_thw, self.visual.spatial_merge_size
-                    ).to(pixel_values.device),
-                    "cu_seqlens": get_vision_cu_seqlens(grid_thw),
-                }
-            grid_thw = grid_thw.to(pixel_values.device)
-        visual_out = self.visual(pixel_values, grid_thw=grid_thw, **vision_kwargs)
+        visual_out = self.visual(pixel_values, grid_thw=grid_thw)
         return visual_out.pooler_output, visual_out.deepstack_features
 
     def get_image_features(
@@ -1161,6 +1159,7 @@ class Qwen3VLModel(nn.Module):
 
 
 class Qwen3VLForConditionalGeneration(TextEncoder):
+    layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
     default_bitsandbytes_target_modules = [
         ".gate_up_proj.",
         ".down_proj.",
@@ -1272,6 +1271,8 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
+            if "visual." in name:
+                name = name.replace(".attn.qkv.", ".attn.qkv_proj.")
 
             try:
                 param = params_dict[name]

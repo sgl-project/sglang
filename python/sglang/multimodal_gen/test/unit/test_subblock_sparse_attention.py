@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """SubBlock block-sparse attention backend.
 
-The schedule tests are pure CPU. The numerical tests need an SM100 GPU with
+The schedule and adapter tests are pure CPU. The numerical tests need either
+an SM90 GPU with SGLang's CuTe-DSL dependencies or an SM100 GPU with
 FlashInfer's ``bsa_attn_blk64_fwd`` and are skipped otherwise.
 
 The trick that makes the sparse kernel checkable against dense attention: at
@@ -26,31 +27,40 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_att
     SubBlockSparseAttentionImpl,
     SubBlockSparseSchedule,
     _dit_layer_index,
+    _run_subblock_sparse_attention,
+    _sm90_sparse_attention,
 )
 
 HEAD_DIM = 128
 NUM_HEADS = 4
 
 
-def _sm100_available() -> bool:
+def _subblock_kernel_available() -> bool:
     if not torch.cuda.is_available():
         return False
-    # Exactly 10.0: the kernel is built for sm_100a, and 10.3 has no cubin.
-    if torch.cuda.get_device_capability(0) != (10, 0):
-        return False
+    capability = torch.cuda.get_device_capability(0)
     try:
-        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
-            load_bsa_attn_blk64_fwd,
-        )
+        if capability == (9, 0):
+            from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
+                _load_sm90_block_sparse_attention,
+            )
 
-        load_bsa_attn_blk64_fwd()
+            _load_sm90_block_sparse_attention()
+        elif capability == (10, 0):
+            from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
+                load_bsa_attn_blk64_fwd,
+            )
+
+            load_bsa_attn_blk64_fwd()
+        else:
+            return False
     except Exception:
         return False
     return True
 
 
-requires_sm100 = unittest.skipUnless(
-    _sm100_available(), "needs SM100 and FlashInfer bsa_attn_blk64_fwd"
+requires_subblock_kernel = unittest.skipUnless(
+    _subblock_kernel_available(), "needs an SM90 or SM100 SubBlock attention kernel"
 )
 
 
@@ -180,6 +190,40 @@ class TestSubBlockSparseBackend(unittest.TestCase):
         )
         self.assertEqual(metadata.current_timestep, 7)
 
+    def test_sm90_adapter_sorts_indices_and_uses_64x64_blocks(self):
+        captured = {}
+
+        class _FakeBlockSparseTensors:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.__dict__.update(kwargs)
+
+        def fake_flash_attn_func(q, k, v, **kwargs):
+            captured.update(kwargs)
+            return q, None
+
+        index = torch.tensor([[[[5, 1, 7, 3]]]], dtype=torch.int32)
+        q = torch.empty(1, 64, 1, HEAD_DIM, dtype=torch.bfloat16)
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn._load_sm90_block_sparse_attention",
+            return_value=(_FakeBlockSparseTensors, fake_flash_attn_func),
+        ):
+            out = _sm90_sparse_attention(q, q, q, index, 4, HEAD_DIM**-0.5)
+
+        self.assertIs(out, q)
+        torch.testing.assert_close(
+            captured["mask_block_idx"],
+            torch.tensor([[[[1, 3, 5, 7]]]], dtype=torch.int32),
+        )
+        self.assertEqual(captured["mask_block_cnt"].item(), 4)
+        self.assertIsNone(captured["full_block_cnt"])
+        self.assertIsNone(captured["full_block_idx"])
+        self.assertEqual(captured["block_size"], (64, 64))
+        self.assertIs(
+            captured["block_sparse_tensors"].mask_block_idx,
+            captured["mask_block_idx"],
+        )
+
 
 class TestSubBlockGating(unittest.TestCase):
     """The schedule must decide sparsity from the layer and the step alone."""
@@ -241,7 +285,7 @@ class TestSubBlockGating(unittest.TestCase):
             self.assertFalse(impl._sparse_ready(q, q))
 
 
-@requires_sm100
+@requires_subblock_kernel
 class TestSubBlockNumerics(unittest.TestCase):
     seq_len = 8192
 
@@ -275,6 +319,46 @@ class TestSubBlockNumerics(unittest.TestCase):
         ref = _dense_reference(q, k, v, HEAD_DIM**-0.5)
         self.assertGreater(_cosine(out, ref), 0.999)
 
+    def test_unsorted_ragged_tail_oversubscribes_sms(self):
+        """Make tail-mask ordering observable across multiple SM waves."""
+        if torch.cuda.get_device_capability() != (9, 0):
+            self.skipTest("the reverse-consumption constraint is specific to SM90")
+
+        device = torch.device("cuda")
+        seq_len = self.seq_len + 37
+        shape = (1, seq_len, NUM_HEADS, HEAD_DIM)
+        q = torch.zeros(shape, device=device, dtype=torch.bfloat16)
+        k = torch.zeros_like(q)
+        v = torch.ones_like(q)
+
+        num_blocks = (seq_len + 63) // 64
+        num_tiles = NUM_HEADS * num_blocks
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        self.assertGreater(num_tiles, 2 * num_sms)
+
+        # The SM90 consumer visits slots from high to low and applies the tail
+        # mask to the first block. Put the ragged block in the lowest slot, so
+        # removing the adapter's sort leaves its 27 padded rows unmasked. With
+        # zero Q/K and unit V that changes the output magnitude from 1 to
+        # (7 * 64 + 37) / (8 * 64), which an assert_close cannot overlook.
+        topk = 8
+        tail_block = num_blocks - 1
+        unsorted_blocks = torch.tensor(
+            [tail_block, 0, 1, 2, 3, 4, 5, 6],
+            device=device,
+            dtype=torch.int32,
+        )
+        unsorted_index = (
+            unsorted_blocks.view(1, 1, 1, topk)
+            .expand(1, NUM_HEADS, num_blocks, topk)
+            .clone()
+        )
+        out = _run_subblock_sparse_attention(
+            q, k, v, unsorted_index, topk, HEAD_DIM**-0.5
+        )
+
+        torch.testing.assert_close(out, torch.ones_like(out), rtol=0, atol=2e-3)
+
     def test_routing_finds_the_blocks_that_carry_the_mass(self):
         """At 0.75 sparsity the router must keep the blocks that matter.
 
@@ -282,11 +366,6 @@ class TestSubBlockNumerics(unittest.TestCase):
         number of blocks but chosen at random the output collapses, so a high
         cosine here measures the routing, not a forgiving fixture.
         """
-        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
-            SubBlockRouter,
-            load_bsa_attn_blk64_fwd,
-        )
-
         device = torch.device("cuda")
         q, k, v = _structured_qkv(self.seq_len, device)
         ref = _dense_reference(q, k, v, HEAD_DIM**-0.5)
@@ -308,17 +387,14 @@ class TestSubBlockNumerics(unittest.TestCase):
             .argsort(dim=-1)[..., :topk]
             .to(torch.int32)
         )
-        random_out = load_bsa_attn_blk64_fwd()(
+        random_out = _run_subblock_sparse_attention(
             q,
             k,
             v,
             random_index,
             topk,
-            block_sizes=SubBlockRouter.block_sizes(self.seq_len, device),
-            q2k_block_nums=None,
-            softmax_scale=HEAD_DIM**-0.5,
+            HEAD_DIM**-0.5,
         )
-        random_out = random_out[0] if isinstance(random_out, tuple) else random_out
         self.assertLess(_cosine(random_out, ref), 0.9)
 
     def test_skipped_step_is_bitwise_dense(self):

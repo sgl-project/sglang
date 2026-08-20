@@ -15,6 +15,7 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
+import os
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -139,9 +140,13 @@ _is_amx_available = cpu_has_amx_support()
 # Head-group ratios (num_v_heads // num_k_heads) served by the fused
 # split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
 # covered by the fused kernel, which removes the two `.contiguous()` copies
-# plus the `torch.cat` of the unfused fallback. Other backends keep the
-# original tuple so their control flow is unchanged.
-_GDN_FUSED_QKVZBA_RATIOS = (1, 2, 4, 8) if _use_aiter else (1, 2, 4)
+# plus the `torch.cat` of the unfused fallback. On CUDA the ratio-3 dense 27B
+# layout is handled by the Triton kernel's per-head walk (the CPU fused op
+# still requires a power-of-two group). Other backends keep the original
+# tuple so their control flow is unchanged.
+_GDN_FUSED_QKVZBA_RATIOS = (
+    (1, 2, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
+)
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -151,6 +156,32 @@ def _disable_shared_experts_fusion() -> bool:
     # its layers build (per runner); models without a gate see the config
     # intent through the accessor's fallback.
     return is_shared_experts_fusion_disabled()
+
+
+def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
+    """Fuse SiLU+mul with the down_proj NVFP4 input quantization.
+
+    Replaces the separate act_and_mul and per-token FP4 quantize kernels with
+    one FlashInfer kernel and feeds down_proj a prequantized (fp4, scale)
+    tuple. Enabled when both dense-MLP projections use the NVFP4 (W4A4)
+    linear method; kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
+    """
+    if os.environ.get("SGLANG_DISABLE_SILU_FP4_QUANT_FUSION", "0") == "1":
+        return
+    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
+
+    if not (
+        isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
+        and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
+    ):
+        return
+    try:
+        from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize  # noqa: F401
+    except ImportError:
+        return
+    mlp._enable_silu_fp4_quant_fusion = True
+    mlp.down_proj._accepts_prequantized_fp4 = True
+    logger.info("Enabled fused SiLU+mul+FP4-quant for dense MLP down_proj input.")
 
 
 if _is_cuda:
@@ -693,7 +724,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        core_attn_out = core_attn_out.reshape(
+            *core_attn_out.shape[:-2],
+            core_attn_out.shape[-2] * core_attn_out.shape[-1],
+        )
 
         output, _ = self.out_proj(core_attn_out)
         return output
@@ -746,6 +780,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             )
+            _maybe_enable_silu_fp4_quant_fusion(self.mlp)
             is_layer_sparse = False
             is_previous_layer_sparse = False
             is_next_layer_sparse = False
@@ -800,7 +835,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle():
+        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
@@ -1204,7 +1239,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         )
 
-        if not forward_batch.forward_mode.is_idle():
+        if not forward_batch.forward_mode.is_idle() and hidden_states.shape[0] > 0:
             hidden_states = self.self_attention(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1258,6 +1293,9 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
     orig_to_new_substr={
         ".self_attn.k_proj.k_scale": ".attn.k_scale",
         ".self_attn.v_proj.v_scale": ".attn.v_scale",
+        # compressed-tensors stores kv_cache_scheme scales on the attention module.
+        ".self_attn.k_scale": ".attn.k_scale",
+        ".self_attn.v_scale": ".attn.v_scale",
     },
 )
 

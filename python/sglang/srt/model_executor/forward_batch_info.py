@@ -32,7 +32,7 @@ import warnings
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -53,6 +53,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import (
+    is_cpu,
     is_cuda,
     is_hip,
     is_npu,
@@ -74,6 +75,7 @@ if TYPE_CHECKING:
 _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 
 
 def _elastic_should_preserve_local_token_counts(
@@ -231,11 +233,12 @@ def register_attn_tp_sequence_sharded_predicate(
     _attn_tp_sequence_sharded_predicate = predicate
 
 
-def get_server_return_hidden_states_mode(server_args: Any) -> CaptureHiddenMode:
-    mode = getattr(server_args, "return_hidden_states_mode", None)
+def get_server_return_hidden_states_mode() -> CaptureHiddenMode:
+    features = get_exec().features
+    mode = features.return_hidden_states_mode
     if mode == "last":
         return CaptureHiddenMode.LAST
-    if mode == "full" or getattr(server_args, "enable_return_hidden_states", False):
+    if mode == "full" or features.enable_return_hidden_states:
         return CaptureHiddenMode.FULL
     return CaptureHiddenMode.NULL
 
@@ -301,59 +304,23 @@ def compute_local_num_token_non_padded_cpu(
 class DSV4OutCacheLoc:
     """Per-forward-pass KV cache allocation for DeepSeek-V4 on NPU.
 
-    Bundles slot indices for full/SWA pools, the two compressed-KV pools
-    (c4/c128), and the two compressed-state pools (c4_state/c128_state).
+    Bundles slot indices for full/SWA pools and the two compressed-KV pools
+    (C4/C128). Compressor state uses fixed ring storage and explicit
+    ``state_loc`` metadata, so it is not part of the token-allocation bundle.
     Populated by the NPU V4 allocator (DSV4NPUTokenToKVPoolAllocator) when
     the model is DeepSeek-V4 on NPU; left as ``None`` on ForwardBatch
-    otherwise. CUDA's DSV4 path doesn't construct this bundle (state is
-    derived via translate_kv_loc_to_compress_state_loc there).
+    otherwise.
 
     All fields are token-level slot ids in their respective pools (NOT page
     ids). Attention backends convert to page ids via ``// page_size`` when
     constructing PA_ND block tables.
 
-    State fields default to ``None`` so the bundle is constructible from
-    paths that allocate KV but not state (or vice versa); the NPU allocator
-    fills all six on real alloc, CUDA paths leave state ones None and use
-    the ring-hash translation instead.
     """
 
     out_full_loc: torch.Tensor
     out_swa_loc: torch.Tensor
     out_c4_loc: torch.Tensor
     out_c128_loc: torch.Tensor
-    out_c4_state_loc: Optional[torch.Tensor] = None
-    out_c128_state_loc: Optional[torch.Tensor] = None
-
-
-@dataclass
-class DSV4StateLens:
-    """Per-extend/decode c4/c128 compress-state pool allocation lens (DSV4-NPU).
-
-    Built by ``ScheduleBatch._compute_dsv4_state_lens_{extend,decode}`` and
-    threaded through ``mem_cache/common.py`` to
-    ``DSV4NPUTokenToKVPoolAllocator.alloc_{extend,decode}``, which consumes:
-
-      * ``c{4,128}_prefix_lens`` / ``..._cpu`` — per-req prev cumulative
-        state-slot count (the paged allocator's ``prefix`` contract).
-      * ``c{4,128}_seq_lens`` / ``..._cpu`` — per-req new cumulative count.
-      * ``c{4,128}_extend_num_tokens`` — total new state slots this step.
-
-    Replaces the 10 loose ``c{4,128}_state_*`` kwargs the allocator used to
-    take: scheduler only produces this object, common only forwards it, the
-    allocator only consumes it.
-    """
-
-    c4_prefix_lens: torch.Tensor
-    c4_prefix_lens_cpu: torch.Tensor
-    c4_seq_lens: torch.Tensor
-    c4_seq_lens_cpu: torch.Tensor
-    c4_extend_num_tokens: int
-    c128_prefix_lens: torch.Tensor
-    c128_prefix_lens_cpu: torch.Tensor
-    c128_seq_lens: torch.Tensor
-    c128_seq_lens_cpu: torch.Tensor
-    c128_extend_num_tokens: int
 
 
 @dataclass
@@ -755,7 +722,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if model_runner.is_draft_worker
                 else max(
                     batch.return_hidden_states_mode,
-                    get_server_return_hidden_states_mode(model_runner.server_args),
+                    get_server_return_hidden_states_mode(),
                 )
             )
             capture_hidden_mode = get_required_capture_hidden_mode(
@@ -1492,8 +1459,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self._pad_inputs_to_size(model_runner, num_tokens, bs)
         self.global_num_tokens_cpu = global_num_tokens
-        global_num_tokens_pinned = torch.tensor(global_num_tokens, pin_memory=True)
-        self.global_num_tokens_gpu.copy_(global_num_tokens_pinned, non_blocking=True)
+        self.use_pin_memory = not _is_cpu
+        global_num_tokens_pinned = torch.tensor(
+            global_num_tokens, pin_memory=self.use_pin_memory
+        )
+        self.global_num_tokens_gpu.copy_(
+            global_num_tokens_pinned, non_blocking=self.use_pin_memory
+        )
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
@@ -1519,7 +1491,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
         seq_len_fill_value = (
-            model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+            model_runner.attn_backend.get_cpu_graph_seq_len_fill_value()
+            if _is_cpu
+            else model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
         )
         # Keep gpu_only batches sync-free: leave seq_lens_sum None and let the
         # attention backend over-allocate from an upper bound (see #26738).
