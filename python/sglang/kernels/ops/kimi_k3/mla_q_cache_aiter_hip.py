@@ -37,6 +37,14 @@ def _op():
         return None
 
 
+def supports_compute_all_q_rope() -> bool:
+    try:
+        schema = torch.ops.aiter.fused_qk_rope_concat_and_cache_mla.default._schema
+    except (AttributeError, RuntimeError):
+        return False
+    return "compute_all_q_rope" in str(schema)
+
+
 def _is_gfx950() -> bool:
     try:
         from aiter.jit.utils.chip_info import get_gfx_runtime
@@ -53,6 +61,7 @@ def available(device: torch.device | None = None) -> bool:
         or not torch.cuda.is_available()
         or not _is_gfx950()
         or _op() is None
+        or not supports_compute_all_q_rope()
     ):
         return False
     return device is None or device.type == "cuda"

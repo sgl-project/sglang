@@ -8,14 +8,17 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from sglang.kernels.ops.kimi_k3 import mla_q_cache_aiter_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=60, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 def _available() -> bool:
     if not torch.cuda.is_available():
         return False
     try:
-        return get_gfx_runtime() == "gfx950"
+        return (
+            get_gfx_runtime() == "gfx950"
+            and mla_q_cache_aiter_hip.supports_compute_all_q_rope()
+        )
     except (AssertionError, KeyError, RuntimeError):
         return False
 
@@ -137,6 +140,13 @@ def test_fused_mla_q_cache_support_is_narrow():
     assert mla_q_cache_aiter_hip.covered(**values)
     values["positions"] = values["positions"].to(torch.int32)
     assert not mla_q_cache_aiter_hip.covered(**values)
+
+
+def test_fused_mla_q_cache_is_opt_in(monkeypatch):
+    monkeypatch.delenv("SGLANG_K3_AITER_MLA_Q_CACHE_FUSION", raising=False)
+    assert not mla_q_cache_aiter_hip.enabled()
+    monkeypatch.setenv("SGLANG_K3_AITER_MLA_Q_CACHE_FUSION", "1")
+    assert mla_q_cache_aiter_hip.enabled()
 
 
 if __name__ == "__main__":
