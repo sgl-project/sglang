@@ -122,10 +122,16 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
         def post_hook():
             # Perform post-processing after weight loading similar to DefaultModelLoader
             try:
+                from sglang.srt.lora.layers import BaseLayerWithLoRA
                 from sglang.srt.model_loader.loader import device_loading_context
 
                 # Process quantization methods after loading weights
                 for _, module in self.model_runner.model.named_modules():
+                    # LoRA wrappers forward `quant_method` but don't own the
+                    # packed params; the inner base layer (yielded separately
+                    # by `named_modules`) handles the post-processing.
+                    if isinstance(module, BaseLayerWithLoRA):
+                        continue
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         # Move parameters to device if needed for quantization processing
