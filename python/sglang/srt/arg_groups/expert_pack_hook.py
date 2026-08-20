@@ -83,11 +83,7 @@ def handle_expert_pack(server_args: Any) -> None:
     # here, before model-config parsing and before the loader is constructed.
     raw_model_path = Path(server_args.model_path).expanduser()
     raw_preparation_failed = False
-    if (
-        not errors
-        and raw_model_path.is_file()
-        and raw_model_path.suffix.lower() == ".gguf"
-    ):
+    if not errors and raw_model_path.is_file():
         try:
             from sglang.srt.model_loader import expert_pack_runtime
 

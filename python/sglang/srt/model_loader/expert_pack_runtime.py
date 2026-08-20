@@ -501,7 +501,7 @@ def prepare_raw_deepseek_server_args(
 ) -> None:
     """Resolve a raw DeepSeek V4 GGUF into metadata and Expert Pack inputs."""
     source = Path(server_args.model_path).expanduser().resolve(strict=True)
-    if not source.is_file() or source.suffix.lower() != ".gguf":
+    if not source.is_file():
         return
     repo = _repo_root()
     artifact_dir = _deepseek_artifact_dir_for_source(source).resolve()
@@ -542,7 +542,7 @@ def prepare_raw_expert_pack_server_args(
 ) -> None:
     """Dispatch a raw GGUF to the model-specific expert-pack preparation path."""
     source = Path(server_args.model_path).expanduser()
-    if not source.is_file() or source.suffix.lower() != ".gguf":
+    if not source.is_file():
         return
     name = source.name.upper()
     if "KIMI" in name:

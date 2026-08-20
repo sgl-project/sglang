@@ -123,6 +123,11 @@ LOAD_FORMAT_CHOICES = [
     "sharded_state",
     "presharded",
     "gguf",
+    # Experimental and intentionally narrow: expert_pack is validated only for
+    # DeepSeek-V4-Flash-0731 MXFP4 GGUF (MXFP4 experts, FP8 dense weights)
+    # and KIMI-K3-MXP4-DERISKED-Q2_K-*.gguf (Q2_K gate/up, Q3_K down weights):
+    # https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF
+    # https://huggingface.co/Blackfrost-AI/KIMI-K3-Q2_K-GGUF-ABLITERATED
     "expert_pack",
     "bitsandbytes",
     "mistral",
@@ -543,9 +548,9 @@ class ServerArgs:
             '"dummy" will initialize the weights with random values, '
             "which is mainly for profiling."
             '"gguf" will load the weights in the gguf format. '
-            '"expert_pack" will load the supported deepseek-v4-flash or '
-            "text-only Kimi-K3 GGUF model with routed experts stored in an "
-            "SSD expert pack. "
+            '"expert_pack" is experimental and loads only the validated '
+            "DeepSeek-V4-Flash-0731 MXFP4 or text-only Kimi-K3 Q2_K GGUF "
+            "model with routed experts stored in an SSD expert pack. "
             '"bitsandbytes" will load the weights using bitsandbytes '
             "quantization."
             '"layered" loads weights layer by layer so that one can quantize a '

@@ -169,10 +169,10 @@ class TestExpertPackServerArgs(unittest.TestCase):
         self.assertEqual(args.model_loader_extra_config["manifest_path"], str(manifest))
         self.assertEqual(args.model_loader_extra_config["read_splits"], 1)
 
-    def test_raw_deepseek_gguf_is_prepared_inside_server_startup(self):
+    def test_suffixless_ollama_deepseek_blob_is_prepared_inside_server_startup(self):
         with tempfile.TemporaryDirectory() as value:
             root = Path(value)
-            gguf = root / "DeepSeek-V4-Flash.gguf"
+            gguf = root / f"sha256-{'a' * 64}"
             gguf.write_bytes(b"gguf")
             artifact_dir = root / "artifact"
             model_dir = artifact_dir / "model-meta"
@@ -210,6 +210,16 @@ class TestExpertPackServerArgs(unittest.TestCase):
                     "sglang.srt.model_loader.expert_pack_runtime."
                     "_deepseek_artifact_dir_for_source",
                     return_value=artifact_dir,
+                ),
+                patch(
+                    "gguf.GGUFReader",
+                    return_value=SimpleNamespace(
+                        fields={
+                            "general.architecture": SimpleNamespace(
+                                contents=lambda: "deepseek4"
+                            )
+                        }
+                    ),
                 ),
                 patch(
                     "sglang.srt.model_loader.expert_pack_runtime."
