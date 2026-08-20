@@ -34,9 +34,11 @@ _SWIGLU = ActivationFn.SILU
 
 
 def _menu(architecture, layout, activation=_SWIGLU):
-    """The whole menu, built from the same table loader and plan builder
-    serving uses — minus ``resolve_plans``' phase and rank predicates,
-    which pick ONE row per phase."""
+    """Build every plan row with the loader and builder that serving uses.
+
+    ``resolve_plans`` checks the phase and the rank, then keeps one row for
+    each phase. This helper skips those checks and returns every row.
+    """
     table = load_plans(architecture)
     layout_name = "shared" if layout else "per_expert"
     return {
@@ -132,17 +134,16 @@ class TestBActConfig:
         relu2 = _prefill(False, ActivationFn.RELU2)
         for sel in (per_expert, shared, relu2):
             assert sel.name == "fallback.serial_prefill"
-        # The per-expert twin composes the swap with the scatter; the shared
-        # twin gets the swap only (its down-B is shared, never scattered);
-        # rows are activation-agnostic, so the ReLU2 twin ships the same
-        # fused middle with its own activation injected.
+        # Both layouts add down-B into the base output. The epilogue finds its
+        # rows through src2dst, so a shared down-B factor does not prevent it.
+        # A row does not depend on the activation, so the ReLU2 row matches.
         assert per_expert.plan.act.family is ActFamily.B_ACTIVATION
         assert per_expert.plan.gate_up_b is None
         assert per_expert.plan.down_b_into_base is True
         assert per_expert.base_gemm_rows == "route_major"
         assert shared.plan.act.family is ActFamily.B_ACTIVATION
         assert shared.plan.gate_up_b is None
-        assert shared.plan.down_b_into_base is False
+        assert shared.plan.down_b_into_base is True
         assert shared.base_gemm_rows == "expert_major"
         assert relu2.plan.act.family is ActFamily.B_ACTIVATION
         assert relu2.plan.act.activation is ActivationFn.RELU2
@@ -171,9 +172,9 @@ _SLOTS = 2
 _TOP_K = 2
 _ROUTED_SCALING = 0.75
 
-# The b_act middle folds each pair's gate/up delta into the activation
-# join's FP32 arithmetic instead of materializing a BF16 delta the join
-# re-reads — the same rounding class as the shared-rank and scatter notes.
+# The b_act middle adds each pair's gate/up delta inside the FP32 activation
+# math. The shipped path writes that delta to BF16 first, then reads it back.
+# The two paths round at different points, so compare them with a tolerance.
 _B_ACT_TOLERANCE = {"atol": 1e-2, "rtol": 0.05}
 
 
@@ -195,8 +196,8 @@ def _make_gpu_tensors(num_tokens: int, num_experts: int, device: torch.device):
         "down_lora_b": rand_bf16((_SLOTS, num_experts, _HIDDEN, _RANK), 0.15),
         "adapter_enabled": torch.tensor([1, 1], dtype=torch.int32),
     }
-    # Slot 1 is a narrower adapter (mixed ranks in one batch): zero-fill its
-    # rank padding across all four factors, exactly how mlpb residents look.
+    # Slot 1 is a narrow adapter. Its rank padding is zero in all four
+    # factors. A batch with mixed ranks reaches the kernels in this form.
     half = _RANK // 2
     tensors["gate_up_lora_a"][1].view(num_experts, 2, _RANK, _HIDDEN)[
         :, :, half:, :
@@ -206,10 +207,10 @@ def _make_gpu_tensors(num_tokens: int, num_experts: int, device: torch.device):
     tensors["down_lora_b"][1, :, :, half:] = 0
 
     scores = torch.rand((num_tokens, num_experts), generator=generator)
-    scores[: num_tokens // 2, 0] += 4.0  # skewed segments next to sparse ones
+    scores[: num_tokens // 2, 0] += 4.0  # one expert gets many more pairs
     topk_ids = torch.topk(scores, _TOP_K, dim=1).indices.to(torch.int32)
-    topk_ids[0] = -1  # a token with zero routed pairs
-    topk_ids[5, 1] = -1  # a sentinel pair inside a live token
+    topk_ids[0] = -1  # a token with no routed pair
+    topk_ids[5, 1] = -1  # one sentinel pair inside a token that keeps a routed pair
     tensors["topk_ids"] = topk_ids.contiguous()
     weights = torch.rand((num_tokens, _TOP_K), generator=generator) + 0.1
     tensors["topk_weights"] = (weights / weights.sum(dim=1, keepdim=True)).float()
@@ -236,10 +237,11 @@ def _standalone_output_allocation(runner, *, num_tokens, dtype, device):
 
 
 def _reference_choice():
-    """The shipped choice carrying the serial materialized reference shape.
+    """Return the shipped row that holds the serial materialized shape.
 
-    The decode fallback is exactly that plan with a complete tuned launch
-    config, so it doubles as the config donor for the swapped variants."""
+    That row is the decode fallback. It has a complete tuned launch config, so
+    the swapped plans can use the same config.
+    """
     choice = _menu(_GB300, False)["fallback.serial"]
     assert choice.plan.act.family is ActFamily.MATERIALIZED
     assert choice.plan.gate_up_b is not None
@@ -308,8 +310,10 @@ def _run_once(runner, gpu, token_lora_mapping):
 def test_runner_b_act_matches_the_materialized_reference(
     base_gemm_rows: str, into_base: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Serial materialized middle vs the b_act swap (and vs b_act + into-base)
-    under ONE shared launch config so only the plan changes."""
+    """Compare the serial materialized middle with the b_act middle.
+
+    Both runners use the same launch config, so only the plan changes.
+    """
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
     device = torch.device("cuda")

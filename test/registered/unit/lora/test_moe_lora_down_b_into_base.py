@@ -35,9 +35,11 @@ _SWIGLU = ActivationFn.SILU
 
 
 def _menu(architecture, layout, activation=_SWIGLU):
-    """The whole menu, from the same table loader and plan builder serving
-    uses — minus ``resolve_plans``' phase and rank predicates, which pick
-    ONE row per phase."""
+    """Build every plan row with the loader and builder that serving uses.
+
+    ``resolve_plans`` checks the phase and the rank, then keeps one row for
+    each phase. This helper skips those checks and returns every row.
+    """
     table = load_plans(architecture)
     layout_name = "shared" if layout else "per_expert"
     return {
@@ -111,22 +113,21 @@ class TestDownBIntoBasePlan:
         assert plan.down_b_into_base is False
         assert plan.down_b_into_base_eligible()
         reordered = replace(plan, down_b_into_base=True)
-        # The standalone one-launch stage is RETAINED — only its output
-        # addressing changes.
+        # The one-launch down-B stage stays. Only its output address changes.
         assert reordered.down_b is not None
         assert reordered.down_b.family is LoraBFamily.ONE_LAUNCH_SLICED
         assert reordered.finalize.family is FinalizeFamily.MATERIALIZED
 
     def test_flagged_plan_leaves_the_shape_keyed_conversions(self) -> None:
-        # The scatter couples down-B to the base down output; it must not
-        # re-qualify for conversions keyed on the plain serial shape.
+        # With the scatter, down-B writes into the base down rows. The plan is
+        # then no longer the plain serial shape.
         plan = _serial_plan()
         assert plan.is_fully_serial_materialized()
         assert not replace(plan, down_b_into_base=True).is_fully_serial_materialized()
 
     def test_flag_leaves_the_b_family_to_provider_capability(self) -> None:
-        # Which down-B kernel implements the scatter epilogue is asked of the
-        # provider (supports_down_b_into_base), not pinned by the plan.
+        # The provider says which down-B kernel does the scatter. The plan
+        # does not fix the down-B family.
         indexed = replace(
             _serial_plan(),
             down_b=LoraBSpec(
@@ -139,9 +140,9 @@ class TestDownBIntoBasePlan:
         assert replace(indexed, down_b_into_base=True).down_b_into_base is True
 
     def test_flag_requires_a_standalone_down_b(self) -> None:
-        # A finalize-consumed down-B (shared-rank reduce) has no standalone
-        # down-B stage to reorder; the H200 shared prefill.shared_rank row
-        # still ships this form.
+        # The shared-rank reduce consumes down-B inside finalize. There is
+        # then no separate down-B stage to move. The H200 shared row uses
+        # this form.
         consumed = _build_plan(
             is_shared_outer=True,
             finalize_family=FinalizeFamily.SHARED_RANK_REDUCE,
@@ -151,31 +152,31 @@ class TestDownBIntoBasePlan:
             replace(consumed, down_b_into_base=True)
 
     def test_flag_rejects_the_windows_that_race_the_base_gemm(self) -> None:
-        # down-B must launch after the base down GEMM has written its rows.
-        # DOWN_B and DOWN_A_B put down-B on the side stream concurrently with
-        # the base GEMM, so it would read rows that are not there yet.
+        # down-B must run after the base down GEMM writes its rows. DOWN_B and
+        # DOWN_A_B put down-B on the side stream next to the base GEMM. down-B
+        # then reads rows before the base GEMM writes them.
         for window in (DownOverlap.DOWN_B, DownOverlap.DOWN_A_B):
             overlapped = _build_plan(down_overlap=window)
             with pytest.raises(ValueError, match="down-B into-base"):
                 replace(overlapped, down_b_into_base=True)
 
     def test_flag_admits_the_down_a_window(self) -> None:
-        # DOWN_A forks down-A against the base GEMM and JOINS before down-B
-        # runs, so the rows are complete -- the same ordering the serial
-        # branch gives.  No shipped row asks for it (measured a wash; configs
-        # README); the rule stays permissive so a table CAN ask.
+        # DOWN_A runs down-A next to the base GEMM. It joins before down-B
+        # starts. The base rows are complete at that point, so the scatter is
+        # safe. No shipped row uses this window. The measurement showed no
+        # gain from it.
         forked = _build_plan(down_overlap=DownOverlap.DOWN_A)
         assert replace(forked, down_b_into_base=True).down_b_into_base is True
 
 
 def _into_base_expected(name: str, layout) -> bool:
-    """Per-expert: the serial prefill shapes. Shared-outer: the SM100
-    token-dedup prefill row, measured on GB300 and B200 (configs README).
-    The expert-major shared fallback was not measured, so it stays off;
-    H200's shared row consumes down-B in its finalize, so there is no
-    standalone down-B stage to reorder."""
+    """Return whether one plan row must add down-B into the base output.
+
+    The prefill rows use it. A row skips it when finalize consumes down-B.
+    No separate down-B stage then remains to move.
+    """
     if layout != False:
-        return name == "prefill.token_dedup"
+        return name in ("prefill.token_dedup", "fallback.serial_prefill")
     return name in ("prefill.serial", "fallback.serial_prefill")
 
 
@@ -186,8 +187,8 @@ class TestDownBIntoBaseConfig:
             ("h200_pe", _H200, False, _SWIGLU),
             ("h200_sh", _H200, True, _SWIGLU),
             ("gb300_sh", _GB300, True, _SWIGLU),
-            # Rows are activation-agnostic: the ReLU2 build of the same menu
-            # makes the same per-row scatter decision.
+            # A row does not depend on the activation. The ReLU2 build makes
+            # the same scatter choice for each row.
             ("gb300_relu2", _GB300, False, ActivationFn.RELU2),
         )
         for name, architecture, layout, activation in cases:
@@ -273,7 +274,7 @@ _RANK = 16
 _SLOTS = 2
 _TOP_K = 2
 _ROUTED_SCALING = 0.75
-_ROW_POISON = 2**30  # sentinel-pair src2dst entries must never be dereferenced
+_ROW_POISON = 2**30  # the kernel must never read a sentinel pair's src2dst entry
 
 
 def _kernel_case(num_tokens: int, top_k: int, num_experts: int, seed: int):
@@ -282,7 +283,7 @@ def _kernel_case(num_tokens: int, top_k: int, num_experts: int, seed: int):
         0, num_experts, (num_tokens, top_k), generator=generator, dtype=torch.int32
     )
     topk_ids[torch.rand((num_tokens, top_k), generator=generator) < 0.15] = -1
-    topk_ids[0] = -1  # a token with zero routed pairs
+    topk_ids[0] = -1  # a token with no routed pair
     pattern = torch.tensor([0, 1, -1, 0, -1, 1], dtype=torch.int32)
     token_lora_mapping = pattern.repeat(-(-num_tokens // pattern.numel()))[:num_tokens]
     weights = torch.rand((num_tokens, top_k), generator=generator) + 0.1
@@ -295,8 +296,8 @@ def _kernel_case(num_tokens: int, top_k: int, num_experts: int, seed: int):
     b_down = (
         torch.randn((_SLOTS * num_experts, _HIDDEN, _RANK), generator=generator) * 0.15
     ).to(torch.bfloat16)
-    # Slot 1 is a narrower (mlpb-style) adapter: its factors are zero-filled
-    # past half the physical rank, exactly how mixed ranks reach the kernels.
+    # Slot 1 is a narrow adapter. Its rank padding is zero in the bridge and
+    # in down-B. A batch with mixed ranks reaches the kernels in this form.
     b_down.view(_SLOTS, num_experts, _HIDDEN, _RANK)[1, :, :, _RANK // 2 :] = 0
     bridge_view = bridge.view(num_tokens, top_k, _RANK)
     bridge_view[token_lora_mapping == 1, :, _RANK // 2 :] = 0
@@ -304,14 +305,14 @@ def _kernel_case(num_tokens: int, top_k: int, num_experts: int, seed: int):
 
 
 def _src2dst_rows(topk_ids: torch.Tensor, num_experts: int, style: str, seed: int):
-    """Host model of both row domains' pair-to-row mapping over random rows."""
+    """Build the pair-to-row map of both row domains on the host."""
     ids = topk_ids.view(-1)
     counts = [int((ids == expert).sum()) for expert in range(num_experts)]
     if style == "masked":
         m_max = -(-max(counts + [1]) // 8) * 8 + 8
         base = [expert * m_max for expert in range(num_experts)]
         total_rows = num_experts * m_max
-    else:  # contiguous compact rows at an 8-row segment alignment
+    else:  # contiguous rows, with each segment aligned to 8 rows
         alignment = 8
         base, offset = [], 0
         for count in counts:
@@ -358,8 +359,8 @@ def _fp32_finalize_oracle(
     return out * _ROUTED_SCALING
 
 
-# One config drives BOTH launches: preserving the shipped down-B tiling is
-# the entire point of the scatter variant.
+# Both launches use one config. The scatter must keep the same down-B tiling
+# as the shipped path.
 _DOWN_B_CONFIG = {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 64,
@@ -369,10 +370,9 @@ _DOWN_B_CONFIG = {
     "num_stages": 2,
 }
 
-# The one intended divergence versus the shipped tail: the scatter rounds
-# the FP32 delta to BF16 jointly with the base row, the shipped tail rounds
-# the delta to BF16 separately before the FP32 combine — the same rounding
-# class as the shared-rank/b_activation contract notes.
+# The scatter adds the FP32 delta to the base row, then rounds once. The
+# shipped path rounds the delta to BF16 first, then adds. The two paths round
+# at different points, so compare them with a tolerance.
 _INTO_BASE_TOLERANCE = {"atol": 1e-2, "rtol": 0.05}
 
 
@@ -440,8 +440,8 @@ def test_into_base_matches_the_standalone_downb_plus_post_reorder(
         view=RouteViewKind.ALIGNED,
     )
 
-    # Shipped tail: one-launch down-B writes the materialized LoRA delta,
-    # post_reorder re-reads it next to the untouched base rows.
+    # In the shipped path, down-B writes the LoRA delta to its own buffer.
+    # post_reorder then reads that buffer and the unchanged base rows.
     lora_delta = torch.empty(
         (num_tokens * top_k, _HIDDEN), dtype=torch.bfloat16, device=device
     )
@@ -463,8 +463,8 @@ def test_into_base_matches_the_standalone_downb_plus_post_reorder(
         lora_delta=lora_delta.view(num_tokens, top_k, _HIDDEN),
     )
 
-    # Scatter tail: the SAME tiling adds the delta into a copy of the base
-    # rows; post_reorder then runs in no-pair-delta mode.
+    # In the scatter path, the same tiling adds the delta into a copy of the
+    # base rows. post_reorder then runs with no delta buffer.
     scattered = gpu["down_rows"].clone()
     invoke_down_b_into_base(
         down_rows=scattered,
@@ -480,9 +480,9 @@ def test_into_base_matches_the_standalone_downb_plus_post_reorder(
     )
     torch.testing.assert_close(output, reference, **_INTO_BASE_TOLERANCE)
 
-    # Rows no LoRA-active pair targets are BITWISE untouched: base-only and
-    # sentinel pairs contribute no add and their (poisoned or unwritten)
-    # src2dst entries are never dereferenced.
+    # A row stays bitwise equal if no active LoRA pair targets it. A base-only
+    # pair and a sentinel pair add nothing. The kernel never reads their
+    # src2dst entries.
     lora_active = (topk_ids.view(-1) >= 0) & (
         token_lora_mapping.repeat_interleave(top_k) >= 0
     )
@@ -505,7 +505,7 @@ def test_into_base_matches_the_standalone_downb_plus_post_reorder(
     )
     torch.testing.assert_close(output.cpu(), oracle, atol=1.8e-2, rtol=0.06)
 
-    # Base-only traffic: the launch is a bitwise no-op on the base rows.
+    # With base-only traffic, the kernel must not change any base row.
     base_slots = torch.full_like(gpu["token_lora_mapping"], -1)
     aligned_base, _ = build_virtual_expert_routing(
         gpu["topk_ids"],
@@ -525,7 +525,7 @@ def test_into_base_matches_the_standalone_downb_plus_post_reorder(
         config=_DOWN_B_CONFIG,
     )
     assert torch.equal(scattered_base, gpu["down_rows"])
-    # LoRA must actually contribute on the active routing.
+    # The active routing must change the rows.
     assert (scattered - gpu["down_rows"]).abs().max().item() > 1e-3
 
 
@@ -557,7 +557,7 @@ def test_into_base_rejects_a_mismatched_route_block() -> None:
             bridge=bridge.to(device),
             b_down=b_down.to(device),
             routing=aligned,
-            config=_DOWN_B_CONFIG,  # declares BLOCK_SIZE_M=16, route uses 32
+            config=_DOWN_B_CONFIG,  # the config says 16, the route uses 32
         )
 
 
@@ -579,8 +579,8 @@ def _make_gpu_tensors(num_tokens: int, num_experts: int, device: torch.device):
         "down_lora_b": rand_bf16((_SLOTS, num_experts, _HIDDEN, _RANK), 0.15),
         "adapter_enabled": torch.tensor([1, 1], dtype=torch.int32),
     }
-    # Slot 1 is a narrower adapter (mixed ranks in one batch): zero-fill its
-    # rank padding across all four factors, exactly how mlpb residents look.
+    # Slot 1 is a narrow adapter. Its rank padding is zero in all four
+    # factors. A batch with mixed ranks reaches the kernels in this form.
     half = _RANK // 2
     tensors["gate_up_lora_a"][1].view(num_experts, 2, _RANK, _HIDDEN)[
         :, :, half:, :
@@ -590,10 +590,10 @@ def _make_gpu_tensors(num_tokens: int, num_experts: int, device: torch.device):
     tensors["down_lora_b"][1, :, :, half:] = 0
 
     scores = torch.rand((num_tokens, num_experts), generator=generator)
-    scores[: num_tokens // 2, 0] += 4.0  # skewed segments next to sparse ones
+    scores[: num_tokens // 2, 0] += 4.0  # one expert gets many more pairs
     topk_ids = torch.topk(scores, _TOP_K, dim=1).indices.to(torch.int32)
-    topk_ids[0] = -1  # a token with zero routed pairs
-    topk_ids[5, 1] = -1  # a sentinel pair inside a live token
+    topk_ids[0] = -1  # a token with no routed pair
+    topk_ids[5, 1] = -1  # one sentinel pair inside a token that keeps a routed pair
     tensors["topk_ids"] = topk_ids.contiguous()
     weights = torch.rand((num_tokens, _TOP_K), generator=generator) + 0.1
     tensors["topk_weights"] = (weights / weights.sum(dim=1, keepdim=True)).float()
@@ -620,11 +620,11 @@ def _standalone_output_allocation(runner, *, num_tokens, dtype, device):
 
 
 def _into_base_pair():
-    """The shipped menu composes both forms with the b_act middle (covered by
-    the dedicated b_act suite); to isolate the down-tail change alone, the
-    reference is the shipped decode fallback choice — exactly the serial
-    materialized shape with a complete tuned config — and the reordering is
-    the same plan with the flag flipped."""
+    """Return the reference plan, the scatter plan, and one launch config.
+
+    Every shipped row with the scatter also uses the b_act middle. The b_act
+    tests cover that middle. These two plans differ in the down tail alone.
+    """
     reference = _menu(_GB300, False)["fallback.serial"]
     assert reference.plan.down_b_into_base is False
     assert reference.plan.act.family is ActFamily.MATERIALIZED
@@ -700,8 +700,10 @@ def _workspace_buffer_names(runner) -> set[str]:
 def test_runner_into_base_matches_the_materialized_reference(
     base_gemm_rows: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Shipped tail vs the scatter reordering on BOTH providers — row-domain
-    agnosticism at the seam."""
+    """Compare the shipped tail with the scatter on both providers.
+
+    The result must not depend on the row domain.
+    """
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
     device = torch.device("cuda")
@@ -729,8 +731,8 @@ def test_runner_into_base_matches_the_materialized_reference(
             msg=f"{base_gemm_rows}: {traffic}",
         )
 
-    # The disappearing allocation: the into-base path never materializes the
-    # pair-major [T*K, H] down delta, while the shipped tail always does.
+    # The scatter path never allocates the pair-major delta buffer for down-B.
+    # The shipped path always allocates it.
     assert "down_b:delta" in _workspace_buffer_names(reference_runner)
     assert "down_b:delta" not in _workspace_buffer_names(into_base_runner)
 
@@ -756,7 +758,7 @@ def test_into_base_pipeline_replays_correctly_in_a_real_cuda_graph(
     )
     token_lora_mapping = _token_lora_mapping("active", num_tokens).to(device)
 
-    for _ in range(2):  # JIT + workspace graph-buffer retention before capture
+    for _ in range(2):  # warm the JIT and keep the graph buffers before capture
         _run_once(into_base_runner, gpu, token_lora_mapping, use_cuda_graph=True)
     torch.cuda.synchronize(device)
 
@@ -773,7 +775,7 @@ def test_into_base_pipeline_replays_correctly_in_a_real_cuda_graph(
     reference = _run_once(reference_runner, gpu, token_lora_mapping).hidden_states
     torch.testing.assert_close(output, reference, **_INTO_BASE_TOLERANCE)
 
-    # Replay 2: the whole batch flips to base-only through the sentinel.
+    # Replay 2: every token in the batch becomes base-only.
     token_lora_mapping.fill_(-1)
     graph.replay()
     torch.cuda.synchronize(device)
@@ -781,7 +783,7 @@ def test_into_base_pipeline_replays_correctly_in_a_real_cuda_graph(
     reference = _run_once(reference_runner, gpu, token_lora_mapping).hidden_states
     torch.testing.assert_close(output, reference, **_INTO_BASE_TOLERANCE)
 
-    # Replay 3: new routing and activations arrive in place, adapters return.
+    # Replay 3: new routing and new activations arrive in the same buffers.
     gpu["topk_ids"].copy_(gpu["topk_ids"].flip(dims=(1,)))
     gpu["hidden_states"].copy_((gpu["hidden_states"].float() * 1.5).to(torch.bfloat16))
     token_lora_mapping.copy_(_token_lora_mapping("mixed", num_tokens).to(device))

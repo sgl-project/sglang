@@ -106,7 +106,8 @@
     "down_a_family": "grouped",
     "down_b_family": "one_launch_sliced",
     "act_family": "b_activation",
-    "finalize_family": "materialized"
+    "finalize_family": "materialized",
+    "down_b_into_base": true
    }
   }
  ]

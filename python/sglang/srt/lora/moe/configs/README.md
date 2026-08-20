@@ -413,6 +413,37 @@ far outside the noise floor. H200's shared prefill row is `prefill.shared_rank`,
 whose finalize consumes down-B, so it has no standalone down-B stage and no
 into-base axis -- that row is untouched.
 
+Shared expert-major fallback row (2026-08-20). The row
+`fallback.serial_prefill` with `layout: shared` uses `expert_major` row order
+and was not in the sweep above, so it kept the epilogue off. It serves only
+out-of-domain geometry, which means hidden above 4096 or more than 512 local
+experts. Two real models land there: GLM-5.2 and full Inkling, both hidden
+6144. 16 captured cells, each config captured twice:
+
+| arch | model | 1024 | 2048 | 4096 | 8192 |
+|---|---|---:|---:|---:|---:|
+| GB300 | GLM-5.2 | +1.67% | +1.68% | +1.64% | +1.42% |
+| GB300 | Inkling | +1.02% | +1.21% | +1.38% | +0.87% |
+| B200 | GLM-5.2 | +1.23% | +1.41% | +0.69% | - |
+| B200 | Inkling | +0.34% | +0.66% | +0.87% | - |
+| H200 | GLM-5.2 | +2.03% | - | - | - |
+| H200 | Inkling | +1.40% | - | - | - |
+
+Here `+` means faster with the epilogue on. All 16 cells are faster. The range
+is +0.34% to +2.03%, the median is +1.30%, and the worst per-cell noise floor
+is 0.55%. The empty cells are a limit of the harness, not of the row: each arm
+holds its own workspace, and one expert-major slab at hidden 6144 is up to
+24.8 GB. The row now uses the epilogue in all three tables. The `default`
+table cannot reach it in serving, because the runner admits SM90 and SM100
+only, but the three tables stay aligned.
+
+The numerics check needed a new bound at this size. The epilogue rounds
+`base + delta` to BF16 one time, and the shipped path rounds the delta first.
+At hidden 6144 the largest difference was 0.125, which is one BF16 unit at the
+largest row value of 18.1. Only 9 elements of 12.6 million passed a fixed
+tolerance of 3e-2, and each one is a near-zero output where the base and the
+delta cancel. Use a tolerance that scales with the row size, not a fixed one.
+
 Also seen, not acted on: on PER-EXPERT rows at the 2048 bucket, removing
 into-base measured -2.06% (B200) and -2.03% (GB300) for Qwen3.5-397B, while at
 8192 removing it costs +0.85% to +2.99%. That is a token-banded preference the
