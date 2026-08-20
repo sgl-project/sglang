@@ -2386,6 +2386,7 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_queue_sizes = ()
             extra_pool_names = ()
         else:
+            cc.check_direct_dispatch_error()
             write_acks = self._count_ready_acks(cc.ack_write_queue)
             load_acks = self._count_ready_acks(cc.ack_load_queue)
             extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
@@ -2437,9 +2438,11 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         if cc is None:
             return
+        cc.check_direct_dispatch_error()
 
         if write_back:
             # Blocking: wait for all pending write-backs
+            cc.wait_direct_dispatch()
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()
@@ -2492,6 +2495,7 @@ class UnifiedRadixCache(BasePrefixCache):
         cc = self.cache_controller
         if cc is None:
             return
+        cc.check_direct_dispatch_error()
         if finish_count is None:
             # Every rank must enter the all_reduce below; ongoing_load_back can
             # diverge across ranks.

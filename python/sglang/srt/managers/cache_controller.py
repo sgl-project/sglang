@@ -47,6 +47,21 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+def _resolve_background_thread_device(device: torch.device | str):
+    """Return a device value accepted by ``set_device`` in a new thread.
+
+    Device pools may expose the generic ``torch.device("cuda")`` because each
+    scheduler process already selected its local GPU.  CUDA's current-device
+    selection is thread-local, however, and ``set_device(torch.device("cuda"))``
+    rejects a device without an index.  Resolve that index on the scheduler
+    thread before starting the helper thread.
+    """
+    device = torch.device(device)
+    if device.type != "cpu" and device.index is None:
+        return device_module.current_device()
+    return device
+
+
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
@@ -346,6 +361,26 @@ class HiCacheController:
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
 
+        # Direct I/O needs CPU index arrays.  Converting CUDA allocator output
+        # with Tensor.cpu() can block for the entire outstanding forward on the
+        # scheduler's current stream.  Dispatch direct transfers from a helper
+        # thread so that unavoidable D2H index readiness never stalls the
+        # scheduler launch loop.
+        self._direct_dispatch_queue: Queue = Queue()
+        self._direct_dispatch_error: Optional[BaseException] = None
+        self._direct_dispatch_thread = None
+        self._direct_dispatch_device = None
+        if self.io_backend == "direct":
+            self._direct_dispatch_device = _resolve_background_thread_device(
+                self.device
+            )
+            self._direct_dispatch_thread = threading.Thread(
+                target=self._direct_dispatch_thread_func,
+                name="hicache-direct-dispatch",
+                daemon=True,
+            )
+            self._direct_dispatch_thread.start()
+
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
         if storage_backend is not None:
@@ -368,6 +403,44 @@ class HiCacheController:
                 torch.distributed.get_world_size(group=self.attn_cp_group),
             )
         return 0, 1
+
+    def _direct_dispatch_thread_func(self) -> None:
+        if torch.device(self.device).type != "cpu":
+            device_module.set_device(self._direct_dispatch_device)
+        while True:
+            task = self._direct_dispatch_queue.get()
+            try:
+                if task is None:
+                    return
+                dependency, fn, args = task
+                # CUDA current streams are thread-local.  Wait on the event
+                # recorded by the scheduler before Tensor.cpu() observes the
+                # allocator output from its current forward stream.
+                dependency.synchronize()
+                fn(*args)
+            except BaseException as exc:
+                self._direct_dispatch_error = exc
+                logger.exception("HiCache direct transfer dispatch failed")
+            finally:
+                self._direct_dispatch_queue.task_done()
+
+    def _enqueue_direct_dispatch(self, fn, *args) -> None:
+        self.check_direct_dispatch_error()
+        dependency = device_module.Event()
+        dependency.record()
+        self._direct_dispatch_queue.put((dependency, fn, args))
+
+    def check_direct_dispatch_error(self) -> None:
+        if self._direct_dispatch_error is not None:
+            error = self._direct_dispatch_error
+            self._direct_dispatch_error = None
+            raise RuntimeError("HiCache direct transfer dispatch failed") from error
+
+    def wait_direct_dispatch(self) -> None:
+        if self._direct_dispatch_thread is None:
+            return
+        self._direct_dispatch_queue.join()
+        self.check_direct_dispatch_error()
 
     def _create_prefetch_sync_groups(self) -> None:
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
@@ -696,6 +769,9 @@ class HiCacheController:
         )
 
     def reset(self):
+        # Do not clear queues or acknowledgements while a helper-owned direct
+        # transfer still references their tensors.
+        self.wait_direct_dispatch()
         self.storage_stop_event.set()
 
         self.write_queue.clear()
@@ -747,8 +823,14 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
+        if self.io_backend == "direct":
+            self._enqueue_direct_dispatch(self._start_writing_op, op)
+        else:
+            self._start_writing_op(op)
+
+    def _start_writing_op(self, op: CacheOperation) -> None:
+        host_indices, device_indices, pool_transfers = self._move_write_operation(op)
 
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
@@ -874,10 +956,18 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
+        if self.io_backend == "direct":
+            self._enqueue_direct_dispatch(self._start_loading_op, op, producer_id)
+        else:
+            self._start_loading_op(op, producer_id)
+        return producer_id
+
+    def _start_loading_op(self, op: CacheOperation, producer_id: int) -> None:
+        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
+        producer_event = self.layer_done_counter.events[producer_id]
 
         completion = self.l2_transfer_engine.submit_host_to_device(
             self._l2_load_transfers(host_indices, device_indices, pool_transfers),
@@ -897,7 +987,6 @@ class HiCacheController:
                 num_bytes=self._transfer_num_bytes(op),
             )
         )
-        return producer_id
 
     def evict_device(self, device_indices: torch.Tensor) -> int:
         self.mem_pool_device_allocator.free(device_indices)
