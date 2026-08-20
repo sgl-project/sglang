@@ -1428,6 +1428,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
+        shared_event = None
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
@@ -1722,6 +1723,7 @@ class DeepseekV2MoE(nn.Module):
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
             and not is_in_breakable_cuda_graph()
+            and shared_event is not None
         ):
             torch.cuda.current_stream().wait_event(shared_event)
 
