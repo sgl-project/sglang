@@ -91,6 +91,15 @@
     "change": "Add profiler-gated NVTX ranges around Layer-2 receive, DP-rank query, admission, running-batch update, and DP-sync stages. Prefer the optional nvtx package and use torch.cuda.nvtx when it is absent. Default execution remains a shared no-op when scheduler NVTX and torch profiling are disabled.",
     "scope": "Diagnostic source only; no performance result or production optimization claim."
   },
+  "layer2_rank_ready_nvtx_overlay": {
+    "parent_commit": "ba6e34a7899c5b4ea53c221f31c63c00a66ec840",
+    "files": {
+      "python/sglang/srt/disaggregation/decode.py": "e27c0d8c868b73f14805f65883498bdb10b9088a5d594385cccde788862c2a6d",
+      "python/sglang/srt/distributed/device_communicators/symm_mem_gather.py": "38f6a3d1e44b0d8c0dab5da0ed53877c4d8d33ae2bc9c681ee920774fdb85b3e"
+    },
+    "change": "When scheduler NVTX is explicitly enabled, label every symmetric DP gather and ready-mask poll with its shared generation and rank, and emit the preceding P/D queue/admission counts. Default execution remains profiler-gated.",
+    "scope": "Diagnostic source only; generation-exact attribution must pass all-rank matched-B and observer-overhead gates before use."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"

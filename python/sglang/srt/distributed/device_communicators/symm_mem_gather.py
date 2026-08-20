@@ -6,6 +6,11 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.utils.nvtx_utils import (
+    NVTX_SCHEDULER_ENABLED,
+    scheduler_nvtx_range,
+)
+
 logger = logging.getLogger(__name__)
 
 _BARRIER_TIMEOUT_MS = 10_000
@@ -106,6 +111,29 @@ class SymmMemGather:
         slot = self._slot
         self._slot = (slot + 1) % _NUM_SLOTS
 
+        self._generation = self._generation % 0xFFFFFFFF + 1
+        generation = self._generation
+        rank = self._handle.rank
+
+        if NVTX_SCHEDULER_ENABLED:
+            trace = scheduler_nvtx_range(
+                f"scheduler.pd.symm_gather.gen={generation}.rank={rank}"
+            )
+        else:
+            trace = scheduler_nvtx_range("")
+
+        with trace:
+            return self._gather(slot, generation, rank, local_row_cpu)
+
+    def _gather(
+        self,
+        slot: int,
+        generation: int,
+        rank: int,
+        local_row_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """Execute one gather with profile-only generation/ready-mask markers."""
+
         self._host_in.copy_(local_row_cpu)
         with torch.cuda.stream(self._stream):
             self._staging.copy_(self._host_in, non_blocking=True)
@@ -113,12 +141,11 @@ class SymmMemGather:
                 copy_row_and_publish,
             )
 
-            self._generation = self._generation % 0xFFFFFFFF + 1
             copy_row_and_publish(
                 self._peer_row_ptrs[slot],
                 self._peer_marker_ptrs[slot],
                 self._staging,
-                self._generation,
+                generation,
             )
 
         from sglang.srt.distributed.device_communicators.symm_mem_marker import (
@@ -126,18 +153,31 @@ class SymmMemGather:
         )
 
         deadline = time.monotonic() + _BARRIER_TIMEOUT_MS / 1000
+        poll_index = 0
         while True:
+            poll_index += 1
             with torch.cuda.stream(self._stream):
                 snapshot_rows_acquire(
                     self._region[slot],
                     self._marker_region[slot],
                     self._row_snapshot,
                     self._ready,
-                    self._generation,
+                    generation,
                 )
                 self._host_ready.copy_(self._ready, non_blocking=True)
                 self._host_out.copy_(self._row_snapshot, non_blocking=True)
             self._stream.synchronize()
+            if NVTX_SCHEDULER_ENABLED:
+                ready_mask = sum(
+                    int(bool(value)) << peer
+                    for peer, value in enumerate(self._host_ready.tolist())
+                )
+                with scheduler_nvtx_range(
+                    "scheduler.pd.symm_poll."
+                    f"gen={generation}.rank={rank}.poll={poll_index}."
+                    f"mask=0x{ready_mask:x}"
+                ):
+                    pass
             if self._host_ready.all().item():
                 return self._host_out
             if time.monotonic() >= deadline:

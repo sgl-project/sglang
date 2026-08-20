@@ -92,7 +92,11 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method, scheduler_nvtx_range
+from sglang.srt.utils.nvtx_utils import (
+    NVTX_SCHEDULER_ENABLED,
+    scheduler_nvtx_method,
+    scheduler_nvtx_range,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -2470,3 +2474,13 @@ class SchedulerDisaggregationDecodeMixin:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
             self.waiting_queue.extend(transferred_reqs)
+            if NVTX_SCHEDULER_ENABLED:
+                with scheduler_nvtx_range(
+                    "scheduler.pd.queue_state."
+                    f"admit_prealloc={len(req_conns)}."
+                    f"admit_transfer={len(transferred_reqs)}."
+                    f"prealloc={len(self.disagg_decode_prealloc_queue.queue)}."
+                    f"transfer={len(self.disagg_decode_transfer_queue.queue)}."
+                    f"waiting={len(self.waiting_queue)}"
+                ):
+                    pass
