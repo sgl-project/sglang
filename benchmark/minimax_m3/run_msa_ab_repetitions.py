@@ -104,6 +104,52 @@ def run_checked(command: list[str], *, cwd: Path, env: dict[str, str]) -> None:
     subprocess.run(command, cwd=cwd, env=env, check=True)
 
 
+def comparison_command(
+    *,
+    args: argparse.Namespace,
+    repetition_dir: Path,
+    output_name: str,
+) -> list[str]:
+    return [
+        args.python,
+        "benchmark/minimax_m3/compare_msa_gate.py",
+        "--baseline-dir",
+        str(repetition_dir / "baseline"),
+        "--candidate-dir",
+        str(repetition_dir / "candidate"),
+        "--gpqa-score-tolerance",
+        str(args.gpqa_score_tolerance),
+        "--longbench-score-tolerance",
+        str(args.longbench_score_tolerance),
+        "--output",
+        str(repetition_dir / output_name),
+    ]
+
+
+def validate_resume_manifest(
+    existing: dict, expected: dict, *, start_repetition: int
+) -> None:
+    immutable_keys = (
+        "schema_version",
+        "model",
+        "base_url",
+        "flashinfer_source_dir",
+        "expected_flashinfer_head",
+        "expected_tvm_ffi_version",
+        "server_command",
+        "repetitions",
+    )
+    mismatches = [
+        key for key in immutable_keys if existing.get(key) != expected.get(key)
+    ]
+    if mismatches:
+        raise ValueError(
+            "resume manifest does not match immutable inputs: " + ", ".join(mismatches)
+        )
+    if not 2 <= start_repetition <= 3:
+        raise ValueError("resume start repetition must be 2 or 3")
+
+
 def server_command(args: argparse.Namespace) -> list[str]:
     return [
         args.python,
@@ -255,14 +301,28 @@ def main() -> None:
         help="Append one launch_server argument; repeat for multiple arguments",
     )
     parser.add_argument("--min-median-output-throughput-gain", type=float, default=0.0)
+    parser.add_argument("--gpqa-score-tolerance", type=float, required=True)
+    parser.add_argument("--longbench-score-tolerance", type=float, required=True)
+    parser.add_argument(
+        "--start-repetition",
+        type=int,
+        default=1,
+        choices=(1, 2, 3),
+        help="Resume at repetition 2 or 3 after revalidating every completed pair",
+    )
     args = parser.parse_args()
     args.base_url = f"http://{args.host}:{args.port}"
 
     repo = Path(__file__).resolve().parents[2]
     output_root = args.output_root.resolve()
-    if output_root.exists():
-        raise SystemExit(f"refusing to reuse output root: {output_root}")
-    output_root.mkdir(parents=True)
+    if args.gpqa_score_tolerance < 0 or args.longbench_score_tolerance < 0:
+        raise SystemExit("score tolerances must be non-negative")
+    if args.start_repetition == 1:
+        if output_root.exists():
+            raise SystemExit(f"refusing to reuse output root: {output_root}")
+        output_root.mkdir(parents=True)
+    elif not output_root.is_dir():
+        raise SystemExit(f"resume output root does not exist: {output_root}")
     environment = dict(os.environ)
     python_path = str((repo / "python").resolve())
     if environment.get("PYTHONPATH"):
@@ -275,6 +335,11 @@ def main() -> None:
         }
     )
 
+    preflight_output = output_root / (
+        "preflight.json"
+        if args.start_repetition == 1
+        else f"resume_preflight_rep{args.start_repetition:02d}.json"
+    )
     preflight_command = [
         args.python,
         "benchmark/minimax_m3/probe_msa_e2e_dependencies.py",
@@ -291,7 +356,7 @@ def main() -> None:
         "--expected-tvm-ffi-version",
         args.expected_tvm_ffi_version,
         "--output",
-        str(output_root / "preflight.json"),
+        str(preflight_output),
     ]
     run_checked(preflight_command, cwd=repo, env=environment)
     manifest = {
@@ -303,13 +368,54 @@ def main() -> None:
         "expected_tvm_ffi_version": args.expected_tvm_ffi_version,
         "server_command": server_command(args),
         "repetitions": 3,
+        "score_tolerances": {
+            "gpqa": args.gpqa_score_tolerance,
+            "longbench_v2": args.longbench_score_tolerance,
+        },
     }
-    (output_root / "run_manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-    )
+    manifest_path = output_root / "run_manifest.json"
+    if args.start_repetition == 1:
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    else:
+        validate_resume_manifest(
+            json.loads(manifest_path.read_text()),
+            manifest,
+            start_repetition=args.start_repetition,
+        )
+        resume_manifest = dict(manifest)
+        resume_manifest["start_repetition"] = args.start_repetition
+        resume_manifest_path = (
+            output_root / f"resume_manifest_rep{args.start_repetition:02d}.json"
+        )
+        resume_manifest_path.write_text(
+            json.dumps(resume_manifest, indent=2, sort_keys=True) + "\n"
+        )
+        for repetition in range(1, args.start_repetition):
+            repetition_dir = output_root / f"rep{repetition:02d}"
+            recorded_order = json.loads(
+                (repetition_dir / "order.json").read_text()
+            )["order"]
+            if recorded_order != expected_order(repetition):
+                raise ValueError(f"rep{repetition:02d} provider order drifted")
+            resume_validation_name = (
+                f"resume_validation_rep{args.start_repetition:02d}.json"
+            )
+            run_checked(
+                comparison_command(
+                    args=args,
+                    repetition_dir=repetition_dir,
+                    output_name=resume_validation_name,
+                ),
+                cwd=repo,
+                env=environment,
+            )
 
-    for repetition in range(1, 4):
+    for repetition in range(args.start_repetition, 4):
         repetition_dir = output_root / f"rep{repetition:02d}"
+        if repetition_dir.exists():
+            raise SystemExit(
+                f"refusing to overwrite incomplete repetition: {repetition_dir}"
+            )
         repetition_dir.mkdir()
         order = expected_order(repetition)
         (repetition_dir / "order.json").write_text(
@@ -324,16 +430,11 @@ def main() -> None:
                 provider_role=provider_role,
             )
         run_checked(
-            [
-                args.python,
-                "benchmark/minimax_m3/compare_msa_gate.py",
-                "--baseline-dir",
-                str(repetition_dir / "baseline"),
-                "--candidate-dir",
-                str(repetition_dir / "candidate"),
-                "--output",
-                str(repetition_dir / "comparison.json"),
-            ],
+            comparison_command(
+                args=args,
+                repetition_dir=repetition_dir,
+                output_name="comparison.json",
+            ),
             cwd=repo,
             env=environment,
         )
@@ -346,6 +447,10 @@ def main() -> None:
             str(output_root),
             "--min-median-output-throughput-gain",
             str(args.min_median_output_throughput_gain),
+            "--gpqa-score-tolerance",
+            str(args.gpqa_score_tolerance),
+            "--longbench-score-tolerance",
+            str(args.longbench_score_tolerance),
         ],
         cwd=repo,
         env=environment,

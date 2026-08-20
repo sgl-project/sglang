@@ -129,6 +129,8 @@ export FLASHINFER_SOURCE_DIR=/workspace/flashinfer
 export FLASHINFER_HEAD=<exact-final-source-commit>
 export OUTPUT_ROOT=/shared/results/msa_gb300_tp4_$(date -u +%Y%m%dT%H%M%SZ)
 export EXPECTED_TVM_FFI_VERSION=0.1.9
+export GPQA_SCORE_TOLERANCE=0
+export LONGBENCH_SCORE_TOLERANCE=0.01
 export MINFER_FMHA_CACHE_DIR=/workspace/run/cache/fmha_sm100
 export BASELINE_FMHA_PRECOMPILE_RECEIPT=/shared/results/fmha_sm100_precompile.json
 export SERVER_TIMEOUT=7200
@@ -142,8 +144,8 @@ JIT compilation within one process; serial precompilation prevents four TP
 workers from racing on the same shared `.so` while preserving one identical
 completed cache for all six server starts.
 
-The driver refuses an existing output root and runs exactly three complete
-repetitions in `baseline,candidate`, `candidate,baseline`, then
+For a fresh run, the driver refuses an existing output root and runs exactly
+three complete repetitions in `baseline,candidate`, `candidate,baseline`, then
 `baseline,candidate` order. Every backend gets a fresh server. The driver waits
 for `/health_generate`, verifies one startup-log line contains the requested
 `main_attn`, `msa_decode=True`, `msa_owns_decode=True`, and
@@ -152,6 +154,10 @@ the full gate. Both warmup and serving sweeps use the fixed-seed, offline
 `random-ids` generator and send token IDs directly, so the 8K input length is
 exact and they never depend on an implicit dataset download. It stops the
 server between providers and fails if the old server still owns the port.
+If an allocation ends between complete repetitions, set `START_REPETITION` to
+2 or 3 and reuse the output root. Resume is fail-closed: immutable manifest
+inputs and every completed pair are revalidated, while an incomplete target
+repetition is never overwritten.
 
 Each repetition is compared independently. `summary.json` then reports the
 three raw values, backend median, gain computed from backend medians, and median
@@ -178,16 +184,21 @@ the accuracy contract:
 ```bash
 python benchmark/minimax_m3/compare_msa_gate.py \
   --baseline-dir /shared/results/msa_external \
-  --candidate-dir /shared/results/msa_flashinfer
+  --candidate-dir /shared/results/msa_flashinfer \
+  --gpqa-score-tolerance 0 \
+  --longbench-score-tolerance 0.01
 ```
 
 The mandatory accuracy gates are exact temperature-zero output parity for the
-fixed probes (with tokenizer-measured 32K and 64K prompt lengths), no regression
-on all 198 GPQA-Diamond questions, and no regression
-on the deterministic 100-example category-balanced LongBench-v2 subset whose
-prompts are 32K--512K tokens. GPQA is materially harder than saturated GSM8K;
-LongBench directly exercises MSA's long-context page selection and decode replay
-without admitting prompts beyond the model's serving envelope.
+fixed probes (with tokenizer-measured 32K and 64K prompt lengths), zero score
+tolerance on all 198 GPQA-Diamond questions, and an explicit one-answer (0.01)
+noninferiority margin on the deterministic 100-example category-balanced
+LongBench-v2 subset whose prompts are 32K--512K tokens. Both the per-pair checks
+and the three-run backend medians enforce those margins. The runner requires the
+two margins as inputs and records them in its manifests and comparison JSON.
+GPQA is materially harder than saturated GSM8K; LongBench directly exercises
+MSA's long-context page selection and decode replay without admitting prompts
+beyond the model's serving envelope.
 
 The single-pair comparison command also reports fractional speedup for
 request/output-token throughput and median/p99 TTFT and inter-token latency. Pass

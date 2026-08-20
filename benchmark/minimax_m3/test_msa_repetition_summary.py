@@ -11,10 +11,12 @@ from precompile_fmha_sm100 import runtime_variants
 from run_msa_ab_repetitions import (
     OFFLINE_THROUGHPUT_ARGS,
     OFFLINE_THROUGHPUT_DATASET,
+    validate_resume_manifest,
 )
 from summarize_msa_repetitions import (
     CONCURRENCIES,
     SERVING_METRICS,
+    accuracy_noninferiority_failures,
     build_summary,
     expected_order,
 )
@@ -133,6 +135,48 @@ class MSARepetitionSummaryTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "order"):
                 build_summary(root)
+
+    def test_accuracy_margins_are_metric_specific(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.make_fixture(root)
+            for repetition in range(1, 4):
+                comparison_path = root / f"rep{repetition:02d}" / "comparison.json"
+                comparison = json.loads(comparison_path.read_text())
+                comparison["accuracy"]["longbench_v2"]["candidate"] = 0.39
+                self.write_json(comparison_path, comparison)
+            summary = build_summary(root)
+
+        self.assertEqual(
+            accuracy_noninferiority_failures(
+                summary,
+                {"gpqa": 0.0, "longbench_v2": 0.01},
+            ),
+            [],
+        )
+        self.assertRegex(
+            accuracy_noninferiority_failures(
+                summary,
+                {"gpqa": 0.0, "longbench_v2": 0.009},
+            )[0],
+            "longbench_v2",
+        )
+
+    def test_resume_manifest_rejects_immutable_input_drift(self) -> None:
+        expected = {
+            "schema_version": 1,
+            "model": "/model",
+            "base_url": "http://127.0.0.1:30000",
+            "flashinfer_source_dir": "/flashinfer",
+            "expected_flashinfer_head": "a" * 40,
+            "expected_tvm_ffi_version": "0.1.9",
+            "server_command": ["python", "-m", "sglang.launch_server"],
+            "repetitions": 3,
+        }
+        validate_resume_manifest(expected, expected, start_repetition=2)
+        drifted = dict(expected, model="/different-model")
+        with self.assertRaisesRegex(ValueError, "model"):
+            validate_resume_manifest(drifted, expected, start_repetition=2)
 
 
 if __name__ == "__main__":
