@@ -2278,5 +2278,50 @@ class TestDcpKvEventContract(CustomTestCase):
         self.assertEqual(args.kv_event_block_size, 8)
 
 
+class TestNvidiaMpsReplicas(CustomTestCase):
+    def _args(self, **overrides):
+        kwargs = {
+            "model_path": "dummy",
+            "served_model_name": "dummy",
+            "device": "cuda",
+            "max_total_tokens": 1024,
+            "nvidia_mps_replicas": 2,
+        }
+        kwargs.update(overrides)
+        return ServerArgs(**kwargs)
+
+    def test_resolves_to_same_gpu_native_dp(self):
+        args = self._args()
+        self.assertEqual(args.dp_size, 2)
+        self.assertEqual(args.gpu_id_step, 0)
+        self.assertTrue(args.is_same_gpu_dp())
+        args._check_same_gpu_dp()
+
+    def test_cli_flag_is_available(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--nvidia-mps-replicas",
+                "2",
+                "--max-total-tokens",
+                "1024",
+            ]
+        )
+        self.assertEqual(args.nvidia_mps_replicas, 2)
+        self.assertEqual(args.dp_size, 2)
+        self.assertEqual(args.gpu_id_step, 0)
+
+    def test_rejects_conflicting_dp_size(self):
+        with self.assertRaisesRegex(ValueError, "conflicts with --dp-size"):
+            self._args(dp_size=3)
+
+    def test_rejects_unsupported_same_gpu_topology(self):
+        with self.assertRaisesRegex(ValueError, "tp_size must be 1"):
+            self._args(tp_size=2)._check_same_gpu_dp()
+        with self.assertRaisesRegex(ValueError, "max_total_tokens must be explicit"):
+            self._args(max_total_tokens=None)._check_same_gpu_dp()
+
+
 if __name__ == "__main__":
     unittest.main()

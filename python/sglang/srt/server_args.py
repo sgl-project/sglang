@@ -1058,6 +1058,16 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
+    nvidia_mps_replicas: A[
+        int,
+        (
+            "Number of native data-parallel replicas to place on one NVIDIA GPU. "
+            "Values greater than 1 enable guarded same-GPU DP (equivalent to "
+            "--dp-size N --gpu-id-step 0). CUDA MPS itself must be started and "
+            "managed outside SGLang."
+        ),
+        NS("parallel"),
+    ] = 1
     load_balance_method: A[
         str,
         Arg(
@@ -3647,6 +3657,7 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
+        self._handle_nvidia_mps_replicas()
         self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
@@ -6713,6 +6724,64 @@ class ServerArgs:
             f"disable_cuda_graph=True"
         )
 
+    def _handle_nvidia_mps_replicas(self):
+        """Resolve the convenience flag for guarded same-GPU native DP.
+
+        CUDA MPS is deliberately not managed here: its daemon and pipe/log
+        directories are process-external NVIDIA runtime concerns. This flag
+        only selects SGLang's replica placement.
+        """
+        if self.nvidia_mps_replicas < 1:
+            raise ValueError("--nvidia-mps-replicas must be at least 1")
+        if self.nvidia_mps_replicas == 1:
+            return
+        if self.dp_size not in (1, self.nvidia_mps_replicas):
+            raise ValueError(
+                "--nvidia-mps-replicas conflicts with --dp-size: "
+                f"got replicas={self.nvidia_mps_replicas}, dp_size={self.dp_size}"
+            )
+        if self.gpu_id_step not in (0, 1):
+            raise ValueError(
+                "--nvidia-mps-replicas conflicts with --gpu-id-step; "
+                "same-GPU replicas require --gpu-id-step 0"
+            )
+        self.dp_size = self.nvidia_mps_replicas
+        self.gpu_id_step = 0
+
+    def is_same_gpu_dp(self) -> bool:
+        """Whether native DP replicas are intentionally placed on one GPU."""
+        return self.dp_size > 1 and self.gpu_id_step == 0
+
+    def _check_same_gpu_dp(self):
+        if self.gpu_id_step != 0:
+            return
+        unsupported = []
+        if self.device != "cuda":
+            unsupported.append("device must be cuda")
+        if self.dp_size <= 1:
+            unsupported.append("dp_size must be greater than 1")
+        if self.tp_size != 1:
+            unsupported.append("tp_size must be 1")
+        if self.pp_size != 1:
+            unsupported.append("pp_size must be 1")
+        if self.nnodes != 1:
+            unsupported.append("nnodes must be 1")
+        if self.enable_dp_attention:
+            unsupported.append("DP attention must be disabled")
+        if self.disaggregation_mode != "null":
+            unsupported.append("disaggregation must be disabled")
+        if self.elastic_ep_backend is not None or self.is_ep_scale_joiner:
+            unsupported.append("elastic scaling must be disabled")
+        if self.use_ray:
+            unsupported.append("Ray must be disabled")
+        if self.max_total_tokens is None:
+            unsupported.append("max_total_tokens must be explicit")
+        if unsupported:
+            raise ValueError(
+                "--gpu-id-step 0 enables same-GPU native DP and requires: "
+                + "; ".join(unsupported)
+            )
+
     def _handle_data_parallelism(self):
         # The dp_size==1 resets moved to the resolution pipeline
         # (arg_groups/overrides.py: _data_parallelism_defaults).
@@ -9259,7 +9328,9 @@ class ServerArgs:
         ), "multi-node data parallel is not supported unless dp attention!"
 
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
-        assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
+        if self.gpu_id_step < 0:
+            raise ValueError("gpu_id_step must be non-negative")
+        self._check_same_gpu_dp()
 
         assert self.moe_dense_tp_size in (
             None,
