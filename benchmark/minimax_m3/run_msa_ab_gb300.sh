@@ -8,6 +8,7 @@ GPQA_DATASET="${GPQA_DATASET:?set GPQA_DATASET to the frozen GPQA-Diamond CSV}"
 FLASHINFER_SOURCE_DIR="${FLASHINFER_SOURCE_DIR:?set FLASHINFER_SOURCE_DIR to the final source checkout}"
 FLASHINFER_HEAD="${FLASHINFER_HEAD:?set FLASHINFER_HEAD to the exact 40-character source commit}"
 OUTPUT_ROOT="${OUTPUT_ROOT:?set OUTPUT_ROOT to a new evidence directory}"
+EXPECTED_TVM_FFI_VERSION="${EXPECTED_TVM_FFI_VERSION:?set the compatibility baseline TVM-FFI version}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
 exec "${PYTHON_BIN}" benchmark/minimax_m3/run_msa_ab_repetitions.py \
@@ -17,5 +18,6 @@ exec "${PYTHON_BIN}" benchmark/minimax_m3/run_msa_ab_repetitions.py \
   --flashinfer-source-dir "${FLASHINFER_SOURCE_DIR}" \
   --expected-flashinfer-head "${FLASHINFER_HEAD}" \
   --output-root "${OUTPUT_ROOT}" \
+  --expected-tvm-ffi-version "${EXPECTED_TVM_FFI_VERSION}" \
   --python "${PYTHON_BIN}" \
   --min-median-output-throughput-gain "${MIN_MEDIAN_OUTPUT_THROUGHPUT_GAIN:-0}"

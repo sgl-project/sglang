@@ -189,10 +189,44 @@ def probe_fmha_sm100() -> dict:
     for name in ("fmha_sm100", "fmha_sm100_plan"):
         if not callable(getattr(module, name, None)):
             raise RuntimeError(f"fmha_sm100 installation has no callable {name}")
-    return {"installed_path": str(Path(inspect.getfile(module)).resolve())}
+    import torch
+
+    device = torch.device("cuda:0")
+    qo = torch.ones(1, dtype=torch.int32)
+    kv = torch.full((1,), 16 * 128, dtype=torch.int32)
+    plan = module.fmha_sm100_plan(
+        qo,
+        kv,
+        16,
+        num_kv_heads=1,
+        page_size=128,
+        kv_block_num=16,
+        causal=False,
+        qo_offset=kv - 1,
+        device=device,
+        use_fp8_kvcache=False,
+    )
+    required_metadata = {
+        "kv_segment_lens",
+        "kv_segment_offsets",
+        "kv_page_indptr",
+        "qo_offset",
+    }
+    if not (isinstance(plan, tuple) and len(plan) > 3 and isinstance(plan[3], dict)):
+        raise RuntimeError("fmha_sm100_plan returned an incompatible plan layout")
+    missing = sorted(
+        name for name in required_metadata if not torch.is_tensor(plan[3].get(name))
+    )
+    if missing:
+        raise RuntimeError(f"fmha_sm100_plan is missing metadata tensors: {missing}")
+    return {
+        "installed_path": str(Path(inspect.getfile(module)).resolve()),
+        "plan_length": len(plan),
+        "plan_metadata_tensors": sorted(required_metadata),
+    }
 
 
-def probe_sglang(repo: Path) -> dict:
+def probe_sglang(repo: Path, expected_tvm_ffi_version: str) -> dict:
     module = importlib.import_module("sglang")
     installed_path = Path(inspect.getfile(module)).resolve()
     expected_package = (repo / "python" / "sglang").resolve()
@@ -221,11 +255,12 @@ def probe_sglang(repo: Path) -> dict:
             f"{REQUIRED_DEEP_GEMM_VERSION}"
         )
     tvm_ffi_version = metadata.version("apache-tvm-ffi")
-    if tvm_ffi_version != REQUIRED_TVM_FFI_VERSION:
+    if tvm_ffi_version != expected_tvm_ffi_version:
         raise RuntimeError(
             f"apache-tvm-ffi is {tvm_ffi_version}, expected "
-            f"{REQUIRED_TVM_FFI_VERSION}"
+            f"{expected_tvm_ffi_version}"
         )
+    tvm_ffi = importlib.import_module("tvm_ffi")
     deep_gemm = importlib.import_module("deep_gemm")
     scale = torch.ones((4, 4), dtype=torch.float32, device="cuda")
     packed_scale = deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
@@ -245,6 +280,7 @@ def probe_sglang(repo: Path) -> dict:
         "deep_gemm_version": deep_gemm_version,
         "deep_gemm_path": str(Path(inspect.getfile(deep_gemm)).resolve()),
         "tvm_ffi_version": tvm_ffi_version,
+        "tvm_ffi_path": str(Path(inspect.getfile(tvm_ffi)).resolve()),
     }
 
 
@@ -296,6 +332,9 @@ def main() -> None:
     parser.add_argument("--expected-flashinfer-head", required=True)
     parser.add_argument("--expected-gpus", type=int, default=4)
     parser.add_argument("--expected-capability", default="10.3")
+    parser.add_argument(
+        "--expected-tvm-ffi-version", default=REQUIRED_TVM_FFI_VERSION
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -307,7 +346,7 @@ def main() -> None:
     repo = Path(__file__).resolve().parents[2]
     report = {
         "offline": True,
-        "sglang": probe_sglang(repo),
+        "sglang": probe_sglang(repo, args.expected_tvm_ffi_version),
         "flashinfer": probe_flashinfer(
             args.flashinfer_source_dir, args.expected_flashinfer_head
         ),

@@ -240,6 +240,7 @@ def main() -> None:
     parser.add_argument("--server-timeout", type=int, default=3600)
     parser.add_argument("--num-threads", type=int, default=32)
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--expected-tvm-ffi-version", required=True)
     parser.add_argument(
         "--extra-server-arg",
         action="append",
@@ -282,6 +283,8 @@ def main() -> None:
         str(args.flashinfer_source_dir.resolve()),
         "--expected-flashinfer-head",
         args.expected_flashinfer_head,
+        "--expected-tvm-ffi-version",
+        args.expected_tvm_ffi_version,
         "--output",
         str(output_root / "preflight.json"),
     ]
@@ -292,6 +295,7 @@ def main() -> None:
         "base_url": args.base_url,
         "flashinfer_source_dir": str(args.flashinfer_source_dir.resolve()),
         "expected_flashinfer_head": args.expected_flashinfer_head,
+        "expected_tvm_ffi_version": args.expected_tvm_ffi_version,
         "server_command": server_command(args),
         "repetitions": 3,
     }
