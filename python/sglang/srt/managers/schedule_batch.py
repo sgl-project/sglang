@@ -19,6 +19,10 @@ from sglang.srt.utils.common import (
     flatten_arrays_to_pinned_cpu,
     is_pin_memory_available,
 )
+from sglang.srt.utils.weight_versions import (
+    WeightVersionEvent,
+    truncate_weight_version_events,
+)
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1038,6 +1042,8 @@ class Req(ReqDllmMixin):
         # Indicates if the req has ever been retracted.
         self.retracted_stain = False
 
+        self.weight_version_events: List[WeightVersionEvent] = []
+
         # Incremental streamining
         self.send_token_offset: int = 0
         self.send_decode_id_offset: int = 0
@@ -1716,6 +1722,9 @@ class Req(ReqDllmMixin):
         # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
             self.output_ids = array("q")
+            self.weight_version_events = truncate_weight_version_events(
+                self.weight_version_events, num_kept_tokens=self.send_token_offset
+            )
 
     def offload_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
