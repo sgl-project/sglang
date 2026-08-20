@@ -23,7 +23,7 @@ from sglang.kernels.ops.kimi_k3.flydsl.kimi_k3_kda_decode import (
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=120, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 def _gfx950_flydsl_available() -> bool:
@@ -514,6 +514,15 @@ def test_decode_api_rejects_invalid_input_rank() -> None:
 
     with pytest.raises(ValueError, match="`x` must have rank 2"):
         _run(inputs)
+
+
+def test_fused_kda_backend_is_opt_in(monkeypatch):
+    from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
+
+    monkeypatch.delenv("SGLANG_K3_KDA_FUSED_BACKEND", raising=False)
+    assert not kda_fused_decode_aiter_hip.enabled()
+    monkeypatch.setenv("SGLANG_K3_KDA_FUSED_BACKEND", "aiter")
+    assert kda_fused_decode_aiter_hip.enabled()
 
 
 if __name__ == "__main__":
