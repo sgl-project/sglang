@@ -925,6 +925,7 @@ class Scheduler(
             self.external_corpus_manager = None
 
     def init_target_memory_pool(self):
+        """Allocate target KV cache pools if they have not been allocated yet."""
         if (
             self.tp_worker.model_runner.memory_pool_config is not None
             and self.tp_worker.model_runner.req_to_token_pool is not None
@@ -934,6 +935,7 @@ class Scheduler(
         self.tp_worker.alloc_memory_pool()
 
     def init_memory_pools(self):
+        """Allocate KV cache pools for target and draft workers."""
         self.init_target_memory_pool()
         # Lands the retraction backend on the disagg bag before the draft
         # worker's HiCache plan reads it.
@@ -948,11 +950,13 @@ class Scheduler(
             self.draft_worker.init_hicache_draft_plan()
 
     def init_all_attention_backends(self):
+        """Initialize attention backends for all workers."""
         self.tp_worker.init_attention_backends()
         if self.draft_worker is not None:
             self.draft_worker.init_attention_backends()
 
     def init_all_cuda_graphs(self):
+        """Capture cuda graphs for all workers."""
         self.tp_worker.init_cuda_graphs()
         if self.draft_worker is not None:
             self.draft_worker.init_cuda_graphs()
@@ -1483,6 +1487,7 @@ class Scheduler(
             self.ngram_embedding_k = hf_config.ngram_embedding_k
 
     def init_deterministic_inference_config(self):
+        """Initialize deterministic inference configuration for different attention backends."""
         if not get_exec().deterministic.enable_deterministic_inference:
             self.truncation_align_size = None
             return
@@ -2674,6 +2679,7 @@ class Scheduler(
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
     def _set_or_validate_priority(self, req: Req) -> bool:
+        """Set the default priority value, or abort the request based on the priority scheduling mode."""
         if self.enable_priority_scheduling and req.priority is None:
             if self.schedule_low_priority_values_first:
                 req.priority = sys.maxsize
@@ -3379,6 +3385,7 @@ class Scheduler(
             )
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
+        """Update the current running decoding batch."""
         initial_bs = batch.batch_size()
 
         batch.filter_batch()
@@ -3507,6 +3514,7 @@ class Scheduler(
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+        """Run a batch."""
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
         batch.launch_ts = time.monotonic()
@@ -4568,6 +4576,7 @@ class Scheduler(
     def handle_scale_elastic_ep(
         self, recv_req: ScaleElasticEPReqInput
     ) -> ScaleElasticEPReqOutput:
+        """Begin a pending elastic EP scale-up request."""
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
         old_ep_size = ElasticEPStateManager.get_effective_ep_size()
@@ -4647,6 +4656,7 @@ class Scheduler(
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
     ) -> LoadLoRAAdapterReqOutput:
+        """In-place loading a new lora adapter from disk or huggingface."""
 
         result = self.tp_worker.load_lora_adapter(recv_req)
         return result
@@ -4654,6 +4664,7 @@ class Scheduler(
     def load_lora_adapter_from_tensors(
         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
     ) -> LoadLoRAAdapterFromTensorsReqOutput:
+        """In-place loading a new lora adapter from serialized tensors."""
 
         result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
         return result
@@ -4661,6 +4672,7 @@ class Scheduler(
     def unload_lora_adapter(
         self, recv_req: UnloadLoRAAdapterReqInput
     ) -> UnloadLoRAAdapterReqOutput:
+        """Unload the lora adapter."""
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
         return result
@@ -4668,6 +4680,7 @@ class Scheduler(
     def init_weights_send_group_for_remote_instance(
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
     ):
+        """Init the seed and client instance communication group."""
         success, message = self.tp_worker.init_weights_send_group_for_remote_instance(
             recv_req
         )
@@ -4678,6 +4691,7 @@ class Scheduler(
     def send_weights_to_remote_instance(
         self, recv_req: SendWeightsToRemoteInstanceReqInput
     ):
+        """Send the seed instance weights to the destination instance."""
         success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
         return SendWeightsToRemoteInstanceReqOutput(success=success, message=message)
 
@@ -4722,6 +4736,7 @@ class Scheduler(
             self.idle_sleeper.maybe_sleep()
 
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
+        """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
         freeze_gc("Scheduler")
         self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
         return None

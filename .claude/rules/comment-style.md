@@ -174,3 +174,11 @@ they may run past two lines; every other rule in this file still applies.
 - **No:** internal helpers, overrides, private methods. Never hand-write or
   generate Python `Args:` / `Returns:` blocks -- the signature and its type
   hints already carry the names and types.
+
+  The one exception is the orchestration step. In the frozen classes
+  (`Scheduler`, `TokenizerManager`, `ModelRunner` -- see
+  `.claude/skills/large-class-style`), each `init_*` / `handle_*` / event-loop
+  method is an override point a subclass picks from a list; its one-line
+  docstring is the catalog entry that says what the step does, so it stays even
+  when it reads close to the method name. A genuine private helper
+  (`_validate_*`, `_normalize_*`) that no subclass overrides still gets nothing.
