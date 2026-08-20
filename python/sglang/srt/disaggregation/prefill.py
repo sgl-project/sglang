@@ -23,8 +23,9 @@ import hashlib
 import logging
 from array import array
 from collections import deque
+from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -86,6 +87,40 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+
+@dataclass
+class StagedPrefillTransferIndices:
+    """Pinned CPU mirrors covered by GenerationBatchResult.copy_done."""
+
+    end_idx: int
+    full_page_indices: torch.Tensor
+    dsa_page_indices: Optional[torch.Tensor] = None
+    swa_seq_len: Optional[int] = None
+    swa_page_indices: Optional[torch.Tensor] = None
+    mamba_indices: Optional[torch.Tensor] = None
+
+
+def _copy_page_indices_to_pinned_cpu(
+    kv_indices: torch.Tensor, page_size: int
+) -> torch.Tensor:
+    """Queue a fixed-shape page-id D2H without synchronizing the caller."""
+    page_indices = kv_indices[::page_size].to(torch.int64) // page_size
+    cpu_indices = torch.empty(
+        page_indices.shape, dtype=page_indices.dtype, device="cpu", pin_memory=True
+    )
+    cpu_indices.copy_(page_indices, non_blocking=True)
+    page_indices.record_stream(torch.cuda.current_stream(page_indices.device))
+    return cpu_indices
+
+
+def _copy_to_pinned_cpu(tensor: torch.Tensor) -> torch.Tensor:
+    cpu_tensor = torch.empty(
+        tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True
+    )
+    cpu_tensor.copy_(tensor, non_blocking=True)
+    tensor.record_stream(torch.cuda.current_stream(tensor.device))
+    return cpu_tensor
 
 
 def should_force_retry(req: Req) -> bool:
@@ -498,6 +533,95 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    def stage_prefill_transfer_indices(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> Dict[str, StagedPrefillTransferIndices]:
+        """Queue page-index D2H copies on the existing result-copy stream.
+
+        The scheduler consumes these tensors only after ``copy_done``.  This
+        keeps send_kv_chunk() from executing a series of pageable ``.cpu()`` /
+        ``.numpy()`` calls after the forward, each of which otherwise drains the
+        schedule stream.  The pending-send set also closes the unified-memory
+        move gate while the staged physical addresses are waiting to be sent.
+        """
+        if _is_npu:
+            return {}
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        state_types = set(
+            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+        )
+        staged: Dict[str, StagedPrefillTransferIndices] = {}
+
+        for req in batch.reqs:
+            if (
+                req.pending_bootstrap
+                or is_aborted(req)
+                or req.extend_range is None
+            ):
+                continue
+
+            transfer_input_len = len(req.origin_input_ids)
+            end_idx = min(req.extend_range.end, transfer_input_len)
+            if end_idx <= 0 or end_idx < req.start_send_idx:
+                continue
+
+            full_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, :end_idx
+            ]
+            transfer_indices = (
+                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                    full_indices
+                )
+            )
+            entry = StagedPrefillTransferIndices(
+                end_idx=end_idx,
+                full_page_indices=_copy_page_indices_to_pinned_cpu(
+                    transfer_indices, page_size
+                ),
+            )
+
+            is_last_chunk = end_idx >= transfer_input_len
+            if is_last_chunk:
+                if StateType.MAMBA in state_types:
+                    mamba_indices = (
+                        self.req_to_token_pool.translate_mamba_indices(
+                            self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                                req.req_pool_idx
+                            ]
+                        )
+                    )
+                    entry.mamba_indices = _copy_to_pinned_cpu(mamba_indices)
+
+                if StateType.SWA in state_types:
+                    window_start = max(0, end_idx - self.sliding_window_size)
+                    window_start = (window_start // page_size) * page_size
+                    swa_indices = (
+                        self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                            full_indices[window_start:end_idx]
+                        )
+                    )
+                    entry.swa_seq_len = end_idx
+                    entry.swa_page_indices = _copy_page_indices_to_pinned_cpu(
+                        swa_indices, page_size
+                    )
+
+                if (
+                    StateType.DSA in state_types
+                    or StateType.MINIMAX_INDEX_K in state_types
+                ):
+                    # Preserve the existing state-pool addressing semantics:
+                    # unlike the main KV transfer, this path intentionally uses
+                    # the req_to_token values before unified-pool translation.
+                    entry.dsa_page_indices = _copy_page_indices_to_pinned_cpu(
+                        full_indices, page_size
+                    )
+
+            staged[str(req.rid)] = entry
+            self.disagg_prefill_pending_chunk_rids.add(req.rid)
+
+        return staged
+
     def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
         """Resolve bootstrap status for waiting prefill requests before admission.
 
@@ -680,6 +804,11 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        staged_transfer_indices = result.disagg_transfer_indices or {}
+        for req in batch.reqs:
+            req._staged_prefill_transfer_indices = staged_transfer_indices.get(
+                str(req.rid)
+            )
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
@@ -1177,6 +1306,9 @@ class SchedulerDisaggregationPrefillMixin:
             return
 
         state_indices: Optional[List] = None
+        staged: Optional[StagedPrefillTransferIndices] = getattr(
+            req, "_staged_prefill_transfer_indices", None
+        )
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 
@@ -1188,6 +1320,8 @@ class SchedulerDisaggregationPrefillMixin:
             c128_seq_len = transfer_input_len
 
             def _mamba_payload():
+                if staged is not None and staged.mamba_indices is not None:
+                    return [staged.mamba_indices.numpy()]
                 return [
                     self.req_to_token_pool.translate_mamba_indices(
                         self.req_to_token_pool.req_index_to_mamba_index_mapping[
@@ -1199,6 +1333,12 @@ class SchedulerDisaggregationPrefillMixin:
                 ]
 
             def _swa_payload():
+                if (
+                    staged is not None
+                    and staged.swa_seq_len == seq_len
+                    and staged.swa_page_indices is not None
+                ):
+                    return staged.swa_page_indices.numpy()
                 window_size = self.sliding_window_size
                 window_start = max(req.disagg_decode_prefix_len, seq_len - window_size)
                 window_start = (window_start // page_size) * page_size
@@ -1213,6 +1353,14 @@ class SchedulerDisaggregationPrefillMixin:
                 return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _full_kv_pages_payload():
+                if (
+                    staged is not None
+                    and staged.end_idx >= seq_len
+                    and staged.dsa_page_indices is not None
+                ):
+                    return staged.dsa_page_indices[
+                        : kv_to_page_num(seq_len, page_size)
+                    ].numpy()
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
@@ -1296,17 +1444,28 @@ class SchedulerDisaggregationPrefillMixin:
 
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
-            kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, seg_start:seg_end
-            ]
-            # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
-            # physical ones. Per segment, since each is its own gather.
-            kv_indices = (
-                self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                    kv_indices
+            if (
+                staged is not None
+                and staged.end_idx >= seg_end
+                and seg_start % page_size == 0
+            ):
+                page_start = seg_start // page_size
+                page_count = kv_to_page_num(seg_end - seg_start, page_size)
+                page_indices = staged.full_page_indices[
+                    page_start : page_start + page_count
+                ].numpy()
+            else:
+                kv_indices = self.req_to_token_pool.req_to_token[
+                    req.req_pool_idx, seg_start:seg_end
+                ]
+                # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
+                # physical ones. Per segment, since each is its own gather.
+                kv_indices = (
+                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
+                        kv_indices
+                    )
                 )
-            )
-            page_indices = kv_to_page_indices(kv_indices, page_size)
+                page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             if not req.disagg_kv_sender.should_send_kv_chunk(
                 len(page_indices), segment_is_last
@@ -1322,6 +1481,7 @@ class SchedulerDisaggregationPrefillMixin:
         # already put the request on `disagg_prefill_inflight_queue`.
         if last_chunk:
             self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+            req._staged_prefill_transfer_indices = None
         else:
             self.disagg_prefill_pending_chunk_rids.add(req.rid)
 
