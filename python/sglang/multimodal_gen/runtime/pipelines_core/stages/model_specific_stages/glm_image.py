@@ -707,9 +707,9 @@ class GlmImageAR(PipelineStage):
             height = height or ar_condition_images[0].height
             width = width or ar_condition_images[0].width
 
-        if batch.requested_width is None:
+        if getattr(batch, "requested_width", None) is None:
             batch.requested_width = width
-        if batch.requested_height is None:
+        if getattr(batch, "requested_height", None) is None:
             batch.requested_height = height
 
         requested_width = width
