@@ -107,9 +107,8 @@ def init_npu_backend():
 
         # Re-mock torch.cuda.is_available because transfer_to_npu mocks it True.
         torch.cuda.is_available = lambda: False
-
-    torch_npu.npu.config.allow_internal_format = True
-    torch_npu.npu.set_compile_mode(jit_compile=False)
+        torch_npu.npu.config.allow_internal_format = True
+        torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
 def _is_nz_aligned(tensor: torch.Tensor) -> bool:
