@@ -93,6 +93,13 @@ class _ReadbackMixin:
             "--enable-return-routed-experts",
             "--disable-cuda-graph",
             "--disable-radix-cache",
+            # The prompts here are a dozen tokens each, but the default chunked
+            # prefill budget is 8192, which DP attention halves to 4096 per rank
+            # -- above the 256-token dispatch buffer both backends are given
+            # below, so deepep_v2's boot-time capacity check rejects the launch.
+            # Ask for a budget this test actually needs.
+            "--chunked-prefill-size",
+            "256",
             "--mem-fraction-static",
             "0.5",
             *cls.backend_args,
