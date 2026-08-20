@@ -24,6 +24,11 @@ class StateType(str, enum.Enum):
     SWA_RING = "swa_ring"
     # DeepSeek-V4 online C128 request-scoped state.
     C128_STATE = "c128_state"
+    # MXFP8 KV keeps its UE8M0 block scales in buffers parallel to K/V, one
+    # component per sub-pool so each carries the index payload of the KV it
+    # describes (whole sequence for full attention, window for SWA).
+    MXFP8_SCALE = "mxfp8_scale"
+    MXFP8_SCALE_SWA = "mxfp8_scale_swa"
 
 
 @dataclasses.dataclass

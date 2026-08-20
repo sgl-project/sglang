@@ -1064,6 +1064,15 @@ def setup_state_kv_args(
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
 
+    if hasattr(token_to_kv_pool, "get_kv_scale_buf_infos") and not hasattr(
+        token_to_kv_pool, "has_kv_scale_buffers"
+    ):
+        append_state_component(
+            kv_args,
+            StateType.MXFP8_SCALE,
+            *token_to_kv_pool.get_kv_scale_buf_infos(),
+        )
+
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
             raise NotImplementedError(
@@ -1082,6 +1091,21 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
             )
+            # MXFP8 KV: each sub-pool's block scales ride as their own component
+            # so they inherit the index payload of the KV they describe.
+            if getattr(token_to_kv_pool, "has_kv_scale_buffers", None) and (
+                token_to_kv_pool.has_kv_scale_buffers()
+            ):
+                append_state_component(
+                    kv_args,
+                    StateType.MXFP8_SCALE,
+                    *token_to_kv_pool.get_kv_scale_buf_infos(),
+                )
+                append_state_component(
+                    kv_args,
+                    StateType.MXFP8_SCALE_SWA,
+                    *token_to_kv_pool.get_swa_kv_scale_buf_infos(),
+                )
             # unified_kv: the SWA ring lives in the unified buffers (no separate
             # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
             if getattr(token_to_kv_pool, "_unified_kv", False) and hasattr(

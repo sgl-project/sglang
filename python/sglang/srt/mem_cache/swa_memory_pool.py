@@ -137,6 +137,15 @@ class SWAKVPool(BaseSWAKVPool):
             full_kv_item_lens,
         )
 
+    def has_kv_scale_buffers(self) -> bool:
+        return hasattr(self.full_kv_pool, "get_kv_scale_buf_infos")
+
+    def get_kv_scale_buf_infos(self):
+        return self.full_kv_pool.get_kv_scale_buf_infos()
+
+    def get_swa_kv_scale_buf_infos(self):
+        return self.swa_kv_pool.get_kv_scale_buf_infos()
+
     def get_state_buf_infos(self):
         swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens = (
             self.swa_kv_pool.get_contiguous_buf_infos()

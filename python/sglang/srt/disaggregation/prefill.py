@@ -1259,6 +1259,9 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.MINIMAX_INDEX_K: _dsa_payload,
                 StateType.SWA_RING: _swa_ring_payload,
                 StateType.C128_STATE: _c128_state_payload,
+                # Scale rows sit at the same locs as the KV they describe.
+                StateType.MXFP8_SCALE: _dsa_payload,
+                StateType.MXFP8_SCALE_SWA: _swa_payload,
             }
             if _is_npu and isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(),
