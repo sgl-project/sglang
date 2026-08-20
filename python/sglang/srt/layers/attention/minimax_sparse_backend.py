@@ -551,9 +551,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._msa_prefill_meta = page_table
         if in_capture:
             graph_states = {
-                layer_id: make_flashinfer_msa_graph_state(
-                    forward_batch.seq_lens.device
-                )
+                layer_id: make_flashinfer_msa_graph_state(forward_batch.seq_lens.device)
                 for layer_id in self.sparse_layer_ids
             }
             self._msa_graph_state_lifetime.append(graph_states)
@@ -813,7 +811,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
 
         page_size = self.page_size  # == block_size_k
-        num_q_heads = q.shape[1]
         head_dim = q.shape[2]
         num_idx_heads = idx_q.shape[1]
         idx_dim = idx_q.shape[2]
@@ -946,7 +943,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
 
         page_size = self.page_size  # == block_size_k
-        num_q_heads = q.shape[1]
         head_dim = q.shape[2]
         num_idx_heads = idx_q.shape[1]
         idx_dim = idx_q.shape[2]
@@ -1148,9 +1144,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         per_query_prefix = prefix_lens_l.repeat_interleave(extend_lens)  # [total_q]
         per_query_within = torch.arange(
             total_q, device=device, dtype=torch.long
-        ) - cu_q[:-1].repeat_interleave(
-            extend_lens
-        )  # 0-indexed within each request
+        ) - cu_q[:-1].repeat_interleave(extend_lens)  # 0-indexed within each request
         per_query_seq_lens = (per_query_prefix + per_query_within + 1).to(torch.int32)
 
         max_seqlen = (
@@ -1226,7 +1220,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
 
         page_size = self.page_size  # == block_size_k
-        num_q_heads = q.shape[1]
         head_dim = q.shape[2]
         num_idx_heads = idx_q.shape[1]
         idx_dim = idx_q.shape[2]
@@ -1254,7 +1247,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
             self._prefill_meta = meta
         per_query_seq_lens = meta.per_query_seq_lens
-        max_seqlen = meta.max_seqlen
         max_blocks = meta.max_blocks
         block_size_q = meta.block_size_q
         per_query_req = meta.per_query_req

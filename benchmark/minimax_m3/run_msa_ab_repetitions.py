@@ -255,9 +255,7 @@ def main() -> None:
         default=[],
         help="Append one launch_server argument; repeat for multiple arguments",
     )
-    parser.add_argument(
-        "--min-median-output-throughput-gain", type=float, default=0.0
-    )
+    parser.add_argument("--min-median-output-throughput-gain", type=float, default=0.0)
     args = parser.parse_args()
     args.base_url = f"http://{args.host}:{args.port}"
 

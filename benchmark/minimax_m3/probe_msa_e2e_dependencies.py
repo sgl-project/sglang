@@ -54,9 +54,7 @@ def resolve_checkpoint(model: str) -> Path:
 
     from huggingface_hub import snapshot_download
 
-    return Path(
-        snapshot_download(repo_id=model, local_files_only=True)
-    ).resolve()
+    return Path(snapshot_download(repo_id=model, local_files_only=True)).resolve()
 
 
 def probe_checkpoint(model: str) -> dict:
@@ -71,7 +69,9 @@ def probe_checkpoint(model: str) -> dict:
         weight_map = json.loads(index.read_text()).get("weight_map", {})
         shards.update(str(value) for value in weight_map.values())
     if shards:
-        missing = sorted(shard for shard in shards if not (checkpoint / shard).is_file())
+        missing = sorted(
+            shard for shard in shards if not (checkpoint / shard).is_file()
+        )
         if missing:
             raise RuntimeError(
                 f"checkpoint is missing {len(missing)} indexed weight shards; "
@@ -82,7 +82,9 @@ def probe_checkpoint(model: str) -> dict:
             checkpoint.glob("pytorch_model*.bin")
         )
         if not standalone_weights:
-            raise RuntimeError(f"checkpoint contains no locally cached weights: {checkpoint}")
+            raise RuntimeError(
+                f"checkpoint contains no locally cached weights: {checkpoint}"
+            )
         shards = {path.name for path in standalone_weights}
 
     from transformers import AutoTokenizer
@@ -181,9 +183,13 @@ def probe_flashinfer(source: Path, expected_head: str) -> dict:
         "msa_topk_select",
         "MSASparseAttentionWorkspace",
     }
-    missing = sorted(name for name in required if not callable(getattr(msa_ops, name, None)))
+    missing = sorted(
+        name for name in required if not callable(getattr(msa_ops, name, None))
+    )
     if missing:
-        raise RuntimeError(f"installed flashinfer.msa_ops is missing callables: {missing}")
+        raise RuntimeError(
+            f"installed flashinfer.msa_ops is missing callables: {missing}"
+        )
     return {
         "source_path": str(source),
         "source_head": head,
@@ -267,8 +273,7 @@ def probe_sglang(repo: Path, expected_tvm_ffi_version: str) -> dict:
     tvm_ffi_version = metadata.version("apache-tvm-ffi")
     if tvm_ffi_version != expected_tvm_ffi_version:
         raise RuntimeError(
-            f"apache-tvm-ffi is {tvm_ffi_version}, expected "
-            f"{expected_tvm_ffi_version}"
+            f"apache-tvm-ffi is {tvm_ffi_version}, expected {expected_tvm_ffi_version}"
         )
     tvm_ffi = importlib.import_module("tvm_ffi")
     deep_gemm = importlib.import_module("deep_gemm")
@@ -299,7 +304,9 @@ def probe_gpus(expected_gpus: int, expected_capability: tuple[int, int]) -> dict
 
     count = torch.cuda.device_count()
     if count != expected_gpus:
-        raise RuntimeError(f"{count} CUDA devices are visible, expected {expected_gpus}")
+        raise RuntimeError(
+            f"{count} CUDA devices are visible, expected {expected_gpus}"
+        )
     devices = []
     for index in range(count):
         capability = torch.cuda.get_device_capability(index)
@@ -342,15 +349,15 @@ def main() -> None:
     parser.add_argument("--expected-flashinfer-head", required=True)
     parser.add_argument("--expected-gpus", type=int, default=4)
     parser.add_argument("--expected-capability", default="10.3")
-    parser.add_argument(
-        "--expected-tvm-ffi-version", default=REQUIRED_TVM_FFI_VERSION
-    )
+    parser.add_argument("--expected-tvm-ffi-version", default=REQUIRED_TVM_FFI_VERSION)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    capability_parts = tuple(int(value) for value in args.expected_capability.split("."))
+    capability_parts = tuple(
+        int(value) for value in args.expected_capability.split(".")
+    )
     if len(capability_parts) != 2:
         raise SystemExit("--expected-capability must look like 10.3")
     repo = Path(__file__).resolve().parents[2]
