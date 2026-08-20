@@ -261,6 +261,8 @@ class TestTopK(CustomTestCase):
                     correction_bias = torch.randn((1, num_experts))
                 else:
                     correction_bias = torch.randn(num_experts)
+            else:
+                correction_bias = None
 
             topk_weights, topk_ids = torch.ops.sgl_kernel.topk_softmax_cpu(
                 hidden_states=hidden_states,
