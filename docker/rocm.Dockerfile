@@ -887,18 +887,6 @@ with record_path.open("w", newline="", encoding="utf-8") as f:
     csv.writer(f).writerows(rows)
 PY
 
-RUN cd /tmp/whl \
-    && case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        python hack.py \
-        && python3 -m pip install --force --no-deps /tmp/${TORCH_ROCM_FILE} \
-        && rm -fr /tmp/whl /tmp/${TORCH_ROCM_FILE} \
-        ;; \
-      *) \
-        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
-        ;; \
-    esac
 
 # transformers 5.12.1: don't follow HF-cache symlinks when hashing custom modules
 # (transformers#46618, not yet released).
