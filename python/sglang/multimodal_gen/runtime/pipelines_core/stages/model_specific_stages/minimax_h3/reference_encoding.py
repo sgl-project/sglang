@@ -121,18 +121,54 @@ def _nearest_multiple(value: float, multiple: int) -> int:
     return max(multiple, int(round(float(value) / multiple)) * multiple)
 
 
+def minimax_h3_validate_reference_image_short_edge(value: Any) -> int:
+    """Validate a reference-image short edge against the 32px grid contract."""
+
+    try:
+        short_edge = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"reference image short edge must be an integer, got {value!r}"
+        ) from exc
+    if value != short_edge:
+        raise ValueError(
+            f"reference image short edge must be an integer, got {value!r}"
+        )
+    if short_edge <= 0:
+        raise ValueError(
+            f"reference image short edge must be positive, got {short_edge}"
+        )
+    if short_edge % MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE:
+        raise ValueError(
+            "reference image short edge must be a multiple of "
+            f"{MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE}, got {short_edge}"
+        )
+    return short_edge
+
+
 def minimax_h3_resolve_reference_image_shape(
     *,
     width: int | float,
     height: int | float,
+    short_edge: int | None = None,
 ) -> dict[str, Any]:
     """Resolve a ref2va image independently from the target canvas.
 
-    The image keeps its display ratio, always targets a 2048px short edge (even
-    when that requires upscaling), and rounds both dimensions independently to
-    the nearest 32px grid. Unlike target/video ``adapt_shape_v1``, reference
-    images have no area-cap branch.
+    The image keeps its display ratio, always targets ``short_edge`` px on its
+    short side (even when that requires upscaling), and rounds both dimensions
+    independently to the nearest 32px grid. Unlike target/video
+    ``adapt_shape_v1``, reference images have no area-cap branch.
+
+    ``short_edge`` defaults to the released 2048px contract. Lowering it cuts
+    token count with the square of the ratio, departing from the checkpoint's
+    audited preprocessing to trade conditioning fidelity for memory.
     """
+
+    resolved_short_edge = (
+        MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE
+        if short_edge is None
+        else minimax_h3_validate_reference_image_short_edge(short_edge)
+    )
 
     try:
         source_width = float(width)
@@ -156,7 +192,7 @@ def minimax_h3_resolve_reference_image_shape(
             f"1:4 to 4:1, got {source_width:g}x{source_height:g}"
         )
 
-    scale = MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE / min(source_width, source_height)
+    scale = resolved_short_edge / min(source_width, source_height)
     target_width = _nearest_multiple(
         source_width * scale, MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE
     )
@@ -166,7 +202,7 @@ def minimax_h3_resolve_reference_image_shape(
     return {
         "geometry": "reference_image_resolved",
         "shape_policy_version": "reference_image_short_edge_v1",
-        "base_short_edge": MINIMAX_H3_REFERENCE_IMAGE_SHORT_EDGE,
+        "base_short_edge": resolved_short_edge,
         "effective_short_edge": min(target_width, target_height),
         "size_mode": "short_edge",
         "multiple": MINIMAX_H3_REFERENCE_IMAGE_MULTIPLE,
@@ -919,4 +955,5 @@ __all__ = [
     "minimax_h3_prepared_reference_videos",
     "minimax_h3_resolve_reference_image_shape",
     "minimax_h3_sample_reference_video_frames",
+    "minimax_h3_validate_reference_image_short_edge",
 ]

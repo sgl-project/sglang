@@ -347,6 +347,8 @@ class ServerArgs(DisaggServerArgsMixin):
     use_fsdp_inference: bool | None = None
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
+    # MiniMax-H3 ref2va reference images; None keeps the released 2048px contract
+    minimax_h3_reference_image_short_edge: int | None = None
     _explicit_arg_names: set[str] = field(default_factory=set, repr=False)
     _required_resident_components: set[str] = field(
         default_factory=set, init=False, repr=False
@@ -564,7 +566,22 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_cfg_parallel()
         self._validate_batching()
         self._validate_breakable_cuda_graph()
+        self._validate_minimax_h3_reference_image_short_edge()
         self.pipeline_config.validate_server_args(self)
+
+    def _validate_minimax_h3_reference_image_short_edge(self) -> None:
+        if self.minimax_h3_reference_image_short_edge is None:
+            return
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.reference_encoding import (
+            minimax_h3_validate_reference_image_short_edge,
+        )
+
+        # fail at launch rather than on the first ref2va request
+        self.minimax_h3_reference_image_short_edge = (
+            minimax_h3_validate_reference_image_short_edge(
+                self.minimax_h3_reference_image_short_edge
+            )
+        )
 
     def _validate_scheduler_rpc_timeout(self) -> None:
         timeout = self.scheduler_rpc_timeout
@@ -2206,6 +2223,19 @@ class ServerArgs(DisaggServerArgsMixin):
                 "'original' keeps official two-stage semantics without premerged stage2, "
                 "'resident' keeps both transformers resident on GPU. "
                 "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
+            ),
+        )
+        parser.add_argument(
+            "--minimax-h3-reference-image-short-edge",
+            type=int,
+            default=ServerArgs.minimax_h3_reference_image_short_edge,
+            help=(
+                "MiniMax-H3 ref2va only: short edge every reference image is "
+                "resized to before Qwen3-VL and the video VAE, as a positive "
+                "multiple of 32. Token count scales with the square of this "
+                "value, so 1024 costs a quarter of the 2048 default and trades "
+                "conditioning fidelity for memory. Unset keeps the released "
+                "2048px contract; reference videos are unaffected."
             ),
         )
         parser.add_argument(
