@@ -22,7 +22,10 @@ pub use egress::{
     frame_egress_result,
 };
 pub use finish_reason::Matched;
-pub(crate) use io_struct::{AbortReq, ControlRequest, GetInternalStateReq};
+pub(crate) use io_struct::{
+    AbortReq, ControlRequest, GetInternalStateReq, SaveRemoteModelReqInput,
+    SaveShardedModelReqInput,
+};
 pub use request::{GenerateBody, GenerateRequest, MmRequest, MmWorkItem, RequestKind};
 // Constructed directly only by tests: `api_server::prefetch` fills its
 // `prefetched` field, everything else gets it packed inside a `GenerateRequest`.
