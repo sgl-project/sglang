@@ -143,9 +143,13 @@ For a native text encoder:
 
 The same contract applies to every weighted component: path routing is generic,
 while quantized materialization is capability-based. Native auxiliary loaders
-that only understand unquantized state dicts reject quantization metadata before
-model construction. See [Quantized Component Repositories](../quantization#quantized-component-repositories)
+whose current materializer expects plain state dicts reject unsupported
+quantization metadata before model construction. See
+[Quantized Component Repositories](../quantization#quantized-component-repositories)
 for the current component matrix.
+
+Component overrides accept a local component directory, a standalone Hub
+repository, or a Hub component subfolder written as `owner/repo/subfolder`.
 
 For supported realtime causal video models, `--kv-cache-quant {off|int4|int2}`
 compresses completed KV-cache chunks independently of transformer weight
