@@ -398,7 +398,7 @@ class CompressorAscendBackendMixin:
             allow_build=False,
         )
 
-        cmp_kv = torch.ops.custom.compressor(
+        cmp_kv = torch.ops.npu.compressor(
             x,
             compressor._fused_wkv_w,
             compressor._fused_wgate_w,
