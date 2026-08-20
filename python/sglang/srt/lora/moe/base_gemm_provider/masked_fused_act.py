@@ -1,20 +1,18 @@
-"""Fused LoRA middle stage over the production masked MoE row domain.
+"""One kernel that computes the gate/up LoRA-B product and the activation over
+the masked MoE rows.
 
-The base GEMM writes ``[E, m_max, S * I]`` while LoRA uses original pair
-order, so the kernel crosses the domains through ``src2dst``, computing
-gate/up LoRA-B and the activation in one launch.
+The base GEMM writes ``[E, m_max, slices * width]`` rows. LoRA uses the
+original pair order. The kernel joins the two orders through ``src2dst``.
 
-Activation always goes to the masked rows consumed by the base down GEMM.
-The pair-major copy is optional — the compatibility output for non-mapped
-down-A families, since grouped down-A can read the masked rows through the
-provider pair-to-row ABI; an invalid routed pair writes exact zero to the
-pair output and never touches a masked row.
+The activation always goes to the masked rows that the base down GEMM reads.
+The pair-major copy is optional. It exists for a down-A family that cannot read
+the masked rows through the pair-to-row map in the provider ABI. An invalid
+routed pair gets exact zero in the pair output, and no masked row at all.
 
-LoRA-B is combined with the BF16 base row in FP32 before activation, so this
-implements ``activation(base + A @ B)`` but intentionally does not reproduce
-the extra BF16 delta-materialization rounding of the serial reference. The
-activation exposed to down-A and the base down GEMM is rounded to the
-provider BF16 ABI.
+NUMERICS: the kernel adds LoRA-B to the BF16 base row in FP32, then applies the
+activation. It computes ``activation(base + A @ B)``. The serial reference
+rounds the delta to BF16 first. The kernel then rounds the activation itself
+to BF16. That dtype is the provider ABI for down-A and the base down GEMM.
 """
 
 from __future__ import annotations
@@ -276,8 +274,8 @@ def _b_act_kernel(
     consume_base_pdl: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    # tl.cdiv would return a tensor-like value here and break the constexpr
-    # multiplication below, so keep the schedule arithmetic in Python.
+    # ``tl.cdiv`` returns a tensor-like value. The multiplication below needs a
+    # constexpr, so this line uses Python arithmetic.
     num_w_tiles: tl.constexpr = (width + block_w - 1) // block_w
     programs_per_group = group_m * num_w_tiles
     group_id = pid // programs_per_group
@@ -350,8 +348,9 @@ def _b_act_kernel(
             )
 
     if consume_base_pdl:
-        # The LoRA-B tile above does not depend on GEMM1; let it run while
-        # GEMM1 is resident and wait at the first base-output load.
+        # The LoRA-B tile above does not depend on the base gate/up GEMM. It
+        # runs while that GEMM is still on the GPU. The kernel waits here, just
+        # before it loads the base output.
         tl.extra.cuda.gdc_wait()
     base_gate = tl.load(
         base_ptr + dst_rows[:, None] * stride_pm + gate_cols[None, :] * stride_pn,
@@ -373,7 +372,7 @@ def _b_act_kernel(
         mask=base_valid[:, None] & w_mask[None, :],
     )
     if store_pair_act:
-        # Pair rows are total: invalid routed pairs are exact zero.
+        # Every pair row gets a store. An invalid pair gets exact zero.
         tl.store(
             act_pairs_ptr
             + pair_ids[:, None] * stride_qm

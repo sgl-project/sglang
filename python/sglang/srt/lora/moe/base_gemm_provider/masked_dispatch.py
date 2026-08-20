@@ -1,18 +1,20 @@
-"""One-launch masked dispatch for the MoE LoRA BF16 pipeline, replacing the
-``fused_moe_dispatch_index`` + ``fill_gateup_input`` composition.
+"""One kernel that permutes the tokens into the masked rows. It replaces the
+``fused_moe_dispatch_index`` plus ``fill_gateup_input`` pair.
 
-Contract (drop-in for the bf16 branch of ``moe_ep_deepgemm_preprocess``):
+This is a drop-in for the BF16 branch of ``moe_ep_deepgemm_preprocess``. The
+return tuple and the host formulas are the same:
+``m_max = (T // 256 + 1) * 256`` and ``expected_m = ceil(T * top_k / E_local)``.
 
-- Same 5-tuple return and host formulas ``m_max = (T // 256 + 1) * 256``,
-  ``expected_m = ceil(T * top_k / E_local)``.
-- Pairs with ``topk_ids < 0`` (EP-unrouted / padding) get no ``src2dst``
-  store (entries stay uninitialized) and copy nothing; every consumer gates
-  on ``topk_ids >= 0``.
-- Slot order within an expert is atomic-arrival nondeterministic, as in the
-  two-kernel composition; all stages share the one ``src2dst``, so the final
-  combine is bitwise-independent of the slot permutation.
-- Graph safe: the grid derives only from host-static shapes, with no host
-  sync or readback.
+A pair with ``topk_ids < 0`` is unrouted or padding. The kernel copies no row
+for it and writes no ``src2dst`` entry. That entry keeps old data, so every
+consumer must test ``topk_ids >= 0`` first.
+
+Atomic arrival order decides which slot a pair gets inside an expert. Every
+stage reads the same ``src2dst``, so the final combine gives the same bits
+under any slot order.
+
+The grid comes from host-static shapes only. The kernel needs no host sync and
+no readback, so a CUDA graph can capture it.
 """
 
 from __future__ import annotations
@@ -25,10 +27,10 @@ import triton.language as tl
 @triton.jit
 def fused_dispatch_fill_kernel(
     input_ptr,  # [num_tokens, hidden] bf16 source rows
-    gateup_input_ptr,  # [E_local, m_max, hidden] bf16 slab, viewed flat
-    topk_ids_ptr,  # [num_tokens * topk]; < 0 = padding / EP-unrouted
-    src2dst_ptr,  # [num_tokens * topk] int32 out (valid lanes only)
-    masked_m_ptr,  # [E_local] int32 cursor + count, PRE-ZEROED by caller
+    gateup_input_ptr,  # [E_local, m_max, hidden] bf16 rows, viewed flat
+    topk_ids_ptr,  # [num_tokens * topk]; < 0 = padding or EP-unrouted
+    src2dst_ptr,  # [num_tokens * topk] int32 out; valid pairs only
+    masked_m_ptr,  # [E_local] int32 count and atomic cursor; caller zeroes it
     m_max,
     hidden_size,
     TOPK: tl.constexpr,
@@ -64,8 +66,8 @@ def fused_masked_preprocess(
 ) -> tuple[torch.Tensor, int, torch.Tensor, torch.Tensor, None]:
     if block_shape is not None:
         raise ValueError("fused masked preprocess takes no quantization block shape")
-    # output_dtype is a literal at every call site; what matters is the
-    # activation dtype, which the fill kernel would silently downcast.
+    # The fill kernel downcasts a non-BF16 input and gives no warning. This
+    # check rejects one first. ``output_dtype`` is a literal at every call site.
     if hidden_states.dtype != torch.bfloat16:
         raise ValueError("fused masked preprocess is BF16-only")
     if hidden_states.ndim != 2 or not hidden_states.is_contiguous():
@@ -130,8 +132,8 @@ def fused_masked_preprocess(
             )
         gateup_input = gateup_input_out
 
-    # masked_m doubles as the atomic cursor, so it must be zeroed first; a
-    # stream-ordered memset is legal inside CUDA-graph capture.
+    # ``masked_m`` is also the atomic cursor, so it must start at zero. The
+    # memset runs in stream order, and CUDA-graph capture accepts it.
     masked_m.zero_()
     if num_tokens > 0:
         fused_dispatch_fill_kernel[(num_tokens, top_k)](

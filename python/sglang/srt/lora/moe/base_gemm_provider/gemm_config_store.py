@@ -1,11 +1,13 @@
-"""M-bucketed launch-config store for the MoE LoRA base GEMM providers: one
-JSON file per (provider, geometry, device), keyed by ``expected_m`` buckets
-with nearest-M selection, mirroring sglang's Triton fused-MoE JSON pattern.
+"""Launch-config store for the MoE LoRA base GEMM providers.
 
-Bucket payloads carry ``token_width`` for the CuTeDSL provider or
-``expected_m`` for DeepGEMM; ``tiles`` is CuTeDSL-only and declares the tile
-set to compile at attach.  Files are generated on the target device by
-``benchmark/kernels/lora_moe/sweep_masked_gemm_configs.py``, never by hand.
+One JSON file serves one provider, one geometry and one device. The file keys
+its buckets by ``expected_m``, and a lookup takes the nearest bucket. This
+follows the JSON pattern of sglang's Triton fused-MoE configs.
+
+A bucket holds ``token_width`` for a CuTeDSL provider, or ``expected_m`` for
+DeepGEMM. The ``tiles`` field is CuTeDSL-only, and it names the tiles to
+compile at attach. Do not write a file by hand. Generate each file on the
+target device with ``benchmark/kernels/lora_moe/sweep_masked_gemm_configs.py``.
 """
 
 from __future__ import annotations
@@ -111,11 +113,11 @@ def load_config_table(
     device_name: str | None = None,
     expected_versions: Mapping[str, str] | None = None,
 ) -> GemmConfigTable | None:
-    """Load the bucket table for one provider+geometry, or ``None``.
+    """Load the bucket table for one provider and geometry, or return ``None``.
 
-    ``None`` always means "use the built-in heuristics unchanged".  The search
-    is per file, so an override dir carrying only some files inherits the rest
-    from the package instead of losing them.
+    ``None`` always means "use the built-in heuristics". The search runs
+    separately for each file. An override directory may therefore hold some of
+    the files, and the package supplies the rest.
     """
     if device_name is None:
         from sglang.srt.utils import get_device_name

@@ -35,9 +35,9 @@ class DeepGemmBf16Provider(MaskedRowDomainProvider):
             load_config_table,
         )
 
-        # ``expected_m`` is DeepGEMM's only config input (it drives the internal
-        # get_best_config choice); ``masked_m`` still bounds the actual work, so
-        # a swept bucket table overriding the hint is purely a performance knob.
+        # ``expected_m`` is the only config input DeepGEMM reads, and it picks
+        # the internal config. ``masked_m`` still bounds the real work. A
+        # bucket table that overrides the hint therefore changes speed only.
         self._config_table = load_config_table(
             self.contract.key,
             num_local_experts=quant_info.num_local_experts,
@@ -104,13 +104,13 @@ class DeepGemmBf16Provider(MaskedRowDomainProvider):
 
 
 class DeepGemmBf16ContiguousProvider(ContiguousRowDomainProvider):
-    """Route-major twin of :class:`DeepGemmBf16Provider`.
+    """Route-major variant of :class:`DeepGemmBf16Provider`.
 
-    Same weights and contract semantics; only the S2/S4 primitive changes to
-    ``m_grouped_bf16_gemm_nt_contiguous`` (the upstream EP prefill path's call
-    convention), driven by the domain's ``grouped_layout``.  The wrapper keeps
-    DeepGEMM's ``ensure_zero_padding=True``, so ``-1``-labeled ceiling rows are
-    skipped work with zeroed output.
+    The weights and the contract do not change. This provider calls
+    ``m_grouped_bf16_gemm_nt_contiguous`` instead, and passes the domain's
+    ``grouped_layout``. The wrapper keeps ``ensure_zero_padding=True``. The
+    kernel therefore skips a row with ``grouped_layout`` entry ``-1``, and
+    writes zeros there.
     """
 
     contract = MoeBaseProviderContract(
@@ -123,9 +123,9 @@ class DeepGemmBf16ContiguousProvider(ContiguousRowDomainProvider):
     )
 
     def __init__(self, quant_info: MoeLoraBf16QuantInfo):
-        # The m-granule the contiguous kernel schedules and zero-pads by is the
-        # engine's own contract; read it from DeepGEMM rather than hardcoding so
-        # a kernel-side change cannot silently break segment geometry.
+        # The contiguous kernel schedules and zero-pads by its own
+        # m-alignment. Read that value from DeepGEMM. A hardcoded value breaks
+        # the segment geometry after a change inside the kernel.
         import deep_gemm
 
         super().__init__(

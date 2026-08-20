@@ -159,9 +159,9 @@ class MoEStaticSchedulerParams:
         params: "MoEStaticSchedulerParams",
         max_active_clusters: int,
     ) -> Tuple[int, int, int]:
-        """
-        The host does not know the token distribution across experts, so launch
-        max_active_clusters and let the device-side scheduler pick valid tiles.
+        """The host does not know how many tokens each expert gets. The launch
+        therefore uses ``max_active_clusters`` clusters, and the device
+        scheduler selects the valid tiles.
         """
         return (
             params.cluster_shape_mn[0],
@@ -171,19 +171,18 @@ class MoEStaticSchedulerParams:
 
 
 class MoEStaticPersistentTileScheduler:
-    """
-    The shipped provider config always sets ``direct_schedule=True`` and compiles
-    :class:`MoEDirectPersistentTileScheduler` instead; this variant is kept as the
-    fallback schedule source for the planned SM90 port (plan section 54), where
-    the host-built direct schedule is most likely to need rework first.
+    """Persistent scheduler that finds each work tile from the row counts.
 
-    The kernel constructs it outside any warp predicate and does no smem
-    broadcast, so enumeration is replicated across all six warps (TMA, MMA, four
-    epilogue). Every warp must derive an identical tile sequence or the mainloop
-    pipelines deadlock; that holds only because the mapping is a pure function of
-    ``offs`` (or of the packed schedule), which must not be mutated while the
-    kernel runs. Per-tile resolution cost is also paid six times, the strongest
-    argument for :class:`MoEDirectPersistentTileScheduler`.
+    The kernel builds this scheduler in all six warps: the TMA warp, the MMA
+    warp, and the four epilogue warps. No warp broadcasts the result through
+    shared memory. Every warp must produce the same tile sequence, or the
+    mainloop pipelines deadlock. The sequence is a pure function of ``offs``,
+    so the caller must not change ``offs`` while the kernel runs.
+
+    Each warp repeats the same tile search, so that search runs six times.
+    :class:`MoEDirectPersistentTileScheduler` avoids the repeat, and the
+    shipped configuration uses it. This class stays as the fallback for the
+    planned SM90 port.
     """
 
     def __init__(
@@ -412,7 +411,7 @@ class MoEStaticPersistentTileScheduler:
         loc=None,
         ip=None,
     ) -> None:
-        """Diagnostic fast path when every expert has the same valid M."""
+        """Fast path for the case where every expert has the same row count."""
         cluster_tile_m_cnt = (
             self.params.uniform_m + self.cluster_tile_m - 1
         ) // self.cluster_tile_m
@@ -485,7 +484,7 @@ class MoEStaticPersistentTileScheduler:
         loc=None,
         ip=None,
     ) -> None:
-        # expert_tile_end == 0 means uninitialized, i.e. this is the first call.
+        # expert_tile_end is 0 only before the first call.
         if self.expert_tile_end == Int32(0):
             tiles_for_expert_0 = self._compute_tiles_for_expert(
                 Int32(0), loc=loc, ip=ip
@@ -523,8 +522,8 @@ class MoEStaticPersistentTileScheduler:
             ) // self.cluster_tile_n
             return cluster_tile_m_cnt * cluster_tile_n_cnt
         else:
-            # Unlike the upstream contiguous scheduler, ``offs`` is a count
-            # vector here.
+            # ``offs`` holds one row count for each expert here. The upstream
+            # contiguous scheduler holds offsets in the same tensor.
             tokens_i = self.offs[expert_idx]
             cluster_tile_m_cnt = (
                 tokens_i + self.cluster_tile_m - 1  # type: ignore[operator]
@@ -544,9 +543,8 @@ class MoEStaticPersistentTileScheduler:
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32]:
-        """
-        Short side first: the shorter dimension changes faster, which maximizes
-        overlap between adjacent clusters in L2.
+        """The shorter axis changes faster. Adjacent clusters then share more
+        data in L2.
         """
         cluster_tile_m_cnt, cluster_tile_n_cnt = self._get_cluster_tile_counts(
             expert_idx, loc=loc, ip=ip
@@ -580,7 +578,6 @@ class MoEStaticPersistentTileScheduler:
                 self.intermediate + self.cluster_tile_n - 1
             ) // self.cluster_tile_n
         else:
-            # ``offs`` stores counts; the uniform specialization drops that load.
             tokens_i = (
                 self.params.uniform_m
                 if const_expr(self.params.uniform_m is not None)
@@ -613,13 +610,11 @@ class MoEStaticPersistentTileScheduler:
 
 
 class MoEDirectPersistentTileScheduler:
-    """Persistent scheduler over a routing-produced compact cluster map.
+    """Persistent scheduler that reads a work map which routing built.
 
-    ``schedule[i]`` packs ``(expert, cluster_m, cluster_n)`` into one int64 at the
-    field widths declared in ``schedule_abi``. Building the map belongs to
-    routing/permutation and is deliberately outside the GEMM boundary, like
-    TRTLLM's CTA-to-expert map, so the GEMM does one coalesced load per work tile
-    instead of rescanning every expert count in each specialized warp.
+    ``schedule[i]`` packs ``(expert, cluster_m, cluster_n)`` into one int64. The
+    GEMM then does one coalesced load for each work tile. It does not scan the
+    expert counts again in every warp.
     """
 
     def __init__(
@@ -727,8 +722,8 @@ class MoEDirectPersistentTileScheduler:
     def _get_current_work(self, *, loc=None, ip=None) -> MoEWorkTileInfo:
         work = MoEWorkTileInfo(Int32(-1), Int32(0), Int32(0), Int32(0))
         if self._current_work_linear_idx < self.schedule_tiles[0]:
-            # Extracted in 64-bit, narrowed once: every field is far inside
-            # int32 range by construction (see schedule_abi).
+            # The code shifts and masks in 64 bits, then narrows once to int32.
+            # Each field fits, because schedule_abi limits every field width.
             packed = Int64(self.schedule[self._current_work_linear_idx])
             expert = Int32(packed & Int64(EXPERT_MASK))
             cluster_m = Int32(

@@ -9,9 +9,6 @@ _T = TypeVar("_T")
 
 
 class MoeLoraWorkspace:
-    """Missing state is never created inside a CUDA capture: the graph warm-up
-    forwards must have run the same plan and bucket first.
-    """
 
     def __init__(self) -> None:
         self._graph_buffers: dict[
@@ -25,11 +22,6 @@ class MoeLoraWorkspace:
         self._graph_mode = False
 
     def begin_forward(self, *, graph_mode: bool) -> None:
-        """Eager keeps only the largest flat allocation per buffer name, so
-        varying prefill lengths cannot grow a lifetime shape cache. Graphs
-        retain exact warmed shapes because replacing an allocation would
-        invalidate an older captured graph.
-        """
         self._graph_mode = bool(graph_mode)
 
     @staticmethod
@@ -45,8 +37,9 @@ class MoeLoraWorkspace:
         device: torch.device | str,
         zero_on_first_allocation: bool = False,
     ) -> torch.Tensor:
-        """A buffer needing a fresh zero per forward must enqueue that memset
-        itself, so the graph records it and every replay repeats it.
+        """A caller that needs a fresh zero for each forward pass must enqueue
+        the memset itself. The CUDA graph then records that memset, and every
+        replay repeats it.
         """
         resolved_device = torch.device(device)
         resolved_shape = tuple(int(dim) for dim in shape)
@@ -81,8 +74,8 @@ class MoeLoraWorkspace:
         return tensor
 
     def side_stream(self, device: torch.device | str) -> torch.cuda.Stream:
-        # Streams and events are keyed by device alone, which assumes every
-        # overlap window forks from the same consumer stream.
+        # The workspace keys each stream and each event by device only. This is
+        # correct only if every call to run_parallel forks from one stream.
         resolved_device = torch.device(device)
         stream = self._streams.get(resolved_device)
         if stream is None:
@@ -117,10 +110,6 @@ class MoeLoraWorkspace:
         compute: Callable[[], _T],
         side: Callable[[], object],
     ) -> _T:
-        """The join is complete — side-stream work never escapes this method —
-        so allocator ``record_stream`` calls are neither required nor hidden
-        here.
-        """
         if device.type != "cuda":
             side()
             return compute()

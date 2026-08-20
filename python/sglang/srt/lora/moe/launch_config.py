@@ -54,7 +54,7 @@ def _is_power_of_two(value: int) -> bool:
 
 
 def _validate_flat_config(name: str, config: Mapping[str, int]) -> None:
-    # Key/value types are enforced by the strict pydantic fields.
+    # The strict pydantic fields already check the key and value types.
     if not config:
         raise ValueError(f"{name} must be a non-empty launch-config mapping")
 
@@ -63,13 +63,12 @@ def _validate_flat_config(name: str, config: Mapping[str, int]) -> None:
     frozen=True,
     slots=True,
     kw_only=True,
-    # extra="forbid": an unknown site key in a tiles rule aborts bind
-    # instead of silently serving default tiles.
     config=pydantic.ConfigDict(strict=True, extra="forbid"),
 )
 class MoeLoraLaunchConfig:
-    # One aligned route is SHARED by every grouped LoRA stage; its block is
-    # each stage's row tile. Values and their evidence: configs/README.md.
+    # Every grouped LoRA kernel in a plan reads one aligned route. This value
+    # is the row tile of those kernels, and of nothing else. See
+    # configs/README.md for the shipped values and the measurements behind them.
     routing_block_size: int = 16
     gate_up_a: dict[str, int] = field(default_factory=_a_default)
     gate_up_b: dict[str, int] = field(default_factory=_b_default)
@@ -122,9 +121,9 @@ class MoeLoraLaunchConfig:
             )
 
 
-# Rules are matched first hit in order per plan-row name: ``max_rank`` resolves
-# at bind (the pool-padded rank is a server constant), ``max_tokens`` per
-# forward.
+# Each plan row has a list of rules, and the runtime uses the first rule that
+# matches. ``max_rank`` resolves once at bind time, because the pool-padded
+# rank is a server constant. ``max_tokens`` resolves on every forward.
 
 
 class _TileRuleModel(pydantic.BaseModel):
@@ -158,8 +157,8 @@ def _config_from_sites(sites: Mapping[str, Any]) -> MoeLoraLaunchConfig:
 
 class TileTable:
     def __init__(self, rules: list[tuple[int, MoeLoraLaunchConfig]]) -> None:
-        # resolve_tiles is the only constructor and always supplies at least
-        # one rule (falling back to the built-in default config).
+        # ``resolve_tiles`` is the only caller, and it always passes at least
+        # one rule. ``config_for`` can therefore always read the last rule.
         self._rules = rules
 
     def config_for(self, num_tokens: int) -> MoeLoraLaunchConfig:
@@ -190,7 +189,7 @@ def resolve_tiles(
         bound = rule.max_tokens if rule.max_tokens is not None else 1 << 30
         resolved.append((bound, _config_from_sites(rule.sites)))
         if rule.max_tokens is None:
-            break  # unconditional rule terminates the ladder
+            break  # a rule with no token bound is the last rule in the ladder
     if not resolved:
         resolved.append((1 << 30, MoeLoraLaunchConfig()))
     return TileTable(resolved)

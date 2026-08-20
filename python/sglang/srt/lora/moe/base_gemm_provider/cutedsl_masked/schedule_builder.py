@@ -1,7 +1,9 @@
-"""Both GEMM stages' schedules derive from the SAME ``masked_m`` in ONE launch
-(the dual-ownership rule): a schedule built from any row-count source other
-than the masked_m the GEMMs will read is silent corruption, so this module
-never accepts row counts through a second path.
+"""One launch builds the schedules for both GEMM stages from one ``masked_m``
+tensor.
+
+The two GEMMs read that same ``masked_m``. A schedule built from any other row
+count corrupts the output, and nothing reports the error. Each function here
+therefore takes the row counts through one argument only.
 """
 
 from __future__ import annotations
@@ -39,8 +41,8 @@ def _dual_schedule_kernel(
     OUTPUT_SHIFT: tl.constexpr,
     SINGLE_STAGE: tl.constexpr,
 ):
-    """Measured, rejected: one program with a serial per-entry loop over all
-    experts cost more at prefill scale than the GEMM saving it enabled.
+    """A benchmark rejected one program with a serial loop over all experts.
+    At prefill sizes that loop takes more time than the GEMM saves.
     """
     expert = tl.program_id(0)
     stage = tl.program_id(1)
@@ -77,8 +79,8 @@ def _dual_schedule_kernel(
         oc_b = local - tc_b * out_clusters
         tc_i = tl.where(token_major, tc_b, tc_a)
         oc_i = tl.where(token_major, oc_b, oc_a)
-        # Widen BEFORE shifting: int32 operands would overflow the upper
-        # fields silently.
+        # Widen to int64 before the shift. An int32 shift drops the upper
+        # fields, and nothing reports the loss.
         packed = (
             expert.to(tl.int64)
             | (tc_i.to(tl.int64) << TOKEN_SHIFT)
@@ -104,11 +106,10 @@ def dual_stage_schedule_capacities(
     cluster_shape_mn: tuple[int, int] = (1, 1),
     use_2cta_instrs: bool = False,
 ) -> tuple[int, int]:
-    """``cluster_shape_mn`` / ``use_2cta_instrs`` are taken only to be REJECTED
-    unless trivial: this builder emits indices at CTA-tile granularity while
-    the device scheduler treats them as CLUSTER indices and expands them, so a
-    real cluster would over-enumerate and address tiles out of range silently,
-    with no device assertion to catch it.
+    """The builder writes one index for each CTA tile. The device scheduler
+    reads each index as a cluster index and multiplies it by the cluster shape.
+    Only a (1, 1) cluster is therefore correct, and this function rejects every
+    other value. The device has no assertion for it.
     """
     if tuple(cluster_shape_mn) != (1, 1) or use_2cta_instrs:
         raise ValueError(
@@ -138,8 +139,8 @@ def dual_stage_schedule_capacities(
             f"{max(out_clusters1, out_clusters2)} output clusters exceed the "
             f"{MAX_OUTPUT_CLUSTERS} the non-negative-word config allows"
         )
-    # The kernel's begin/total arithmetic is int32 and the per-field width caps
-    # do not imply that bound, so check the worst-case capacity directly.
+    # The kernel adds the entry counts in int32. The field width limits above
+    # do not bound that sum, so check the worst-case capacity here.
     capacity = num_experts * max_token_clusters * max(out_clusters1, out_clusters2)
     if capacity > 2**31 - 1:
         raise ValueError(
@@ -176,11 +177,11 @@ def single_stage_schedule_capacity(
 
 
 def validate_contiguous_tile_geometry(token_width: int, m_alignment: int) -> None:
-    """The contiguous kernel folds ``seg_offsets[e] // token_width`` into the
-    flat tile index and lets the final partial tile overrun an expert's valid
-    rows.  Both are safe iff the token tile divides the segment alignment,
-    which keeps segment bases exact tile multiples and every overrun inside
-    the expert's OWN segment.
+    """The contiguous kernel adds ``seg_offsets[e] // token_width`` to the flat
+    tile index. The last tile of an expert can also write past the valid rows.
+    Both are safe only if the token tile divides the segment alignment. Each
+    segment base is then an exact multiple of the tile. Each overrun then stays
+    inside the same expert's segment.
     """
     if not isinstance(token_width, int) or token_width < 1:
         raise ValueError(f"token_width must be a positive int, got {token_width!r}")
@@ -207,10 +208,11 @@ def contiguous_dual_stage_schedule_capacities(
     cluster_shape_mn: tuple[int, int] = (1, 1),
     use_2cta_instrs: bool = False,
 ) -> tuple[int, int]:
-    """Only the CAPACITY differs from the masked builder: expert segments
-    share one flat aligned buffer, so with the token tile dividing the
-    alignment each stage needs only ``(m_pad_ceiling / w) * out_clusters``
-    entries — O(rows), not per-expert worst case times expert count.
+    """Only the capacity differs from the masked builder. The experts share one
+    flat aligned buffer, and the token tile divides the alignment. Each stage
+    therefore needs ``(m_pad_ceiling / token_width) * out_clusters`` entries.
+    That count grows with the total rows. The masked builder instead needs the
+    worst case for one expert times the expert count.
     """
     dual_stage_schedule_capacities(
         num_experts=num_experts,
@@ -260,15 +262,15 @@ def build_dual_stage_schedules_contiguous(
     schedule2_out: torch.Tensor | None = None,
     tiles2_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Entries are identical to the masked builder's — (expert, LOCAL token
-    cluster, output cluster) — because the contiguous kernel folds the aligned
-    segment base in on device.  The dual-ownership rule carries over with
-    ``seg_counts`` in the ``masked_m`` role.
+    """The entries match the masked builder's entries. Each entry holds the
+    expert, the local token cluster, and the output cluster. The device kernel
+    adds the aligned segment base itself. ``seg_counts`` takes the place of
+    ``masked_m``, and the rule above applies to it.
 
-    The serving provider folds the same packing into its S1 seg-layout launch
-    instead (:func:`contiguous_dual_stage_schedule_pack`, one launch fewer per
-    forward); this stays as the eager API and the reference that build is
-    tested entry-identical against.
+    The serving path does not call this function. It packs the same entries
+    inside its segment-layout launch, and it saves one launch for each forward
+    pass. See :func:`contiguous_dual_stage_schedule_pack`. A test compares the
+    entries of the two paths.
     """
     num_experts = seg_counts.numel()
     capacity1, capacity2 = contiguous_dual_stage_schedule_capacities(
@@ -346,9 +348,9 @@ def contiguous_dual_stage_schedule_pack(
     schedule2_out: torch.Tensor | None = None,
     tiles2_out: torch.Tensor | None = None,
 ) -> ContiguousSchedulePack:
-    """Sole constructor of the :class:`ContiguousSchedulePack` the fused S1
-    seg-layout launch consumes, so its capacities and field shifts come from
-    the same sources as the standalone builder and cannot drift from it.
+    """This function is the only constructor of
+    :class:`ContiguousSchedulePack`. The capacities and the field shifts come
+    from this module, so they always match the standalone builder.
     """
     capacity1, capacity2 = contiguous_dual_stage_schedule_capacities(
         num_experts=num_experts,
@@ -424,8 +426,8 @@ def _tile_count_output(
     device: torch.device,
     label: str,
 ) -> torch.Tensor:
-    """int32, not int64: this is the builder's own prefix arithmetic (bounded by
-    the capacity check above), and the device compares it to an Int32 work index.
+    """The tile count is int32, not int64. The device compares it to an Int32
+    work index. The capacity check above keeps the count inside int32.
     """
     return _int_output(
         output, elements=1, device=device, label=label, dtype=torch.int32
@@ -467,8 +469,9 @@ def build_single_stage_schedule(
         device=device,
         label="tiles_out",
     )
-    # Stage 2 aliases are never read or written: SINGLE_STAGE is constexpr and
-    # the launch grid contains only stage 0.  Aliasing avoids dummy buffers.
+    # The stage-2 arguments repeat the stage-1 buffers. The kernel never reads
+    # or writes them, because SINGLE_STAGE is constexpr and the grid holds
+    # stage 0 only.
     _dual_schedule_kernel[(num_experts, 1)](
         masked_m,
         schedule,
@@ -503,8 +506,8 @@ def build_dual_stage_schedules(
     schedule2_out: torch.Tensor | None = None,
     tiles2_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Capacity is the worst case over this forward's ``m_max`` (every expert
-    full), so the kernel's device-side counts can never overflow the buffers.
+    """The capacity assumes that every expert holds ``m_max`` rows. The counts
+    that the kernel computes on device therefore always fit in the buffers.
     """
     num_experts = masked_m.numel()
     capacity1, capacity2 = dual_stage_schedule_capacities(

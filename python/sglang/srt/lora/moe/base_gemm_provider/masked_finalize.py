@@ -1,16 +1,21 @@
-"""``shared_rank_reduce`` is valid only when down-B is shared across all routed
-experts of an adapter: it folds router weights in rank space, then one
-from-scratch finalizer combines weighted base rows with the shared B tail and
-scales the complete sum.  Both kernels serve the masked AND contiguous
-providers verbatim -- the reduction is pure pair-domain, and the tail reads
-base rows only through ``src2dst`` over a flat row view; only the tail's host
-validation distinguishes the two layouts.
+"""Two kernels that finish the MoE output when one down-B matrix serves every
+routed expert of an adapter. Use them only in that case.
 
-Reductions use a fixed order and every destination cell has exactly one writer.
-The tail accumulates in FP32 and combines with the BF16 base rows before the
-output cast -- ``scale * sum(weight * (base + A @ B))`` -- omitting the serial
-reference's intermediate BF16 delta rounding, so correctness is judged against
-that contract rather than bitwise equality with the materialized path.
+The first kernel multiplies each bridge row by its router weight. It sums
+those rows for each token, in rank space.
+The second kernel then sums the weighted base rows, adds the one B product, and
+scales the total.
+
+Both kernels also serve the contiguous provider. The reduction reads pair data
+only. The tail reads the base rows through ``src2dst`` over a flat row view.
+Only the host validation in the tail knows which layout it got.
+
+Each reduction runs in a fixed order, and each output cell has one writer.
+
+NUMERICS: the tail sums in FP32, adds the BF16 base rows, then rounds once at
+the store. It computes ``scale * sum(weight * (base + A @ B))``. The serial
+reference rounds the delta to BF16 first. Thus you must compare the two paths
+with allclose, not with an exact test.
 """
 
 from __future__ import annotations
@@ -57,8 +62,8 @@ def _validate_output_boundary(
 ) -> tuple[int, int, int]:
     num_tokens, top_k = routing.topk_ids.shape
     pairs = num_tokens * top_k
-    # Only the masked slab admits a host-side row-domain check: the compact
-    # row count is a device-side quantity (seg_offsets[-1]).
+    # Only the masked layout allows a host-side row check. The contiguous
+    # layout keeps its row count on the device, in ``seg_offsets[-1]``.
     if down_masked.ndim == 3:
         if down_masked.shape[0] != num_local_experts or down_masked.shape[2] < 1:
             raise ValueError("down_masked must be [num_local_experts, m_max, hidden]")
@@ -152,8 +157,8 @@ def _shared_rank_reduce_kernel(
     block_t: tl.constexpr,
     block_r: tl.constexpr,
 ):
-    # Routed scaling is deliberately deferred to the B tail so every finalizer
-    # implements scale * sum(weight * pair).
+    # The B tail applies the routed scaling. Every finalizer then computes
+    # ``scale * sum(weight * pair)``.
     tokens = tl.program_id(0) * block_t + tl.arange(0, block_t)
     token_mask = tokens < num_tokens
     tokens64 = tokens.to(tl.int64)
@@ -221,8 +226,9 @@ def _shared_from_scratch_finalize_kernel(
     block_h: tl.constexpr,
     block_k: tl.constexpr,
 ):
-    """Scaling after the complete base+LoRA sum matches the stock DeepGEMM
-    coefficient order while avoiding a post-reorder + full-H read-modify-write.
+    """The kernel scales after it sums the base part and the LoRA part. That
+    order matches the stock DeepGEMM path. It also removes a second pass that
+    reads and rewrites every hidden column.
     """
     token = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -287,9 +293,8 @@ def invoke_shared_rank_reduce(
     token_rank: torch.Tensor,
     config: Mapping[str, int],
 ) -> None:
-    # The provider ABI carries the scaling factor through both scheduled halves
-    # so alternate implementations can bind the same inputs; this one applies
-    # it in the tail, after the fixed-order router-weight reduction.
+    # Both halves take the scaling factor, so another implementation can apply
+    # it in either one. This implementation applies it in the tail.
     del routed_scaling_factor
     _validate_shared_route(routing)
     num_tokens, top_k = routing.topk_ids.shape

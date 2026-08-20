@@ -1,10 +1,13 @@
-"""Base-only, mixed, and active batches all run this one LoRA-capable topology so
-they share a single graph shape; inactive assignments ride sentinel routes and
-contribute exact zeros. Serving gives the base model a REAL resident slot whose
-factors are zero-filled, and batch preparation normalizes such assignments to
-the ``-1`` execution sentinel before any layer runs — otherwise base rows build
-routed work against zero weights, which is numerically harmless but inflates
-route padding, group counts, and every LoRA GEMM's row count.
+"""One topology runs every batch, so the CUDA graph keeps one shape.
+
+A batch can hold base rows, LoRA rows, or both. A row with no adapter takes the
+sentinel route and adds an exact zero.
+
+Serving gives the base model a real resident slot, and the factors in that slot
+are zero. Batch preparation must map that slot to the ``-1`` sentinel before any
+layer runs. Zero factors give the correct result, but the base rows still build
+routed work. That work grows the route padding, the group count, and the row
+count of every LoRA GEMM.
 """
 
 from __future__ import annotations
@@ -75,9 +78,6 @@ class _DownAInput:
 
 
 class MoeLoraBatch(msgspec.Struct, kw_only=True):
-    """Narrow by design: the legacy ``LoRAInfo`` carries ~18 fields for the old
-    kernels, and passing it wholesale would hide what this runner depends on.
-    """
 
     gate_up_lora_a: torch.Tensor  # [L_cap, E_f, slices*R_phys, H]
     gate_up_lora_b: torch.Tensor  # [L_cap, E_local, slices*I, R_phys]
@@ -132,9 +132,6 @@ class MoeLoraRunner:
         self.top_k = top_k
         self.routed_scaling_factor = routed_scaling_factor
         self.activation = activation
-        # Gating is a resident-shape fact -- the gate/up buffer is one slice or
-        # two -- never inferred from the activation, which made non-gated SiLU
-        # unservable.
         self.is_gated = is_gated
         self.workspace = workspace if workspace is not None else MoeLoraWorkspace()
 
@@ -147,9 +144,6 @@ class MoeLoraRunner:
         vendor: str,
         workspace: MoeLoraWorkspace | None = None,
     ) -> MoeLoraRunner:
-        # No vendor fallback: _admit narrows the device to SM90 or SM100 and
-        # both vendors require exactly those two families, so below them there
-        # was never anything to fall back to.
         cls._admit(base_layer)
         config = base_layer.moe_runner_config
         return cls(
@@ -169,11 +163,6 @@ class MoeLoraRunner:
 
     @staticmethod
     def _admit(base_layer: FusedMoE) -> None:
-        """The base layer picks its runner backend, reformats resident weights,
-        configures dispatch, and decides routed-scaling ownership BEFORE the
-        LoRA layer attaches, so all of that is validated here rather than
-        assumed.
-        """
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
         from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 
@@ -255,9 +244,8 @@ class MoeLoraRunner:
                 else CuteDslBf16ContiguousProvider
             )
         if vendor == "deepgemm":
-            # An unusable build must fail HERE, not at admission: only these
-            # providers import deep_gemm, and checking earlier would refuse a
-            # CuteDSL serve for a dependency it never touches.
+            # Only these providers import deep_gemm. The check stays here so a
+            # CuteDSL serve does not fail on a dependency it does not use.
             from sglang.srt.layers import deep_gemm_wrapper
 
             if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
@@ -417,8 +405,9 @@ class MoeLoraRunner:
             batch,
             num_tokens,
         )
-        # Allocate before GEMM2 so a requested GEMM2 -> finalize PDL edge has no
-        # allocator activity between producer and dependent launch.
+        # The runner allocates the output before the down GEMM. A programmatic
+        # dependent launch (PDL) links the down GEMM to finalize. No allocator
+        # call can run between the two launches.
         output = self._allocate_output(
             num_tokens=num_tokens,
             dtype=hidden_states.dtype,
@@ -684,7 +673,8 @@ class MoeLoraRunner:
             )
             return act_out, _DownAInput(act_pairs)
 
-        # The gate/up B the act stage absorbs is always per-expert.
+        # The act stage runs the gate/up B GEMM. That GEMM always reads the
+        # per-expert route.
         route = routes.aligned(False)
         family, implementation = self._act_implementation(plan)
         provider.run_fused_act(
@@ -861,11 +851,11 @@ class MoeLoraRunner:
     ) -> torch.Tensor:
         if plan.finalize.family is FinalizeFamily.MATERIALIZED:
             if plan.down_b_into_base:
-                # No-pair-delta mode: the unweighted delta was already
-                # scatter-added into the base down rows, so it rounds to BF16
-                # JOINTLY with the base row before this FP32 weighted top-k
-                # sum, where the shipped tail rounds it separately. Equality
-                # versus that tail is therefore allclose, not bitwise.
+                # The down-B kernel adds the delta into the base down rows, so
+                # finalize gets no pair delta. The base row and the delta then
+                # round to BF16 together. The shipped path rounds the delta on
+                # its own. Thus you must compare the two paths with allclose,
+                # not with an exact test.
                 provider.finalize(
                     base_gemm_state,
                     down_out,

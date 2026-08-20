@@ -1,6 +1,8 @@
-"""Triton bodies behind routing.py's route builders, kept apart so they move to
-the kernels folder as one unit and the host layer can import the plan layer
-without dragging triton in behind it.
+"""The Triton kernels that routing.py launches.
+
+They stay in their own file for two reasons. The host layer must import the
+plan layer without importing Triton. The whole file also moves to the kernels
+folder later, as one unit.
 """
 
 from __future__ import annotations
@@ -57,7 +59,7 @@ def add_counts_inline(
     NUM_BUCKETS: tl.constexpr,
     BINS: tl.constexpr,
 ):
-    """Count these pairs, one atomic per bucket when BINS is nonzero."""
+    """Add the pairs to ``counts``. With BINS nonzero, one atomic covers a bucket."""
     buckets = tl.where(virtual_ids < 0, NUM_BUCKETS - 1, virtual_ids)
     if BINS == 0:
         tl.atomic_add(counts_ptr + buckets, 1, mask=mask)
@@ -75,7 +77,11 @@ def claim_slots_inline(
     NUM_BUCKETS: tl.constexpr,
     PER_BLOCK: tl.constexpr,
 ):
-    """A slot per pair; PER_BLOCK claims each bucket's run at once, reordering it."""
+    """Return one output slot for each pair.
+
+    With PER_BLOCK, the block claims a whole run of slots for each bucket at
+    once. This changes the order of the pairs inside a bucket.
+    """
     buckets = tl.where(virtual_ids < 0, NUM_BUCKETS - 1, virtual_ids)
     if not PER_BLOCK:
         return tl.atomic_add(cursor_ptr + buckets, 1, mask=mask)
@@ -132,7 +138,7 @@ def _hist_kernel(
     BINS: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
-    """Count each group's pairs; counts arrive zeroed, so there is no memset."""
+    """Count the pairs of each bucket. ``counts`` arrives zeroed, so no memset runs."""
     pair_ids = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     pair_mask = pair_ids < num_pairs
     add_counts_inline(
@@ -167,8 +173,11 @@ def _scan_one(
     BLOCK_SIZE_M: tl.constexpr,
     CHUNK: tl.constexpr,
 ):
-    """Exclusive scan of block-padded bucket sizes; re-zeroes counts as it reads,
-    restoring the zero-count invariant the next replay needs."""
+    """Scan the block-padded bucket sizes.
+
+    The scan stores zero into each count as it reads it. ``counts`` is then
+    ready for the next replay, and no other kernel must clear it.
+    """
     running = 0
     for base in range(0, num_buckets, CHUNK):
         offsets = base + tl.arange(0, CHUNK)
@@ -180,7 +189,7 @@ def _scan_one(
         tl.store(block_cumulative_ptr + offsets, block_start, mask=mask)
         slot_start = block_start * BLOCK_SIZE_M
         tl.store(cursor_ptr + offsets, slot_start, mask=mask)
-        # bucket_end must be materialized here; counts are gone by the fill.
+        # Store bucket_end now. The counts are already zero when the fill runs.
         tl.store(bucket_end_ptr + offsets, slot_start + counts, mask=mask)
         running += tl.sum(blocks)
     tl.store(block_cumulative_ptr + num_buckets, running)
@@ -201,8 +210,8 @@ def _scan_kernel(
 ):
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
-        # Safe to start the place kernel now: every path there waits before its
-        # first read of scan output.
+        # The place kernel can start now. Each of its paths waits before it
+        # reads any scan output.
         tl.extra.cuda.gdc_launch_dependents()
     _scan_one(
         counts_ptr,
@@ -231,7 +240,7 @@ def _label_blocks(
     BLOCK_SIZE_M: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
 ):
-    """Name each block's owning group and fill its padding tail."""
+    """Give each block its bucket id, then fill the padding tail of the block."""
     block_ids = pid * BLOCK + tl.arange(0, BLOCK)
     block_mask = block_ids < num_blocks
     low = tl.zeros(block_ids.shape, dtype=tl.int32)
@@ -254,8 +263,8 @@ def _label_blocks(
         tl.where(in_plan & (owner < NUM_VIRTUAL_EXPERTS), owner, -1),
         mask=block_mask,
     )
-    # Fill every in-plan block's padding tail, sentinel bucket included: a -1
-    # block's slots ARE read by the aligned B kernels.
+    # The aligned B kernels also read the slots of a -1 block. So this fills
+    # the tail of every in-plan block, the sentinel bucket included.
     real_end = tl.load(bucket_end_ptr + owner, mask=in_plan, other=0)
     slots = block_ids[:, None] * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)[None, :]
     tl.store(
@@ -290,11 +299,14 @@ def _place_kernel(
     CLAIM_PER_BLOCK: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
-    """Every scan consumer on one grid, split by program id: labels, then pairs."""
+    """Run both readers of the scan on one grid.
+
+    The low program ids label the blocks. The rest place the pairs.
+    """
     pid = tl.program_id(0)
     if pid < label_programs:
         if USE_PDL:
-            # The label path immediately consumes scan outputs.
+            # The label path reads the scan output right away.
             tl.extra.cuda.gdc_wait()
         _label_blocks(
             pid,
@@ -312,8 +324,8 @@ def _place_kernel(
         )
         return
 
-    # Recomputing the key beats a [T, K] round trip and needs no scan, so it runs
-    # before the wait below.
+    # Recomputing the key is faster than reading it back from a [T, K] tensor.
+    # The key needs no scan output, so it runs before the wait below.
     pair_ids = (pid - label_programs) * BLOCK + tl.arange(0, BLOCK)
     pair_mask = pair_ids < num_pairs
     virtual_ids = virtual_expert_ids_inline(
@@ -328,7 +340,7 @@ def _place_kernel(
         SHARED_OUTER=SHARED_OUTER,
     )
     if USE_PDL:
-        # Cursors below are the first scan-produced values this path consumes.
+        # The cursors below are the first scan output that this path reads.
         tl.extra.cuda.gdc_wait()
     slots = claim_slots_inline(
         cursor_ptr,

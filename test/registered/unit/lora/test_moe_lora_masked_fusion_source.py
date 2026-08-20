@@ -1,6 +1,8 @@
-"""Source-level guards for the masked fusion/finalizer ABI — properties that
-must hold before a kernel can be compiled.  GPU numerics run with the Step-8
-sweep."""
+"""Source-level checks on the masked fusion and finalize files.
+
+These tests read the source text, so they report a broken call contract
+before anyone compiles a kernel. The Step-8 sweep checks the GPU numbers.
+"""
 
 from __future__ import annotations
 
@@ -44,15 +46,14 @@ def _function(source: str, name: str) -> str:
 
 
 class _ContiguousRowStateStub(msgspec.Struct, kw_only=True):
-    """Subclassable stand-in: the real state is a Struct, and providers extend it."""
+    """Providers subclass the real row state, so the stub must be a Struct too."""
 
 
 class TestMaskedFusionSource(unittest.TestCase):
     def test_lora_a_to_b_pdl_has_a_complete_signal_wait_launch_chain(self):
-        # The kernel-level A->B PDL ABI stays complete (benchmarks drive it);
-        # the serving runner no longer threads it (plan-level PDL knobs were
-        # retired: route PDL is arch-keyed, A->B edges measured no better
-        # than launch-order overlap).
+        # The benchmarks still use the A-to-B chain of Programmatic Dependent
+        # Launch (PDL), so the kernels must keep it. The serving runner does
+        # not use PDL. An A-to-B edge measured no better than launch order.
         a = (LORA_MOE / "lora_a.py").read_text()
         b = (LORA_MOE / "lora_b.py").read_text()
         runner = (LORA_MOE / "moe_lora_runner.py").read_text()
@@ -89,8 +90,8 @@ class TestMaskedFusionSource(unittest.TestCase):
             kernel = _function(source, "kernel")
             self.assertIn("griddepcontrol_launch_dependents", kernel)
             self.assertIn("self.produce_pdl", kernel)
-        # The base GEMM is the primary producer. It must not request the
-        # dependent-launch attribute against its own S1/S3 predecessor.
+        # The base GEMM signals the kernels after it. It must not also wait
+        # on the kernel before it, so use_pdl must not read produce_pdl.
         self.assertNotIn("use_pdl=self.produce_pdl", sm100)
         self.assertNotIn("use_pdl=self.produce_pdl", sm90)
 
@@ -105,9 +106,9 @@ class TestMaskedFusionSource(unittest.TestCase):
             self.assertIn("gdc_wait", _function(source, kernel_name))
             self.assertIn('"launch_pdl": True', _function(source, launcher_name))
 
-        # The shared upstream combine deliberately takes NO PDL edge: no
-        # shipped config row enables a base down -> finalize handoff, so the
-        # wait would be dead weight in a file the whole MoE stack shares.
+        # The combine kernel takes no PDL edge. No shipped plan row turns on
+        # the base-down to finalize handoff. The whole MoE stack shares this
+        # file, and an unused wait slows every other caller.
         combine = _function(post_reorder, "post_reorder_deepgemm_triton_kernel")
         self.assertNotIn("gdc_wait", combine)
         self.assertNotIn(
@@ -115,19 +116,18 @@ class TestMaskedFusionSource(unittest.TestCase):
         )
 
     def test_contiguous_cutedsl_launch_passes_no_pdl_argument(self):
-        # The contiguous provider's _launch has no produce_pdl parameter
-        # (contiguous compiles no producer twins); passing one crashes at
-        # prefill-graph capture. Pin it at the source level — no call-site
-        # kwarg inside the class — so a CPU runner catches it on both archs.
+        # The contiguous provider compiles no producer kernel, so its _launch
+        # has no produce_pdl parameter. A call that passes one crashes when
+        # the prefill graph captures.
         src = _source("cutedsl_bf16.py")
         contiguous = src[src.index("class CuteDslBf16ContiguousProvider") :]
         self.assertNotIn("produce_pdl=", contiguous)
 
     def test_both_device_kernels_carry_the_contiguous_admission_and_fold(self):
-        # prepare_contiguous dispatches by capability, so the SM90 kernel
-        # must enforce the same admission and fold the segment base in BOTH
-        # device loops — a kernel missing one loop's fold reads the wrong
-        # expert's rows.
+        # prepare_contiguous picks a kernel by device capability, so the SM90
+        # kernel must check the same rules as the SM100 kernel. Both device
+        # loops must add the segment base. A loop that misses the add reads
+        # the rows of the wrong expert.
         for name in ("cutedsl_masked/kernel.py", "cutedsl_masked/kernel_sm90.py"):
             source = _source(name)
             self.assertIn(
@@ -263,9 +263,9 @@ class TestMaskedFusionSource(unittest.TestCase):
         self.assertIn("pair_to_row=row_state.src2dst", mapped)
         self.assertNotIn("base_gemm_state.src2dst", runner)
 
-        # The contiguous domain exposes the same shared-rank finalize ABI
-        # through the same opaque-workspace routing: the reduce is pure
-        # pair-domain and the tail reaches physical rows only via src2dst.
+        # The contiguous domain offers the same shared-rank finalize methods.
+        # Its reduce step works on pairs only. Its tail step reaches a
+        # physical row only through src2dst.
         contiguous = _source("contiguous_row_domain.py")
         for method in (
             "fused_finalize_implementations",
@@ -285,8 +285,6 @@ class TestMaskedFusionSource(unittest.TestCase):
     def test_act_pair_store_is_optional_and_masked_store_is_unconditional(self):
         source = _source("masked_fused_act.py")
         self.assertIn('("b_activation",)', source)
-        # The activation set is single-sourced from moe.activation; restating
-        # it here is the drift this assertion exists to prevent.
         self.assertIn("ActivationFn.parse", source)
         self.assertNotIn('("silu", "relu2")', source)
         base_columns = _function(source, "_base_columns")
@@ -309,9 +307,12 @@ class TestMaskedFusionSource(unittest.TestCase):
         self.assertIn("store_pair_act=act_pairs is not None", launcher)
 
     def test_materialized_activation_keeps_the_two_axes_independent(self):
-        """NUM_SLICES carries the gating and ACTIVATION_TYPE the pointwise
-        function, so all four combinations compile; one "swiglu-or-relu2"
-        constant could not express non-gated silu or gated relu2."""
+        """Gating and the activation function are two separate constants.
+
+        NUM_SLICES sets the gating and ACTIVATION_TYPE sets the function, so
+        all four combinations compile. One "swiglu-or-relu2" constant cannot
+        express a non-gated silu.
+        """
         source = _source("masked_activation.py")
         kernel = _function(source, "_activation_delta_masked_kernel")
         wrapper = _function(source, "act_delta_masked")
@@ -323,16 +324,18 @@ class TestMaskedFusionSource(unittest.TestCase):
         self.assertIn("num_slices * inter", wrapper)
 
     def test_no_module_restates_the_activation_set(self):
-        """The set used to be hand-copied into eight modules, so adding an
-        activation meant finding all eight; any literal pair reappearing
-        under moe/ is that drift starting again."""
+        """Eight modules once held their own copy of the activation names.
+
+        A new activation then needed an edit in all eight modules. A pair of
+        names in a literal under moe/ is that copy starting again.
+        """
         import re
 
         from sglang.srt.lora.moe.activation import ActivationFn
 
         moe_root = PROVIDER.parent
         owner = moe_root / "activation.py"
-        # Any tuple/list/set literal holding two or more of the member names.
+        # The pattern finds a literal that lists two of the names.
         names = "|".join(re.escape(fn.value) for fn in ActivationFn)
         pattern = re.compile(
             rf"""[\(\[{{]\s*["']({names})["']\s*,\s*["']({names})["']"""
@@ -347,7 +350,6 @@ class TestMaskedFusionSource(unittest.TestCase):
                         f"{path.relative_to(moe_root)}:{number}: {line.strip()}"
                     )
         self.assertEqual(offenders, [], "\n".join(offenders))
-        # And the owner really does declare them.
         self.assertEqual({fn.value for fn in ActivationFn}, {"silu", "relu2"})
 
     def test_shared_rank_finalize_is_fail_closed_and_two_stage(self):
@@ -521,9 +523,11 @@ class TestMaskedFusionSource(unittest.TestCase):
             provider.mapped_down_lora_a_input(workspace, activation_rows)
 
     def test_cutedsl_schedule_uses_the_resident_slice_count(self):
-        """A NON-GATED provider must not schedule a two-slice GEMM1 — the
-        slice count comes from the resident width, so non-gated silu is the
-        same case as relu2."""
+        """A non-gated provider must not schedule a two-slice GEMM1.
+
+        The slice count comes from the width of the resident weight. A
+        non-gated silu is therefore the same case as relu2.
+        """
 
         class StubWorkspace(msgspec.Struct, kw_only=True):
             hidden_permuted: torch.Tensor

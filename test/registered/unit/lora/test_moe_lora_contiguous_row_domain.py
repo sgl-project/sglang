@@ -29,9 +29,11 @@ _SWIGLU = ActivationFn.SILU
 
 
 def _menu(architecture, layout, activation=_SWIGLU):
-    """The whole menu, built from the same table loader and plan builder
-    serving uses — minus ``resolve_plans``' phase and rank predicates,
-    which pick ONE row per phase."""
+    """Build every plan row with the loader and builder that serving uses.
+
+    ``resolve_plans`` checks the phase and the rank, then keeps one row for
+    each phase. This helper skips those checks and returns every row.
+    """
     table = load_plans(architecture)
     layout_name = "shared" if layout else "per_expert"
     return {
@@ -67,7 +69,7 @@ def _host_aligned_prefix(counts: list[int], alignment: int) -> list[int]:
 
 
 class _DomainStub(ContiguousRowDomainProvider):
-    """The domain with a contract but no GEMM engine: S1/S3/S5 only."""
+    """A row domain with a contract but no GEMM engine. Only ``prepare`` runs."""
 
     contract = MoeBaseProviderContract(
         key="contiguous_stub",
@@ -115,12 +117,10 @@ class TestAlignedSegmentMath:
 
 class TestRowDomainConfig:
     def test_prefill_ships_contiguous_providers(self) -> None:
-        # Route-major is the shipped prefill posture: the gb300 tuned-domain
-        # prefill scenarios ship the CuTeDSL contiguous backend, h200 (SM90
-        # has no CuTeDSL contiguous port) and the per-expert out-of-domain
-        # prefill fallback ship the shape-general DeepGEMM contiguous
-        # backend.  The shared-outer fallback twin has no per-expert
-        # is_shared_outer to re-target and stays on the masked DeepGEMM provider.
+        # Prefill uses route-major rows. SM90 has no CuTeDSL contiguous
+        # kernel. H200 and the out-of-domain fallback therefore use the
+        # DeepGEMM contiguous backend. The shared fallback row has no
+        # per-expert form, so it stays on the masked provider.
         gb300_pe = _menu(_GB300, False)
         assert gb300_pe["prefill.serial"].base_gemm_rows == "route_major"
         assert gb300_pe["fallback.serial_prefill"].base_gemm_rows == "route_major"
@@ -130,10 +130,9 @@ class TestRowDomainConfig:
         h200_pe = _menu(_H200, False)
         assert h200_pe["prefill.serial"].base_gemm_rows == "route_major"
         assert h200_pe["fallback.serial_prefill"].base_gemm_rows == "route_major"
-        # Every H200 shared prefill band converted: the small-rank and
-        # materialized b_activation twins and the shared-rank band (its
-        # reduce is pair-domain, its tail reads base rows only through
-        # src2dst).
+        # Every shared prefill row on H200 uses route-major rows. The
+        # shared-rank row can do so for two reasons. Its reduce works on pairs.
+        # Its tail reads the base rows through ``src2dst`` alone.
         h200_sh = _menu(_H200, True)
         assert (
             h200_sh["prefill.materialized.small_rank"].base_gemm_rows == "route_major"
@@ -143,9 +142,8 @@ class TestRowDomainConfig:
         assert h200_sh["fallback.serial_prefill"].base_gemm_rows == "expert_major"
 
     def test_decode_choices_never_convert(self) -> None:
-        # DECODE is categorically expert-major by measured config (the
-        # contiguous decode port lost to masked on GB300) — including the
-        # fully serial decode fallback and the ReLU2 decode winner.
+        # Every decode row uses expert-major rows. On GB300 the contiguous
+        # decode kernel is slower than the masked kernel.
         for architecture in (_GB300, _H200):
             for layout in (False, True):
                 for activation in (_SWIGLU, ActivationFn.RELU2):
@@ -155,11 +153,9 @@ class TestRowDomainConfig:
                         assert choice.base_gemm_rows == "expert_major", name
 
     def test_h200_large_expert_prefill_selects_the_contiguous_serial(self) -> None:
-        # The DeepGEMM contiguous backend is the only feasible prefill
-        # posture at large-expert geometry on SM90 (the masked E x chunk
-        # scratch does not fit).  The served plan carries the composed
-        # b_act middle and down-B scatter, so it is no longer the bare
-        # fully-serial shape.
+        # On SM90 with many experts, the masked scratch buffer does not fit in
+        # memory. The DeepGEMM contiguous backend is then the only prefill
+        # choice. That row also uses the b_act middle and the down-B scatter.
         routed = resolve_plans(
             architecture=_H200,
             is_shared_outer=False,
@@ -227,8 +223,9 @@ class TestCuteDslContiguousScheduleGeometry:
                 n_gemm2=n_gemm2,
                 output_width=128,
             )
-            # The builder writes exactly cdiv(count, w) * out_clusters entries
-            # per expert; the capacity must bound that for ANY count split.
+            # The builder writes cdiv(count, w) * out_clusters entries for
+            # each expert. The capacity must bound that total for any split of
+            # the counts.
             clusters = sum(-(-count // token_width) for count in counts)
             assert clusters * -(-n_gemm1 // 128) <= capacity1, (counts, token_width)
             assert clusters * -(-n_gemm2 // 128) <= capacity2, (counts, token_width)
@@ -263,9 +260,9 @@ class TestCuteDslContiguousScheduleGeometry:
         assert contiguous1 * 10 < masked1
 
     def test_schedule_pack_constructor_matches_the_standalone_geometry(self) -> None:
-        # The S1-fused build consumes a pack this constructor alone builds;
-        # its capacities, shifts, and geometry gates must be the standalone
-        # builder's own, not a parallel copy that could drift.
+        # The fused build reads a pack that this constructor alone makes. Its
+        # capacities, shifts, and checks must come from the standalone
+        # builder, not from a second copy that can drift.
         from sglang.srt.lora.moe.base_gemm_provider.cutedsl_masked.schedule_abi import (
             OUTPUT_CLUSTER_SHIFT,
             TOKEN_CLUSTER_SHIFT,
@@ -319,7 +316,7 @@ class TestCuteDslContiguousScheduleGeometry:
             contiguous_dual_stage_schedule_capacities(
                 m_pad_ceiling=512, token_width=48, **kwargs
             )
-        # The packed-ABI checks still delegate to the masked validator.
+        # The packed-schedule checks call the masked validator.
         with pytest.raises(ValueError, match="cluster"):
             contiguous_dual_stage_schedule_capacities(
                 m_pad_ceiling=512,
@@ -365,9 +362,8 @@ deepgemm_cuda_only = pytest.mark.skipif(
 
 
 def _cutedsl_contiguous_ready() -> bool:
-    # The oracle's masked reference is the DeepGEMM runner, so the CuTeDSL
-    # leg needs everything the DeepGEMM leg does PLUS SM90+ and the CuTeDSL
-    # stack (both device kernels carry the contiguous fold).
+    # The masked reference runs on DeepGEMM. The CuTeDSL case needs DeepGEMM
+    # too, plus SM90 or newer and the CuTeDSL stack.
     if not _deep_gemm_ready():
         return False
     if torch.cuda.get_device_capability() < (9, 0):
@@ -404,16 +400,19 @@ _CONTIGUOUS_PROVIDER_PARAMS = (
 def test_contiguous_dispatch_metadata_contract(
     num_tokens: int, top_k: int, num_experts: int, alignment: int
 ) -> None:
-    """S1 must produce aligned segments, dense unique compact rows, expert-
-    labeled aligned segments with a -1 ceiling tail, and a bitwise gather."""
+    """Check what the dispatch stage writes.
+
+    It must build aligned segments, compact rows, and one expert label for
+    each row. The rows after the last segment must hold ``-1``.
+    """
     device = torch.device("cuda")
     generator = torch.Generator().manual_seed(0xC017 + num_tokens)
     topk_ids = torch.randint(
         0, num_experts, (num_tokens, top_k), generator=generator, dtype=torch.int32
     )
-    topk_ids[topk_ids == 1] = 0  # empty expert with a zero-length segment
+    topk_ids[topk_ids == 1] = 0  # expert 1 gets no pair, so its segment is empty
     topk_ids[torch.rand((num_tokens, top_k), generator=generator) < 0.15] = -1
-    topk_ids[0] = -1  # a token with zero routed pairs
+    topk_ids[0] = -1  # a token with no routed pair
     topk_ids = topk_ids.to(device)
     hidden_states = (
         (torch.randn((num_tokens, _HIDDEN), generator=generator) * 0.2)
@@ -459,21 +458,20 @@ def test_contiguous_dispatch_metadata_contract(
             torch.testing.assert_close(
                 compact[row], host_hidden[pair // top_k], atol=0.0, rtol=0.0
             )
-        # The FULL aligned segment carries the expert id (routed rows and the
-        # partial-block padding alike) so every m-block is group-uniform.
+        # The whole aligned segment holds the expert id, padding rows
+        # included. Every m-block then holds one expert.
         aligned_len = offsets[expert + 1] - offsets[expert]
         assert (layout[offsets[expert] : offsets[expert + 1]] == expert).all(), (
             expert,
             aligned_len,
         )
-    # Everything past the dynamic aligned total keeps the -1 skip label.
+    # The rows after the last segment hold the -1 skip label.
     assert (layout[offsets[-1] :] == -1).all()
     assert counts[1] == 0 and offsets[2] == offsets[1]  # the empty expert
 
-    # No host-side -1 prefill exists anymore: the seg-layout launch itself
-    # must overwrite a GARBAGE buffer end to end — expert ids over every
-    # aligned segment and -1 over the ceiling tail (written by the launch's
-    # extra tail program, not a memset).
+    # No host code clears the layout buffer. The launch must write every
+    # entry: an expert id over each aligned segment, and -1 over the tail.
+    # The test fills the buffer with garbage first to prove that.
     from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
         contiguous_dispatch_fill,
     )
@@ -506,10 +504,8 @@ def test_contiguous_dispatch_metadata_contract(
     assert dirty["seg_counts_out"].cpu().tolist() == counts
     assert dirty["seg_offsets_out"].cpu().tolist() == offsets
 
-    # Alignment-tagged workspace names: differently aligned instances may
-    # share one layer workspace, and their row geometry (compact rows,
-    # ceilings) is alignment-dependent, so the buffer names carry the
-    # alignment.
+    # Two providers with different alignments can share one workspace. Their
+    # row counts differ, so each buffer name holds the alignment.
     from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
     workspace = MoeLoraWorkspace()
@@ -523,9 +519,11 @@ def test_contiguous_dispatch_metadata_contract(
 
 @triton_cuda_only
 def test_fused_schedule_pack_matches_the_standalone_builder() -> None:
-    """Both builds read the same device ``seg_counts``; the fused kernel claims
-    verbatim packing arithmetic, so agreement is bitwise over the first
-    ``tiles`` entries of each stage (the rest is uninspected capacity)."""
+    """Both builds read the same device ``seg_counts`` and pack it the same way.
+
+    The first ``tiles`` entries of each stage must match bitwise. The entries
+    after that are spare capacity, and nothing reads them.
+    """
     from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
         contiguous_dispatch_fill,
     )
@@ -538,15 +536,15 @@ def test_fused_schedule_pack_matches_the_standalone_builder() -> None:
     generator = torch.Generator().manual_seed(0x5CED)
     alignment, output_width = 128, 128
     for num_tokens, top_k, num_experts, token_width, n_gemm1, n_gemm2 in (
-        (64, 8, 6, 64, 512, 256),  # multi-block segments, uneven experts
-        (13, 3, 4, 8, 384, 128),  # narrow decode-style tile, partial tail
-        (96, 2, 16, 128, 256, 640),  # xwide tile, out_clusters2 > out_clusters1
+        (64, 8, 6, 64, 512, 256),  # segments over many blocks, uneven experts
+        (13, 3, 4, 8, 384, 128),  # a narrow decode tile, a partial tail
+        (96, 2, 16, 128, 256, 640),  # a wide tile, out_clusters2 > out_clusters1
     ):
         topk_ids = torch.randint(
             0, num_experts, (num_tokens, top_k), generator=generator, dtype=torch.int32
         )
         topk_ids[torch.rand((num_tokens, top_k), generator=generator) < 0.2] = -1
-        topk_ids[1, 0] = 0  # at least one routed pair stays deterministic
+        topk_ids[1, 0] = 0  # keep one routed pair in every case
         topk_ids = topk_ids.to(device)
         hidden_states = (
             (torch.randn((num_tokens, _HIDDEN), generator=generator) * 0.1)
@@ -566,7 +564,8 @@ def test_fused_schedule_pack_matches_the_standalone_builder() -> None:
             output_width=output_width,
             device=device,
         )
-        # Dirty the pack outputs so agreement cannot come from shared zeros.
+        # Fill the pack outputs with garbage, so a match cannot come from
+        # shared zeros.
         pack.schedule1.fill_(0x3BAD)
         pack.schedule2.fill_(0x3BAD)
         pack.tiles1.fill_(-1)
@@ -627,8 +626,8 @@ def _make_gpu_tensors(
     def rand_bf16(shape, scale):
         return (torch.randn(shape, generator=generator) * scale).to(torch.bfloat16)
 
-    # The shared-outer resident layout: ONE gate/up-A and ONE down-B factor
-    # per adapter (expert dim 1); gate/up-B and down-A stay per-expert.
+    # In the shared-outer layout, each adapter has one gate/up-A factor and
+    # one down-B factor. The gate/up-B and down-A factors stay per expert.
     gate_up_a_experts = 1 if shared else num_experts
     down_b_experts = 1 if shared else num_experts
     tensors = {
@@ -650,12 +649,12 @@ def _make_gpu_tensors(
         "adapter_enabled": torch.tensor([1, 0], dtype=torch.int32),
     }
     scores = torch.rand((num_tokens, num_experts), generator=generator)
-    # Skew the routing so per-expert counts are uneven (multi-block segments
-    # next to empty experts under the 128-row alignment).
+    # Skew the routing so the expert counts are uneven. Some segments then
+    # span many blocks, and some experts get no pair.
     scores[: num_tokens // 2, 0] += 4.0
     topk_ids = torch.topk(scores, _TOP_K, dim=1).indices.to(torch.int32)
-    topk_ids[0] = -1  # a token with zero routed pairs
-    topk_ids[5, 1] = -1  # a sentinel pair inside a live token
+    topk_ids[0] = -1  # a token with no routed pair
+    topk_ids[5, 1] = -1  # one sentinel pair inside a token that keeps a routed pair
     tensors["topk_ids"] = topk_ids.contiguous()
     weights = torch.rand((num_tokens, _TOP_K), generator=generator) + 0.1
     tensors["topk_weights"] = (weights / weights.sum(dim=1, keepdim=True)).float()
@@ -679,7 +678,7 @@ def _token_lora_mapping(traffic: str, num_tokens: int) -> torch.Tensor:
 
 
 def _standalone_output_allocation(runner, *, num_tokens, dtype, device):
-    """Match eager output geometry without requiring a serving TP group."""
+    """Allocate the output with the eager shape and no tensor-parallel group."""
     return torch.empty((num_tokens, runner.hidden_size), dtype=dtype, device=device)
 
 
@@ -741,25 +740,14 @@ def _run_once(
     return runner.run_plan(dispatch, batch, **runner._test_execution)
 
 
-# The one intended divergence: the masked and contiguous S2/S4 kernel
-# families (and, on the CuTeDSL leg, the GEMM engine itself) may tile and
-# round BF16 outputs differently over the same FP32 accumulation; everything
-# downstream (materialized activation join or fused B+activation middle,
-# LoRA path, finalize — post_reorder and the shared-rank reduce + tail
-# alike, both reused verbatim across domains) is the identical kernel in
-# the identical order, so an engine swap is the same rounding-class
-# divergence as a tile-configuration swap and shares one tolerance.
+# The masked GEMM and the contiguous GEMM tile the same FP32 accumulation in
+# different ways. The two GEMMs therefore round the BF16 output at different
+# points. Every stage after the GEMM is the same kernel in both domains.
 _ORACLE_TOLERANCE = {"atol": 2e-2, "rtol": 0.05}
 
-# Every eligible prefill plan shape, each on its own resident factor
-# layout: the per-expert serial materialized reference (the shipped decode
-# fallback carries exactly that plan with a complete tuned config — the
-# shipped per-expert prefill choice composes the b_act middle and down-B
-# scatter, which the dedicated b_act/scatter suites cover), the shared-outer
-# serial token-dedup b_activation winner, and the H200 shared-outer serial
-# shared-rank twin.  The masked reference runner executes the SAME plan on
-# the SAME DeepGEMM masked provider either way — this oracle isolates the
-# row-domain seam.
+# One row for each eligible prefill shape, each with its own factor layout.
+# The masked runner and the contiguous runner run the same plan, so the test
+# compares the two row domains alone.
 _ELIGIBLE_PLAN_PARAMS = (
     pytest.param(_GB300, False, "fallback.serial", id="per-expert-materialized"),
     pytest.param(_GB300, True, "prefill.token_dedup", id="shared-outer-b-activation"),
@@ -787,7 +775,7 @@ def test_contiguous_prefill_matches_masked(
     fragment: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The oracle: one eligible prefill plan, two row domains."""
+    """Run one prefill plan on both row domains and compare the outputs."""
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
     device = torch.device("cuda")
@@ -814,10 +802,10 @@ def test_contiguous_prefill_matches_masked(
             **_ORACLE_TOLERANCE,
             msg=f"contiguous vs masked: {choice.key}, {traffic} traffic",
         )
-        # The zero-routed token must be exact zero in both domains.
+        # The token with no routed pair must be exactly zero in both domains.
         assert actual[0].abs().max().item() == 0.0
         assert reference[0].abs().max().item() == 0.0
-    # Guard against both domains silently bypassing the LoRA math.
+    # Both domains must apply the LoRA math.
     active = _run_once(
         contiguous, gpu, _token_lora_mapping("active", num_tokens).to(device), layout
     ).hidden_states
@@ -836,11 +824,11 @@ def test_contiguous_prefill_replays_in_a_real_cuda_graph(
     fragment: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Capture once; replay across ROUTING mutations and a base-only flip.
+    """Capture the graph once, then replay it after the routing changes.
 
-    The counts, aligned seg_offsets, grouped_layout, compact rows are rebuilt
-    in place on every replay from device memory alone, so mutating
-    ``topk_ids`` between replays must be observed through unchanged pointers.
+    Every replay rebuilds the counts, the offsets, the labels, and the compact
+    rows in place from device memory. A change to ``topk_ids`` must reach the
+    output through the same pointers.
     """
     from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
 
@@ -858,7 +846,7 @@ def test_contiguous_prefill_replays_in_a_real_cuda_graph(
     )
     token_lora_mapping = _token_lora_mapping("active", num_tokens).to(device)
 
-    for _ in range(2):  # JIT + workspace graph-buffer retention before capture
+    for _ in range(2):  # warm the JIT and keep the graph buffers before capture
         _run_once(contiguous, gpu, token_lora_mapping, layout, use_cuda_graph=True)
     torch.cuda.synchronize(device)
 

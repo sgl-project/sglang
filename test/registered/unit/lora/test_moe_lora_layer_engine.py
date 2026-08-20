@@ -62,9 +62,9 @@ def _engine(monkeypatch, *, capability=(9, 0), created=None, runner_cls=_FakeRun
         "sglang.srt.lora.moe.moe_lora_runner.MoeLoraRunner.from_layer",
         staticmethod(fake_from_layer),
     )
-    # The engine reads --moe-lora-base-gemm at construction. Publish a context
-    # so it reads the shipped default, rather than having production carry a
-    # no-server fallback for tests' benefit.
+    # The engine constructor reads --moe-lora-base-gemm. The test therefore
+    # publishes a context that holds the shipped default. Production code
+    # then needs no fallback for a missing server.
     with get_context().override_server_args():
         return MoeLoraLayerEngine(_base_layer(), workspace=object())
 

@@ -1,8 +1,10 @@
-"""The three LoRA-A families an execution plan can name. Grouped A rides the
-aligned route and is the general choice; indexed A rides the raw route, for the
-decode down-A composition where aligned block padding dominates; token-dedup
-grouped A is grouped A over a one-pair-per-token route, so a shared-outer bridge
-row is written once per token, not once per pair.
+"""The three LoRA-A families that an execution plan can name.
+
+Grouped A reads the aligned route. It is the general choice. Indexed A reads
+the raw route. It is faster for down-A at decode, where the aligned blocks are
+mostly padding. Token-dedup grouped A is grouped A over a route with one pair
+per token. It writes each shared-outer bridge row once per token, not once per
+pair.
 """
 
 from __future__ import annotations
@@ -126,7 +128,7 @@ def grouped_lora_a(
     pair_to_row: torch.Tensor | None = None,
     produce_pdl: bool = False,
 ) -> None:
-    """One result per pair in original pair order; invalid rows are zeroed."""
+    """Write one result for each pair, in pair order. An invalid row gets zeros."""
     num_pairs = routing.topk_ids.numel()
     if num_pairs == 0:
         return
@@ -195,7 +197,7 @@ def _indexed_lora_a_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
-    """One deterministic vector reduction per raw-route pair and N tile."""
+    """Do one vector reduction for each raw-route pair and N tile, in a fixed order."""
     pair_id = tl.program_id(0)
     pid_n = tl.program_id(1)
     key = virtual_expert_ids_inline(
@@ -237,8 +239,8 @@ def _indexed_lora_a_kernel(
         )
         accumulator += tl.sum(rhs.to(tl.float32) * lhs[None, :].to(tl.float32), axis=1)
 
-    # B owns and zero-fills every consumed destination cell, so an indexed A need
-    # not write sentinel pairs.
+    # The B kernel writes zeros into every destination cell that it reads. So
+    # an indexed A can skip the sentinel pairs.
     tl.store(
         output_ptr + pair64 * stride_om + n_offsets * stride_on,
         accumulator.to(output_ptr.dtype.element_ty),
@@ -255,7 +257,11 @@ def indexed_lora_a(
     config: Mapping[str, int],
     pair_input: bool = False,
 ) -> None:
-    """Raw-route A, one program per pair: no aligned plan built, no PDL."""
+    """Run A over the raw route, with one program per pair.
+
+    This family builds no aligned route. It cannot produce a programmatic
+    dependent launch (PDL) signal.
+    """
     num_pairs = routing.topk_ids.numel()
     if num_pairs == 0:
         return
@@ -328,7 +334,7 @@ def run_lora_a(
     pair_to_row: torch.Tensor | None = None,
     produce_pdl: bool = False,
 ) -> torch.Tensor:
-    """Run exactly the family the spec names; no fallback, no selector."""
+    """Run the family that the spec names. There is no fallback and no selector."""
     family = spec.family.value
     pair_input = spec.site.value == "down"
     match family:

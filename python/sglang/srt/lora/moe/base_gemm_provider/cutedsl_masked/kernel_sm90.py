@@ -26,10 +26,6 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-# Derived from CUTLASS v4.6.1 examples/python/CuTeDSL/cute/hopper/kernel/
-# dense_gemm/dense_gemm_persistent.py, with the dense persistent scheduler
-# replaced by the MoE masked tile schedulers and L repurposed as expert index.
-
 import math
 from typing import Optional, Tuple, Type
 
@@ -56,11 +52,11 @@ except ImportError:
 
 
 class MaskedGroupedGemmKernelSm90:
-    """Persistent WGMMA masked grouped GEMM over ``[expert, m_max, ·]`` tensors.
+    """Masked grouped GEMM for Hopper, over ``[expert, m_max, ·]`` tensors.
 
-    Constructor surface mirrors :class:`kernel.MaskedGroupedGemmKernel` so one
-    config builds either kernel; knobs with no SM90 meaning are validated to
-    their only legal value.
+    The constructor takes the same arguments as
+    :class:`kernel.MaskedGroupedGemmKernel`, so one config can build either
+    kernel. An argument with no meaning on SM90 must keep its only legal value.
     """
 
     def __init__(
@@ -98,20 +94,22 @@ class MaskedGroupedGemmKernelSm90:
         self.use_direct_schedule = use_direct_schedule
         self.contiguous_segments = contiguous_segments
         if contiguous_segments and not (swap_ab and use_direct_schedule):
-            # The segment-base fold assumes the token axis is the scheduler's
-            # dynamic-M viewed through swap_ab, and only the direct scheduler
-            # leaves the masked_m argument slot free to carry seg_offsets.
+            # The kernel adds a segment base to the token tile index. Only
+            # swap_ab puts the token axis on the scheduler's M axis. Only the
+            # direct scheduler leaves the masked_m argument free for
+            # seg_offsets.
             raise ValueError(
                 "contiguous_segments requires swap_ab and use_direct_schedule"
             )
         if contiguous_segments and cluster_shape_mn != (1, 1):
-            # A real cluster would break the local->global tile-index fold;
-            # also matches the packed schedule's own (1, 1) guard.
+            # A cluster larger than (1, 1) breaks the segment-base addition.
+            # The packed schedule has the same (1, 1) rule.
             raise ValueError("contiguous_segments requires a (1, 1) cluster")
 
-        # K extent of the tile is deferred to _setup_attributes.
+        # The K extent here is a placeholder. _setup_attributes computes it.
         self.tile_shape_mnk = (*mma_tiler_mn, 1)
-        # Upstream heuristic: a second math warp group only pays off on large tiles.
+        # A second math warp group helps only on large tiles. This is the
+        # upstream heuristic.
         self.atom_layout_mnk = (
             (2, 1, 1)
             if self.tile_shape_mnk[0] > 64 and self.tile_shape_mnk[1] > 128
@@ -249,13 +247,13 @@ class MaskedGroupedGemmKernelSm90:
             c, self.epi_smem_layout_staged, self.epi_tile
         )
 
-        # The scheduler always keeps the dynamic/masked token extent on ITS M
-        # axis, so under swap_ab the tile and cluster are handed over
-        # transposed and the device swaps the returned coords back.
+        # The scheduler always keeps the token axis on its own M axis. Under
+        # swap_ab the host passes the tile and the cluster transposed. The
+        # device code swaps the returned coordinates back.
         m_max, n, expert_cnt = c.shape
         if cutlass.const_expr(self.contiguous_segments):
-            # The flat route-major output carries a unit L mode, so the true
-            # expert count lives on the resident weight (logical A under swap_ab).
+            # The flat output has one expert slot only. Take the real expert
+            # count from the weight, which is A under swap_ab.
             expert_cnt = cute.size(a.shape[2])
         k = cute.size(a.shape[1])
         scheduler_cta_tile = self.tile_shape_mnk
@@ -370,10 +368,9 @@ class MaskedGroupedGemmKernelSm90:
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if cutlass.const_expr(self.produce_pdl):
-            # Release the dependent consumer at kernel entry so its
-            # producer-independent prologue may overlap this GEMM; the
-            # consumer's griddepcontrol.wait still guards its first load of
-            # producer-owned data.
+            # This signal starts the next kernel at entry. That kernel runs
+            # its prologue while this GEMM runs. Its griddepcontrol.wait still
+            # holds back the first read of the data that this GEMM writes.
             cute.arch.griddepcontrol_launch_dependents()
 
         if warp_idx == 0:
@@ -432,7 +429,7 @@ class MaskedGroupedGemmKernelSm90:
             epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
         )
 
-        # (bM, bK, RestM, RestK, RestL) — the L mode is the expert index.
+        # (bM, bK, RestM, RestK, RestL). The L mode is the expert index.
         gA_mkl = cute.local_tile(
             mA_mkl,
             cute.slice_(self.tile_shape_mnk, (None, 0, None)),
@@ -537,10 +534,12 @@ class MaskedGroupedGemmKernelSm90:
                     )
                 a_rest_l_coord = mma_tile_coord_mnl[2]
                 if cutlass.const_expr(self.contiguous_segments):
-                    # ``masked_m`` carries seg_offsets in this mode. Folding the
-                    # segment base into the flat token-tile index is exact:
-                    # segment bases are alignment multiples and the token tile
-                    # divides the alignment (host-guarded).
+                    # ``masked_m`` holds seg_offsets here. Add the expert's
+                    # segment base to the token tile index. That division is
+                    # exact. Each base is a multiple of the alignment, and the
+                    # token tile divides the alignment. The flat token and
+                    # output tensors use expert slot 0. Only the weight keeps
+                    # the real expert index.
                     seg_base_tile = (
                         masked_m[work_tile.expert_idx] // self.tile_shape_mnk[1]
                     )
@@ -621,9 +620,10 @@ class MaskedGroupedGemmKernelSm90:
                 producer_group=tma_store_producer_group,
             )
 
-            # Epilogue smem-buffer rotation: the dense example used the
-            # scheduler's linear tile index, but the masked schedule is
-            # compacted, so count locally.
+            # This counter rotates the epilogue shared-memory buffers. The
+            # dense example uses the scheduler's linear tile index. The masked
+            # scheduler compacts the tile space, so this kernel counts its own
+            # tiles.
             num_tiles_executed = cutlass.Int32(0)
 
             while work_tile.is_valid_tile:
@@ -639,8 +639,8 @@ class MaskedGroupedGemmKernelSm90:
                         work_tile.expert_idx,
                     )
                 if cutlass.const_expr(self.contiguous_segments):
-                    # Same segment-base fold as the DMA warp, so the store lands
-                    # at the flat global token tile.
+                    # The same segment base as in the DMA warp. The store then
+                    # writes to the flat token tile in expert slot 0.
                     seg_base_tile = (
                         masked_m[work_tile.expert_idx] // self.tile_shape_mnk[1]
                     )
@@ -657,8 +657,9 @@ class MaskedGroupedGemmKernelSm90:
                 tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
                 cute.nvgpu.warpgroup.fence()
 
-                # K >= 1 always holds (the host rejects K % 8 != 0), so the
-                # one-deep WGMMA pipeline can hardcode its prologue depth.
+                # The host rejects a K that is not a multiple of 8. There is
+                # always at least one K tile, so the WGMMA prologue can use a
+                # fixed depth of one.
                 k_pipe_mmas = 1
                 for k_tile in cutlass.range(0, k_pipe_mmas, 1, unroll=1):
                     mainloop_pipeline.consumer_wait(mainloop_consumer_read_state)
@@ -756,7 +757,7 @@ class MaskedGroupedGemmKernelSm90:
 
             tma_store_pipeline.producer_tail()
 
-    # Host helpers below are verbatim from the upstream Hopper persistent example.
+    # The host helpers below come from the upstream Hopper persistent example.
 
     @staticmethod
     def _compute_stages(

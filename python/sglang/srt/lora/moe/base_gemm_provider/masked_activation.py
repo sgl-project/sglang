@@ -1,17 +1,16 @@
-"""S3 activation-join kernel for the MoE LoRA BF16 pipeline: activation with
-the LoRA delta added pre-activation, plus the ``activation_lora_input`` side
-output consumed by the down-proj LoRA shrink.
+"""The activation stage of the masked BF16 pipeline. It adds the LoRA delta
+before the activation. It also writes ``activation_lora_input``, which the
+down-projection LoRA shrink reads.
 
-The base GEMM1 output is the provider masked layout ``[E_local, m_max,
-slices * inter]``, whose flat row for expanded pair (t, k) is
-``src2dst[t * top_k + k]``; the LoRA delta is contiguous ``[gate | up]``
-indexed by the expanded pair, so the two index spaces meet here. Gating is a
-shape property: the gate half is multiplied in only when ``NUM_SLICES`` says
-the resident buffer has one.
+The base gate/up GEMM writes ``[E_local, m_max, slices * inter]``. The row of
+pair ``(t, k)`` is ``src2dst[t * top_k + k]``. The LoRA delta is contiguous
+``[gate | up]`` and uses the pair index. This kernel joins the two index
+spaces. It multiplies the activated gate by the up half only when
+``NUM_SLICES`` is 2.
 
-Invalid pairs (``topk_ids[t, k] < 0``: EP-unrouted / padding) skip the store
-into the masked layout and zero ``activation_lora_input`` so the down-LoRA
-shrink sees exact zeros.
+A pair with ``topk_ids[t, k] < 0`` is unrouted or padding. The kernel writes no
+masked row for it. It writes zero to ``activation_lora_input``, so the shrink
+reads exact zeros.
 """
 
 from __future__ import annotations
@@ -68,8 +67,8 @@ def _activation_delta_masked_kernel(
 
     vec = tl.arange(0, BLOCK_SIZE)
     if CONSUME_BASE_PDL:
-        # Route decoding and addressing do not depend on GEMM1; wait only at
-        # the first producer-owned base load.
+        # The route and the addresses above do not depend on the gate/up GEMM.
+        # The kernel waits here, just before it loads that GEMM's output.
         tl.extra.cuda.gdc_wait()
     for start in tl.range(0, inter, BLOCK_SIZE):
         offs = start + vec
@@ -89,7 +88,7 @@ def _activation_delta_masked_kernel(
 
         g = tl.load(gateup_row + gate_offs, mask=mask & valid, other=0.0).to(tl.float32)
         if HAS_DELTA:
-            # delta is always contiguous [gate | up]
+            # The delta is always contiguous [gate | up].
             dg = tl.load(delta_row + offs, mask=mask & valid, other=0.0).to(tl.float32)
             g += dg
         act = apply_activation(g, ACTIVATION_TYPE)
@@ -108,7 +107,6 @@ def _activation_delta_masked_kernel(
         act_bf16 = act.to(act_out_ptr.dtype.element_ty)
 
         tl.store(act_out_row + offs, act_bf16, mask=mask & valid)
-        # activation_lora_input is written for every (t, k): zeros when invalid.
         lora_in = tl.where(valid, act, 0.0)
         tl.store(
             lora_in_row + offs, lora_in.to(act_lora_in_ptr.dtype.element_ty), mask=mask

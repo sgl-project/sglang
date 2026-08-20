@@ -1,7 +1,9 @@
-"""Turn a forward's token/expert pairs into the routes a plan's kernels read.
+"""Build the routes that the MoE LoRA kernels read.
 
-A route groups those pairs -- by virtual expert, or by adapter alone for shared
-outer factors -- either raw or sorted into whole blocks.
+A route puts each token-expert pair in a bucket. One bucket is one virtual
+expert. When the experts share the LoRA factor, one bucket is one adapter. An
+aligned route sorts the pairs by bucket, then pads each bucket to whole blocks.
+A raw route sorts nothing. Each raw-route kernel finds the bucket itself.
 """
 
 from __future__ import annotations
@@ -28,12 +30,12 @@ from sglang.srt.lora.moe.route_kernels import (
 from sglang.srt.lora.moe.route_view import RouteView, RouteViewKind
 from sglang.srt.lora.moe.workspace import MoeLoraWorkspace
 
-# Smallest bucket count and pair count at which our three kernels beat the shared
-# CUDA align; the bucket count is also that kernel's own hard ceiling.
+# Above either count, the three Triton kernels here are faster than the shared
+# CUDA align kernel. 8192 buckets is also the hard limit of that CUDA kernel.
 FUSED_ALIGN_MIN_VIRTUAL_EXPERTS = 8192
 FUSED_ALIGN_MIN_PAIRS = 16384
 
-# Launch tiles; see configs/README.md before changing them.
+# Block sizes and warp counts. Read configs/README.md before you change them.
 HIST_BLOCK = 512
 HIST_WARPS = 8
 EXPAND_BLOCK = 128
@@ -41,18 +43,18 @@ EXPAND_WARPS = 4
 SCAN_CHUNK = 2048
 SCAN_WARPS = 4
 
-# Bin ceiling and smallest pair counts at which counting a block's pairs beats
-# one atomic per pair.
+# A block counts its own pairs first, then adds one atomic for each bin. That
+# is faster than one atomic for each pair, but only within these limits.
 COUNT_MAX_BINS = 512
 COUNT_MIN_PAIRS = 16384
 CLAIM_MIN_PAIRS_PER_BUCKET = 12288
 
 
 def count_bins(num_buckets: int, num_pairs: int) -> int:
-    """Bins for counting inside a block, or 0 to add one pair at a time."""
+    """Return the bin count for in-block counting, or 0 for one atomic per pair."""
     if num_buckets >= COUNT_MAX_BINS or num_pairs < COUNT_MIN_PAIRS:
         return 0
-    return 1 << num_buckets.bit_length()  # one spare bin, for masked-off lanes
+    return 1 << num_buckets.bit_length()  # the extra bin holds the masked-off lanes
 
 
 def _routing_capacity(
@@ -76,7 +78,11 @@ def _plan_scratch(
     block_size: int,
     device: torch.device,
 ) -> dict[str, object]:
-    """Route-owned scratch; counts are zeroed once because the scan restores that."""
+    """Allocate the scratch buffers of one route.
+
+    Only the first allocation zeroes ``counts``, because the scan sets every
+    count back to zero as it reads it.
+    """
     scratch: dict[str, object] = {
         "num_buckets": num_buckets,
         "capacity": capacity,
@@ -126,7 +132,7 @@ def _build_aligned(
     tensor_prefix: str,
     is_shared_outer: bool,
 ) -> RouteView:
-    """Sort the pairs into whole blocks, keyed by virtual expert or adapter."""
+    """Sort the pairs into whole blocks, one bucket per virtual expert or adapter."""
     from sglang.kernels.jit.utils import is_arch_support_pdl
 
     num_pairs = topk_ids.numel()
@@ -203,8 +209,9 @@ def _build_aligned(
         SHARED_OUTER=is_shared_outer,
         BLOCK=EXPAND_BLOCK,
         BLOCK_SIZE_M=block_size,
-        # The search picks one of NUM_BUCKETS + 1 answers, so it needs
-        # num_buckets.bit_length() steps -- one fewer and a sentinel reads as 0.
+        # The search picks one of NUM_BUCKETS + 1 answers. It needs
+        # num_buckets.bit_length() steps. With one step fewer, a sentinel
+        # bucket reads as bucket 0.
         SEARCH_STEPS=num_buckets.bit_length(),
         CLAIM_PER_BLOCK=num_pairs >= CLAIM_MIN_PAIRS_PER_BUCKET * num_buckets,
         USE_PDL=use_pdl,
@@ -234,7 +241,8 @@ def _build_virtual_topk_ids(
 ) -> torch.Tensor:
     virtual_topk_ids = torch.empty_like(topk_ids)
     if topk_ids.numel() == 0:
-        # An idle DP rank arrives with zero tokens; cdiv(0, block) is no grid.
+        # An idle data-parallel rank has zero tokens. cdiv(0, block) gives an
+        # empty grid.
         return virtual_topk_ids
 
     block_size = 1024

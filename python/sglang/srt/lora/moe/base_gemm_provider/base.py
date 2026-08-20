@@ -1,10 +1,13 @@
-"""A provider owns the BASE model's half of the MoE — its physical row layout,
-resident weight format, activation join, finalize, and workspace config — and
-the runner owns the LoRA half. The only reason a provider is decomposed into
-stages (prepare -> gateup -> act_with_delta -> down -> finalize) is so the
-runner can inject LoRA between them, and every stage is launched from Python
-so overlap topologies can place stream joins between them. No stock
-``MoeRunner`` is involved.
+"""The base half of the MoE forward pass, in stages.
+
+A provider runs the base model. It defines the row layout, the weight format,
+the activation, the finalize, and the workspace shapes. The runner adds the
+LoRA half.
+
+The stages are prepare, gateup, act_with_delta, down, and finalize. They are
+separate for one reason: the runner inserts LoRA work between them. Python
+launches each stage, so a caller can also place a stream join between two
+stages. No stock ``MoeRunner`` takes part.
 """
 
 from __future__ import annotations
@@ -22,8 +25,8 @@ if TYPE_CHECKING:
 
 class MoeBaseProviderContract(msgspec.Struct, frozen=True, kw_only=True):
     key: str
-    # Column order of the provider's own gate/up GEMM output. The LoRA delta is
-    # always [gate | up]; these flags describe the BASE rows only.
+    # These two flags give the column order of the base gate/up GEMM output.
+    # The LoRA delta is always [gate | up].
     gate_first: bool
     interleaved: bool
     gate_up_output_dtype: torch.dtype
@@ -32,8 +35,9 @@ class MoeBaseProviderContract(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class MappedLoraAInput(msgspec.Struct, frozen=True, kw_only=True):
-    """``pair_to_row`` is a contiguous int32 tensor mapping each routed pair
-    to one row; ``-1`` denotes an invalid pair.
+    """``pair_to_row`` gives one row of ``rows`` for each routed pair.
+
+    It is a contiguous int32 tensor. A value of ``-1`` marks an invalid pair.
     """
 
     rows: torch.Tensor
@@ -41,11 +45,12 @@ class MappedLoraAInput(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class MoeBaseProvider:
-    """One instance per (layer, quant type), bound to quant_info.
+    """One instance for each layer and quantization type.
 
-    The semantic geometry below is on the seam rather than read off a
-    provider-private payload because a packed FP8/NVFP4 provider cannot be
-    asked for dimensions its resident tensors no longer carry.
+    Each instance binds to one ``quant_info``. This interface declares the four
+    size properties below. A packed FP8 or NVFP4 provider cannot report them
+    from its resident tensors. Those tensors have packed shapes. A packed shape
+    does not give these sizes.
     """
 
     contract: MoeBaseProviderContract
@@ -56,7 +61,7 @@ class MoeBaseProvider:
 
     @property
     def intermediate_size(self) -> int:
-        """Local (TP-sharded) intermediate width in semantic elements."""
+        """The intermediate width of one tensor-parallel shard, in logical elements."""
         raise NotImplementedError
 
     @property
@@ -74,12 +79,11 @@ class MoeBaseProvider:
         top_k: int,
         workspace: MoeLoraWorkspace | None = None,
     ):
-        """Permute inputs into the provider's physical row domain.
+        """Permute the inputs into the provider's own row layout.
 
-        Returns an opaque provider-private workspace for the later stages.
-        When the runner supplies its workspace, every per-forward tensor must
-        come from that address-stable allocator so the provider is CUDA-graph
-        capturable.
+        The return value is an opaque state object for the later stages. If the
+        runner passes a workspace, take every per-forward tensor from it. Its
+        addresses are stable, and CUDA-graph capture needs that.
         """
         raise NotImplementedError
 
@@ -87,9 +91,7 @@ class MoeBaseProvider:
         raise NotImplementedError
 
     def release_prepared_inputs(self, row_state) -> None:
-        """Free whatever ``prepare`` allocated; the prepared inputs are dead
-        once the gate/up GEMM is done.
-        """
+        """Free what ``prepare`` allocated. The gate/up GEMM is the last reader."""
         raise NotImplementedError
 
     def act_with_delta(
@@ -125,16 +127,16 @@ class MoeBaseProvider:
         *,
         lora_delta: torch.Tensor | None = None,
     ) -> None:
-        """Fixed-order weighted top-k reduction into ``output``.
+        """Reduce the top-k pairs into ``output``, in a fixed order.
 
-        Router coefficient and routed scaling are applied exactly once over
-        ``base_pair + lora_delta``; ``lora_delta`` is the unweighted down-LoRA
-        contribution in ``[T, K, H]`` pair order.
+        Apply the router weight and the routed scaling once, to the sum of the
+        base pair and ``lora_delta``. ``lora_delta`` holds the unweighted
+        down-LoRA result in ``[T, K, H]`` pair order.
         """
         raise NotImplementedError
 
-    # The implementation name is explicit so the config/benchmark can force
-    # Triton versus an injected CuTe candidate.
+    # Each implementation has a name. A config or a benchmark then selects
+    # Triton or an injected CuTe kernel.
     def fused_act_implementations(self, family: str) -> tuple[str, ...]:
         return ()
 
@@ -174,10 +176,10 @@ class MoeBaseProvider:
         row_state,
         activation: torch.Tensor,
     ) -> MappedLoraAInput | None:
-        """Expose provider activation rows for standalone grouped down-A.
+        """Give the provider's activation rows to a standalone grouped down-A.
 
-        ``None`` unless the activation row domain has a stable pair-to-row
-        mapping; the default keeps the pair-major bridge.
+        Return ``None`` when the activation rows have no stable pair-to-row
+        map. The caller then keeps the pair-major bridge.
         """
 
         return None
@@ -197,8 +199,9 @@ class MoeBaseProvider:
         return implementation in self.fused_finalize_implementations(family, ownership)
 
     def supports_down_b_into_base(self) -> bool:
-        """Whether S4's output rows admit the down-B into-base epilogue; true
-        only with a stable pair-to-row mapping, as for
+        """Report whether the down rows accept the down-B into-base add.
+
+        Return ``True`` only with a stable pair-to-row map, as for
         ``mapped_down_lora_a_input``.
         """
         return False
@@ -213,12 +216,12 @@ class MoeBaseProvider:
         routing: RouteView,
         config: Mapping[str, int],
     ) -> None:
-        """Scatter-add each pair's unweighted down-B delta into ``down_out``.
+        """Add each pair's unweighted down-B result into ``down_out``.
 
-        Runs AFTER the base down GEMM, through the provider's pair-to-row
-        mapping, and the materialized finalize then runs in no-pair-delta
-        mode.  ``bridge`` is the pair-major down-A output and ``b_down`` the
-        flattened per-virtual-expert down-B groups.
+        Call this after the base down GEMM. It uses the provider's pair-to-row
+        map. The later finalize must then run with no pair delta. ``bridge`` is
+        the pair-major down-A output. ``b_down`` holds the down-B weights of
+        every virtual expert.
         """
         raise NotImplementedError(
             f"{self.contract.key} has no down-B into-base epilogue"
@@ -255,7 +258,7 @@ class MoeBaseProvider:
         token_rank: torch.Tensor,
         config: Mapping[str, int],
     ) -> None:
-        """Launch the shared rank reduction independently of base W2."""
+        """Launch the shared-rank reduction. It does not wait for the base W2 GEMM."""
         raise NotImplementedError(
             f"{self.contract.key} has no {implementation!r} shared-rank reduction"
         )
@@ -274,12 +277,16 @@ class MoeBaseProvider:
         token_rank: torch.Tensor,
         config: Mapping[str, int],
     ) -> None:
-        """Join base W2/reduce, then finalize base and add the shared B tail."""
+        """Finish the shared-rank path.
+
+        Wait for the base W2 GEMM and the reduction. Then finalize the base
+        rows and add the shared-B tail.
+        """
         raise NotImplementedError(
             f"{self.contract.key} has no {implementation!r} shared B tail"
         )
 
-    # Buffer shape helpers so the runner owns every allocation.
+    # The runner allocates every buffer, so it asks the provider for the shapes.
     def gateup_out_shape(self, row_state) -> tuple[int, ...]:
         raise NotImplementedError
 

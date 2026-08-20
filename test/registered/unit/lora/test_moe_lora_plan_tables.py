@@ -1,5 +1,8 @@
-"""Pins the shipped best-config tables (2026-08 campaign, Appendix B of the
-best-config document) and the fail-closed resolution machinery around them."""
+"""Pins the shipped plan and tile tables, and the code that reads them.
+
+The numbers come from the 2026-08 campaign, Appendix B of the best-config
+document. A bad table must raise an error, not serve a wrong row in silence.
+"""
 
 from __future__ import annotations
 
@@ -83,13 +86,14 @@ class TestSm100PerExpert:
         c = _resolve()[Phase.PREFILL]
         assert c.base_gemm_rows == "route_major"
         assert c.plan.act.family is ActFamily.B_ACTIVATION
-        assert c.plan.gate_up_b is None  # consumed by the b_activation middle
+        assert c.plan.gate_up_b is None  # the b_activation kernel does this work
         assert c.plan.down_b_into_base
         assert c.plan.gate_up_overlap is GateUpOverlap.NONE
         assert c.plan.down_overlap is DownOverlap.NONE
 
     def test_decode_tile_ladder_is_rank_then_token_bucketed(self):
-        # gate_up_b BLOCK_SIZE_N names the tile set: 128 tiny, 512 mse, 256 large
+        # gate_up_b BLOCK_SIZE_N names the tile set the table chose. The rank
+        # rules come first in the ladder, then the token rules.
         def block_n(rank: int, tokens: int) -> int:
             table = resolve_tiles(
                 architecture_value="gb300",
@@ -143,14 +147,15 @@ class TestSm100Shared:
 
 class TestH200:
     def test_decode_ships_indexed_down_a_at_every_rank(self):
-        # indexed down-A beat the retired step10 pdl_down split on a real model
+        # On a real model, the indexed down-A row was faster than the retired
+        # step10 pdl_down split.
         for rank in (8, 32, 320):
             c = _resolve(architecture=_H200, rank=rank)[Phase.DECODE]
             assert c.plan.down_a.family is LoraAFamily.INDEXED
             assert c.base_gemm_rows == "expert_major"
 
     def test_shared_prefill_rank_band(self):
-        # the Inkling r128 replication set the shared-rank ceiling
+        # A rank-128 run on the Inkling model set the top of this rank band.
         small = _resolve(architecture=_H200, layout=True, rank=8)[Phase.PREFILL]
         assert small.name == "prefill.materialized.small_rank"
         assert small.plan.finalize.family is FinalizeFamily.MATERIALIZED
@@ -198,7 +203,8 @@ class TestResolution:
         assert selected[Phase.PREFILL].name == "fallback.serial_prefill"
 
     def test_every_resolvable_plan_is_a_declared_row(self):
-        # checked against the raw table, not a helper that shares the filtering code
+        # The test reads the raw table. A shared helper repeats the filter,
+        # so the test misses a filter bug.
         for architecture in (_GB300, _H200):
             for layout in (False, True):
                 table = load_plans(architecture)
@@ -220,9 +226,10 @@ class TestResolution:
                             assert sel.name in declared, (sel.name, declared)
 
     def test_every_tile_rule_key_names_a_declared_plan_row(self):
-        # resolve_tiles silently serves built-in defaults on a key miss, so a
-        # renamed plan row discards its tuned ladder with no error (throughput
-        # only). The reverse is not required: no rules = built-in heuristics.
+        # resolve_tiles returns the built-in defaults when a key is missing.
+        # A renamed plan row therefore loses its tuned tiles and raises no
+        # error. Only the speed drops. This test allows the reverse case. A
+        # plan row with no tile rules uses the built-in defaults.
         for architecture in (_GB300, _H200, DeviceArchitecture.DEFAULT):
             plans = load_plans(architecture)
             tiles = lc._load_tiles(architecture.value)
@@ -233,8 +240,8 @@ class TestResolution:
             assert not orphans, (architecture.value, orphans)
 
     def test_unknown_domain_key_fails_closed(self, tmp_path):
-        # domain was once read with .get(key, 1 << 30): a typo'd bound silently
-        # served tuned rows to geometry they were never measured on
+        # The loader once read the domain with .get(key, 1 << 30). A typo in
+        # a bound then let tuned rows serve a geometry nobody measured.
         packaged = json.load(open(f"{ep._CONFIG_DIR}/gb300.plans.json"))
         json.dump(packaged, open(tmp_path / "gb300.plans.json", "w"))
         with envs.SGLANG_LORA_MOE_CONFIG_DIR.override(str(tmp_path)):
@@ -277,8 +284,8 @@ class TestResolution:
                 _resolve()
 
     def test_unknown_plan_field_fails_closed(self, tmp_path):
-        # a retired "when" predicate from an older file must abort at load,
-        # not silently widen or narrow the match
+        # An old file can hold a retired "when" key. The loader must stop
+        # with an error, because an ignored key changes which rows match.
         packaged = json.load(open(f"{ep._CONFIG_DIR}/gb300.plans.json"))
         packaged["scenarios"][0]["when"] = {"activation": "swiglu"}
         json.dump(packaged, open(tmp_path / "gb300.plans.json", "w"))
@@ -288,8 +295,9 @@ class TestResolution:
                 _resolve()
 
     def test_tuner_annotations_load_but_near_misses_do_not(self, tmp_path):
-        # tune_lora_config.py --emit-seed stamps "provenance" and "seeded_for";
-        # the onboarding flow serves them via SGLANG_LORA_MOE_CONFIG_DIR
+        # tune_lora_config.py --emit-seed writes "provenance" and
+        # "seeded_for" into the file. A user loads that file with
+        # SGLANG_LORA_MOE_CONFIG_DIR.
         packaged = json.load(open(f"{ep._CONFIG_DIR}/h200.plans.json"))
         packaged["seeded_for"] = {"model": "acme/moe", "hidden": 6144}
         for row in packaged["scenarios"]:
@@ -321,8 +329,8 @@ class TestResolution:
                 )
 
     def test_unknown_tile_site_key_fails_closed(self, tmp_path):
-        # rule-level extra="forbid" does not reach inside "sites"; the
-        # launch-config dataclass must forbid on its own
+        # The rule-level extra="forbid" does not reach inside "sites". The
+        # launch-config class must reject an unknown key on its own.
         packaged = json.load(open(f"{ep._CONFIG_DIR}/gb300.tiles.json"))
         rule = packaged["rules"]["decode.per_expert"][0]
         rule["sites"]["gate_up_bee"] = rule["sites"].pop("gate_up_b")
@@ -339,8 +347,8 @@ class TestResolution:
 
 class TestLoraMoeRunnerBackend:
     def test_lora_backend_is_distinct_from_deep_gemm(self):
-        # the one place that must treat them alike is the resident weight
-        # prep, which spells it out (see FusedMoE.__init__ use_deep_gemm)
+        # One place treats the two backends alike. That place is the resident
+        # weight preparation, and it names both (FusedMoE.__init__).
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
         assert MoeRunnerBackend.LORA.is_lora()
@@ -349,8 +357,9 @@ class TestLoraMoeRunnerBackend:
         assert not MoeRunnerBackend.TRITON.is_lora()
 
     def test_lora_backend_gets_deep_gemm_resident_weight_prep(self):
-        # without the shared prep the layer builds triton-layout experts and
-        # the engine refuses to attach (or binds a provider to the wrong layout)
+        # Without the shared preparation the layer builds the experts in the
+        # Triton layout. The engine then refuses to attach, or it binds a
+        # provider to the wrong layout.
         import inspect
 
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE

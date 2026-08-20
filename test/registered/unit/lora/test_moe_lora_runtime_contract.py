@@ -97,7 +97,7 @@ def _refresh_metadata(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph required")
 def test_decode_and_prefill_metadata_refresh_through_real_graph_replay() -> None:
-    """A replay must observe new routing without changing captured pointers."""
+    """A replay reads the new routing. The captured pointers stay the same."""
     device = torch.device("cuda")
     backend = _graph_backend(device)
     decode_buffers = backend.moe_cg_buffers
@@ -138,8 +138,8 @@ def test_decode_and_prefill_metadata_refresh_through_real_graph_replay() -> None
     observed_decode_enabled = torch.empty_like(decode_buffers["adapter_enabled"])
     observed_prefill_enabled = torch.empty_like(prefill_buffers["adapter_enabled"])
 
-    # Compile the copy path before capture; metadata routing was already
-    # compiled by the first refresh above.
+    # These copies compile the copy path before the capture. The first
+    # refresh above already compiled the metadata routing.
     observed_decode.copy_(decode_buffers["token_lora_mapping"])
     observed_prefill.copy_(prefill_buffers["token_lora_mapping"])
     observed_decode_enabled.copy_(decode_buffers["adapter_enabled"])
@@ -199,9 +199,9 @@ def test_decode_and_prefill_metadata_refresh_through_real_graph_replay() -> None
         is_prefill=True,
     )
 
-    # The serving scheduler completes the metadata refresh before launching
-    # the model graph.  Make that ordering explicit even if PyTorch chooses a
-    # distinct internal replay stream.
+    # The serving scheduler finishes the metadata refresh before it launches
+    # the model graph. PyTorch can replay on another stream, so the test
+    # forces that order here.
     torch.cuda.synchronize()
     graph.replay()
     torch.cuda.synchronize()
@@ -215,8 +215,8 @@ def test_decode_and_prefill_metadata_refresh_through_real_graph_replay() -> None
     assert not torch.equal(observed_decode, first_decode)
     assert not torch.equal(observed_prefill, first_prefill)
 
-    # Smaller replays must clear the graph bucket tail rather than inherit
-    # routes from the earlier, larger assignment.
+    # A smaller batch must clear the tail of the graph bucket. It must not
+    # keep the routes of the earlier, larger batch.
     assert observed_decode[4:].tolist() == [-1] * 4
     assert observed_prefill[5:].tolist() == [-1] * 7
     assert observed_decode_enabled.tolist() == [0, 0, 0, 1]
@@ -237,8 +237,8 @@ def test_decode_and_prefill_metadata_refresh_through_real_graph_replay() -> None
         -1,
     ]
 
-    # A later base-only replay must not retain any active assignment from
-    # either of the preceding batches.
+    # A later replay with no adapter must clear every route. The two batches
+    # above must leave nothing behind.
     decode_batch = _batch_info(
         device=device,
         weight_indices=[0, 0],
@@ -320,7 +320,7 @@ class TestRunnerAdmission:
         activation: str,
         is_gated: bool,
     ) -> None:
-        """The two axes are independent, so the whole product is admissible."""
+        """Gating and the activation are independent, so every pair is valid."""
         self._admit(activation=activation, is_gated=is_gated)
 
     @pytest.mark.parametrize("activation", [fn.value for fn in ActivationFn])
@@ -330,8 +330,10 @@ class TestRunnerAdmission:
         activation: str,
         is_gated: bool,
     ) -> None:
-        """Regression: non-gated SiLU passed _admit then died in validate_plan
-        because the gate/up slice count was inferred from the activation."""
+        """Non-gated SiLU once passed _admit and then failed in validate_plan.
+
+        The old code read the gate and up slice count from the activation.
+        """
         from sglang.srt.lora.moe.moe_lora_runner import MoeLoraRunner
         from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 

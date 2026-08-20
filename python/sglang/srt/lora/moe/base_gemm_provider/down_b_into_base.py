@@ -1,38 +1,23 @@
-"""Sibling of ``lora_b._one_launch_sliced_lora_b_kernel`` — the shipping kernel
-is untouched — with only the OUTPUT ADDRESSING changed, so the tiled GEMM is
-preserved.  A per-token down-B-in-finalize fusion was measured and rejected:
-without a route-block-tiled GEMM it degrades to scalar FMA.  The two deltas
-are in the epilogue:
+"""Down-B GEMM that adds its result into the base down output.
 
-* the destination row is indirect — ``down_rows[src2dst[pair]]`` instead of
-  the dense pair-major ``delta[pair]`` — targeting the base down GEMM's
-  output AFTER it has run, so the ``[T, K, H]`` pair-major delta buffer is
-  never allocated; and
-* the store is a read-modify-write ADD of the unweighted delta.  No atomics:
-  each provider row corresponds to exactly one routed pair in both
-  row domains (masked ``e * m_max + slot`` and contiguous
-  ``seg_offsets[e] + slot`` are both injective over valid pairs), each pair
-  appears exactly once in ``sorted_pair_ids``, and different N tiles of one
-  row touch disjoint columns.
+This kernel is the one-launch down-B kernel with one change: the output
+address. It writes to ``down_rows[src2dst[pair]]``, not to a pair-major
+``delta`` buffer, so no code allocates that buffer. The store is a
+read-modify-write add. A benchmark measured a per-token fusion into finalize.
+This file does not use that fusion, because the fusion loses the block tiling
+and does scalar work.
 
-Sentinel semantics DIFFER from the pair-major twin: there the kernel owns
-every delta cell and must zero ``-1``-group blocks so stale graph memory
-never becomes a false delta; here the base down GEMM owns ``down_rows`` and a
-zero-ADD is a no-op.  Returning early is also a correctness requirement —
-sentinel pairs' ``src2dst`` entries are never written by either row domain's
-dispatch and must not be dereferenced.  ``src2dst`` is only READ here, so the
-documented hazard barring kernels that combine an in-place ``src2dst`` STORE
-with bulk row copies (see ``_contig_fill_rows_kernel``) does not apply.
+The add needs no atomics. Each row maps to one routed pair. Each pair occurs
+once in ``sorted_pair_ids``. Different N tiles write to different columns.
 
-NUMERICS: the FP32-accumulated delta is added to the BF16 base row and the
-sum is rounded to BF16 once, whereas the shipped tail rounds the delta to
-BF16 separately and keeps base and delta as two BF16 operands of finalize's
-FP32 sum.  Output equality versus the shipped tail is therefore judged
-allclose, not bitwise.
+A block with group ``-1`` returns immediately. The base GEMM writes those rows,
+and an add of zero changes nothing. The early return is also a safety rule. The
+dispatch does not write ``src2dst`` for a sentinel pair, so the kernel must not
+read it.
 
-There is no PDL variant: the eligible plan shape is fully serial with the
-base down GEMM between down-A and this launch, so neither the down-A ->
-down-B nor the base-down -> finalize edge exists.
+NUMERICS: this path adds the FP32 delta to the BF16 base row, then rounds once.
+The shipped path rounds the delta first. Thus you must compare the two paths
+with allclose, not with an exact test.
 """
 
 from __future__ import annotations
@@ -73,8 +58,8 @@ def _down_b_into_base_kernel(
 ):
     pid = tl.program_id(0)
     num_pairs_post_padded = tl.load(num_pairs_post_padded_ptr)
-    # Verbatim one-launch M/N schedule with the down site's single slice
-    # constant folded (NUM_SLICES == 1 makes num_pid_n the plain N tiling).
+    # This is the M/N schedule of the one-launch kernel. The down site has one
+    # slice, so num_pid_n folds down to the plain N tiling.
     num_pid_n: tl.constexpr = (N_HIDDEN + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
     programs_per_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // programs_per_group
@@ -87,8 +72,6 @@ def _down_b_into_base_kernel(
 
     group = tl.load(block_virtual_expert_ids_ptr + pid_m).to(tl.int64)
     if group == -1:
-        # B does NOT own these cells (the base down GEMM does), and this is
-        # what keeps sentinel pairs' unwritten src2dst entries from being read.
         return
 
     pair_slots = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
@@ -96,15 +79,15 @@ def _down_b_into_base_kernel(
     pair_mask = pair_ids < num_pairs
     n_offsets = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
     n_mask = n_offsets < N_HIDDEN
-    # A valid group implies routed pairs (the fused key is -1 whenever
-    # topk_id < 0), so every unmasked src2dst entry was written.
+    # The fused key is -1 for every pair with a topk_id below 0. A valid group
+    # therefore means the dispatch wrote each unmasked src2dst entry.
     dest_rows = tl.load(src2dst_ptr + pair_ids, mask=pair_mask, other=0).to(tl.int64)
     destination_ptrs = (
         down_rows_ptr + dest_rows[:, None] * stride_dm + n_offsets[None, :] * stride_dn
     )
     store_mask = pair_mask[:, None] & n_mask[None, :]
 
-    # The down bridge is inherently pair-major: bridge rows ARE pair ids.
+    # The down bridge is pair-major. A bridge row index is a pair id.
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k_begin in range(0, RANK, BLOCK_SIZE_K):
         k_offsets = k_begin + tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
@@ -124,8 +107,6 @@ def _down_b_into_base_kernel(
         )
         accumulator += tl.dot(lhs, rhs, out_dtype=tl.float32)
 
-    # Each (row, N tile) cell is owned by exactly one program, so no atomics.
-    # This is the single joint BF16 rounding of base + delta.
     base = tl.load(destination_ptrs, mask=store_mask, other=0.0).to(tl.float32)
     tl.store(
         destination_ptrs,

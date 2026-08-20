@@ -1,8 +1,9 @@
-"""The two LoRA-B families an execution plan can name. One-launch sliced B rides
-the aligned route and is the general choice; pair-indexed sliced B rides the raw
-route, its grid covering occupied pairs rather than aligned expert-major blocks,
-so a sparse decode route -- hundreds of distinct experts at one pair each -- pays
-no block padding.
+"""The two LoRA-B families that an execution plan can name.
+
+One-launch sliced B reads the aligned route. It is the general choice.
+Pair-indexed sliced B reads the raw route. Its grid covers the occupied pairs,
+not whole expert blocks. A sparse decode route can hold hundreds of experts with
+one pair each. This family then does no padded work.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ def _one_launch_sliced_lora_b_kernel(
     GROUP_SIZE_M: tl.constexpr,
     CONSUME_PDL: tl.constexpr,
 ):
-    """All one/two output slices in one aligned-plan launch."""
+    """Compute one or two output slices in a single launch over the aligned route."""
     pid = tl.program_id(0)
     num_pairs_post_padded = tl.load(num_pairs_post_padded_ptr)
     tiles_per_slice: tl.constexpr = (N_PER_SLICE + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
@@ -83,9 +84,10 @@ def _one_launch_sliced_lora_b_kernel(
     store_mask = pair_mask[:, None] & n_mask[None, :]
 
     if group == -1:
-        # B owns these cells: zeroing sentinels keeps stale graph-buffer contents
-        # from becoming a false LoRA delta. This path never reads A's bridge, so
-        # it must not wait on the producer.
+        # This kernel writes every cell that it can reach. It must zero a
+        # sentinel block, or stale CUDA-graph memory becomes a false LoRA
+        # delta. This path never reads the A bridge, so it must not wait on
+        # the producer.
         zeros = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         tl.store(
             destination_ptrs,
@@ -209,9 +211,12 @@ def _indexed_pairs_lora_b_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
-    """One raw-route pair and one N tile per program: no sort, no padding. Differs
-    from one-launch only in within-tile summation order, so oracles compare
-    allclose rather than bitwise."""
+    """One program handles one raw-route pair and one N tile.
+
+    This family sorts nothing and pads nothing. It sums a tile in another order
+    than one-launch B. Thus you must compare the two with allclose, not with an
+    exact test.
+    """
     pair_id = tl.program_id(0)
     pid_n = tl.program_id(1)
     tiles_per_slice: tl.constexpr = (N_PER_SLICE + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
@@ -244,9 +249,8 @@ def _indexed_pairs_lora_b_kernel(
     )
 
     if key == -1:
-        # B owns these cells: zeroing invalid pairs keeps stale graph-buffer
-        # contents from becoming a false LoRA delta, same contract as the
-        # one-launch sentinel-block store.
+        # This kernel writes every cell that it can reach. It must zero an
+        # invalid pair, or stale CUDA-graph memory becomes a false LoRA delta.
         zeros = tl.zeros((BLOCK_SIZE_N,), dtype=tl.float32)
         tl.store(
             destination_ptrs,
@@ -295,7 +299,12 @@ def indexed_pairs_lora_b(
     config: Mapping[str, int],
     intermediate_top_k: int = 1,
 ) -> None:
-    """Raw-route B: no aligned plan built, static grid per capture bucket, no PDL."""
+    """Run B over the raw route.
+
+    This family builds no aligned route. Its grid is a constant for each
+    CUDA-graph capture size. It cannot consume a programmatic dependent launch
+    (PDL) signal.
+    """
     _, weight_rows, rank = weight.shape
     num_slices = len(destination_offsets)
     slice_width = weight_rows // num_slices
@@ -352,7 +361,7 @@ def run_lora_b(
     intermediate_top_k: int = 1,
     consume_pdl: bool = False,
 ) -> None:
-    """Run exactly the family the spec names; no fallback, no selector."""
+    """Run the family that the spec names. There is no fallback and no selector."""
     family = spec.family.value
     match family:
         case "one_launch_sliced":

@@ -5,11 +5,12 @@ import torch
 
 
 class MoeLoraBf16QuantInfo(msgspec.Struct, kw_only=True):
-    """Unquantized standard-layout MoE weights.
+    """Unquantized MoE weights in the standard layout.
 
-    ``w13_weight`` is ``[E_local, S * I, H]`` with ``S=2`` when gated (gate
-    first) and ``S=1`` when not; the pointwise activation is a separate axis
-    and does not affect ``S``. ``w2_weight`` is ``[E_local, H, I]``.
+    ``w13_weight`` is ``[E_local, S * I, H]``. ``S`` is 2 when the layer
+    gates, and the gate rows come first. ``S`` is 1 when the layer does not
+    gate. The choice of pointwise function does not change ``S``.
+    ``w2_weight`` is ``[E_local, H, I]``.
     """
 
     w13_weight: torch.Tensor

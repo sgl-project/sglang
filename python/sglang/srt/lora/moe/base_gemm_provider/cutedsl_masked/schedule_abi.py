@@ -1,15 +1,15 @@
-"""Packed direct-schedule ABI: one int64 per work tile (expert, token cluster,
-output cluster), shared by the host builder and the device decoder.
+"""Packed schedule ABI: one int64 for each work tile.
 
-The fields sum to 63 bits, not 64: torch's int64 is SIGNED, so bit 63 must stay
-clear or a saturated entry packs as a negative number.
+The host builder writes the three fields and the device decoder reads them. The
+fields use 63 bits, not 64. A torch int64 is signed, so bit 63 must stay clear.
+A full entry otherwise becomes a negative number.
 
-The predecessor was an int32 split 10/10/12, whose 8192-row-per-expert ceiling
-a long chunked prefill with lopsided routing can reach; these widths put every
-ceiling out of reach. Measured cost of the wider word at a 4096-token chunk:
-both stages grow by 238 KiB on a 32-expert/4096-hidden slice and 510 KiB on a
-48-expert/6144-hidden one, on the LoRA backend's shared (whole-server)
-workspace.
+The earlier version packed the fields into an int32 with 10, 10 and 12 bits.
+That version allowed only 8192 rows for each expert. A long chunked prefill
+with uneven routing reaches that limit. The wider fields use more workspace
+memory. At a chunk of 4096 tokens, each stage grows by 238 KiB with 32 experts
+and hidden size 4096. Each stage grows by 510 KiB with 48 experts and hidden
+size 6144.
 """
 
 EXPERT_SHIFT = 0

@@ -1,7 +1,3 @@
-"""The route type on its own, so the kernel-side modules that consume routes can
-import it without the plan layer's pydantic.
-"""
-
 from __future__ import annotations
 
 from enum import Enum

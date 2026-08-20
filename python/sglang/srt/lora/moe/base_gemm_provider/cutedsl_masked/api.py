@@ -1,12 +1,15 @@
 # Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Host adapter for the BF16 masked grouped GEMM (SM100 and SM90).
+"""Host adapter for the BF16 masked grouped GEMM on SM100 and SM90.
 
-``prepare`` compiles per call; the provider layer (cutedsl_bf16.py) owns the
-compile-once cache and per-forward re-wrapping. Compilation keys only on the
-config plus layout STRUCTURE: A/C/masked_m/schedule keep dynamic layouts, so
-one compiled fn serves every m_max.
+``prepare`` compiles the kernel on every call. The provider layer in
+cutedsl_bf16.py holds the compile-once cache. It also re-wraps the arguments
+for each forward pass.
+
+The compile key is the config and the layout structure only. A, C,
+``masked_m``, and the schedule keep dynamic layouts, so one compiled function
+serves every ``m_max``.
 """
 
 from typing import Any, Tuple
@@ -20,9 +23,8 @@ import msgspec
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-# The shipped provider always selects swap_ab; the non-swap orientation is kept
-# as the SM90 port's fallback if the swap_ab narrow-N WGMMA path is
-# unsupported there.
+# The shipped provider always uses swap_ab. The non-swap wrapper stays as a
+# fallback for SM90, where the narrow-N WGMMA path may not work.
 from sglang.srt.lora.moe.base_gemm_provider.cutedsl_masked.kernel import (
     MaskedGroupedGemmKernel,
     masked_grouped_gemm,
@@ -57,20 +59,19 @@ class MaskedGroupedGemmConfig(msgspec.Struct, frozen=True, kw_only=True):
     use_warp_scan: bool = False
     uniform_m: int | None = None
     persistent_clusters: int | None = None
-    # Producer signaling only: this GEMM may release a downstream
-    # middle/finalize kernel, but is not itself launched early against its own
-    # preprocess/activation producer without an internal wait.
+    # This flag only lets the GEMM release a later kernel. The GEMM itself
+    # does not start early against its own producer.
     produce_pdl: bool = False
     swap_ab: bool = False
     direct_schedule: bool = False
-    # Route-major flat row domain (segment bases in the masked_m slot); only
-    # ``prepare_contiguous`` may set it, and it requires swap_ab +
-    # direct_schedule at a (1, 1) cluster.
+    # The rows are one flat route-major buffer, and ``masked_m`` holds the
+    # segment bases. Only ``prepare_contiguous`` sets this flag. It needs
+    # swap_ab, direct_schedule, and a (1, 1) cluster.
     contiguous_segments: bool = False
 
 
 class PreparedMaskedGroupedGemm(msgspec.Struct, kw_only=True):
-    """Compiled callable plus DLPack arguments kept alive by the Torch tensors."""
+    """The Torch tensors keep the DLPack arguments alive."""
 
     compiled_fn: Any
     a_arg: cute.Tensor
@@ -139,12 +140,12 @@ def _validate(
 
 
 def as_dynamic_cute_tensor(tensor: torch.Tensor, *, leading_dim: int) -> cute.Tensor:
-    """Wrap a torch tensor with its shape/strides left DYNAMIC.
+    """Wrap a torch tensor and keep its shape and strides dynamic.
 
-    Public because a caller sharing one compiled function across layers must
-    wrap that layer's weight exactly the way the compile path wrapped its
-    representative one -- divergent wrapping silently changes the argument's
-    MLIR type.
+    A caller may share one compiled function across layers. It must then wrap
+    every weight the same way as the compile path. A different wrapping changes
+    the argument's MLIR type, and nothing reports the change. This function is
+    public for that reason.
     """
     return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(
         leading_dim=leading_dim
@@ -325,15 +326,17 @@ def prepare_contiguous(
     direct_schedule: torch.Tensor | None = None,
     schedule_tiles: torch.Tensor | None = None,
 ) -> PreparedMaskedGroupedGemm:
-    """Validate, compile, and bind a route-major (contiguous) GEMM launch.
+    """Compile and bind a GEMM launch over one flat route-major row buffer.
 
-    ``a``/``c`` are ONE flat row buffer whose per-expert segments start at
-    ``seg_offsets[e]`` (each an ``m_alignment`` multiple); a host-side
-    ``unsqueeze(0)`` gives them the unit L mode the masked swap_ab wrapper
-    expects, so descriptors, partitioning, and the epilogue are reused
-    verbatim.  ``seg_offsets`` rides the masked_m argument slot: the direct
-    scheduler this mode requires never reads that slot, and the kernel reads it
-    only for the segment-base tile fold.
+    ``a`` and ``c`` are one flat buffer each. The segment of expert ``e``
+    starts at ``seg_offsets[e]``, and every start is a multiple of
+    ``m_alignment``. The host calls ``unsqueeze(0)`` to add the single expert
+    slot that the swap_ab wrapper expects. The descriptors, the partitioning,
+    and the epilogue then stay the same as in the masked path.
+
+    ``seg_offsets`` uses the ``masked_m`` argument slot. The direct scheduler
+    that this mode needs never reads that slot. The kernel reads it only to add
+    the segment base to a tile index.
     """
     if not config.contiguous_segments:
         raise ValueError("prepare_contiguous requires config.contiguous_segments")

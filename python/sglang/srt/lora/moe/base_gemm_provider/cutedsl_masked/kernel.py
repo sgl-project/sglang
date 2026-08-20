@@ -51,29 +51,19 @@ except ImportError:
     )
 
 """
-Physical contract: A ``[E, m_max, K]``, B ``[E, N, K]``, C ``[E, m_max, N]``,
-``masked_m`` ``[E]`` int32 valid row counts; FP32 accumulation. Only
-``C[e, :masked_m[e]]`` is defined -- the final partial CTA tile can overwrite
-padding up to its tile boundary, but the scheduler never launches a CTA wholly
-outside an expert's valid rows. The fixed expert stride lets A/B/C each use one
-3-D TMA descriptor, avoiding an expert-descriptor helper kernel.
+The tensors are A ``[E, m_max, K]``, B ``[E, N, K]``, C ``[E, m_max, N]`` and
+``masked_m`` ``[E]``. Only ``C[e, :masked_m[e]]`` holds defined values. A partial
+tile can write into the padding after those rows. No CTA starts fully outside
+an expert's valid rows.
 
-``contiguous_segments=True`` retargets the same kernel at the route-major
-(DeepGEMM "contiguous") row domain: activation and output are ONE flat row
-buffer (``[1, M_pad_ceiling, K]`` / ``[1, M_pad_ceiling, N]``) whose per-expert
-segments start at ``seg_offsets[e]``, a multiple of the segment alignment. The
-``masked_m`` argument slot then carries ``seg_offsets`` (the direct scheduler
-never reads that slot), the packed schedule keeps its LOCAL per-expert
-token-cluster indices, and the kernel folds
-``global_token_tile = seg_offsets[e] // token_tile + local_tile`` with the
-token/output L coordinate pinned to 0 while the resident weight keeps its true
-expert L index. Because every shipped token tile divides the segment alignment,
-a partial tile's overrun stays inside its expert's own aligned segment
-(``ceil(count/w) * w <= ceil(count/align) * align`` whenever ``w | align``).
+If ``contiguous_segments`` is true, the kernel reads one flat row buffer in
+place of the per-expert slabs. The ``masked_m`` argument then holds
+``seg_offsets``, and the kernel adds that offset to each tile coordinate. Every
+token tile divides the segment alignment, so a partial tile stays inside its own
+segment.
 
-Mainloop and epilogue derive from CUTLASS v4.6.1
-``blackwell/kernel/dense_gemm/dense_gemm_persistent.py``. NVIDIA's original
-BSD-3-Clause license is retained above.
+The mainloop and the epilogue come from CUTLASS v4.6.1
+``blackwell/kernel/dense_gemm/dense_gemm_persistent.py``.
 """
 
 
@@ -140,7 +130,7 @@ class MaskedGroupedGemmKernel:
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
-        # K dimension is deferred in _setup_attributes
+        # The K extent here is a placeholder. _setup_attributes computes it.
         self.mma_tiler_mn = mma_tiler_mn
         self.mma_tiler = (*mma_tiler_mn, 1)
         self.mma_inst_tile_k = mma_inst_tile_k
@@ -153,16 +143,17 @@ class MaskedGroupedGemmKernel:
         self.use_direct_schedule = use_direct_schedule
         self.contiguous_segments = contiguous_segments
         if contiguous_segments and not (swap_ab and use_direct_schedule):
-            # The segment-base fold assumes the token axis is the scheduler's
-            # dynamic-M seen through swap_ab, and only the direct scheduler
-            # leaves the masked_m slot free to carry seg_offsets.
+            # The kernel adds a segment base to the token tile index. Only
+            # swap_ab puts the token axis on the scheduler's M axis. Only the
+            # direct scheduler leaves the masked_m argument free for
+            # seg_offsets.
             raise ValueError(
                 "contiguous_segments requires swap_ab and use_direct_schedule"
             )
         if contiguous_segments and cluster_shape_mn != (1, 1):
-            # Matches the packed schedule's own (1, 1) representability guard
-            # (schedule_builder.dual_stage_schedule_capacities); a real cluster
-            # would also break the local->global tile-index fold.
+            # A cluster larger than (1, 1) breaks the segment-base addition.
+            # The packed schedule has the same (1, 1) rule in
+            # schedule_builder.dual_stage_schedule_capacities.
             raise ValueError("contiguous_segments requires a (1, 1) cluster")
         self.arch = "sm_100"
 
@@ -338,20 +329,19 @@ class MaskedGroupedGemmKernel:
 
         m_max, n, expert_cnt = c.shape
         if cutlass.const_expr(self.contiguous_segments):
-            # The flat route-major output carries a unit L mode, so the true
-            # expert count lives on the resident weight (logical A under the
-            # swap_ab this mode requires).
+            # The flat output has one expert slot only. Take the real expert
+            # count from the weight, which is A under swap_ab.
             expert_cnt = cute.size(a.shape[2])
-        # The K mode may be hierarchical after a layout adapter groups modes;
-        # the scheduler needs its scalar extent.
+        # A layout adapter can group modes, so the K mode may be hierarchical.
+        # The scheduler needs one scalar extent.
         k = cute.size(a.shape[1])
         scheduler_cta_tile = self.cta_tile_shape_mnk
         scheduler_cluster = self.cluster_shape_mn
         scheduler_n = n
         if cutlass.const_expr(self.swap_ab):
-            # The actual MMA is W[Nout,K] @ X[tokens,K]^T. The existing MoE
-            # scheduler can still enumerate it by viewing its dynamic-M axis
-            # as the actual MMA-N token axis and swapping the returned coords.
+            # The MMA computes W[Nout, K] @ X[tokens, K]^T. The scheduler
+            # keeps the token axis on its own M axis. The device code swaps
+            # the two coordinates back.
             scheduler_cta_tile = (
                 self.cta_tile_shape_mnk[1],
                 self.cta_tile_shape_mnk[0],
@@ -435,10 +425,9 @@ class MaskedGroupedGemmKernel:
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
         if cutlass.const_expr(self.produce_pdl):
-            # Signalling at kernel entry lets the dependent consumer take
-            # residency and run its producer-independent prologue during this
-            # GEMM; its griddepcontrol.wait still blocks the first
-            # producer-owned load until this grid's writes are visible.
+            # This signal starts the next kernel at entry. That kernel runs
+            # its prologue while this GEMM runs. Its griddepcontrol.wait still
+            # holds back the first read of the data that this GEMM writes.
             cute.arch.griddepcontrol_launch_dependents()
 
         if warp_idx == self.tma_warp_id:
@@ -653,11 +642,12 @@ class MaskedGroupedGemmKernel:
                     )
                 a_rest_l_coord = mma_tile_coord_mnl[2]
                 if cutlass.const_expr(self.contiguous_segments):
-                    # ``masked_m`` carries seg_offsets here. Fold the expert's
-                    # aligned segment base into the flat token-tile index
-                    # (exact: bases are alignment multiples and the token tile
-                    # divides the alignment), pin the flat token/output tensors
-                    # to their unit L mode, keep the weight's own expert index.
+                    # ``masked_m`` holds seg_offsets here. Add the expert's
+                    # segment base to the token tile index. That division is
+                    # exact. Each base is a multiple of the alignment, and the
+                    # token tile divides the alignment. The flat token and
+                    # output tensors use expert slot 0. Only the weight keeps
+                    # the real expert index.
                     seg_base_tile = (
                         masked_m[work_tile.expert_idx] // self.cta_tile_shape_mnk[1]
                     )
@@ -803,8 +793,8 @@ class MaskedGroupedGemmKernel:
                         work_tile.expert_idx,
                     )
                 if cutlass.const_expr(self.contiguous_segments):
-                    # Same segment-base fold as the TMA warp: the store lands
-                    # at the flat global token tile, L pinned to the unit mode.
+                    # The same segment base as in the TMA warp. The store then
+                    # writes to the flat token tile in expert slot 0.
                     seg_base_tile = (
                         masked_m[work_tile.expert_idx] // self.cta_tile_shape_mnk[1]
                     )
@@ -815,8 +805,8 @@ class MaskedGroupedGemmKernel:
                     )
                 work_tile = tile_sched.advance_to_next_work()
 
-                # This scheduler only enumerates valid tiles, so the
-                # accumulator pipeline state is the authoritative tile count.
+                # This scheduler gives out valid tiles only. The accumulator
+                # pipeline state is therefore the correct tile count.
                 num_tiles_executed = acc_consumer_state.count
                 if cutlass.const_expr(self.use_tma_store):
                     acc_consumer_state = utils.gemm.sm100.epilogue_tma_store(
@@ -1026,7 +1016,8 @@ class MaskedGroupedGemmKernel:
             )
 
     def check_epilog_store_option(self, m: int, n: int):
-        # The non-TMA store has no predication, so it cannot support OOB tiles.
+        # The non-TMA store has no predication. It cannot write a tile that
+        # crosses the end of the tensor.
         cta_tile_shape_mn = (
             self.mma_tiler_mn[0] // (2 if self.use_2cta_instrs else 1),
             self.mma_tiler_mn[1],
@@ -1074,9 +1065,11 @@ def masked_grouped_gemm(
     stream: cuda.CUstream,
     epilogue_op: cutlass.Constexpr = lambda x: x,
 ):
-    """PyTorch-layout adapter: the kernel wants CuTe's logical ``(M, K, E)`` /
-    ``(N, K, E)`` / ``(M, N, E)``. Keeping the resident weight physically
-    ``[E, N, K]`` makes K contiguous for the transposed-B MMA operand.
+    """Map the PyTorch layouts to the logical layouts that the kernel reads.
+
+    The kernel reads A as ``(M, K, E)``, B as ``(N, K, E)``, and C as
+    ``(M, N, E)``. The weight stays ``[E, N, K]`` in memory. K is then
+    contiguous for the transposed B operand.
     """
     a_mke = cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0]))
     b_nke = cute.make_tensor(b.iterator, cute.select(b.layout, mode=[1, 2, 0]))
