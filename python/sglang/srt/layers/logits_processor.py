@@ -67,10 +67,8 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 _is_cpu = is_cpu()
 
-# Denoise rows at which keeping the lm_head dtype starts to pay off on Ascend,
-# where the crossover was measured (~16 blocks of 32; 512 leaves no margin below
-# it because the loss under the crossover is steep -- 9x at one block). Other
-# backends stay on the fp32 path until their own crossover is measured.
+# Ascend crossover for keeping the lm_head dtype. Other backends stay on the
+# fp32 path until their own crossover is measured.
 _NPU_KEEP_LOGITS_DTYPE_MIN_ROWS = 512
 
 
@@ -713,10 +711,9 @@ class LogitsProcessor(nn.Module):
             )
 
         if keep_lm_head_dtype:
-            # Skip the fp32 buffer copy; a [tokens, vocab] fp32 materialization
-            # is what OOMs large dLLM batches (vocab 157k: 112 blocks -> 2.1 GiB
-            # per copy). Callers on this path consume the lm_head-dtype logits
-            # via reductions that never build another [tokens, vocab] fp32.
+            # Skip the fp32 buffer copy: the [tokens, vocab] fp32 materialization
+            # is what OOMs large dLLM batches. Callers here consume the
+            # lm_head-dtype logits via reductions that never build another one.
             #
             # _copy_logits_to_buffer does two things; only the padding trim is
             # reproduced here. Its other job -- publishing into
@@ -936,13 +933,9 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
     ) -> LogitsProcessorOutput:
         assert self.return_full_logits
-        # Keep the lm_head dtype (bf16) once the batch is wide enough. The
-        # denoise algorithms need only per-position argmax + its softmax
-        # probability and reduce for both, so the fp32 [tokens, vocab] copy buys
-        # nothing and is exactly what OOMs a large batch -- but the reduction
-        # that consumes low-precision logits is launch-bound, so below the
-        # threshold the fp32 path is the faster one and there is no memory
-        # pressure to trade against. See SGLANG_DLLM_KEEP_LOGITS_DTYPE_MIN_ROWS.
+        # Above the crossover, keep the lm_head dtype: the denoise algorithms
+        # only reduce, so the fp32 [tokens, vocab] copy buys nothing and OOMs
+        # wide batches. See SGLANG_DLLM_KEEP_LOGITS_DTYPE_MIN_ROWS.
         min_rows = _keep_logits_dtype_min_rows()
         keep_lm_head_dtype = (
             min_rows is not None

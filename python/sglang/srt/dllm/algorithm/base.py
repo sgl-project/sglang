@@ -43,8 +43,7 @@ def argmax_and_softmax_prob(
 
     * a fused single-pass kernel when one is available for this device;
     * ``softmax(logits).gather(argmax)`` when the logits are already an fp32
-      ``[tokens, vocab]`` tensor -- this is the upstream formulation and is
-      bitwise what dLLM did before this path existed;
+      ``[tokens, vocab]`` tensor;
     * otherwise a max reduction plus a vocab-chunked exp-sum, whose transients
       are only ``[tokens, vocab_chunk]``. This is the path that lets a caller
       keep the logits in lm_head dtype and never materialize the fp32
@@ -53,20 +52,14 @@ def argmax_and_softmax_prob(
       fp32 cast internally.
 
     The argmax is identical across all three; the probability differs only by
-    exp's precision in the input dtype (2.8e-4 max relative error on bf16
-    LLaDA2-shaped logits at vocab 157k, with no threshold-decision flips
-    at 0.5).
+    exp's precision in the input dtype.
     """
     if _argmax_softmax_prob_fused is not None:
         # Single-pass fused kernel: one read of the logits vs the 5-6 below.
         return _argmax_softmax_prob_fused(full_logits_2d)
 
     if full_logits_2d.dtype == torch.float32:
-        # The fp32 [tokens, vocab] tensor already exists, so there is nothing
-        # to save by re-reducing it in chunks -- and a fused softmax beats the
-        # chunked loop. Keeps non-NPU dLLM bitwise on its pre-existing path.
-        # Callers that want the memory back hand over lm_head-dtype logits
-        # instead, which lands on the chunked branch below.
+        # The fp32 copy already exists; chunking would save nothing.
         argmax_ids = torch.argmax(full_logits_2d, dim=-1)
         prob = torch.gather(
             torch.softmax(full_logits_2d, dim=-1),

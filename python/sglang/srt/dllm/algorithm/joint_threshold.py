@@ -42,7 +42,7 @@ def joint_threshold_update_step_vectorized(
     if penalty_lambda > 0:
         # The penalty rewrites one logit per position before the argmax, so
         # this branch cannot use the reduction below and keeps the fp32 path.
-        # ``.float()`` is a no-op on fp32 logits (unchanged behaviour); on
+        # ``.float()`` is a no-op on fp32 logits; on
         # lm_head-dtype logits it is the copy the scatter then mutates,
         # keeping the rewrite off a buffer the graph owns.
         logits = full_logits_2d.float().view(B, blk, V)
@@ -55,6 +55,9 @@ def joint_threshold_update_step_vectorized(
             ),
             reduce="add",
         )
+        # Batched form of the per-row path, which keeps decisions bitwise
+        # aligned with it. On NPU this also beats a log-domain max+logsumexp
+        # variant (fused softmax).
         x = torch.argmax(logits, dim=-1)
         p = torch.gather(
             F.softmax(logits, dim=-1), dim=-1, index=x.unsqueeze(-1)

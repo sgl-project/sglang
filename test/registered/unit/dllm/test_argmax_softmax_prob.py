@@ -101,7 +101,7 @@ class TestArgmaxAndSoftmaxProb(CustomTestCase):
         # check above cannot see rounding. Build rows whose top two logits are
         # nearly tied, which puts the argmax probability just above 0.5, and
         # require every decision to match the exact fp32 answer. Exponentiating
-        # in bf16 instead of fp32 gets ~4% of these rows wrong.
+        # in bf16 instead of fp32 flips a measurable fraction of them.
         rows, vocab = 512, 8192
         logits = torch.full((rows, vocab), -30.0)
         logits[:, 0] = 0.0
