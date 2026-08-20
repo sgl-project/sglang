@@ -33,4 +33,14 @@ for _mod, _fn in _TRITON_KERNELS:
     )
 del _mod, _fn
 
+# Torch reference implementations backing the Triton kernels above on
+# devices without Triton (see their device dispatch).
+register_kernel(
+    KernelSpec(
+        op="speculative.chain_speculative_sampling_torch",
+        backend=KernelBackend.TORCH,
+        target="sglang.kernels.ops.speculative.reject_sampling:chain_speculative_sampling_torch",
+    )
+)
+
 __all__ = []
