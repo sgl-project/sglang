@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.gdn_attention import (
@@ -373,6 +374,18 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         linear_attn_decode_backend="flashinfer",
         linear_attn_prefill_backend="flashinfer",
     )
+    CAKE_CP_PREFILL_CASE = GDNAttentionCase(
+        name="flashinfer_cake_gdn_tp4_cp_prefill_b1_s128",
+        backend="flashinfer",
+        forward_mode=ForwardMode.EXTEND,
+        num_k_heads=4,
+        num_v_heads=8,
+        page_size=16,
+        prefix_lens=(4,),
+        extend_lens=(128,),
+        linear_attn_decode_backend="flashinfer",
+        linear_attn_prefill_backend="flashinfer",
+    )
     CAKE_VERIFY_CASE = GDNAttentionCase(
         name="flashinfer_cake_gdn_tp4_verify_b8_t4",
         backend="flashinfer",
@@ -392,6 +405,13 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
         except ImportError:
             self.skipTest("public FlashInfer Cake GDN loader is unavailable")
         return cake_gdn_noncp_decode
+
+    def _cake_cp_api_or_skip(self):
+        try:
+            from flashinfer.jit import cake_gdn_cp_prefill
+        except ImportError:
+            self.skipTest("public FlashInfer Cake GDN CP loader is unavailable")
+        return cake_gdn_cp_prefill
 
     def test_cake_exact_decode_eager_and_cuda_graph(self):
         cake_api = self._cake_api_or_skip()
@@ -449,6 +469,103 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             fixture.forward_batch.extend_seq_lens_cpu,
         )
         self.assertEqual(extend.call_args.kwargs["layer_id"], 0)
+        torch.testing.assert_close(
+            actual, expected.output, atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            _ssm_states(fixture)[cache_indices],
+            expected.final_states[cache_indices],
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+        # Prepare all stream-local Cake buffers before capture, then prove that
+        # the same admitted non-CP route captures and replays on a caller stream.
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        _ssm_states(fixture).copy_(initial_ssm_states)
+        with (
+            torch.no_grad(),
+            torch.cuda.stream(capture_stream),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
+        ):
+            fixture.backend.init_forward_metadata(fixture.forward_batch)
+            fixture.actual_module(
+                fixture.forward_batch,
+                fixture.mixed_qkv,
+                fixture.a,
+                fixture.b,
+            )
+        capture_stream.synchronize()
+
+        _ssm_states(fixture).copy_(initial_ssm_states)
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with (
+            torch.no_grad(),
+            torch.cuda.stream(capture_stream),
+            forward_context(ForwardContext(attn_backend=fixture.backend)),
+        ):
+            with torch.cuda.graph(graph):
+                graph_output = fixture.actual_module(
+                    fixture.forward_batch,
+                    fixture.mixed_qkv,
+                    fixture.a,
+                    fixture.b,
+                )
+        capture_stream.synchronize()
+
+        _ssm_states(fixture).copy_(initial_ssm_states)
+        torch.cuda.current_stream().synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            graph_output, expected.output, atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            _ssm_states(fixture)[cache_indices],
+            expected.final_states[cache_indices],
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+    def test_public_auto_cp_prefill_is_not_intercepted(self):
+        cake_api = self._cake_api_or_skip()
+        cake_cp_api = self._cake_cp_api_or_skip()
+        from flashinfer.gdn_kernels.blackwell import cake_gdn_cp_prefill
+
+        fixture = build_gdn_attention_fixture(
+            self,
+            self.CAKE_CP_PREFILL_CASE,
+            head_k_dim=self.HEAD_DIM,
+            head_v_dim=self.HEAD_DIM,
+            max_context_len=256,
+        )
+        initial_ssm_states = _ssm_states(fixture).clone()
+        with (
+            mock.patch.object(
+                cake_api,
+                "select_cake_gdn_prefill_variant",
+                wraps=cake_api.select_cake_gdn_prefill_variant,
+            ) as noncp_selector,
+            mock.patch.object(
+                cake_api,
+                "load_cake_gdn_kernel",
+                wraps=cake_api.load_cake_gdn_kernel,
+            ) as noncp_loader,
+            mock.patch.object(
+                cake_gdn_cp_prefill,
+                "load_cake_gdn_cp_kernel",
+                wraps=cake_cp_api.load_cake_gdn_cp_kernel,
+            ) as cp_loader,
+        ):
+            actual = run_gdn_fixture_eager(fixture)
+        expected = _pure_torch_gdn_reference(fixture, initial_ssm_states)
+        cache_indices = _cache_indices(fixture)
+
+        noncp_selector.assert_not_called()
+        noncp_loader.assert_not_called()
+        self.assertGreater(cp_loader.call_count, 0)
         torch.testing.assert_close(
             actual, expected.output, atol=1e-2, rtol=1e-2
         )
