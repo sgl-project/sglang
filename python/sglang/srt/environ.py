@@ -565,15 +565,9 @@ class Envs:
     # fall back to the per-free eager compaction. Used for production
     # A/B and quick rollback. Default False (lazy compaction on).
     SGLANG_DISABLE_LAZY_COMPACTION = EnvBool(False)
-    # Minimum dLLM FDFO reuse rows for fetching the retained KV blocks with one
-    # flat index op instead of a slice per row. The batched path trades one kernel
-    # launch per row for a fixed index build + H2D, so it wins on wide batches and
-    # loses on narrow ones; the row count gates it per round, so a small-batch
-    # latency deployment keeps the per-row path either way. Unset (default) takes
-    # the backend's measured break-even: 8 on Ascend (measured ~6; at 128 rows
-    # 5.7 ms per-row versus 0.3 ms batched), and never on backends where it has
-    # not been measured. Set it to the break-even you measure to override, or to
-    # -1 to disable the batched path outright (production A/B and quick rollback).
+    # Minimum dLLM FDFO reuse rows for gathering the retained KV blocks with one
+    # flat index op instead of a slice per row. Unset takes the backend default
+    # (Ascend only); -1 disables the batched path.
     SGLANG_DLLM_BATCHED_GATHER_MIN_ROWS = EnvInt(None)
     # Periodically log lazy-compaction stats per sub-pool (observability only).
     SGLANG_LOG_LAZY_COMPACTION_STATS = EnvBool(False)
