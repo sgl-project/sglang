@@ -77,7 +77,7 @@ def maybe_build_flashinfer_checkpoint_plan(
         device, non_blocking=True
     )
     forward_metadata.state_checkpoint_cu_starts = checkpoint_cu_starts.to(
-        device, non_blocking=True
+        device=device, dtype=torch.int32, non_blocking=True
     )
     forward_metadata.num_state_checkpoints = int(checkpoint_cu_starts[-1])
     forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
@@ -186,6 +186,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         self._cake_gdn_entries = {}
         self._cake_gdn_outputs = {}
         self._cake_gdn_prefill_outputs = {}
+        self._cake_gdn_prefill_checkpoints = {}
         self._cake_gdn_prefill_workspaces = {}
         self._cake_gdn_prefill_dummies = {}
         self._cake_gdn_dt_bias_fp32 = {}
@@ -436,6 +437,42 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             self._cake_gdn_prefill_workspaces[key] = workspace
         return workspace
 
+    def _cake_prefill_checkpoint_buffer(
+        self,
+        q: torch.Tensor,
+        *,
+        layer_id: int,
+        num_state_checkpoints: int,
+        num_v_heads: int,
+        state_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return a reusable checkpoint buffer on the caller stream."""
+
+        stream_handle = int(torch.cuda.current_stream(q.device).cuda_stream)
+        key = (
+            q.device.index,
+            stream_handle,
+            layer_id,
+            num_v_heads,
+            state_dtype,
+        )
+        checkpoints = self._cake_gdn_prefill_checkpoints.get(key)
+        required_shape = (num_state_checkpoints, num_v_heads, 128, 128)
+        if checkpoints is None or any(
+            actual < required
+            for actual, required in zip(checkpoints.shape, required_shape)
+        ):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Cake GDN prefill checkpoints were not prepared before "
+                    "CUDA Graph capture"
+                )
+            checkpoints = torch.empty(
+                required_shape, dtype=state_dtype, device=q.device
+            )
+            self._cake_gdn_prefill_checkpoints[key] = checkpoints
+        return checkpoints[:num_state_checkpoints]
+
     def _cake_prefill_dummy_buffers(
         self, q: torch.Tensor, *, state_dtype: torch.dtype
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -464,6 +501,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         state: torch.Tensor,
         state_indices: torch.Tensor,
         cu_seqlens: torch.Tensor,
+        state_checkpoint_cu_starts: Optional[torch.Tensor],
         seq_lens_cpu: Optional[list[int]],
         layer_id: Optional[int],
         num_state_checkpoints: int,
@@ -476,8 +514,6 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             or self._flashinfer_gdn_should_use_cp_host is None
             or layer_id is None
             or not seq_lens_cpu
-            or num_state_checkpoints != 0
-            or state_checkpoint_every_n_tokens != 0
         ):
             return None
         total_tokens, num_q_heads, head_size = q.shape
@@ -485,6 +521,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         num_v_heads = v.shape[1]
         num_seqs = len(seq_lens_cpu)
         max_seq_len = max(seq_lens_cpu)
+        enable_checkpoints = state_checkpoint_every_n_tokens > 0
         tensors = (q, k, v, alpha, beta, state, state_indices, cu_seqlens)
         if (
             head_size != 128
@@ -517,6 +554,27 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             or state.stride(0) < num_v_heads * 128 * 128
         ):
             return None
+        if enable_checkpoints:
+            expected_checkpoint_counts = tuple(
+                seq_len // state_checkpoint_every_n_tokens
+                for seq_len in seq_lens_cpu
+            )
+            if (
+                num_state_checkpoints != sum(expected_checkpoint_counts)
+                or state_checkpoint_every_n_tokens % 64 != 0
+                or state_checkpoint_cu_starts is None
+                or state_checkpoint_cu_starts.device != q.device
+                or state_checkpoint_cu_starts.dtype != torch.int32
+                or tuple(state_checkpoint_cu_starts.shape) != (num_seqs + 1,)
+                or not state_checkpoint_cu_starts.is_contiguous()
+            ):
+                return None
+        elif (
+            num_state_checkpoints != 0
+            or state_checkpoint_every_n_tokens != 0
+            or state_checkpoint_cu_starts is not None
+        ):
+            return None
         if self._flashinfer_gdn_should_use_cp_host(
             num_seqs * num_v_heads,
             self._flashinfer_gdn_num_sms,
@@ -541,8 +599,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 num_v_heads=num_v_heads,
                 use_initial_state=True,
                 store_final_state=True,
-                checkpoint_every_n_tokens=0,
+                checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
                 use_state_indices=True,
+                seq_lens=tuple(seq_lens_cpu),
             )
         except self._cake_gdn_api.CakeGDNUnsupportedError:
             return None
@@ -578,6 +637,17 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         empty_state, empty_i32 = self._cake_prefill_dummy_buffers(
             q, state_dtype=state.dtype
         )
+        state_checkpoints = (
+            self._cake_prefill_checkpoint_buffer(
+                q,
+                layer_id=layer_id,
+                num_state_checkpoints=num_state_checkpoints,
+                num_v_heads=num_v_heads,
+                state_dtype=state.dtype,
+            )
+            if enable_checkpoints
+            else empty_state
+        )
         entry(
             q,
             k,
@@ -589,12 +659,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             state_indices,
             state,
             state,
-            empty_state,
-            empty_i32,
+            state_checkpoints,
+            state_checkpoint_cu_starts if enable_checkpoints else empty_i32,
             workspace,
             state.stride(0),
             state.stride(0),
-            0,
+            state_checkpoint_every_n_tokens,
             128**-0.5,
             num_seqs,
             num_q_heads,
@@ -607,7 +677,8 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         if route.route_id not in self._cake_gdn_logged_routes:
             self._cake_gdn_logged_routes.add(route.route_id)
             logger.info("Using %s", route.route_id)
-        return output.view(1, total_tokens, num_v_heads, 128)
+        h = state_checkpoints.unsqueeze(0) if enable_checkpoints else None
+        return output.view(1, total_tokens, num_v_heads, 128), h
 
     def _try_cake_decode(
         self,
@@ -871,13 +942,15 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             state=ssm_states,
             state_indices=cache_indices,
             cu_seqlens=query_start_loc,
+            state_checkpoint_cu_starts=state_checkpoint_cu_starts,
             seq_lens_cpu=kwargs.get("seq_lens_cpu"),
             layer_id=kwargs.get("layer_id"),
             num_state_checkpoints=num_state_checkpoints,
             state_checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
         )
         if output_cake is not None:
-            return output_cake, None, None
+            core_attn_out, h = output_cake
+            return core_attn_out, None, h
 
         if self.use_state_pool:
             # Negative indices (e.g. -1) are padding markers for slots not yet

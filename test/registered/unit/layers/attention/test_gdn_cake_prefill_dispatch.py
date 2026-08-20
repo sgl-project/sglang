@@ -37,6 +37,7 @@ def _kernel_and_inputs():
     kernel._cake_gdn_arch = "sm_100a"
     kernel._cake_gdn_entries = {"prefill_bf16_indexed": entry}
     kernel._cake_gdn_logged_routes = set()
+    kernel._cake_gdn_prefill_checkpoints = {}
     kernel._flashinfer_gdn_should_use_cp_host = MagicMock(return_value=False)
     kernel._flashinfer_gdn_num_sms = 148
     kernel._flashinfer_gdn_device_name = "NVIDIA B200"
@@ -70,6 +71,7 @@ def _kernel_and_inputs():
         state=state,
         state_indices=state_indices,
         cu_seqlens=cu_seqlens,
+        state_checkpoint_cu_starts=None,
         seq_lens_cpu=[64] * 5,
         layer_id=7,
         num_state_checkpoints=0,
@@ -86,7 +88,9 @@ class TestCakeGDNPrefillDispatch(unittest.TestCase):
 
         result = kernel._try_cake_prefill(**inputs)
 
-        self.assertEqual(tuple(result.shape), (1, 320, 8, 128))
+        core_attn_out, h = result
+        self.assertEqual(tuple(core_attn_out.shape), (1, 320, 8, 128))
+        self.assertIsNone(h)
         api.select_cake_gdn_prefill_variant.assert_called_once_with(
             arch="sm_100a",
             io_dtype="bfloat16",
@@ -101,6 +105,7 @@ class TestCakeGDNPrefillDispatch(unittest.TestCase):
             store_final_state=True,
             checkpoint_every_n_tokens=0,
             use_state_indices=True,
+            seq_lens=(64, 64, 64, 64, 64),
         )
         entry.assert_called_once()
         args = entry.call_args.args
@@ -123,10 +128,76 @@ class TestCakeGDNPrefillDispatch(unittest.TestCase):
         api.select_cake_gdn_prefill_variant.assert_not_called()
         entry.assert_not_called()
 
+    def test_exact_b7_checkpoint_row_returns_cached_intermediate_states(self):
+        kernel, api, entry, inputs, _, workspace, _, _ = _kernel_and_inputs()
+        seq_lens = [52, 93, 15, 107, 72, 61, 21]
+        total_tokens = sum(seq_lens)
+        q = torch.empty(total_tokens, 4, 128, dtype=torch.bfloat16)
+        k = torch.empty_like(q)
+        v = torch.empty(total_tokens, 8, 128, dtype=torch.bfloat16)
+        output = torch.empty_like(v)
+        checkpoints = torch.empty(3, 8, 128, 128, dtype=torch.bfloat16)
+        checkpoint_cu_starts = torch.tensor(
+            [0, 0, 1, 1, 2, 3, 3, 3], dtype=torch.int32
+        )
+        inputs.update(
+            q=q,
+            k=k,
+            v=v,
+            alpha=torch.empty(total_tokens, 8, dtype=torch.float32),
+            beta=torch.empty(total_tokens, 8, dtype=torch.float32),
+            state_indices=torch.tensor([5, 3, 1, 6, 2, 4, 0], dtype=torch.int32),
+            cu_seqlens=torch.tensor(
+                [0, 52, 145, 160, 267, 339, 400, 421], dtype=torch.int32
+            ),
+            state_checkpoint_cu_starts=checkpoint_cu_starts,
+            seq_lens_cpu=seq_lens,
+            num_state_checkpoints=3,
+            state_checkpoint_every_n_tokens=64,
+        )
+        kernel._cake_prefill_output_buffer.return_value = output
+        kernel._cake_prefill_checkpoint_buffer = MagicMock(
+            return_value=checkpoints
+        )
+
+        core_attn_out, h = kernel._try_cake_prefill(**inputs)
+
+        self.assertEqual(tuple(core_attn_out.shape), (1, 421, 8, 128))
+        self.assertEqual(h.data_ptr(), checkpoints.data_ptr())
+        self.assertEqual(tuple(h.shape), (1, 3, 8, 128, 128))
+        api.select_cake_gdn_prefill_variant.assert_called_once_with(
+            arch="sm_100a",
+            io_dtype="bfloat16",
+            state_dtype="bfloat16",
+            num_seqs=7,
+            total_seq_len=421,
+            max_seq_len=107,
+            num_q_heads=4,
+            num_k_heads=4,
+            num_v_heads=8,
+            use_initial_state=True,
+            store_final_state=True,
+            checkpoint_every_n_tokens=64,
+            use_state_indices=True,
+            seq_lens=(52, 93, 15, 107, 72, 61, 21),
+        )
+        args = entry.call_args.args
+        self.assertIs(args[10], checkpoints)
+        self.assertIs(args[11], checkpoint_cu_starts)
+        self.assertIs(args[12], workspace)
+        self.assertEqual(args[15], 64)
+
     def test_checkpoint_and_missing_cpu_metadata_fail_closed(self):
         for override in (
             {"num_state_checkpoints": 1},
             {"state_checkpoint_every_n_tokens": 64},
+            {
+                "num_state_checkpoints": 1,
+                "state_checkpoint_every_n_tokens": 64,
+                "state_checkpoint_cu_starts": torch.tensor(
+                    [0, 1, 1, 1, 1, 1], dtype=torch.int64
+                ),
+            },
             {"seq_lens_cpu": None},
         ):
             with self.subTest(override=override):
