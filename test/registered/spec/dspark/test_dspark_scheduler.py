@@ -9,6 +9,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
+    DSparkVerifyPlanner,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
     compute_verify_token_budget,
@@ -552,6 +553,19 @@ class TestBudgetTierSelection(CustomTestCase):
                 model_runner=model_runner,
             )
         )
+
+
+class TestForcedBudgetVerifyAllTransition(CustomTestCase):
+    def test_forced_budget_disables_and_restores_verify_all_fast_path(self):
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner._is_verify_all = True
+        planner._budget_planner = types.SimpleNamespace(forced_budget_frac=None)
+
+        self.assertTrue(planner.is_verify_all)
+        planner.set_forced_budget_frac(0.75)
+        self.assertFalse(planner.is_verify_all)
+        planner.set_forced_budget_frac(None)
+        self.assertTrue(planner.is_verify_all)
 
 
 if __name__ == "__main__":

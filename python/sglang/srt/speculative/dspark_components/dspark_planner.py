@@ -227,7 +227,10 @@ class DSparkVerifyPlanner:
 
     @property
     def is_verify_all(self) -> bool:
-        return self._is_verify_all
+        return self._is_verify_all and (
+            self._budget_planner is None
+            or self._budget_planner.forced_budget_frac is None
+        )
 
     @property
     def mode_value(self) -> str:
@@ -417,7 +420,7 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+        if self.is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
             # the per-step schedule and its host<->device round-trips.
