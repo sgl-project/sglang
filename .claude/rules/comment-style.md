@@ -10,9 +10,10 @@ paths:
 
 # Comment Style
 
-Applies to `#` and `//` comments and to docstrings, in Python, CUDA/C++, and Rust
-alike. Comments are reviewed like code, with the burden of proof reversed: the
-author justifies a comment's existence, not the reviewer its removal.
+Applies to `#` and `//` comments, Python docstrings, and C/C++ Doxygen blocks
+(`///`, `/** ... */`) -- Python, CUDA/C++, and Rust alike. Comments are reviewed
+like code, with the burden of proof reversed: the author justifies a comment's
+existence, not the reviewer its removal.
 
 **The test.** Delete the comment. If someone familiar with the repo can recover
 the fact from the surrounding code plus a grep, it stays deleted.
@@ -114,8 +115,8 @@ has neither the PR nor the discussion.
 
 ## Form
 
-Governs `#` / `//` comments; docstring length and placement follow the Docstrings
-section. ASCII-and-English applies to both.
+Governs `#` / `//` comments; the length and placement of documentation blocks
+follow the section below. ASCII-and-English applies to both.
 
 - **One or two lines.** A genuinely intricate invariant may run longer; that is
   a rare exception, not a licence.
@@ -140,15 +141,24 @@ occurrences are grandfathered and get folded into these when the line is touched
   never retired. `TODO(perf)` and similar topic tags are acceptable when the work
   is a standing category rather than one person's task.
 
-## Docstrings
+## API documentation blocks
 
-Docstrings are part of the product on the surfaces users and integrators touch,
-and noise everywhere else. Where they are warranted they may run past two lines;
-everything else in this file still applies to them.
+Python docstrings and Doxygen blocks are part of the product on the surfaces
+users, integrators, and tooling read, and noise everywhere else. Where warranted
+they may run past two lines; every other rule in this file still applies.
 
 - **Yes:** `Engine` and entrypoint public methods, `ServerArgs` help text, base
   classes third parties subclass (attention backends, quant methods, model
   extension points), and `sgl-kernel` op signatures -- where the shape/dtype
   contract is the documentation.
-- **No:** internal helpers, overrides, private methods. Never auto-generate
-  `Args:` / `Returns:` blocks for a three-line function.
+- **Yes:** exported C++ / CUDA entities, as Doxygen with `\brief` / `\param` /
+  `\tparam` / `\return`. clangd renders these on hover, driven by
+  `CommentFormat: Doxygen`, so the per-parameter enumeration is the
+  caller-facing contract rather than filler.
+- **Yes:** a bug-regression test, stating in one or two lines which black-box
+  behavior must not come back -- the live constraint, not the incident. Root
+  cause and repro belong in the issue and the PR
+  (see `.claude/rules/unit-test-admission.md`).
+- **No:** internal helpers, overrides, private methods. Never hand-write or
+  generate Python `Args:` / `Returns:` blocks -- the signature and its type
+  hints already carry the names and types.
