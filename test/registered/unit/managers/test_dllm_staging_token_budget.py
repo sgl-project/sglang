@@ -6,9 +6,6 @@ per staging row every round, so long-output workloads drive it negative long
 before the KV pool fills). Uncapped, the fallback can grant a staging row more
 than ``block_size`` tokens, producing a variable-length row that crashes the
 denoise algorithms' uniform-block reshape (``view(B, block_size)``).
-
-The fallback must grant a whole block or nothing: a sub-block grant is just as
-unusable as an oversized one, since ``view(B, block_size)`` admits neither.
 """
 
 import unittest
@@ -72,7 +69,6 @@ class TestDllmStagingTokenBudgetFallbackCap(CustomTestCase):
         self.assertEqual(adder._get_dllm_remain_tokens(), 0)
 
     def test_fallback_refuses_a_zero_dllm_budget(self):
-        # Nothing left to grant at all.
         adder = _make_adder(
             rem_dllm_tokens=0,
             dllm_block_size=self.BLOCK_SIZE,
@@ -90,8 +86,8 @@ class TestDllmStagingTokenBudgetFallbackCap(CustomTestCase):
         self.assertEqual(adder._get_dllm_remain_tokens(), self.BLOCK_SIZE)
 
     def test_normal_budget_path_is_unaffected(self):
-        # With rem_total_tokens still positive the pre-existing
-        # min(rem_dllm, block, total) result must be unchanged by the cap.
+        # Positive rem_total_tokens: min(rem_dllm, block, total), unchanged
+        # by the cap.
         adder = _make_adder(
             rem_dllm_tokens=4096,
             dllm_block_size=self.BLOCK_SIZE,
