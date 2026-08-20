@@ -2205,7 +2205,9 @@ export const Playground = ({ config }) => {
   // base cell itself or a sibling (different strategy). A sibling match
   // still shows Verified, plus a "switch base" link.
   const matchedCell = baseCell
-    ? findMatchingCell(config.cells, base, pgEnvLatest, pgFlagsLatest)
+    ? findMatchingCell(
+        config.cells.map((c) => withOverlay(c, { ...base, ...c.match })),
+        base, pgEnvLatest, pgFlagsLatest)
     : null;
   const playgroundVerified = !!(matchedCell && matchedCell.verified);
   const matchedSiblingCell = (matchedCell

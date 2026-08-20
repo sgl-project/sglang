@@ -69,6 +69,9 @@ const playgroundSource = readFileSync(join(SNIPPETS, "_playground.jsx"), "utf8")
 if (/\bmatchedCell\s*!==\s*baseCell\b/.test(playgroundSource)) {
   fail("_playground.jsx", "sibling detection compares cloned cells by object identity");
 }
+if (/findMatchingCell\(config\.cells,/.test(playgroundSource)) {
+  fail("_playground.jsx", "verified detection compares effective flags with raw cells");
+}
 
 // --------------------------------------------------------------- 3/4. Configs
 // Configs are .jsx with a single `export const config` literal; import them
