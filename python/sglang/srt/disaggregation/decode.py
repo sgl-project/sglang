@@ -760,6 +760,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         return resumed_reqs
 
+    @scheduler_nvtx_method("scheduler.pd.update_handshake_waiters")
     def _update_handshake_waiters(
         self,
         rids_to_check: Optional[List[str]] = None,
@@ -1011,6 +1012,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             for decode_req, prefill_dp_rank in resolved:
                 decode_req.kv_receiver.init(prefill_dp_rank)
 
+    @scheduler_nvtx_method("scheduler.pd.pop_preallocated")
     def pop_preallocated(
         self,
         rids_to_check: Optional[List[str]] = None,
@@ -2063,6 +2065,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.time_stats.set_wait_queue_entry_time()
         return
 
+    @scheduler_nvtx_method("scheduler.pd.transfer.poll_with_metadata_gate")
     def _poll_with_metadata_gate(self) -> List[int]:
         pollers = (
             [HiCacheRestoreGatedKVReceiver(dr) for dr in self.queue]
@@ -2097,6 +2100,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
         kv_manager._staging_handler = self.staging_handler
 
+    @scheduler_nvtx_method("scheduler.pd.pop_transferred")
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
         if not self.queue:
             return []

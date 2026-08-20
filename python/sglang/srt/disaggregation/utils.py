@@ -24,6 +24,7 @@ from sglang.srt.configs.model_config import get_dsa_index_topk
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_npu
+from sglang.srt.utils.nvtx_utils import scheduler_nvtx_range
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -166,7 +167,8 @@ def poll_and_all_reduce(
     server_args: Optional[ServerArgs] = None,
 ):
     # at a certain prob, the poll is failed to simulate failure
-    polls = _poll_with_failure_injection(pollers)
+    with scheduler_nvtx_range("scheduler.pd.transfer.poll_local"):
+        polls = _poll_with_failure_injection(pollers)
 
     # Apply metadata gate on the decode requests to downgrade Success → Transferring for requests whose metadata hasn't landed.
     if (
@@ -174,10 +176,14 @@ def poll_and_all_reduce(
         and metadata_buffers is not None
         and server_args is not None
     ):
-        _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args)
-    tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
-    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
-    return tensor_to_reduce.tolist()
+        with scheduler_nvtx_range("scheduler.pd.transfer.metadata_gate"):
+            _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args)
+    with scheduler_nvtx_range("scheduler.pd.transfer.poll_tensor_pack"):
+        tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
+    with scheduler_nvtx_range("scheduler.pd.transfer.poll_all_reduce"):
+        dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
+    with scheduler_nvtx_range("scheduler.pd.transfer.poll_tensor_unpack"):
+        return tensor_to_reduce.tolist()
 
 
 def poll_and_all_reduce_attn_cp_tp_group(

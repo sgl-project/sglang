@@ -100,6 +100,15 @@
     "change": "When scheduler NVTX is explicitly enabled, label every symmetric DP gather and ready-mask poll with its shared generation and rank, and emit the preceding P/D queue/admission counts. Default execution remains profiler-gated.",
     "scope": "Diagnostic source only; generation-exact attribution must pass all-rank matched-B and observer-overhead gates before use."
   },
+  "layer2_transfer_substage_nvtx_overlay": {
+    "parent_commit": "ca969e92cc84652b9db39f762ee1f8d8d1241d58fe",
+    "files": {
+      "python/sglang/srt/disaggregation/decode.py": "232e812fcabd813d8440b9b17f09158f0af1fa5ba22c13cf025b17fa9e5a9582",
+      "python/sglang/srt/disaggregation/utils.py": "584a2ba5364b94599c3daa60c48be0f9f2734687766f441a857e7ba8f3226e3a"
+    },
+    "change": "Split the generation-exact P-to-D admission path into profiler-gated preallocation, handshake, local transfer poll, metadata gate, CPU Gloo all-reduce, tensor pack/unpack, and transfer-commit ranges without changing their order or data flow.",
+    "scope": "Diagnostic source only; no production optimization or performance claim."
+  },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",
     "tree": "b0161fbca98775c0f79999f4970de1f14a4426fb"
