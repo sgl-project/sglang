@@ -17,6 +17,7 @@ import torch
 from diffusers.utils import SAFE_WEIGHTS_INDEX_NAME
 from torch import nn
 
+from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
     _patch_nunchaku_scales,
@@ -42,7 +43,6 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_quant_config,
     get_quant_config_from_safetensors_metadata,
 )
-from sglang.srt.layers.quantization import QuantizationConfig
 
 logger = init_logger(__name__)
 
@@ -742,13 +742,13 @@ def _resolve_quant_config(
         if server_args.quantization == "modelslim":
             return get_quant_config(hf_config, component_model_path)
 
-        # Online-quant convention: for `fp8` and `mxfp4`, a no-arg
-        # QuantizationConfig() selects the post-load path -- weights load
-        # in source dtype and are quantized in
+        # Online-quant convention: for `fp8`, `mxfp4` and `kitchen_int8`, a
+        # no-arg QuantizationConfig() selects the post-load path -- weights
+        # load in source dtype and are quantized in
         # process_weights_after_loading.
         quant_cls = get_quantization_config(server_args.quantization)
         quant_kwargs = {}
-        if server_args.quantization in {"fp8", "mxfp4"}:
+        if server_args.quantization in {"fp8", "mxfp4", "kitchen_int8"}:
             quant_kwargs["ignored_layers"] = getattr(
                 server_args, "quantization_ignored_layers", None
             )
