@@ -14,8 +14,7 @@ from typing import Any
 
 import numpy as np
 
-KV_RESHARD_PROTOCOL = "KV_RESHARD_V1"
-KV_RESHARD_SCHEMA_VERSION = 1
+KV_RESHARD_PROTOCOL = "KV_RESHARD"
 
 
 class KVReshardCompatibilityError(RuntimeError):
@@ -266,6 +265,7 @@ class KVReshardRuntime:
                     ),
                     address=address,
                     nbytes=nbytes,
+                    worker_id=str(self.participant_id),
                     endpoint=session_id,
                     device=f"cuda:{self.kv_args.gpu_id}",
                     itemsize=self.itemsize,
@@ -299,32 +299,18 @@ class KVReshardRuntime:
         tp_size: int,
     ):
         from mooncake.reshard.kv_cache import (
-            KVCachePlacementManifest,
-            KVCacheTopology,
-            KVCacheTopologyParticipant,
+            assemble_kv_cache_placement,
             kv_cache_part_from_json,
         )
 
         parsed = tuple(kv_cache_part_from_json(value) for value in parts)
         if not parsed:
             raise KVReshardCompatibilityError("KV reshard placement has no parts")
-        first = parsed[0]
-        topology = KVCacheTopology(
+        return assemble_kv_cache_placement(
+            parsed,
             dp_size=dp_size,
             pp_size=pp_size,
             tp_size=tp_size,
-            participants=tuple(
-                KVCacheTopologyParticipant(part.participant_id, part.rank)
-                for part in parsed
-            ),
-        )
-        return KVCachePlacementManifest(
-            resource_id=first.resource_id,
-            revision=first.revision,
-            placement_set_id=first.placement_set_id,
-            topology=topology,
-            descriptor=first.descriptor,
-            parts=parsed,
         )
 
     @staticmethod
@@ -389,7 +375,7 @@ class KVReshardRuntime:
         self._complete_placement = placement
         return placement
 
-    def plan_decode_routes(
+    def plan_target_routes(
         self,
         *,
         source_placement_json: str,
@@ -403,6 +389,11 @@ class KVReshardRuntime:
 
         source = kv_cache_placement_from_json(source_placement_json)
         target = self.complete_local_placement()
+        if len(source.dp_ranks) != 1:
+            raise KVReshardCompatibilityError(
+                "SGLang PD bootstrap must select exactly one source DP replica"
+            )
+        source_dp_rank = source.dp_ranks[0]
         fanout: dict[str, int] = {part.participant_id: 0 for part in source.parts}
         local_plan = None
         for target_part in target.parts:
@@ -410,6 +401,7 @@ class KVReshardRuntime:
                 source,
                 target,
                 target_part.participant_id,
+                source_dp_rank=source_dp_rank,
             )
             if target_part.participant_id == self.participant_id:
                 local_plan = plan
@@ -417,7 +409,7 @@ class KVReshardRuntime:
                 fanout[writer] = fanout.get(writer, 0) + 1
         if local_plan is None:
             raise KVReshardCompatibilityError(
-                f"complete Decode placement omits {self.participant_id}"
+                f"complete target placement omits {self.participant_id}"
             )
         infos = []
         for writer in local_plan.source_participant_ids:
@@ -648,7 +640,7 @@ def encode_wire_json(value: Mapping[str, Any]) -> bytes:
 def decode_wire_json(value: bytes) -> dict[str, Any]:
     payload = json.loads(value.decode())
     if not isinstance(payload, dict):
-        raise TypeError("KV_RESHARD_V1 payload must be an object")
+        raise TypeError("KV_RESHARD payload must be an object")
     return payload
 
 
@@ -666,7 +658,6 @@ def record_writer_completion(
 
 __all__ = [
     "KV_RESHARD_PROTOCOL",
-    "KV_RESHARD_SCHEMA_VERSION",
     "KVReshardCompatibilityError",
     "KVReshardRoutePlan",
     "KVReshardRuntime",

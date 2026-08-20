@@ -549,7 +549,6 @@ class CommonKVManager(BaseKVManager):
             return True
 
         kv_reshard_capability = False
-        kv_reshard_schema_version = 0
         info: PrefillServerInfo = None
         try:
             url = (
@@ -561,9 +560,6 @@ class CommonKVManager(BaseKVManager):
             if response.status_code == 200:
                 data = response.json()
                 kv_reshard_capability = bool(data.pop("kv_reshard_capability", False))
-                kv_reshard_schema_version = int(
-                    data.pop("kv_reshard_schema_version", 0)
-                )
                 info = PrefillServerInfo(**data)
             else:
                 logger.error(
@@ -606,15 +602,11 @@ class CommonKVManager(BaseKVManager):
         if self.enable_kv_reshard:
             from sglang.srt.disaggregation.mooncake.kv_reshard import (
                 KV_RESHARD_PROTOCOL,
-                KV_RESHARD_SCHEMA_VERSION,
             )
 
-            if (
-                not kv_reshard_capability
-                or kv_reshard_schema_version != KV_RESHARD_SCHEMA_VERSION
-            ):
+            if not kv_reshard_capability:
                 raise RuntimeError(
-                    f"Prefill does not advertise a compatible {KV_RESHARD_PROTOCOL} "
+                    f"Prefill does not advertise {KV_RESHARD_PROTOCOL} "
                     "manifest capability"
                 )
             if info.attn_cp_size != 1:
@@ -780,14 +772,9 @@ class CommonKVManager(BaseKVManager):
         if getattr(self, "enable_kv_reshard", False):
             from mooncake.reshard.kv_cache import kv_cache_part_to_json
 
-            from sglang.srt.disaggregation.mooncake.kv_reshard import (
-                KV_RESHARD_SCHEMA_VERSION,
-            )
-
             payload.update(
                 {
                     "kv_reshard_capability": True,
-                    "kv_reshard_schema_version": KV_RESHARD_SCHEMA_VERSION,
                     "kv_reshard_placement_part_json": kv_cache_part_to_json(
                         self.kv_reshard.local_part
                     ),
@@ -1384,7 +1371,7 @@ class CommonKVReceiver(BaseKVReceiver):
                 self.expected_writer_ids
             )
             if self.kv_mgr.enable_staging:
-                raise RuntimeError("KV_RESHARD_V1 cannot use staging")
+                raise RuntimeError("KV_RESHARD cannot use staging")
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
             return
 
@@ -1660,7 +1647,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.kv_reshard_capability: Optional[bool] = None
-        self.kv_reshard_schema_version: int = 0
         self.kv_reshard_parts: Dict[int, Dict[str, str]] = defaultdict(dict)
         self.kv_reshard_routes: Dict[int, Dict[str, Dict[str, Union[str, int]]]] = (
             defaultdict(dict)
@@ -1736,18 +1722,13 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
         kv_reshard_capability = bool(data.get("kv_reshard_capability", False))
-        kv_reshard_schema_version = int(data.get("kv_reshard_schema_version", 0))
         kv_reshard_part_json = data.get("kv_reshard_placement_part_json")
 
         if kv_reshard_capability and not isinstance(kv_reshard_part_json, str):
             return web.Response(text="Missing KV placement part", status=400)
         if self.kv_reshard_capability is None:
             self.kv_reshard_capability = kv_reshard_capability
-            self.kv_reshard_schema_version = kv_reshard_schema_version
-        elif (
-            self.kv_reshard_capability != kv_reshard_capability
-            or self.kv_reshard_schema_version != kv_reshard_schema_version
-        ):
+        elif self.kv_reshard_capability != kv_reshard_capability:
             return web.Response(
                 text="Mixed KV reshard capabilities in one prefill instance",
                 status=409,
@@ -1867,10 +1848,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
             payload = dataclasses.asdict(info)
             if self.kv_reshard_capability:
-                payload.update(
-                    kv_reshard_capability=True,
-                    kv_reshard_schema_version=self.kv_reshard_schema_version,
-                )
+                payload.update(kv_reshard_capability=True)
             return web.json_response(payload, status=200)
 
         if not self._is_ready():
@@ -1902,13 +1880,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
         from sglang.srt.disaggregation.mooncake.kv_reshard import (
             KV_RESHARD_PROTOCOL,
-            KV_RESHARD_SCHEMA_VERSION,
         )
 
-        if (
-            not self.kv_reshard_capability
-            or self.kv_reshard_schema_version != KV_RESHARD_SCHEMA_VERSION
-        ):
+        if not self.kv_reshard_capability:
             return web.Response(
                 text=f"{KV_RESHARD_PROTOCOL} is not enabled", status=409
             )
@@ -1939,7 +1913,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         return web.json_response(
             {
                 "protocol": KV_RESHARD_PROTOCOL,
-                "schema_version": KV_RESHARD_SCHEMA_VERSION,
                 "placement_json": kv_cache_placement_to_json(placement),
                 "routes": routes,
             },

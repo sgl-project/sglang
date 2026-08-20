@@ -30,7 +30,6 @@ from sglang.srt.disaggregation.mooncake.conn import (
 )
 from sglang.srt.disaggregation.mooncake.kv_reshard import (
     KV_RESHARD_PROTOCOL,
-    KV_RESHARD_SCHEMA_VERSION,
     KVReshardCompatibilityError,
     KVReshardRuntime,
     encode_wire_json,
@@ -99,6 +98,8 @@ def _runtime(
     page_size: int = 16,
     base_address: int = 1_000_000_000,
     capacity_tokens: int = 64,
+    dp_rank: int = 0,
+    dp_size: int = 1,
 ) -> KVReshardRuntime:
     return KVReshardRuntime(
         kv_args=_kv_args(
@@ -113,8 +114,8 @@ def _runtime(
         ),
         server_args=_server_args(),
         role=role,
-        dp_rank=0,
-        dp_size=1,
+        dp_rank=dp_rank,
+        dp_size=dp_size,
         pp_rank=pp_rank,
         pp_size=pp_size,
         tp_rank=tp_rank,
@@ -129,6 +130,8 @@ def _source_placement(
     tp_size: int,
     total_heads: int = 4,
     page_size: int = 16,
+    dp_rank: int = 0,
+    dp_size: int = 1,
 ):
     runtimes = [
         _runtime(
@@ -140,13 +143,15 @@ def _source_placement(
             tp_size=tp_size,
             total_heads=total_heads,
             page_size=page_size,
+            dp_rank=dp_rank,
+            dp_size=dp_size,
         )
         for pp_rank in range(pp_size)
         for tp_rank in range(tp_size)
     ]
     placement = KVReshardRuntime.assemble_placement(
         (kv_cache_part_to_json(runtime.local_part) for runtime in runtimes),
-        dp_size=1,
+        dp_size=dp_size,
         pp_size=pp_size,
         tp_size=tp_size,
     )
@@ -172,7 +177,7 @@ def test_pp_2_to_3_and_tp_1_to_2_routes_come_only_from_planner() -> None:
         tp_size=2,
     )
 
-    route_plan = target.plan_decode_routes(
+    route_plan = target.plan_target_routes(
         source_placement_json=kv_cache_placement_to_json(source), routes=routes
     )
 
@@ -194,6 +199,39 @@ def test_pp_2_to_3_and_tp_1_to_2_routes_come_only_from_planner() -> None:
     assert edge_layers == {1, 2}
 
 
+def test_pd_routes_allow_different_source_and_target_dp_pp_tp() -> None:
+    source, routes = _source_placement(
+        total_layers=6,
+        pp_size=3,
+        tp_size=2,
+        dp_rank=1,
+        dp_size=2,
+    )
+    target = _runtime(
+        "decode",
+        total_layers=6,
+        pp_rank=0,
+        pp_size=2,
+        tp_rank=3,
+        tp_size=4,
+        dp_rank=3,
+        dp_size=4,
+    )
+
+    route_plan = target.plan_target_routes(
+        source_placement_json=kv_cache_placement_to_json(source), routes=routes
+    )
+
+    assert route_plan.expected_writer_ids == (
+        "prefill:dp1:pp0:tp1",
+        "prefill:dp1:pp1:tp1",
+    )
+    for info in route_plan.bootstrap_infos:
+        plan = kv_cache_logical_plan_from_json(info["kv_reshard_plan_json"])
+        assert plan.source_dp_rank == 1
+        assert plan.target_part.rank.dp == 3
+
+
 def test_gqa_replica_selects_exact_matching_writer() -> None:
     source, routes = _source_placement(
         total_layers=1, pp_size=1, tp_size=4, total_heads=2
@@ -208,7 +246,7 @@ def test_gqa_replica_selects_exact_matching_writer() -> None:
         total_heads=2,
     )
 
-    route_plan = target.plan_decode_routes(
+    route_plan = target.plan_target_routes(
         source_placement_json=kv_cache_placement_to_json(source), routes=routes
     )
 
@@ -303,10 +341,15 @@ def test_prepared_request_lowers_partial_page_ranges_to_native_batch() -> None:
     target_runtime.bind_runtime(
         session_id="target:12346", transfer_engine=target_engine
     )
+    assert source_runtime.binding is not None
+    assert (
+        source_runtime.binding.buffers[0].fragment.worker_id
+        == source_runtime.participant_id
+    )
     source, routes = _source_placement(
         total_layers=1, pp_size=1, tp_size=1, total_heads=2
     )
-    route_plan = target_runtime.plan_decode_routes(
+    route_plan = target_runtime.plan_target_routes(
         source_placement_json=kv_cache_placement_to_json(source), routes=routes
     )
 
@@ -370,7 +413,7 @@ def test_full_rows_coalesce_contiguous_source_and_target_slots(
         total_heads=2,
         page_size=page_size,
     )
-    route_plan = target_runtime.plan_decode_routes(
+    route_plan = target_runtime.plan_target_routes(
         source_placement_json=kv_cache_placement_to_json(source), routes=routes
     )
     prepared = source_runtime.prepare_transfer(
@@ -467,7 +510,7 @@ def test_tp_slice_vectorization_caps_native_batches_at_1024_operations() -> None
     source, routes = _source_placement(
         total_layers=1, pp_size=1, tp_size=1, total_heads=2
     )
-    route_plan = target_runtime.plan_decode_routes(
+    route_plan = target_runtime.plan_target_routes(
         source_placement_json=kv_cache_placement_to_json(source), routes=routes
     )
     prepared = source_runtime.prepare_transfer(
@@ -500,10 +543,9 @@ def test_illegal_tp_head_ratio_fails_before_registration() -> None:
         )
 
 
-def test_versioned_request_wire_roundtrip() -> None:
+def test_request_wire_roundtrip() -> None:
     header = {
         "protocol": KV_RESHARD_PROTOCOL,
-        "schema_version": KV_RESHARD_SCHEMA_VERSION,
         "room": 17,
         "endpoint": "10.0.0.2",
         "dst_port": 19001,
@@ -562,7 +604,6 @@ def test_manifest_capability_mismatch_fails_before_transfer(mock_get) -> None:
         "kv_cache_dtype": "float16",
         "follow_bootstrap_room": False,
         "kv_reshard_capability": False,
-        "kv_reshard_schema_version": 0,
     }
     mock_get.return_value = response
     manager = CommonKVManager.__new__(CommonKVManager)
@@ -574,7 +615,7 @@ def test_manifest_capability_mismatch_fails_before_transfer(mock_get) -> None:
     manager.is_hybrid_mla_backend = False
     manager.enable_kv_reshard = True
 
-    with pytest.raises(RuntimeError, match="compatible KV_RESHARD_V1"):
+    with pytest.raises(RuntimeError, match="KV_RESHARD"):
         manager.try_ensure_parallel_info("127.0.0.1:8999")
 
 
@@ -591,7 +632,6 @@ def test_legacy_route_payload_does_not_advertise_reshard() -> None:
     server.enable_dsa_cache_layer_split = False
     server.prefill_http_port = 31020
     server.kv_reshard_capability = False
-    server.kv_reshard_schema_version = 0
     request = SimpleNamespace(
         query={
             "prefill_dp_rank": "-1",
@@ -606,14 +646,13 @@ def test_legacy_route_payload_does_not_advertise_reshard() -> None:
 
     assert response.status == 200
     assert "kv_reshard_capability" not in payload
-    assert "kv_reshard_schema_version" not in payload
+
 
 def test_bootstrap_aggregates_complete_source_placement() -> None:
     placement, _ = _source_placement(total_layers=5, pp_size=2, tp_size=2)
     server = CommonKVBootstrapServer.__new__(CommonKVBootstrapServer)
     server._is_ready = lambda: True
     server.kv_reshard_capability = True
-    server.kv_reshard_schema_version = KV_RESHARD_SCHEMA_VERSION
     server.dp_size = 1
     server.pp_size = 2
     server.attn_tp_size = 2
@@ -664,12 +703,11 @@ def test_concurrent_connection_cache_miss_is_single_flight(
         tp_size=1,
         capacity_tokens=256,
     )
-    target.plan_decode_routes = MagicMock(wraps=target.plan_decode_routes)
+    target.plan_target_routes = MagicMock(wraps=target.plan_target_routes)
     response = MagicMock()
     response.status_code = 200
     response.json.return_value = {
         "protocol": KV_RESHARD_PROTOCOL,
-        "schema_version": KV_RESHARD_SCHEMA_VERSION,
         "placement_json": kv_cache_placement_to_json(source),
         "routes": routes,
     }
@@ -715,7 +753,7 @@ def test_concurrent_connection_cache_miss_is_single_flight(
 
     assert errors == []
     assert mock_get.call_count == 1
-    assert target.plan_decode_routes.call_count == 1
+    assert target.plan_target_routes.call_count == 1
     assert mock_register.call_count == 1
 
 
