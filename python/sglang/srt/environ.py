@@ -536,6 +536,10 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # Charge the chunked-prefill compute budget in tokens, not page-ceiled
+    # tokens, so a prefill batch runs exactly chunked_prefill_size and the dense
+    # GEMMs get an aligned M. gfx95 only; see PrefillAdder.exact_chunk_fill.
+    SGLANG_EXACT_CHUNK_FILL = EnvBool(True)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
