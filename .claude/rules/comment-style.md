@@ -15,27 +15,47 @@ Applies to `#` and `//` comments, Python docstrings, and C/C++ Doxygen blocks
 like code, with the burden of proof reversed: the author justifies a comment's
 existence, not the reviewer its removal.
 
-**The test.** Delete the comment. If someone familiar with the repo can recover
-what it said from the surrounding code plus a grep *at no real cost*, it stays
-deleted. The standard is the cost of recovery, not whether recovery is
-theoretically possible: a fact that lives in another file costs everything, a
-grouping the names only half-encode costs a tedious reconstruction, a restated
-line costs nothing.
+## Two modes
 
-**Size decides what is worth reviewing.** The test above is aimed at the
-multi-line prose block -- the docstring with an `Args:` list, the paragraph
-restating a function. A comment that already fits on one line costs a reader
-nothing to skip, so a cleanup pass leaves it where it is: deleting it buys one
-line and risks losing the one fact nobody could have recovered. Removing a
-one-liner needs a reason of its own -- it is wrong, it is stale, or it is
-commented-out code -- not merely that the line below says the same thing.
+Writing a comment and editing someone else's are different decisions.
 
-The next three sections are that test applied. A comment either carries a fact
-you cannot see from here (**keep**), carries nothing the code does not already
-carry (**delete**), or carries a real fact whose home is somewhere else
-(**move**).
+**Writing.** You still have the context that made the comment necessary, so the
+judgment is reliable. Everything below `## Cleanup` is written for this case.
 
-## Keep: facts you cannot see from here
+**Editing.** The judgment is unreliable and the error is one-way. A one-line
+comment carries too little text to tell a restatement apart from the last anchor
+for a cross-file fact -- deciding takes the whole function and its callers, more
+context than the line costs. And the payoff is asymmetric: keeping a useless
+one-liner costs a line of scroll, while deleting a load-bearing one deletes a
+fact silently, inside a diff of two hundred deletions where no reviewer will
+catch it. So: a bright line, not a judgment call.
+
+> **A comment-only diff does not touch one-line comments.** It removes or
+> condenses multi-line prose blocks. A one-liner is rewritten only for a reason
+> of its own -- it is wrong, it is stale, or it is commented-out code -- never
+> because the line below it says the same thing.
+
+## Cleanup: what a comment-only diff may remove
+
+- **Multi-line prose restating the code** -- the function name, the next line,
+  the branch condition, or the loop body, written out as a paragraph.
+- **Python `Args:` / `Returns:` blocks** on anything that is not a documented API
+  surface -- see `## Documentation blocks` for the list of surfaces that keep
+  them.
+- **Multi-line history and rationale** -- what the code used to do, why the
+  change was made, which approach was abandoned. Each of these has a home
+  elsewhere (see `## Where other explanations live`).
+- **Commented-out code**, at any length.
+
+Condense rather than delete when a block carries one fact that is not
+recoverable: keep that sentence, drop the enumeration around it.
+
+## What a comment is for
+
+State the fact a reader cannot see from here. Delete the comment and ask what it
+costs to recover: a fact that lives in another file costs everything, a grouping
+the names only half-encode costs a tedious reconstruction, a restated line costs
+nothing.
 
 - **Cross-boundary constraints.** Layout, field order, or call order shared with
   a CUDA kernel, the Rust router, an IPC schema, or another process. Nothing in
@@ -82,38 +102,51 @@ carry (**delete**), or carries a real fact whose home is somewhere else
   # None means the request is excluded from the radix cache, not that lookup failed.
   ```
 
-- **Structure the names only partly encode.** A marker whose deletion forces
-  the reader to re-derive organization the code does not state outright -- a
-  group boundary in a long flat block, a section split in a long body. If the
-  names alone leave the boundary ambiguous or tedious to reconstruct, the
-  marker earns its place. The same word above a single item that already says
-  it is still a restatement.
+- **Structure the names only partly encode** -- a group boundary in a long flat
+  block, a section split in a long body. `# ===== Helpers =====` above two
+  functions costs nothing to see past; the same banner splitting a genuinely long
+  flat module (see `python/sglang/srt/environ.py`) is the only statement of where
+  one group ends.
 
-## Delete: nothing the code does not already carry
+Not worth writing, at any length: prose that restates the line below it,
+`# Step 1:` / `# Step 2:` numbering over straight-line code (extract named
+helpers if the flow needs numbers), the names of the callers (that is what grep
+is for), and hedging -- "this should probably be revisited" is either a fact to
+establish and state, or a `TODO(<owner>)`.
 
-- **Restating the code.** The function name, the next line, the branch
-  condition, or the loop body in prose -- as a block. One such line is below
-  the threshold above and stays.
-- **Step-by-step play-by-play.** `# Step 1: ...` / `# Step 2: ...` over
-  straight-line code. If the flow needs numbering, extract named helpers.
-- **Naming the callers.** That is what grep is for.
-- **Banners where the structure is already obvious.** `# ===== Helpers =====`
-  above two functions costs nothing to see past; the same banner splitting a
-  genuinely long flat module (see `python/sglang/srt/environ.py`) is a group
-  boundary and stays.
-- **Hedging.** "This should probably be revisited." Either establish the fact
-  and state it, or file it as `TODO(<owner>)`.
+## Form and tags
 
-## Move: real facts that live somewhere else
+- **One or two lines.** A genuinely intricate invariant may run longer; that is a
+  rare exception, not a licence. Documentation blocks are the separate case
+  below.
+- **ASCII and English only.** No Unicode arrows, math symbols, or CJK.
+- **Break at a clause boundary.** If a comment needs a second line, wrap after a
+  semicolon or a comma -- never mid-phrase. A sentence that will not split
+  cleanly is a sentence that should be shortened instead.
+- **Attach the comment to the line it constrains**, not to the top of the
+  function. Comments collected into a preamble are the ones that go stale.
+- **You change the line, you own its comment.** Update it or delete it -- never
+  leave it orphaned. A stale comment is worse than no comment.
+
+Two tag spellings only. New code does not use `FIXME`, `XXX`, or `HACK`; existing
+occurrences are grandfathered and get folded into these when the line is touched.
+
+- `# NOTE:` -- a constraint or trap. Most of the time the prefix adds nothing;
+  drop it and just state the fact.
+- `# TODO(<gh-handle>):` -- planned work, **always** with an owner or an issue
+  link. A bare `# TODO: fix this` is rejected in review; an unowned TODO is
+  never retired. `TODO(perf)` and similar topic tags are acceptable when the work
+  is a standing category rather than one person's task.
+
+## Where other explanations live
 
 Every explanation has exactly one home. A second copy in a comment drifts from
 the first.
 
 - **What the code used to do -> `git log`.** Comments describe the current
-  state: not what was tried first, not which approach was abandoned.
-
-  The exception is a past failure that is still a live constraint. That is not
-  history -- but write it as the constraint, not as the story.
+  state: not what was tried first, not which approach was abandoned. The
+  exception is a past failure that is still a live constraint -- write it as the
+  constraint, not as the story.
 
   ```python
   # Bad:  We used to call this before init_new but it broke CUDA graph capture.
@@ -125,44 +158,16 @@ the first.
   diff, and is written for a reviewer who is long gone.
 - **Design rationale -> `docs/` or a module docstring. CLI semantics -> the
   `ServerArgs` help text. Test intent -> the test.**
-- **Superseded code -> `git show`.** Never leave commented-out code behind.
+- **Superseded code -> `git show`.**
 
 Also out: review attribution ("as suggested in review") and our own PR numbers
 used as a changelog. An upstream issue URL is different -- it is not a changelog
-entry but a workaround's retirement condition, and the Keep section requires it.
+entry but a workaround's retirement condition, and the section above requires it.
 
 What stays next to the line is why *this line* exists, written for a reader who
 has neither the PR nor the discussion.
 
-## Form
-
-Governs `#` / `//` comments; the length and placement of documentation blocks
-follow the section below. ASCII-and-English applies to both.
-
-- **One or two lines.** A genuinely intricate invariant may run longer; that is
-  a rare exception, not a licence.
-- **ASCII and English only.** No Unicode arrows, math symbols, or CJK.
-- **Break at a clause boundary.** If a comment needs a second line, wrap after a
-  semicolon or a comma -- never mid-phrase. A sentence that will not split
-  cleanly is a sentence that should be shortened instead.
-- **Attach the comment to the line it constrains**, not to the top of the
-  function. Comments collected into a preamble are the ones that go stale.
-- **You change the line, you own its comment.** Update it or delete it -- never
-  leave it orphaned. A stale comment is worse than no comment.
-
-## Tags
-
-Two spellings only. New code does not use `FIXME`, `XXX`, or `HACK`; existing
-occurrences are grandfathered and get folded into these when the line is touched.
-
-- `# NOTE:` -- a constraint or trap. Most of the time the prefix adds nothing;
-  drop it and just state the fact.
-- `# TODO(<gh-handle>):` -- planned work, **always** with an owner or an issue
-  link. A bare `# TODO: fix this` is rejected in review; an unowned TODO is
-  never retired. `TODO(perf)` and similar topic tags are acceptable when the work
-  is a standing category rather than one person's task.
-
-## API documentation blocks
+## Documentation blocks
 
 Python docstrings and Doxygen blocks are part of the product on the surfaces
 users, integrators, and tooling read, and noise everywhere else. Where warranted
