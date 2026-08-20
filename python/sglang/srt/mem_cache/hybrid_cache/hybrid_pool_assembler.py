@@ -1149,7 +1149,7 @@ def build_hicache_draft_sidecars(
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Compose the full and SWA draft-sidecar paths."""
-    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.pool.base import BaseSWAKVPool
 
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]

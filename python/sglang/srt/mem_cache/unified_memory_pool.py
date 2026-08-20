@@ -47,6 +47,9 @@ from sglang.srt.mem_cache.memory_pool import (
     MambaPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
+    move_kv_cache_native,
+)
+from sglang.srt.mem_cache.pool.base import (
     unwrap_write_loc,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool

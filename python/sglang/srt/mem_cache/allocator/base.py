@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.mem_cache.pool.base import KVCache
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):

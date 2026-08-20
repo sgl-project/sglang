@@ -53,7 +53,6 @@ from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
-    KVCache,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
     MHATokenToKVPoolMXFP8,
@@ -63,6 +62,9 @@ from sglang.srt.mem_cache.memory_pool import (
     NoOpMHATokenToKVPool,
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
+)
+from sglang.srt.mem_cache.pool.base import (
+    KVCache,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.platforms import current_platform

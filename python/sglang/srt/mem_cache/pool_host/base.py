@@ -10,7 +10,7 @@ import psutil
 import torch
 
 from sglang.srt.distributed.parallel_state import get_world_group
-from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.pool.base import KVCache
 from sglang.srt.mem_cache.pool_host.common import (
     _cuda_host_unregister,
     get_allocator_from_storage,
