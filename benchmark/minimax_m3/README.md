@@ -4,8 +4,8 @@ This gate compares SGLang's standalone `fmha_sm100` path with FlashInfer's
 source-distributed MSA path on the same host, model, software environment, and
 GPU clocks. It also records the Triton fallback as an optional diagnostic.
 
-Use a Blackwell node with enough memory for the selected checkpoint. The
-standard B200 setup is `MiniMaxAI/MiniMax-M3-MXFP8` at TP4 with BF16 KV cache,
+Use a 4x GB300 node with enough memory for the selected checkpoint. The formal
+setup is `MiniMaxAI/MiniMax-M3-MXFP8` at TP4 with BF16 KV cache,
 `--attention-backend fa4`, page size 128, CUDA Graph enabled, and no speculative
 decoding. The FlashInfer checkout must contain the public
 `flashinfer.msa_ops.{msa_sparse_attention,msa_sparse_decode_attention,msa_topk_select}`
@@ -64,19 +64,80 @@ SGLANG_MINIMAX_MSA_BACKEND=flashinfer \
 SGLANG_DISABLE_MSA=1 python -m sglang.launch_server "${COMMON_ARGS[@]}"
 ```
 
-Before either measured run, wait for model load and CUDA Graph capture, send one
-unmeasured 8K/1K request, and verify the startup log says `main_attn=...` for the
-intended path. Freeze the LongBench subset once with the candidate model's
-tokenizer:
+Before any measured run, freeze both accuracy inputs. Download GPQA-Diamond
+once, then build the LongBench subset with the candidate model's tokenizer:
 
 ```bash
+curl -fL \
+  https://openaipublic.blob.core.windows.net/simple-evals/gpqa_diamond.csv \
+  -o /shared/eval/gpqa_diamond.csv
+
 python benchmark/minimax_m3/build_longbench_subset.py \
   --model MiniMaxAI/MiniMax-M3-MXFP8 \
   --num-examples 100 --min-tokens 32768 \
   --output /shared/eval/longbench_v2_m3_100_min32k.json
 ```
 
-Then run the gate once per server:
+The preflight is offline and read-only when `--output` is omitted. It resolves
+the model from the local Hugging Face cache (or a local path), checks every
+indexed weight shard, loads the tokenizer locally, verifies both dataset hashes
+and row counts, checks the exact clean FlashInfer source HEAD and installed
+public API, checks the standalone baseline import, verifies this SGLang checkout
+is the one Python imports, and requires exactly four visible compute-capability
+10.3 GPUs:
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+python benchmark/minimax_m3/probe_msa_e2e_dependencies.py \
+  --model MiniMaxAI/MiniMax-M3-MXFP8 \
+  --longbench-subset /shared/eval/longbench_v2_m3_100_min32k.json \
+  --gpqa-dataset /shared/eval/gpqa_diamond.csv \
+  --flashinfer-source-dir "${FLASHINFER_SOURCE_DIR}" \
+  --expected-flashinfer-head "${FLASHINFER_HEAD}"
+```
+
+These smaller probes are also useful before requesting the allocation; none
+downloads or modifies a cache:
+
+```bash
+git -C "${FLASHINFER_SOURCE_DIR}" rev-parse HEAD
+git -C "${FLASHINFER_SOURCE_DIR}" status --short
+test -r /shared/eval/gpqa_diamond.csv
+test -r /shared/eval/longbench_v2_m3_100_min32k.json
+test -r /shared/eval/longbench_v2_m3_100_min32k.json.manifest.json
+```
+
+For the publishable gate, use the automated driver inside an already-created,
+exclusive 4x GB300 Slurm allocation. This command is suitable as the payload of
+an `sbatch --wrap` or session-specific job script:
+
+```bash
+export MODEL=MiniMaxAI/MiniMax-M3-MXFP8
+export LONGBENCH_SUBSET=/shared/eval/longbench_v2_m3_100_min32k.json
+export GPQA_DATASET=/shared/eval/gpqa_diamond.csv
+export FLASHINFER_SOURCE_DIR=/workspace/flashinfer
+export FLASHINFER_HEAD=<exact-final-source-commit>
+export OUTPUT_ROOT=/shared/results/msa_gb300_tp4_$(date -u +%Y%m%dT%H%M%SZ)
+bash benchmark/minimax_m3/run_msa_ab_gb300.sh
+```
+
+The driver refuses an existing output root and runs exactly three complete
+repetitions in `baseline,candidate`, `candidate,baseline`, then
+`baseline,candidate` order. Every backend gets a fresh server. The driver waits
+for `/health_generate`, verifies one startup-log line contains the requested
+`main_attn`, `msa_decode=True`, `msa_owns_decode=True`, and
+`decode_cuda_graph=True`, sends an unmeasured 8K/1K warmup, and only then starts
+the full gate. It stops the server between providers and fails if the old server
+still owns the port.
+
+Each repetition is compared independently. `summary.json` then reports the
+three raw values, backend median, gain computed from backend medians, and median
+paired gain for every concurrency and metric. It also rejects provider-order
+drift, dataset-hash drift, and any temperature-zero fixed response that changes
+across the six server runs. By default, candidate median output throughput may
+not regress at any concurrency.
+
+For a single diagnostic run, start one server manually and run:
 
 ```bash
 BASE_URL=http://127.0.0.1:30000 \
@@ -84,6 +145,7 @@ MODEL=MiniMaxAI/MiniMax-M3-MXFP8 \
 LABEL=external \
 OUTPUT_DIR=/shared/results/msa_external \
 LONGBENCH_SUBSET=/shared/eval/longbench_v2_m3_100_min32k.json \
+GPQA_DATASET=/shared/eval/gpqa_diamond.csv \
 bash benchmark/minimax_m3/run_msa_gate.sh
 ```
 
@@ -103,10 +165,12 @@ on the deterministic 100-example category-balanced LongBench-v2 subset whose
 prompts are at least 32K tokens. GPQA is materially harder than saturated GSM8K;
 LongBench directly exercises MSA's long-context page selection and decode replay.
 
-The comparison command also reports fractional speedup for request/output-token
-throughput and median/p99 TTFT and inter-token latency. Pass
+The single-pair comparison command also reports fractional speedup for
+request/output-token throughput and median/p99 TTFT and inter-token latency. Pass
 `--min-output-throughput-gain 0` to make non-regression at every concurrency a
-hard gate. For a publishable result, report the median of three complete runs
-for each backend and concurrency. Alternate backend order across repetitions,
-keep clocks/power limits fixed, flush the radix cache, and reject any run with
-errors, retries, JIT compilation, or thermal throttling.
+hard gate. The automated three-repetition gate applies non-regression to the
+backend medians instead, which is less sensitive to one noisy pair. Keep
+clocks/power limits fixed, and reject evidence with errors, retries, compilation
+during a measured serving interval, or thermal throttling. The gate records the
+server-log byte offsets bracketing every serving interval to make that review
+exact rather than timestamp-based.
