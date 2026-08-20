@@ -24,6 +24,8 @@ REQUIRED_GPQA_COLUMNS = {
 }
 REQUIRED_SGLANG_KERNEL_VERSION = "0.4.6.post1"
 REQUIRED_TORCH_VERSION = "2.13.0"
+REQUIRED_DEEP_GEMM_VERSION = "0.1.5.post3"
+REQUIRED_TVM_FFI_VERSION = "0.1.11"
 
 
 def sha256(path: Path) -> str:
@@ -203,6 +205,27 @@ def probe_sglang(repo: Path) -> dict:
             f"torch is {torch.__version__}, expected {REQUIRED_TORCH_VERSION}"
         )
     sgl_kernel = importlib.import_module("sgl_kernel")
+    deep_gemm_version = metadata.version("sgl-deep-gemm")
+    if deep_gemm_version != REQUIRED_DEEP_GEMM_VERSION:
+        raise RuntimeError(
+            f"sgl-deep-gemm is {deep_gemm_version}, expected "
+            f"{REQUIRED_DEEP_GEMM_VERSION}"
+        )
+    tvm_ffi_version = metadata.version("apache-tvm-ffi")
+    if tvm_ffi_version != REQUIRED_TVM_FFI_VERSION:
+        raise RuntimeError(
+            f"apache-tvm-ffi is {tvm_ffi_version}, expected "
+            f"{REQUIRED_TVM_FFI_VERSION}"
+        )
+    deep_gemm = importlib.import_module("deep_gemm")
+    scale = torch.ones((4, 4), dtype=torch.float32, device="cuda")
+    packed_scale = deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+        scale
+    )
+    if packed_scale.shape != (4, 1) or packed_scale.dtype != torch.int32:
+        raise RuntimeError(
+            f"sgl-deep-gemm ABI probe returned {packed_scale.shape}/{packed_scale.dtype}"
+        )
     return {
         "repo": str(repo.resolve()),
         "head": git(repo, "rev-parse", "HEAD"),
@@ -210,6 +233,9 @@ def probe_sglang(repo: Path) -> dict:
         "sglang_kernel_version": kernel_version,
         "sglang_kernel_path": str(Path(inspect.getfile(sgl_kernel)).resolve()),
         "torch_version": torch.__version__,
+        "deep_gemm_version": deep_gemm_version,
+        "deep_gemm_path": str(Path(inspect.getfile(deep_gemm)).resolve()),
+        "tvm_ffi_version": tvm_ffi_version,
     }
 
 
