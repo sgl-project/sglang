@@ -804,7 +804,7 @@ TWO_GPU_CASES = [
                     "aspect_ratio": "16:9",
                     "duration_seconds": 4.0,
                 },
-                "num_inference_steps": 2,
+                "num_inference_steps": 8,
                 "flow_shift": 12.0,
                 "audio_flow_shift": 3.0,
                 "seed": 42,
