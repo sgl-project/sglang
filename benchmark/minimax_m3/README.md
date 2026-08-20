@@ -129,8 +129,18 @@ export FLASHINFER_SOURCE_DIR=/workspace/flashinfer
 export FLASHINFER_HEAD=<exact-final-source-commit>
 export OUTPUT_ROOT=/shared/results/msa_gb300_tp4_$(date -u +%Y%m%dT%H%M%SZ)
 export EXPECTED_TVM_FFI_VERSION=0.1.9
+export MINFER_FMHA_CACHE_DIR=/workspace/run/cache/fmha_sm100
+export BASELINE_FMHA_PRECOMPILE_RECEIPT=/shared/results/fmha_sm100_precompile.json
+export SERVER_TIMEOUT=7200
 bash benchmark/minimax_m3/run_msa_ab_gb300.sh
 ```
+
+Before the first server starts, the driver serially compiles and validates the
+BF16 sparse-paged `fmha_sm100` variants reachable by this TP4 gate, plus its
+plan, reduction, and sparse-top-k modules. The baseline package only protects
+JIT compilation within one process; serial precompilation prevents four TP
+workers from racing on the same shared `.so` while preserving one identical
+completed cache for all six server starts.
 
 The driver refuses an existing output root and runs exactly three complete
 repetitions in `baseline,candidate`, `candidate,baseline`, then

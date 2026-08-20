@@ -9,7 +9,13 @@ FLASHINFER_SOURCE_DIR="${FLASHINFER_SOURCE_DIR:?set FLASHINFER_SOURCE_DIR to the
 FLASHINFER_HEAD="${FLASHINFER_HEAD:?set FLASHINFER_HEAD to the exact 40-character source commit}"
 OUTPUT_ROOT="${OUTPUT_ROOT:?set OUTPUT_ROOT to a new evidence directory}"
 EXPECTED_TVM_FFI_VERSION="${EXPECTED_TVM_FFI_VERSION:?set the compatibility baseline TVM-FFI version}"
+MINFER_FMHA_CACHE_DIR="${MINFER_FMHA_CACHE_DIR:?set an allocation-local baseline JIT cache}"
+BASELINE_FMHA_PRECOMPILE_RECEIPT="${BASELINE_FMHA_PRECOMPILE_RECEIPT:?set a new precompile receipt path}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+
+"${PYTHON_BIN}" benchmark/minimax_m3/precompile_fmha_sm100.py \
+  --cache-dir "${MINFER_FMHA_CACHE_DIR}" \
+  --output "${BASELINE_FMHA_PRECOMPILE_RECEIPT}"
 
 exec "${PYTHON_BIN}" benchmark/minimax_m3/run_msa_ab_repetitions.py \
   --model "${MODEL}" \
@@ -20,4 +26,5 @@ exec "${PYTHON_BIN}" benchmark/minimax_m3/run_msa_ab_repetitions.py \
   --output-root "${OUTPUT_ROOT}" \
   --expected-tvm-ffi-version "${EXPECTED_TVM_FFI_VERSION}" \
   --python "${PYTHON_BIN}" \
+  --server-timeout "${SERVER_TIMEOUT:-7200}" \
   --min-median-output-throughput-gain "${MIN_MEDIAN_OUTPUT_THROUGHPUT_GAIN:-0}"
