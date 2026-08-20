@@ -2489,6 +2489,14 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.swa_attn_allocator.free(live)
         self.swa_attn_allocator.clear_inverse_history()
 
+    def free_full(self, free_index: torch.Tensor) -> None:
+        """Release the full-physical page and the virtual id, leaving the swa
+        side alone -- the caller already tombstoned it (`swa.v2p_page == -1`)."""
+        if free_index is None or free_index.numel() == 0:
+            return
+        self.full_attn_allocator.free(free_index.detach().to(torch.int64))
+        self.full_attn_allocator.clear_inverse_history()
+
     def set_full_to_swa_mapping(
         self, full_indices: torch.Tensor, swa_indices: torch.Tensor
     ) -> None:

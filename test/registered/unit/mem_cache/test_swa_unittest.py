@@ -223,8 +223,81 @@ class TestSWA(unittest.TestCase):
             )
         )
 
-        allocator.free_swa(full_indices[1:2])
+        # `free_swa` is deliberately not idempotent -- filtering the cleared
+        # mapping entries would need a device-side count. Once the SWA side is
+        # gone the caller releases the full side alone.
+        full_available = allocator.full_available_size()
+        allocator.free_full(full_indices)
         self.assertEqual(allocator.swa_available_size(), 16)
+        self.assertEqual(allocator.full_available_size(), full_available + page_size)
+
+    def test_paged_free_swa_tolerates_a_partially_mapped_page(self):
+        """A paged full page can own slots that never got an SWA peer (a partial
+        extend, or a HiCache load-back that re-paired the page). free_swa must
+        skip those instead of handing the SWA padding slot back to the pool.
+        """
+        page_size = 4
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=page_size,
+            kv_size=16,
+            kv_size_swa=16,
+            sliding_window_size=page_size,
+        )
+
+        full_indices = _swa_alloc(allocator, page_size)
+        # Leave the tail of the page without an SWA peer.
+        allocator.full_to_swa_index_mapping[full_indices[2:].to(torch.int64)] = 0
+        swa_available = allocator.swa_available_size()
+
+        allocator.free_swa(full_indices[:2])
+
+        # Exactly the one page comes back, and the padding slot never does.
+        self.assertEqual(allocator.swa_available_size(), swa_available + page_size)
+        self.assertLessEqual(
+            allocator.swa_available_size(), allocator.swa_attn_allocator.size
+        )
+
+    def test_free_full_defers_inside_a_free_group(self):
+        page_size = 4
+        _, allocator, _ = _build_swa_tree(
+            is_eagle=False,
+            page_size=page_size,
+            kv_size=16,
+            kv_size_swa=16,
+            sliding_window_size=page_size,
+        )
+
+        full_indices = _swa_alloc(allocator, page_size)
+        allocator.free_swa(full_indices)
+        full_available = allocator.full_available_size()
+
+        allocator.free_group_begin()
+        allocator.free_full(full_indices)
+        self.assertEqual(len(allocator.full_free_group), 1)
+        self.assertEqual(allocator.full_available_size(), full_available)
+        # The group owns a copy, so a caller reusing its buffer is harmless.
+        full_indices.zero_()
+        allocator.free_group_end()
+
+        self.assertEqual(allocator.full_available_size(), full_available + page_size)
+        self.assertEqual(allocator.swa_available_size(), 16)
+
+    def test_evicting_a_tombstoned_node_frees_swa_once(self):
+        tree, allocator, _ = _build_swa_tree(is_eagle=False, kv_size=32, kv_size_swa=32)
+        swa_size = allocator.swa_attn_allocator.size
+
+        _insert(tree, allocator, [1, 2, 3, 4])
+        _insert(tree, allocator, [1, 2, 3, 4, 5, 6])
+
+        # SWA-only eviction tombstones a node: its SWA slots are already back.
+        tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        swa_after_tombstone = allocator.swa_available_size()
+
+        # Full eviction of that same node must not hand the SWA slots back twice.
+        tree.evict(EvictParams(num_tokens=32, swa_num_tokens=0))
+        self.assertLessEqual(allocator.swa_available_size(), swa_size)
+        self.assertGreaterEqual(allocator.swa_available_size(), swa_after_tombstone)
 
     def test_free_swa_group_owns_deferred_indices(self):
         _, allocator, _ = _build_swa_tree(
@@ -654,14 +727,23 @@ class TestSWA(unittest.TestCase):
         req2.cache_protected_len = 1
         req2.prefix_indices = torch.tensor([21, 22, 23, 24, 25], device=tree.device)
 
-        freed_lens = []
-        original_free = allocator.free
+        # Probe the pool-specific pair, not free(): a row range gives its full
+        # side back whole and its SWA side from the eviction floor up.
+        full_freed_lens = []
+        swa_freed_lens = []
+        original_free_full = allocator.free_full
+        original_free_swa = allocator.free_swa
 
-        def wrapped_free(indices):
-            freed_lens.append(int(indices.numel()))
-            return original_free(indices)
+        def wrapped_free_full(indices):
+            full_freed_lens.append(int(indices.numel()))
+            return original_free_full(indices)
 
-        allocator.free = wrapped_free
+        def wrapped_free_swa(indices):
+            swa_freed_lens.append(int(indices.numel()))
+            return original_free_swa(indices)
+
+        allocator.free_full = wrapped_free_full
+        allocator.free_swa = wrapped_free_swa
         tree.cache_finished_req(
             req2, is_insert=False, kv_len_to_handle=req2._kv_committed_len
         )
@@ -670,7 +752,9 @@ class TestSWA(unittest.TestCase):
         # Expected frees:
         #   overlap range [1:5] -> 4
         #   tail range [5:]     -> 1
-        self.assertEqual(freed_lens, [4, 1])
+        self.assertEqual(full_freed_lens, [4, 1])
+        # swa_evicted_seqlen is 0 here, so nothing is skipped on the SWA side.
+        self.assertEqual(swa_freed_lens, [4, 1])
 
 
 # Optimization: SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT.

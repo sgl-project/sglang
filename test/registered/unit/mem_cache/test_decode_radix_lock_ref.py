@@ -82,7 +82,7 @@ class MockReq:
         self.prefix_indices = torch.empty(0, dtype=torch.int64)
         self.priority = 0
         self.kv_committed_len = len(fill_ids)
-        self.kv = SimpleNamespace(kv_allocated_len=len(fill_ids))
+        self.kv = SimpleNamespace(kv_allocated_len=len(fill_ids), swa_evicted_seqlen=0)
 
     def get_fill_ids(self):
         return self.full_untruncated_fill_ids[: self.extend_range.end]

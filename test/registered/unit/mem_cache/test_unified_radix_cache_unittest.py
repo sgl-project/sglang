@@ -9,6 +9,7 @@ import unittest
 from array import array
 from collections import defaultdict
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
@@ -5988,6 +5989,76 @@ def _component_with_cache(component_type, cache):
     component.cache = cache
     component.tree_core = cache.tree_core
     return component
+
+
+class TestSWALoadBackPagePhase(CustomTestCase):
+    """HiCache LOAD_BACK re-pairs a page-aligned full chunk with an SWA chunk cut
+    at a raw token offset, so a full page can span three SWA pages and share one
+    with its neighbour. `SWATokenToKVPoolAllocator.free_swa` therefore cannot
+    derive SWA pages from one representative per full page while page_size > 1.
+    """
+
+    def test_load_back_chunks_lose_full_to_swa_page_alignment(self):
+        page_size, n_tokens = 64, 100  # not a page multiple: the whole point
+        nodes = {}
+        for nid, full_page in ((1, 10), (2, 20)):
+            nodes[nid] = SimpleNamespace(
+                id=nid,
+                component_data={
+                    ComponentType.SWA: SimpleNamespace(
+                        host_value=torch.arange(n_tokens), value=None
+                    ),
+                    ComponentType.FULL: SimpleNamespace(
+                        value=torch.arange(
+                            full_page * page_size, full_page * page_size + n_tokens
+                        )
+                    ),
+                },
+            )
+        cache = mock.MagicMock()
+        cache.tree_core.page_size = page_size
+        cache.tree_core.node_by_id.side_effect = lambda nid: nodes[nid]
+        component = _component_with_cache(ComponentType.SWA, cache)
+
+        base = 30 * page_size
+        xfer = SimpleNamespace(
+            device_indices=torch.arange(base, base + 2 * n_tokens),
+            host_indices=torch.arange(2 * n_tokens),
+            nodes_to_load=[1, 2],
+        )
+        actions = []
+        component.commit_hicache_transfer(
+            nodes[1], CacheTransferPhase.LOAD_BACK, [xfer], cache_actions=actions
+        )
+
+        rebuild = [a for a in actions if isinstance(a, RebuildFullToSWAMapping)]
+        self.assertEqual(len(rebuild), 1)
+        pairs = list(zip(rebuild[0].full_indices, rebuild[0].swa_indices))
+        self.assertEqual(len(pairs), 2)
+
+        # First chunk starts at the allocation's own page boundary, so it lines up.
+        full0, swa0 = pairs[0]
+        self.assertEqual(int(full0[0]) % page_size, 0)
+        self.assertEqual(int(swa0[0]) % page_size, 0)
+
+        # The second starts `n_tokens` in, which is not a page multiple.
+        full1, swa1 = pairs[1]
+        self.assertEqual(int(full1[0]) % page_size, 0)
+        self.assertNotEqual(
+            int(swa1[0]) % page_size,
+            0,
+            "load-back now page-aligns the SWA chunk: free_swa's paged arm can "
+            "switch to page representatives",
+        )
+        self.assertGreater(
+            len(set((swa1 // page_size).tolist())),
+            len(set((full1 // page_size).tolist())),
+            "the SWA side must span more pages than the full side here",
+        )
+        self.assertTrue(
+            set((swa0 // page_size).tolist()) & set((swa1 // page_size).tolist()),
+            "the two chunks must share an SWA page",
+        )
 
 
 class TestUnifiedRadixCacheActionRouting(CustomTestCase):

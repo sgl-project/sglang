@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
-    FreeDeviceKV,
+    FreeDeviceKVFullOnly,
     RebuildFullToSWAMapping,
     RecoverSWAWithLockedFull,
     SWARebuild,
@@ -295,7 +295,7 @@ class SWAComponent(TreeComponent):
                 )
                 return 0
             full_cd.value = value_slice.clone()
-            cache_actions.append(FreeDeviceKV([old_full]))
+            cache_actions.append(FreeDeviceKVFullOnly([old_full]))
             cache_actions.append(SWARebuild(node.id, value_slice))
             return 0
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
@@ -313,7 +313,7 @@ class SWAComponent(TreeComponent):
                 )
                 return start_idx
             node.component_data[BASE_COMPONENT_TYPE].value = new_full.clone()
-            cache_actions.append(FreeDeviceKV([old_full]))
+            cache_actions.append(FreeDeviceKVFullOnly([old_full]))
             cache_actions.append(SWARebuild(node.id, new_full))
             return start_idx
         else:
@@ -484,9 +484,9 @@ class SWAComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
-            # Pass full indices to free_swa so slots with no SWA pair are
-            # skipped. Freeing swa_value directly would double free those
-            # entries since they all map to the same sentinel slot.
+            # Pass full indices, not swa_value: the allocator's mapping is the
+            # source of truth. `cd.value is not None` is what proves this node
+            # still owns its SWA slots -- `free_swa` no longer filters.
             device_frees[self.component_type].append(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )

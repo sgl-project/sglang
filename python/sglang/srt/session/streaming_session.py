@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.common import free_kv_row_range
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -443,7 +444,12 @@ class StreamingSession(BasePrefixCache):
                 kv_indices = self.req_to_token_pool.req_to_token[
                     slot.req_pool_idx, start:end
                 ]
-                self.token_to_kv_pool_allocator.free(kv_indices)
+                free_kv_row_range(
+                    self.token_to_kv_pool_allocator,
+                    kv_indices,
+                    start_pos=start,
+                    swa_evicted_seqlen=slot.kv.swa_evicted_seqlen,
+                )
             self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
 
         self._free_slot_mamba(slot)
@@ -537,7 +543,12 @@ class StreamingSession(BasePrefixCache):
         decoding pushes allocated above committed, or when retract retry's
         logit-reserve pulls prefix_len below committed.
         """
-        self._free_kv_aligned(slot.req_pool_idx, prefix_len, slot.kv.kv_allocated_len)
+        self._free_kv_aligned(
+            slot.req_pool_idx,
+            prefix_len,
+            slot.kv.kv_allocated_len,
+            swa_evicted_seqlen=slot.kv.swa_evicted_seqlen,
+        )
         slot.kv.kv_allocated_len = prefix_len
         slot.kv_committed_len = min(slot.kv_committed_len, prefix_len)
         slot.kv.swa_evicted_seqlen = min(slot.kv.swa_evicted_seqlen, prefix_len)
@@ -552,13 +563,20 @@ class StreamingSession(BasePrefixCache):
         be released to avoid token/KV mismatch.
         """
         target = len(req.origin_input_ids) + finished_len
-        self._free_kv_aligned(req.req_pool_idx, target, req.kv.kv_allocated_len)
+        self._free_kv_aligned(
+            req.req_pool_idx,
+            target,
+            req.kv.kv_allocated_len,
+            swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
+        )
         req.kv.kv_allocated_len = min(req.kv.kv_allocated_len, target)
         req.kv_committed_len = min(req.kv_committed_len, target)
         req.kv.swa_evicted_seqlen = min(req.kv.swa_evicted_seqlen, target)
         req.output_ids = req.output_ids[:finished_len]
 
-    def _free_kv_aligned(self, pool_idx: int, target: int, end: int) -> None:
+    def _free_kv_aligned(
+        self, pool_idx: int, target: int, end: int, *, swa_evicted_seqlen: int = 0
+    ) -> None:
         """Free req_to_token[pool_idx, ceil_align(target):end). Page-aligned
         because PagedTokenToKVPoolAllocator.free returns whole pages
         (free_index // page_size), so partial-page free would corrupt pages
@@ -572,7 +590,12 @@ class StreamingSession(BasePrefixCache):
             start = ceil_align(start, self.page_size)
         if start < end:
             tail = self.req_to_token_pool.req_to_token[pool_idx, start:end]
-            self.token_to_kv_pool_allocator.free(tail)
+            free_kv_row_range(
+                self.token_to_kv_pool_allocator,
+                tail,
+                start_pos=start,
+                swa_evicted_seqlen=swa_evicted_seqlen,
+            )
 
     # -- Pass-through methods --
 

@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.common import free_kv_row_range
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -134,6 +135,23 @@ class SWAChunkCache(ChunkCache):
             self.sliding_window_size is not None
         ), "sliding_window_size must be set for SWAChunkCache"
         return True
+
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ):
+        # The [cache_protected_len, swa_evicted_seqlen) part of the row already
+        # gave its SWA slots back during decode (`free_swa_out_of_window_slots`),
+        # so only its full-attention slots are still ours to release.
+        protected_len = req.cache_protected_len
+        kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, protected_len:kv_len_to_handle
+        ]
+        free_kv_row_range(
+            self.token_to_kv_pool_allocator,
+            kv_indices,
+            start_pos=protected_len,
+            swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
+        )
 
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()

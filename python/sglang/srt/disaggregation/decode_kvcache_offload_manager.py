@@ -13,6 +13,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.common import free_kv_row_range
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     build_kv_host_pool,
 )
@@ -261,12 +262,22 @@ class DecodeKVCacheOffloadManager:
             prefill_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : state.prefill_len
             ]
-            self.token_to_kv_pool_allocator.free(prefill_indices)
+            free_kv_row_range(
+                self.token_to_kv_pool_allocator,
+                prefill_indices,
+                start_pos=0,
+                swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
+            )
         start = start_offset
         end = kv_committed_len
         # Free the incremental part of the request (DSA-aware)
         kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, start:end]
-        self.token_to_kv_pool_allocator.free(kv_indices)
+        free_kv_row_range(
+            self.token_to_kv_pool_allocator,
+            kv_indices,
+            start_pos=start,
+            swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
+        )
 
         # Free over-allocated KV cache slots (e.g. from speculative decoding v2).
         # Without spec v2, start_p == end_p so this is a no-op.
@@ -277,7 +288,12 @@ class DecodeKVCacheOffloadManager:
             overalloc_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, start_p:end_p
             ]
-            self.token_to_kv_pool_allocator.free(overalloc_indices)
+            free_kv_row_range(
+                self.token_to_kv_pool_allocator,
+                overalloc_indices,
+                start_pos=start_p,
+                swa_evicted_seqlen=req.kv.swa_evicted_seqlen,
+            )
 
         self.req_to_token_pool.free(req)
         req.kv = None
