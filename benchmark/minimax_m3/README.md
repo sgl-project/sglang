@@ -32,7 +32,8 @@ a runtime rejection, so an A/B run cannot silently turn into a Triton fallback.
 Run the two servers sequentially on the same idle node. Keep every launch flag
 identical except the provider. The compatibility baseline needs its existing
 decode-under-graph opt-in; setting it for both launches keeps the comparison
-explicit and symmetric:
+explicit and symmetric. This gate disables the dynamic-request prefill BCG so
+both providers exercise their own eager prefill while decode remains captured:
 
 ```bash
 COMMON_ARGS=(
@@ -46,6 +47,7 @@ COMMON_ARGS=(
   --moe-runner-backend deep_gemm
   --chunked-prefill-size 8192
   --mem-fraction-static 0.75
+  --disable-prefill-cuda-graph
 )
 
 # baseline

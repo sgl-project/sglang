@@ -233,6 +233,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._msa_prefill_meta = None
         self._msa_capture_active = False
         self._msa_active_graph_states: Optional[dict[int, object]] = None
+        self._msa_bcg_prefill_warned = False
         if self.use_msa:
             from sglang.srt.runtime_context import get_parallel
 
@@ -515,7 +516,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         if bs == 0:
             return
         key = (bs, total_q)
-        entry = self._msa_prefill_cg.get(key) if in_capture else None
+        # Capture records the page-table address, so replay must refresh the
+        # same cached tensor rather than building an equivalent new tensor.
+        # Eager calls may reuse it too; the next graph replay refreshes it again.
+        entry = self._msa_prefill_cg.get(key)
         if entry is None and in_capture:
             page_table = torch.empty(
                 (bs, self._msa_nb_max),
@@ -554,6 +558,31 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             }
             self._msa_graph_state_lifetime.append(graph_states)
             self._msa_active_graph_states = graph_states
+
+    def _use_msa_for_prefill(self) -> bool:
+        """Keep dynamic-request BCG on its existing capture-safe prefill path.
+
+        Breakable prefill graphs are keyed by aggregate query tokens, while the
+        public MSA capture contract fixes the request axis and page-table shape.
+        Full prefill graphs have a fixed padded request axis and are supported;
+        eager prefill is supported as well.
+        """
+
+        if not self.use_msa or self.msa_backend != "flashinfer":
+            return self.use_msa
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            is_in_breakable_cuda_graph,
+        )
+
+        in_breakable_graph = is_in_breakable_cuda_graph()
+        if in_breakable_graph and not self._msa_bcg_prefill_warned:
+            logger.info(
+                "[MiniMaxSparse] FlashInfer MSA prefill uses the Triton path "
+                "inside dynamic-request breakable CUDA graphs; eager prefill "
+                "and fixed-request full CUDA graphs retain FlashInfer MSA."
+            )
+            self._msa_bcg_prefill_warned = True
+        return not in_breakable_graph
 
     def on_after_cuda_graph_warmup(self):
         """Honor FlashInfer's requirement to finish workspace warmup first."""
@@ -1547,7 +1576,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 self.local_blocks,
                 score_type=self.score_type,
                 disable_index_value=disable_value,
-                use_msa=self.use_msa,
+                use_msa=self._use_msa_for_prefill(),
                 seqlens_cpu=forward_batch.extend_seq_lens_cpu,
                 q_scale=layer.q_scale_float,
                 k_scale=layer.k_scale_float,
