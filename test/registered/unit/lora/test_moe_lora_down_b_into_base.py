@@ -212,8 +212,9 @@ class TestDownBIntoBasePlan:
     def test_flag_admits_the_down_a_window(self) -> None:
         # DOWN_A forks down-A against the base GEMM and JOINS before down-B
         # runs, so the rows are complete -- the same ordering the serial
-        # branch gives.  Measured faster than either alone at prefill token
-        # counts; see the configs README.
+        # branch gives.  Legal, and no shipped row asks for it: the 3-model x
+        # 3-arch sweep measured it as a wash under CUDA-graph capture (configs
+        # README).  The rule stays permissive so a table CAN ask.
         forked = _build_plan(down_overlap=DownOverlap.DOWN_A)
         assert replace(forked, down_b_into_base=True).down_b_into_base is True
 

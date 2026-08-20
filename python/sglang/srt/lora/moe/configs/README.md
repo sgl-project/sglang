@@ -361,43 +361,63 @@ is never just one stage.
 Provenance and the full axis inventory: the campaign's best-config tables
 document, plus `B200_POLICY_ADJUDICATION_20260814.md`.
 
-DOWN_A window on top of `down_b_into_base` (2026-08-20, B200
-`verda-b200-fin-03-3`, one layer forward, hidden 2048 / intermediate 768 /
-top-k 8 / rank 16, 21 repeats x 40 iterations with the arm order rotated per
-repeat, first repeat discarded). Percentages are paired per-repeat deltas
-against `down_overlap=none` + delta buffer; the CONTROL column is a fifth arm
-byte-identical to that baseline, so it is the noise floor and no number inside
-it means anything:
+Down-tail sweep, 3 models x 3 architectures x 2 adapter layouts (2026-08-20).
+Instrument: one `MoeLoraRunner.run_plan` at each model's real per-rank geometry
+(Qwen3.5-35B h2048/i128/E256/k8, Qwen3.5-397B h4096/i256 or i128/E512/k10,
+Inkling-Small h4096/i512 or i256/E256/k6), against the row `resolve_plans`
+actually selects for that arch and layout -- so an arm differs from production
+by exactly one plan field. Wall clock over batches of back-to-back calls, arm
+order rotated per repeat, first repeat discarded. Sanity: the measured layer
+time x layer count is 43-59% of the runbook's e2e prefill time, so a layer-level
+delta is worth roughly half that at e2e prefill.
 
-| tokens | rows | E | into-base | DOWN_A | both | control |
-|---:|---|---:|---:|---:|---:|---:|
-| 8192 | route_major | 64 | -1.98% | -1.94% | **-3.95%** [-6.1,-1.9] | +0.86% |
-| 8192 | route_major | 128 | -1.46% | -1.68% | **-3.43%** [-5.2,-1.7] | +0.64% |
-| 8192 | expert_major | 64 | -1.59% | -1.57% | **-3.73%** [-5.5,-0.8] | +0.68% |
-| 4096 | route_major | 64 | -1.92% | -2.75% | **-3.41%** | +0.46% |
-| 2048 | route_major | 64 | **-2.86%** | +1.64% | +0.81% | +0.38% |
-| 1024 | route_major | 64 | -0.90% | +7.12% | +6.54% | +0.02% |
+EAGER results are reported first because they are misleading, and the reason is
+the point. Eagerly, the DOWN_A window swings +11% to -1.7% depending on model and
+architecture -- Qwen3.5-35B loses 6-11% at <=4096 tokens everywhere, and on GB300
+at every token count. None of that survives CUDA-graph capture, which is what
+production prefill runs at the `--cuda-graph-bs-prefill` buckets: capture turns
+the fork's event record/wait into graph nodes and the overhead disappears.
 
-Three readings. The two effects are near-additive at prefill token counts, and
-at 8192 the whole paired range of the combined arm is negative and clear of the
-control. The row domain does not matter, which is what the epilogue's
-row-domain agnosticism predicts. And the DOWN_A fork crosses over between 2048
-and 4096 tokens: below that its fork/join costs more than it hides, +1.6% at
-2048 and +7.1% at 1024, while the into-base epilogue alone wins at every size
-measured.
+CAPTURED results, every config captured twice so the graph-to-graph spread is
+measured per config rather than assumed (a single capture of an identical plan
+drifted ~1%, the size of the effect). `noise` is that spread for the shipped
+config; nothing inside it means anything.
 
-That crossover is why the shipped rows still declare `down_overlap: none`.
-`down_b_into_base_eligible` admits DOWN_A, so a table can ask for it, but plan
-selection has no token predicate (`max_rank` is the only one), so a prefill row
-applies to a short final chunk and a short prompt too, where this costs 7%.
-Turning it on needs either an e2e run at the serving protocol that stays ahead
-including short prefills, or a `max_tokens` predicate on plan rows the way the
-tile rules already have one.
+| arch | model | layout | tokens | noise | DOWN_A | adopt into-base |
+|---|---|---|---:|---:|---:|---:|
+| B200 | q35 | shared | 2048 | 0.94% | -2.69% | **-5.31%** |
+| B200 | q35 | shared | 8192 | 0.67% | +0.05% | **-6.84%** |
+| B200 | q397 | shared | 2048 | 0.01% | -0.67% | **-2.62%** |
+| B200 | q397 | shared | 8192 | 0.73% | -0.76% | **-3.73%** |
+| B200 | ink | shared | 2048 | 0.11% | -0.06% | **-1.89%** |
+| B200 | ink | shared | 8192 | 0.90% | +0.03% | **-3.51%** |
+| GB300 | q35 | shared | 2048 | 0.94% | -2.65% | **-6.20%** |
+| GB300 | q35 | shared | 8192 | 0.39% | -0.30% | **-6.71%** |
+| GB300 | q397 | shared | 2048 | 0.02% | -0.40% | **-1.84%** |
+| GB300 | q397 | shared | 8192 | 0.30% | -0.40% | **-3.37%** |
+| GB300 | ink | shared | 2048 | 0.00% | -0.62% | **-2.28%** |
+| GB300 | ink | shared | 8192 | 0.21% | +0.63% | **-1.79%** |
 
-Harness: the arms are the 2x2 of `down_overlap` and `down_b_into_base` over one
-`MoeLoraRunner.run_plan`, timed as wall clock over batches of back-to-back
-calls -- never CUDA events around a single call, which has measured a config
-faster than itself here before.
+Two conclusions.
+
+**The DOWN_A window is not worth shipping.** Across 36 captured cells its effect
+runs -2.7% to +2.0% with no consistent sign by model, architecture, or token
+count, and most cells sit inside their own noise floor. The eligibility rule
+admits it so a table *can* ask for it, and the eager numbers explain why an
+eager measurement would have shipped it by mistake.
+
+**Shared-outer prefill rows should adopt `down_b_into_base`.** They ship with it
+off; turning it on wins 1.8-6.8% of MoE-LoRA layer time in every cell measured,
+on both SM100 architectures and all three models, at both prefill graph buckets,
+far outside the noise floor. H200's shared prefill row is `prefill.shared_rank`,
+whose finalize consumes down-B, so it has no standalone down-B stage and no
+into-base axis -- that row is untouched.
+
+Also seen, not acted on: on PER-EXPERT rows at the 2048 bucket, removing
+into-base measured -2.06% (B200) and -2.03% (GB300) for Qwen3.5-397B, while at
+8192 removing it costs +0.85% to +2.99%. That is a token-banded preference the
+plan table cannot express -- `max_rank` is its only predicate -- so it is a lead,
+not a change.
 
 To onboard a model whose geometry the shipped `domain`/rows do not cover:
 
