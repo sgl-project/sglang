@@ -574,17 +574,17 @@ def _is_mxfp4_pack_quantized(hf_config: Any) -> bool:
 def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # MoE runner default, independent of the attention-backend gate above.
     # trtllm-gen fused MoE (flashinfer_mxfp4) beats marlin on both the decode
-    # (M=bs) and the target-verify (M=bs*(gamma+1)) regimes on SM100/SM103;
-    # FlashInfer 0.6.17+ ships the required SiTU kernels and is a pinned
-    # project dependency.
+    # (M=bs) and the target-verify (M=bs*(gamma+1)) regimes on SM100/SM103.
+    # SM107 uses the same packed-MXFP4 runner; leaving auto unresolved falls
+    # back to BF16 weight materialization during model loading.
     if server_args.moe_runner_backend != "auto":
         return {}
-    if not (is_sm100_supported() and get_device_sm() in (100, 103)):
+    if not (is_sm100_supported() and get_device_sm() in (100, 103, 107)):
         return {}
     if not _is_mxfp4_pack_quantized(hf_config):
         return {}
     logger.info(
-        "Kimi-K3 on SM100/SM103: moe_runner_backend=flashinfer_mxfp4 "
+        "Kimi-K3 on SM100/SM103/SM107: moe_runner_backend=flashinfer_mxfp4 "
         "(FlashInfer SiTU kernels)."
     )
     return {"moe_runner_backend": "flashinfer_mxfp4"}
