@@ -261,6 +261,14 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
   fi
 
   echo "[MORI] Reinstalling MORI ${MORI_COMMIT} (MORI_GPU_ARCHS=${MORI_GPU_ARCHS})"
+  # Neither apt step may be fatal. libgrpc++-dev is optional -- rocm.Dockerfile
+  # builds MORI without it -- and the ROCm base image carries an AMD-internal
+  # artifactory source (rocm-osdb) whose index 404s whenever a ROCm build is
+  # rotated out. apt-get update exits 100 on that while still keeping every
+  # index it did fetch, so under set -e one dead third-party source we do not
+  # even install from takes out the dependency install on every AMD runner at
+  # once. Retries are already configured image-wide (Acquire::Retries) and do
+  # not help against a 404.
   docker exec ci_sglang bash -c "
     set -euo pipefail
     export MORI_GPU_ARCHS='${MORI_GPU_ARCHS}'
@@ -269,8 +277,8 @@ if docker exec ci_sglang test -d /sgl-workspace/mori; then
     cd /sgl-workspace/mori
     git checkout '${MORI_COMMIT}'
     git submodule update --init --recursive
-    apt-get update
-    apt-get install -y --no-install-recommends libgrpc++-dev 2>/dev/null || true
+    apt-get update || echo '[MORI] apt-get update reported errors; continuing with the indexes it did fetch'
+    apt-get install -y --no-install-recommends libgrpc++-dev || echo '[MORI] libgrpc++-dev unavailable; building MORI without it'
     python3 setup.py develop
     python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), \"lib\"))' > /etc/ld.so.conf.d/torch.conf
     ldconfig
