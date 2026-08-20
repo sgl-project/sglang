@@ -564,14 +564,14 @@ class MoeLoraRunner:
         # The route defines the pair domain, so read the row count off it
         # rather than off input, whose first dimension means tokens for gate/up,
         # pairs for down, and provider rows for mapped down.
-        rows = (
+        num_output_rows = (
             route.topk_ids.shape[0]
             if spec.output_layout is BridgeLayout.TOKEN_MAJOR
             else route.topk_ids.numel()
         )
         output = self.workspace.tensor(
             f"{name}:output",
-            (rows, weight.shape[1]),
+            (num_output_rows, weight.shape[1]),
             dtype=self.lora_delta_dtype,
             device=input.device,
         )
