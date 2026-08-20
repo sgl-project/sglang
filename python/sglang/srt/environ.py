@@ -504,6 +504,8 @@ class Envs:
     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
     MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
+    # NIXL plugin for remote-instance weight transfer
+    SGLANG_REMOTE_INSTANCE_NIXL_BACKEND = EnvStr("UCX")
 
     # MoRI KV Transfer
     # Send CPU-resident AUX data via RDMA instead of ZMQ TCP (default: TCP).
