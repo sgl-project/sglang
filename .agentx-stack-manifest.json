@@ -112,10 +112,19 @@
   "layer2_prealloc_substage_nvtx_overlay": {
     "parent_commit": "26241fe158447b8a157a16a9c91e80545a829f44",
     "files": {
-      "python/sglang/srt/disaggregation/decode.py": "605dfbd407dcdb4271c695cd6c0ae27d9120b781c414ed29902bb9466251eeab"
+      "python/sglang/srt/disaggregation/decode.py": "1283b2627186e4e0f04411d4f40301e268efc4409a3badf06fa87ea8be3230a0"
     },
     "change": "Split decode-side preallocation into profiler-gated allocation, state-index materialization, page-index materialization, and metadata-send ranges without changing execution order or data flow.",
     "scope": "Diagnostic source only; no production optimization or performance claim."
+  },
+  "decode_preallocation_async_materialization": {
+    "parent_runtime_job": "3179509",
+    "files": [
+      "python/sglang/srt/disaggregation/decode.py",
+      "python/sglang/srt/mem_cache/memory_pool.py"
+    ],
+    "change": "Keep single-request Mamba resets and request mappings on device, and construct one-element decode preallocation tensors without pageable host-to-device copies.",
+    "targeted_validation": "CMH job 3187136: 16 requests bitwise; CPU admission wall 20.408094 to 0.304404 ms and post-graph GPU-visible gap 0.447396 to 0.040410 ms. Production pair 3187323/3187324: generation +1.1467%, Output TPS/User +1.5226%, all alignment gates pass."
   },
   "srt_slurm": {
     "commit": "0e34ceb34b681282f7c0490386aa8de292b5dce8",

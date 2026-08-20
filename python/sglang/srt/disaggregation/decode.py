@@ -1831,7 +1831,7 @@ def alloc_for_decode_prealloc(
         last_loc = (
             prefix_indices[-1:].to(dtype=torch.int64, device=device)
             if prefix_len > 0
-            else torch.tensor([-1], dtype=torch.int64, device=device)
+            else torch.full((1,), -1, dtype=torch.int64, device=device)
         )
         extra_kwargs = {}
         dsv4_unwrap_prealloc = None
@@ -1867,11 +1867,13 @@ def alloc_for_decode_prealloc(
             req.kv.swa_evicted_seqlen = fill_len - swa_tail_len
         else:
             kv_loc = allocator.alloc_extend(
-                prefix_lens=torch.tensor(
-                    [total_prefix_len], dtype=torch.int64, device=device
+                prefix_lens=torch.full(
+                    (1,), total_prefix_len, dtype=torch.int64, device=device
                 ),
                 prefix_lens_cpu=torch.tensor([total_prefix_len], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
+                seq_lens=torch.full(
+                    (1,), fill_len, dtype=torch.int64, device=device
+                ),
                 seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                 last_loc=last_loc,
                 extend_num_tokens=delta_len,

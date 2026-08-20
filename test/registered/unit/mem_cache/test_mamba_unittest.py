@@ -134,6 +134,10 @@ class TestMamba(unittest.TestCase):
         assert (
             req_to_token_pool.mamba_allocator.available_size() == mamba_cache_size - 1
         )
+        assert torch.equal(
+            req_to_token_pool.req_index_to_mamba_index_mapping[req.req_pool_idx],
+            req.mamba_pool_idx.to(dtype=torch.int32),
+        )
 
         # free req
         req_to_token_pool.free_mamba_cache(req)
