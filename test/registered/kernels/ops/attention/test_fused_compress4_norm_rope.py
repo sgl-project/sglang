@@ -24,7 +24,7 @@ from sglang.test.kernels.deepseek_v4.common import (
 )
 
 # HIP/gfx95 only: compress_forward_norm_rope_store is the fused c4 decode path.
-register_amd_ci(est_time=90, suite="nightly-amd-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=150, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 pytestmark = pytest.mark.skipif(
     not is_hip(), reason="fused compress+norm+rope is HIP/gfx95 only"
@@ -39,17 +39,60 @@ ROPE_DIM = 64
 NORM_EPS = 1.0e-6
 N_DECODE_STEPS = 8  # spans >=2 compress boundaries plus non-boundary steps
 
-# Per-head-dim store epilogue the fused kernel dispatches to. Both epilogues
-# write into a page-major uint8 cache whose row stride is page_size *
-# bytes_per_token. head_dim 512 is the flashmla epilogue (bf16 store, so
-# head_dim * 2 bytes per token, page_size 1); head_dim 128 is the indexer
-# epilogue (fp8 store into the index-k-with-scale layout, head_dim + 4 bytes per
-# token, page_size 64). The indexer store is always fp8; bf16_store is a
-# flashmla-only option.
+# Store epilogue the fused kernel dispatches to, one scenario per reachable
+# (head_dim, store) pairing. All caches are page-major uint8 buffers.
+#
+#   512-bf16 : flashmla epilogue, plain bf16 store (head_dim * 2 bytes/token).
+#              This is the unified-KV-triton path (compressor_v2 bf16_store=True).
+#   512-fp8  : flashmla epilogue, UE8M0 pack -- 448 nope codes in 7 fp8 groups
+#              of 64 + 64 rope elements kept in bf16, with 8 scale bytes/token in
+#              a trailing region. This is the production non-indexer extra-key
+#              cache, where compressor_v2 leaves bf16_store=False; page_size > 1
+#              so the per-token offset math in the store is exercised.
+#   128-fp8  : indexer epilogue, always fp8 (head_dim codes + one fp32 scale per
+#              token). bf16_store is a flashmla-only option and does not apply.
+#
+# buffer_dtype is the state-pool (BufferFloat) dtype; the last scenario runs it
+# in bf16 while ape/input stay fp32 so the mixed BufferFloat != InputFloat path
+# is covered on the reachable 512 FP8 store.
 CONFIGS = {
-    512: dict(page_size=1, bf16_store=True, store="bf16"),
-    128: dict(page_size=64, bf16_store=False, store="fp8"),
+    "512-bf16": dict(
+        head_dim=512,
+        page_size=1,
+        bf16_store=True,
+        store="bf16",
+        buffer_dtype=torch.float32,
+    ),
+    "512-fp8": dict(
+        head_dim=512,
+        page_size=16,
+        bf16_store=False,
+        store="flashmla_fp8",
+        buffer_dtype=torch.float32,
+    ),
+    "128-fp8": dict(
+        head_dim=128,
+        page_size=64,
+        bf16_store=False,
+        store="indexer_fp8",
+        buffer_dtype=torch.float32,
+    ),
+    "512-fp8-bf16buf": dict(
+        head_dim=512,
+        page_size=16,
+        bf16_store=False,
+        store="flashmla_fp8",
+        buffer_dtype=torch.bfloat16,
+    ),
 }
+
+# flashmla FP8 pack constants (head_dim 512): the nope half is 448 elements in 7
+# UE8M0 groups of 64, the rope half is 64 bf16 elements, and each token's value
+# region is 576 bytes with an 8-byte scale slot at 576*page_size.
+_FLASHMLA_NOPE = 448
+_FLASHMLA_GROUP = 64
+_FLASHMLA_VALUE_BYTES = 576
+_FLASHMLA_SCALE_BYTES = 8
 
 
 def _make_ctx(mode: str, head_dim: int) -> Context:
@@ -74,16 +117,27 @@ def _to_dev(t: torch.Tensor) -> torch.Tensor:
     return t.to(get_device())
 
 
+def _flashmla_page_bytes(page_size: int) -> int:
+    # Mirrors the kernel's kPageBytes: 576 value bytes + 8 scale bytes per token,
+    # rounded up to a multiple of the 576-byte value stride.
+    used = _FLASHMLA_VALUE_BYTES * page_size + _FLASHMLA_SCALE_BYTES * page_size
+    return -(-used // _FLASHMLA_VALUE_BYTES) * _FLASHMLA_VALUE_BYTES
+
+
 def _make_cache(
     head_dim: int, num_slots: int, page_size: int, store: str
 ) -> torch.Tensor:
-    # bf16 store: head_dim * 2 bytes/token; fp8 indexer store: head_dim fp8
-    # codes + 4 scale bytes. Both are page-major uint8 buffers.
-    bytes_per_token = head_dim * 2 if store == "bf16" else head_dim + 4
+    # All caches are page-major uint8 buffers.
+    #   bf16          : head_dim * 2 bytes/token.
+    #   indexer_fp8   : head_dim fp8 codes + 4 scale bytes/token.
+    #   flashmla_fp8  : 576 value bytes/token + 8 scale bytes/token, page padded.
     num_pages = (num_slots + page_size) // page_size + 1
-    return torch.zeros(
-        num_pages, page_size * bytes_per_token, dtype=torch.uint8, device=get_device()
-    )
+    if store == "flashmla_fp8":
+        page_bytes = _flashmla_page_bytes(page_size)
+    else:
+        bytes_per_token = head_dim * 2 if store == "bf16" else head_dim + 4
+        page_bytes = page_size * bytes_per_token
+    return torch.zeros(num_pages, page_bytes, dtype=torch.uint8, device=get_device())
 
 
 def _dequant_indexer_fp8(
@@ -105,6 +159,31 @@ def _dequant_indexer_fp8(
     return codes * scale
 
 
+def _dequant_flashmla_fp8(cache: torch.Tensor, page_size: int) -> torch.Tensor:
+    """Decode the flashmla nope-fp8 + rope-bf16 pack into [pages, page_size, 512].
+
+    Each token's value region is 576 bytes: 448 e4m3 codes in 7 UE8M0 groups of
+    64, then 64 rope elements as bf16 (128 bytes). Scales live in a trailing
+    region at 576*page_size, 8 bytes/token (7 used, one UE8M0 exponent byte per
+    group); the fp32 scale is 2^(exp - 127).
+    """
+    pages = cache.shape[0]
+    value = cache[:, : _FLASHMLA_VALUE_BYTES * page_size].reshape(
+        pages, page_size, _FLASHMLA_VALUE_BYTES
+    )
+    codes = value[:, :, :_FLASHMLA_NOPE].contiguous().view(torch.float8_e4m3fn).float()
+    rope = value[:, :, _FLASHMLA_NOPE:].contiguous().view(torch.bfloat16).float()
+    scale_base = _FLASHMLA_VALUE_BYTES * page_size
+    scale_bytes = cache[
+        :, scale_base : scale_base + _FLASHMLA_SCALE_BYTES * page_size
+    ].reshape(pages, page_size, _FLASHMLA_SCALE_BYTES)
+    n_groups = _FLASHMLA_NOPE // _FLASHMLA_GROUP
+    exp = scale_bytes[:, :, :n_groups].int()
+    scale = torch.exp2((exp - 127).float())  # [pages, page_size, n_groups]
+    nope = codes.reshape(pages, page_size, n_groups, _FLASHMLA_GROUP) * scale[..., None]
+    return torch.cat([nope.reshape(pages, page_size, _FLASHMLA_NOPE), rope], dim=-1)
+
+
 def _assert_cache_close(
     store: str, a: torch.Tensor, b: torch.Tensor, head_dim: int, page_size: int
 ) -> None:
@@ -112,9 +191,9 @@ def _assert_cache_close(
 
     The fused kernel keeps the compressed row in fp32 registers while the
     two-kernel chain rounds it to bf16 between launches. bf16 store carries that
-    intermediate difference straight into the cache; the fp8 indexer store keeps
-    codes essentially identical while a rare amax tie shifts one token's scale in
-    its lowest mantissa bits, so it is compared in dequantized value space where
+    intermediate difference straight into the cache; the fp8 stores keep codes
+    essentially identical while a rare amax tie shifts one token's scale in its
+    lowest mantissa bits, so they are compared in dequantized value space where
     at most a handful of elements may land one e4m3 code apart.
     """
     if store == "bf16":
@@ -122,8 +201,12 @@ def _assert_cache_close(
         b_f = b.view(torch.bfloat16).float()
         torch.testing.assert_close(a_f, b_f, atol=2e-2, rtol=2e-2)
         return
-    va = _dequant_indexer_fp8(a, head_dim, page_size)
-    vb = _dequant_indexer_fp8(b, head_dim, page_size)
+    if store == "flashmla_fp8":
+        va = _dequant_flashmla_fp8(a, page_size)
+        vb = _dequant_flashmla_fp8(b, page_size)
+    else:
+        va = _dequant_indexer_fp8(a, head_dim, page_size)
+        vb = _dequant_indexer_fp8(b, head_dim, page_size)
     diff = (va - vb).abs()
     # No element may diverge by more than a single e4m3 code step...
     step_tol = 2e-1 + 2e-1 * vb.abs()
@@ -133,24 +216,29 @@ def _assert_cache_close(
     assert (diff > small_tol).float().mean().item() < 5e-3, "too many fp8 codes shifted"
 
 
-@pytest.mark.parametrize("head_dim", list(CONFIGS))
+@pytest.mark.parametrize("scenario", list(CONFIGS))
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
 @pytest.mark.parametrize("prefix_len", [0, 6, 256])
-def test_fused_matches_chain_decode(head_dim: int, mode: str, prefix_len: int) -> None:
+def test_fused_matches_chain_decode(scenario: str, mode: str, prefix_len: int) -> None:
     """Fused compress+norm+rope+store must match compress_forward + store.
 
-    A prefix that is not a multiple of the ratio (6) forces a partial first
-    block whose overlap is read from the state buffer; prefix 256 exercises a
-    multi-page paged layout. Stepping N_DECODE_STEPS past the prefix crosses
-    several compress boundaries and includes non-compress accumulate steps.
+    Runs across every reachable store epilogue (see CONFIGS): flashmla bf16,
+    flashmla FP8/UE8M0, and the indexer FP8 pack, including a mixed
+    BufferFloat != InputFloat state pool. A prefix that is not a multiple of the
+    ratio (6) forces a partial first block whose overlap is read from the state
+    buffer; prefix 256 exercises a multi-page paged layout. Stepping
+    N_DECODE_STEPS past the prefix crosses several compress boundaries and
+    includes non-compress accumulate steps.
     """
-    cfg = CONFIGS[head_dim]
+    cfg = CONFIGS[scenario]
+    head_dim = cfg["head_dim"]
+    buffer_dtype = cfg["buffer_dtype"]
     device = get_device()
     torch.manual_seed(head_dim + prefix_len)
 
     ctx = _make_ctx(mode, head_dim)
-    pool_chain = make_state_pool(ctx.num_pages, RATIO, head_dim)
-    pool_fused = make_state_pool(ctx.num_pages, RATIO, head_dim)
+    pool_chain = make_state_pool(ctx.num_pages, RATIO, head_dim, dtype=buffer_dtype)
+    pool_fused = make_state_pool(ctx.num_pages, RATIO, head_dim, dtype=buffer_dtype)
 
     seq_len_total = prefix_len + N_DECODE_STEPS
     kv_full_cpu, ape_cpu = _make_inputs(seq_len_total, head_dim, seed=seq_len_total)
