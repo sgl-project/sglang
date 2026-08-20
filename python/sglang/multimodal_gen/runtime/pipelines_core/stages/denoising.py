@@ -544,7 +544,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             apply_attention_backend_override(layer, target)
         self.attn_backend = stage_backend
         self._attention_backend_active_override = target
-        logger.info(
+        logger.debug(
             "Attention backend for this batch: %s (%d layers switched)",
             target.name.lower() if target else "server default",
             len(layers),
