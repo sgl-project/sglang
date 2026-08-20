@@ -52,6 +52,23 @@ class TestPrepareServerArgs(CustomTestCase):
         ):
             ServerArgs(model_path="dummy", prefill_decode_interval=-1)
 
+    def test_dsv4_prefill_backend_cli_choices(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        base_args = ["--model-path", "dummy-model"]
+
+        default_args = parser.parse_args(base_args)
+        self.assertEqual(default_args.dsv4_prefill_backend, "auto")
+
+        q8_args = parser.parse_args(
+            base_args + ["--dsv4-prefill-backend", "flashmla_sparse_q8"]
+        )
+        self.assertEqual(q8_args.dsv4_prefill_backend, "flashmla_sparse_q8")
+
+        with self.assertRaises(SystemExit):
+            parser.parse_args(base_args + ["--dsv4-prefill-backend", "flashmla_kv"])
+
     def test_return_hidden_states_mode_configuration(self):
         disabled = ServerArgs(model_path="dummy")
         self.assertFalse(disabled.enable_return_hidden_states)

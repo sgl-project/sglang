@@ -299,7 +299,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # Optional LTX-2.5 decoder is large enough to load only when requested.
     load_diffusion_decoder: bool = False
 
-    # path to pre-quantized transformer weights (single .safetensors or directory).
+    # Pre-quantized transformer weights: safetensors file/directory or GGUF file.
     transformer_weights_path: str | None = None
     # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
     minimax_h3_adaln_cache_path: str | None = None
