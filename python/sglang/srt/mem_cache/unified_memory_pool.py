@@ -1543,10 +1543,8 @@ class UnifiedSWAKVPool(SWAKVPool):
         full_phys = self._virt_tokens_to_phys_tokens(indices, self._full_allocator)
         swa_phys = self._virt_tokens_to_phys_tokens(indices, self._swa_allocator)
         full_cpu = self.full_kv_pool.get_cpu_copy(full_phys)
-        valid = swa_phys >= 0
-        swa_cpu = None
-        if bool(valid.any().item()):
-            swa_cpu = self.swa_kv_pool.get_cpu_copy(swa_phys[valid])
+        valid_swa_phys = swa_phys[swa_phys >= 0]
+        swa_cpu = self.swa_kv_pool.get_cpu_copy(valid_swa_phys)
         return {"full": full_cpu, "swa": swa_cpu}
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
@@ -1556,7 +1554,8 @@ class UnifiedSWAKVPool(SWAKVPool):
         if kv_cache_cpu.get("swa") is not None:
             assert self._swa_allocator is not None
             swa_phys = self._virt_tokens_to_phys_tokens(indices, self._swa_allocator)
-            self.swa_kv_pool.load_cpu_copy(kv_cache_cpu["swa"], swa_phys)
+            valid_swa_phys = swa_phys[swa_phys >= 0]
+            self.swa_kv_pool.load_cpu_copy(kv_cache_cpu["swa"], valid_swa_phys)
 
 
 class UnifiedSWAPoolBundle(NamedTuple):
