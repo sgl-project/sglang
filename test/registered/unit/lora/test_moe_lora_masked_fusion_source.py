@@ -54,7 +54,7 @@ class TestMaskedFusionSource(unittest.TestCase):
         # the serving runner no longer threads it (plan-level PDL knobs were
         # retired: route PDL is arch-keyed, A->B edges measured no better
         # than launch-order overlap, 2026-08 twins).
-        a = (LORA_MOE / "bf16.py").read_text()
+        a = (LORA_MOE / "lora_a.py").read_text()
         b = (LORA_MOE / "lora_b.py").read_text()
         runner = (LORA_MOE / "moe_lora_runner.py").read_text()
 

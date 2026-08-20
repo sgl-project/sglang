@@ -1,26 +1,9 @@
-"""Selector-free BF16 LoRA-A candidate kernels for the SGL MoE backend.
+"""The three LoRA-A families an execution plan can name.
 
-This module deliberately carries no selection logic.  It contains only
-the families the production config resolver can reach:
-
-* aligned grouped A, the general reference/winner (implemented in ``bf16``);
-* raw-route indexed A, retained for the evidence-qualified down-A
-  small-decode composition; and
-* token-deduplicated shared-outer grouped A.
-
-The caller owns route selection, launch-config selection, workspace lifetime,
-and composition with B.  Indexed A consumes a raw ``RouteView`` and has no PDL
-annotations. Grouped A exposes an explicit producer flag used only by legal,
-same-stream A-to-B execution-plan twins; it is never an implicit
-device-dependent behavior inside the math primitive.
-
-Port provenance (the source launchers remain benchmark-only controls):
-
-* ``grouped_lora_a`` wraps ``MoE LoRA.bf16.grouped_lora_a``;
-* ``indexed_lora_a`` mirrors
-  ``benchmark.kernels.lora_moe.lora_a_candidates.invoke_indexed_lora_a``; and
-* ``token_dedup_grouped_lora_a`` is the A half of
-  ``lora_a_shared.shared_gate_up_a_token_dedup``.
+Grouped A rides the aligned route and is the general choice. Indexed A rides
+the raw route, for the decode down-A composition where aligned block padding
+dominates. Token-dedup grouped A is grouped A over a one-pair-per-token route,
+so a shared-outer bridge row is written once per token, not once per pair.
 """
 
 from __future__ import annotations
@@ -32,7 +15,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.lora.moe.bf16 import grouped_lora_a
 from sglang.srt.lora.moe.route_kernels import virtual_expert_ids_inline
 from sglang.srt.lora.moe.route_view import RouteView
 
@@ -79,6 +61,159 @@ def _validate_pair_gemm(
     }
     if len(devices) != 1:
         raise ValueError(f"tensors span devices {sorted(map(str, devices))}")
+
+
+@triton.jit
+def _grouped_lora_a_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    pair_to_row_ptr,
+    sorted_pair_ids_ptr,
+    block_virtual_expert_ids_ptr,
+    num_pairs_post_padded_ptr,
+    num_input_rows,
+    num_pairs,
+    stride_im,
+    stride_ik,
+    stride_we,
+    stride_wn,
+    stride_wk,
+    stride_om,
+    stride_on,
+    TOP_K: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    PAIR_INPUT: tl.constexpr,
+    USE_PAIR_TO_ROW: tl.constexpr,
+    NUM_M_BLOCKS: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    PRODUCE_PDL: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pairs_post_padded = tl.load(num_pairs_post_padded_ptr)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    programs_per_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // programs_per_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(NUM_M_BLOCKS - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % programs_per_group) % group_size_m)
+    pid_n = (pid % programs_per_group) // group_size_m
+    if pid_m * BLOCK_SIZE_M >= num_pairs_post_padded:
+        return
+
+    pair_slots = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    pair_ids = tl.load(sorted_pair_ids_ptr + pair_slots).to(tl.int64)
+    pair_mask = pair_ids < num_pairs
+    virtual_expert_id = tl.load(block_virtual_expert_ids_ptr + pid_m).to(tl.int64)
+    if virtual_expert_id == -1:
+        return
+
+    if USE_PAIR_TO_ROW:
+        input_rows = tl.load(
+            pair_to_row_ptr + pair_ids,
+            mask=pair_mask,
+            other=-1,
+        ).to(tl.int64)
+    elif PAIR_INPUT:
+        input_rows = pair_ids
+    else:
+        input_rows = pair_ids // TOP_K
+    input_mask = pair_mask & (input_rows >= 0) & (input_rows < num_input_rows)
+
+    n_offsets = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    n_mask = n_offsets < N
+    if PRODUCE_PDL:
+        # Everything above is independent route/pointer setup. Release the
+        # consecutive B launch now so it can execute its own independent
+        # prologue while this CTA computes A. B's gdc_wait still protects its
+        # first bridge load until every producer CTA has completed.
+        tl.extra.cuda.gdc_launch_dependents()
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k_begin in range(0, K, BLOCK_SIZE_K):
+        k_offsets = k_begin + tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
+        k_mask = k_offsets < K
+        lhs = tl.load(
+            input_ptr
+            + input_rows[:, None] * stride_im
+            + k_offsets[None, :] * stride_ik,
+            mask=input_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        rhs = tl.load(
+            weight_ptr
+            + virtual_expert_id * stride_we
+            + n_offsets[None, :] * stride_wn
+            + k_offsets[:, None] * stride_wk,
+            mask=n_mask[None, :] & k_mask[:, None],
+            other=0.0,
+        )
+        accumulator += tl.dot(lhs, rhs, out_dtype=tl.float32)
+
+    tl.store(
+        output_ptr + pair_ids[:, None] * stride_om + n_offsets[None, :] * stride_on,
+        accumulator.to(output_ptr.dtype.element_ty),
+        mask=pair_mask[:, None] & n_mask[None, :],
+    )
+
+
+def grouped_lora_a(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    output: torch.Tensor,
+    routing: RouteView,
+    *,
+    config: Mapping[str, int],
+    pair_input: bool = False,
+    pair_to_row: torch.Tensor | None = None,
+    produce_pdl: bool = False,
+) -> None:
+    """One result per pair in original pair order; invalid rows are zeroed."""
+    num_pairs = routing.topk_ids.numel()
+    if num_pairs == 0:
+        return
+
+    block_size_n = int(config["BLOCK_SIZE_N"])
+    block_size_k = int(config["BLOCK_SIZE_K"])
+    group_size_m = int(config["GROUP_SIZE_M"])
+    pair_to_row_ptr = output if pair_to_row is None else pair_to_row
+    num_m_blocks = triton.cdiv(routing.sorted_pair_ids.numel(), routing.block_size)
+    num_n_blocks = triton.cdiv(weight.shape[1], block_size_n)
+    _grouped_lora_a_kernel[(num_m_blocks * num_n_blocks,)](
+        input,
+        weight,
+        output,
+        pair_to_row_ptr,
+        routing.sorted_pair_ids,
+        routing.block_virtual_expert_ids,
+        routing.num_pairs_post_padded,
+        input.shape[0],
+        num_pairs,
+        input.stride(0),
+        input.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        weight.stride(2),
+        output.stride(0),
+        output.stride(1),
+        TOP_K=routing.topk_ids.shape[1],
+        N=weight.shape[1],
+        K=weight.shape[2],
+        PAIR_INPUT=pair_input,
+        USE_PAIR_TO_ROW=pair_to_row is not None,
+        NUM_M_BLOCKS=num_m_blocks,
+        BLOCK_SIZE_M=routing.block_size,
+        BLOCK_SIZE_N=block_size_n,
+        BLOCK_SIZE_K=block_size_k,
+        GROUP_SIZE_M=group_size_m,
+        PRODUCE_PDL=produce_pdl,
+        num_warps=int(config["num_warps"]),
+        num_stages=int(config["num_stages"]),
+    )
 
 
 @triton.jit
@@ -167,12 +302,7 @@ def indexed_lora_a(
     config: Mapping[str, int],
     pair_input: bool = False,
 ) -> None:
-    """Execute raw-route indexed A.
-
-    This launcher intentionally contains no ``launch_pdl`` or GDC operations.
-    A caller choosing this family should request ``RouteViewKind.RAW`` so no aligned
-    plan is built merely for another site.
-    """
+    """Raw-route A, one program per pair: no aligned plan built, no PDL."""
     num_pairs = routing.topk_ids.numel()
     if num_pairs == 0:
         return
@@ -218,12 +348,7 @@ def token_dedup_grouped_lora_a(
     config: Mapping[str, int],
     produce_pdl: bool = False,
 ) -> None:
-    """Shared-outer A over a T-domain adapter plan.
-
-    ``token_routing`` has top-k one, so the ordinary grouped primitive writes
-    one bridge row per token instead of repeating it for every routed expert.
-    Plan construction belongs to routing, not this math module.
-    """
+    """Grouped A over a one-pair-per-token route: one bridge row per token."""
     if token_routing.topk_ids.shape[1] != 1:
         raise ValueError(
             "token-deduplicated grouped A requires a T-domain top-k-1 route"
@@ -254,11 +379,7 @@ def run_lora_a(
     pair_to_row: torch.Tensor | None = None,
     produce_pdl: bool = False,
 ) -> torch.Tensor:
-    """Execute exactly the A family named by an execution-plan spec.
-
-    No fallback or selector lives here. Every family writes and returns the
-    caller-owned ``output``.
-    """
+    """Run exactly the family the spec names; no fallback, no selector."""
     family = _spec_value(spec, "family")
     site = _spec_value(spec, "site")
     pair_input = site == "down"

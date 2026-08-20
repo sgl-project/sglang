@@ -1,28 +1,9 @@
-"""Selector-free BF16 LoRA-B candidate kernels for the SGL MoE backend.
+"""The two LoRA-B families an execution plan can name.
 
-Only the production shortlist lives here:
-
-* one-launch sliced grouped B, the general promoted family; and
-* pair-indexed sliced B, the decode experiment behind
-  the shipped per-expert decode B family: its grid covers
-  occupied routed pairs instead of aligned expert-major M blocks, so a
-  sparse decode route (hundreds of distinct experts at one pair each) pays
-  no block padding.
-
-Rejected deterministic rank-split B and B-SGMV/CSGMV families are not copied
-into production.  The caller owns route and launch-config selection.
-
-Port provenance:
-
-* ``one_launch_sliced_lora_b`` mirrors function
-  ``invoke_one_launch_sliced_lora_b`` in
-  ``benchmark.kernels.lora_moe.lora_b_candidates``; and
-* ``indexed_pairs_lora_b`` models its raw-route indexing on the H200
-  ``_indexed_lora_a_kernel`` and keeps ``one_launch_sliced``'s destination,
-  slice-folding, and K-loop arithmetic.
-
-The production bodies preserve those launchers' tile geometry, config field
-semantics, route use, and invalid-pair zero-store contract.
+One-launch sliced B rides the aligned route and is the general choice.
+Pair-indexed sliced B rides the raw route: its grid covers occupied pairs
+rather than aligned expert-major blocks, so a sparse decode route -- hundreds
+of distinct experts at one pair each -- pays no block padding.
 """
 
 from __future__ import annotations
@@ -322,21 +303,10 @@ def _indexed_pairs_lora_b_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):
-    """One raw-route pair and one sliced N tile per program.
+    """One raw-route pair and one N tile per program: no sort, no padding.
 
-    The aligned one-launch kernel pays a full ``BLOCK_SIZE_M`` tensor-core
-    tile per occupied virtual expert, which at sparse decode routes is
-    almost entirely block padding.  This variant derives the pair's virtual
-    expert key inline (the one definition of it), so the M axis is
-    exactly the occupied pairs: no sort, no capacity padding, no
-    ``num_pairs_post_padded`` device scalar.
-
-    Numerics: the K loop steps ``BLOCK_SIZE_K`` over ``RANK`` with one FP32
-    accumulator per destination cell — the same per-pair k-tile order as
-    ``_one_launch_sliced_lora_b_kernel``.  BF16 products are exact in FP32
-    in both kernels, so results differ from one-launch only by the
-    within-tile summation order (``tl.sum`` here, the ``tl.dot`` MMA tree
-    there); oracles compare with the established allclose discipline.
+    Differs from one-launch only in within-tile summation order, so oracles
+    compare allclose rather than bitwise.
     """
     pair_id = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -421,15 +391,7 @@ def indexed_pairs_lora_b(
     config: Mapping[str, int],
     intermediate_top_k: int = 1,
 ) -> None:
-    """Execute raw-route pair-indexed sliced B.
-
-    Consumes only the raw source tensors carried on every ``RouteView``
-    (``topk_ids``/``token_lora_mapping``); an execution plan choosing this family
-    requests ``RouteViewKind.RAW`` so no aligned pair plan is built merely for this
-    stage.  The ``(num_pairs, n_tiles)`` grid is static per CUDA-graph
-    capture bucket (``num_pairs == T * top_k``), matching the graph-captured
-    indexed down-A precedent.  This launcher has no PDL operations.
-    """
+    """Raw-route B: no aligned plan built, static grid per capture bucket, no PDL."""
     num_slices, slice_width, rank = _validate_b_call(
         bridge,
         weight,
