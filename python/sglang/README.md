@@ -1,18 +1,26 @@
 # Code Structure
 
-- `eval`: The evaluation utilities.
-- `lang`: The frontend language.
-- `multimodal_gen`: Inference framework for accelerated image/video generation.
-- `srt`: The backend engine for running local models. (SRT = SGLang Runtime).
-- `test`: The test utilities.
-- `api.py`: The public APIs.
-- `bench_offline_throughput.py`: Benchmark the performance in the offline mode.
-- `bench_one_batch.py`: Benchmark the latency of running a single static batch without a server.
-- `bench_one_batch_server.py`: Benchmark the latency of running a single batch with a server.
-- `bench_serving.py`: Benchmark online serving with dynamic requests.
-- `check_env.py`: Check the environment variables and dependencies.
-- `global_config.py`: The global configs and constants.
-- `launch_server.py`: The entry point for launching a local server.
-- `profiler.py`: The profiling entry point to send profile requests.
-- `utils.py`: Common utilities.
-- `version.py`: Version info.
+## Folders
+
+- `benchmark/`: Benchmark implementations and dataset utilities.
+- `cli/`: Command-line interface commands and entrypoints.
+- `kernels/`: Kernel interfaces, implementations, selection, and debugging utilities shared by the runtimes.
+- `lang/`: Deprecated language frontend that is no longer actively maintained.
+- `multimodal_gen/`: Core runtime for image, video, and audio generation models, most of which are diffusion models.
+- `srt/`: Core runtime for autoregressive language models. (SRT = SGLang Runtime.)
+- `test/`: Shared test and evaluation utilities.
+
+## Files
+
+- `README.md`: This package structure overview.
+- `__init__.py`: Package initialization and public Python APIs.
+- `bench_offline_throughput.py`: Deprecated wrapper for the offline throughput benchmark.
+- `bench_one_batch.py`: Deprecated wrapper for the one-batch benchmark.
+- `bench_one_batch_server.py`: Deprecated wrapper for the server-based one-batch benchmark.
+- `bench_serving.py`: Deprecated wrapper for the online serving benchmark.
+- `check_env.py`: Environment and dependency diagnostics.
+- `compile_deep_gemm.py`: DeepGEMM kernel precompilation entrypoint.
+- `launch_server.py`: Compatibility entrypoint for launching an inference server.
+- `profiler.py`: Client entrypoint for collecting server profiling traces.
+- `utils.py`: Common package utilities.
+- `version.py`: Public package version resolution.

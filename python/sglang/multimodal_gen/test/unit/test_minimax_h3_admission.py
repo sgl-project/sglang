@@ -19,6 +19,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
+    LAYERWISE_OFFLOAD,
+    RESIDENT,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.release_metadata import (
     MiniMaxH3PartitionAdmissionStage,
     MiniMaxH3ReleaseMetadata,
@@ -28,6 +32,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
     minimax_h3_resolve_plan,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+    MiniMaxH3DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     partition_for_task,
@@ -247,12 +254,56 @@ def _quality_server_args():
         is_dit_layerwise_offload_selected=False,
         performance_mode="speed",
         quantization=None,
+        transformer_weights_path=None,
         regional_compile=False,
         ring_degree=1,
         sp_degree=4,
         tp_size=1,
         ulysses_degree=4,
         use_fsdp_inference=False,
+    )
+
+
+def test_high_quality_deployment_rejects_transformer_weight_override():
+    config = MiniMaxH3PipelineConfig()
+    server_args = _quality_server_args()
+    server_args.transformer_weights_path = "model.gguf"
+
+    with (
+        patch.object(current_platform, "is_cuda", return_value=True),
+        patch.object(current_platform, "get_device_name", return_value="NVIDIA H200"),
+        patch.object(
+            current_platform,
+            "get_device_capability",
+            return_value=_HopperCapability(),
+        ),
+        pytest.raises(ValueError, match="transformer_weights_path"),
+    ):
+        config.validate_quality_deployment(server_args)
+
+
+def test_high_quality_request_warns_when_bcg_suppresses_cache_dit():
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    stage.server_args = SimpleNamespace(enable_breakable_cuda_graph=True)
+    stage._cache_dit_enabled = False
+    batch = SimpleNamespace(
+        sampling_params=SimpleNamespace(
+            quality="high",
+            _explicit_fields={"quality"},
+            enable_cache_dit=None,
+            cache_dit_params=None,
+        )
+    )
+
+    with patch(
+        "sglang.multimodal_gen.runtime.pipelines_core.stages.denoising."
+        "logger.warning_once"
+    ) as warning_once:
+        stage._maybe_enable_cache_dit(50, batch)
+
+    warning_once.assert_called_once_with(
+        "Cache-DiT was requested but is disabled because breakable CUDA graphs "
+        "are enabled."
     )
 
 
@@ -340,4 +391,31 @@ def test_validate_server_args_requires_packed_varlen_backend():
         side_effect=ValueError("does not implement packed varlen attention"),
     ):
         with pytest.raises(ValueError, match="does not implement packed varlen"):
+            MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+
+def test_mps_admission_requires_layerwise_residency_for_every_h3_component():
+    config = SimpleNamespace(
+        vae_config=SimpleNamespace(resolved_parallel_decode_mode=lambda: None),
+        dit_config=SimpleNamespace(arch_config=SimpleNamespace(attention_head_dim=128)),
+        _server_arg_value=MiniMaxH3PipelineConfig._server_arg_value,
+    )
+    modes = {
+        "transformer": LAYERWISE_OFFLOAD,
+        "text_encoder": LAYERWISE_OFFLOAD,
+        "video_vae": LAYERWISE_OFFLOAD,
+        "audio_vae": LAYERWISE_OFFLOAD,
+    }
+    server_args = SimpleNamespace(
+        component_attention_backends={},
+        attention_backend=None,
+        enable_torch_compile=False,
+        residency_mode=modes.get,
+    )
+
+    with patch.object(current_platform, "is_mps", return_value=True):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+        modes["audio_vae"] = RESIDENT
+        with pytest.raises(ValueError, match="audio_vae"):
             MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
