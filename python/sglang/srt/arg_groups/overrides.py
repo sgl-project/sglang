@@ -2570,7 +2570,7 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
 def _a2a_fusion_adjustments(view: Any) -> dict:
     """A2A-backend-driven shared-experts fusion adjustments, declared at the
     legacy write slots in _handle_a2a_moe: Waterfill requires the
-    fusion enabled; FlashInfer and DeepEP v2 A2A require it disabled."""
+    fusion enabled; FlashInfer A2A requires it disabled."""
     if view.moe_a2a_backend in ("deepep", "megamoe") and view.enable_waterfill:
         if view.disable_shared_experts_fusion:
             logger.warning(
@@ -2583,10 +2583,6 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
             "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
         )
         return {"disable_shared_experts_fusion": True}
-    if view.moe_a2a_backend == "deepep_v2":
-        # DeepEP v2 has not validated fused shared experts yet; the handler
-        # rejects an explicit --enforce-shared-experts-fusion.
-        return {"disable_shared_experts_fusion": True}
     return {}
 
 
@@ -2595,7 +2591,6 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
     {
         "megamoe",
         "deepep",
-        "deepep_v2",
         "mooncake",
         "nixl",
         "ascend_fuseep",

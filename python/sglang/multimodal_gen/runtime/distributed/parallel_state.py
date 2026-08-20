@@ -56,6 +56,7 @@ from .group_coordinator import (
     PipelineGroupCoordinator,
     SequenceParallelGroupCoordinator,
     get_local_torch_device,
+    new_device_group,
 )
 
 logger = init_logger(__name__)
@@ -999,9 +1000,7 @@ def init_dit_group(
 ) -> None:
     global _DIT
     assert _DIT is None, "DIT group is already initialized"
-    _DIT = torch.distributed.new_group(
-        ranks=list(range(dit_parallel_size)), backend=backend
-    )
+    _DIT = new_device_group(list(range(dit_parallel_size)), backend)
 
 
 def get_dit_group() -> ProcessGroup:
@@ -1018,7 +1017,7 @@ def init_vae_group(
     global _VAE
     assert _VAE is None, "VAE parallel group is already initialized"
     vae_ranks = list(range(dit_parallel_size, dit_parallel_size + vae_parallel_size))
-    _VAE = torch.distributed.new_group(ranks=vae_ranks, backend=backend)
+    _VAE = new_device_group(vae_ranks, backend)
 
 
 def destroy_model_parallel() -> None:

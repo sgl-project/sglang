@@ -82,6 +82,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
+        draft_worker_cls: type[TpModelWorker] = TpModelWorker,
     ):
         super().__init__()
 
@@ -124,6 +125,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 attention_backend_override=(
                     DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
                 ),
+                draft_worker_cls=draft_worker_cls,
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner

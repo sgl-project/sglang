@@ -1358,9 +1358,19 @@ def configure_layerwise_offload_modules(
         configured_component_names.append(component_name)
 
     if configured_component_names:
+        # Report where the weights ended up, not just which components opted
+        # in. The loader's per-component line runs before this, so it can only
+        # ever describe the pre-offload placement.
+        from sglang.multimodal_gen.runtime.loader.utils import (
+            format_component_residency,
+        )
+
         logger.info(
             "Enabled layerwise offload for pipeline components: %s",
-            configured_component_names,
+            ", ".join(
+                f"{name} ({format_component_residency(modules[name])})"
+                for name in configured_component_names
+            ),
         )
     elif warn_missing:
         logger.debug("No selected pipeline component enabled layerwise offload")
