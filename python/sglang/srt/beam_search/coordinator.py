@@ -13,6 +13,13 @@ All rows decode in lockstep over [prompt_len, leader_allocated), but
 share-on-fork lets several of them reference the same slot, so the group --
 not the individual row -- owns that region: it is freed once, deduped, at
 group finish.
+
+Every tick splits in two, and the whole file follows the naming. select_* is
+the launch half (tensor-side, no D2H) and must run before the next forward
+resolves its inputs, so the relayed tokens and reparented KV are the selected
+ones. commit_* is the deferred half (DAG build, finish/abort); under overlap it
+lags one forward and discards overshoot steps. Sync callers run both within one
+tick. Commits are tick-gated; BeamGroup.commit_pending documents why.
 """
 
 from __future__ import annotations
@@ -196,9 +203,8 @@ class BeamCoordinator:
         neutral.no_stop_trim = user_params.no_stop_trim
         req.sampling_params = neutral
         req.beam_group = group
-        # The leader's decode suffix is a beam path; never insert it into the
-        # radix tree (this also skips the prefill-time unfinished insert: in v1
-        # the leader row keeps sole ownership of any non-tree prompt KV).
+        # The leader's decode suffix is a beam path, never a tree entry; this
+        # also skips the prefill-time unfinished insert.
         req.skip_radix_cache_insert = True
         self._num_live_groups += 1
         return None
@@ -231,14 +237,6 @@ class BeamCoordinator:
         return sorted(stop_ids)
 
     # ==================== relay hook ====================
-    # Every tick is split in two for overlap, and the whole file follows this
-    # naming: select_* is the LAUNCH half (all tensor-side, no D2H) -- it must
-    # run before the next forward resolves its inputs, so the relayed tokens
-    # and reparented KV are the selected ones. commit_* is the DEFERRED half
-    # (DAG build + finish/abort); under overlap it lags one forward and
-    # discards overshoot steps, mirroring the standard overlap finish-lag.
-    # Sync callers run both back-to-back within one tick. Commits are tick-
-    # gated; BeamGroup.commit_pending documents why.
 
     def maybe_select_and_relay(
         self, batch: ScheduleBatch, batch_result, chunked_req: Optional[Req] = None
@@ -299,9 +297,8 @@ class BeamCoordinator:
         final = group.next_step_is_final()
         next_tokens, _ = self._select_group(group, top_logprobs, top_tokens, tick)
         if final:
-            # Prefill-terminated (e.g. effective max_new_tokens == 1): no
-            # spawn. The relay slot still gets a token so an overlap overshoot
-            # step has a valid input; commit_prefill applies the finish.
+            # Prefill-terminated (max_new_tokens == 1): no spawn, but the relay
+            # slot still needs a token so an overshoot step has a valid input.
             self._stash_next_tokens([req.req_pool_idx], next_tokens[:1])
             return
         self._spawn_member_rows(group, req)
@@ -381,9 +378,8 @@ class BeamCoordinator:
             group = req.beam_group
             if group is None or group.retired:
                 continue
-            # Orphan slots are reclaimed whether or not the step's DAG commit
-            # survives: the remap already mutated req_to_token on the launch
-            # path, so an overshoot step's orphans are real either way.
+            # Reclaim even if the DAG commit is discarded: the launch path
+            # already mutated req_to_token, so the orphans are real either way.
             self._reclaim_orphans(group, batch.forward_iter)
             if req.to_finish is not None:
                 self._abort_group(group)
@@ -429,12 +425,8 @@ class BeamCoordinator:
     ) -> None:
         rows = group.all_rows
         if parent_idx is not None:
-            # Share-on-fork: the survivor's history IS its parent's window
-            # (including the token just computed at seq_len-1), so remap the
-            # mapping instead of copying KV. Slots nobody inherits are staged
-            # for the deferred half -- reclaiming them needs a data-dependent
-            # set difference, which must not sit on the launch path.
-            # Final steps skip this: their KV is never read again.
+            # Final steps skip this: their KV is never read again. Orphans are
+            # staged, not freed here -- the set difference must not block launch.
             old_map, new_map = remap_kv_mapping(
                 self.req_to_token_pool.req_to_token,
                 rows=rows,
@@ -467,9 +459,8 @@ class BeamCoordinator:
             ]
         if not staged:
             return
-        # Plain free(), never a nested free_group: free_group_begin wipes the
-        # pending list and free_group_end does not clear it, so an inner
-        # begin/end pair inside the decode path's group double-frees.
+        # Plain free(), never a nested free_group: an inner begin/end pair
+        # inside the decode path's group double-frees.
         allocator = self.token_to_kv_pool_allocator
         for entry in staged:
             orphans = collect_orphan_slots(entry.old_mapping, entry.new_mapping)

@@ -463,7 +463,7 @@ class GenerateReqInput:
                 self.batch_size = len(self.input_embeds)
 
     def _sampling_params_beam_width(self) -> int:
-        """beam_width of the request's sampling params (1 = not a beam request)."""
+        # 1 means not a beam request.
         if isinstance(self.sampling_params, dict):
             return self.sampling_params.get("beam_width") or 1
         elif isinstance(self.sampling_params, list) and self.sampling_params:
@@ -471,11 +471,7 @@ class GenerateReqInput:
         return 1
 
     def _handle_beam_search_parallel_sampling(self) -> int:
-        """Disable parallel-sampling fan-out for beam requests.
-
-        beam_width > 1 makes this a beam request; n keeps its "number of
-        returned sequences" meaning, so there is no fan-out.
-        """
+        # No fan-out for beam requests: n means "number of returned sequences".
         if self._sampling_params_beam_width() > 1:
             return 1
         return self.parallel_sample_num

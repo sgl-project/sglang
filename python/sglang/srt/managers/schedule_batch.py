@@ -2202,9 +2202,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     global_num_tokens_for_logprob: Optional[List[int]] = None
     global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
-    # Beam search: layout of the member rows appended after the reqs-aligned
-    # rows for one forward (set by append_beam_tail, cleared by
-    # strip_beam_tail; None whenever reqs and row tensors are 1:1).
+    # Member rows riding one forward; None whenever reqs and rows are 1:1.
     beam_tail: Optional[BeamTail] = None
 
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
@@ -2863,10 +2861,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             if req.beam_group is not None:
-                # Abort the whole group atomically (only the leader is a Req;
-                # member rows are freed here while the leader's kv info still
-                # carries the group's lockstep allocated length). The
-                # scheduler retires the group via retire_aborted_beam_groups.
+                # Free member rows before release_req: they need the leader's kv
+                # info, which still carries the lockstep allocated length.
                 req.to_finish = FINISH_ABORT(
                     "Beam search group aborted: KV cache pool is full. Beam "
                     "groups cannot be retracted, so they are aborted instead "

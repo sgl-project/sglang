@@ -71,10 +71,8 @@ class BeamGroup:
 
         self.frontier_cum_logprobs = torch.zeros(1, dtype=torch.float32, device=device)
         self.leaves: List[Optional[BeamNode]] = [None]  # parents of the next tokens
-        # Two step counters, one per half: num_generated counts frontier steps
-        # taken (launch path; schedules the next selection), num_committed
-        # counts steps folded into the DAG (deferred path; the group's true
-        # length). Equal in sync mode; generated may lead by one under overlap.
+        # num_generated is the launch half's count, num_committed the deferred
+        # half's (the true length); generated may lead by one under overlap.
         self.num_generated = 0
         self.num_committed = 0
         self.completed: List[CompletedBeam] = []
@@ -86,9 +84,8 @@ class BeamGroup:
         # (finish / abort / dead-leader); guards double bookkeeping.
         self.retired = False
 
-        # Scheduler wiring, set by BeamCoordinator rather than the search
-        # core. Members have no Req, so all their bookkeeping (seq len, KV
-        # committed/allocated) is implied by the leader's.
+        # Scheduler wiring, filled in from outside the search core. Members have
+        # no Req, so their seq len and KV lengths are implied by the leader's.
         self.leader = None
         # Device [k-1] member row indices, and the same rows on host (for
         # row-slot free). None until the post-prefill spawn / after free.
@@ -96,9 +93,8 @@ class BeamGroup:
         self.member_rows_cpu: Optional[torch.Tensor] = None
         # Device [k]: leader row first, then member_rows (frontier-row order).
         self.all_rows: Optional[torch.Tensor] = None
-        # StagedOrphans from the launch half; the deferred half turns them into
-        # freed slots (share-on-fork GC), gated on the tick whose copy_done
-        # sync already happened.
+        # Staged by the launch half; the deferred half frees them, gated on the
+        # tick whose copy_done sync already happened.
         self.pending_orphans: List[StagedOrphans] = []
         # Running total the GC has returned, so held KV is a host-side
         # arithmetic (allocated - freed) rather than a tensor read.
@@ -204,9 +200,8 @@ class BeamGroup:
         tokens = sel.tokens.tolist()
         parents = sel.parent_idx.tolist()
         cums = sel.cum_logprobs.tolist()
-        # A parent outside the committed frontier means the commit consumed a
-        # step whose device tensors were not yet synchronized (tick gating
-        # bug) -- fail loudly rather than build a corrupt DAG.
+        # A parent outside the committed frontier means a tick-gating bug let an
+        # unsynchronized step through; fail rather than build a corrupt DAG.
         assert not parents or max(parents) < len(
             self.leaves
         ), "beam commit consumed an unsynced or misordered step"

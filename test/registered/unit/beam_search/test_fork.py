@@ -170,9 +170,8 @@ class TestFreeMemberRows(CustomTestCase):
 
 
 class TestRetireReclaimsStagedOrphans(CustomTestCase):
-    """The retract-abort path releases member rows through free_member_rows
-    directly, which only sees slots some row still names. Orphans staged by the
-    launch half are named by none, so _retire_group is their last chance."""
+    """Regression: aborting a group must not leak the orphan slots staged by the
+    launch half, which no surviving row names."""
 
     @staticmethod
     def _make_coordinator(allocator):

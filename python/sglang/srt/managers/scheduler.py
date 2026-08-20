@@ -3568,8 +3568,7 @@ class Scheduler(
             and not (new_batch.return_logprob or running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
-            # Beam member rows (appended by prepare_for_decode) are not
-            # supported inside a mixed extend batch.
+            # Beam member rows are not supported inside a mixed extend batch.
             and all(r.beam_group is None for r in running_batch.reqs)
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
@@ -4028,9 +4027,8 @@ class Scheduler(
         else:
             return
         if batch.beam_tail is not None:
-            # The worker sliced the member rows off before sampling, so the
-            # sampled tokens cover only the reqs-aligned rows; the member rows
-            # are relayed by the coordinator's selection below.
+            # The worker sliced the tail off before sampling, so sampled tokens
+            # cover only the reqs-aligned rows; the coordinator relays the rest.
             future_indices = future_indices[: batch.beam_tail.num_base_rows]
         self.future_map.stash(future_indices, payload)
         self.beam_coordinator.maybe_select_and_relay(

@@ -45,11 +45,8 @@ async def _generate(session, base_url, prompt, width):
 
 
 class _BeamSweepBase(CustomTestCase):
-    """Shared sweep harness; concrete classes pick the pool configuration.
-
-    Primary metric is aggregate beam tok/s (= reqs x width x new_tokens /
-    elapsed); QPS is reported secondarily since it conflates width.
-    """
+    # Primary metric is aggregate beam tok/s (reqs x width x new_tokens /
+    # elapsed); QPS is secondary since it conflates width.
 
     extra_server_args = []
     pool_label = "default pool"
@@ -62,10 +59,8 @@ class _BeamSweepBase(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            # Leave VRAM headroom: the beam logprob path materializes a
-            # full-vocab [num_beam_rows, vocab] logprobs tensor each step,
-            # which OOMs at large width x concurrency if the KV pool takes the
-            # default share.
+            # 0.7 leaves headroom for the full-vocab [num_beam_rows, vocab]
+            # logprobs tensor, which OOMs at large width x concurrency.
             other_args=["--disable-overlap-schedule", "--mem-fraction-static", "0.7"]
             + cls.extra_server_args,
         )
@@ -127,23 +122,16 @@ class _BeamSweepBase(CustomTestCase):
 
 
 class TestBeamSweepDefaultPool(_BeamSweepBase):
-    """Default req-slot pool: measures the deployment-default curve.
-
-    With the default max_running_requests (4096) the in-flight beam rows pin
-    at ~4000 for width >= 50, so this curve saturates at the pool, not the
-    engine.
-    """
+    """Default req-slot pool (4096): beam rows pin at ~4000 for width >= 50, so
+    this curve saturates at the pool, not the engine."""
 
     def test_beam_width_sweep(self):
         self._run_sweep()
 
 
 class TestBeamSweepLargePool(_BeamSweepBase):
-    """Enlarged req-slot pool: measures the engine ceiling.
-
-    16384 slots let up to ~40 width-400 groups run concurrently; the short
-    --context-length keeps the req_to_token pool small enough to afford it.
-    """
+    """Enlarged pool (16384) for the engine ceiling: ~40 width-400 groups run
+    concurrently, affordable because --context-length is short."""
 
     extra_server_args = [
         "--max-running-requests",

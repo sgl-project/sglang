@@ -89,10 +89,8 @@ def decode_beam_search_output(
                     ],
                 )
     else:
-        # batch_decode only accepts scalar skip_special_tokens /
-        # spaces_between_special_tokens flags, so decode per request (each
-        # request's beams share that request's flags). Batching across the whole
-        # batch would apply request 0's flags to every request's beams.
+        # batch_decode takes scalar skip_special_tokens flags, so decode per
+        # request; batching all would apply request 0's flags to everyone.
         for i, beam_output in enumerate(recv_obj.beam_search_output):
             if beam_output is None:
                 # Mixed batch: this item is not a beam request.

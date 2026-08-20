@@ -268,9 +268,8 @@ class SchedulerBatchResultProcessor:
                     req.time_stats.set_prefill_finished_time()
 
                     if req.beam_group is not None:
-                        # Beam leader: the joint selection already replaced the
-                        # sampled-token append at the forward's relay point,
-                        # and the group owns all finish semantics.
+                        # The relay point already replaced the sampled-token
+                        # append; the group owns all finish semantics.
                         self.beam_coordinator.commit_prefill(
                             req, up_to_tick=batch.forward_iter
                         )
@@ -854,9 +853,8 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        # Deferred commit: folds the relay point's selection into the DAG and
-        # sets the group-atomic finish states the loop below observes.
-        # (Beam + spec is rejected at admission.)
+        # Folds the relay point's selection into the DAG and sets the finish
+        # states the loop below observes. Beam + spec is rejected at admission.
         newly_finished_beam_groups = set()
         if batch.spec_algorithm.is_none() and logits_output is not None:
             newly_finished_beam_groups = self.beam_coordinator.commit_decode(batch)
@@ -865,11 +863,8 @@ class SchedulerBatchResultProcessor:
             req: Req
 
             if req.beam_group is not None:
-                # The commit pre-pass owns tokens and finish state; only the
-                # shared finish machinery (KV release, completion time) runs
-                # here. Under overlap a finished row reappears for one
-                # overshoot tick, so gate on the tick that finished the group
-                # to run this exactly once.
+                # Under overlap a finished row reappears for one overshoot tick;
+                # gate on the committing tick so this runs exactly once.
                 if req.finished() and (
                     id(req.beam_group) not in newly_finished_beam_groups
                 ):

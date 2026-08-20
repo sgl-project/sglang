@@ -1748,7 +1748,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # all subsequent finished/logging/metrics logic is shared automatically.
             if out.get("beam_results"):
                 if not finished:
-                    # Intermediate beam search output — skip until finished
+                    # Intermediate beam output; skip until finished.
                     continue
                 out = build_beam_search_out(out)
 
@@ -2306,7 +2306,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             state.finished = recv_obj.finished_reasons[i] is not None
 
-            # Build beam search out dict after meta_info is fully populated,
+            # Must run after meta_info is fully populated.
             beam_out_dict = try_build_beam_search_out_dict(recv_obj, i, meta_info)
 
             if beam_out_dict is not None:

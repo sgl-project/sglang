@@ -41,10 +41,8 @@ def capture_pre_sample_logits(
     ):
         return
     if batch.beam_tail is not None:
-        # The sampler and every consumer downstream are reqs-aligned, so the
-        # member tail is split off their view. Outside that view the tail's
-        # raw logits survive the in-place sampling writes as-is; the leader
-        # rows do not, hence the clone.
+        # Split off the reqs-aligned view: outside it the tail survives the
+        # in-place sampling writes, but the leader rows do not, hence the clone.
         n = batch.beam_tail.num_base_rows
         logits = logits_output.next_token_logits
         logits_output.next_token_logits = logits[:n]

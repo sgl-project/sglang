@@ -30,9 +30,8 @@ class StagedOrphans(NamedTuple):
     new_mapping: torch.Tensor
 
 
-# Members outlive the group's own length checks by a margin so that row-side
-# length limits can never truncate before the coordinator's deterministic
-# advance_final.
+# Margin so row-side length limits can never truncate before the coordinator's
+# deterministic advance_final.
 MEMBER_LENGTH_MARGIN = 4
 
 
@@ -77,11 +76,8 @@ def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> No
     start = group.prompt_len
     end = leader.kv.kv_allocated_len if leader.kv is not None else start
     if end > start:
-        # Share-on-fork lets several rows (incl. the leader's) point at one
-        # slot, so the GROUP owns the decode region and frees it once, deduped.
-        # Rewinding the leader's kv lengths then leaves its per-Req release
-        # path exactly the region still its own -- [0, prompt_len), the aliased
-        # prompt. Without the rewind it frees the decode region a second time.
+        # The rewind below is required: without it the leader's own per-Req
+        # release frees this decode region a second time.
         slots = req_to_token_pool.req_to_token[group.all_rows, start:end]
         token_to_kv_pool_allocator.free(slots.flatten().unique())
         if leader.kv is not None:
