@@ -11,6 +11,8 @@ included; anything less and a token's routing would depend on the batch size.
 Run:  pytest test/registered/kernels/ops/moe/test_moe_route_radix4.py -v
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -299,3 +301,7 @@ def test_route_radix4_coverage():
     assert not moe_route_radix4.covered(
         scores.new_empty((1536, NUM_EXPERTS)), bias, TOPK, 1, 1
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
