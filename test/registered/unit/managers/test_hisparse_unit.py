@@ -50,7 +50,7 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         fill_ids=origin_input_ids + output_ids,
         seqlen=len(origin_input_ids) + len(output_ids),
         req_pool_idx=None,
-        kv=SimpleNamespace(kv_allocated_len=0),
+        kv=SimpleNamespace(kv_allocated_len=0, swa_evicted_seqlen=0),
         kv_committed_len=0,
         finished_reason=None,
         hisparse_staging=False,

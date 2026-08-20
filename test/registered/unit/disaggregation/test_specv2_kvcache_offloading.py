@@ -35,7 +35,7 @@ def _make_mock_req(
     req.rid = rid
     req.req_pool_idx = req_pool_idx
     req.kv_committed_len = kv_committed_len
-    req.kv = SimpleNamespace(kv_allocated_len=kv_allocated_len)
+    req.kv = SimpleNamespace(kv_allocated_len=kv_allocated_len, swa_evicted_seqlen=0)
     req.prefix_indices = list(range(prefix_indices_len))
     req.effective_kv_committed_len = lambda: req.kv_committed_len
     return req
