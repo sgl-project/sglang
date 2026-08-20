@@ -563,11 +563,7 @@ class SchedulerDisaggregationPrefillMixin:
         staged: Dict[str, StagedPrefillTransferIndices] = {}
 
         for req in batch.reqs:
-            if (
-                req.pending_bootstrap
-                or is_aborted(req)
-                or req.extend_range is None
-            ):
+            if req.pending_bootstrap or is_aborted(req) or req.extend_range is None:
                 continue
 
             transfer_input_len = len(req.origin_input_ids)
@@ -593,12 +589,10 @@ class SchedulerDisaggregationPrefillMixin:
             is_last_chunk = end_idx >= transfer_input_len
             if is_last_chunk:
                 if StateType.MAMBA in state_types:
-                    mamba_indices = (
-                        self.req_to_token_pool.translate_mamba_indices(
-                            self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                                req.req_pool_idx
-                            ]
-                        )
+                    mamba_indices = self.req_to_token_pool.translate_mamba_indices(
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            req.req_pool_idx
+                        ]
                     )
                     entry.mamba_indices = _copy_to_pinned_cpu(mamba_indices)
 
@@ -663,10 +657,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_staging
                 else len(req.prefix_indices) - req.host_hit_length
             )
-            if (
-                cached_end <= req.start_send_idx
-                or cached_end % page_size != 0
-            ):
+            if cached_end <= req.start_send_idx or cached_end % page_size != 0:
                 continue
 
             full_indices = self.req_to_token_pool.req_to_token[
@@ -1324,6 +1315,20 @@ class SchedulerDisaggregationPrefillMixin:
             # DCP radix hits can end on a logical cache-page boundary that is
             # not a complete physical DCP page. The regular final send covers
             # the full range; only skip this optional early-send optimization.
+            return
+        staged_prefix: Optional[StagedCachedPrefixTransferIndices] = getattr(
+            req, "_staged_cached_prefix_transfer_indices", None
+        )
+        if (
+            staged_prefix is not None
+            and staged_prefix.end_idx >= cached_end
+            and not staged_prefix.ready_event.query()
+        ):
+            # Early-send is optional. Under overlap scheduling the pinned D2H
+            # can still be behind the previous forward. Waiting here blocks
+            # the scheduler and turns one slow DP rank into an all-gather idle
+            # gap on every rank. Retry on the request's next chunk; if there
+            # is no next chunk, the regular final send covers the full range.
             return
         # Early-send issues the KV read before this step's forward is enqueued,
         # but under overlap scheduling the PRIOR step's prefill forward may still
