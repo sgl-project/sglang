@@ -99,7 +99,7 @@ def free_member_rows(group, req_to_token_pool, token_to_kv_pool_allocator) -> No
         if leader.kv is not None:
             leader.kv_committed_len = start
             leader.kv.kv_allocated_len = start
-    req_to_token_pool.free_raw(group.member_rows_cpu.tolist())
+    req_to_token_pool.free_rows(group.member_rows_cpu.tolist())
     group.member_rows = None
     group.member_rows_cpu = None
     group.all_rows = None

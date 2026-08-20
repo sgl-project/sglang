@@ -337,7 +337,7 @@ class BeamCoordinator:
     def _spawn_member_rows(self, group: BeamGroup, leader: Req) -> None:
         """Allocate the k-1 member rows and alias the leader's prompt KV
         mapping onto them, batched. No Req objects, no host sync."""
-        rows = self.req_to_token_pool.alloc_raw(group.beam_width - 1)
+        rows = self.req_to_token_pool.alloc_rows(group.beam_width - 1)
         assert rows is not None, (
             f"Beam member spawn needs {group.beam_width - 1} req-to-token slots "
             f"but only {self.req_to_token_pool.available_size()} are free; the "

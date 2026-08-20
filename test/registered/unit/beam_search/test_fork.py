@@ -104,7 +104,7 @@ class _FakeReqToTokenPool:
         self.req_to_token = req_to_token
         self.freed = []
 
-    def free_raw(self, indices):
+    def free_rows(self, indices):
         self.freed.extend(indices)
 
 
