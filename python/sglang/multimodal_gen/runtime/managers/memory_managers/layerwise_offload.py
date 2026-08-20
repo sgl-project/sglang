@@ -205,6 +205,16 @@ class LayerwiseOffloadManager:
         except Exception:
             return None
 
+    def _managed_parameter_bytes(self) -> int:
+        total_bytes = 0
+        for name, tensor in self.model.named_parameters():
+            layer_idx = self._match_layer_idx(name)
+            if layer_idx is None or layer_idx >= self.num_layers:
+                continue
+            local_tensor = self._to_local_tensor(tensor)
+            total_bytes += local_tensor.numel() * local_tensor.element_size()
+        return total_bytes
+
     def _get_shared_empty_tensor(self, dtype: torch.dtype) -> torch.Tensor:
         placeholder = self._offload_placeholders.get(dtype)
         if placeholder is None:
@@ -252,12 +262,25 @@ class LayerwiseOffloadManager:
         if not self.enabled:
             return
 
-        self._named_parameters = dict(self.model.named_parameters())
-        self._named_buffers = dict(self.model.named_buffers())
-
         if self._synchronous_mps:
+            self._named_parameters = dict(self.model.named_parameters())
+            self._named_buffers = dict(self.model.named_buffers())
             self._initialize_mps_cpu_weights()
             return
+
+        self._initialize_layer_weights()
+
+        # Keep non-layer parameters resident on GPU. Layer tensors have already
+        # been replaced by tiny device placeholders, so this does not reload the
+        # offloaded layer weights.
+        if not self._has_dtensor_weights:
+            self.model.to(self.device)
+
+        self._finalize_initialization()
+
+    def _initialize_layer_weights(self) -> None:
+        self._named_parameters = dict(self.model.named_parameters())
+        self._named_buffers = dict(self.model.named_buffers())
 
         # 1. collect and group layer parameters by dtype. Keep buffers resident:
         # shared buffers such as RoPE caches may be referenced by many layers.
@@ -353,12 +376,7 @@ class LayerwiseOffloadManager:
 
                 self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
 
-        # Keep non-layer parameters resident on GPU. Layer tensors have already
-        # been replaced by tiny device placeholders, so this does not reload the
-        # offloaded layer weights.
-        if not self._has_dtensor_weights:
-            self.model.to(self.device)
-
+    def _finalize_initialization(self) -> None:
         # prefetch the head of the stream for warm-up; residency is not armed
         # yet, so this is layer 0 regardless of policy
         self.prepare_for_next_req(non_blocking=False)
@@ -1012,7 +1030,7 @@ class LayerwiseOffloadableModuleMixin:
                 pin_cpu_memory=server_args.pin_cpu_memory,
                 prefetch_size=prefetch_size,
                 resident_layers=resident_layers,
-                initialize=not current_platform.is_mps(),
+                initialize=False,
                 residency_policy=(
                     server_args.dit_layerwise_residency_policy
                     if dit_tuning_enabled
@@ -1026,6 +1044,33 @@ class LayerwiseOffloadableModuleMixin:
             for manager in self.layerwise_offload_managers:
                 manager.initialize()
             self._capture_mps_cpu_non_layer_weights()
+        else:
+            enabled_managers = [
+                manager
+                for manager in self.layerwise_offload_managers
+                if manager.enabled
+            ]
+            initialization_order = sorted(
+                enabled_managers,
+                key=lambda manager: manager._managed_parameter_bytes(),
+                reverse=True,
+            )
+            # release the largest managed groups first when checkpoint loading
+            # already placed weights on the accelerator; keep the stored manager
+            # order unchanged for prefetch and forward lifecycle semantics
+            for manager in initialization_order:
+                manager._initialize_layer_weights()
+
+            # Every managed layer group must be replaced before moving the
+            # remaining parameters, otherwise an earlier manager transiently
+            # moves later groups to the device.
+            if enabled_managers and not any(
+                manager._has_dtensor_weights for manager in enabled_managers
+            ):
+                self.to(enabled_managers[0].device)
+
+            for manager in enabled_managers:
+                manager._finalize_initialization()
 
         if configured_layer_names:
             logger.debug(
@@ -1313,9 +1358,19 @@ def configure_layerwise_offload_modules(
         configured_component_names.append(component_name)
 
     if configured_component_names:
+        # Report where the weights ended up, not just which components opted
+        # in. The loader's per-component line runs before this, so it can only
+        # ever describe the pre-offload placement.
+        from sglang.multimodal_gen.runtime.loader.utils import (
+            format_component_residency,
+        )
+
         logger.info(
             "Enabled layerwise offload for pipeline components: %s",
-            configured_component_names,
+            ", ".join(
+                f"{name} ({format_component_residency(modules[name])})"
+                for name in configured_component_names
+            ),
         )
     elif warn_missing:
         logger.debug("No selected pipeline component enabled layerwise offload")
