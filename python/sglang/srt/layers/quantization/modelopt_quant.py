@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import regex as re
@@ -508,6 +509,14 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             self.use_marlin = (
                 envs.SGLANG_FORCE_FP8_MARLIN.get() or can_auto_enable_marlin_fp8()
             )
+        # SM120 decode fast path: cuBLAS serves M=1 fp8 GEMMs with SM89 tiles
+        # at 50-70% DRAM bandwidth for mid-sized N; a streaming GEMV recovers
+        # the gap. Kill switch: SGLANG_DISABLE_SM120_FP8_GEMV=1.
+        self.use_sm120_gemv = (
+            is_cuda()
+            and torch.cuda.get_device_capability()[0] == 12
+            and os.environ.get("SGLANG_DISABLE_SM120_FP8_GEMV", "0") != "1"
+        )
 
     def create_weights(
         self,
@@ -577,6 +586,17 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             max_w_scale = convert_to_channelwise(max_w_scale, layer.logical_widths)
         layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
         layer.input_scale = Parameter(layer.input_scale.max(), requires_grad=False)
+        if (
+            self.use_sm120_gemv
+            and layer.weight_scale.numel() == 1
+            and layer.input_scale.numel() == 1
+        ):
+            # Combined GEMM epilogue scale for the SM120 M=1 GEMV fast path.
+            layer.sm120_gemv_alpha = (
+                (layer.input_scale.float() * layer.weight_scale.float())
+                .reshape(1)
+                .contiguous()
+            )
         if self.use_marlin:
             prepare_fp8_layer_for_marlin(layer)
             # Marlin uses FP8 weights with unquantized activations.
@@ -599,6 +619,26 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
+        if (
+            self.use_sm120_gemv
+            and bias is None
+            and x.dim() == 2
+            and x.shape[0] == 1
+            and hasattr(layer, "sm120_gemv_alpha")
+        ):
+            from sglang.kernels.ops.gemm.sm120_fp8_gemv import (
+                sm120_fp8_gemv,
+                use_sm120_fp8_gemv,
+            )
+
+            # layer.weight is the [K, N] transposed view of an [N, K]-contiguous
+            # buffer, so .t() recovers the row-major weight the GEMV streams.
+            w = layer.weight.t()
+            if use_sm120_fp8_gemv(1, w.shape[0], w.shape[1]) and w.is_contiguous():
+                from sglang.kernels.ops.quantization.fp8_kernel import static_quant_fp8
+
+                qinput, _ = static_quant_fp8(x, layer.input_scale, repeat_scale=False)
+                return sm120_fp8_gemv(qinput, w, layer.sm120_gemv_alpha)
         if layer.use_flashinfer_bmm:
             return apply_fp8_linear_bmm_flashinfer(
                 input=x,
@@ -736,6 +776,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         packed_modules_mapping: Optional[Dict[str, List[str]]],
         quantized_layers: Dict[str, Dict[str, Any]],
         fp8_config: ModelOptFp8Config,
+        fp8_pb_wo_config: Fp8Config,
         nvfp4_config: ModelOptFp4Config,
         nvfp4a16_config: ModelOptFp4Config,
         mxfp8_config: Fp8Config,
@@ -743,6 +784,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
+        self.fp8_pb_wo_config = fp8_pb_wo_config
         self.mxfp8_config = mxfp8_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
@@ -827,6 +869,12 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             exclude_modules=[],
             packed_modules_mapping=packed_modules_mapping,
         )
+        fp8_pb_wo_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+            packed_modules_mapping=packed_modules_mapping,
+        )
         mxfp8_config = Fp8Config(
             is_checkpoint_fp8_serialized=True,
             activation_scheme="dynamic",
@@ -856,6 +904,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             quantized_layers=quantized_layers,
             fp8_config=fp8_config,
+            fp8_pb_wo_config=fp8_pb_wo_config,
             mxfp8_config=mxfp8_config,
             nvfp4_config=nvfp4_config,
             nvfp4a16_config=nvfp4a16_config,
@@ -937,6 +986,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
                 return UnquantizedLinearMethod()
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
+            if quant_algo == "FP8_PB_WO":
+                return Fp8LinearMethod(self.fp8_pb_wo_config)
             if quant_algo == "MXFP8":
                 return Fp8LinearMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":
@@ -1330,7 +1381,8 @@ class ModelOptFp4Config(ModelOptQuantConfig):
       and checkpoint-provided scales.
     - Serialized + per-token FP32 activation scales: set
       `SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION=1`; use
-      `flashinfer_trtllm` or `flashinfer_trtllm_routed`.
+      `flashinfer_trtllm`, `flashinfer_trtllm_routed`, or `flashinfer_cutedsl`
+      v2 with no A2A or FlashInfer A2A.
     - BF16/FP16/FP8 MoE + per-tensor FP32 activation scales: quantize expert
       weights on load, keep dense weights in source precision or FP8, and use
       1.0 when the checkpoint has no NVFP4 activation scale.
@@ -2470,9 +2522,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
 
         if layer.moe_runner_config.is_gated and self.enable_flashinfer_trtllm_moe:
+            runner_config = layer.moe_runner_config
+            is_situ = runner_config.activation == "situ"
             gemm1_clamp_limit = (
-                layer.moe_runner_config.gemm1_clamp_limit
-                or layer.moe_runner_config.swiglu_limit
+                None
+                if is_situ
+                else (runner_config.gemm1_clamp_limit or runner_config.swiglu_limit)
             )
             if gemm1_clamp_limit is not None:
                 copy_or_rebind_param(
@@ -2481,30 +2536,36 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     (gemm1_clamp_limit / layer.g1_alphas).to(torch.float32),
                 )
 
-            if layer.moe_runner_config.gemm1_alpha is not None:
+            if runner_config.gemm1_alpha is not None:
                 copy_or_rebind_param(
                     layer,
                     "gemm1_alpha",
                     torch.full_like(
                         layer.g1_alphas,
-                        layer.moe_runner_config.gemm1_alpha,
+                        runner_config.gemm1_alpha,
                         dtype=torch.float32,
                     ),
                 )
-                copy_or_rebind_param(
-                    layer,
-                    "gemm1_beta",
-                    (1.0 / layer.g1_alphas).to(torch.float32),
+                gemm1_beta = (
+                    torch.full_like(
+                        layer.g1_alphas,
+                        runner_config.gemm1_clamp_limit,
+                        dtype=torch.float32,
+                    )
+                    if is_situ
+                    else (1.0 / layer.g1_alphas).to(torch.float32)
                 )
+                copy_or_rebind_param(layer, "gemm1_beta", gemm1_beta)
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
+        use_dispatch_fp4 = not self.quant_config.use_per_token_activation and (
+            MOE_NVFP4_DISPATCH or should_use_flashinfer_cutlass_moe_fp4_allgather()
+        )
+
         layer.dispatcher.set_quant_config(
             {
                 "input_global_scale": (
-                    layer.w13_input_scale_quant
-                    if MOE_NVFP4_DISPATCH
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                    else None
+                    layer.w13_input_scale_quant if use_dispatch_fp4 else None
                 )
             }
         )
@@ -2565,17 +2626,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     interleave_w13_halves,
                 )
 
-                layer.w13_weight = Parameter(
+                copy_or_rebind_param(
+                    layer,
+                    "w13_weight",
                     interleave_w13_halves(
                         layer.w13_weight.view(torch.uint8), group_size=64, dim=1
                     ).contiguous(),
-                    requires_grad=False,
                 )
-                layer.w13_weight_scale = Parameter(
+                copy_or_rebind_param(
+                    layer,
+                    "w13_weight_scale",
                     interleave_w13_halves(
                         layer.w13_weight_scale, group_size=64, dim=1
                     ).contiguous(),
-                    requires_grad=False,
                 )
 
             # Process w13 weights
@@ -2636,6 +2699,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
                 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
                     _FP4_SF_VEC_SIZE,
+                    refresh_cutedsl_standard_scales_for_weight_update,
                 )
 
                 sf_vec_size = _FP4_SF_VEC_SIZE
@@ -2644,7 +2708,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w13_k = layer.w13_weight.shape[2] * 2
                 w2_m = layer.w2_weight.shape[1]
                 w2_k = layer.w2_weight.shape[2] * 2
-                layer.w13_blockscale_mma = Parameter(
+                copy_or_rebind_param(
+                    layer,
+                    "w13_blockscale_mma",
                     convert_sf_to_mma_layout(
                         layer.w13_blockscale_swizzled.contiguous()
                         .view(torch.uint8)
@@ -2654,9 +2720,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         num_groups=num_local_experts,
                         sf_vec_size=sf_vec_size,
                     ),
-                    requires_grad=False,
                 )
-                layer.w2_blockscale_mma = Parameter(
+                copy_or_rebind_param(
+                    layer,
+                    "w2_blockscale_mma",
                     convert_sf_to_mma_layout(
                         layer.w2_blockscale_swizzled.contiguous()
                         .view(torch.uint8)
@@ -2666,8 +2733,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                         num_groups=num_local_experts,
                         sf_vec_size=sf_vec_size,
                     ),
-                    requires_grad=False,
                 )
+                if layer._cutedsl_wrapper is not None:
+                    refresh_cutedsl_standard_scales_for_weight_update(layer)
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -2695,6 +2763,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
+
+            layer._cutedsl_wrapper = None
 
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
@@ -2751,9 +2821,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self, "_moe_runner_backend", get_moe_runner_backend()
         )
 
-        assert (
-            activation in _SUPPORTED_ACT_STRS
-        ), f"{activation=} not in supported {_SUPPORTED_ACT_STRS}"
+        assert activation in _SUPPORTED_ACT_STRS or (
+            activation == "situ" and moe_runner_backend.is_flashinfer_trtllm()
+        ), f"{activation=} is unsupported by {moe_runner_backend}"
         moe_runner_config = self.moe_runner_config
 
         if moe_runner_backend.is_marlin():
@@ -2840,6 +2910,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 a1_scale=layer._cutedsl_input_scale,
                 a2_scale=fc2_input_scale,
                 wrapper=layer._cutedsl_wrapper,
+                use_per_token_activation=self.quant_config.use_per_token_activation,
             )
             return self.runner.run(dispatch_output, quant_info)
 
