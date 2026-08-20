@@ -1051,6 +1051,7 @@ def setup_state_kv_args(
     from sglang.srt.mem_cache.memory_pool import (
         DSATokenToKVPool,
         HybridLinearKVPool,
+        MHATokenToKVPoolMXFP8,
         MiniMaxSparseKVPool,
     )
 
@@ -1064,9 +1065,7 @@ def setup_state_kv_args(
     kv_args.is_hybrid_mla_backend = False
     kv_args.state_conv_shard_groups = []
 
-    if hasattr(token_to_kv_pool, "get_kv_scale_buf_infos") and not hasattr(
-        token_to_kv_pool, "has_kv_scale_buffers"
-    ):
+    if isinstance(token_to_kv_pool, MHATokenToKVPoolMXFP8):
         append_state_component(
             kv_args,
             StateType.BLOCK_SCALE,
@@ -1093,9 +1092,7 @@ def setup_state_kv_args(
             )
             # MXFP8 KV: each sub-pool's block scales ride as their own component
             # so they inherit the index payload of the KV they describe.
-            if getattr(token_to_kv_pool, "has_kv_scale_buffers", None) and (
-                token_to_kv_pool.has_kv_scale_buffers()
-            ):
+            if isinstance(token_to_kv_pool.full_kv_pool, MHATokenToKVPoolMXFP8):
                 append_state_component(
                     kv_args,
                     StateType.BLOCK_SCALE,
