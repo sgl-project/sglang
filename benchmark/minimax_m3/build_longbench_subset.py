@@ -18,6 +18,23 @@ from sglang.test.simple_eval_longbench_v2 import (
 )
 
 
+DOMAIN_TO_CATEGORY = {
+    "Single-Document QA": "single_document_qa",
+    "Multi-Document QA": "multi_document_qa",
+    "Long In-context Learning": "long_in_context_learning",
+    "Long-dialogue History Understanding": "long_dialogue_history",
+    "Code Repository Understanding": "code_repo_understanding",
+    "Long Structured Data Understanding": "long_structured_data",
+}
+
+
+def canonical_category(example: dict) -> str | None:
+    value = example.get("category", example.get("domain"))
+    if value in TASK_CATEGORIES:
+        return value
+    return DOMAIN_TO_CATEGORY.get(value)
+
+
 def stable_key(example: dict) -> str:
     identity = json.dumps(
         {
@@ -46,8 +63,8 @@ def main() -> None:
     eligible: dict[str, list[dict]] = defaultdict(list)
     token_lengths: dict[str, int] = {}
     for row in rows:
-        category = row.get("category", row.get("domain", "unknown"))
-        if category not in TASK_CATEGORIES:
+        category = canonical_category(row)
+        if category is None:
             continue
         key = stable_key(row)
         num_tokens = len(
@@ -95,9 +112,8 @@ def main() -> None:
         "model": args.model,
         "minimum_tokens": args.min_tokens,
         "num_examples": len(selected),
-        "category_counts": Counter(
-            row.get("category", row.get("domain", "unknown")) for row in selected
-        ),
+        "category_counts": Counter(canonical_category(row) for row in selected),
+        "domain_to_category": DOMAIN_TO_CATEGORY,
         "minimum_observed_tokens": min(lengths),
         "maximum_observed_tokens": max(lengths),
         "subset_sha256": hashlib.sha256(args.output.read_bytes()).hexdigest(),

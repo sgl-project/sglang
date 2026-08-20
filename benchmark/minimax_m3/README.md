@@ -78,6 +78,11 @@ python benchmark/minimax_m3/build_longbench_subset.py \
   --output /shared/eval/longbench_v2_m3_100_min32k.json
 ```
 
+The builder maps LongBench-v2's six human-readable `domain` labels to the
+canonical SGLang task-category names before balancing the subset. The manifest
+records that mapping, the per-category counts, and the tokenizer-observed
+minimum and maximum prompt lengths.
+
 The preflight is offline and read-only when `--output` is omitted. It resolves
 the model from the local Hugging Face cache (or a local path), checks every
 indexed weight shard, loads the tokenizer locally, verifies both dataset hashes
