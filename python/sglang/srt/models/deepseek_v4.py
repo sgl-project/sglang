@@ -183,6 +183,7 @@ class MhcOps(NamedTuple):
     mhc_fused_post_pre: Optional[Callable[..., Any]]
     mhc_pre: Optional[Callable[..., Any]]
     mhc_post: Optional[Callable[..., Any]]
+    fused_hc_head: Optional[Callable[..., Any]]
 
 
 @functools.cache
@@ -197,13 +198,20 @@ def _get_mhc_ops() -> MhcOps:
     """
     if _is_xpu:
         from sgl_kernel import (
+            fused_hc_head,
             hc_post,
             hc_split_sinkhorn,
             mhc_fused_post_pre,
             mhc_pre,
         )
 
-        return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, mhc_pre, hc_post)
+        return MhcOps(
+            hc_split_sinkhorn,
+            mhc_fused_post_pre,
+            mhc_pre,
+            hc_post,
+            fused_hc_head,
+        )
 
     from sglang.kernels.ops.layernorm.mhc import (
         hc_split_sinkhorn,
@@ -211,7 +219,7 @@ def _get_mhc_ops() -> MhcOps:
         npu_hc_pre,
     )
 
-    return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre, None)
+    return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre, None, None)
 
 
 logger = logging.getLogger(__name__)
@@ -2644,10 +2652,8 @@ class DeepseekV4Model(nn.Module):
         hc_base: torch.Tensor,
     ):
         if x.numel() > 0:
-            if _is_xpu or x.device.type == "xpu":
-                from sgl_kernel import fused_hc_head
-
-                return fused_hc_head(
+            if _is_xpu:
+                return _get_mhc_ops().fused_hc_head(
                     x.contiguous(),
                     hc_fn,
                     hc_scale,
