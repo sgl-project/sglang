@@ -34,6 +34,8 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
+    graph_pool_capture_scope,
+    graph_pool_replay_scope,
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -135,15 +137,21 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
                 self._device_module.synchronize()
                 self._tp_group.barrier()
                 prime_graph = torch.cuda.CUDAGraph()
-                with graph_ctx(
-                    cuda_graph=prime_graph,
-                    pool=self._pool,
-                    stream=self._capture_stream,
+                with (
+                    graph_pool_capture_scope(),
+                    graph_ctx(
+                        cuda_graph=prime_graph,
+                        pool=self._pool,
+                        stream=self._capture_stream,
+                    ),
                 ):
                     forward_fn()
 
         graph = torch.cuda.CUDAGraph()
-        with graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream):
+        with (
+            graph_pool_capture_scope(),
+            graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
+        ):
             out = forward_fn()
         del prime_graph
 
@@ -166,7 +174,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
-        self._graphs[shape_key].replay()
+        with graph_pool_replay_scope():
+            self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:

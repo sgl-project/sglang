@@ -16,8 +16,10 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     ComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
+from sglang.multimodal_gen.runtime.loader.gguf_weights import gguf_weights_iterator
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     TransformerQuantLoadSpec,
+    resolve_transformer_gguf_to_load,
     resolve_transformer_quant_load_spec,
     resolve_transformer_safetensors_to_load,
 )
@@ -45,8 +47,11 @@ def _resolve_checkpoint_load_device(
     *,
     component_starts_on_cpu: bool,
     runtime_quant_config: object | None,
+    quantized_cpu_load_supported: bool = False,
 ) -> torch.device:
-    if component_starts_on_cpu and runtime_quant_config is None:
+    if component_starts_on_cpu and (
+        runtime_quant_config is None or quantized_cpu_load_supported
+    ):
         return torch.device("cpu")
     return runtime_device
 
@@ -136,6 +141,18 @@ class TransformerLoader(ComponentLoader):
     ]
     expected_library = "diffusers"
 
+    def customized_load_kwargs_for_component(
+        self, server_args: ServerArgs, component_name: str
+    ) -> dict[str, bool]:
+        if current_platform.is_mps() and self._is_component_set_as_layerwise_load(
+            server_args, component_name
+        ):
+            logger.info(
+                "Loading %s on CPU first for MPS layerwise offload", component_name
+            )
+            return {"cpu_offload_flag": True}
+        return {}
+
     def should_raise_customized_load_error(
         self, server_args: ServerArgs, component_name: str
     ) -> bool:
@@ -151,7 +168,11 @@ class TransformerLoader(ComponentLoader):
         )
 
     def load_customized(
-        self, component_model_path: str, server_args: ServerArgs, component_name: str
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        cpu_offload_flag: bool = False,
     ):
         """Load the transformer based on the model path, and inference args."""
         component_server_args = _server_args_for_transformer_component(
@@ -161,9 +182,17 @@ class TransformerLoader(ComponentLoader):
         # 1. hf config
         config = get_diffusers_component_config(component_path=component_model_path)
 
-        safetensors_list = resolve_transformer_safetensors_to_load(
-            component_server_args, component_model_path
+        gguf_file = resolve_transformer_gguf_to_load(
+            component_server_args, component_name
         )
+        if gguf_file is not None:
+            # A GGUF file holds the whole transformer; the remaining components
+            # still load from the base model path.
+            safetensors_list = []
+        else:
+            safetensors_list = resolve_transformer_safetensors_to_load(
+                component_server_args, component_model_path
+            )
 
         # 2. dit config
         # Config from Diffusers supersedes sgl_diffusion's model config
@@ -193,21 +222,44 @@ class TransformerLoader(ComponentLoader):
             model_cls=model_cls,
             cls_name=cls_name,
             component_name=component_name,
+            gguf_file=gguf_file,
         )
+        if quant_spec.gguf_file is not None and cls_name == "MiniMaxH3DiTModel":
+            assert quant_spec.quant_config is not None
+            curve = quant_spec.quant_config.tensor_meta.get("adaln_t_table")
+            if curve is not None:
+                if curve.is_quantized or len(curve.logical_shape) != 2:
+                    raise ValueError(
+                        "MiniMax-H3 adaln_t_table must be an unquantized 2D tensor"
+                    )
+                curve_grid, time_embed_dim = curve.logical_shape
+                if curve_grid < 2:
+                    raise ValueError("MiniMax-H3 adaln_t_table needs at least two rows")
+                dit_config.arch_config.adaln_curve_grid = curve_grid
+                dit_config.arch_config.time_embed_dim = time_embed_dim
         # Quantization adapters may require resident weights, so placement must
         # be resolved after they have validated the component configuration.
-        component_starts_on_cpu = server_args.should_start_component_on_cpu(
-            component_name
+        component_starts_on_cpu = (
+            server_args.should_start_component_on_cpu(component_name)
+            or cpu_offload_flag
         )
         use_fsdp = server_args.should_use_fsdp_for_component(component_name)
 
-        logger.info(
-            "Loading %s from %s safetensors file(s) %s, param_dtype: %s",
-            cls_name,
-            len(safetensors_list),
-            f": {safetensors_list}" if get_log_level() == logging.DEBUG else "",
-            quant_spec.param_dtype,
-        )
+        if quant_spec.gguf_file is not None:
+            logger.info(
+                "Loading %s from GGUF file %s, param_dtype: %s",
+                cls_name,
+                quant_spec.gguf_file,
+                quant_spec.param_dtype,
+            )
+        else:
+            logger.info(
+                "Loading %s from %s safetensors file(s) %s, param_dtype: %s",
+                cls_name,
+                len(safetensors_list),
+                f": {safetensors_list}" if get_log_level() == logging.DEBUG else "",
+                quant_spec.param_dtype,
+            )
         # prepare init_param
         init_params: dict[str, Any] = {
             "config": dit_config,
@@ -259,10 +311,15 @@ class TransformerLoader(ComponentLoader):
             logger.debug("quantization config: %s", init_params["quant_config"])
 
         local_torch_device = get_local_torch_device()
-        checkpoint_load_device = _resolve_checkpoint_load_device(
-            local_torch_device,
-            component_starts_on_cpu=component_starts_on_cpu,
-            runtime_quant_config=quant_spec.runtime_quant_config,
+        checkpoint_load_device = (
+            torch.device("cpu")
+            if cpu_offload_flag
+            else _resolve_checkpoint_load_device(
+                local_torch_device,
+                component_starts_on_cpu=component_starts_on_cpu,
+                runtime_quant_config=quant_spec.runtime_quant_config,
+                quantized_cpu_load_supported=quant_spec.gguf_file is not None,
+            )
         )
         direct_gpu_weight_loading = bool(
             component_server_args.direct_gpu_weight_loading
@@ -276,6 +333,9 @@ class TransformerLoader(ComponentLoader):
             needs_device_weight_postprocess=quant_spec.needs_device_weight_postprocess,
             component_starts_on_cpu=component_starts_on_cpu,
             load_full_state_dict_on_device=direct_gpu_weight_loading,
+            mps_layerwise_cpu_staging=bool(
+                cpu_offload_flag and current_platform.is_mps()
+            ),
         )
         if direct_gpu_weight_loading:
             logger.warning(
@@ -319,6 +379,15 @@ class TransformerLoader(ComponentLoader):
                 strict=False,
                 weight_load_plan=weight_load_plan,
                 checkpoint_key_filter=checkpoint_key_filter,
+                weights_iterator=(
+                    gguf_weights_iterator(
+                        quant_spec.gguf_file,
+                        quant_spec.quant_config.tensor_meta,
+                        key_filter=checkpoint_key_filter,
+                    )
+                    if quant_spec.gguf_file is not None
+                    else None
+                ),
             )
 
         # post-hooks (e.g., patch scales (nunchaku))

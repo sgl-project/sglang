@@ -163,6 +163,9 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
 
         sm_major = torch.cuda.get_device_capability()[0]
         self.use_state_pool = sm_major >= 10
+        # The SM120 chunked-prefill kernel only accepts float32 initial
+        # states; SM100 accepts the state-pool dtype directly.
+        self._prefill_needs_fp32_state = sm_major >= 12
         self.supports_target_verify = sm_major in (9, 10)
 
         if sm_major == 9 and self._prefill_fn is None:
@@ -307,8 +310,12 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
             # assigned to a real sequence; clamp them to 0 (the reserved dummy
             # slot) so the FlashInfer kernel never reads out-of-bounds state.
             ssm_cache_indices = cache_indices.clamp(min=0).to(torch.int64)
-            initial_state_fi = ssm_states[ssm_cache_indices].contiguous()
-            cu_seqlens = query_start_loc  # already int32
+            initial_state_fi = (
+                ssm_states[ssm_cache_indices].to(torch.float32)
+                if self._prefill_needs_fp32_state
+                else ssm_states[ssm_cache_indices].contiguous()
+            )
+            cu_seqlens = query_start_loc.to(torch.int64)  # kernel requires int64
         else:
             # SM90: preserve original negative-index handling (remap to last slot).
             ssm_cache_indices = torch.where(
