@@ -56,7 +56,10 @@ def main() -> None:
     parser.add_argument("--split", default="train")
     parser.add_argument("--num-examples", type=int, default=100)
     parser.add_argument("--min-tokens", type=int, default=32768)
+    parser.add_argument("--max-tokens", type=int, default=131072)
     args = parser.parse_args()
+    if args.max_tokens < args.min_tokens:
+        raise SystemExit("--max-tokens must be at least --min-tokens")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     rows = [dict(row) for row in load_dataset(args.dataset, split=args.split)]
@@ -72,7 +75,7 @@ def main() -> None:
                 format_longbench_v2_question(row), add_special_tokens=False
             )
         )
-        if num_tokens >= args.min_tokens:
+        if args.min_tokens <= num_tokens <= args.max_tokens:
             eligible[category].append(row)
             token_lengths[key] = num_tokens
 
@@ -100,7 +103,8 @@ def main() -> None:
         selected.extend(remainder_rows[: args.num_examples - len(selected)])
     if len(selected) != args.num_examples:
         raise RuntimeError(
-            f"only {len(selected)} examples have at least {args.min_tokens} tokens"
+            f"only {len(selected)} examples have {args.min_tokens} to "
+            f"{args.max_tokens} tokens"
         )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -111,6 +115,7 @@ def main() -> None:
         "split": args.split,
         "model": args.model,
         "minimum_tokens": args.min_tokens,
+        "maximum_tokens": args.max_tokens,
         "num_examples": len(selected),
         "category_counts": Counter(canonical_category(row) for row in selected),
         "domain_to_category": DOMAIN_TO_CATEGORY,
