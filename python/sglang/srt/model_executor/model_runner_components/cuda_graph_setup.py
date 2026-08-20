@@ -50,24 +50,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Measured immediately before prefill graph construction, after model weights,
-# KV cache, and the eager runner's static buffers have been allocated.  Below
-# this budget, compiling/capturing a multi-bucket prefill graph is likely to
-# OOM or make no forward progress for large models.  Keep an explicitly chosen
-# backend untouched: an operator may intentionally trade KV capacity for it.
-_MIN_AUTO_PREFILL_CUDA_GRAPH_FREE_MEMORY_GB = 4.0
-
-
-def should_skip_auto_prefill_cuda_graph_for_memory(
-    available_memory_gb: float,
-    cuda_graph_config_locked: set[tuple[str, str]],
-) -> bool:
-    """Return whether an auto-selected prefill graph lacks capture headroom."""
-    return (
-        (Phase.PREFILL, "backend") not in cuda_graph_config_locked
-        and available_memory_gb < _MIN_AUTO_PREFILL_CUDA_GRAPH_FREE_MEMORY_GB
-    )
-
 
 class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
     runner: Optional[BaseRunner]
@@ -279,8 +261,7 @@ def capture_prefill_graph(
     if (
         model_runner.spec_algorithm.is_eagle()
         and not model_runner.is_draft_worker
-        and get_server_return_hidden_states_mode(model_runner.server_args)
-        < CaptureHiddenMode.FULL
+        and get_server_return_hidden_states_mode() < CaptureHiddenMode.FULL
         and not check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     ):
         logger.info(
@@ -396,20 +377,6 @@ def capture_prefill_graph(
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
-    if should_skip_auto_prefill_cuda_graph_for_memory(
-        before_mem,
-        getattr(model_runner.server_args, "_cuda_graph_config_locked", set()),
-    ):
-        logger.warning(
-            "Disabling auto-selected prefill CUDA graph: only %.2f GiB is free "
-            "after model/KV/eager-buffer allocation; at least %.2f GiB is "
-            "required for capture. Set an explicit prefill CUDA graph backend "
-            "to override this safety gate.",
-            before_mem,
-            _MIN_AUTO_PREFILL_CUDA_GRAPH_FREE_MEMORY_GB,
-        )
-        return result(eager_runner)
-
     role = "draft" if model_runner.is_draft_worker else "target"
     capture_name = f"{role} prefill"
     logger.info(
@@ -446,6 +413,14 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
         capture_time=0,
     )
 
+    # A PD prefill server never replays the target-verify graph, and its pool
+    # is built without the spec-verify scratch the capture would need.
+    if (
+        model_runner.spec_algorithm.is_speculative()
+        and not model_runner.is_draft_worker
+        and model_runner.server_args.disaggregation_mode == "prefill"
+    ):
+        return no_capture
     if not model_runner.is_generation:
         # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
         return no_capture

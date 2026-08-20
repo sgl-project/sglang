@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 from sglang.multimodal_gen.runtime.loader.component_loaders import transformer_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     _default_quantized_attention_backend,
+    _resolve_checkpoint_load_device,
     _warn_if_expected_param_dtype_missing,
 )
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
@@ -72,7 +73,9 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms.interface import DeviceCapability
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    _resolve_quant_method_name,
     build_nvfp4_config_from_safetensors_list,
     get_quant_config,
 )
@@ -118,6 +121,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             quantization_ignored_layers=None,
             tp_size=1,
             dit_cpu_offload=False,
+            direct_gpu_weight_loading=False,
             text_encoder_cpu_offload=False,
         )
         defaults.update(overrides)
@@ -247,12 +251,52 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         plan = WeightLoadPlan.for_component(
             checkpoint_load_device=device,
             needs_device_weight_postprocess=True,
-            component_cpu_offload=True,
+            component_starts_on_cpu=True,
         )
 
         self.assertEqual(plan.checkpoint_load_device, device)
         self.assertEqual(plan.weight_postprocess_device, device)
-        self.assertTrue(plan.defer_component_cpu_offload)
+        self.assertTrue(plan.defer_cpu_placement)
+        self.assertFalse(plan.load_full_state_dict_on_device)
+
+    def test_weight_load_plan_can_keep_full_state_dict_on_device(self):
+        plan = WeightLoadPlan.for_component(
+            checkpoint_load_device=torch.device("cuda:0"),
+            needs_device_weight_postprocess=False,
+            component_starts_on_cpu=False,
+            load_full_state_dict_on_device=True,
+        )
+
+        self.assertTrue(plan.load_full_state_dict_on_device)
+
+    def test_unquantized_cpu_offload_loads_checkpoint_on_cpu(self):
+        device = _resolve_checkpoint_load_device(
+            torch.device("cuda:0"),
+            component_starts_on_cpu=True,
+            runtime_quant_config=None,
+        )
+
+        self.assertEqual(device, torch.device("cpu"))
+
+    def test_quantized_cpu_offload_keeps_checkpoint_on_runtime_device(self):
+        runtime_device = torch.device("cuda:0")
+        device = _resolve_checkpoint_load_device(
+            runtime_device,
+            component_starts_on_cpu=True,
+            runtime_quant_config=object(),
+        )
+
+        self.assertEqual(device, runtime_device)
+
+    def test_resident_transformer_loads_checkpoint_on_runtime_device(self):
+        runtime_device = torch.device("cuda:0")
+        device = _resolve_checkpoint_load_device(
+            runtime_device,
+            component_starts_on_cpu=False,
+            runtime_quant_config=None,
+        )
+
+        self.assertEqual(device, runtime_device)
 
     def test_mixed_model_with_expected_dtype_does_not_warn(self):
         model = torch.nn.Module()
@@ -271,6 +315,13 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             _warn_if_expected_param_dtype_missing(model, torch.bfloat16)
 
         warning.assert_called_once()
+
+    def test_modelopt_fp8_serialized_checkpoint_needs_device_postprocess(self):
+        self.assertTrue(
+            _needs_device_weight_postprocess(
+                ModelOptFp8Config(is_checkpoint_fp8_serialized=True)
+            )
+        )
 
     def test_online_fp8_needs_device_weight_postprocess(self):
         self.assertTrue(_needs_device_weight_postprocess(Fp8Config()))
@@ -440,6 +491,37 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertTrue(config.load_in_4bit)
         self.assertEqual(config.bnb_4bit_quant_type, "nf4")
 
+    def test_fp8_quant_config_resolves_from_text_config(self):
+        config = get_quant_config(
+            {
+                "text_config": {
+                    "quantization_config": {
+                        "quant_method": "fp8",
+                        "activation_scheme": "dynamic",
+                    }
+                }
+            },
+            "/unused/component/path",
+        )
+
+        self.assertIsInstance(config, Fp8Config)
+        self.assertTrue(config.is_checkpoint_fp8_serialized)
+
+    def test_bitsandbytes_quant_config_resolves_from_compression_config(self):
+        config = get_quant_config(
+            {
+                "compression_config": {
+                    "quant_method": "bitsandbytes",
+                    "load_in_4bit": True,
+                    "bnb_4bit_quant_storage": "uint8",
+                }
+            },
+            "/unused/component/path",
+        )
+
+        self.assertEqual(config.get_name(), "bitsandbytes")
+        self.assertTrue(config.load_in_4bit)
+
     def test_nvfp4_safetensors_inference_ignores_fp8_fallback_scales(self):
         with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
             save_file(
@@ -566,6 +648,91 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertIsInstance(config, ModelOptFp8Config)
         self.assertEqual(config.exclude_modules, ["proj_out"])
 
+    def test_modelopt_checkpoint_algorithm_admission(self):
+        cases = [
+            ("modelopt", "FP8", {"ignore": []}, ModelOptFp8Config, None),
+            ("modelopt_fp8", "FP8", {"ignore": []}, ModelOptFp8Config, None),
+            (
+                "modelopt",
+                "NVFP4",
+                {"group_size": 16, "ignore": []},
+                ModelOptFp4Config,
+                None,
+            ),
+            (
+                "modelopt_fp4",
+                "NVFP4",
+                {"group_size": 16, "ignore": []},
+                ModelOptFp4Config,
+                None,
+            ),
+            ("modelopt", "MXFP8", {}, None, "maps to 'mxfp8'"),
+            ("modelopt", "FP4", {}, None, "maps to 'modelopt_fp4'"),
+            ("modelopt", "NVFP4_AWQ", {}, None, "maps to 'modelopt_fp4'"),
+            ("modelopt", "W4A16_NVFP4", {}, None, "maps to 'modelopt_fp4'"),
+            (
+                "modelopt",
+                "MIXED_PRECISION",
+                {},
+                None,
+                "mixed precision is not supported",
+            ),
+            (
+                "modelopt",
+                "FP8_FAKE",
+                {},
+                None,
+                "Unsupported ModelOpt quant_algo for diffusion: FP8_FAKE",
+            ),
+            (
+                "modelopt_fp8",
+                "MXFP8",
+                {},
+                None,
+                "declares quant_method='modelopt_fp8'.*maps to 'mxfp8'",
+            ),
+            (
+                "modelopt_fp4",
+                "FP8",
+                {},
+                None,
+                "declares quant_method='modelopt_fp4'.*maps to 'modelopt_fp8'",
+            ),
+        ]
+        for (
+            quant_method,
+            quant_algo,
+            extra_metadata,
+            expected_type,
+            expected_error,
+        ) in cases:
+            with self.subTest(quant_algo=quant_algo):
+                metadata = {
+                    "quant_method": quant_method,
+                    "quant_algo": quant_algo,
+                    **extra_metadata,
+                }
+                if expected_error is not None:
+                    with self.assertRaisesRegex(ValueError, expected_error):
+                        get_quant_config(
+                            {"quantization_config": metadata},
+                            "/unused/component/path",
+                        )
+                else:
+                    config = get_quant_config(
+                        {"quantization_config": metadata},
+                        "/unused/component/path",
+                    )
+                    self.assertIsInstance(config, expected_type)
+
+    def test_explicit_modelopt_method_without_algorithm_is_preserved(self):
+        for quant_method in ("modelopt_fp8", "modelopt_fp4"):
+            with self.subTest(quant_method=quant_method):
+                self.assertEqual(
+                    _resolve_quant_method_name({"quant_method": quant_method}),
+                    quant_method,
+                )
+
     @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_rank", return_value=0)
     @patch("sglang.multimodal_gen.runtime.layers.linear.get_group_size", return_value=1)
     @patch(
@@ -602,14 +769,18 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             ],
         )
 
-        block = FluxSingleTransformerBlock(
-            dim=64,
-            num_attention_heads=4,
-            attention_head_dim=16,
-            mlp_ratio=2.0,
-            quant_config=quant_config,
-            prefix="single_transformer_blocks.0",
-        )
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant.current_platform.get_device_capability",
+            return_value=DeviceCapability(10, 0),
+        ):
+            block = FluxSingleTransformerBlock(
+                dim=64,
+                num_attention_heads=4,
+                attention_head_dim=16,
+                mlp_ratio=2.0,
+                quant_config=quant_config,
+                prefix="single_transformer_blocks.0",
+            )
 
         self.assertEqual(block.proj_mlp.prefix, "single_transformer_blocks.0.proj_mlp")
         self.assertEqual(block.proj_out.prefix, "single_transformer_blocks.0.proj_out")

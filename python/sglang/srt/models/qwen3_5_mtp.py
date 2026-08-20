@@ -44,7 +44,48 @@ from sglang.srt.utils import add_prefix, is_npu
 logger = logging.getLogger(__name__)
 
 
+def _mtp_quant_config(quant_config):
+    """The quantization the MTP module itself is built with.
+
+    The MTP module often ships unquantized even though the target checkpoint is
+    quantized; the loader's fusion gate has to see the same normalization the
+    constructor applies, or it would answer for the target's quantization.
+    """
+    # Serialized Qwen3.5 ModelOpt checkpoints keep embedded MTP weights in
+    # BF16. Disable quantization for those checkpoints; non-serialized
+    # modelopt_fp4 still converts MoE expert weights on load.
+    if quant_config and (
+        quant_config.get_name() == "modelopt_mixed"
+        or (
+            quant_config.get_name() == "modelopt_fp4"
+            and quant_config.is_checkpoint_nvfp4_serialized
+        )
+    ):
+        return None
+    if is_npu() and get_spec().speculative_draft_model_quantization is None:
+        return None
+    # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in bf16;
+    # every `mtp.*` layer appears under the quantization exclude list. Detect
+    # that and skip quantization here so linear/MoE weight loaders allocate
+    # bf16 shapes (see sgl-project/sglang#23113).
+    if quant_config and quant_config.get_name() == "quark":
+        exclude_layers = getattr(quant_config, "exclude_layers", [])
+        if any(
+            isinstance(layer, str) and layer.startswith("mtp.")
+            for layer in exclude_layers
+        ):
+            return None
+    return quant_config
+
+
 class Qwen3_5ForCausalLMMTP(nn.Module):
+
+    @staticmethod
+    def shared_experts_fusion_disable_reason(hf_config, quant_config):
+        return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(
+            getattr(hf_config, "text_config", hf_config),
+            _mtp_quant_config(quant_config),
+        )
 
     def __init__(
         self,
@@ -61,31 +102,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
 
-        # Serialized Qwen3.5 ModelOpt checkpoints keep embedded MTP weights in
-        # BF16. Disable quantization for those checkpoints; non-serialized
-        # modelopt_fp4 still converts MoE expert weights on load.
-        if quant_config and (
-            quant_config.get_name() == "modelopt_mixed"
-            or (
-                quant_config.get_name() == "modelopt_fp4"
-                and quant_config.is_checkpoint_nvfp4_serialized
-            )
-        ):
-            quant_config = None
-        if is_npu() and get_spec().speculative_draft_model_quantization is None:
-            quant_config = None
-
-        # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in
-        # bf16; every `mtp.*` layer appears under the quantization exclude
-        # list. Detect that and skip quantization here so linear/MoE weight
-        # loaders allocate bf16 shapes (see sgl-project/sglang#23113).
-        if quant_config and quant_config.get_name() == "quark":
-            exclude_layers = getattr(quant_config, "exclude_layers", [])
-            if any(
-                isinstance(layer, str) and layer.startswith("mtp.")
-                for layer in exclude_layers
-            ):
-                quant_config = None
+        quant_config = _mtp_quant_config(quant_config)
 
         self.config = config
         self.tp_size = get_parallel().tp_size
