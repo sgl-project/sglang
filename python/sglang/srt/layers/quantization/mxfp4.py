@@ -482,6 +482,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # CUTLASS post-load processor after the load completes.
             self._padded_intermediate = round_up(intermediate_size_per_partition, 128)
             self._padded_hidden = round_up(hidden_size, 128)
+            # `hidden_size` here may ALREADY be FusedMoE's rounded value (GPT-OSS
+            # 2880 -> 3072). Remember the checkpoint's K so the post-load
+            # processor can exclude the never-written tail from Humming's
+            # per-expert scale range.
+            self._unpadded_hidden = getattr(layer, "hidden_size_unpadded", hidden_size)
             # create_weights below uses the *unpadded* sizes so the loader's
             # naive-copy fast path is correct.
             intermediate_size_per_partition_after_pad = intermediate_size_per_partition
@@ -1094,8 +1099,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         _interleaved = getattr(layer.moe_runner_config, "gate_up_interleaved", True)
 
+        # FusedMoE may have rounded hidden up (GPT-OSS 2880 -> 3072) BEFORE
+        # create_weights, so K_un above is that rounded value, not the
+        # checkpoint's K. The loader never writes the trailing columns, so they
+        # keep the scale buffer's _UE8M0_ONE (2^0) fill -- far above a real
+        # per-expert max. Humming derives its residual from each expert's
+        # min/max E8M0 exponent, so letting those columns through would shift
+        # the residual and perturb the REAL weights. Copy only the checkpoint's
+        # columns and let the preserve_expert_range fill cover the rest; the
+        # packed weights there are zero, so the scale is numerically inert.
+        K_real = min(getattr(self, "_unpadded_hidden", None) or K_un, K_un)
+        # ceil: a partial trailing group is still real and must be kept.
+        w13_scale_real = -(-K_real // sf_block_size)
+
         def _stack_up_gate_w13(
-            unpadded_w13, last_pad, last_un, preserve_expert_range=False
+            unpadded_w13, last_pad, last_un, preserve_expert_range=False, last_real=None
         ):
             # unpadded_w13: [E, 2*N_un, last_un]
             # Returns: [E, 2*N_pad, last_pad] in [up_padded; gate_padded] order.
@@ -1114,10 +1132,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # exponents. Fill padding with an existing expert value so
                 # padding cannot change that range.
                 out.copy_(unpadded_w13[:, :1, :1])
+            # When protecting the expert range, stop at the checkpoint's K so
+            # the stale tail is covered by the fill instead of copied through.
+            copy_un = (
+                min(last_real, last_un)
+                if (preserve_expert_range and last_real is not None)
+                else last_un
+            )
             # First half: up (with row + col padding zeros).
-            out[:, :N_un, :last_un] = up_rows
+            out[:, :N_un, :copy_un] = up_rows[:, :, :copy_un]
             # Second half: gate.
-            out[:, N_pad : N_pad + N_un, :last_un] = gate_rows
+            out[:, N_pad : N_pad + N_un, :copy_un] = gate_rows[:, :, :copy_un]
             return out
 
         w13_padded = _stack_up_gate_w13(
@@ -1128,6 +1153,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             K_pad // sf_block_size,
             K_un // sf_block_size,
             preserve_expert_range=self._use_sm90_humming,
+            last_real=w13_scale_real,
         )
         # Bias: same de-interleave on dim=-1.
         if _interleaved:
@@ -1140,11 +1166,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w13_bias_padded[:, :N_un] = w13_bias_up
         w13_bias_padded[:, N_pad : N_pad + N_un] = w13_bias_gate
 
-        def _pad_w2_3d(unpadded, last_pad, last_un, preserve_expert_range=False):
+        def _pad_w2_3d(
+            unpadded, last_pad, last_un, preserve_expert_range=False, k_real=None
+        ):
             out = torch.zeros(E, K_pad, last_pad, dtype=unpadded.dtype, device=device)
             if preserve_expert_range:
                 out.copy_(unpadded[:, :1, :1])
-            out[:, :K_un, :last_un] = unpadded[:, :K_un, :]
+            # Same stale-tail exclusion as _stack_up_gate_w13, on w2's K rows.
+            k_copy = (
+                min(k_real, K_un)
+                if (preserve_expert_range and k_real is not None)
+                else K_un
+            )
+            out[:, :k_copy, :last_un] = unpadded[:, :k_copy, :]
             return out
 
         # ---- w2 (no halving, just pad to [E, K_pad, N_pad/2]) ----------------
@@ -1156,6 +1190,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             N_pad // sf_block_size,
             N_un // sf_block_size,
             preserve_expert_range=self._use_sm90_humming,
+            k_real=K_real,
         )
         w2_bias_padded = torch.zeros(E, K_pad, dtype=bias_dtype, device=device)
         w2_bias_padded[:, :K_un] = layer.w2_weight_bias.data

@@ -493,6 +493,108 @@ def test_humming_padding_preserves_per_expert_residual():
     assert torch.equal(layer.w2_humming_residual_scale, expected_w2_residual * 64.0)
 
 
+
+def _build_prerounded_case(E, hidden_real, hidden_rounded, inter, tail_fill, seed=0):
+    """Weights as ``create_weights`` leaves them when FusedMoE pre-rounds hidden.
+
+    Buffers are allocated at ``hidden_rounded``; the loader only ever writes the
+    first ``hidden_real`` columns, so the tail keeps whatever the buffer was
+    filled with (``_UE8M0_ONE`` in production). Real scales sit well BELOW 2^0
+    so a leaked tail moves the per-expert max.
+    """
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    kr_bytes = hidden_real // 2
+    kr_grp = hidden_real // GROUP_SIZE
+
+    w13 = torch.zeros(
+        (E, 2 * inter, hidden_rounded // 2), dtype=torch.uint8, device="cuda"
+    )
+    w13[:, :, :kr_bytes] = torch.randint(
+        0, 256, (E, 2 * inter, kr_bytes), dtype=torch.uint8, device="cuda", generator=g
+    )
+    w2 = torch.zeros((E, hidden_rounded, inter // 2), dtype=torch.uint8, device="cuda")
+    w2[:, :hidden_real, :] = torch.randint(
+        0,
+        256,
+        (E, hidden_real, inter // 2),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=g,
+    )
+
+    w13_s = torch.full(
+        (E, 2 * inter, hidden_rounded // GROUP_SIZE),
+        tail_fill,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w13_s[:, :, :kr_grp] = torch.randint(
+        100, 110, (E, 2 * inter, kr_grp), dtype=torch.uint8, device="cuda", generator=g
+    )
+    w2_s = torch.full(
+        (E, hidden_rounded, inter // GROUP_SIZE),
+        tail_fill,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    w2_s[:, :hidden_real, :] = torch.randint(
+        100,
+        110,
+        (E, hidden_real, inter // GROUP_SIZE),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=g,
+    )
+
+    w13_b = torch.zeros((E, 2 * inter), dtype=torch.bfloat16, device="cuda")
+    w2_b = torch.zeros((E, hidden_rounded), dtype=torch.bfloat16, device="cuda")
+    return w13, w2, w13_s, w2_s, w13_b, w2_b
+
+
+@pytest.mark.skipif(
+    not HAS_CORRECTED_HUMMING_API,
+    reason="requires corrected per-expert Humming API from FlashInfer >= 0.6.18",
+)
+def test_humming_range_ignores_prerounded_hidden_tail():
+    """FusedMoE rounds GPT-OSS hidden 2880 -> 3072 BEFORE ``create_weights``, so
+    the trailing scale columns keep the ``_UE8M0_ONE`` buffer fill. Those bytes
+    are 2^0 -- above any real per-expert max -- and must not reach Humming's
+    min/max, or the residual shifts and perturbs the real weights.
+
+    Invariant: the residual must not depend on what the never-written tail holds.
+    """
+    from sglang.srt.layers.quantization.mxfp4 import _UE8M0_ONE
+
+    E, hidden_real, hidden_rounded, inter = 4, 2880, 3072, 256
+
+    residuals = []
+    for tail_fill in (_UE8M0_ONE, 105):  # 105 sits inside the real 100..110 band
+        w13, w2, w13_s, w2_s, w13_b, w2_b = _build_prerounded_case(
+            E, hidden_real, hidden_rounded, inter, tail_fill
+        )
+        layer = _build_mock_layer(
+            E, hidden_rounded, inter, w13, w2, w13_s, w2_s, w13_b, w2_b
+        )
+        method = _build_method(E, hidden_rounded, inter, use_humming=True)
+        # What create_weights records from layer.hidden_size_unpadded.
+        method._unpadded_hidden = hidden_real
+        method._process_weights_for_sm90_cutlass(layer)
+        residuals.append(
+            (
+                layer.w13_humming_residual_scale.clone(),
+                layer.w2_humming_residual_scale.clone(),
+            )
+        )
+
+    assert torch.equal(residuals[0][0], residuals[1][0]), (
+        "w13 Humming residual changed with the never-written hidden tail; "
+        "the _UE8M0_ONE fill leaked into the per-expert E8M0 range"
+    )
+    assert torch.equal(
+        residuals[0][1], residuals[1][1]
+    ), "w2 Humming residual changed with the never-written hidden tail"
+
+
 @pytest.mark.skipif(
     not HAS_CORRECTED_HUMMING_API,
     reason="requires corrected per-expert Humming API from FlashInfer >= 0.6.18",
