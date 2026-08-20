@@ -3,7 +3,7 @@
 import asyncio
 import base64
 import contextlib
-import json
+import dataclasses
 import os
 import time
 from typing import Any, List, Optional
@@ -37,9 +37,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     build_sampling_params,
     choose_output_image_ext,
-    flatten_extra_params,
     merge_image_input_list,
     process_generation_batch,
+    request_extra_value,
     resolve_sampling_params_cls,
     save_image_to_path,
     temp_dir_if_disabled,
@@ -54,20 +54,7 @@ router = APIRouter(prefix="/v1/images", tags=["images"])
 
 
 def _get_extra_field(request, field_name):
-    """Get a field from model_extra, with fallback to nested extra_body dict."""
-    extra = request.model_extra or {}
-    value = extra.get(field_name)
-    if value is not None:
-        return value
-    if field_name == "use_guardrails" and extra.get("guardrails") is not None:
-        return extra["guardrails"]
-
-    for container_name in ("extra_body", "extra_json", "extra_args", "extra_params"):
-        value = _parse_extra_container(extra.get(container_name)).get(field_name)
-        if value is not None:
-            return value
-
-    return value
+    return request_extra_value(request, field_name)
 
 
 def _get_request_field_or_extra(request, field_name):
@@ -83,8 +70,13 @@ def _image_request_model_kwargs(
 ) -> dict[str, Any]:
     """Extract only model-declared image API extension fields."""
 
+    sampling_fields = {
+        field.name for field in dataclasses.fields(sampling_params_cls) if field.init
+    }
     kwargs = {}
-    for field_name in sampling_params_cls.image_request_extra_fields():
+    for field_name in (
+        sampling_params_cls.image_request_extra_fields() & sampling_fields
+    ):
         value = _get_extra_field(request, field_name)
         if value is not None:
             kwargs[field_name] = value
@@ -94,17 +86,6 @@ def _image_request_model_kwargs(
 def _runtime_sampling_quality(quality: str | None) -> str | None:
     """Keep OpenAI's automatic default out of SGLang's sampling contract."""
     return None if quality in (None, "auto") else quality
-
-
-def _parse_extra_container(value: Any) -> dict[str, Any]:
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except Exception:
-            return {}
-    if isinstance(value, dict):
-        return flatten_extra_params(dict(value))
-    return {}
 
 
 def _read_b64_for_paths(paths: list[str]) -> list[str]:
@@ -324,12 +305,6 @@ async def generations(
                 if request.flow_shift is not None
                 else _get_extra_field(request, "flow_shift")
             ),
-            use_duration_template=_get_extra_field(request, "use_duration_template"),
-            use_resolution_template=_get_extra_field(
-                request, "use_resolution_template"
-            ),
-            use_system_prompt=_get_extra_field(request, "use_system_prompt"),
-            use_guardrails=_get_extra_field(request, "use_guardrails"),
             enable_teacache=request.enable_teacache,
             enable_cache_dit=_get_extra_field(request, "enable_cache_dit"),
             cache_dit_params=_get_extra_field(request, "cache_dit_params"),
@@ -345,8 +320,6 @@ async def generations(
             upscaling_model_path=request.upscaling_model_path,
             upscaling_scale=request.upscaling_scale,
             perf_dump_path=request.perf_dump_path,
-            use_pe=_get_extra_field(request, "use_pe"),
-            preset=_get_extra_field(request, "preset"),
             progressive_mode=_get_request_field_or_extra(request, "progressive_mode"),
             progressive_levels=_get_request_field_or_extra(
                 request, "progressive_levels"

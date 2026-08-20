@@ -95,6 +95,45 @@ def flatten_extra_params(payload: Any) -> dict[str, Any]:
     return payload
 
 
+_REQUEST_EXTRA_CONTAINERS = (
+    "extra_body",
+    "extra_json",
+    "extra_args",
+    "extra_params",
+)
+
+
+def _parse_request_extra_container(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
+    if not isinstance(value, dict):
+        return {}
+    return flatten_extra_params(dict(value))
+
+
+def request_extra_value(request: Any, field_name: str) -> Any:
+    """Read an extension field while preserving top-level precedence."""
+
+    extra = dict(getattr(request, "model_extra", None) or {})
+    direct = {
+        key: value
+        for key, value in extra.items()
+        if key not in _REQUEST_EXTRA_CONTAINERS
+    }
+    direct = flatten_extra_params(direct)
+    if field_name in direct and direct[field_name] is not None:
+        return direct[field_name]
+
+    for container_name in _REQUEST_EXTRA_CONTAINERS:
+        nested = _parse_request_extra_container(extra.get(container_name))
+        if field_name in nested and nested[field_name] is not None:
+            return nested[field_name]
+    return None
+
+
 @contextmanager
 def temp_dir_if_disabled(
     configured_path: str | None,

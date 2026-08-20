@@ -4,7 +4,12 @@ from dataclasses import fields
 from fastapi import HTTPException
 from PIL import Image
 
+from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
+from sglang.multimodal_gen.configs.sample.ernie_image import (
+    ErnieImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
+from sglang.multimodal_gen.configs.sample.ideogram import Ideogram4SamplingParams
 from sglang.multimodal_gen.configs.sample.longcat_image import (
     LongCatImageSamplingParams,
 )
@@ -93,6 +98,42 @@ def test_longcat_image_fields_accept_nested_extra_body():
         "enable_prompt_rewrite": True,
         "enable_cfg_renorm": False,
         "cfg_renorm_min": 0.5,
+    }
+
+
+def test_other_image_extensions_remain_model_specific():
+    cases = (
+        (Cosmos3SamplingParams, "guidance_interval", [400.0, 1000.0]),
+        (Cosmos3SamplingParams, "use_guardrails", False),
+        (ErnieImageSamplingParams, "use_pe", False),
+        (Ideogram4SamplingParams, "preset", "V4_TURBO_12"),
+    )
+    base_fields = {field.name for field in fields(SamplingParams)}
+
+    for sampling_params_cls, field_name, value in cases:
+        request = ImageGenerationsRequest(
+            prompt="a lantern",
+            extra_body={field_name: value},
+        )
+        model_fields = {field.name for field in fields(sampling_params_cls)}
+
+        assert field_name not in ImageGenerationsRequest.model_fields
+        assert field_name not in base_fields
+        assert field_name in model_fields
+        assert _image_request_model_kwargs(request, sampling_params_cls) == {
+            field_name: value
+        }
+        assert _image_request_model_kwargs(request, SamplingParams) == {}
+
+
+def test_cosmos_image_guardrails_alias_is_preserved():
+    request = ImageGenerationsRequest(
+        prompt="a lantern",
+        extra_body={"guardrails": False},
+    )
+
+    assert _image_request_model_kwargs(request, Cosmos3SamplingParams) == {
+        "use_guardrails": False
     }
 
 
