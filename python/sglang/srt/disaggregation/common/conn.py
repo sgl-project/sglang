@@ -163,6 +163,10 @@ class CommonKVManager(BaseKVManager):
         self.enable_deferred_decode_kv_release = (
             envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
         )
+        self.enable_dcp_pack = envs.SGLANG_DISAGG_DCP_PACK.get()
+        self.mla_kv_buffers: Optional[list] = None
+        self._dcp_pack_buffers = None
+        self._dcp_pack_lock = threading.Lock()
         # for p/d multi node infer
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
@@ -307,6 +311,18 @@ class CommonKVManager(BaseKVManager):
         raise RuntimeError(
             f"Unsupported PD DCP topology: {self.dcp_size} -> {dst_dcp_size}"
         )
+
+    def set_mla_kv_buffers(self, buffers) -> None:
+        self.mla_kv_buffers = list(buffers)
+
+    def _mla_tensors_for_ptrs(self, src_ptrs: List[int]):
+        if not self.mla_kv_buffers:
+            return None
+        by_ptr = {int(buf.data_ptr()): buf for buf in self.mla_kv_buffers}
+        try:
+            return [by_ptr[int(ptr)] for ptr in src_ptrs]
+        except KeyError:
+            return None
 
     def prepare_dcp_token_item_lens(self, dst_page_item_lens: List[int]) -> List[int]:
         page_size = self.kv_args.page_size

@@ -906,6 +906,24 @@ class MooncakeKVManager(CommonKVManager):
             dst_device_data_ptrs=dst_device_kv_ptrs,
         )
 
+    def _ensure_dcp_pack_buffers(self) -> None:
+        if not self.enable_dcp_pack or self._dcp_pack_buffers is not None:
+            return
+        if not self.kv_args.kv_item_lens:
+            return
+        with self._dcp_pack_lock:
+            if self._dcp_pack_buffers is not None:
+                return
+            from sglang.srt.disaggregation.common.dcp_pack import (
+                init_dcp_pack_buffers,
+            )
+
+            self._dcp_pack_buffers = init_dcp_pack_buffers(
+                lambda ptr, size: self.engine.batch_register([ptr], [size]),
+                self.kv_args,
+                len(self.transfer_queues),
+            )
+
     def send_kvcache_dcp(
         self,
         mooncake_session_id: str,
@@ -921,6 +939,7 @@ class MooncakeKVManager(CommonKVManager):
         num_kv_tokens: int,
         executor: concurrent.futures.ThreadPoolExecutor,
         dst_layer_ids: List[int],
+        pack_buffer=None,
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
@@ -953,10 +972,30 @@ class MooncakeKVManager(CommonKVManager):
                 self.kv_args.kv_data_ptrs,
                 dst_kv_ptrs,
             )
+        src_token_indices = plan.src_token_indices
+        dst_token_indices = plan.dst_token_indices
+        if pack_buffer is not None:
+            from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
+
+            src_tensors = self._mla_tensors_for_ptrs(src_kv_ptrs)
+            packed = (
+                try_pack_dcp_src(
+                    pack_buffer=pack_buffer,
+                    kv_buffers=src_tensors,
+                    src_token_indices=src_token_indices,
+                    token_item_lens=dcp_token_item_lens[: len(src_kv_ptrs)],
+                    gpu_id=self.kv_args.gpu_id,
+                )
+                if src_tensors is not None
+                else None
+            )
+            if packed is not None:
+                src_kv_ptrs, src_token_indices = packed
+
         layers_current_pp_stage = len(src_kv_ptrs)
         src_groups, dst_groups = group_concurrent_contiguous(
-            plan.src_token_indices,
-            plan.dst_token_indices,
+            src_token_indices,
+            dst_token_indices,
         )
 
         layers_params = [
@@ -1763,6 +1802,11 @@ class MooncakeKVManager(CommonKVManager):
                                 target_rank_registration_info.dcp_token_item_lens
                             )
                             assert dcp_token_item_lens is not None
+                            pack_buffer = (
+                                self._dcp_pack_buffers[worker_index]
+                                if self._dcp_pack_buffers
+                                else None
+                            )
                             ret = self.send_kvcache_dcp(
                                 req.mooncake_session_id,
                                 kv_chunk.prefill_kv_indices,
@@ -1778,6 +1822,7 @@ class MooncakeKVManager(CommonKVManager):
                                 dst_layer_ids=(
                                     target_rank_registration_info.dst_kv_layer_ids
                                 ),
+                                pack_buffer=pack_buffer,
                             )
                         elif (
                             self.is_mla_backend
@@ -2072,6 +2117,7 @@ class MooncakeKVManager(CommonKVManager):
                                 * len(self.kv_args.kv_item_lens)
                             )
                         )
+                        self._ensure_dcp_pack_buffers()
                     self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
                     with self.session_lock:
                         if mooncake_session_id in self.failed_sessions:

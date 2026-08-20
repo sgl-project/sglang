@@ -1,0 +1,110 @@
+---
+title: "DCP × PD packed KV transfer"
+description: "Gather cyclic DCP-owned MLA rows on the prefill sender before RDMA so DCP1-to-DCP-N PD transfers emit large blocks instead of one operation per token."
+---
+
+Prefill-side packing for decode context parallelism (DCP) under prefll/decode (PD) disaggregation. This page is the design for the `dcp-pd-packed-transfer` work. It does not cover DSPARK; that combination stays on [PR #34343](https://github.com/sgl-project/sglang/pull/34343).
+
+## Problem
+
+DCP stripes MLA KV by `owner(p) = p % c`. A DCP1 prefill page is dense. A DCP-N decode page is compacted (`physical(p) = floor(p / c)`).
+
+`build_dcp_token_transfer_plan` therefore emits a **strided** source index list and a **dense** dest list. `group_concurrent_contiguous` only merges when both sides have `diff == 1`, so the Mooncake/NIXL sender posted one RDMA per owned token per layer.
+
+For `page_size=64`, `dcp=4`, an 8K chunk, ~48 MLA layers:
+
+| | Before pack | After pack |
+|---|---|---|
+| RDMA ops / layer | 2048 (1 token) | 1–32 (dest-contiguous runs) |
+| Typical payload | ~0.5–1 KB | tens of KB to a few MB |
+
+Equal-DCP (`N→N`) already copies whole pages and is unchanged.
+
+## Design
+
+Do not change the cyclic owner rule. Attention, the allocator, and HiCache L2 all assume `p % c == r`.
+
+Pack on the **source** only:
+
+1. Keep the existing token plan (owned offsets, exact `num_kv_tokens`).
+2. GPU-gather those rows into a registered contiguous buffer, dest-token order, layer-major.
+3. Treat packed source indices as `0..N-1`.
+4. Group dest-contiguous runs and RDMA those blocks into decode slots.
+
+Dest is already compacted, so there is no dest scatter. If decode chunk-cache allocated consecutive pages, a chunk is one run per layer. If dest pages fragment, each dest page is still one 64-token block.
+
+```text
+prefill page (dense)     pack buffer              decode rank 0
+ 0 1 2 3 4 5 6 7   gather  0 4 8 12 …     RDMA    0 1 2 3 …
+ |     |                 contiguous              dest-contiguous
+ rank0 owns 0,4,…
+```
+
+## Placement
+
+| Piece | Where |
+|---|---|
+| Plan + gather | `disaggregation/common/dcp_pack.py` |
+| Token plan (unchanged) | `build_dcp_token_transfer_plan` |
+| Mooncake / NIXL send | `send_kvcache_dcp` after the token plan |
+| Buffer alloc | Lazy, on first DCP-relayout peer; one `StagingBuffer` per transfer-queue shard |
+| MLA tensor refs | Prefill `set_mla_kv_buffers` from `kv_buffer` / `full_kv_pool.kv_buffer` |
+
+Handshake still happens before the first send, so the pack buffers exist before `send_kvcache_dcp` runs.
+
+## Fallback
+
+The per-token path remains if any of these hold:
+
+- `SGLANG_DISAGG_DCP_PACK=0`
+- no MLA tensor refs (pointer mismatch, non-MLA pool)
+- pack buffer too small for this chunk
+- fake / non-Mooncake-NIXL backends
+
+A too-small buffer logs a warning and continues. Size defaults to `chunked_prefill_size` tokens of KV, or 32768 if chunking is off. Override with `SGLANG_DISAGG_DCP_PACK_MAX_TOKENS`.
+
+## Out of scope
+
+- DSPARK draft KV. Draft pools are replicated and must not go through DCP relayout. Tracked in [PR #34343](https://github.com/sgl-project/sglang/pull/34343).
+- Changing DCP to a blocked owner layout.
+- Dest-side staging / scatter.
+- HiCache, decode radix, prefill CP `> 1` (already rejected for PD+DCP).
+- A strided RDMA descriptor API. Mooncake/NIXL still take `(src, dst, length)` triples.
+
+## Tests
+
+`test/registered/unit/disaggregation/test_dcp_pack.py` pins:
+
+- dest-contiguous packing collapses a cyclic source page to one block
+- dest page gaps still split
+- gather writes layer-major owned rows
+
+The existing `test_kimi_linear_pd_dcp4` acceptance job is the e2e check for DCP1 prefill → DCP4 decode. It does not need DSPARK.
+
+## Knobs
+
+| Env | Default | Role |
+|---|---|---|
+| `SGLANG_DISAGG_DCP_PACK` | `1` | Master switch |
+| `SGLANG_DISAGG_DCP_PACK_MAX_TOKENS` | unset | Cap pack-buffer tokens; unset uses chunked prefill size |
+
+## Static review
+
+Findings from reading the draft. Not exercised.
+
+**Safe as written**
+
+- Equal-DCP (`N→N`) never enters `send_kvcache_dcp`, so page copies stay intact.
+- Pack buffers are allocated only after `requires_dcp_relayout` is true (DCP1→N).
+- One pack buffer per transfer-queue shard; gather+sync finishes before RDMA. The Mooncake custom-mem-pool executor only reads the pack.
+- `_mla_tensors_for_ptrs` misses if `kv_data_ptrs` has extra entries (draft KV still on the KV channel, DSV4 bucket lists). Pack is skipped and the old per-token path runs. That is the intended DSPARK boundary until [PR #34343](https://github.com/sgl-project/sglang/pull/34343).
+- Mooncake remaps PP layers **before** gather, so packed pointers are never fed back into `get_mla_kv_ptrs_with_pp`.
+
+**Keep an eye on**
+
+- NIXL still sends packed pointers through `_send_kvcache_generic` → `get_mla_kv_ptrs_with_pp`. Today dest is already paired by `dcp_dst_region_indices`, so lengths match and the fast path returns as-is. A later change that re-slices packed pointers as if they were pool layout (compressed-MLA / DSV4) would be wrong.
+- `plan_packed_dcp_blocks` is the spec for dest-contiguous splits. The send path uses `group_concurrent_contiguous` on packed `0..N-1` instead, which is equivalent. Do not let those two diverge.
+- Pack size is `max_tokens * sum(token_item_lens)` **per queue shard** (default 4). A 8K-chunk DeepSeek-class MLA prefill is on the order of a few hundred MB per shard.
+- `_get_custom_mem_pool` logs “Staging buffer using cudaMalloc” even when the allocation is a DCP pack buffer.
+- `index_select` + per-layer `copy_` is the first gather. A fused kernel can replace it later; it is not required for correctness.
+- `SGLANG_DISAGG_DCP_PACK` defaults on. Prefill still only pays the allocation after a DCP-relayout peer registers.

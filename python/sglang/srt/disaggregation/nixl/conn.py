@@ -501,7 +501,7 @@ class NixlKVManager(CommonKVManager):
                 )
                 threading.Thread(
                     target=self.transfer_worker,
-                    args=(queue, staging_buffer),
+                    args=(queue, staging_buffer, i),
                     daemon=True,
                 ).start()
             self._start_bootstrap_thread()
@@ -1118,7 +1118,27 @@ class NixlKVManager(CommonKVManager):
                 dst_mem_kind=dst_mem_kind,
             )
 
-    def transfer_worker(self, queue: FastQueue, staging_buffer=None):
+    def _ensure_dcp_pack_buffers(self) -> None:
+        if not self.enable_dcp_pack or self._dcp_pack_buffers is not None:
+            return
+        if not self.kv_args.kv_item_lens:
+            return
+        with self._dcp_pack_lock:
+            if self._dcp_pack_buffers is not None:
+                return
+            from sglang.srt.disaggregation.common.dcp_pack import (
+                init_dcp_pack_buffers,
+            )
+
+            self._dcp_pack_buffers = init_dcp_pack_buffers(
+                lambda ptr, size: self._register_staging_memory(
+                    ptr, size, self.kv_args.gpu_id
+                ),
+                self.kv_args,
+                len(self.transfer_queues),
+            )
+
+    def transfer_worker(self, queue: FastQueue, staging_buffer=None, worker_index=0):
         # Per-worker staging strategy: lazy-created on first chunk so we
         # see kv_buffer_tensors (set by ModelRunner after engine init).
         # Never cache on self -- multiple workers would race the ring.
@@ -1247,6 +1267,11 @@ class NixlKVManager(CommonKVManager):
 
                         if kv_xfer_handle is None:
                             if is_dcp_transfer:
+                                pack_buffer = (
+                                    self._dcp_pack_buffers[worker_index]
+                                    if self._dcp_pack_buffers
+                                    else None
+                                )
                                 kv_xfer_handle = self.send_kvcache_dcp(
                                     req.agent_name,
                                     src_prefill_kv_indices,
@@ -1256,6 +1281,7 @@ class NixlKVManager(CommonKVManager):
                                     decode_prefix_len=req.decode_prefix_len or 0,
                                     num_kv_tokens=kv_chunk.num_kv_tokens,
                                     notif=notif,
+                                    pack_buffer=pack_buffer,
                                 )
                             elif (
                                 self.is_mla_backend
@@ -1472,6 +1498,8 @@ class NixlKVManager(CommonKVManager):
         decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
             decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
         )
+        if decode_kv_args.requires_dcp_relayout:
+            self._ensure_dcp_pack_buffers()
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1681,6 +1709,7 @@ class NixlKVManager(CommonKVManager):
         decode_prefix_len: int,
         num_kv_tokens: int,
         notif: str,
+        pack_buffer=None,
     ):
         if self.src_mem_kind is None:
             raise RuntimeError("Missing NIXL source KV memory kind")
@@ -1709,15 +1738,36 @@ class NixlKVManager(CommonKVManager):
         dst_kv_ptrs = [
             dst_info.dst_kv_ptrs[dst_idx] for dst_idx in dst_info.dcp_dst_region_indices
         ]
+        src_kv_ptrs = self.kv_args.kv_data_ptrs
+        src_token_indices = plan.src_token_indices
+        if pack_buffer is not None:
+            from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
+
+            src_tensors = self._mla_tensors_for_ptrs(src_kv_ptrs)
+            packed = (
+                try_pack_dcp_src(
+                    pack_buffer=pack_buffer,
+                    kv_buffers=src_tensors,
+                    src_token_indices=src_token_indices,
+                    token_item_lens=token_item_lens[: len(src_kv_ptrs)],
+                    gpu_id=self.kv_args.gpu_id,
+                )
+                if src_tensors is not None
+                else None
+            )
+            if packed is not None:
+                src_kv_ptrs, src_token_indices = packed
+                token_item_lens = token_item_lens[: len(src_kv_ptrs)]
 
         # Prepared handles encode page-level offsets, while DCP relayout needs
-        # flat descriptors for the selected token rows.
+        # flat descriptors for the selected token rows. After a successful pack
+        # those rows are contiguous in the registered pack buffer.
         return self._send_kvcache_generic(
             peer_name=peer_name,
-            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            src_data_ptrs=src_kv_ptrs,
             dst_data_ptrs=dst_kv_ptrs,
             item_lens=token_item_lens,
-            prefill_data_indices=plan.src_token_indices,
+            prefill_data_indices=src_token_indices,
             dst_data_indices=plan.dst_token_indices,
             dst_gpu_id=dst_info.gpu_id,
             notif=notif,

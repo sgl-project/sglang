@@ -1018,6 +1018,7 @@
                 "pages": [
                   "docs/developer_guide/development_guide_using_docker",
                   "docs/developer_guide/development_jit_kernel_guide",
+                  "docs/developer_guide/dcp_pd_packed_kv_transfer",
                   "docs/developer_guide/quantization_contribution_guide"
                 ]
               },
