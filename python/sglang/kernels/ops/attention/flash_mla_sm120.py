@@ -714,6 +714,25 @@ def _flash_mla_b12x(
             int(extra_k_cache.shape[1]) if extra_k_cache.ndim >= 3 else _PBS_DST
         )
 
+    if mode is None:
+        mode = "decode" if B <= 256 else "extend"
+
+    # The SM120 unified-prefill kernel only instantiates fixed single-cache
+    # widths ({128, 512, 1024, 2048}); vLLM pads the DSpark SWA index width
+    # to 512 for the same reason. Decode accepts any 64-multiple width.
+    if mode == "extend" and extra_idx is None and idx.shape[-1] not in (
+        128,
+        512,
+        1024,
+        2048,
+    ):
+        for w in (128, 512, 1024, 2048):
+            if idx.shape[-1] <= w:
+                idx = torch.nn.functional.pad(
+                    idx, (0, w - idx.shape[-1]), value=-1
+                )
+                break
+
     width = idx.shape[-1] + (extra_idx.shape[-1] if extra_idx is not None else 0)
     num_splits_cap = compressed_mla.split_chunks_for_contract(
         rows=max(1, B),
@@ -721,8 +740,6 @@ def _flash_mla_b12x(
         max_chunks=max(1, (width + 63) // 64),
         decode_row_capacity=None,
     )
-    if mode is None:
-        mode = "decode" if B <= 256 else "extend"
 
     caps = compressed_mla.Caps(
         device=dev,
