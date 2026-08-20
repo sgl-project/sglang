@@ -596,6 +596,7 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             head_k_dim=self.HEAD_DIM,
             head_v_dim=self.HEAD_DIM,
             max_context_len=192,
+            runner_batch_size=14,
         )
         batch = fixture.forward_batch
         batch.mamba_track_mask = torch.tensor(
@@ -604,7 +605,7 @@ class TestFlashInferLinearGDNBackendCorrectness(CustomTestCase):
             device="cuda",
         )
         batch.mamba_track_indices = torch.tensor(
-            [7, 8, 9, 10, 11, 12, 13], dtype=torch.int64, device="cuda"
+            [8, 9, 10, 11, 12, 13, 14], dtype=torch.int64, device="cuda"
         )
         batch.mamba_track_seqlens = torch.tensor(
             [56, 100, 25, 120, 88, 80, 43],
