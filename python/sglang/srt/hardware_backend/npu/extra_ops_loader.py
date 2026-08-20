@@ -106,14 +106,3 @@ class TorchOpLoader:
         logger.info("Registered %s operators from %s", self._spec.name, library_path)
         return library_path
 
-
-def initialize_dspark_sparse_attn_ops() -> Optional[Path]:
-    """Register the DSpark sparse-attention ops before backend execution."""
-    spec = OpLibSpec(
-        name="DSpark sparse-attention",
-        so_env="SGLANG_DSPARK_EXTRA_OPS_SO",
-        namespace="_C_ascend",
-        required_ops=("npu_sparse_attn_sharedkv",),
-        pre_load_imports=("torch_npu",),
-    )
-    return TorchOpLoader(spec).initialize()

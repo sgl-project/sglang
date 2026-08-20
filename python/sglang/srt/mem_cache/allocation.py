@@ -113,11 +113,8 @@ def get_last_loc(
         "ascend",
         "torch_native",
     ) and decode_backend not in ("ascend", "torch_native")
-    uses_safe_last_loc = _is_hip or (
-        _is_npu and "dsv4" in (prefill_backend, decode_backend)
-    )
 
-    if uses_safe_last_loc and uses_triton_dispatch:
+    if (_is_hip or _is_npu) and uses_triton_dispatch:
         # HIP and NPU DSV4: the legacy get_last_loc_triton kernel emits a
         # mixed-width int32->int64 store that Triton mis-compiles on HIP,
         # producing out-of-range last_loc values under EAGLE +
