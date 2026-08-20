@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.diffusion.qknorm_rope import (
+from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     fused_qknorm_rope_pack_kv,
 )
@@ -55,6 +55,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
@@ -1600,6 +1601,14 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         self._ensure_cache_dicts()
 
+        # The T=1 fused path is faster on Blackwell, but regresses the Hopper
+        # Cosmos3-Super two-GPU workload. Keep Hopper on the original split path.
+        enable_t1_fused_qk_norm_rope = (
+            T == 1
+            and current_platform.is_blackwell()
+            and not self._gen_layers_torch_compiled
+        )
+
         # Compute UND K/V cache for this cache_key if not already cached
         # This allows reusing the cache across denoising steps for the same text
         if (
@@ -1636,7 +1645,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                     vis_pos_ids, cache_dtype=hidden_gen.dtype
                 )
             )
-            if T == 1 and not self._gen_layers_torch_compiled:
+            if enable_t1_fused_qk_norm_rope:
                 # build_rope_cache_inputs already rounds through cache_dtype
                 # before returning FP32 storage. Keep that rounded cache in the
                 # activation dtype so the exact fused QKNorm+RoPE kernel can
@@ -1654,11 +1663,11 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         # fused add+rmsnorm path instead of separate add + norm kernels.
         cached_kv_for_key = self.cached_kv[cache_key]
         residual: torch.Tensor | None = None
-        round_norm_before_rope = T == 1
+        round_norm_before_rope = enable_t1_fused_qk_norm_rope
         use_fused_qk_norm_rope = T > 1 or (
-            hidden_gen.device.type == "cuda"
+            enable_t1_fused_qk_norm_rope
+            and hidden_gen.device.type == "cuda"
             and not torch.compiler.is_compiling()
-            and not self._gen_layers_torch_compiled
             and get_sp_world_size() == 1
             and can_use_fused_inplace_qknorm_rope(
                 self.head_dim,

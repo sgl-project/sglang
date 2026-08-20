@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.layers.attention.selector import (
 from sglang.multimodal_gen.runtime.loader.utils import (
     _normalize_component_type,
     component_name_to_loader_cls,
+    format_component_residency,
     get_memory_usage_of_component,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
@@ -40,6 +41,14 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import resolve_component_precision
 
 logger = init_logger(__name__)
+
+
+class ComponentCheckpointUnsupportedError(ValueError):
+    """A component checkpoint is unsupported and must not use native fallback."""
+
+
+class NativeComponentLoaderRequired(RuntimeError):
+    """The customized loader must defer to the native library loader."""
 
 
 def _load_auto_tokenizer_with_roberta_processing_compat(*args, **kwargs):
@@ -191,16 +200,21 @@ class ComponentLoader(ABC):
                 component_attn_name,
             )
             source = "sgl-diffusion"
-        except ComponentResidencyError:
+        except (ComponentCheckpointUnsupportedError, ComponentResidencyError):
             raise
         except Exception as e:
+            native_loader_required = isinstance(e, NativeComponentLoaderRequired)
             if self.should_raise_customized_load_error(server_args, component_name):
+                if native_loader_required:
+                    raise
                 traceback.print_exc()
                 raise RuntimeError(
                     f"Failed to load customized {component_name}; native fallback "
                     "is disabled for this component configuration."
                 ) from e
-            if "Unsupported model architecture" in str(e):
+            if native_loader_required:
+                logger.info("%s", e)
+            elif "Unsupported model architecture" in str(e):
                 logger.info(
                     f"Component: {component_name} doesn't have a customized version yet, using native version"
                 )
@@ -241,11 +255,11 @@ class ComponentLoader(ABC):
             model_size = get_memory_usage_of_component(component) or "NA"
             consumed = gpu_mem_before_loading - current_gpu_mem
             logger.info(
-                f"Loaded %s: %s ({source} version). model size: %s GB, consumed GPU mem: %.2f GB, avail GPU mem: %.2f GB",
+                f"Loaded %s: %s ({source} version). model size: %s GB, %s. avail GPU mem: %.2f GB",
                 component_name,
                 component.__class__.__name__,
                 model_size,
-                consumed,
+                format_component_residency(component),
                 current_gpu_mem,
             )
         return component, consumed
