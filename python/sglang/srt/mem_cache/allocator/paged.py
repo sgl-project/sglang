@@ -302,6 +302,24 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self._copy_for_free_group(piece) for piece in pieces
             )
 
+    def free_page_reps(self, page_reps: torch.Tensor):
+        """Free pages given one arbitrary token index per distinct page.
+
+        For callers that can name the pages positionally (fixed shape), which
+        keeps the data-dependent ``torch.unique`` -- and its device sync -- out
+        of the path. Contract: ``page_reps`` must hold exactly one token per
+        page to free, with no duplicates.
+        """
+        if page_reps.numel() == 0:
+            return
+
+        if self.is_not_in_free_group:
+            self._release_page_ids(page_reps // self.page_size)
+            if self.debug_mode:
+                self._debug_check_no_duplicate_pages()
+        else:
+            self.free_page_reps_group.append(page_reps)
+
     def _debug_check_no_duplicate_pages(self):
         # span both containers: need_sort (PD disagg) routes frees into release_pages
         pages = torch.cat((self.free_pages, self.release_pages))
