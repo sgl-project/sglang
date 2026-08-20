@@ -9,7 +9,10 @@ contract is identical:
 * MP (synchronous) mode — the default.
   ``match_prefix`` fires only a FlexKV LOOKUP and returns ``host_hit_length``;
   the scheduler then calls :meth:`init_load_back` at dispatch time which
-  allocates slots and fires the FlexKV RETRIEVE.
+  allocates slots and fires the FlexKV RETRIEVE. With ``--enable-flexkv``,
+  the scheduler also runs enqueue-time :meth:`prefetch_from_storage` and
+  waits via :meth:`check_prefetch_progress` so Remote/Mooncake blocks are
+  on CPU before lookup/retrieve (compute GET no longer issues REMOTE2H).
 
 * IP (layerwise) mode — enabled with ``FLEXKV_ENABLE_LAYERWISE_TRANSFER=1``.
   ``match_prefix`` allocates uncached slots and kicks off a layerwise
@@ -32,6 +35,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
+from flexkv.integration.sglang.connector import (
+    FlexKVConnector,
+    FlexKVHostReleaseShim,
+)
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
@@ -41,7 +48,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.mem_cache.storage.flexkv.flexkv_connector import FlexKVConnector
 from sglang.srt.runtime_context import get_spec
 
 if TYPE_CHECKING:
@@ -117,6 +123,9 @@ class FlexKVRadixCache(RadixCache):
             # forward layer blocks on its own eventfd.
             self.flexkv_connector.register_layer_transfer_counter(kvcache)
 
+        # Same hook HiCache uses: scheduler.release_host_resources → destroy().
+        self.token_to_kv_pool_host = FlexKVHostReleaseShim(self.flexkv_connector)
+
         # CUDA streams (mirroring LMCRadixCache).
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
@@ -124,9 +133,9 @@ class FlexKVRadixCache(RadixCache):
         # Two-phase MP load: stash marker between ``match_prefix`` and
         # ``init_load_back``.
         self._load_markers: dict[str, _LoadBackMarker] = {}
-        # ``store_kv`` is async — we keep a lock on the source node
-        # until FlexKV signals completion, draining in ``evict`` /
-        # ``check_hicache_events``.
+        # ``store_kv`` is async — we keep a lock on the source node until
+        # FlexKV signals completion at the scheduler's synchronized
+        # ``check_hicache_events`` point.
         self._inflight_store_nodes: dict[str, TreeNode] = {}
         self._node_lock = threading.Lock()
 
@@ -145,7 +154,9 @@ class FlexKVRadixCache(RadixCache):
             self.flexkv_connector.reset()
 
     def shutdown(self) -> None:
-        if hasattr(self, "flexkv_connector"):
+        if hasattr(self, "token_to_kv_pool_host"):
+            self.token_to_kv_pool_host.destroy()
+        elif hasattr(self, "flexkv_connector"):
             self.flexkv_connector.shutdown()
 
     # ------------------------------------------------------------------
@@ -205,7 +216,10 @@ class FlexKVRadixCache(RadixCache):
         token_mask[device_len:] = True
 
         fkv_task_id, hit = self.flexkv_connector.lookup_kv(
-            token_ids=token_ids, token_mask=token_mask, rid=req.rid
+            token_ids=token_ids,
+            token_mask=token_mask,
+            rid=req.rid,
+            sglang_req_id=req.rid,
         )
         if hit <= 0:
             return base_res
@@ -252,7 +266,10 @@ class FlexKVRadixCache(RadixCache):
         # No rid here — IP mode self-pops; pass a synthetic stable key.
         synthetic_rid = f"_ip_{id(key)}"
         _, hit = self.flexkv_connector.lookup_kv(
-            token_ids=token_ids, token_mask=token_mask, rid=synthetic_rid
+            token_ids=token_ids,
+            token_mask=token_mask,
+            rid=synthetic_rid,
+            sglang_req_id=None,
         )
         if hit <= 0:
             return base_res
@@ -434,6 +451,7 @@ class FlexKVRadixCache(RadixCache):
                     rid=req.rid,
                     token_ids=list(token_ids),
                     kv_indices=kv_indices,
+                    sglang_req_id=req.rid,
                 )
         except Exception:  # noqa: BLE001
             self.dec_lock_ref(new_last_node)
@@ -453,11 +471,13 @@ class FlexKVRadixCache(RadixCache):
     # ------------------------------------------------------------------
 
     def evict(self, params: EvictParams) -> EvictResult:  # type: ignore[override]
-        """Drain completed stores before letting the base evict touch
-        the source nodes."""
+        """Evict unlocked nodes without entering a cross-rank protocol."""
         if self.disable:
             return EvictResult()
-        self._drain_completed_stores()
+        # Eviction is conditional on local allocator pressure, so not every
+        # TP/CP rank calls it. Store completion is a scatter protocol and must
+        # only run from the synchronized scheduler hook below. In-flight store
+        # nodes remain protected by their lock refs here.
         # Make sure the store stream's GPU work is observed before any
         # eviction frees the source slots.
         self.store_stream.synchronize()
@@ -496,12 +516,45 @@ class FlexKVRadixCache(RadixCache):
         self.flexkv_connector.release_pending(rid)
         self.flexkv_connector.cancel_prefetch(rid)
 
+    def prefetch_request(self, req: Req) -> None:
+        """Wait-complete FlexKV prefetch for a queued request.
+
+        Owns fill-id refresh / page alignment so the scheduler only needs
+        ``tree_cache.prefetch_request(req)``. Does not call FlexKV lookup
+        (that happens at admission after prefetch completes).
+        """
+        req.init_next_round_input(tree_cache=None, cow_mamba=False)
+        fill_ids = req.full_untruncated_fill_ids
+        if not fill_ids:
+            return
+        match_end = req._compute_max_prefix_len(len(fill_ids))
+        tokens = fill_ids[:match_end]
+        self.prefetch_from_storage(req.rid, None, tokens)
+
     def prefetch_from_storage(
-        self, rid: str, last_host_node: TreeNode, token_ids
+        self,
+        rid: str,
+        last_host_node=None,
+        token_ids=None,
+        last_hash=None,
+        prefix_keys=None,
     ) -> None:
-        """Kick off an opportunistic prefetch (SSD/Remote → CPU)."""
+        """Kick off FlexKV prefetch (SSD/Remote/Mooncake → CPU).
+
+        Extra HiCache-style args (``last_host_node`` / hashes) are ignored;
+        FlexKV addresses blocks by token ids.
+        """
+        del last_host_node, last_hash, prefix_keys
+        if not token_ids:
+            return
+        ids = list(token_ids)
+        if self.page_size > 1:
+            aligned = (len(ids) // self.page_size) * self.page_size
+            ids = ids[:aligned]
+        if not ids:
+            return
         try:
-            self.flexkv_connector.prefetch_async(rid, list(token_ids))
+            self.flexkv_connector.prefetch_async(rid, ids, sglang_req_id=rid)
         except Exception as exc:  # noqa: BLE001
             logger.debug("[FlexKV] prefetch_from_storage: %s", exc)
 
@@ -512,7 +565,11 @@ class FlexKVRadixCache(RadixCache):
         self.flexkv_connector.cancel_prefetch(rid)
 
     def pop_prefetch_loaded_tokens(self, rid: str) -> int:
-        # FlexKV doesn't expose per-rid prefetched token counts yet.
+        pop = getattr(self.flexkv_connector, "pop_prefetch_loaded_tokens", None)
+        if callable(pop):
+            return int(pop(rid))
+        # Fallback until connector exposes actual prefetch hit length (M1).
+        del rid
         return 0
 
     @property

@@ -1,0 +1,114 @@
+---
+title: "FlexKV hybrid cache eviction"
+description: "Understand how FlexKV restores and evicts full-attention and sliding-window KV cache without exhausting either device pool."
+---
+
+FlexKV can restore a cached prompt from host memory to device memory. On hybrid-attention models, that restore uses two device-memory pools:
+
+- The **full-attention pool** stores KV data used by full-attention layers.
+- The **sliding-window attention (SWA) pool** stores KV data used by layers that attend to a recent window.
+
+An allocation succeeds only when both pools have enough free capacity for their parts of the restore. This page explains how to calculate that capacity and how to diagnose failures that appear only under memory pressure.
+
+## Follow the restore path
+
+`FlexKVHybridRadixCache._alloc_restore_slots()` first asks the allocator for device slots. If the allocation fails, it follows this path:
+
+```text
+_alloc_restore_slots()
+  -> evict_from_tree_cache()
+  -> tree_cache.evict(EvictParams(...))
+  -> retry the allocation once
+```
+
+Small tests may never enter `evict_from_tree_cache()` because the device pools still have free slots. Always include a memory-pressure test when you change this path.
+
+## Keep demand separate from eviction
+
+The eviction helper accepts two allocation demands:
+
+```python
+evict_from_tree_cache(
+    tree_cache,
+    num_tokens=full_need,
+    swa_num_tokens=swa_need,
+)
+```
+
+`num_tokens` and `swa_num_tokens` describe how much capacity the pending allocation needs. They do not describe how many cached tokens to evict.
+
+For each pool, evict only its deficit:
+
+```python
+full_to_evict = max(0, full_need - full_available)
+swa_to_evict = max(0, swa_need - swa_available)
+```
+
+For example, suppose a restore needs 128 full-attention slots and 64 SWA slots. If 80 full-attention slots and 32 SWA slots are free, the cache should evict 48 full-attention slots and 32 SWA slots.
+
+| Pool | Needed | Available | Evict |
+| --- | ---: | ---: | ---: |
+| Full attention | 128 | 80 | 48 |
+| SWA | 64 | 32 | 32 |
+
+Passing `swa_need` directly to `EvictParams.swa_num_tokens` would evict 64 SWA slots in this example, twice the required amount.
+
+## Calculate SWA demand for each allocation mode
+
+FlexKV uses different SWA allocation behavior depending on the page size:
+
+| Allocation mode | Full-attention demand | SWA demand |
+| --- | ---: | ---: |
+| `page_size == 1` | `host_hit_length` | `host_hit_length` |
+| `page_size > 1`, hybrid SWA tail restore | `host_hit_length` | `min(page_size, host_hit_length)` |
+| Non-SWA allocator | `host_hit_length` | Not supplied |
+
+With `page_size == 1`, `SWATokenToKVPoolAllocator.alloc()` allocates one full-attention slot and one SWA slot per restored token. The two demands are therefore equal.
+
+With paged allocation, `alloc_extend_swa_tail()` restores full-attention KV for the whole host hit but SWA KV only for the last page. Its SWA demand is at most one page.
+
+If a caller omits `swa_num_tokens`, `evict_from_tree_cache()` defaults it to `num_tokens`. This keeps existing callers compatible because normal hybrid allocations reserve the same token demand from both pools.
+
+## Avoid an infinite eviction loop
+
+One radix-tree eviction may not release enough usable slots from both pools. The helper rechecks both capacities and may evict again. It stops when either condition is true:
+
+- both pools satisfy the pending allocation; or
+- an eviction attempt does not increase either pool's available capacity.
+
+The second condition prevents an infinite loop when protected cache entries cannot be evicted.
+
+## Recognize the failure pattern
+
+An interface mismatch can stay hidden until the cache is full:
+
+1. A small run restores data without eviction and passes.
+2. A larger or more concurrent run exhausts a device pool.
+3. `_alloc_restore_slots()` enters the eviction path.
+4. If the caller and helper signatures disagree, Python raises `TypeError` before eviction.
+5. Later requests may report connection failures if the server process exits.
+
+Start with the first server-side exception. A final `Connection refused` error is often a consequence, not the root cause.
+
+## Test changes to this path
+
+Run the focused CPU tests:
+
+```bash
+python -m pytest -q \
+  test/registered/unit/mem_cache/test_evict_from_tree_cache.py \
+  test/registered/unit/mem_cache/test_flexkv_hybrid_radix_cache.py
+```
+
+The tests should cover these cases:
+
+- only the full-attention pool has a deficit;
+- only the SWA pool has a deficit;
+- both pools already have enough capacity;
+- a caller omits `swa_num_tokens`;
+- eviction cannot make progress; and
+- `page_size == 1` requests SWA capacity for the full host hit.
+
+After the CPU tests pass, run a workload that is large enough to trigger real eviction. Confirm that the log contains no `TypeError`, the server stays healthy, and the restore round returns responses for every request.
+
+For the broader cache hierarchy, see [HiCache system design and optimization](/docs/advanced_features/hicache_design).

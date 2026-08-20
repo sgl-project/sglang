@@ -1020,7 +1020,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.output_streamer.stream_output([req], req.return_logprob)
         if self.metrics_reporter.enable_metrics:
             self.metrics_collector.increment_bootstrap_failed_reqs()
-        if self.enable_hicache_storage:
+        if self.enable_hicache_storage or self.enable_flexkv:
             self.tree_cache.release_aborted_request(req.rid)
 
     def handle_pending_bootstrap(self: Scheduler, req: Req, poll: KVPoll) -> bool:

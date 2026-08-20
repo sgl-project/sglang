@@ -108,6 +108,18 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         logger.info("Using experimental C++ radix tree implementation.")
         return RadixCacheCpp(params=params, server_args=server_args)
 
+    if get_memory().enable_flexkv:
+        # FlexKV supplies its own host-tier path and composes with the unified
+        # radix cache for SWA models. Select it before the built-in hybrid
+        # cache branches so --enable-flexkv works for DeepSeek V4 as well.
+        import os
+
+        from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
+
+        if get_memory().flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
+            os.environ["FLEXKV_CONFIG_PATH"] = get_memory().flexkv_config_file
+        return _flexkv_factory(ctx)
+
     if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get() or use_mlx():
         return _create_unified_radix_cache(ctx, server_args, params)
 
@@ -147,20 +159,6 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
             rank=ctx.tp_rank,
             tp_group=ctx.tp_group,
         )
-
-    if get_memory().enable_flexkv:
-        # Importing the package side-effect registers the explicit
-        # ``--radix-cache-backend=flexkv`` factory; we then call the
-        # factory directly so --enable-flexkv stands on its own.
-        import os
-
-        from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
-
-        # Honor a CLI --flexkv-config-file by forwarding it via the env
-        # var that FlexKV's config loader actually reads.
-        if get_memory().flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
-            os.environ["FLEXKV_CONFIG_PATH"] = get_memory().flexkv_config_file
-        return _flexkv_factory(ctx)
 
     from sglang.srt.mem_cache.radix_cache import RadixCache
 

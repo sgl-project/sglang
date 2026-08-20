@@ -111,7 +111,19 @@ def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     tree_cache.cache_unfinished_req(req, **kwargs)
 
 
-def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
+def evict_from_tree_cache(
+    tree_cache: BasePrefixCache | None,
+    num_tokens: int,
+    *,
+    swa_num_tokens: int | None = None,
+):
+    """Evict enough radix-cache entries to satisfy an allocation.
+
+    For a hybrid SWA allocator, ``num_tokens`` is the full-attention demand and
+    ``swa_num_tokens`` is the independent SWA demand. The latter defaults to
+    ``num_tokens`` for existing callers that allocate both pools symmetrically.
+    Tail-only restore paths may request less SWA capacity than full capacity.
+    """
     if tree_cache is None:
         return
 
@@ -119,18 +131,35 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
         return
 
     allocator = tree_cache.token_to_kv_pool_allocator
+    swa_need = num_tokens if swa_num_tokens is None else swa_num_tokens
 
     if isinstance(allocator, SWATokenToKVPoolAllocator):
         # Hybrid allocator
-        full_available_size = allocator.full_available_size()
-        swa_available_size = allocator.swa_available_size()
+        while True:
+            full_available_size = allocator.full_available_size()
+            swa_available_size = allocator.swa_available_size()
+            if full_available_size >= num_tokens and swa_available_size >= swa_need:
+                break
 
-        if full_available_size < num_tokens or swa_available_size < num_tokens:
             full_num_tokens = max(0, num_tokens - full_available_size)
-            swa_num_tokens = max(0, num_tokens - swa_available_size)
+            swa_to_evict = max(0, swa_need - swa_available_size)
+            if full_num_tokens == 0 and swa_to_evict == 0:
+                break
+
             tree_cache.evict(
-                EvictParams(num_tokens=full_num_tokens, swa_num_tokens=swa_num_tokens)
+                EvictParams(
+                    num_tokens=full_num_tokens,
+                    swa_num_tokens=swa_to_evict,
+                )
             )
+
+            new_full_available_size = allocator.full_available_size()
+            new_swa_available_size = allocator.swa_available_size()
+            if (
+                new_full_available_size == full_available_size
+                and new_swa_available_size == swa_available_size
+            ):
+                break
     else:
         # Standard allocator: evict only the shortfall (mirrors the SWA arm)
         available_size = allocator.available_size()
