@@ -712,7 +712,10 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             out.add_(offsets)
             out.clamp_(min=0)  # tombstoned page: -1*ps + offset in [-ps, -1]
             return out
-        phys_pages = self.virtual_to_physical[virt_pages]
+        # Keep the hot transfer-metadata path asynchronous. CUDA advanced
+        # indexing may perform a host-side bounds check; index_select does not
+        # force that scalar readback.
+        phys_pages = torch.index_select(self.virtual_to_physical, 0, virt_pages)
         result = phys_pages * self.page_size + offsets
         return torch.clamp_min(result, 0)
 
@@ -2388,7 +2391,9 @@ class UnifiedSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         ps = self.swa_attn_allocator.page_size
         virt_pages = kv_indices // ps
         offsets = kv_indices % ps
-        swa_phys_pages = self.swa_attn_allocator.virtual_to_physical[virt_pages]
+        swa_phys_pages = torch.index_select(
+            self.swa_attn_allocator.virtual_to_physical, 0, virt_pages
+        )
         result = (swa_phys_pages * ps + offsets).to(torch.int32)
         result = torch.clamp_min(result, 0)
         if out is not None:
