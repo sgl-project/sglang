@@ -989,6 +989,15 @@ class DeepseekV4AscendAttnBackend(
             dtype=torch.int32,
             device=device,
         )
+        if self._use_host_sparse_metadata:
+            # q_pa is constant per graph shape (never rewritten at replay), so the
+            # CPU mirror for the host metadata op is built once here.
+            metadata.actual_seq_lengths_q_pa_cpu = torch.arange(
+                0,
+                bs * tokens_per_req + tokens_per_req,
+                tokens_per_req,
+                dtype=torch.int32,
+            )
 
         # init >=1 so the captured kernel records valid attention work; replay overwrites in-place
         metadata.actual_seq_lengths_kv = torch.ones(
@@ -1189,6 +1198,10 @@ class DeepseekV4AscendAttnBackend(
                 fm.seq_lens_cpu_int,
                 ctx.live_seq_lens_cpu.int(),
             )
+        elif self._use_host_sparse_metadata:
+            # CPU mirror of the kv buffer written below, from its CPU source — the
+            # host metadata op reads this instead of a D2H sync.
+            fm.seq_lens_cpu_int = ctx.final_seq_lens_cpu[: ctx.bs].int().clamp(min=1)
         fm.actual_seq_lengths_kv.copy_(attn_seq_lens.clamp(min=1))
 
     def _refresh_graph_compress_page_tables_direct(self, ctx) -> None:
@@ -1432,6 +1445,14 @@ class DeepseekV4AscendAttnBackend(
                 [torch.zeros(1, dtype=torch.int32, device=device), actual_q],
                 dim=0,
             )
+            if self._use_host_sparse_metadata:
+                fm.actual_seq_lengths_q_pa_cpu = torch.cat(
+                    [
+                        torch.zeros(1, dtype=torch.int32),
+                        torch.cumsum(seq_lens_cpu, dim=0).int(),
+                    ],
+                    dim=0,
+                )
         elif forward_batch.forward_mode.is_decode():
             B = forward_batch.batch_size
             fm.actual_seq_lengths_q = torch.arange(
@@ -1440,6 +1461,10 @@ class DeepseekV4AscendAttnBackend(
             fm.actual_seq_lengths_q_pa = torch.arange(
                 0, B + 1, dtype=torch.int32, device=device
             )
+            if self._use_host_sparse_metadata:
+                fm.actual_seq_lengths_q_pa_cpu = torch.arange(
+                    0, B + 1, dtype=torch.int32
+                )
         elif (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
@@ -1458,6 +1483,16 @@ class DeepseekV4AscendAttnBackend(
                 [torch.zeros(1, dtype=torch.int32, device=device), actual_q],
                 dim=0,
             )
+            if self._use_host_sparse_metadata:
+                fm.actual_seq_lengths_q_pa_cpu = torch.cat(
+                    [
+                        torch.zeros(1, dtype=torch.int32),
+                        torch.arange(
+                            n_draft, B * n_draft + 1, n_draft, dtype=torch.int32
+                        ),
+                    ],
+                    dim=0,
+                )
         else:
             fm.actual_seq_lengths_q = None
             fm.actual_seq_lengths_q_pa = None
@@ -1537,8 +1572,11 @@ class DeepseekV4AscendAttnBackend(
         c1a_kwargs = base_kwargs | common
         if self._is_dspark_draft_worker:
             seq_lens_cpu = getattr(fm, "seq_lens_cpu_int", None)
-            # do sparse_attn_sharedkv_metadata on CPU, Simple but with better performance, data movement can be ignored
-            cu_q_cpu = actual_seq_lengths_q_pa[: bs + 1].to("cpu", torch.int32)
+            cu_q_cpu = getattr(fm, "actual_seq_lengths_q_pa_cpu", None)
+            if cu_q_cpu is None or cu_q_cpu.numel() < bs + 1:
+                cu_q_cpu = actual_seq_lengths_q_pa[: bs + 1].to("cpu", torch.int32)
+            else:
+                cu_q_cpu = cu_q_cpu[: bs + 1]
             seq_kv_cpu = (
                 seq_lens_cpu[:bs].int()
                 if seq_lens_cpu is not None
