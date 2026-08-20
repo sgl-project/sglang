@@ -17,6 +17,28 @@ if TYPE_CHECKING:
     import torch
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
+_HIP = frozenset({CapabilityRequirement.HIP})
+
+for _name in ("gptq_gemm", "gptq_shuffle"):
+    register_kernel(
+        KernelSpec(
+            op=f"quantization.{_name}",
+            backend=KernelBackend.AOT,
+            target=f"sgl_kernel:{_name}",
+            capabilities=_HIP,
+            description=f"{_name} (sgl_kernel ROCm wheel).",
+        )
+    )
+    register_kernel(
+        KernelSpec(
+            op=f"quantization.{_name}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.quantization.gptq:{_name}",
+            capabilities=_CUDA,
+            description=f"{_name} (sglang.kernels.jit).",
+        )
+    )
+del _name
 
 register_kernel(
     KernelSpec(
@@ -82,6 +104,32 @@ def sgl_per_token_quant_fp8(
     return get_kernel("quantization.sgl_per_token_quant_fp8", KernelBackend.JIT)(
         input, output_q, output_s
     )
+
+
+def gptq_gemm(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_gptq_qzeros: torch.Tensor,
+    b_gptq_scales: torch.Tensor,
+    b_g_idx: torch.Tensor,
+    use_shuffle: bool,
+    bit: int,
+) -> torch.Tensor:
+    """Multiply activations by GPTQ-packed weights."""
+    return get_kernel("quantization.gptq_gemm")(
+        a,
+        b_q_weight,
+        b_gptq_qzeros,
+        b_gptq_scales,
+        b_g_idx,
+        use_shuffle,
+        bit,
+    )
+
+
+def gptq_shuffle(q_weight: torch.Tensor, q_perm: torch.Tensor, bit: int) -> None:
+    """Shuffle GPTQ-packed weights in place."""
+    return get_kernel("quantization.gptq_shuffle")(q_weight, q_perm, bit)
 
 
 def sgl_per_token_group_quant_8bit(
@@ -155,6 +203,8 @@ def per_token_group_quant(
 
 
 __all__ = [
+    "gptq_gemm",
+    "gptq_shuffle",
     "sgl_per_token_quant_fp8",
     "sgl_per_token_group_quant_8bit",
     "sgl_per_token_group_quant_fp8",

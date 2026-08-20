@@ -45,8 +45,7 @@ gptq_marlin_repack = _unsupported_kernel
 gptq_shuffle = _unsupported_kernel
 
 try:
-    from sgl_kernel import gptq_gemm, gptq_shuffle
-
+    from sglang.kernels.ops.quantization import gptq_gemm, gptq_shuffle
     from sglang.kernels.ops.quantization.gptq_marlin_repack import gptq_marlin_repack
 except Exception:
     pass

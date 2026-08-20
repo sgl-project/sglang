@@ -3,7 +3,7 @@ import torch
 from sgl_kernel import gptq_gemm as aot_gptq_gemm
 from sgl_kernel import gptq_shuffle as aot_gptq_shuffle
 
-from sglang.kernels.ops.quantization.gptq import gptq_gemm, gptq_shuffle
+from sglang.kernels.ops.quantization import gptq_gemm, gptq_shuffle
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
