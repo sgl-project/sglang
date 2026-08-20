@@ -528,7 +528,8 @@ class MoeLoraRunner:
         )
         return StandardCombineInput(hidden_states=output)
 
-    def _route_for_a(self, spec: LoraASpec, routes: MoeLoraRoutes) -> RouteView:
+    @staticmethod
+    def _route_for_a(spec: LoraASpec, routes: MoeLoraRoutes) -> RouteView:
         if spec.family is LoraAFamily.TOKEN_DEDUP_GROUPED:
             if routes.shared_token is None:
                 raise ValueError("shared token route was not constructed")
@@ -808,89 +809,6 @@ class MoeLoraRunner:
             down_a_input = None
         return act_out, down_a_input
 
-    def _run_down_a(
-        self,
-        plan: MoeLoraExecutionPlan,
-        launch_config: MoeLoraLaunchConfig,
-        routes: MoeLoraRoutes,
-        down_a_input: _DownAInput,
-        batch: MoeLoraBatch,
-    ) -> torch.Tensor:
-        return self._run_a(
-            launch_config,
-            plan.down_a,
-            down_a_input.rows.view(-1, self.intermediate_size),
-            batch.down_lora_a.flatten(0, 1),
-            routes,
-            "down_a",
-            input_row_map=down_a_input.pair_to_row,
-        )
-
-    def _run_down_b(
-        self,
-        plan: MoeLoraExecutionPlan,
-        launch_config: MoeLoraLaunchConfig,
-        routes: MoeLoraRoutes,
-        rank: torch.Tensor,
-        batch: MoeLoraBatch,
-    ) -> torch.Tensor:
-        delta = self.workspace.tensor(
-            "down_b:delta",
-            (rank.shape[0], self.hidden_size),
-            dtype=self.lora_delta_dtype,
-            device=rank.device,
-        )
-        self._run_b(
-            launch_config,
-            plan.down_b,
-            rank,
-            batch.down_lora_b.flatten(0, 1),
-            delta,
-            routes,
-        )
-        return delta
-
-    def _run_down_b_scatter(
-        self,
-        plan: MoeLoraExecutionPlan,
-        launch_config: MoeLoraLaunchConfig,
-        provider: MoeBaseProvider,
-        routes: MoeLoraRoutes,
-        base_gemm_state,
-        down_out: torch.Tensor,
-        rank: torch.Tensor,
-        batch: MoeLoraBatch,
-    ) -> None:
-        """Scatter-add the unweighted down-B delta into the base down rows.
-
-        The down_b_scatter experiment: the SAME one-launch down-B tiling (and
-        the same down-B site launch config and aligned route) runs AFTER the
-        base down GEMM and targets ``down_out[src2dst[pair]]`` with a
-        read-modify-write add instead of storing a dense pair-major delta, so
-        the ``down_b:delta`` workspace buffer is never allocated.
-        """
-        spec = plan.down_b
-        provider.run_down_b_scatter(
-            base_gemm_state,
-            down_out=down_out,
-            bridge=rank,
-            b_down=batch.down_lora_b.flatten(0, 1),
-            routing=self._route_for_b(spec, routes),
-            config=launch_config.for_b(spec.site),
-        )
-
-    def _run_base_down(
-        self, provider: MoeBaseProvider, base_gemm_state, act_out: torch.Tensor
-    ) -> torch.Tensor:
-        down_out = self.workspace.tensor(
-            "base:down",
-            provider.down_out_shape(base_gemm_state),
-            dtype=torch.bfloat16,
-            device=act_out.device,
-        )
-        provider.down(base_gemm_state, act_out, down_out)
-        return down_out
-
     def _run_down(
         self,
         plan: MoeLoraExecutionPlan,
@@ -911,25 +829,42 @@ class MoeLoraRunner:
         def down_a() -> None:
             if down_a_input is None:
                 raise RuntimeError("standalone down A requires pair activation")
-            state.rank = self._run_down_a(
-                plan,
+            state.rank = self._run_a(
                 launch_config,
+                plan.down_a,
+                down_a_input.rows.view(-1, self.intermediate_size),
+                batch.down_lora_a.flatten(0, 1),
                 routes,
-                down_a_input,
-                batch,
+                "down_a",
+                input_row_map=down_a_input.pair_to_row,
             )
 
         def down_b() -> None:
-            state.delta = self._run_down_b(
-                plan,
-                launch_config,
-                routes,
-                state.rank,
-                batch,
+            delta = self.workspace.tensor(
+                "down_b:delta",
+                (state.rank.shape[0], self.hidden_size),
+                dtype=self.lora_delta_dtype,
+                device=state.rank.device,
             )
+            self._run_b(
+                launch_config,
+                plan.down_b,
+                state.rank,
+                batch.down_lora_b.flatten(0, 1),
+                delta,
+                routes,
+            )
+            state.delta = delta
 
         def base() -> torch.Tensor:
-            return self._run_base_down(provider, base_gemm_state, act_out)
+            down_out = self.workspace.tensor(
+                "base:down",
+                provider.down_out_shape(base_gemm_state),
+                dtype=torch.bfloat16,
+                device=act_out.device,
+            )
+            provider.down(base_gemm_state, act_out, down_out)
+            return down_out
 
         if plan.down_overlap is DownOverlap.NONE:
             if state.rank is None:
@@ -943,15 +878,17 @@ class MoeLoraRunner:
                 # pair-major delta buffer is never allocated on this path.
                 down_out = base()
                 assert state.rank is not None
-                self._run_down_b_scatter(
-                    plan,
-                    launch_config,
-                    provider,
-                    routes,
+                # The same one-launch down-B tiling, the same site launch
+                # config and aligned route, but targeting
+                # down_out[src2dst[pair]] with a read-modify-write add instead
+                # of storing a dense pair-major delta.
+                provider.run_down_b_scatter(
                     base_gemm_state,
-                    down_out,
-                    state.rank,
-                    batch,
+                    down_out=down_out,
+                    bridge=state.rank,
+                    b_down=batch.down_lora_b.flatten(0, 1),
+                    routing=self._route_for_b(plan.down_b, routes),
+                    config=launch_config.for_b(plan.down_b.site),
                 )
             else:
                 if plan.down_b is not None:
