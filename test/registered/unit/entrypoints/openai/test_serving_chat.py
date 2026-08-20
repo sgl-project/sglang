@@ -4594,5 +4594,105 @@ class InklingReasoningEffortTest(unittest.TestCase):
         )
 
 
+class KimiK3ToolCallRequestTestCase(unittest.TestCase):
+    """Tool-call request handling under the K3 encoding."""
+
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def setUp(self):
+        # Bag-read config (get_serving()) comes from the published ServerArgs;
+        # the mock server_args still answers config_value() lookups.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                tool_call_parser="kimi_k3",
+                reasoning_parser="kimi_k3",
+                default_chat_template_kwargs=None,
+            ),
+            role="tokenizer",
+        )
+        self.tm = _MockTokenizerManager()
+        self.tm.server_args.tool_call_parser = "kimi_k3"
+        self.tm.server_args.reasoning_parser = "kimi_k3"
+        self.tm.chat_template_name = None
+        self.tm.tokenizer.apply_chat_template = Mock(return_value=[1, 2, 3])
+        template_manager = _MockTemplateManager()
+        template_manager.chat_template_name = None
+        template_manager.jinja_template_content_format = "string"
+        self.chat = OpenAIServingChat(self.tm, template_manager)
+        self.chat.chat_encoding_spec = "kimi_k3"
+        self.chat.tool_call_parser = "kimi_k3"
+
+    def _template_kwargs(self, **kwargs):
+        request = ChatCompletionRequest(model="x", messages=self.MESSAGES, **kwargs)
+        self.chat._process_messages(request, is_multimodal=False)
+        return self.tm.tokenizer.apply_chat_template.call_args.kwargs
+
+    def test_response_channel_flag_tracks_the_resolved_thinking_mode(self):
+        """The constraint has to know which channel the prompt left open."""
+        from unittest.mock import patch
+
+        for kwargs, expected in (
+            ({"chat_template_kwargs": {"thinking": False}}, True),
+            ({"chat_template_kwargs": {"thinking": True}}, False),
+            ({}, False),
+        ):
+            with self.subTest(request=kwargs):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=self.MESSAGES,
+                    tools=[
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "f",
+                                "parameters": {"type": "object", "properties": {}},
+                            },
+                        }
+                    ],
+                    tool_choice="required",
+                    **kwargs,
+                )
+                with patch(
+                    "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+                ) as ParserMock:
+                    parser = ParserMock.return_value
+                    parser.get_structure_constraint.return_value = None
+                    parser.detector.parses_required_natively.return_value = False
+                    parser.detector.eot_token = "<|close|>tools<|sep|>"
+                    self.chat._process_messages(request, is_multimodal=False)
+                self.assertEqual(
+                    parser.get_structure_constraint.call_args.kwargs[
+                        "response_channel_open"
+                    ],
+                    expected,
+                )
+
+    def test_draft07_identifier_in_tool_parameters_is_accepted(self):
+        """A `$id` with a fragment is draft-07 style: it fails the 2020-12
+        metaschema's URI form check but constrains nothing, and this stack
+        renders and constrains such a schema correctly."""
+        request = ChatCompletionRequest(
+            model="x",
+            messages=self.MESSAGES,
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "f",
+                        "parameters": {
+                            "$id": "#user",
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}},
+                        },
+                    },
+                }
+            ],
+        )
+        self.assertIsNone(self.chat._validate_request(request))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
