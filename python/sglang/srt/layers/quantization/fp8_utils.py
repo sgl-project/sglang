@@ -11,6 +11,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
     sglang_per_token_group_quant_fp8_row_padded,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import has_npu_a5_support
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
@@ -780,7 +781,7 @@ def _dispatch_auto_backend() -> Callable:
     # 2. FlashInfer TRTLLM (if Blackwell GPU and FlashInfer available)
     # 3. CUTLASS (if SM120 GPU and CUDA 12.8+)
     # 4. AITER (if AMD GPU with AITER enabled)
-    # 5. NPU (Ascend)
+    # 5. NPU (Atlas A5)
     # 6. Triton (fallback)
 
     if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
@@ -792,10 +793,6 @@ def _dispatch_auto_backend() -> Callable:
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
     elif _is_npu and has_npu_a5_support():
-        # A5 only: the NPU implementation is an MXFP8 GEMM, which earlier parts
-        # do not have — they keep the Triton fallback below.
-        # Imported here, not at module scope: the NPU module is only importable
-        # once torch_npu has registered torch.ops.npu.
         from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
             npu_w8a8_block_fp8_linear,
         )
