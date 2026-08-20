@@ -115,11 +115,8 @@ on:
         description: 'ROCm image version ("all" runs every flavor)'
         required: false
         type: string
-        # Deliberately a single flavor rather than 'all', unlike the schedule
-        # and the dispatch form. amd-aiter-scout, bot-bump-sglang-version and
-        # release-branch-cut all call this workflow without passing
-        # rocm_version, and defaulting them to 'all' would silently double
-        # their GPU cost. They can opt in explicitly.
+        # A single flavor, unlike the schedule and the dispatch form: a caller
+        # that says nothing should not silently get double the GPU cost.
         default: rocm724
       ref:
         description: 'Git ref (branch, tag, or SHA) to test. If not provided, uses the default branch.'
