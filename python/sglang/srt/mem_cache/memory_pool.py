@@ -1074,6 +1074,12 @@ class MambaPool:
             tensors = value if isinstance(value, list) else [value]
             slice_axis = self.conv_slice_axis if field == "conv" else 0
             for state_tensor in tensors:
+                # A conv-only linear layer carries no recurrent temporal state,
+                # so that buffer is allocated with a degenerate shape. It holds
+                # nothing to transfer, and advertising it makes the RDMA engine
+                # reject the batch registration that carries the real buffers.
+                if state_tensor.numel() == 0:
+                    continue
                 yield field, state_tensor, slice_axis
 
     def get_contiguous_buf_infos(self):

@@ -288,20 +288,12 @@ class MooncakeKVManager(CommonKVManager):
         Deduped because the unified memory pool reports one raw buffer as both
         its KV and its mamba state component, and double registration fails in
         the engine.
-
-        Zero-length regions are dropped: a hybrid model interleaves attention
-        and linear-attention layers, so each state component reports an empty
-        buffer for every layer of the other kind. The transfer engine rejects a
-        zero-length region, and that failure leaves the whole batch -- real
-        buffers included -- unregistered.
         """
         regions: List[Tuple[int, int]] = []
         seen: Set[Tuple[int, int]] = set()
 
         def add(ptrs: List[int], lens: List[int]) -> None:
             for ptr, length in zip(ptrs or [], lens or []):
-                if length == 0:
-                    continue
                 if (ptr, length) not in seen:
                     seen.add((ptr, length))
                     regions.append((ptr, length))
