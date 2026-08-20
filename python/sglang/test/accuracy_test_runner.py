@@ -21,7 +21,6 @@ class AccuracyTestParams:
     baseline_accuracy: float  # Required: minimum accuracy threshold
     num_examples: Optional[int] = None
     num_threads: Optional[int] = None
-    num_shots: Optional[int] = None  # few-shot count; None = run_eval's default
     max_tokens: Optional[int] = None
     return_latency: bool = False
     # Extended parameters for special evaluations (e.g., GPQA with thinking mode)
@@ -35,6 +34,7 @@ class AccuracyTestParams:
     # sgl-eval-backed datasets only: force chat_template_kwargs.thinking instead
     # of letting _run_sgl_eval infer it from the model name.
     sgl_eval_thinking: Optional[bool] = None
+    num_shots: Optional[int] = None  # few-shot count; None = run_eval's default
 
 
 @dataclass
