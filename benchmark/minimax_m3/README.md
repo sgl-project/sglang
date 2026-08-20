@@ -83,13 +83,17 @@ canonical SGLang task-category names before balancing the subset. The manifest
 records that mapping, the per-category counts, and the tokenizer-observed
 minimum and maximum prompt lengths.
 
-The preflight is offline and read-only when `--output` is omitted. It resolves
+The preflight is offline and fail-closed. When `--output` is omitted it writes
+no evidence file, although the real plan-ABI probe may populate the configured
+session JIT cache. It resolves
 the model from the local Hugging Face cache (or a local path), checks every
 indexed weight shard, loads the tokenizer locally, verifies both dataset hashes
 and row counts, checks the exact clean FlashInfer source HEAD and installed
 public API, checks the standalone baseline import, verifies this SGLang checkout
-is the one Python imports, and requires exactly four visible compute-capability
-10.3 GPUs:
+is the one Python imports, executes the baseline's real decode-plan ABI, and
+requires exactly four visible compute-capability 10.3 GPUs. The compatibility
+image carries `apache-tvm-ffi==0.1.9`; preserve that runtime for the A/B instead
+of shadowing it with a second FFI DSO in the session environment:
 
 ```bash
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
@@ -98,7 +102,8 @@ python benchmark/minimax_m3/probe_msa_e2e_dependencies.py \
   --longbench-subset /shared/eval/longbench_v2_m3_100_min32k.json \
   --gpqa-dataset /shared/eval/gpqa_diamond.csv \
   --flashinfer-source-dir "${FLASHINFER_SOURCE_DIR}" \
-  --expected-flashinfer-head "${FLASHINFER_HEAD}"
+  --expected-flashinfer-head "${FLASHINFER_HEAD}" \
+  --expected-tvm-ffi-version 0.1.9
 ```
 
 These smaller probes are also useful before requesting the allocation; none
@@ -123,6 +128,7 @@ export GPQA_DATASET=/shared/eval/gpqa_diamond.csv
 export FLASHINFER_SOURCE_DIR=/workspace/flashinfer
 export FLASHINFER_HEAD=<exact-final-source-commit>
 export OUTPUT_ROOT=/shared/results/msa_gb300_tp4_$(date -u +%Y%m%dT%H%M%SZ)
+export EXPECTED_TVM_FFI_VERSION=0.1.9
 bash benchmark/minimax_m3/run_msa_ab_gb300.sh
 ```
 
