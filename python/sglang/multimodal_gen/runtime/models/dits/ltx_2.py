@@ -10,28 +10,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.diffusion.bitexact_gate import BitExactFusionGate
-from sglang.kernels.ops.diffusion.fused_linear_gelu import (
-    can_fuse_linear_gelu,
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_linear_gelu,
+    can_use_ltx2_qknorm_split_rope_cuda,
+    can_use_ltx2_rms_norm_modulate,
+    can_use_modulate_scale_shift_cuda,
     fused_gelu_active,
     fused_linear_gelu_tanh,
-    mark_fused_gelu_site,
-)
-from sglang.kernels.ops.diffusion.ltx2_qknorm_split_rope import (
-    can_use_ltx2_qknorm_split_rope_cuda,
-    ltx2_qknorm_split_rope_cuda,
-)
-from sglang.kernels.ops.diffusion.ltx2_rmsnorm_modulate import (
-    can_fuse_ltx2_rms_norm_modulate,
     fused_ltx2_rms_norm_modulate,
+    ltx2_qknorm_split_rope_cuda,
     ltx2_rms_norm_modulate_active,
+    mark_fused_gelu_site,
     mark_ltx2_rms_norm_modulate_site,
-)
-from sglang.kernels.ops.diffusion.modulate_scale_shift import (
-    can_use_modulate_scale_shift_cuda,
     modulate_scale_shift_cuda,
+    residual_gate_add,
 )
-from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
 from sglang.multimodal_gen.configs.models.dits.ltx_2 import LTX2ArchConfig, LTX2Config
 from sglang.multimodal_gen.configs.models.fsdp import (
     is_blocks_or_transformer_blocks,
@@ -209,7 +203,7 @@ def _ltx2_rms_norm_modulate(
     default). The fused kernel is not bit-exact (<=1 bf16 ULP) so it is gated
     on the request-scoped mount rather than a runtime self-check.
     """
-    if ltx2_rms_norm_modulate_active(block) and can_fuse_ltx2_rms_norm_modulate(
+    if ltx2_rms_norm_modulate_active(block) and can_use_ltx2_rms_norm_modulate(
         x, scale, shift
     ):
         return fused_ltx2_rms_norm_modulate(x, scale, shift, eps)
@@ -256,9 +250,7 @@ def _ltx2_try_fused_ada_values9(
         return None
 
     try:
-        from sglang.kernels.ops.diffusion.triton.ltx2_ada_values import (
-            ltx2_ada_values9,
-        )
+        from sglang.kernels.ops.diffusion import ltx2_ada_values9
 
         return ltx2_ada_values9(scale_shift_table, timestep)
     except Exception as exc:
@@ -338,9 +330,7 @@ def apply_split_rotary_emb(
         and cos.is_cuda
         and sin.is_cuda
     ):
-        from sglang.kernels.ops.diffusion.triton.ltx2_rotary import (
-            apply_ltx2_split_rotary_emb,
-        )
+        from sglang.kernels.ops.diffusion import apply_ltx2_split_rotary_emb
 
         return apply_ltx2_split_rotary_emb(x, cos, sin)
 
@@ -1080,7 +1070,7 @@ class LTX2FeedForward(nn.Module):
         mark_fused_gelu_site(self, "proj_in")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj_in, x):
+        if fused_gelu_active(self) and can_use_linear_gelu(self.proj_in, x):
             x = fused_linear_gelu_tanh(x, self.proj_in.weight, self.proj_in.bias)
         else:
             x, _ = self.proj_in(x)
