@@ -215,11 +215,6 @@ class SamplingParams:
     progressive_levels: int = 1
     progressive_delta: float = 0.01
 
-    # LongCat-Image parameters
-    enable_cfg_renorm: bool = False
-    cfg_renorm_min: float = 0.0
-    enable_prompt_rewrite: bool = False
-
     # TeaCache parameters
     enable_teacache: bool = False
     teacache_params: Any = (
@@ -393,6 +388,12 @@ class SamplingParams:
             req.condition_inputs.update(self.condition_inputs)
         if self.realtime_chunk_size is not None:
             req.realtime_chunk_size = self.realtime_chunk_size
+
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        """Declare model-specific JSON fields accepted by the image API."""
+
+        return frozenset()
 
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
@@ -1008,7 +1009,7 @@ class SamplingParams:
         add_argument(
             "--enable-cfg-renorm",
             action=StoreBoolean,
-            help="Enable CFG renormalization for LongCat-Image (default: false).",
+            help="Enable CFG renormalization for LongCat-Image (enabled by default).",
         )
         add_argument(
             "--cfg-renorm-min",
@@ -1018,7 +1019,7 @@ class SamplingParams:
         add_argument(
             "--enable-prompt-rewrite",
             action=StoreBoolean,
-            help="Enable prompt rewriting via Qwen2.5-VL before encoding for LongCat-Image (default: false).",
+            help="Enable prompt rewriting via Qwen2.5-VL before encoding for LongCat-Image (enabled by default).",
         )
 
         # profiling

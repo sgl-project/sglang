@@ -1,18 +1,26 @@
 import os
+from dataclasses import fields
 
 from fastapi import HTTPException
 from PIL import Image
 
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
+from sglang.multimodal_gen.configs.sample.longcat_image import (
+    LongCatImageSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
     _build_image_response_kwargs,
     _fallback_image_urls,
     _get_response_resize,
+    _image_request_model_kwargs,
     _raise_if_image_variant_not_found,
     _runtime_sampling_quality,
     _select_image_variant_cloud_url,
     _select_image_variant_path,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
+    ImageGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
@@ -46,6 +54,46 @@ def test_runtime_sampling_quality_preserves_the_openai_default():
     assert _runtime_sampling_quality("auto") is None
     assert _runtime_sampling_quality("lossless") == "lossless"
     assert _runtime_sampling_quality("high") == "high"
+
+
+def test_longcat_image_fields_remain_model_specific():
+    field_values = {
+        "enable_cfg_renorm": False,
+        "cfg_renorm_min": 0.25,
+        "enable_prompt_rewrite": False,
+    }
+    request = ImageGenerationsRequest(prompt="a lantern", **field_values)
+    base_fields = {field.name for field in fields(SamplingParams)}
+    longcat_fields = {field.name for field in fields(LongCatImageSamplingParams)}
+
+    for field_name, value in field_values.items():
+        assert field_name not in ImageGenerationsRequest.model_fields
+        assert field_name not in base_fields
+        assert field_name in longcat_fields
+        assert getattr(request, field_name) == value
+
+    assert _image_request_model_kwargs(request, LongCatImageSamplingParams) == (
+        field_values
+    )
+    assert _image_request_model_kwargs(request, SamplingParams) == {}
+
+
+def test_longcat_image_fields_accept_nested_extra_body():
+    request = ImageGenerationsRequest(
+        prompt="a lantern",
+        enable_prompt_rewrite=True,
+        extra_body={
+            "enable_prompt_rewrite": False,
+            "enable_cfg_renorm": False,
+            "cfg_renorm_min": 0.5,
+        },
+    )
+
+    assert _image_request_model_kwargs(request, LongCatImageSamplingParams) == {
+        "enable_prompt_rewrite": True,
+        "enable_cfg_renorm": False,
+        "cfg_renorm_min": 0.5,
+    }
 
 
 def test_image_response_includes_resize_for_every_output():

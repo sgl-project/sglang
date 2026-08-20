@@ -67,10 +67,6 @@ class ImageGenerationsRequest(BaseModel):
     enable_teacache: Optional[bool] = False
     max_sequence_length: Optional[int] = None
     flow_shift: Optional[float] = None
-    # LongCat-Image
-    enable_cfg_renorm: Optional[bool] = None
-    cfg_renorm_min: Optional[float] = None
-    enable_prompt_rewrite: Optional[bool] = None
     # Upscaling
     enable_upscaling: Optional[bool] = False
     upscaling_model_path: Optional[str] = None

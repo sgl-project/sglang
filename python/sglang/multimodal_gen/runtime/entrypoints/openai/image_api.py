@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     flatten_extra_params,
     merge_image_input_list,
     process_generation_batch,
+    resolve_sampling_params_cls,
     save_image_to_path,
     temp_dir_if_disabled,
 )
@@ -74,6 +75,20 @@ def _get_request_field_or_extra(request, field_name):
     if value is not None:
         return value
     return _get_extra_field(request, field_name)
+
+
+def _image_request_model_kwargs(
+    request: ImageGenerationsRequest,
+    sampling_params_cls: type[SamplingParams],
+) -> dict[str, Any]:
+    """Extract only model-declared image API extension fields."""
+
+    kwargs = {}
+    for field_name in sampling_params_cls.image_request_extra_fields():
+        value = _get_extra_field(request, field_name)
+        if value is not None:
+            kwargs[field_name] = value
+    return kwargs
 
 
 def _runtime_sampling_quality(quality: str | None) -> str | None:
@@ -273,6 +288,8 @@ async def generations(
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
+    sampling_params_cls = resolve_sampling_params_cls(server_args)
+    model_kwargs = _image_request_model_kwargs(request, sampling_params_cls)
     is_cosmos3 = "cosmos3" in (server_args.model_path or "").lower()
     ext = (
         "png"
@@ -320,11 +337,6 @@ async def generations(
             attention_backend_override=_get_extra_field(
                 request, "attention_backend_override"
             ),
-            enable_cfg_renorm=_get_request_field_or_extra(request, "enable_cfg_renorm"),
-            cfg_renorm_min=_get_request_field_or_extra(request, "cfg_renorm_min"),
-            enable_prompt_rewrite=_get_request_field_or_extra(
-                request, "enable_prompt_rewrite"
-            ),
             quality=_runtime_sampling_quality(request.quality),
             output_compression=request.output_compression,
             output_quality=request.output_quality,
@@ -340,6 +352,7 @@ async def generations(
                 request, "progressive_levels"
             ),
             progressive_delta=_get_request_field_or_extra(request, "progressive_delta"),
+            **model_kwargs,
         )
         trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(

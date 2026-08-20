@@ -42,6 +42,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     flatten_extra_params,
     merge_image_input_list,
     process_generation_batch,
+    resolve_sampling_params_cls,
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -132,29 +133,6 @@ _MULTIPART_EXTRA_FORM_FIELDS = (
     "condition_video_keep",
     "quality",
 )
-
-
-def _video_sampling_params_cls(server_args) -> type[SamplingParams]:
-    """Resolve the params type selected for the current server."""
-
-    sampling_params_cls = SamplingParams
-    if server_args.pipeline_class_name:
-        from sglang.multimodal_gen.registry import get_pipeline_config_classes
-
-        config_classes = get_pipeline_config_classes(server_args.pipeline_class_name)
-        if config_classes is not None:
-            _, sampling_params_cls = config_classes
-    if sampling_params_cls is SamplingParams:
-        from sglang.multimodal_gen.registry import get_model_info
-
-        model_info = get_model_info(
-            server_args.model_path,
-            backend=server_args.backend,
-            model_id=server_args.model_id,
-        )
-        if model_info is not None:
-            sampling_params_cls = model_info.sampling_param_cls
-    return sampling_params_cls
 
 
 def _multipart_extra_form_keys(
@@ -415,7 +393,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         **cosmos3_kwargs,
     }
 
-    sampling_params_cls = _video_sampling_params_cls(server_args)
+    sampling_params_cls = resolve_sampling_params_cls(server_args)
     kwargs = sampling_params_cls.lower_video_request_kwargs(request, kwargs)
     sampling_params = build_sampling_params(request_id, **kwargs)
     if (
@@ -622,7 +600,7 @@ async def create_video(
             raw_form,
             extra_body=extra_body,
             extra_params=extra_params,
-            sampling_params_cls=_video_sampling_params_cls(server_args),
+            sampling_params_cls=resolve_sampling_params_cls(server_args),
         )
 
     # Resolve input upload directory (may be a temp dir when saving is disabled)

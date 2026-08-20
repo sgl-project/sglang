@@ -179,6 +179,29 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
     return sampling_params
 
 
+def resolve_sampling_params_cls(server_args: Any) -> type[SamplingParams]:
+    """Resolve the sampling-parameter type selected for the current server."""
+
+    sampling_params_cls = SamplingParams
+    if server_args.pipeline_class_name:
+        from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+        config_classes = get_pipeline_config_classes(server_args.pipeline_class_name)
+        if config_classes is not None:
+            _, sampling_params_cls = config_classes
+    if sampling_params_cls is SamplingParams:
+        from sglang.multimodal_gen.registry import get_model_info
+
+        model_info = get_model_info(
+            server_args.model_path,
+            backend=server_args.backend,
+            model_id=server_args.model_id,
+        )
+        if model_info is not None:
+            sampling_params_cls = model_info.sampling_param_cls
+    return sampling_params_cls
+
+
 async def save_image_to_path(
     image: Union[UploadFile, bytes, str],
     target_path: str,
