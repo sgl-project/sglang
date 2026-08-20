@@ -38,8 +38,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import get_device_module
+from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -1273,13 +1274,23 @@ class SchedulerPPMixin:
         batch_result = None
         send_output_work = []
 
-        # isend only makes the CPU call asynchronous. Device P2P work is still
-        # ordered on the CUDA stream, so enqueueing several sends before any
-        # recv on every PP rank can form a ring wait. This happens when output
-        # metadata contains multiple GPU tensors (for example speculative
-        # verify state). Pair adjacent stages by parity so one side posts recv
-        # while the other posts send.
-        send_first = (self.ps.pp_rank % 2) == 0
+        # On CUDA, isend is async: it enqueues to the stream and returns,
+        # so every rank can send first safely. On some backends isend is
+        # effectively blocking and does not return until the peer posts a
+        # matching recv; if every PP rank sends first, all ranks block
+        # waiting for a receiver and the ring deadlocks. Order send/recv
+        # by pp_rank parity (even: send->recv, odd: recv->send) so each
+        # adjacent pair has one sender and one receiver posted at the
+        # same time.
+
+        if self.spec_algorithm == SpeculativeAlgorithm.EAGLE:
+            # PP+MTP: every rank sending first deadlocks on CUDA, so even
+            # ranks send first instead.
+            send_first = (self.ps.pp_rank % 2) == 0
+        else:
+            # CUDA: send first
+            # XPU: even ranks send first, odd ranks recv first.
+            send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
