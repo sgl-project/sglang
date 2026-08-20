@@ -661,6 +661,11 @@ class TestUnifiedRadixCacheKVEvents(CustomTestCase):
         self.assertTrue(loaded)
         producer_id = cache.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
+        # Direct HiCache deliberately prepares transfer indices on a helper
+        # thread.  These helpers assert the final post-DMA cache state, so wait
+        # for that preparation before inspecting the acknowledgement queue;
+        # production scheduling remains asynchronous and polls it next step.
+        cache.cache_controller.wait_direct_dispatch()
         for ack in list(cache.cache_controller.ack_load_queue):
             ack.finish_event.synchronize()
         cache.loading_check()
@@ -3561,6 +3566,7 @@ class UnifiedRadixCacheSuite:
         self.assertTrue(loaded)
         producer_id = cache.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
+        cache.cache_controller.wait_direct_dispatch()
         for ack in list(cache.cache_controller.ack_load_queue):
             ack.finish_event.synchronize()
         cache.loading_check()
@@ -4044,6 +4050,7 @@ class UnifiedRadixCacheSuite:
     def _finish_pending_loads(self, cache):
         producer_id = cache.ready_to_load_host_cache()
         self.assertNotEqual(producer_id, -1)
+        cache.cache_controller.wait_direct_dispatch()
         for ack in list(cache.cache_controller.ack_load_queue):
             ack.finish_event.synchronize()
         cache.loading_check()
