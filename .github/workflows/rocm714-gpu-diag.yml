@@ -1,0 +1,97 @@
+name: ROCm 7.14 GPU visibility diagnostic (AMD)
+
+# Bring-up harness, test branch only.
+#
+# On the AMD runners the 7.14 image starts fine and both rocminfo and amd-smi
+# see the GPU, but torch reports device_count()==0. The same image sees all 8
+# GPUs on a local MI300X box, where the whole /dev/dri directory is passed in
+# rather than the single render node the runner pods expose. torch's device code
+# lives in torch/.kpack/torch_<arch>.kpack, loaded at runtime by libamdhip64
+# resolving `../.kpack/torch_@GFXARCH@.kpack`, so this run pins down whether the
+# load fails, and whether the missing card node is what breaks it.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - bingxche/rocm714-ci-test
+    paths:
+      - .github/workflows/rocm714-gpu-diag.yml
+
+concurrency:
+  group: rocm714-gpu-diag-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  diag:
+    if: github.repository == 'sgl-project/sglang'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: linux-mi300-1gpu-sglang
+            image: bingxche/sgl-test:v0.5.17-rocm714-mi30x-20260820
+            reference: rocm/sgl-dev:v0.5.8.post1-rocm720-mi30x-20260211-preview
+          - runner: linux-mi35x-gpu-1
+            image: bingxche/sgl-test:v0.5.17-rocm714-mi35x-20260820
+            reference: rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211-preview
+    runs-on: ${{ matrix.runner }}
+    environment: 'prod'
+    steps:
+      - name: Host device inventory
+        id: host
+        run: |
+          echo "driver: $(cat /sys/module/amdgpu/version 2>/dev/null)"
+          echo "kernel: $(uname -r)"
+          ls -l /dev/dri /dev/kfd
+          echo "podinfo: $(cat /etc/podinfo/gha-render-devices 2>/dev/null)"
+          # The card node matching the exposed render node, if any.
+          CARD=$(ls /dev/dri/ 2>/dev/null | grep -E '^card' | head -1)
+          echo "card_node=${CARD}" >> $GITHUB_OUTPUT
+          echo "detected card node: ${CARD:-<none>}"
+
+      - name: Pull images
+        run: |
+          docker pull ${{ matrix.image }}
+          docker pull ${{ matrix.reference }} || echo "reference pull failed; comparison will be skipped"
+
+      - name: A. 7.14 image, pod device flags (the failing configuration)
+        if: always()
+        run: |
+          DEV=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
+          docker run --rm --user root --device=/dev/kfd ${DEV} \
+            --group-add video --security-opt seccomp=unconfined --ipc=host \
+            -e AMD_LOG_LEVEL=3 ${{ matrix.image }} bash -lc '
+              python3 -c "import torch; print(\"count\", torch.cuda.device_count())" 2>&1 |
+                grep -iE "kpack|count|error|fail|gfx|No device|hipError" | head -30
+            ' 2>&1 | tail -35 || echo "rc=$?"
+
+      - name: B. 7.14 image, plus the card node
+        if: always()
+        run: |
+          DEV=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
+          CARD="${{ steps.host.outputs.card_node }}"
+          if [ -z "$CARD" ]; then echo "no card node on host; skipping"; exit 0; fi
+          docker run --rm --user root --device=/dev/kfd ${DEV} --device /dev/dri/${CARD} \
+            --group-add video --security-opt seccomp=unconfined --ipc=host \
+            ${{ matrix.image }} bash -lc '
+              python3 -c "import torch; print(\"count\", torch.cuda.device_count())"
+            ' 2>&1 | tail -10 || echo "rc=$?"
+
+      - name: C. 7.14 image, whole /dev/dri (matches the working local setup)
+        if: always()
+        run: |
+          docker run --rm --user root --device=/dev/kfd --device /dev/dri \
+            --group-add video --security-opt seccomp=unconfined --ipc=host \
+            ${{ matrix.image }} bash -lc '
+              python3 -c "import torch; print(\"count\", torch.cuda.device_count())"
+            ' 2>&1 | tail -10 || echo "rc=$?"
+
+      - name: D. Known-good ROCm 7.2 image, pod device flags (control)
+        if: always()
+        run: |
+          DEV=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
+          docker run --rm --user root --device=/dev/kfd ${DEV} \
+            --group-add video --security-opt seccomp=unconfined --ipc=host \
+            ${{ matrix.reference }} bash -lc '
+              python3 -c "import torch; print(\"hip\", torch.version.hip, \"count\", torch.cuda.device_count())"
+            ' 2>&1 | tail -10 || echo "rc=$?"
