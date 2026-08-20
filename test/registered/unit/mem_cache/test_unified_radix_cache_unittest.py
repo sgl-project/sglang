@@ -295,9 +295,7 @@ class TestUnifiedTreeCoreLoadBackPending(CustomTestCase):
             comp_xfers[ComponentType.SWA] = [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    host_indices=torch.tensor(
-                        [2] * len(swa_nodes), dtype=torch.int64
-                    ),
+                    host_indices=torch.tensor([2] * len(swa_nodes), dtype=torch.int64),
                     nodes_to_load=[node.id for node in swa_nodes],
                 )
             ]
@@ -6074,6 +6072,41 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         )
         full_allocator = cache.token_to_kv_pool_allocator.full_attn_allocator
         full_allocator.free_segment.assert_called_once_with(indices, start_pos=0)
+
+    def test_flush_write_back_batch_waits_before_demoting(self):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.cache_controller = mock.Mock()
+        cache.cache_controller.write_queue = [mock.sentinel.pending_write]
+        cache.ongoing_write_through = {}
+        cache.writing_check = mock.Mock()
+        cache._demote = mock.Mock()
+        tracker = {ComponentType.FULL: 0}
+        node_ids = [11, 12]
+        calls = mock.Mock()
+        calls.attach_mock(cache.cache_controller.start_writing, "start")
+        calls.attach_mock(cache.writing_check, "wait")
+        calls.attach_mock(cache._demote, "demote")
+
+        cache._flush_write_back_eviction_batch(node_ids, tracker)
+
+        self.assertEqual(
+            calls.mock_calls,
+            [
+                mock.call.start(),
+                mock.call.wait(write_back=True),
+                mock.call.demote(11, tracker),
+                mock.call.demote(12, tracker),
+            ],
+        )
+        self.assertEqual(node_ids, [])
+
+    def test_flush_write_back_batch_is_noop_without_hicache(self):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.cache_controller = None
+        cache.ongoing_write_through = {}
+        tracker = {ComponentType.FULL: 0}
+
+        cache._flush_write_back_eviction_batch([], tracker)
 
     def test_apply_component_action_device_kv_swa_uses_segment_release(self):
         cache = mock.MagicMock()

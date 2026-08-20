@@ -805,6 +805,8 @@ class HiCacheController:
         device_indices: torch.Tensor,
         priority: Optional[int] = None,
         node_id: int = -1,
+        *,
+        defer_start: bool = False,
     ) -> Optional[torch.Tensor]:
         """
         Back up KV caches from device memory to host memory.
@@ -815,7 +817,8 @@ class HiCacheController:
         self.write_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
-        self.start_writing()
+        if not defer_start:
+            self.start_writing()
         return host_indices
 
     def start_writing(self) -> None:
