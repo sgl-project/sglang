@@ -19,7 +19,6 @@ path is stable (see the TODO in tokenspeed_mla_backend.py).
 from __future__ import annotations
 
 import logging
-import math
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -55,19 +54,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
-
-# The flashinfer cute-dsl MLA decode kernel returns a natural-log (base-e) LSE,
-# whereas sglang's DCP cross-rank merge (forward_mla: dcp_a2a_lse_reduce /
-# cp_lse_ag_out_rs_mla) assumes the FlashInfer-MLA/FlashMLA base-2 convention
-# (is_lse_base_on_e=False). Multiplying a natural-log LSE by log2(e) rebases it
-# to base-2 (the softmax output is base-invariant; only the LSE value changes).
-# CONFIRMED base-e (not base-2), so this rebase is required, not optional:
-# the flashinfer-dcp-backport public-API unit test asserts the public
-# trtllm_batch_decode_with_kv_cache_mla LSE against a torch.logsumexp
-# (natural-log) reference at atol=1e-2 and passes (a base-2 LSE would be
-# off by 1/ln2 ~= 44%). GPU job 467640:
-# tests/attention/test_cute_dsl_mla_dcp*.py 27/27 + 17/17 pass.
-_LSE_BASE2_FROM_NATURAL_LOG = math.log2(math.e)
 
 
 class CuteDslMLABackend(TRTLLMMLABackend):
@@ -299,7 +285,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         Without DCP (``cp_world <= 1``) this defers to the base cute-dsl path.
         With DCP, ``seq_lens`` are this rank's cyclic-local KV lengths and
         ``causal_seqs`` the global per-request KV lengths; the kernel returns a
-        rank-local ``(out, lse)`` (LSE rebased to base-2 for the sglang merge).
+        rank-local ``(out, lse)``, the LSE in natural log.
         """
         if cp_world <= 1:
             return super()._run_decode_kernel(
@@ -336,7 +322,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             ),
             return_lse=True,  # DCP requires the rank-local LSE for the merge
         )
-        return raw_out, lse * _LSE_BASE2_FROM_NATURAL_LOG
+        return raw_out, lse
 
     def forward_decode(
         self,

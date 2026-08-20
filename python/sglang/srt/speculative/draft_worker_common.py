@@ -71,6 +71,7 @@ def build_draft_tp_worker(
     target_model_config: ModelConfig,
     algo_label: str,
     attention_backend_override: Optional[str] = None,
+    draft_worker_cls: type[TpModelWorker] = TpModelWorker,
 ) -> DraftWorkerBundle:
     # An override names a draft-specific backend the caller has already
     # validated (e.g. a self-drafting architecture); it skips the generic
@@ -88,7 +89,7 @@ def build_draft_tp_worker(
     # workers run the draft outside speculative_moe_backend_context, so a
     # construction-only swap would build and execute under different backends.
     with draft_model_build_scope():
-        draft_worker = TpModelWorker(
+        draft_worker = draft_worker_cls(
             server_args=server_args,
             gpu_id=gpu_id,
             ps=ps,
@@ -101,6 +102,10 @@ def build_draft_tp_worker(
 
     draft_model_runner = draft_worker.model_runner
     draft_worker.draft_runner = draft_model_runner
+
+    # DFlash drafts have no vocab; borrow the target's.
+    if draft_model_runner.model_config.vocab_size is None:
+        draft_model_runner.model_config.vocab_size = target_model_config.vocab_size
     return DraftWorkerBundle(
         draft_worker=draft_worker,
         draft_model_runner=draft_model_runner,

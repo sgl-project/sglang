@@ -28,24 +28,21 @@ from diffusers.models.normalization import (
 )
 from torch.nn import LayerNorm as LayerNorm
 
-from sglang.kernels.ops.diffusion.fused_linear_gelu import (
-    can_fuse_linear_gelu,
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    can_use_fused_layernorm_modulate,
+    can_use_linear_gelu,
+    can_use_ln_modulate,
     fused_gelu_active,
+    fused_layernorm_modulate,
     fused_linear_gelu_tanh,
-    mark_fused_gelu_site,
-)
-from sglang.kernels.ops.diffusion.fused_ln_modulate import (
-    can_fuse_ln_modulate,
     fused_ln_modulate,
     fused_ln_modulate_active,
-    mark_fused_ln_modulate_site,
-)
-from sglang.kernels.ops.diffusion.modulate_scale_shift import modulate_scale_shift
-from sglang.kernels.ops.diffusion.residual_gate_add import residual_gate_add
-from sglang.kernels.ops.diffusion.triton.layernorm_modulate import (
-    can_use_fused_layernorm_modulate,
-    fused_layernorm_modulate,
     is_plain_layer_norm,
+    mark_fused_gelu_site,
+    mark_fused_ln_modulate_site,
+    modulate_scale_shift,
+    residual_gate_add,
 )
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.distributed import (
@@ -91,16 +88,18 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
 
+_get_qkv_projections = get_qkv_projections
 
-_FLUX_FUSED_LN_MOD_DISABLED = False
-# (shape, stride, eps) signatures whose fused output has been verified
-# ``torch.equal`` against the live eager chain.
-_FLUX_FUSED_LN_MOD_VERIFIED: set = set()
+_FLUX_LN_MOD = BitExactFusionGate("FLUX fused LN+modulate", per_signature=True)
+# Keep the pre-refactor direct set lookup in this launch-sensitive hot path.
+_FLUX_LN_MOD_SIGS = _FLUX_LN_MOD.verified_sigs
+assert _FLUX_LN_MOD_SIGS is not None
 
 
 def _flux_fused_ln_modulate(
@@ -118,10 +117,8 @@ def _flux_fused_ln_modulate(
     verified ``torch.equal`` against the eager chain on first sight, and any
     mismatch disables the fast path permanently.
     """
-    global _FLUX_FUSED_LN_MOD_DISABLED
-
     if (
-        _FLUX_FUSED_LN_MOD_DISABLED
+        _FLUX_LN_MOD.disabled
         or not is_plain_layer_norm(norm, x.shape[-1])
         or not can_use_fused_layernorm_modulate(x, scale, shift)
     ):
@@ -135,7 +132,7 @@ def _flux_fused_ln_modulate(
         shift.stride(),
         norm.eps,
     )
-    verified = sig in _FLUX_FUSED_LN_MOD_VERIFIED
+    verified = sig in _FLUX_LN_MOD_SIGS
     if not verified and (
         torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()
     ):
@@ -145,23 +142,21 @@ def _flux_fused_ln_modulate(
     try:
         out = fused_layernorm_modulate(x, scale, shift, norm.eps)
     except Exception as exc:
-        if torch.compiler.is_compiling():
-            raise
-        logger.warning_once(f"Disabling FLUX fused LN+modulate fast path: {exc}")
-        _FLUX_FUSED_LN_MOD_DISABLED = True
+        _FLUX_LN_MOD.on_exception(exc, logger=logger)
         return None
     if verified:
         return out
     ref = modulate_scale_shift(norm(x), scale, shift)
-    if torch.equal(out, ref):
-        _FLUX_FUSED_LN_MOD_VERIFIED.add(sig)
-        return out
-    logger.warning_once(
-        "FLUX fused LN+modulate fast path is not bit-exact against this "
-        "platform's LayerNorm dispatch; falling back to eager"
+    return _FLUX_LN_MOD.accept_or_fallback(
+        out,
+        ref,
+        sig=sig,
+        logger=logger,
+        mismatch_msg=(
+            "FLUX fused LN+modulate fast path is not bit-exact against this "
+            "platform's LayerNorm dispatch; falling back to eager"
+        ),
     )
-    _FLUX_FUSED_LN_MOD_DISABLED = True
-    return ref
 
 
 def _flux_norm_modulate(
@@ -183,7 +178,7 @@ def _flux_norm_modulate(
     out = _flux_fused_ln_modulate(norm, x, scale, shift)
     if out is not None:
         return out
-    if fused_ln_modulate_active(site) and can_fuse_ln_modulate(x, scale, shift):
+    if fused_ln_modulate_active(site) and can_use_ln_modulate(x, scale, shift):
         return fused_ln_modulate(x, scale, shift, norm.eps)
     return modulate_scale_shift(norm(x), scale, shift)
 
@@ -373,32 +368,6 @@ def _fused_gelu_mlp(
     return output.view(batch_size, seq_len, -1)
 
 
-def _get_qkv_projections(
-    attn: "FluxAttention", hidden_states, encoder_hidden_states=None
-):
-    if getattr(attn, "use_fused_qkv", False):
-        qkv, _ = attn.to_qkv(hidden_states)
-        query, key, value = [x.contiguous() for x in qkv.chunk(3, dim=-1)]
-    else:
-        query, _ = attn.to_q(hidden_states)
-        key, _ = attn.to_k(hidden_states)
-        value, _ = attn.to_v(hidden_states)
-
-    encoder_query = encoder_key = encoder_value = None
-    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
-        if attn.use_fused_added_qkv:
-            added_qkv, _ = attn.to_added_qkv(encoder_hidden_states)
-            encoder_query, encoder_key, encoder_value = [
-                x.contiguous() for x in added_qkv.chunk(3, dim=-1)
-            ]
-        else:
-            encoder_query, _ = attn.add_q_proj(encoder_hidden_states)
-            encoder_key, _ = attn.add_k_proj(encoder_hidden_states)
-            encoder_value, _ = attn.add_v_proj(encoder_hidden_states)
-
-    return query, key, value, encoder_query, encoder_key, encoder_value
-
-
 class FluxGELU(nn.Module):
     def __init__(
         self,
@@ -423,7 +392,7 @@ class FluxGELU(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
+        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -447,7 +416,7 @@ class FluxFusedGELUProj(nn.Module):
         mark_fused_gelu_site(self, "proj")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if fused_gelu_active(self) and can_fuse_linear_gelu(self.proj, hidden_states):
+        if fused_gelu_active(self) and can_use_linear_gelu(self.proj, hidden_states):
             return fused_linear_gelu_tanh(
                 hidden_states, self.proj.weight, self.proj.bias
             )
@@ -923,7 +892,7 @@ class FluxSingleTransformerBlock(nn.Module):
             hidden_states = gate * hidden_states
             hidden_states = residual + hidden_states
         else:
-            if fused_gelu_active(self) and can_fuse_linear_gelu(
+            if fused_gelu_active(self) and can_use_linear_gelu(
                 self.proj_mlp, norm_hidden_states
             ):
                 mlp_hidden_states = fused_linear_gelu_tanh(
@@ -1202,7 +1171,6 @@ class FluxTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
-        self.config = config.arch_config
 
         self.out_channels = (
             getattr(self.config, "out_channels", None) or self.config.in_channels
