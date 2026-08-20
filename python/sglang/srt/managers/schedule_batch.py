@@ -1914,7 +1914,8 @@ def release_req(
     tree_cache: BasePrefixCache,
     hisparse_coordinator: Optional[HiSparseCoordinator],
     offload_kv: bool = True,
-) -> None:
+) -> bool:
+    """Returns False when the KV backup failed and the request cannot be resumed."""
     if hisparse_coordinator is not None and not req.finished():
         hisparse_coordinator.retract_req(req)
 
@@ -1922,8 +1923,9 @@ def release_req(
     # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
     # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
     # pass offload_kv=False to skip the wasteful device->host copy.
+    backup_saved = True
     if server_args.disaggregation_mode == "decode" and offload_kv:
-        retraction_backup(
+        backup_saved = retraction_backup(
             req,
             tree_cache,
             req_to_token_pool,
@@ -1937,6 +1939,7 @@ def release_req(
     evict_from_tree_cache(tree_cache, num_tokens)
 
     req.reset_for_retract()
+    return backup_saved
 
 
 def retract_all(
@@ -2820,6 +2823,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         sorted_indices = self._get_decode_retraction_order(self.reqs, server_args)
 
         retracted_reqs = []
+        reqs_to_abort: List[Req] = []
         first_iter = True
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
@@ -2831,11 +2835,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             first_iter = False
             idx = sorted_indices.pop()
             req = self.reqs[idx]
-            retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            if self.release_req(idx, len(sorted_indices), server_args):
+                retracted_reqs.append(req)
+            else:
+                # The retraction host pool could not hold the backup and the
+                # device KV is already freed, so the request cannot resume.
+                req.to_finish = FINISH_ABORT(
+                    "Retraction host KV pool exhausted. Aborting the request.",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                reqs_to_abort.append(req)
+                logger.warning(
+                    "retract_decode: aborted request %s, retraction host pool "
+                    "exhausted",
+                    req.rid,
+                )
 
-        reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
@@ -2910,8 +2926,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         remaing_req_count: int,
         server_args: ServerArgs,
         offload_kv: bool = True,
-    ):
-        release_req(
+    ) -> bool:
+        return release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
             server_args=server_args,
