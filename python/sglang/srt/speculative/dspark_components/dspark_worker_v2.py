@@ -217,13 +217,15 @@ class DSparkWorkerV2(BaseSpecWorker):
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
+            and not self._verify_planner.is_verify_all
         ):
             raise ValueError(
                 "DSpark dense-draft compact verify under --enable-dp-attention does not "
-                "yet support cuda graph (idle DP groups cannot join the token-keyed "
-                "compact graph). Re-run with --disable-cuda-graph (eager is lossless), "
-                "or use SGLANG_RAGGED_VERIFY_MODE=static. The dsv4 (MoE) draft supports "
-                "cuda graph under DP."
+                "yet support cuda graph with dynamic verify budgets (dense draft has "
+                "no DP-wide token-tier agreement). Re-run with --disable-cuda-graph "
+                "(eager is lossless), use the verify-all compact schedule, or use "
+                "SGLANG_RAGGED_VERIFY_MODE=static. The dsv4 (MoE) draft supports "
+                "dynamic compact cuda graphs under DP."
             )
         self._kv_injector = TargetHiddenKvInjector(
             draft_model=self.draft_model,
