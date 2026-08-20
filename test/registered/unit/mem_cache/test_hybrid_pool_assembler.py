@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _split_hicache_size,
@@ -53,6 +54,39 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
 
         self.assertEqual(specs, [])
         self.assertEqual(entries, [])
+
+    def test_full_builder_sizes_sidecar_for_anchor_logical_space(self):
+        draft_kv_pool = SimpleNamespace(layer_num=1, size=800)
+        draft_host_pool = SimpleNamespace(layer_num=1)
+        tree_cache = SimpleNamespace(
+            cache_controller=SimpleNamespace(
+                mem_pool_host=SimpleNamespace(size=100, logical_size=800),
+                page_size=512,
+            )
+        )
+        server_args = SimpleNamespace(hicache_mem_layout="page_first")
+
+        with (
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
+                "_build_mha_mla_host_pool",
+                return_value=draft_host_pool,
+            ) as build_host_pool,
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler."
+                "_get_allocator_type",
+                return_value="default",
+            ),
+        ):
+            specs, entries = build_full_draft_pools(
+                draft_kv_pool=draft_kv_pool,
+                tree_cache=tree_cache,
+                server_args=server_args,
+            )
+
+        self.assertEqual(build_host_pool.call_args.kwargs["host_to_device_ratio"], 1.0)
+        self.assertEqual(len(specs), 1)
+        self.assertIs(entries[0].host_pool, draft_host_pool)
 
 
 if __name__ == "__main__":

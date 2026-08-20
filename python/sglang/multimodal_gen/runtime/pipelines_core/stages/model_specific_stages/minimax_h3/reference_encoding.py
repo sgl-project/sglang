@@ -70,6 +70,8 @@ class _AudioVAEDeterminismContext:
     _saved: tuple | None = None
 
     def __enter__(self):
+        if not torch.cuda.is_available():
+            return self
         if _AudioVAEDeterminismContext._depth == 0:
             b = torch.backends
             _AudioVAEDeterminismContext._saved = (
@@ -94,6 +96,8 @@ class _AudioVAEDeterminismContext:
         return self
 
     def __exit__(self, exc_type, exc, tb):
+        if not torch.cuda.is_available():
+            return
         _AudioVAEDeterminismContext._depth -= 1
         if _AudioVAEDeterminismContext._depth == 0:
             b = torch.backends
