@@ -54,7 +54,7 @@ Do not mark the goal complete until the completion check at the end of this skil
 
 ## Preflight
 
-1. Verify GitHub authentication and resolve the repository without changing remote configuration.
+1. Verify GitHub authentication and resolve the repository without changing remote configuration. Confirm up front that the credentials can actually rerun a workflow, because that is this skill's main lever: a read-only default token makes every `gh run rerun` fail. If the ambient token is read-only, check the run's injected secrets (`CLOUD_AGENT_INJECTED_SECRET_NAMES`) for one carrying `repo` and `workflow` scope, and confirm its account with `gh api user` plus the `x-oauth-scopes` response header. Never print a token value.
 2. Resolve the PR and record at least:
    - PR number and URL
    - open/draft state
@@ -73,7 +73,12 @@ Known SGLang gates:
 - `pr-test.yml` requires the `run-ci` label for relevant PR changes. If its existing gate job failed because the label was absent, add `run-ci` when authorized and rerun failed jobs in that existing run; adding the label alone does not necessarily create a new `pr-test.yml` run.
 - `pr-test-extra.yml` requires both `run-ci` and `run-ci-extra`. It listens for relevant label events, so adding a missing label may create a fresh run. Prefer that fresh current-head run; rerun failed jobs in an existing current run only when needed.
 - AMD-extra workflows may use the same `run-ci` plus `run-ci-extra` gate. Verify the actual selected file.
-- Treat draft, cooldown, maintenance, and missing-label failures as gate/infrastructure conditions, not code regressions. Fix only the safe gate condition in scope; wait for cooldown or maintenance windows rather than burning retries immediately.
+- Treat draft, cooldown, maintenance, and missing-label failures as gate/infrastructure conditions, not code regressions. Fix only the safe gate condition in scope.
+- The cooldown is per-actor, and waiting it out is usually the wrong move. `pr-gate` rate-limits on the run's `triggering_actor`, exempting anyone with write access, so the outcome depends on identity rather than on the PR:
+  - A push from an agent is attributed to a shared bot identity, so unrelated agents' pushes in the same repository consume the same one-run-per-window budget. A window that looks clear can be taken seconds later.
+  - A gate-*blocked* run still counts against the window. `pr-gate` tries to discount such runs, but its exclusion list is `['check-changes', 'pr-gate', 'call-gate', 'pr-test-finish']` and `pr-test.yml`'s `notify-pr-states` job is not in it. That job runs `always()` and succeeds, so the blocked run reads as having consumed CI and renews the window. **Pushing again therefore pushes the next opportunity further away; retry-by-push cannot converge.**
+  - A **rerun is the escape hatch**: its `triggering_actor` is `github-actions[bot]`, which `pr-gate` substitutes with the PR author, so a write-access author clears the gate immediately. `gh run rerun <RUN_ID>` on the cooldown-blocked run is the fix, not a new push. `/rerun-failed-ci` from an authorized user does the same.
+  - Do not add a junk commit to force a fresh run. If a new head SHA is genuinely wanted, rebase onto the base branch instead.
 
 Adding the known CI opt-in labels is within scope. Do not add unrelated labels, mark the PR ready, alter reviewers, merge, or mutate other PR metadata.
 
@@ -87,9 +92,10 @@ For each selected workflow:
 2. Ignore runs for older head SHAs, including green runs made stale by a new push.
 3. Treat `queued`, `requested`, `waiting`, `pending`, and `in_progress` as active; keep monitoring.
 4. Treat a workflow as passing only when its current-head run concludes `success`.
-5. If no current-head run exists, wait briefly for event delivery, then inspect the workflow's path filters, event triggers, and label gates.
-6. Trigger only through a mechanism explicitly supported by that workflow. Never invent `workflow_dispatch` inputs or dispatch a workflow against the default branch when the intent is to test the PR head.
-7. If a selected workflow cannot safely be triggered for the PR head, report the exact blocker and request direction.
+5. If no current-head run exists, wait briefly for event delivery, then inspect the workflow's path filters, event triggers, and label gates. Read the trigger before concluding the run is merely late: a workflow can carry a PR-shaped name and no `pull_request` trigger at all, in which case no push will ever produce a run for the head. Selecting such a workflow is unsatisfiable, so say so instead of waiting. Confirm this from the file on the base branch rather than from memory of how it once behaved — which file gates PRs for a given accelerator does change.
+6. A selected workflow can also be the wrong instrument for the change under test. Tests registered as nightly-only run from the cron workflow, never from a PR run, so a PR can never turn them green. Say which coverage is unreachable rather than retrying toward it.
+7. Trigger only through a mechanism explicitly supported by that workflow. Never invent `workflow_dispatch` inputs or dispatch a workflow against the default branch when the intent is to test the PR head.
+8. If a selected workflow cannot safely be triggered for the PR head, report the exact blocker and request direction.
 
 After any user push or skill-authored push, re-read the PR head SHA, discard stale run selections, and start tracking the new head. Reset retry counters for the new head SHA.
 
@@ -98,6 +104,8 @@ After any user push or skill-authored push, re-read the PR head SHA, discard sta
 - Maintain a compact ledger containing workflow file, head SHA, run ID, attempt, status, conclusion, skill-initiated retry count, and latest failure signature.
 - Poll at reasonable intervals, normally 30–60 seconds while runs are active. Give concise progress updates during long waits.
 - Re-check the PR head SHA on each monitoring cycle and before every rerun or push.
+- Re-read the PR's `state` and `mergedAt` on each cycle too, not just its checks. A merged or closed PR ends the goal; checks alone will not tell you, and reporting "one cycle away" on an already-merged PR is a real and easy mistake. Prefer one query that returns state and checks together over polling `gh pr checks` alone.
+- Treat `cancelled` as its own signal rather than a failure to retry blindly. A merge, a superseding push, or a concurrency group cancels in-flight runs, and a cancelled job means the test never reported — so it is neither evidence of passing nor of breakage. `gh run rerun --failed` does pick cancelled jobs back up when the PR is still open.
 - Ignore failures, cancellations, and pending checks from unselected workflows. Do not diagnose, retry, fix, or wait for them.
 - Do not declare success while a selected workflow is absent, stale, pending, skipped, cancelled, neutral, or failed.
 
@@ -113,6 +121,8 @@ After any user push or skill-authored push, re-read the PR head SHA, discard sta
    **Unrelated/infrastructure** when evidence points to a transient network or download error, runner loss, GPU/driver instability, service outage, pre-existing main-branch failure, known flaky threshold, unrelated test area, or another environmental cause.
 
    **Uncertain** when evidence is insufficient. Do not label a failure flaky merely because it might be intermittent. Narrowly reproduce it, compare recent main/scheduled CI, inspect relevant code, or otherwise gather enough evidence to choose a category.
+
+   To establish "pre-existing on main" as more than an assertion, diff the *set of failing cases* against a recent run of the **same workflow file** on the base branch, and compare cases rather than job or partition indices — sharding is by estimated time, so a case moves between partitions from run to run. Two useful readings fall out: a case failing in both runs is pre-existing, and a case failing on the baseline but passing on the PR is a fix the PR delivers, which is worth reporting even when nobody asked for it.
 
 5. When several root failures exist, classify each one. Address PR-related failures before spending retries on unrelated cascades.
 
@@ -150,7 +160,7 @@ gh run rerun <RUN_ID> --failed --repo <OWNER/REPO>
 
 Rules:
 
-- Never use a full-run rerun as a substitute for `--failed`.
+- Never use a full-run rerun as a substitute for `--failed`. The one exception is a run blocked at the gate, where the downstream jobs are `skipped` rather than `failed` and `--failed` has almost nothing to resurrect; there, rerun the whole run once. This is recovering a run that never executed, not re-rolling tests that did.
 - Never rerun a stale run after the PR head SHA changes or a newer current-head run exists.
 - Count only successfully dispatched skill-initiated reruns.
 - Allow at most 10 such reruns per selected workflow and head SHA.
