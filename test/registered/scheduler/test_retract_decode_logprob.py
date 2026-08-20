@@ -78,7 +78,7 @@ class TestRetractDecodeLogprob(CustomTestCase):
             "--max-running-requests",
             "8",
             "--mem-fraction-static",
-            "0.3",
+            "0.7",
         ] + cls.other_args
         with envs.SGLANG_TEST_RETRACT.override(True):
             cls.process = popen_launch_server(
