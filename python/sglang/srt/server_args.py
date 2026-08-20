@@ -1058,13 +1058,15 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
-    nvidia_mps_replicas: A[
+    same_gpu_replicas: A[
         int,
-        (
-            "Number of native data-parallel replicas to place on one NVIDIA GPU. "
-            "Values greater than 1 enable guarded same-GPU DP (equivalent to "
-            "--dp-size N --gpu-id-step 0). CUDA MPS itself must be started and "
-            "managed outside SGLang."
+        Arg(
+            help=(
+                "Number of native data-parallel replicas to place on one GPU. "
+                "Values greater than 1 enable guarded same-GPU DP (equivalent "
+                "to --dp-size N --gpu-id-step 0). NVIDIA CUDA MPS is optional "
+                "and managed outside SGLang."
+            ),
         ),
         NS("parallel"),
     ] = 1
@@ -3657,7 +3659,7 @@ class ServerArgs:
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
 
-        self._handle_nvidia_mps_replicas()
+        self._handle_same_gpu_replicas()
         self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
         self._handle_media_url_security()
@@ -6724,28 +6726,28 @@ class ServerArgs:
             f"disable_cuda_graph=True"
         )
 
-    def _handle_nvidia_mps_replicas(self):
+    def _handle_same_gpu_replicas(self):
         """Resolve the convenience flag for guarded same-GPU native DP.
 
         CUDA MPS is deliberately not managed here: its daemon and pipe/log
         directories are process-external NVIDIA runtime concerns. This flag
         only selects SGLang's replica placement.
         """
-        if self.nvidia_mps_replicas < 1:
-            raise ValueError("--nvidia-mps-replicas must be at least 1")
-        if self.nvidia_mps_replicas == 1:
+        if self.same_gpu_replicas < 1:
+            raise ValueError("--same-gpu-replicas must be at least 1")
+        if self.same_gpu_replicas == 1:
             return
-        if self.dp_size not in (1, self.nvidia_mps_replicas):
+        if self.dp_size not in (1, self.same_gpu_replicas):
             raise ValueError(
-                "--nvidia-mps-replicas conflicts with --dp-size: "
-                f"got replicas={self.nvidia_mps_replicas}, dp_size={self.dp_size}"
+                "--same-gpu-replicas conflicts with --dp-size: "
+                f"got replicas={self.same_gpu_replicas}, dp_size={self.dp_size}"
             )
         if self.gpu_id_step not in (0, 1):
             raise ValueError(
-                "--nvidia-mps-replicas conflicts with --gpu-id-step; "
+                "--same-gpu-replicas conflicts with --gpu-id-step; "
                 "same-GPU replicas require --gpu-id-step 0"
             )
-        self.dp_size = self.nvidia_mps_replicas
+        self.dp_size = self.same_gpu_replicas
         self.gpu_id_step = 0
 
     def is_same_gpu_dp(self) -> bool:

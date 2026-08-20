@@ -2278,14 +2278,14 @@ class TestDcpKvEventContract(CustomTestCase):
         self.assertEqual(args.kv_event_block_size, 8)
 
 
-class TestNvidiaMpsReplicas(CustomTestCase):
+class TestSameGpuReplicas(CustomTestCase):
     def _args(self, **overrides):
         kwargs = {
             "model_path": "dummy",
             "served_model_name": "dummy",
             "device": "cuda",
             "max_total_tokens": 1024,
-            "nvidia_mps_replicas": 2,
+            "same_gpu_replicas": 2,
         }
         kwargs.update(overrides)
         return ServerArgs(**kwargs)
@@ -2302,19 +2302,32 @@ class TestNvidiaMpsReplicas(CustomTestCase):
             [
                 "--model-path",
                 "dummy",
-                "--nvidia-mps-replicas",
+                "--same-gpu-replicas",
                 "2",
                 "--max-total-tokens",
                 "1024",
             ]
         )
-        self.assertEqual(args.nvidia_mps_replicas, 2)
+        self.assertEqual(args.same_gpu_replicas, 2)
         self.assertEqual(args.dp_size, 2)
         self.assertEqual(args.gpu_id_step, 0)
 
     def test_rejects_conflicting_dp_size(self):
         with self.assertRaisesRegex(ValueError, "conflicts with --dp-size"):
             self._args(dp_size=3)
+
+    def test_removed_nvidia_mps_flag_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            prepare_server_args(
+                [
+                    "--model-path",
+                    "dummy",
+                    "--nvidia-mps-replicas",
+                    "2",
+                    "--max-total-tokens",
+                    "1024",
+                ]
+            )
 
     def test_rejects_unsupported_same_gpu_topology(self):
         with self.assertRaisesRegex(ValueError, "tp_size must be 1"):
