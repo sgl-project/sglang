@@ -340,10 +340,8 @@ class ServerArgs(DisaggServerArgsMixin):
     dit_layerwise_resident_layers: float = 0.0
     # Which layers those are: the leading ones, or spread evenly over the stack.
     dit_layerwise_residency_policy: str = RESIDENCY_POLICY_LEADING
-    # Per-component overrides of the three knobs above. The `dit_*` fields name
-    # the group they came from, not the only component they can describe: every
-    # streamed component pays the same per-layer transfer, so every one of them
-    # can be tuned. An entry here wins over the group default for that component.
+    # Per-component overrides of the three knobs above; an entry wins for that
+    # component.
     layerwise_prefetch_size: dict[str, float] | str | None = field(default_factory=dict)
     layerwise_resident_layers: dict[str, float] | str | None = field(
         default_factory=dict
@@ -1030,14 +1028,7 @@ class ServerArgs(DisaggServerArgsMixin):
     def layerwise_tuning_for(
         self, component_name: str | None, *, dit_group: bool
     ) -> tuple[float, float, str]:
-        """Prefetch size, resident layers and residency policy for one component.
-
-        Every streamed component pays a per-layer transfer, so every one of them
-        can be tuned; what differs is the return on spending VRAM. A DiT layer
-        held resident saves that transfer once per denoising step, an auxiliary
-        component's saves it once per request, so the group default stays
-        conservative for auxiliaries and an explicit entry is how you override it.
-        """
+        """Prefetch size, resident layers and residency policy for one component."""
         prefetch_map = self._parse_component_value_map(
             self.layerwise_prefetch_size, option="--layerwise-prefetch-size"
         )
