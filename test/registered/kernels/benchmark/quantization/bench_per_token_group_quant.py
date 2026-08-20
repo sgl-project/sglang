@@ -68,7 +68,6 @@ def benchmark(group_size: int, layout: str, num_tokens: int, impl: str):
     return marker.do_bench(
         FN[impl],
         input_args=(group_size, x, x_q, x_s, scale_ue8m0),
-        graph_clone_args=(1,),
         memory_args=(x,),
         memory_output=(x_q, x_s),
     )

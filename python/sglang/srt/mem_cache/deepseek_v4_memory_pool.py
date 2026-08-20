@@ -24,7 +24,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStateSeparate,
 )
 from sglang.srt.mem_cache.memory_pool import KVCache
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.utils import ceil_div, cpu_has_amx_support, is_cpu, is_hip
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,14 @@ def get_compress_state_ring_size(
         return 16 if compress_ratio == 4 else 256
     else:
         return 8 if compress_ratio == 4 else 128
+
+
+def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
+    """Largest draft-token count this ring can serve; mirrors `mtp_pad` in `c_plan.cuh`
+    (the bound is derived there). Zero for a non-speculative ring, which is exactly one
+    window wide."""
+    window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
+    return ring_size - window_size + 2 if ring_size > window_size else 0
 
 
 class DeepSeekV4SingleKVPool(KVCache):
@@ -279,7 +287,7 @@ class DeepSeekV4IndexerPool(KVCache):
             end_layer,
         )
         self.index_head_dim = index_head_dim
-        self.use_fp4_indexer = get_server_args().enable_deepseek_v4_fp4_indexer
+        self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
 
         self._create_buffer()
 
@@ -578,10 +586,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.swa_kv_pool = None
             self.c4_kv_pool = None
             self.c128_kv_pool = None
-            server_args = get_server_args()
             spec_extra = (
-                (server_args.speculative_num_draft_tokens - 1)
-                if server_args.speculative_algorithm is not None
+                (get_spec().speculative_num_draft_tokens - 1)
+                if get_spec().speculative_algorithm is not None
                 else 0
             )
             self.unified_kv_pool = DeepSeekV4UnifiedKVPool(
@@ -649,9 +656,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._init_compressed_layer_mapping()
 
-        if _is_hip:
-            self._init_paged_compress_states(False)
-        elif _is_cpu and _cpu_amx:
+        if _is_cpu and _cpu_amx:
             self._init_non_paged_compress_states(enable_memory_saver)
         else:
             self._init_paged_compress_states(enable_memory_saver)
@@ -666,8 +671,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
     def get_ring_size(self, compress_ratio: int) -> int:
-        server_args = get_server_args()
-        is_speculative = server_args.speculative_algorithm is not None
+        is_speculative = get_spec().speculative_algorithm is not None
         return get_compress_state_ring_size(compress_ratio, is_speculative)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
@@ -1242,6 +1246,34 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             out_loc=swa_loc,
             kvcache=self.swa_kv_pool.kv_buffer[self._swa_local_layer_id(layer_id)],
             page_size=self.swa_kv_pool.page_size,
+        )
+
+    def set_unified_key_buffer_radix_fused_norm_rope(
+        self,
+        layer_id: int,
+        swa_loc: torch.Tensor,
+        kv: torch.Tensor,
+        kv_weight: torch.Tensor,
+        eps: float,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """unified_kv counterpart of set_swa_key_buffer_radix_fused_norm_rope.
+
+        Under unified_kv the (fp8, paged) swa_kv_pool is None -- SWA K lives in
+        the shared bf16 unified_kv ring instead. Norm+RoPE the draft KV in place
+        (the same freqs_cis path the main model uses via _compute_kv_bf16) and
+        scatter it into ``unified_kv[swa_loc]``. Rows with swa_loc < 0
+        (uncommitted verify tokens) are skipped by the scatter.
+        """
+        from sglang.kernels.ops.attention.dsv4 import fused_norm_rope_inplace
+        from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+
+        fused_norm_rope_inplace(kv, kv_weight, eps, freqs_cis, positions)
+        runtime.scatter_bf16_into_unified(
+            kv=kv,
+            loc=swa_loc,
+            unified_kv=self.get_unified_kv(layer_id),
         )
 
     def set_extra_key_buffer_fused(

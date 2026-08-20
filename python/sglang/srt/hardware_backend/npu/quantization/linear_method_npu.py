@@ -767,32 +767,24 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
 
 
 class NPUSingleLevelMXFP4OfflineLinearMethod(NPUSingleLevelMXFP4LinearMethod):
-    """Ascend NPU offline W4A4 (ModelSlim ``W4A4_MXFP4``): fp8-container FP4 weights.
+    """Ascend NPU offline W4A4 (ModelSlim ``W4A4_MXFP4``): packed FP4 weights.
 
     Kernel for the offline ``ModelSlimMXFP4Scheme`` (delegated as ``self.kernel``).
-    The msmodelslim ``W4A4_MXFP4`` checkpoint stores weights as **fp4-in-fp8
-    container** (``float8_e4m3fn`` [out, in], one FP4 value per byte) plus UE8M0
-    block scales (``uint8`` [out, in//32]). The weight is re-packed to
-    ``float4_e2m1fn_x2`` (two FP4 per byte) and the scale reshaped to 3D; it then
+    The msmodelslim ``W4A4_MXFP4`` checkpoint stores weights as packed ``uint8``
+    [out, in//2] (two FP4 values per byte) plus UE8M0 block scales (``uint8``
+    [out, in//32]). The weight is transposed and the scale reshaped to 3D; it then
     shares the online :class:`NPUSingleLevelMXFP4LinearMethod` matmul (``apply``)
     exactly — only the weight source differs (msmodelslim checkpoint vs online RTN).
     Mirrors vllm-ascend's single-level W4A4 MXFP4 layout.
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Re-pack fp8-container FP4 to float4_e2m1fn_x2 and pre-transpose to match
-        # the online path's layout. All NPU ops go through torch.ops.npu.* (no
-        # torch_npu); the fp4 dtype must be the torch_npu enum (helper).
-        fp4_dtype = _get_float4_e2m1fn_x2_dtype()
-
         weight = layer.weight.data
         if not weight.is_npu:
             weight = weight.to(f"npu:{torch.npu.current_device()}")
-        # fp8 container -> float4_e2m1fn_x2 (2 FP4 per byte): [out, in] -> [out, in//2].
-        weight_fp4 = torch.ops.npu.npu_dtype_cast(weight, fp4_dtype)
-        # Transpose to [in//2, out]; no .contiguous() (preserve the strided view so
-        # the block-scale mapping stays intact).
-        layer.weight = Parameter(weight_fp4.transpose(0, 1), requires_grad=False)
+        # The checkpoint is already packed two-FP4-per-byte. Preserve the strided
+        # transpose used by vllm-ascend and by the online path.
+        layer.weight = Parameter(weight.transpose(0, 1), requires_grad=False)
 
         weight_scale = layer.weight_scale.data
         if not weight_scale.is_npu:

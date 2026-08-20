@@ -89,7 +89,7 @@ from sglang.srt.models.nemotron_h_utils import (
     pad_to_original_num_tokens,
 )
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import get_forward, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
@@ -200,7 +200,7 @@ class NemotronHMoE(nn.Module):
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
-            + get_server_args().ep_num_redundant_experts,
+            + get_exec().moe.ep_num_redundant_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=self.moe_hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -261,15 +261,17 @@ class NemotronHMoE(nn.Module):
             self.fc1_latent_proj = None
             self.fc2_latent_proj = None
 
-        self.use_min_latency_fc1_gemm = (
-            self.use_latent_moe
-            and self.fc1_latent_proj is not None
-            and _is_cuda
-            and fused_a_gemm_weight_eligible(self.fc1_latent_proj)
-        )
+        self._use_min_latency_fc1_gemm: bool | None = None
 
     def _apply_fc1_latent_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.use_min_latency_fc1_gemm:
+        if self._use_min_latency_fc1_gemm is None:
+            self._use_min_latency_fc1_gemm = (
+                self.use_latent_moe
+                and self.fc1_latent_proj is not None
+                and _is_cuda
+                and fused_a_gemm_weight_eligible(self.fc1_latent_proj)
+            )
+        if self._use_min_latency_fc1_gemm:
             return linear_with_fused_a_gemm(self.fc1_latent_proj, hidden_states)
         return self.fc1_latent_proj(hidden_states)[0]
 
@@ -277,17 +279,11 @@ class NemotronHMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        overlap = _is_cuda and not torch.compiler.is_compiling()
-        if (
-            overlap
-            and get_moe_a2a_backend().is_flashinfer()
-            and not get_is_capture_mode()
+        if _is_cuda and (
+            not get_moe_a2a_backend().is_flashinfer() or get_is_capture_mode()
         ):
-            overlap = False
-        if overlap:
             return self._forward_core_shared_routed_overlap(hidden_states)
-        else:
-            return self._forward_core_normal(hidden_states)
+        return self._forward_core_normal(hidden_states)
 
     def _forward_core_normal(
         self,
@@ -937,7 +933,7 @@ class NemotronHForCausalLM(nn.Module):
                         else lora_config.lora_vocab_padding_size
                     ),
                     quant_config=quant_config,
-                    use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                     prefix=add_prefix("lm_head", prefix),
                 )
         else:

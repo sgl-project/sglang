@@ -297,7 +297,7 @@ class AnthropicServing:
 
         def _convert_tool_result_content(
             content: Any,
-        ) -> tuple[Union[str, list[dict]], str]:
+        ) -> tuple[list[Union[str, list[dict]]], str]:
             if isinstance(content, list):
                 tool_content_parts = []
                 tool_text_parts = []
@@ -342,17 +342,29 @@ class AnthropicServing:
                             )
 
                 tool_text = "\n".join(tool_text_parts)
-                if (
-                    len(tool_content_parts) == 1
-                    and tool_content_parts[0]["type"] == "text"
-                ):
-                    return tool_content_parts[0]["text"], tool_text
-                if tool_content_parts:
-                    return tool_content_parts, tool_text
-                return "", tool_text
+                # GLM templates expand references only at the start of a tool
+                # message, so isolate reference runs without changing part order.
+                tool_content_groups: list[list[dict]] = []
+                for part in tool_content_parts:
+                    is_reference = part["type"] == "tool_reference"
+                    if (
+                        not tool_content_groups
+                        or (tool_content_groups[-1][0]["type"] == "tool_reference")
+                        != is_reference
+                    ):
+                        tool_content_groups.append([])
+                    tool_content_groups[-1].append(part)
+
+                tool_contents: list[Union[str, list[dict]]] = []
+                for group in tool_content_groups:
+                    if len(group) == 1 and group[0]["type"] == "text":
+                        tool_contents.append(group[0]["text"])
+                    else:
+                        tool_contents.append(group)
+                return tool_contents or [""], tool_text
 
             tool_text = str(content) if content else ""
-            return tool_text, tool_text
+            return [tool_text], tool_text
 
         def _convert_assistant_thinking_blocks(
             blocks: list[AnthropicContentBlock],
@@ -484,7 +496,7 @@ class AnthropicServing:
                     tool_calls.append(tool_call)
 
                 elif block.type == "tool_result":
-                    tool_content, tool_text = _convert_tool_result_content(
+                    tool_contents, tool_text = _convert_tool_result_content(
                         block.content
                     )
 
@@ -497,13 +509,14 @@ class AnthropicServing:
                     # block must come AFTER that text in OpenAI form too).
                     if msg.role == "user":
                         _emit_user_message(content_parts)
-                        openai_messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "content": tool_content,
-                            }
-                        )
+                        for tool_content in tool_contents:
+                            openai_messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call_id,
+                                    "content": tool_content,
+                                }
+                            )
                     else:
                         content_parts.append(
                             {

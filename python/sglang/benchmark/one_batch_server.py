@@ -1002,10 +1002,21 @@ def run_benchmark_internal(
                 "token_capacity", 1000000000
             )
 
-        assert (
-            max_running_requests_per_dp > 0
-        ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
-        skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
+        # Router /get_server_info responses carry "router_manager"; worker
+        # responses never do, so its presence confirms a router by design.
+        if not internal_states and server_info.get("router_manager"):
+            print(
+                "WARNING: base_url points at a PD router; worker internal "
+                "states are unavailable, so the max-running-requests and "
+                "token-capacity skip guards are disabled."
+            )
+            skip_max_running_requests_threshold = float("inf")
+            skip_token_capacity_threshold = float("inf")
+        else:
+            assert (
+                max_running_requests_per_dp > 0
+            ), f"effective_max_running_requests_per_dp is not set, {max_running_requests_per_dp=}"
+            skip_max_running_requests_threshold = max_running_requests_per_dp * dp_size
 
         print(f"{max_running_requests_per_dp=}")
         print(f"{dp_size=}")
