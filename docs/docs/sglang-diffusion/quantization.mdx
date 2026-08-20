@@ -15,9 +15,9 @@ Use these paths:
 
 - `--model-path`: the base or original model
 - `--transformer-path`: a quantized transformers-style transformer component directory that already contains its own `config.json`
-- `--transformer-weights-path`: replacement transformer weights provided as a
-  safetensors file/directory/repo, an explicit Hub file reference, or a
-  supported GGUF file reference
+- `--transformer-weights-path`: replacement transformer weights in safetensors
+  format (file, directory, or Hub repository/file) or a supported GGUF file
+  (local or Hub)
 - `--quantization`: apply online quantization to unquantized models at load time (activations are quantized dynamically)
 - `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
 - `--component-paths.text_encoder`: replace a native text encoder with a checkpoint whose `quantization_config` is auto-detected
