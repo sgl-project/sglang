@@ -9,6 +9,7 @@ from sglang.kernels.ops.mamba.triton_ops import ssu_dispatch
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=1, stage="base-b", runner_config="1-gpu-small")
@@ -300,6 +301,12 @@ def test_cake_compact_checkpoint_rejects_radix_destination_mismatch():
             torch.zeros((5, 2, 4, 3), dtype=torch.bfloat16),
             metadata,
         )
+
+
+def test_cake_server_args_keep_radix_cache_enabled():
+    args = ServerArgs(model_path="dummy", mamba_backend="cake")
+
+    assert args.disable_radix_cache is False
 
 
 def test_flashinfer_prefill_refuses_non_sglang_return_contract():
