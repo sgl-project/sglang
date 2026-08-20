@@ -631,20 +631,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def _forward_xpu(
         self,
+        backend: object,
         projected_states_qkvz: torch.Tensor,
         projected_states_ba: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        core_attn_out = z = None
-        from sglang.srt.model_executor.forward_context import get_attn_backend
-
-        backend = get_attn_backend()
-        backend = getattr(backend, "linear_attn_backend", backend)
-        if not hasattr(backend, "forward_fused_gdn") or not backend.supports_fused_gdn(
-            self.attn, forward_batch
-        ):
-            return None
-
         core_attn_out, z = backend.forward_fused_gdn(
             self.attn,
             forward_batch,
@@ -687,12 +678,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if _is_xpu:
-            xpu_out = self._forward_xpu(
-                projected_states_qkvz, projected_states_ba, forward_batch
-            )
-            if xpu_out is not None:
-                return xpu_out
+        if _is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu":
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            backend = get_attn_backend()
+            backend = getattr(backend, "linear_attn_backend", backend)
+            if backend.supports_fused_gdn(self.attn, forward_batch):
+                return self._forward_xpu(
+                    backend, projected_states_qkvz, projected_states_ba, forward_batch
+                )
 
         if (
             self.num_v_heads // self.num_k_heads in _GDN_FUSED_QKVZBA_RATIOS

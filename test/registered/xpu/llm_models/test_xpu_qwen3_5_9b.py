@@ -22,7 +22,7 @@ register_xpu_ci(est_time=2400, suite="nightly-xpu-4-gpu", nightly=True)
 )
 class Qwen3_5_9BXPUBase(SimpleEvalGSM8KXPUMixin, CustomTestCase):
     model = "Qwen/Qwen3.5-9B"
-    tp_size = 4
+    tp_size = 1
     accuracy = 0.90
     # max_tokens=8192 lets the GSM8K CoT complete under num_threads=4.
     num_examples = 50
@@ -55,8 +55,8 @@ class TestQwen3_5_9BXPUFusedGDN(Qwen3_5_9BXPUBase):
         "--linear-attn-backend",
         "intel_xpu",
     ]
-    num_examples = 8
-    accuracy = 0.0
+    # num_examples = 8
+    # accuracy = 0.0
 
 
 if __name__ == "__main__":
