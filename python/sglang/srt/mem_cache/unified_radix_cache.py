@@ -72,14 +72,14 @@ from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
 )
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import create_tree_core
+from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
+    UnifiedCacheLinkerWrapper,
+)
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     NodeId,
     UnifiedLRUList,
     UnifiedTreeCore,
     UnifiedTreeNode,
-)
-from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
-    UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
@@ -917,12 +917,12 @@ class UnifiedRadixCache(BasePrefixCache):
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
-        assert req.cache_protected_len <= len(new_indices) + self.page_size - 1, (
-            f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        )
-        assert new_prefix_len <= len(new_indices), (
-            f"{new_prefix_len=}, {len(new_indices)=}"
-        )
+        assert (
+            req.cache_protected_len <= len(new_indices) + self.page_size - 1
+        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        assert new_prefix_len <= len(
+            new_indices
+        ), f"{new_prefix_len=}, {len(new_indices)=}"
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
@@ -2376,9 +2376,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
-        assert count_values[-2] == -count_values[-1], (
-            "write_back duplicate-reclaim victims diverged across TP ranks"
-        )
+        assert (
+            count_values[-2] == -count_values[-1]
+        ), "write_back duplicate-reclaim victims diverged across TP ranks"
         return (
             count_values[0],
             count_values[1],
@@ -2462,9 +2462,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
             finish_count = int(sync_tensor[0].item())
-            assert sync_tensor[1].item() == -sync_tensor[2].item(), (
-                "write_back duplicate-reclaim victims diverged across TP ranks"
-            )
+            assert (
+                sync_tensor[1].item() == -sync_tensor[2].item()
+            ), "write_back duplicate-reclaim victims diverged across TP ranks"
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)

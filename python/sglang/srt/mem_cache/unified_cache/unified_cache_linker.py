@@ -53,6 +53,81 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 
+class UnifiedCacheLinker(ABC):
+    """External KV store reached directly from the device pools."""
+
+    layer_done_counter: object
+
+    @abstractmethod
+    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        """Return every prefix length (in pages) that is fully restorable.
+
+        A length is included only when *all* pools satisfy their hit policy at
+        that exact boundary (contiguous prefix pools, plus each trailing-window
+        pool's window ending there). Trailing-window state (SWA / compress
+        state) only exists at offloaded node boundaries, so the set is sparse
+        and generally non-contiguous -- returning just the local maximum would
+        let the tree pick a length that is invalid on another rank.
+
+        Local to this rank; the tree intersects the sets across ranks.
+        """
+
+    @abstractmethod
+    def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
+        """Queue a load into the given device indices.
+
+        The transfer is executed by the next ``start_layer_wise_loading`` call,
+        not here.
+        """
+
+    @abstractmethod
+    def start_layer_wise_loading(self) -> int:
+        """Start queued loads and return the layer-counter consumer index."""
+
+    @abstractmethod
+    def cancel_queued_load(self, rid: str) -> bool:
+        """Cancel a load that has not started yet."""
+
+    @abstractmethod
+    def num_completed_loads(self) -> int:
+        """Return the number of completed load batches waiting to be consumed."""
+
+    @abstractmethod
+    def pop_completed_load(self) -> list[str]:
+        """Consume the oldest completed load batch and return its request IDs."""
+
+    @abstractmethod
+    def offload(self, transfers: list[PoolTransfer]) -> bool:
+        """Queue every transfer for atomic persistence."""
+
+    @abstractmethod
+    def num_completed_offloads(self) -> int:
+        """Return the number of completed offloads waiting to be consumed."""
+
+    @abstractmethod
+    def pop_completed_offload(self) -> bool:
+        """Consume the oldest completed offload and return its result."""
+
+    def reset(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class ExternalCacheHitMarker(NamedTuple):
+    """What ``match`` found in the external store, consumed by ``load_back``.
+
+    ``prefix_key`` covers the device-cached prefix plus the restorable tail, so
+    it is what gets inserted once the tail lands. ``tail_hashes`` are the
+    per-page storage hashes of that tail alone, starting at ``device_hit_len``.
+    """
+
+    prefix_key: RadixKey
+    tail_hashes: list[str]
+    device_hit_len: int
+
+
 class DevicePoolEntry:
     """Zero-copy linker view over one physical device pool."""
 
@@ -248,81 +323,6 @@ class DevicePoolGroup:
                 )
             )
         return resolved
-
-
-class UnifiedCacheLinker(ABC):
-    """External KV store reached directly from the device pools."""
-
-    layer_done_counter: object
-
-    @abstractmethod
-    def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
-        """Return every prefix length (in pages) that is fully restorable.
-
-        A length is included only when *all* pools satisfy their hit policy at
-        that exact boundary (contiguous prefix pools, plus each trailing-window
-        pool's window ending there). Trailing-window state (SWA / compress
-        state) only exists at offloaded node boundaries, so the set is sparse
-        and generally non-contiguous -- returning just the local maximum would
-        let the tree pick a length that is invalid on another rank.
-
-        Local to this rank; the tree intersects the sets across ranks.
-        """
-
-    @abstractmethod
-    def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
-        """Queue a load into the given device indices.
-
-        The transfer is executed by the next ``start_layer_wise_loading`` call,
-        not here.
-        """
-
-    @abstractmethod
-    def start_layer_wise_loading(self) -> int:
-        """Start queued loads and return the layer-counter consumer index."""
-
-    @abstractmethod
-    def cancel_queued_load(self, rid: str) -> bool:
-        """Cancel a load that has not started yet."""
-
-    @abstractmethod
-    def num_completed_loads(self) -> int:
-        """Return the number of completed load batches waiting to be consumed."""
-
-    @abstractmethod
-    def pop_completed_load(self) -> list[str]:
-        """Consume the oldest completed load batch and return its request IDs."""
-
-    @abstractmethod
-    def offload(self, transfers: list[PoolTransfer]) -> bool:
-        """Queue every transfer for atomic persistence."""
-
-    @abstractmethod
-    def num_completed_offloads(self) -> int:
-        """Return the number of completed offloads waiting to be consumed."""
-
-    @abstractmethod
-    def pop_completed_offload(self) -> bool:
-        """Consume the oldest completed offload and return its result."""
-
-    def reset(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
-
-
-class ExternalCacheHitMarker(NamedTuple):
-    """What ``match`` found in the external store, consumed by ``load_back``.
-
-    ``prefix_key`` covers the device-cached prefix plus the restorable tail, so
-    it is what gets inserted once the tail lands. ``tail_hashes`` are the
-    per-page storage hashes of that tail alone, starting at ``device_hit_len``.
-    """
-
-    prefix_key: RadixKey
-    tail_hashes: list[str]
-    device_hit_len: int
 
 
 class UnifiedCacheLinkerWrapper:
