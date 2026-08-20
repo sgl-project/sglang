@@ -191,7 +191,7 @@ def _get_mhc_ops() -> MhcOps:
     their communication workspaces.  DeepSeek-V4 is the sole consumer here.
     """
     if _is_xpu:
-        from sgl_kernel import hc_split_sinkhorn, mhc_fused_post_pre, mhc_pre, hc_post
+        from sgl_kernel import hc_post, hc_split_sinkhorn, mhc_fused_post_pre, mhc_pre
 
         return MhcOps(hc_split_sinkhorn, mhc_fused_post_pre, mhc_pre, hc_post)
 
