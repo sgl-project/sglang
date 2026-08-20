@@ -413,7 +413,8 @@ class DeepEPBuffer:
             )
         # V2 sizes its internal slots from `num_max_tokens_per_rank` and
         # HARD-asserts `num_tokens <= num_max_tokens_per_rank` on every
-        # dispatch (csrc/elastic/buffer.hpp:684). The env default (128)
+        # dispatch (`EP_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank)`
+        # in csrc/elastic/buffer.hpp). The env default (128)
         # was tuned for the V1 low-latency DECODE path; in normal mode a
         # chunked-prefill batch dispatches up to `chunked_prefill_size`
         # tokens from a rank in one shot (measured: concurrency 8 x
@@ -425,20 +426,20 @@ class DeepEPBuffer:
             # exceeds `chunked_prefill_size` (8192) — measured: an 8192
             # buffer still hit the assert under concurrency 8. Bound by the
             # larger of the two packing caps.
-            chunk, max_prefill = None, None
-            try:
-                from sglang.srt.managers.schedule_batch import (
-                    global_server_args_dict,
-                )
+            from sglang.srt.runtime_context import get_schedule
 
-                chunk = global_server_args_dict.get("chunked_prefill_size")
-                max_prefill = global_server_args_dict.get("max_prefill_tokens")
-            except Exception:
-                pass
+            try:
+                schedule = get_schedule()
+                chunk = schedule.chunked_prefill_size
+                max_prefill = schedule.max_prefill_tokens
+            except ValueError:
+                # `schedule` bag not published (bare import outside a running
+                # server); fall back to the server defaults below.
+                chunk, max_prefill = None, None
             num_max_dispatch_tokens_per_rank = max(
                 num_max_dispatch_tokens_per_rank,
-                chunk or 8192,
-                max_prefill or 16384,
+                chunk if chunk and chunk > 0 else 8192,
+                max_prefill if max_prefill and max_prefill > 0 else 16384,
             )
         # Use the model's real top-k: it is fixed per model and known at
         # dispatcher construction (`router_topk`). Passing 0 is NOT a
@@ -478,7 +479,7 @@ class DeepEPBuffer:
         # DeepEP V2's `ElasticBuffer` does not expose `low_latency_mode`
         # or `clean_low_latency_buffer` — low-latency cleanup is handled
         # internally via `EPHandle` lifetime. Fall through for V2.
-        if not hasattr(state.buffer, "clean_low_latency_buffer"):
+        if ElasticBuffer is not None and isinstance(state.buffer, ElasticBuffer):
             return
         if not state.buffer.low_latency_mode:
             return
@@ -773,7 +774,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     _prev_evt = None
             previous_event = _prev_evt
             _num_tokens = (x[0] if isinstance(x, tuple) else x).shape[0]
-            _cap = getattr(buffer, "num_max_tokens_per_rank", -1)
+            _cap = buffer.num_max_tokens_per_rank
             if _num_tokens > 0.75 * _cap:
                 logger.warning(
                     "[V2-SIZE] dispatch num_tokens=%d approaching/exceeding "
@@ -798,7 +799,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     # dispatch resolves `value_or(passed, ctor_value)`, so the
                     # dispatcher's decode-tuned value (128) would override the
                     # prefill-sized ctor capacity and re-trip the
-                    # buffer.hpp:684 assert on large prefill batches.
+                    # num_tokens<=num_max_tokens_per_rank assert on large prefill batches.
                     num_max_tokens_per_rank=None,
                     expert_alignment=(
                         128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
@@ -810,9 +811,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                     allocate_on_comm_stream=_alloc_on_comm,
                     do_expand=False,
                 )
-            num_recv_tokens_per_expert = getattr(
-                self.handle, "num_recv_tokens_per_expert_list", None
-            )
+            num_recv_tokens_per_expert = self.handle.num_recv_tokens_per_expert_list
             if isinstance(num_recv_tokens_per_expert, torch.Tensor):
                 num_recv_tokens_per_expert = num_recv_tokens_per_expert.tolist()
             get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
@@ -1191,6 +1190,24 @@ class DeepEPDispatcher(BaseDispatcher):
         super().__init__()
 
         self.deepep_mode = deepep_mode
+
+        # The V2 `ElasticBuffer` implements the normal-mode API only — it has
+        # no `low_latency_dispatch` / `low_latency_combine` /
+        # `clean_low_latency_buffer`. The buffer is a cached singleton shared
+        # by both impls, so a mode-conditional build cannot help; fail at
+        # construction with the supported combination instead of an
+        # AttributeError on the first decode batch (default `--deepep-mode
+        # auto` resolves every decode batch to low-latency).
+        if (
+            have_deepep_v2
+            and envs.SGLANG_DEEPEP_USE_V2.get()
+            and deepep_mode.enable_low_latency()
+        ):
+            raise ValueError(
+                "SGLANG_DEEPEP_USE_V2=1 supports '--deepep-mode normal' only: "
+                "deep_ep.ElasticBuffer does not implement the V1 low-latency "
+                f"API, got deepep_mode={deepep_mode.value!r}."
+            )
 
         common_kwargs = dict(
             group=group,
