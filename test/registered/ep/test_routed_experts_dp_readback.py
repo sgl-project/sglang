@@ -39,7 +39,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=900, stage="base-c", runner_config="deepep-8-gpu-h200")
+register_cuda_ci(est_time=900, stage="base-c", runner_config="8-gpu-h200")
 
 _MODEL = os.environ.get("SGLANG_ROUTED_EXPERTS_TEST_MODEL", "deepseek-ai/DeepSeek-V3")
 _NUM_EXPERTS = 24
