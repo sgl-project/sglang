@@ -1159,6 +1159,8 @@ class Scheduler(
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
+        self.prefill_decode_interval = get_schedule().prefill_decode_interval
+        self._prefill_decode_interval_remaining = 0
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
@@ -1194,6 +1196,28 @@ class Scheduler(
                     "Dynamic chunking will be disabled."
                 )
                 self.enable_dynamic_chunking = False
+
+    def _should_defer_prefill(self) -> bool:
+        if self._prefill_decode_interval_remaining == 0:
+            return False
+
+        self._prefill_decode_interval_remaining -= 1
+        return True
+
+    def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
+        if self.prefill_decode_interval == 0 or batch is None:
+            return
+
+        # DP attention synchronizes this flag across ranks. This keeps every
+        # rank on the same prefill/decode cadence even when only one rank has
+        # local prefill work. Non-DP scheduling can use the local mode directly.
+        is_extend = (
+            batch.is_extend_in_batch
+            if self.require_mlp_sync
+            else batch.forward_mode.is_extend()
+        )
+        if is_extend:
+            self._prefill_decode_interval_remaining = self.prefill_decode_interval
 
     def init_metrics_reporter(
         self, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
@@ -3128,6 +3152,8 @@ class Scheduler(
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
+        elif self._should_defer_prefill():
+            new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
@@ -3161,6 +3187,7 @@ class Scheduler(
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
             ret, need_sync=need_mlp_sync
         )
+        self._arm_prefill_decode_interval(ret)
 
         # Handle ngram embedding
         ret = self.ngram_embedding_manager.prepare_for_forward(
