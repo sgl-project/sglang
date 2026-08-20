@@ -663,6 +663,10 @@ class TextEncoderLoader(ComponentLoader):
                         model.__class__.__name__,
                     )
                 elif use_fsdp_cpu_offload:
+                    # Some encoder initializers materialize a small subset of
+                    # parameters on the local device despite CPU weight loading.
+                    # FSDP CPU offload requires every parameter to start on CPU.
+                    model = model.to("cpu")
                     mesh = init_device_mesh(
                         current_platform.device_type,
                         mesh_shape=(1, dist.get_world_size()),
